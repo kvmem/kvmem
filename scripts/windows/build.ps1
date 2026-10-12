@@ -7,6 +7,7 @@ param(
     [switch]$ExperimentalCuda129,
     [switch]$Vulkan,
     [string]$CudaArchitectures = '75-real;80-real;86-real;89-real;90-real;120a-real',
+    [ValidateSet('Release', 'Debug', 'RelWithDebInfo', 'MinSizeRel')][string]$BuildType = 'Release',
     [ValidateRange(1, 64)][int]$Jobs = 4,
     [switch]$HostOnly,
     [switch]$BuildOnly
@@ -99,7 +100,7 @@ if (!$HostOnly) {
     }
 }
 $options = @('-S', $SourceDir, '-B', $BuildDir, '-G', 'Ninja',
-    '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CXX_COMPILER=cl',
+    "-DCMAKE_BUILD_TYPE=$BuildType", '-DCMAKE_CXX_COMPILER=cl',
     "-DCMAKE_USER_MAKE_RULES_OVERRIDE=$rulesOverride",
     '-DBUILD_SHARED_LIBS=OFF', '-DKVMEM_ENABLE_NVME=OFF')
 if (!$HostOnly) {

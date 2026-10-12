@@ -52,6 +52,24 @@ def text_of(response):
                    for part in item.content if part.type == "output_text")
 
 
+def check_system_turns(client):
+    for role in ("system", "developer"):
+        for typed_content in (False, True):
+            for instructions in (False, True):
+                content = ([{"type": "input_text", "text": "Be brief."}]
+                           if typed_content else "Be brief.")
+                payload = {"model": "test", "max_output_tokens": 32, "temperature": 0,
+                           "reasoning": {"effort": "none"},
+                           "input": [{"role": "user", "content": "Say OK."},
+                                     {"role": role, "content": content}]}
+                if instructions:
+                    payload["instructions"] = "Answer in English."
+                response = client.responses.create(**payload)
+                check(f"system merge {role} array={typed_content} instructions={instructions}",
+                      response.object == "response" and response.status in ("completed", "incomplete"),
+                      response.model_dump())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", required=True)
@@ -202,6 +220,8 @@ def main():
             if event.type == "response.output_text.delta":
                 text += event.delta
         check("instructions honored (stream)", "BANANA" in text.upper(), text)
+
+        check_system_turns(client)
 
         # --- vision on both paths --------------------------------------------
         if args.mmproj:

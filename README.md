@@ -1,6 +1,21 @@
-# KVMem + llama.cpp
+# KVMem: llama.cpp and ninfer backends
 
-**Prebuilt downloads:** [Windows x64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Linux / WSL2 x86_64 CUDA 13 / 12 (rc3)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) · [Windows / Linux ROCm (beta 2)](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/rc3-rocm-beta2)
+<a id="downloads"></a>
+
+## Downloads / 下载导航
+
+**Before starting / 启动前：Use English paths for the package and model. 运行包和模型的完整路径不能含中文，包括用户名、上级目录和文件名。**
+
+| 用途 / Audience | 后端 / Backend | 模型 / Model | 下载 / Download | 状态 / Status |
+|---|---|---|---|---|
+| Windows NVIDIA RTX 30/40/50 | NInfer | `.ninfer` | [v0.18.0 RC2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.18.0-ninfer-rc2) | 预发布 / Prerelease |
+| Windows NVIDIA | llama.cpp | GGUF | [CUDA RC3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | 预发布 / Prerelease |
+| Linux / WSL2 NVIDIA | llama.cpp | GGUF | [CUDA RC3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | 预发布 / Prerelease |
+| Windows / Linux / WSL2 AMD | llama.cpp | GGUF | [ROCm Beta2](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/rc3-rocm-beta2) | 测试版 / Beta |
+| Windows Bonsai 2 | Bonsai 专用 / Dedicated | PTQ1 GGUF | [prism.3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3-prism.3) | 专用实验版 / Experiment |
+| 自行编译 / Build from source | llama.cpp | GGUF | [v0.17.0 source](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.17.0) | 仅源码 / Source only |
+
+**Windows RTX 30/40/50 users are encouraged to try the NInfer prerelease. 推荐 Windows RTX 30／40／50 系用户尝试 NInfer 预发布版。** NInfer uses `.ninfer` models; llama.cpp uses GGUF. Models are downloaded separately. 两个后端的模型格式不同，模型需另行准备。
 
 **QQ community / QQ 交流群：1040777853**
 
@@ -74,6 +89,9 @@ The CUDA measurements above use the listed NVIDIA platform. Experimental AMD/ROC
 
 ## Prebuilt downloads
 
+<details>
+<summary>llama.cpp package requirements / llama.cpp 运行包详细要求</summary>
+
 | Platform | Download | Notes |
 |---|---|---|
 | Windows x64 — CUDA 13.2.86 | [v0.16.0-rc3](https://github.com/kvmem/kvmem-llama.cpp/releases/tag/v0.16.0-rc3) | Recommended **runtime** ZIP; GPU targets 75/80/86/89/90/120a. Quantizer is a separate optional ZIP. |
@@ -94,6 +112,9 @@ needed. The performance tables below retain their original Q8/BF16 projectors.
 The locally converted IQ4 MTP-Q4_0 main model does not yet have a project-provided
 download link in this release; use your prepared file or the optional quantizer.
 The recipes and conversion commands below document the historical tested setup.
+
+</details>
+
 
 ## Clone, patch, build
 

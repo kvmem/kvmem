@@ -4,6 +4,10 @@
 // common_json. See kvmem-responses.h for why the conversion crosses a string.
 #include "server-chat.h"
 
+#include <algorithm>
+#include <stdexcept>
+#include <string>
+
 // A reasoning item a client sends back may carry its text only under `summary`.
 //
 // We emit every reasoning item with the text in both `summary` (type
@@ -82,9 +86,50 @@ static void kvmem_responses_fill_message_type(json & body) {
     }
 }
 
+// Merge after upstream validates and converts input_text parts to text.
+// Qwen templates require a single leading system message.
+static void kvmem_responses_merge_system_turns(json & body) {
+    const auto is_system_turn = [](const json & item) {
+        const std::string role = json_value(item, "role", std::string());
+        return role == "system" || role == "developer";
+    };
+    const auto & messages = body.at("messages");
+    if (std::none_of(messages.begin(), messages.end(), is_system_turn)) {
+        return;
+    }
+
+    std::string merged;
+    json kept = json::array({json{{"role", "system"}, {"content", ""}}});
+    for (const json & message : messages) {
+        if (!is_system_turn(message)) {
+            kept.push_back(message);
+            continue;
+        }
+        const auto & content = message.at("content");
+        std::string text;
+        if (content.is_string()) {
+            text = content.get<std::string>();
+        } else {
+            for (const json & part : content) {
+                if (json_value(part, "type", std::string()) != "text") {
+                    throw std::invalid_argument("system message with non-text content is not supported");
+                }
+                text += part.at("text").get<std::string>();
+            }
+        }
+        if (!text.empty()) {
+            merged += (merged.empty() ? "" : "\n\n") + text;
+        }
+    }
+    kept[0]["content"] = merged;
+    body["messages"] = std::move(kept);
+}
+
 std::string kvmem_responses_to_chatcmpl(const std::string & body) {
     json parsed = json::parse(body);
     kvmem_responses_fold_reasoning_summary(parsed);
     kvmem_responses_fill_message_type(parsed);
-    return server_chat_convert_responses_to_chatcmpl(parsed).dump();
+    json converted = server_chat_convert_responses_to_chatcmpl(parsed);
+    kvmem_responses_merge_system_turns(converted);
+    return converted.dump();
 }

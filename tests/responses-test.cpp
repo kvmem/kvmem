@@ -152,6 +152,66 @@ static void test_tools_max_tokens_and_reasoning() {
     CHECK(out["tools"][0]["function"]["name"] == "f");
 }
 
+static void test_system_turns_merge() {
+    for (const char * role : {"system", "developer"}) {
+        for (bool typed_content : {false, true}) {
+            for (bool instructions : {false, true}) {
+                for (bool system_first : {false, true}) {
+                    json content = "be formal";
+                    if (typed_content) {
+                        content = json::array({{{"type", "input_text"}, {"text", "be "}},
+                                               {{"type", "input_text"}, {"text", "formal"}}});
+                    }
+                    const json system = {{"role", role}, {"content", content}};
+                    const json user = {{"role", "user"}, {"content", "hi"}};
+                    json body = {{"input", system_first ? json::array({system, user}) : json::array({user, system})}};
+                    if (instructions) {
+                        body["instructions"] = "be brief";
+                    }
+                    const auto out = convert(body.dump());
+                    CHECK(out["messages"].size() == 2);
+                    CHECK(out["messages"][0]["role"] == "system");
+                    CHECK(out["messages"][0]["content"] == (instructions ? "be brief\n\nbe formal" : "be formal"));
+                    CHECK(out["messages"][1]["role"] == "user");
+                    CHECK(out["messages"][1]["content"][0]["text"] == "hi");
+                }
+            }
+        }
+    }
+    const auto out = convert(R"({"instructions":"S","stream":true,"input":[
+        {"role":"developer","content":"D"}, {"role":"user","content":"hi"},
+        {"role":"assistant","content":"hello"}, {"role":"system","content":"S2"},
+        {"type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},
+        {"type":"function_call_output","call_id":"call_1","output":"42"}
+    ]})");
+    CHECK(out["messages"].size() == 5);
+    CHECK(out["messages"][0]["content"] == "S\n\nD\n\nS2");
+    CHECK(out["messages"][1]["role"] == "user");
+    CHECK(out["messages"][2]["content"][0]["text"] == "hello");
+    CHECK(out["messages"][3]["tool_calls"][0]["id"] == "call_1");
+    CHECK(out["messages"][4]["content"] == "42");
+    CHECK(out["stream"] == true);
+    CHECK(convert(R"({"instructions":"","input":[{"role":"system","content":""},{"role":"user","content":"hi"}]})")["messages"][0]["content"] == "");
+}
+
+static void test_system_turns_reject_invalid_content() {
+    for (const char * role : {"system", "developer"}) {
+        for (const json & content : {json(7), json(nullptr), json::array({{{"type", "input_text"}}}),
+                                    json::array({{{"type", "input_text"}, {"text", 7}}}),
+                                    json::array({{{"type", "text"}, {"text", "wrong wire type"}}}),
+                                    json::array({{{"type", "input_image"}, {"image_url", "https://example.com/a.png"}}})}) {
+            for (bool instructions : {false, true}) {
+                json body = {{"input", json::array({{{"role", role}, {"content", content}}, {{"role", "user"}, {"content", "hi"}}})}};
+                if (instructions) {
+                    body["instructions"] = "S";
+                }
+                CHECK(throws(body.dump()));
+            }
+        }
+        CHECK(throws(json{{"instructions", "S"}, {"input", json::array({{{"role", role}}})}}.dump()));
+    }
+}
+
 static void test_stream_passthrough() {
     // The server rejects streaming Responses itself; the bridge must not drop it.
     const auto out = convert(R"({"input": "hi", "stream": true})");
@@ -531,6 +591,8 @@ int main() {
     test_reasoning_item_with_content_is_left_alone();
     test_assistant_message_without_type_is_typed();
     test_tools_max_tokens_and_reasoning();
+    test_system_turns_merge();
+    test_system_turns_reject_invalid_content();
     test_stream_passthrough();
     test_rejects_bad_input();
     test_stream_created();
