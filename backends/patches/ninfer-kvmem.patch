@@ -2746,21 +2746,26 @@ index dbc8d092f66ddd993390ad7a2be5315f5d893ec6..1d4eab4f059fc7a20b96651e4bd25195
      return out;
  }
 diff --git a/src/models/qwen3_5/frontend/chat_template.cpp b/src/models/qwen3_5/frontend/chat_template.cpp
-index 1bdf3ef3478db084f75ce59c8359cc4db3143def..c7e769bd3bf3dd4b07b9513fa50c0807c0e93a40 100644
+index 1bdf3ef3478db084f75ce59c8359cc4db3143def..759313160afafe641b5920f8082d411e4726bb87 100644
 --- a/src/models/qwen3_5/frontend/chat_template.cpp
 +++ b/src/models/qwen3_5/frontend/chat_template.cpp
-@@ -375,6 +375,10 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
+@@ -375,6 +375,15 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
          layout = inspect_prompt_layout(output, media);
      }
      RenderedChat result;
 +    for (const auto& block : layout.messages) {
-+        if (instruction(block.role) && block.begin < block.end)
-+            result.memory_instructions.push_back({block.begin, block.end});
++        if (instruction(block.role) && block.begin < block.end) {
++            // The closing role token is exact; trailing formatting whitespace can
++            // merge with the next newline in a custom template's BPE tokenizer.
++            const auto end = block.closed ? block.content_end + std::string_view("<|im_end|>").size()
++                                          : block.end;
++            result.memory_instructions.push_back({block.begin, end});
++        }
 +    }
      result.starts_in_reasoning          = layout.starts_in_reasoning;
      result.media_placeholders           = layout.media_placeholders;
      result.rewrite_execution_boundaries = layout.execution_boundaries;
-@@ -433,6 +437,28 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
+@@ -433,6 +442,28 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
          if (extent) message_blocks[i] = containing_message(layout, *extent);
          if (message_blocks[i]) ++block_users[*message_blocks[i]];
      }
@@ -4221,7 +4226,7 @@ index 328a7bc0f7fb18a2a0633a9f6d1c41aa0eceffe8..99b8a32f261e5c2b9bcc7d54357f15fa
  bool ProgramImpl::persistent_backfill_safe(
      const RequestBasePlan& blocked_head, const AdmissionCandidate& candidate,
 diff --git a/src/models/qwen3_5/program/planning/request_plan.cpp b/src/models/qwen3_5/program/planning/request_plan.cpp
-index 9811b10e74fcf5099736f13f261a3bd94ec989e7..291063442cbb91f86d4f056a4f159f0b2da52502 100644
+index 9811b10e74fcf5099736f13f261a3bd94ec989e7..350eb03007c7f7d6259c00f80d70086833c785fe 100644
 --- a/src/models/qwen3_5/program/planning/request_plan.cpp
 +++ b/src/models/qwen3_5/program/planning/request_plan.cpp
 @@ -84,7 +84,7 @@ runtime::PrefillWork scheduled_prefill_work(std::uint32_t begin, std::uint32_t e
@@ -4267,12 +4272,12 @@ index 9811b10e74fcf5099736f13f261a3bd94ec989e7..291063442cbb91f86d4f056a4f159f0b
          }
      }
 +    if (kvmem_window_tokens) {
-+        (void)memory_context_pages(prompt);
 +        // Active requests reserve their complete history across common H/D storage.
 +        // Reject a known budget shortfall while the request is still Waiting;
 +        // running out during prefill is not an unexpected worker/device failure.
 +        const auto frontier = base->summary.prompt_tokens +
 +            (base->summary.effective_output_tokens ? base->summary.effective_output_tokens - 1U : 0U);
++        (void)memory_context_pages(prompt, frontier);
 +        const bool retain_history = options.allow_prefix_reuse && prompt.identity.reusable;
 +        if (frontier > kvmem_window_tokens || retain_history) {
 +            const auto host_layout = plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry());
@@ -5258,7 +5263,7 @@ index ddd6cb476416bd85a565fe462c2aec62e845a2bb..9ce5eec77269840e832be0ee050e1588
      out.max_context     = capacity;
      out.kv_capacity     = kv_capacity;
 diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
-index b82aeb3fcc9a87a640a7c80a9bebefb8b44625d9..93f7e053428b0e4ac1e0f31c1af984384e1140b3 100644
+index b82aeb3fcc9a87a640a7c80a9bebefb8b44625d9..ac4692991e94cc402b7431112e0dd57c34ade978 100644
 --- a/src/models/qwen3_5/program/program_impl.h
 +++ b/src/models/qwen3_5/program/program_impl.h
 @@ -5,6 +5,11 @@
@@ -5602,7 +5607,7 @@ index b82aeb3fcc9a87a640a7c80a9bebefb8b44625d9..93f7e053428b0e4ac1e0f31c1af98438
 +                                  std::uint32_t end, std::uint32_t first_column,
 +                                  std::uint32_t row_width);
 +    void read_memory_candidates();
-+    [[nodiscard]] std::vector<std::uint32_t> memory_context_pages(const PreparedPromptData& prompt) const;
++    [[nodiscard]] std::vector<std::uint32_t> memory_context_pages(const PreparedPromptData& prompt, std::uint32_t maximum_frontier = 0) const;
 +
 +    [[nodiscard]] std::uint32_t compact_position(const SequenceState& sequence,
 +                                                std::uint32_t logical) const {
@@ -5791,10 +5796,10 @@ index 9085edcc7beaa3649711d7695784d2494dea7755..3bb9c685bd99416a7d9ba5539fc8229a
      sequence.dflash_context_frontier = 0;
 diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..172073c4981efd15539d09bf9bedb7db17beeabf
+index 0000000000000000000000000000000000000000..b942db0a0c25605b61a28d17dc34c045658cb55b
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
-@@ -0,0 +1,1403 @@
+@@ -0,0 +1,1410 @@
 +#include "models/qwen3_5/program/program_impl.h"
 +#include "models/qwen3_5/program/context.h"
 +#include "models/qwen3_5/program/context_work.h"
@@ -6257,7 +6262,7 @@ index 0000000000000000000000000000000000000000..172073c4981efd15539d09bf9bedb7db
 +    return std::make_unique<WindowMemoryTransfer>(*this, plan);
 +}
 +
-+std::vector<std::uint32_t> ProgramImpl::memory_context_pages(const PreparedPromptData& prompt) const {
++std::vector<std::uint32_t> ProgramImpl::memory_context_pages(const PreparedPromptData& prompt, std::uint32_t maximum_frontier) const {
 +    std::vector<std::uint32_t> pages;
 +    for (const auto& item : prompt.vision_items) {
 +        if (item.modality != PromptModality::Image) {
@@ -6275,10 +6280,15 @@ index 0000000000000000000000000000000000000000..172073c4981efd15539d09bf9bedb7db
 +    }
 +    std::sort(pages.begin(), pages.end());
 +    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
++    // MTP maps its fixed verification/draft width even in the final output
++    // round. Dense admission must include those scratch rows, not just F.
++    const auto lookahead = backend_kv_pages ? std::max(draft_window, ngram_draft_window) + draft_window : 0U;
++    const auto resident_limit = kvmem_window_tokens > lookahead ? kvmem_window_tokens - lookahead : 0U;
 +    try {
 +        return detail::memory_context_pages(prompt.token_ids.size(), prompt.memory_instructions,
 +            prompt.memory_active_users, std::move(pages), kvmem_options.sink_blocks(),
-+            kvmem_options.recent_blocks(), kvmem_options.selected_tokens / page_tokens);
++            kvmem_options.recent_blocks(), kvmem_options.selected_tokens / page_tokens, maximum_frontier,
++            resident_limit);
 +    } catch (const std::length_error& error) {
 +        throw RequestError(RequestErrorKind::ContextLengthExceeded, error.what());
 +    }
@@ -6364,7 +6374,9 @@ index 0000000000000000000000000000000000000000..172073c4981efd15539d09bf9bedb7db
 +    if (force_selection || compact_position(sequence, end) > kvmem_window_tokens) {
 +        auto backend = std::make_shared<WindowMemoryBackend>(*this, sequence, end);
 +        const auto count = kv_pages_for_tokens(begin);
-+        const auto keep = std::min(count, kvmem_options.selected_tokens / page_tokens);
++        // Rebuilding a fully resident checkpoint does not need a sparse B/R split.
++        const bool full_restore = force_selection && begin == end && end <= kvmem_window_tokens;
++        const auto keep = full_restore ? count : std::min(count, kvmem_options.selected_tokens / page_tokens);
 +        auto& state = sequence.window;
 +        auto mandatory = memory_window_mandatory_pages(begin, state.context_pages,
 +            kvmem_options.sink_blocks(), kvmem_options.recent_blocks());
@@ -6373,7 +6385,7 @@ index 0000000000000000000000000000000000000000..172073c4981efd15539d09bf9bedb7db
 +        const bool query_complete = state.query_tokens != 0 &&
 +            (state.query_replayed || begin >= state.query_end) &&
 +            state.query_tokens == state.query_end - state.query_begin;
-+        if (query_complete) {
++        if (query_complete && !full_restore) {
 +            if (!state.selector || state.statistics_frontier != begin ||
 +                state.selector->total_tokens() != begin) {
 +                throw std::logic_error("KVMem retrieval index does not match the evaluated prefix");
@@ -6405,8 +6417,8 @@ index 0000000000000000000000000000000000000000..172073c4981efd15539d09bf9bedb7db
 +            }
 +            std::sort(selected.begin(), selected.end());
 +        }
-+        const kvmem::MemoryBudget budget{kvmem_options.selected_tokens, kvmem_options.reserve_tokens,
-+            kvmem_window_tokens, memory_retained_budget};
++        const kvmem::MemoryBudget budget{full_restore ? kvmem_window_tokens : kvmem_options.selected_tokens,
++            full_restore ? 0U : kvmem_options.reserve_tokens, kvmem_window_tokens, memory_retained_budget};
 +        if (memory_io) {
 +            auto session = std::make_unique<kvmem::MemorySession>(backend);
 +            session->prepare(backend->stamp(), selected, mandatory, budget);
@@ -7200,10 +7212,10 @@ index 0000000000000000000000000000000000000000..172073c4981efd15539d09bf9bedb7db
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/memory_context.h b/src/models/qwen3_5/program/storage/memory_context.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..52b92f4e7645b3cef1287a8188e21c187628a0d1
+index 0000000000000000000000000000000000000000..9b999cd603da52941e7ac73b9b7364a6260cc8be
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/memory_context.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,63 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -7219,7 +7231,12 @@ index 0000000000000000000000000000000000000000..52b92f4e7645b3cef1287a8188e21c18
 +std::vector<std::uint32_t> memory_context_pages(
 +    std::size_t prompt_tokens, const Spans& instructions, const Spans& active_users,
 +    std::vector<std::uint32_t> image_pages, std::uint32_t sink_pages,
-+    std::uint32_t recent_pages, std::uint32_t selection_pages) {
++    std::uint32_t recent_pages, std::uint32_t selection_pages,
++    std::size_t maximum_frontier = 0, std::uint32_t resident_window_tokens = 0) {
++    if (maximum_frontier == 0) maximum_frontier = prompt_tokens;
++    if (maximum_frontier < prompt_tokens)
++        throw std::invalid_argument("KVMem maximum frontier precedes the prompt");
++    const auto maximum_pages = (std::uint64_t(maximum_frontier) + 63) / 64;
 +    const auto append = [&](const auto& span, bool bounded) {
 +        if (!span.count || span.begin > prompt_tokens || span.count > prompt_tokens - span.begin)
 +            throw std::invalid_argument("KVMem context span is outside the prepared prompt");
@@ -7230,12 +7247,20 @@ index 0000000000000000000000000000000000000000..52b92f4e7645b3cef1287a8188e21c18
 +    };
 +    for (const auto& span : instructions) append(span, false);
 +    for (const auto& span : active_users) append(span, true);
-+    for (std::uint32_t id = 0; id < std::min<std::size_t>(sink_pages, (prompt_tokens + 63) / 64); ++id)
++    for (std::uint32_t id = 0; id < std::min<std::uint64_t>(sink_pages, maximum_pages); ++id)
 +        image_pages.push_back(id);
 +    std::sort(image_pages.begin(), image_pages.end());
 +    image_pages.erase(std::unique(image_pages.begin(), image_pages.end()), image_pages.end());
-+    // The rolling tail will eventually be disjoint during long generation.
-+    if (image_pages.size() > selection_pages || recent_pages > selection_pages - image_pages.size())
++    // For F computed pages and R recent pages, the required union is
++    // pins before max(0,F-R), plus min(F,R) tail pages. Its size is monotonic
++    // in F, so the admitted final frontier bounds every earlier rolling view.
++    const auto tail_pages = std::min<std::uint64_t>(recent_pages, maximum_pages);
++    const auto older_pins = std::lower_bound(image_pages.begin(), image_pages.end(),
++        maximum_pages - tail_pages) - image_pages.begin();
++    // A request that never exceeds the physical B+R window needs no sparse
++    // selection. Once it can overflow, all mandatory rows must fit B.
++    const auto budget = maximum_frontier <= resident_window_tokens ? (std::uint64_t(resident_window_tokens) + 63) / 64 : selection_pages;
++    if (static_cast<std::uint64_t>(older_pins) + tail_pages > budget)
 +        throw std::length_error("KVMem selection budget cannot retain instructions, active User tails, images and recent pages");
 +    return image_pages;
 +}
@@ -14519,7 +14544,7 @@ index 08e0238a5e4cd2356e2a8cb278cbd61a4daacd2e..46a9d98e11fad72c07b64c6d306be868
              while (first < want.size() && first < got.size() && want[first] == got[first]) { ++first; }
              std::cerr << "  first difference at token " << first << '\n';
 diff --git a/tests/models/qwen3_5/test_frontend.cpp b/tests/models/qwen3_5/test_frontend.cpp
-index f5589293e7692d3686cde53909ad736c508bb598..89deb8e48cac5a06b3ee1e509618b7f459e83760 100644
+index f5589293e7692d3686cde53909ad736c508bb598..c87bcb23f82becc554ea10f4c4f2da5d50cce9a9 100644
 --- a/tests/models/qwen3_5/test_frontend.cpp
 +++ b/tests/models/qwen3_5/test_frontend.cpp
 @@ -349,7 +349,7 @@ ninfer::PromptInput image_input() {
@@ -14600,7 +14625,7 @@ index f5589293e7692d3686cde53909ad736c508bb598..89deb8e48cac5a06b3ee1e509618b7f4
                   "request-pinned media payload did not survive its Frontend cache owner");
  }
  
-@@ -3027,6 +3066,124 @@ int test_media_preparation_cancellation() {
+@@ -3027,6 +3066,164 @@ int test_media_preparation_cancellation() {
      return check(false, "cancelled media preparation completed successfully");
  }
  
@@ -14695,6 +14720,46 @@ index f5589293e7692d3686cde53909ad736c508bb598..89deb8e48cac5a06b3ee1e509618b7f4
 +    return failures;
 +}
 +
++
++int test_memory_control_merged_newlines() {
++    auto source = resources("{% for m in messages %}{{'<|im_start|>' + m.role + '\\n' + m.content + '<|im_end|>\\n\\n'}}{% endfor %}{{'<|im_start|>assistant\\n'}}");
++    auto tokenizer_json = nlohmann::json::parse(source.tokenizer_json);
++    auto config = nlohmann::json::parse(source.tokenizer_config_json);
++    auto& tokens = tokenizer_json["added_tokens"];
++    tokens.erase(std::remove_if(tokens.begin(), tokens.end(), [](const auto& token) {
++        return token["content"] == "\n";
++    }), tokens.end());
++    config["added_tokens_decoder"].erase("32");
++    const auto newline = byte_level_symbol('\n');
++    tokenizer_json["model"]["vocab"][newline + newline] = 2100;
++    tokenizer_json["model"]["merges"].push_back(nlohmann::json::array({newline, newline}));
++    source.tokenizer_json = tokenizer_json.dump(); source.tokenizer_config_json = config.dump();
++    fi::Tokenizer tokenizer({source.tokenizer_json, source.tokenizer_config_json, source.generation_config_json});
++    auto rendered = fi::CompiledChatTemplate::resolve(source.chat_template_jinja).render({
++        chat_message(ninfer::ChatRole::System, "control"), chat_message(ninfer::ChatRole::User, "task")});
++    const auto encoded = fi::encode_rendered_chat(tokenizer, rendered);
++    int failures = check(encoded.memory_instructions.size() == 1 &&
++        encoded.memory_active_users.size() == 1 &&
++        std::count(encoded.input_ids.begin(),encoded.input_ids.end(),2100) == 2,
++        "merged formatting newline invalidated a complete instruction block");
++    rendered.memory_instructions.clear(); rendered.memory_active_users.clear();
++    failures += check(encoded.input_ids == fi::encode_rendered_chat(tokenizer, rendered).input_ids,
++        "optional memory metadata changed merged-newline tokenization");
++    const auto frontend = make_frontend(source, false);
++    ninfer::PromptInput input;
++    for (auto role : {ninfer::ChatRole::System,ninfer::ChatRole::User}) {
++        ninfer::ChatMessage message; message.role = role;
++        message.parts.push_back({.kind=ninfer::MessagePartKind::Text,
++            .text=role == ninfer::ChatRole::System ? "control" : "task"});
++        input.messages.push_back(std::move(message));
++    }
++    const auto prepared = frontend.prepare(input);
++    failures += check(FrontendFactory::inspect(prepared).token_ids == encoded.input_ids &&
++        frontend.count_tokens(input) == encoded.input_ids.size(),
++        "Frontend prepare/count rejected the legal merged-newline template");
++    return failures;
++}
++
 +int test_memory_context_tokenization_invariance() {
 +    const auto source = resources();
 +    fi::Tokenizer tokenizer({source.tokenizer_json, source.tokenizer_config_json, source.generation_config_json});
@@ -14725,7 +14790,7 @@ index f5589293e7692d3686cde53909ad736c508bb598..89deb8e48cac5a06b3ee1e509618b7f4
  int test_ngram_proposal_only_sources() {
      ninfer::models::qwen3_5::FrontendOptions options;
      options.vision_enabled        = false;
-@@ -3224,11 +3381,33 @@ int test_forced_tool_call(const Frontend& frontend) {
+@@ -3224,11 +3421,35 @@ int test_forced_tool_call(const Frontend& frontend) {
      return failures;
  }
  
@@ -14739,6 +14804,7 @@ index f5589293e7692d3686cde53909ad736c508bb598..89deb8e48cac5a06b3ee1e509618b7f4
 +        failures += test_memory_query_provenance();
 +        failures += test_memory_active_task_provenance();
 +        failures += test_memory_context_tokenization_invariance();
++        failures += test_memory_control_merged_newlines();
 +        failures += test_prompt_graft();
 +        failures += test_direct_graft_context_cache();
 +        failures += test_rendered_special_tokens();
@@ -14757,10 +14823,11 @@ index f5589293e7692d3686cde53909ad736c508bb598..89deb8e48cac5a06b3ee1e509618b7f4
 +    failures += test_memory_query_provenance();
 +    failures += test_memory_active_task_provenance();
 +    failures += test_memory_context_tokenization_invariance();
++        failures += test_memory_control_merged_newlines();
      failures += test_ngram_proposal_only_sources();
      failures += test_tokenizer_config_merge();
      failures += test_bpe_merge_order();
-@@ -3286,4 +3465,8 @@ int main() {
+@@ -3286,4 +3507,8 @@ int main() {
      failures += test_invalid_media_classification();
      failures += test_disabled_vision();
      return failures == 0 ? 0 : 1;
@@ -14836,10 +14903,10 @@ index 5210c7c6a53926cd360203f67fed844577f4670f..94a61a649b1211d00ecee30b27af2734
          std::cout << "model config, binding, resources and Use checks passed\n";
 diff --git a/tests/models/qwen3_5/test_memory_context.cpp b/tests/models/qwen3_5/test_memory_context.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..aba583470152197cb4f0772e262864bced1a80b4
+index 0000000000000000000000000000000000000000..d0c7e387b95b70d6e7bb31fcaa31c8133df18317
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_memory_context.cpp
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,143 @@
 +#include "models/qwen3_5/program/storage/memory_context.h"
 +#include "kvmem/kvmem_store.hpp"
 +
@@ -14910,9 +14977,74 @@ index 0000000000000000000000000000000000000000..aba583470152197cb4f0772e262864bc
 +    catch (const std::invalid_argument&) { rejected = true; }
 +    check(rejected, "out-of-prompt provenance was accepted");
 +}
++
++void test_admitted_frontier_charge() {
++    const auto small = memory_context_pages(256, std::vector<Span>{{0,192}},
++        std::vector<Span>{{192,64}}, {}, 2, 13, 16, 256);
++    check(small == std::vector<std::uint32_t>({0,1,2,3}),
++          "fully resident short request was rejected by a disjoint-tail estimate");
++    bool rejected = false;
++    try { (void)memory_context_pages(256, std::vector<Span>{{0,192}},
++        std::vector<Span>{{192,64}}, {}, 2, 13, 16, 4096); }
++    catch (const std::length_error&) { rejected = true; }
++    check(rejected, "a genuinely disjoint long-generation union exceeded B");
++
++    const auto resident = memory_context_pages(18 * 64, std::vector<Span>{{0,17 * 64}},
++        std::vector<Span>{{17 * 64,64}}, {}, 2, 13, 16, 20 * 64, 20 * 64);
++    check(resident.size() == 18, "B<F<=B+R fully resident request was rejected");
++    rejected = false;
++    try { (void)memory_context_pages(18 * 64, std::vector<Span>{{0,17 * 64}},
++        std::vector<Span>{{17 * 64,64}}, {}, 2, 13, 16, 20 * 64 + 1, 20 * 64); }
++    catch (const std::length_error&) { rejected = true; }
++    check(rejected, "first overflow page did not enforce B");
++
++    // Fixed MTP mapping width still needs room when the output budget is one.
++    const auto mtp_resident_limit = 1280U - (15U + 15U);
++    (void)memory_context_pages(1220, std::vector<Span>{{0,1200}},
++        std::vector<Span>{{1200,20}}, {}, 2, 13, 16, 1250, mtp_resident_limit);
++    rejected = false;
++    try { (void)memory_context_pages(1220, std::vector<Span>{{0,1200}},
++        std::vector<Span>{{1200,20}}, {}, 2, 13, 16, 1251, mtp_resident_limit); }
++    catch (const std::length_error&) { rejected = true; }
++    check(rejected, "target fits W but fixed MTP scratch overflows W without fitting B");
++
++    // Independent brute-force membership oracle, including sink pages that are
++    // generated after a short prompt. Check every earlier frontier, not only F.
++    std::uint32_t random = 0x913CA1U;
++    const auto next = [&] { random ^= random << 13; random ^= random >> 17; random ^= random << 5; return random; };
++    for (unsigned trial = 0; trial < 1000; ++trial) {
++        const std::uint32_t prompt_pages = 1 + next() % 40;
++        const std::uint32_t final_pages = prompt_pages + next() % 40;
++        const std::uint32_t sink = next() % 10, recent = next() % 24, budget = 1 + next() % 65;
++        std::vector<Span> controls;
++        std::vector<std::uint32_t> images;
++        for (unsigned i = 0; i < 5; ++i) {
++            controls.push_back({64U * (next() % prompt_pages), 1});
++            images.push_back(next() % prompt_pages);
++        }
++        std::size_t peak = 0;
++        for (std::uint32_t f = 0; f <= final_pages; ++f) {
++            std::size_t count = 0;
++            for (std::uint32_t id = 0; id < f; ++id) {
++                const bool control = std::any_of(controls.begin(), controls.end(),
++                    [&](auto span) { return span.begin / 64 == id; });
++                if (id < sink || control || std::find(images.begin(),images.end(),id) != images.end() ||
++                    (f - id <= recent)) ++count;
++            }
++            peak = std::max(peak, count);
++        }
++        bool accepted = true;
++        try { (void)memory_context_pages(prompt_pages * 64, controls, std::vector<Span>{},
++            images, sink, recent, budget, final_pages * 64); }
++        catch (const std::length_error&) { accepted = false; }
++        check(accepted == (peak <= budget), "final-frontier charge disagrees with independent rolling union");
++    }
++}
++
 +} // namespace
 +
 +int main() {
++    test_admitted_frontier_charge();
 +    test_long_history_and_reselection();
 +    test_bounded_charge_and_request_isolation();
 +    if (!failures) std::cout << "memory_context: PASS\n";
