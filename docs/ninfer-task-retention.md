@@ -1,7 +1,7 @@
 # NInfer sparse task retention
 Here B means the selected-token budget, R means the generation reserve, and
 W=B+R is the physical window. The rolling recent-tail setting is independent
-of R (for the long replay, R=4096 but recent=5120).
+of R (for example, R=4096 and recent=5120 are independent settings).
 
 
 The NInfer integration previously required sink, image and recent pages. A short
@@ -19,10 +19,10 @@ active User ranges. No message or model token is removed or rewritten.
 | Each real User in the open tool chain | Last 512 tokens; complete when shorter |
 | Images | Existing complete-image pins |
 | Sink and rolling recent tail | Existing configured page counts |
-| Scoring query | Existing last-real-User policy; separate from these pins |
+| Scoring query | Last eligible real User; explicitly sourced runtime reminders are skipped |
 
-A User here means a provenance-backed User-role input, including runtime
-snapshots; this is not human-versus-clock classification. A non-tool Assistant
+A User pin here means a provenance-backed User-role input, including runtime
+snapshots. Pins do not classify content as human or clock text. A non-tool Assistant
 closes the previous group. Explicit continuation of the
 final Assistant keeps its current group open. User-role tool-response wrappers,
 Tool contents and quoted ChatML do not become task provenance. Unsupported
@@ -50,6 +50,8 @@ forms translate the provenance offsets along with the rest of the prompt.
 |---|---|
 | `backends/ninfer/tests/models/qwen3_5/test_memory_context.cpp` | Synthetic token coordinates/frontiers passed to the production selector: old-history scores win, yet current-task/control and partial-tail pages must remain within 576 pages. The old sink/recent-only control must lose the task. Separately checks an exact 512-token-tail page set, overlap accounting, independently computed request pins, frontier clipping and capacity rejection. This does not run actual prefill/decode or concurrent lanes. |
 | `test_frontend.cpp::test_memory_active_task_provenance` | Old task + completed answer + current task + runtime User + assistant tool call + 20 KB Tool/quoted fake User; decoded active ranges must equal `{CURRENT_TASK, snapshot}`, then a subsequent completed turn must contain only `NEXT_TASK`. |
+| `test_frontend.cpp::test_memory_runtime_query_origin` | Multiple explicitly marked reminders leave the exact query at `CURRENT_TASK`; the same unmarked text remains eligible. Marking preserves tokens, positions, control/User ranges and checkpoint; next task replaces the query and runtime-only input has no trusted query. Invalid typed origins are rejected. |
+| `test_openai_schema.cpp::test_runtime_reminder_origin` | Chat Completions wire origin reaches typed prompt preparation without changing content. Null/unknown/wrong-type values and non-User origins return HTTP 400. |
 | `test_frontend.cpp::test_memory_context_tokenization_invariance` | Text encoded token IDs are identical with/without context boundaries. Expanded-image preparation carries nonempty instruction and one in-bounds User range; this is not an image token-invariance or GPU Vision test. |
 | `test_frontend.cpp::test_prompt_graft` / `test_direct_graft_context_cache` | Query begin and first active User begin move by the graft prefix length; active User range counts agree. |
 
@@ -57,13 +59,29 @@ The Linux host CI prepares and verifies the pinned backend and runs
 `python3 tests/test_ninfer_context_contract.py`. That check compiles the production
 page-selection helper and selector without CUDA or a model. Frontend/media/graft
 checks run in the dedicated `ninfer_qwen3_5_memory_context_frontend_test` target
-(`ninfer_tests ninfer_qwen3_5_frontend_test --memory-context-only`); this runs eight
+(`ninfer_tests ninfer_qwen3_5_frontend_test --memory-context-only`); this runs nine
 frontend functions. The default full `ninfer_qwen3_5_frontend_test` is retained.
 Frontend checks are not implied by the model-free host CI result. Real-model
 execution and any default-suite failure must be reported separately.
 
-This patch does not add DSH-specific clock recognition to NInfer's scoring query,
-change the integration's admitted speculative backends, or establish factual
+Chat Completions supports the optional message field
+`"ninfer_origin": "runtime_reminder"`, lowered to typed `MessageOrigin::RuntimeReminder`.
+It is a caller assertion that a User message came from runtime instrumentation;
+the server never guesses origin from substrings, quoted text or control tokens.
+Only marked reminders are skipped when choosing the scoring query. Without a
+mark, identical text keeps the previous last-User behavior. A runtime-only input
+has no trusted query and uses the existing recency fallback. Invalid field values
+or a non-User role fail explicitly. C++ callers may supply the same typed origin.
+Clients must set it; existing unmarked requests do not acquire the improvement.
+Responses and Anthropic adapters do not support the extension.
+
+This changes neither Jinja input nor model tokens, thinking-history rendering,
+rewrite checkpoints, nor mandatory page ranges. In particular, reminder contents
+remain retained under #115, and complete System/Developer blocks, including rendered
+tool schemas, still consume their
+existing budget. Selecting a different query can change historical pages and
+transfers; no latency or answer-quality improvement is established by span tests.
+It does not change the integration's admitted speculative backends or establish factual
 answer quality. Long User contents outside their protected tail remain ordinary
 retrieval candidates. Full external-tool trajectories require their own harness
 replay and cannot be qualified by these host tests.
@@ -85,5 +103,5 @@ split. The ordinary sparse selection path remains unchanged.
 
 The CUDA container job trusts only the exact checked-out workspace before
 preparing the pinned llama.cpp backend. It does not use a safe.directory wildcard
-or change the engine pin. This addresses the directory-owner preparation failure
-seen in the base workflow as well as the first revision of this PR.
+or change the engine pin. This permits preparation when the container checkout
+and runner use different directory owners.
