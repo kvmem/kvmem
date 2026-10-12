@@ -39,7 +39,7 @@ def fixture(case, marked):
             "max_tokens": 48, "stream": True, "stream_options": {"include_usage": True}}
 
 
-def run(url, name, body, expected):
+def run(url, name, body, expected, finish_expected='stop'):
     started = time.monotonic()
     req = urllib.request.Request(url.rstrip('/') + '/v1/chat/completions',
         json.dumps(body).encode(), headers={"Content-Type": "application/json"})
@@ -61,7 +61,7 @@ def run(url, name, body, expected):
                 content.append(choice.get('delta', {}).get('content', '') or '')
                 finish = choice.get('finish_reason') or finish
     text = ''.join(content)
-    assert done and finish == 'stop', (name, 'incomplete SSE/termination', finish)
+    assert done and finish == finish_expected, (name, 'incomplete SSE/termination', finish)
     assert expected in text and all(f'ORIGIN_{other}' not in text
         for other in ['A', 'B', 'C'] if f'ORIGIN_{other}' != expected), (name, 'task isolation', text)
     timings = next((chunk['timings'] for chunk in reversed(chunks) if 'timings' in chunk), {})
@@ -77,6 +77,7 @@ def main():
     parser.add_argument('--server', required=True)
     parser.add_argument('--output')
     parser.add_argument('--concurrency-only', action='store_true')
+    parser.add_argument('--long-concurrency', action='store_true')
     args = parser.parse_args()
     results = []
     unmarked, marked = fixture('A', False), fixture('A', True)
@@ -94,8 +95,16 @@ def main():
     # Diagnostics must independently confirm query rejection/reconstruction; cache_n alone
     # cannot prove the internal query used by GPU attention.
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(run, args.server, f'concurrent_{case}', fixture(case, True), f'ORIGIN_{case}')
-                   for case in ['B', 'C']]
+        futures = []
+        for case in ['B', 'C']:
+            body = fixture(case, True)
+            if args.long_concurrency:
+                body['messages'][-4]['content'] = (
+                    f'For the current task, repeat ORIGIN_{case} exactly 500 times, '
+                    'separated by spaces. Do not abbreviate or add other words.')
+                body['max_tokens'] = 512
+            futures.append(pool.submit(run, args.server, f'concurrent_{case}', body,
+                f'ORIGIN_{case}', 'length' if args.long_concurrency else 'stop'))
         for future in futures:
             result = future.result()
             results.append(result)
