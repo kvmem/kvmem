@@ -123,3 +123,17 @@ destroy that legitimate mismatch string. The regression tests run the real gramm
 and decoder in 1-byte, 7-byte and whole-call feed chunks, checking canonical empty
 values followed by another argument and preservation of those literal bytes.
 No single-LF empty repair is enabled; consumer schema validation still matters.
+
+The constrained decoder also reports `marker_seen` and accumulates omitted-empty
+and top-level type-mismatch normalization occurrences from completed, published
+calls. Partial or unread calls do not contribute those counts. Repeated parameters
+count each normalization occurrence even if a later value replaces it. These are
+diagnostics, not complete schema validation, and parameter interpretation is
+unchanged. `test_tool_diagnostics.cpp` covers 18 scenarios in three feed sizes,
+including complete/partial and parallel calls, literal tags, strict codecs,
+Automatic and forced continuation.
+
+Chat schema tests follow the baseline's documented tool-selection contract:
+selection is enforced during execution while prompt declarations remain stable;
+required/named choices retain thinking and strict tool schemas remain strict.
+Updating these older expectations changes no production tool-selection code.

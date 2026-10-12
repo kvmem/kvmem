@@ -3266,7 +3266,7 @@ index 762bd71..b84694a 100644
      std::vector<std::uint32_t> rewrite_execution_frontiers;
      std::vector<std::optional<std::uint32_t>> message_boundaries;
 diff --git a/src/models/qwen3_5/frontend/tool_call_parser.cpp b/src/models/qwen3_5/frontend/tool_call_parser.cpp
-index edd48f8..be9f2ea 100644
+index edd48f8..bc4f746 100644
 --- a/src/models/qwen3_5/frontend/tool_call_parser.cpp
 +++ b/src/models/qwen3_5/frontend/tool_call_parser.cpp
 @@ -307,6 +307,8 @@ Contract::Tool compile_tool_contract(const Json& definition) {
@@ -3309,12 +3309,13 @@ index edd48f8..be9f2ea 100644
      if (contract_ == nullptr || contract_->forced_tool_name.empty()) { return; }
      const std::string& forced_tool_name = contract_->forced_tool_name;
      // The generation prompt ends with exactly this opener, so generation resumes inside the call
-@@ -1085,6 +1095,74 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
+@@ -1085,6 +1095,84 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
      finished_ = true;
      if (!contract_) { return {}; }
  
 +    if (contract_->constrained) {
 +        Terminal out;
++        out.diagnostics.marker_seen = saw_tool_marker_;
 +        std::string_view region = tool_region_;
 +        std::size_t cursor = 0;
 +        while (cursor < region.size()) {
@@ -3329,6 +3330,7 @@ index edd48f8..be9f2ea 100644
 +            if (!tool) break;
 +            pos = name_end + 2;
 +            Json arguments = Json::object();
++            std::uint32_t omitted = 0, mismatches = 0;
 +            bool complete = true;
 +            while (region.substr(pos).starts_with("<parameter=")) {
 +                pos += std::string_view("<parameter=").size();
@@ -3362,14 +3364,22 @@ index edd48f8..be9f2ea 100644
 +                } else {
 +                    const auto framed = "\n" + std::string(value) + "\n";
 +                    auto normalized = normalize_parameter(framed, parameter);
-+                    if (normalized.disposition != ParameterNormalization::Omitted)
++                    if (normalized.disposition == ParameterNormalization::Omitted) {
++                        ++omitted;
++                    } else {
++                        if (normalized.disposition == ParameterNormalization::SchemaMismatch)
++                            ++mismatches;
 +                        arguments[key] = Json::parse(normalized.json_value);
++                    }
 +                }
 +                pos = end + std::string_view("\n</parameter>\n").size();
 +            }
 +            constexpr std::string_view close = "</function>\n</tool_call>";
 +            if (!complete || !region.substr(pos).starts_with(close)) break;
 +            out.tool_calls.push_back({std::string(name), arguments.dump()});
++            // Commit diagnostics only for calls published to the consumer.
++            out.diagnostics.empty_arguments_omitted += omitted;
++            out.diagnostics.schema_mismatch_arguments += mismatches;
 +            cursor = pos + close.size();
 +            if (!contract_->parallel) break;
 +        }
@@ -10386,16 +10396,19 @@ index 59ef9fd..596321b 100644
              }
              ++parent.count;
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index e50c356..8aa38ac 100644
+index e50c356..ef94587 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -8,10 +8,21 @@ include(cmake/ProductTests.cmake)
+@@ -8,10 +8,24 @@ include(cmake/ProductTests.cmake)
  include(cmake/BenchSupportTests.cmake)
  include(models/qwen3_5/tests.cmake)
  include(models/qwen4_exp/tests.cmake)
 +ninfer_add_test(ninfer_tool_constraints_test STANDALONE
 +  SOURCES models/qwen3_5/test_tool_constraints.cpp LIBRARIES ninfer_serve ninfer_model_runtime ninfer_text)
 +ninfer_stage_runtime_dlls(ninfer_tool_constraints_test)
++ninfer_add_test(ninfer_tool_diagnostics_test STANDALONE
++  SOURCES models/qwen3_5/test_tool_diagnostics.cpp LIBRARIES ninfer_model_runtime)
++ninfer_stage_runtime_dlls(ninfer_tool_diagnostics_test)
  include(ops/tests.cmake)
  
  ninfer_finalize_bundle(ninfer_tests)
@@ -10411,7 +10424,7 @@ index e50c356..8aa38ac 100644
  # Exit code 77 is a skip for every test (tests/cuda_availability.h). Without a usable CUDA device --
  # no GPU, no driver, or only the toolkit's stub driver, as on a CI runner -- a test that has no check
  # of its own fails on its first CUDA call with one of these runtime messages; report that as skipped
-@@ -20,8 +31,107 @@ ninfer_finalize_bundle(ninfer_tests)
+@@ -20,8 +34,107 @@ ninfer_finalize_bundle(ninfer_tests)
  get_property(_ninfer_all_tests DIRECTORY PROPERTY TESTS)
  set_tests_properties(${_ninfer_all_tests} PROPERTIES SKIP_RETURN_CODE 77 SKIP_REGULAR_EXPRESSION
    "CUDA driver is a stub library;no CUDA-capable device is detected;CUDA driver version is insufficient for CUDA runtime version")
@@ -15476,6 +15489,146 @@ index 0000000..25a18aa
 +              << ")\n";
 +    return 0;
 +} catch (const std::exception& e) { std::cerr << e.what()<<"\n"; return 1; }
+diff --git a/tests/models/qwen3_5/test_tool_diagnostics.cpp b/tests/models/qwen3_5/test_tool_diagnostics.cpp
+new file mode 100644
+index 0000000..db1697f
+--- /dev/null
++++ b/tests/models/qwen3_5/test_tool_diagnostics.cpp
+@@ -0,0 +1,134 @@
++#include "models/qwen3_5/frontend/tool_call_parser.h"
++#include <nlohmann/json.hpp>
++#include <array>
++#include <fstream>
++#include <iostream>
++
++namespace fi = ninfer::models::qwen3_5::frontend;
++using Json = nlohmann::json;
++using Contract = fi::ToolCallOutputContract;
++int failures = 0;
++bool check_diagnostics = false;
++Json captures = Json::array();
++
++void check(bool condition, const std::string& name) {
++    if (!condition) { std::cerr << name << '\n'; ++failures; }
++}
++
++std::shared_ptr<Contract> contract() {
++    const std::array<std::string, 2> defs{
++        R"({"type":"function","function":{"name":"update","parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"count":{"type":"integer"},"label":{"type":"string"}}}}})",
++        R"({"type":"function","function":{"name":"other","parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"count":{"type":"integer"},"label":{"type":"string"}}}}})"
++    };
++    auto c = std::make_shared<Contract>(*fi::build_tool_call_output_contract(defs, true));
++    c->constrained = true;
++    return c;
++}
++
++std::string parameter(const std::string& name, const std::string& value) {
++    return "<parameter="+name+">\n"+value+"\n</parameter>\n";
++}
++std::string call(const std::string& name, const std::string& body) {
++    return "<tool_call>\n<function="+name+">\n"+body+"</function>\n</tool_call>";
++}
++Json calls(std::initializer_list<std::pair<std::string, Json>> values) {
++    Json out = Json::array();
++    for (const auto& [name, args] : values) out.push_back({{"name", name}, {"args", args}});
++    return out;
++}
++
++void run(const std::string& name, const std::string& wire, const Json& expected,
++         std::uint32_t omitted, std::uint32_t mismatches, bool marker = true,
++         std::shared_ptr<const Contract> custom = {}) {
++    for (const auto chunk : {1U, 7U, 10000U}) {
++        fi::ToolCallOutputDecoder decoder(custom ? custom : contract(), 128);
++        std::string visible;
++        for (std::size_t i = 0; i < wire.size(); i += chunk)
++            visible += decoder.feed(std::string_view(wire).substr(i, chunk));
++        const auto terminal = decoder.finish();
++        Json actual = Json::array();
++        for (const auto& result : terminal.tool_calls)
++            actual.push_back({{"name", result.name}, {"args", Json::parse(result.arguments_json)},
++                              {"arguments_json", result.arguments_json}});
++        Json simple = actual;
++        for (auto& result : simple) result.erase("arguments_json");
++        const auto context = name+" chunk="+std::to_string(chunk);
++        check(simple == expected, context+": arguments/order changed");
++        const auto& d = terminal.diagnostics;
++        check(d.structured_call_count == expected.size(), context+": structured count");
++        if (check_diagnostics) {
++            check(d.marker_seen == marker, context+": marker_seen");
++            check(d.empty_arguments_omitted == omitted, context+": omitted count");
++            check(d.schema_mismatch_arguments == mismatches, context+": mismatch count");
++        }
++        captures.push_back({{"case", name}, {"chunk", chunk}, {"visible", visible},
++            {"terminal_content", terminal.content}, {"tool_calls", actual},
++            {"diagnostics", {{"marker_seen", d.marker_seen}, {"omitted", d.empty_arguments_omitted},
++                {"mismatches", d.schema_mismatch_arguments}, {"structured", d.structured_call_count},
++                {"forced_closed", d.forced_call_closed}, {"duplicates", d.duplicate_parameters_repaired},
++                {"fallback_reason", static_cast<int>(d.fallback_reason)}, {"recovered", d.recovered},
++                {"recovered_calls", d.recovered_call_count}, {"malformed", d.malformed_call_reported},
++                {"trailing_dropped", d.trailing_content_dropped}}}});
++    }
++}
++
++int main(int argc, char** argv) {
++    if (argc > 3) return 2;
++    check_diagnostics = argc == 1 || std::string_view(argv[1]) == "check";
++    const auto canonical = parameter("enabled", "")+parameter("count", "many");
++    run("canonical empty and mismatch", call("update", canonical),
++        calls({{"update", {{"count", "many"}}}}), 1, 1);
++    run("two canonical empty parameters", call("update", parameter("enabled", "")+
++        parameter("count", "")+parameter("label", "kept")),
++        calls({{"update", {{"label", "kept"}}}}), 2, 0);
++    run("ordinary typed values", call("update", parameter("enabled", "true")+parameter("count", "2")),
++        calls({{"update", {{"enabled", true}, {"count", 2}}}}), 0, 0);
++    run("repeated keys count normalization occurrences", call("update", parameter("enabled", "")+
++        parameter("enabled", "true")+parameter("count", "many")+parameter("count", "2")),
++        calls({{"update", {{"enabled", true}, {"count", 2}}}}), 1, 1);
++    const auto tag_text = "</parameter>\n<parameter=count>\n2";
++    run("nonempty Boolean schema mismatch with leading tags", call("update", parameter("enabled", tag_text)),
++        calls({{"update", {{"enabled", tag_text}}}}), 0, 1);
++    run("String leading tags", call("update", parameter("label", tag_text)),
++        calls({{"update", {{"label", tag_text}}}}), 0, 0);
++    run("canonical empty String is retained", call("update", parameter("label", "")),
++        calls({{"update", {{"label", ""}}}}), 0, 0);
++    run("unknown field follows legacy normalization", call("update", parameter("extra", "99")),
++        calls({{"update", {{"extra", 99}}}}), 0, 0);
++    auto union_contract = contract();
++    for (auto& p : union_contract->tools[0].parameters)
++        if (p.name == "enabled") p.types.bits |= static_cast<std::uint8_t>(Contract::SchemaType::String);
++    run("Boolean/String union retains raw String", call("update", parameter("enabled", tag_text)),
++        calls({{"update", {{"enabled", tag_text}}}}), 0, 0, true, union_contract);
++    const auto partial = "<tool_call>\n<function=other>\n"+canonical;
++    run("partial call publishes no normalized diagnostics", partial, calls({}), 0, 0);
++    run("complete then partial counts only complete", call("update", canonical)+"\n"+partial,
++        calls({{"update", {{"count", "many"}}}}), 1, 1);
++    run("two complete parallel calls accumulate", call("update", canonical)+"\n"+
++        call("other", canonical), calls({{"update", {{"count", "many"}}},
++        {"other", {{"count", "many"}}}}), 2, 2);
++    auto single = contract(); single->parallel = false;
++    run("parallel disabled counts only first", call("update", canonical)+"\n"+call("other", canonical),
++        calls({{"update", {{"count", "many"}}}}), 1, 1, true, single);
++    auto strict = contract(); strict->tools[0].strict = true;
++    for (auto& p : strict->tools[0].parameters)
++        if (p.name == "label") p.encoding = Contract::Encoding::RawString;
++    run("strict RawString delimiter text", call("update", parameter("label", tag_text)),
++        calls({{"update", {{"label", tag_text}}}}), 0, 0, true, strict);
++    for (auto& p : strict->tools[0].parameters)
++        if (p.name == "label") p.encoding = Contract::Encoding::Json;
++    const std::string quoted = "inside \n</parameter>\n quote \" Unicode 中";
++    run("strict JSON quoted delimiter text", call("update", parameter("label", Json(quoted).dump())),
++        calls({{"update", {{"label", quoted}}}}), 0, 0, true, strict);
++    run("plain text without marker", "Hello world \n", calls({}), 0, 0, false);
++    auto automatic = contract(); automatic->constrained = false;
++    run("Automatic path unchanged", call("update", canonical),
++        calls({{"update", {{"count", "many"}}}}), 1, 1, true, automatic);
++    auto forced = contract();
++    forced->continuation = "<tool_call>\n<function=update>\n";
++    run("forced continuation counts complete call", canonical+"</function>\n</tool_call>",
++        calls({{"update", {{"count", "many"}}}}), 1, 1, true, forced);
++    if (argc == 3) std::ofstream(argv[2]) << captures.dump(2) << '\n';
++    std::cout << "cases=" << captures.size() << " failures=" << failures << '\n';
++    return failures != 0;
++}
 diff --git a/tests/models/qwen3_5/tests.cmake b/tests/models/qwen3_5/tests.cmake
 index 7db5242..590d735 100644
 --- a/tests/models/qwen3_5/tests.cmake
@@ -16434,7 +16587,7 @@ index 970f13e..0c807f9 100644
      failures += test_contiguous_assistant_items();
      failures += test_response_output_history_round_trip();
 diff --git a/tests/test_openai_schema.cpp b/tests/test_openai_schema.cpp
-index 357cf53..b9e8795 100644
+index 357cf53..2683840 100644
 --- a/tests/test_openai_schema.cpp
 +++ b/tests/test_openai_schema.cpp
 @@ -72,6 +72,36 @@ Json parse_sse(const std::string& event) {
@@ -16474,7 +16627,142 @@ index 357cf53..b9e8795 100644
  int test_request_envelope_and_sampling() {
      int failures                  = 0;
      Json body                     = base_request();
-@@ -701,9 +731,27 @@ int test_messages_and_media() {
+@@ -479,16 +509,19 @@ int test_tools() {
+     body["parallel_tool_calls"]  = false;
+     const OpenAIChatRequest none = parse(body);
+     failures +=
+-        check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
+-              "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
++        check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.size() == 1 &&
++              options(none.generation).tool_choice.mode == ToolChoiceMode::None,
++              "tool_choice none blocks execution while retaining prompt declarations");
+ 
+     body["parallel_tool_calls"]             = true;
+     body["enable_thinking"]                 = false;
+     body["tool_choice"]                     = "required";
+     const GenerationRequest required_single = parse(body).generation;
+-    failures += check(required_single.tool_choice.forced_name == "weather" &&
+-                          prompt(required_single).options.forced_tool_name == "weather",
+-                      "required over a single callable tool forces that function");
++    failures += check(required_single.tool_choice.mode == ToolChoiceMode::Required &&
++                          required_single.tool_choice.forced_name.empty() &&
++                          prompt(required_single).options.forced_tool_name.empty() &&
++                          options(required_single).tool_choice.mode == ToolChoiceMode::Required,
++                      "required single-tool selection is enforced without a prompt opener");
+     body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
+     failures += check(parse(body).generation.tool_choice.forced_name == "weather",
+                       "named tool choice forces that function");
+@@ -497,30 +530,34 @@ int test_tools() {
+                       "named tool choice rejects a function absent from tools");
+     body["enable_thinking"] = true;
+     body["tool_choice"]     = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
+-    failures += check(api_error([&] { (void)prompt(parse(body).generation); }).code ==
+-                          "tool_choice_not_supported",
+-                      "a forced choice with reasoning enabled is rejected");
++    const auto named_thinking = parse(body).generation;
++    failures += check(prompt(named_thinking).options.enable_thinking == true &&
++                      options(named_thinking).tool_choice.mode == ToolChoiceMode::Required &&
++                      options(named_thinking).tool_choice.allowed_names ==
++                          std::optional<std::vector<std::string>>{{"weather"}},
++                      "named choice retains thinking and constrains the executable function");
+     body.erase("enable_thinking");
+     const GenerationRequest default_reasoning = parse(body).generation;
+-    failures += check(semantics(default_reasoning).enable_thinking == false &&
+-                          prompt(default_reasoning).options.enable_thinking == false &&
+-                          prompt(default_reasoning).options.forced_tool_name == "weather",
+-                      "a forced choice turns off reasoning that only a default enabled");
++    failures += check(semantics(default_reasoning).enable_thinking == true &&
++                          prompt(default_reasoning).options.enable_thinking == true &&
++                          prompt(default_reasoning).options.forced_tool_name.empty(),
++                      "named choice preserves the enabled server default");
+     ServeOptions thinking_server;
+     thinking_server.enable_thinking = true;
+     failures +=
+-        check(resolve_prompt_semantics(default_reasoning, thinking_server).enable_thinking == false,
+-              "a forced choice turns off reasoning that the server default enables");
++        check(resolve_prompt_semantics(default_reasoning, thinking_server).enable_thinking == true,
++              "named choice preserves the server's thinking default");
+     ServeOptions effort_server;
+     effort_server.default_reasoning_effort = RequestedReasoningEffort::Low;
+     const ResolvedPromptSemantics forced_effort =
+         resolve_prompt_semantics(default_reasoning, effort_server);
+-    failures += check(forced_effort.enable_thinking == false && !forced_effort.reasoning_effort,
+-                      "a forced choice turns off reasoning that the server default effort enables");
++    failures += check(forced_effort.enable_thinking == true &&
++                      forced_effort.reasoning_effort == ninfer::ReasoningEffort::Low,
++                      "named choice preserves the server's reasoning effort");
+     body["reasoning_effort"] = "high";
+-    failures += check(api_error([&] { (void)prompt(parse(body).generation); }).code ==
+-                          "tool_choice_not_supported",
+-                      "a forced choice with a requested reasoning effort is rejected");
++    failures += check(prompt(parse(body).generation).options.reasoning_effort ==
++                      ninfer::ReasoningEffort::High,
++                      "named choice retains the requested reasoning effort");
+     body.erase("reasoning_effort");
+ 
+     {
+@@ -546,10 +583,10 @@ int test_tools() {
+     body                        = base_request();
+     body["tools"]               = Json::array({function_tool(), function_tool("search")});
+     body["tool_choice"]         = "required";
+-    const ApiError over_several = api_error([&] { (void)parse(body); });
+-    failures += check(over_several.code == "tool_choice_not_supported" &&
+-                          over_several.message.find("several tools") != std::string::npos,
+-                      "required over several tools stays rejected");
++    const auto over_several = parse(body).generation;
++    failures += check(options(over_several).tool_choice.mode == ToolChoiceMode::Required &&
++                      over_several.tools.size() == 2 && prompt(over_several).options.tool_jsons.size() == 2,
++                      "required supports several tools while retaining both declarations");
+ 
+     body          = base_request();
+     body["tools"] = Json::array({function_tool(), function_tool("search")});
+@@ -559,20 +596,28 @@ int test_tools() {
+               Json{{"mode", "auto"},
+                    {"tools", Json::array({Json{{"type", "function"}, {"name", "search"}}})}}}};
+     const GenerationRequest allowed = parse(body).generation;
+-    failures += check(allowed.tools.size() == 1 && allowed.tools[0].name == "search" &&
+-                          prompt(allowed).options.tool_jsons.size() == 1,
+-                      "allowed_tools auto narrows the executable function set");
++    failures += check(allowed.tools.size() == 2 &&
++                          prompt(allowed).options.tool_jsons.size() == 2 &&
++                          options(allowed).tool_choice.allowed_names ==
++                              std::optional<std::vector<std::string>>{{"search"}},
++                      "allowed_tools narrows execution while retaining prompt declarations");
+ 
+     body["tool_choice"] =
+         Json{{"type", "allowed_tools"},
+              {"mode", "auto"},
+              {"tools", Json::array({Json{{"type", "function"}, {"name", "weather"}}})}};
+     const GenerationRequest direct_allowed = parse(body).generation;
+-    failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
++    failures += check(direct_allowed.tools.size() == 2 &&
++                      options(direct_allowed).tool_choice.allowed_names ==
++                          std::optional<std::vector<std::string>>{{"weather"}},
+                       "direct allowed_tools compatibility shape is accepted");
+     body["tool_choice"]["mode"] = "required";
+-    failures += check(parse(body).generation.tool_choice.forced_name == "weather",
+-                      "allowed_tools narrowed to one function forces it");
++    const auto allowed_required = parse(body).generation;
++    failures += check(options(allowed_required).tool_choice.mode == ToolChoiceMode::Required &&
++                      options(allowed_required).tool_choice.allowed_names ==
++                          std::optional<std::vector<std::string>>{{"weather"}} &&
++                      prompt(allowed_required).options.forced_tool_name.empty(),
++                      "required allowed-tools selection constrains execution without prompt mutation");
+     body["tool_choice"]["mode"]             = "auto";
+     body["tool_choice"]["tools"][0]["name"] = "missing";
+     failures += check(
+@@ -584,8 +629,8 @@ int test_tools() {
+     const OpenAIChatRequest strict_tools = parse(body);
+     failures += check(strict_tools.generation.tools.size() == 1 &&
+                           prompt(strict_tools.generation).options.tool_jsons[0].find(
+-                              "\"strict\":false") != std::string::npos,
+-                      "strict tools are accepted as advisory without reaching the prompt");
++                              "\"strict\":true") != std::string::npos,
++                      "strict tool schemas reach the prompt without weakening strictness");
+     body["tools"] = Json::array({Json{{"type", "custom"},
+                                       {"custom",
+                                        Json{{"name", "shell"},
+@@ -701,9 +746,27 @@ int test_messages_and_media() {
                            media.messages[0].content[1].kind == ContentKind::Video,
                        "image and video compatibility inputs normalize to Engine media");
  
@@ -16505,7 +16793,7 @@ index 357cf53..b9e8795 100644
  
      auto content_rejected = [&](const char* role, const char* type) {
          Json invalid                   = base_request();
-@@ -731,7 +779,7 @@ int test_messages_and_media() {
+@@ -731,7 +794,7 @@ int test_messages_and_media() {
                 Json::array({Json{{"type", "text"}, {"text", "captured"}},
                              Json{{"type", "image_url"},
                                   {"image_url", Json{{"url", "https://example.test/capture.png"},
@@ -16514,7 +16802,7 @@ index 357cf53..b9e8795 100644
      const GenerationRequest tool_image = parse(body).generation;
      failures += check(tool_image.messages.back().role == ninfer::ChatRole::Tool &&
                            tool_image.messages.back().tool_call_id == "call_capture" &&
-@@ -1465,11 +1513,17 @@ int test_assistant_continuation_mode() {
+@@ -1465,11 +1528,17 @@ int test_assistant_continuation_mode() {
      return failures;
  }
  

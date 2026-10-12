@@ -76,16 +76,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--server', required=True)
     parser.add_argument('--output')
+    parser.add_argument('--concurrency-only', action='store_true')
     args = parser.parse_args()
     results = []
     unmarked, marked = fixture('A', False), fixture('A', True)
-    for name, body in [('cold_unmarked', unmarked), ('warm_unmarked', unmarked),
-                       ('origin_changed', marked), ('warm_marked', marked)]:
+    sequential = [] if args.concurrency_only else [
+        ('cold_unmarked', unmarked), ('warm_unmarked', unmarked),
+        ('origin_changed', marked), ('warm_marked', marked)]
+    for name, body in sequential:
         result = run(args.server, name, body, 'ORIGIN_A')
         results.append(result)
         print(json.dumps(result), flush=True)
-    assert len({row['prompt_tokens'] for row in results}) == 1, 'origin changed model input count'
-    assert results[1]['cached_tokens'] > 0 and results[3]['cached_tokens'] > 0, 'warm reuse absent'
+    if not args.concurrency_only:
+        assert len({row['prompt_tokens'] for row in results}) == 1, 'origin changed model input count'
+        assert results[1]['cached_tokens'] > 0 and results[3]['cached_tokens'] > 0, 'warm reuse absent'
     # Same tokens with a changed query must not silently reuse the old query statistics.
     # Diagnostics must independently confirm query rejection/reconstruction; cache_n alone
     # cannot prove the internal query used by GPU attention.
