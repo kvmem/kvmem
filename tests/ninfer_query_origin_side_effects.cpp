@@ -1,6 +1,7 @@
 #include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/program/storage/memory_context.h"
+#include "models/qwen3_5/program/storage/memory_query.h"
 #include "text/unicode.h"
 #include <nlohmann/json.hpp>
 #include <future>
@@ -10,15 +11,42 @@
 
 namespace fi = ninfer::models::qwen3_5::frontend;
 namespace md = ninfer::models::qwen3_5::detail;
+using md::memory_query_plan;
 using Json = nlohmann::json;
 using Span = fi::TokenSpan;
-struct Window { std::uint32_t query_begin, query_end, query_tokens; };
-struct Prompt { std::optional<Span> memory_query; };
+struct Window {
+    std::uint32_t query_begin=0, query_end=0, query_tokens=0;
+    std::vector<ninfer::models::qwen3_5::TokenSpan> query_spans;
+    std::array<std::uint32_t,ninfer::models::qwen3_5::kMemoryQuerySlots> query_counts{};
+};
+struct Prompt {
+    std::optional<Span> memory_query;
+    std::vector<Span> memory_queries;
+    std::vector<int> token_ids;
+};
 struct Predicate {
     bool memory_same_query(const Window&, const Prompt&, std::uint32_t) const;
+    bool memory_query_checkpoint_compatible(const Window&, const Prompt&, std::uint32_t) const;
 };
-// Contains the unmodified production function body, with a minimal field-only host fixture.
+// Exact production bodies, bound to field-only fixtures rather than a device restore.
+#ifdef ORIGINAL_QUERY_LOGIC
+#include "cache_predicate_baseline.inc"
+#else
 #include "cache_predicate.inc"
+#include "cache_admission.inc"
+#endif
+Prompt prompt(const fi::EncodedChat& c) {
+    Prompt out; out.memory_query=c.memory_query; out.token_ids=c.input_ids;
+    for (const auto s:c.memory_queries) out.memory_queries.push_back({s.begin,s.count});
+    return out;
+}
+Window window(const fi::EncodedChat& c) {
+    const auto p=md::memory_query_plan(prompt(c));
+    Window out; out.query_begin=p.begin; out.query_end=p.end; out.query_tokens=p.tokens;
+    out.query_spans.assign(p.spans.begin(),p.spans.begin()+p.size);
+    for(unsigned i=0;i<p.size;++i) out.query_counts[i]=static_cast<unsigned>(p.spans[i].count);
+    return out;
+}
 
 int checks = 0;
 void require(bool value, const char* label) {
@@ -39,6 +67,16 @@ Json query_span(const fi::EncodedChat& c) {
 std::string query(const fi::Tokenizer& t, const fi::EncodedChat& c) {
     if (!c.memory_query) return {};
     return t.decode(std::span(c.input_ids).subspan(c.memory_query->begin,c.memory_query->count));
+}
+template<class Encoded>
+std::vector<std::string> query_candidates(const fi::Tokenizer& t, const Encoded& c) {
+    std::vector<std::string> out;
+    if constexpr (requires { c.memory_queries; }) {
+        for (const auto& s : c.memory_queries)
+            out.push_back(t.decode(std::span(c.input_ids).subspan(s.begin,s.count)));
+    }
+    if (out.empty() && c.memory_query) out.push_back(query(t,c));
+    return out;
 }
 fi::Tokenizer tokenizer() {
     Json vocab = Json::object(), added = Json::array();
@@ -135,21 +173,69 @@ int main(int argc,char** argv) try {
                 if(pairs==0) {
                     require(ea.memory_query.has_value(),"missing control query");
                     const auto old=*ea.memory_query;
-                    Window window{static_cast<unsigned>(old.begin),static_cast<unsigned>(old.begin+old.count),static_cast<unsigned>(old.count)};
+                    auto cached=window(ea);
                     Predicate predicate;
-                    require(predicate.memory_same_query(window,{ea.memory_query},static_cast<unsigned>(ea.input_ids.size())),"exact query could not reuse cache predicate");
+                    require(predicate.memory_same_query(cached,prompt(ea),static_cast<unsigned>(ea.input_ids.size())),"exact query could not reuse cache predicate");
 #ifndef ORIGINAL_QUERY_LOGIC
-                    require(!predicate.memory_same_query(window,{eb.memory_query},static_cast<unsigned>(eb.input_ids.size())),"changed query reused old-query cache predicate");
+                    require(!predicate.memory_same_query(cached,prompt(eb),static_cast<unsigned>(eb.input_ids.size())),"changed query reused old-query cache predicate");
 #endif
-                    require(!predicate.memory_same_query(window,{ea.memory_query},window.query_end-1),"incomplete frontier reused query predicate");
-                    require(!predicate.memory_same_query(window,{},static_cast<unsigned>(ea.input_ids.size())),"missing query reused predicate");
-                    --window.query_tokens;
-                    require(!predicate.memory_same_query(window,{ea.memory_query},static_cast<unsigned>(ea.input_ids.size())),"incomplete query statistics reused predicate");
+                    require(!predicate.memory_same_query(cached,prompt(ea),cached.query_end-1),"incomplete frontier reused query predicate");
+                    require(!predicate.memory_same_query(cached,{},static_cast<unsigned>(ea.input_ids.size())),"missing query reused predicate");
+                    --cached.query_tokens;
+                    require(!predicate.memory_same_query(cached,prompt(ea),static_cast<unsigned>(ea.input_ids.size())),"incomplete query statistics reused predicate");
                 }
                 ++pairs;
             }
         }
     }
+#ifndef ORIGINAL_QUERY_LOGIC
+    const auto zero_client=fi::encode_rendered_chat(t,renderer.render(fixture("CURRENT_TASK","clock snapshot",false)));
+    const auto candidates=query_candidates(t,zero_client);
+    require(std::find(candidates.begin(),candidates.end(),"CURRENT_TASK")!=candidates.end(),
+        "ordinary unmodified client lost the task query behind runtime User context");
+    require(std::find(candidates.begin(),candidates.end(),"clock snapshot")!=candidates.end(),
+        "ordinary human User context was excluded without source evidence");
+    require(candidates.size()<=ninfer::models::qwen3_5::kMemoryQuerySlots,
+        "query workspace is not bounded");
+    Predicate p;
+    const auto exact=window(zero_client);
+    auto identity=prompt(zero_client);
+    require(p.memory_same_query(exact,identity,static_cast<unsigned>(identity.token_ids.size())),
+        "complete multi-query cache identity rejected");
+    auto incomplete=exact; --incomplete.query_counts[0];
+    require(!p.memory_same_query(incomplete,identity,static_cast<unsigned>(identity.token_ids.size())),
+        "incomplete query slot was hidden by aggregate count");
+    ++identity.memory_queries.front().begin;
+    require(!p.memory_same_query(exact,identity,static_cast<unsigned>(identity.token_ids.size())),
+        "changed nonprimary query reused old statistics");
+    identity=prompt(zero_client); identity.memory_queries.erase(identity.memory_queries.begin());
+    require(!p.memory_same_query(exact,identity,static_cast<unsigned>(identity.token_ids.size())),
+        "shrunk query set reused old statistics");
+    identity=prompt(zero_client); identity.memory_queries.clear(); identity.memory_query.reset();
+    require(!p.memory_same_query(exact,identity,static_cast<unsigned>(identity.token_ids.size())),
+        "cleared query set reused old statistics");
+    require(!p.memory_query_checkpoint_compatible(exact,identity,static_cast<unsigned>(identity.token_ids.size())),
+        "cleared query set admitted an old query-conditioned checkpoint");
+    require(p.memory_query_checkpoint_compatible(exact,identity,exact.query_begin),
+        "cleared query set rejected its safe pre-query checkpoint");
+    require(p.memory_query_checkpoint_compatible(Window{},identity,static_cast<unsigned>(identity.token_ids.size())),
+        "stable empty query set lost checkpoint reuse");
+    require(!p.memory_query_checkpoint_compatible(Window{},prompt(zero_client),exact.query_end),
+        "new query set reused late empty-query checkpoint");
+    auto many=fixture("CURRENT_TASK","clock snapshot",false);
+    for(unsigned i=0;i<6;++i) many.push_back(message(ninfer::ChatRole::User,"context "+std::to_string(i)));
+    const auto many_queries=query_candidates(t,fi::encode_rendered_chat(t,renderer.render(many)));
+    require(many_queries.size()==3 && many_queries.front()=="CURRENT_TASK" && many_queries.back()=="context 5",
+        "repeated unmodified User context lost the anchor or newest query");
+    many.push_back(message(ninfer::ChatRole::User,"Cancel the old task; use the new requirement"));
+    const auto cancelled=query_candidates(t,fi::encode_rendered_chat(t,renderer.render(many)));
+    require(cancelled.back()=="Cancel the old task; use the new requirement",
+        "ordinary cancellation or human refinement was guessed to be runtime data");
+    many.push_back(message(ninfer::ChatRole::Assistant,"completed answer"));
+    many.push_back(message(ninfer::ChatRole::User,"NEW_TASK"));
+    const auto fresh=query_candidates(t,fi::encode_rendered_chat(t,renderer.render(many)));
+    require(fresh==std::vector<std::string>{"NEW_TASK"},"closed old task polluted a genuine new task query");
+#endif
     auto all=fixture("task","reminder",true);
     all={all[7],all[8]};
     const auto only=fi::encode_rendered_chat(t,renderer.render(all));

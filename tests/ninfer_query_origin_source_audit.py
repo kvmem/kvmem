@@ -56,12 +56,19 @@ def function(text, marker):
     return text[begin:end]
 old_pred = function(window_old, signature)
 new_pred = function(window_new, signature)
-assert old_pred == new_pred, 'cache query matching function changed from committed PR patch'
 body = new_pred[new_pred.index('{'):]
 (out / 'cache_predicate.inc').write_text(
     'bool Predicate::memory_same_query(const Window& window, const Prompt& prompt, std::uint32_t frontier) const '\
     + body + '\n')
-assert 'frontier > prompt.memory_query->begin && !memory_same_query(*history, prompt, frontier)' in window_new
+(out / 'cache_predicate_baseline.inc').write_text(
+    'bool Predicate::memory_same_query(const Window& window, const Prompt& prompt, std::uint32_t frontier) const '
+    + old_pred[old_pred.index('{'):] + '\n')
+history_function = function(window_new, 'std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(')
+admission = function(window_new, 'bool ProgramImpl::memory_query_checkpoint_compatible(')
+assert 'if (!memory_query_checkpoint_compatible(*history, prompt, frontier))' in history_function
+(out / 'cache_admission.inc').write_text(
+    'bool Predicate::memory_query_checkpoint_compatible(const Window& window, const Prompt& prompt, std::uint32_t frontier) const '
+    + admission[admission.index('{'):] + '\n')
 
 summary = {
     'checkout_head': git(repo, 'rev-parse', 'HEAD').stdout.decode().strip(),
@@ -71,10 +78,11 @@ summary = {
     'working_patch_sha256': hashlib.sha256((repo / 'backends/patches/ninfer-kvmem.patch').read_bytes()).hexdigest(),
     'source_sha256': {p: hashlib.sha256((source / p).read_bytes()).hexdigest() for p in paths},
     'unchanged_thinking_rewrite_block': True,
-    'unchanged_memory_same_query': True,
+    'unchanged_memory_same_query': old_pred == new_pred,
+    'cache_query_match_checks_all_ranges_counts': 'window.query_counts[slot] != span.count' in new_pred,
     'history_admission_checks_changed_query_span': True,
     'limits': ['cache predicate executes its exact body in field-only host fixture, not a ProgramImpl or device restore',
                'renderer baseline is reconstructed from the committed versioned backend patch']
 }
 (out / 'source-audit.json').write_text(json.dumps(summary, indent=2)+'\n')
-print('independent source audit: PASS; thinking/rewrite block and cache query predicate unchanged')
+print('independent source audit: PASS; thinking/rewrite unchanged; both exact cache predicates extracted')

@@ -28,4 +28,13 @@ struct MeanKeyQueryView {
 // This is selection math only: it mutates no payload, frontier or residency.
 std::vector<double> mean_key_retrieval_scores(const RawKvStore& keys, uint32_t blocks,
                                                MeanKeyQueryView query);
+
+// Diversify independent query rankings by round-robin, skipping already emitted
+// blocks. The caller still applies one shared top-k budget and mandatory union.
+// One query (or one informative query) preserves its scores exactly. Otherwise,
+// mandatory pages are excluded before interleaving. Constant-score queries are
+// ignored; if none inform retrieval, rank by recency. Ties use block IDs.
+// Interleaved ranks lie in (0,1]; no LRFU round is committed.
+std::vector<double> diversify_retrieval_scores(const std::vector<std::vector<double>>& queries,
+                                               const std::vector<uint32_t>& mandatory = {});
 } // namespace kvmem

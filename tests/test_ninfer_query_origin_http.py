@@ -8,6 +8,7 @@ with B=2048, R=512, recent=512 and logical context >=16384.
 import argparse
 import concurrent.futures
 import copy
+import hashlib
 import json
 import time
 import urllib.error
@@ -67,6 +68,7 @@ def run(url, name, body, expected, finish_expected='stop'):
     timings = next((chunk['timings'] for chunk in reversed(chunks) if 'timings' in chunk), {})
     cached = usage.get('prompt_tokens_details', {}).get('cached_tokens', timings.get('cache_n', 0))
     return {"case": name, "prompt_tokens": usage.get('prompt_tokens'),
+            "content_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "cached_tokens": cached, "completion_tokens": usage.get('completion_tokens'),
             "finish": finish, "elapsed_seconds": round(time.monotonic()-started, 3),
             "timings": timings}
@@ -78,26 +80,67 @@ def main():
     parser.add_argument('--output')
     parser.add_argument('--concurrency-only', action='store_true')
     parser.add_argument('--long-concurrency', action='store_true')
+    parser.add_argument('--zero-client', action='store_true', help='Use ordinary messages with no origin extension.')
+    parser.add_argument('--empty-query-transition', action='store_true', help='Check same-token query-set removal through explicit origins.')
+    parser.add_argument('--empty-query-cold', action='store_true', help='Cold control for the empty-query transition.')
     args = parser.parse_args()
     results = []
     unmarked, marked = fixture('A', False), fixture('A', True)
+    if args.empty_query_transition or args.empty_query_cold:
+        assert not args.zero_client and not args.concurrency_only and not args.long_concurrency
+        empty=copy.deepcopy(unmarked)
+        for message in empty['messages']:
+            if message['role']=='user':
+                message['ninfer_origin']='runtime_reminder'
+        sequence = ([('cold_empty',empty)] if args.empty_query_cold else
+                    [('cold_unmarked',unmarked),('warm_unmarked',unmarked),
+                     ('query_set_empty',empty),('warm_empty',empty)])
+        for name,body in sequence:
+            result=run(args.server,name,body,'ORIGIN_A')
+            results.append(result)
+            print(json.dumps(result),flush=True)
+        assert len({row['prompt_tokens'] for row in results})==1, 'empty-query origin changed input count'
+        if args.empty_query_transition:
+            assert results[1]['cached_tokens']>0 and results[3]['cached_tokens']>0
+            assert results[2]['content_sha256']==results[3]['content_sha256'], 'unstable empty-query output'
+        if args.output:
+            with open(args.output,'w',encoding='utf-8') as output:
+                json.dump({'results':results,'empty_query_transition':True},output,indent=2)
+        print('empty-query HTTP: PASS',flush=True)
+        return
     sequential = [] if args.concurrency_only else [
         ('cold_unmarked', unmarked), ('warm_unmarked', unmarked),
         ('origin_changed', marked), ('warm_marked', marked)]
+    if args.zero_client and not args.concurrency_only:
+        many = copy.deepcopy(unmarked)
+        for step in range(6):
+            many['messages'].append({'role':'user','content':f'Runtime sample: step {step}; timestamp 2030-01-01T00:00:00Z.'})
+        shrink = copy.deepcopy(unmarked); shrink['messages'].pop()
+        sequential = [('cold_unmarked',unmarked),('warm_unmarked',unmarked),
+                      ('query_set_grew',many),('warm_grown',many),('query_set_shrank',shrink)]
     for name, body in sequential:
         result = run(args.server, name, body, 'ORIGIN_A')
         results.append(result)
         print(json.dumps(result), flush=True)
-    if not args.concurrency_only:
+    if not args.concurrency_only and not args.zero_client:
         assert len({row['prompt_tokens'] for row in results}) == 1, 'origin changed model input count'
         assert results[1]['cached_tokens'] > 0 and results[3]['cached_tokens'] > 0, 'warm reuse absent'
+    if args.zero_client and not args.concurrency_only:
+        assert results[1]['cached_tokens'] > 0 and results[3]['cached_tokens'] > 0, 'unmodified warm reuse absent'
+        cancel=copy.deepcopy(unmarked)
+        cancel['messages'].append({'role':'user','content':'Cancel the old request. Return exactly ORIGIN_B instead.'})
+        results.append(run(args.server,'human_cancellation',cancel,'ORIGIN_B'))
+        new=copy.deepcopy(unmarked)
+        new['messages'].extend([{'role':'assistant','content':'Completed answer.'},
+                                {'role':'user','content':'For the new task, return exactly ORIGIN_C.'}])
+        results.append(run(args.server,'new_closed_group',new,'ORIGIN_C'))
     # Same tokens with a changed query must not silently reuse the old query statistics.
     # Diagnostics must independently confirm query rejection/reconstruction; cache_n alone
     # cannot prove the internal query used by GPU attention.
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         futures = []
         for case in ['B', 'C']:
-            body = fixture(case, True)
+            body = fixture(case, not args.zero_client)
             if args.long_concurrency:
                 body['messages'][-4]['content'] = (
                     f'For the current task, repeat ORIGIN_{case} exactly 500 times, '
@@ -109,6 +152,13 @@ def main():
             result = future.result()
             results.append(result)
             print(json.dumps(result), flush=True)
+    if args.zero_client:
+        assert all('ninfer_origin' not in message for _,body in sequential for message in body['messages'])
+        if args.output:
+            with open(args.output,'w',encoding='utf-8') as output:
+                json.dump({'results':results,'zero_client':True},output,indent=2)
+        print('unmodified client HTTP: PASS',flush=True)
+        return
     invalid = copy.deepcopy(marked)
     invalid['messages'][-1]['ninfer_origin'] = True
     request = urllib.request.Request(args.server.rstrip('/') + '/v1/chat/completions',

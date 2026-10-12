@@ -59,6 +59,7 @@ kvmem_add_test(tiered_kv_storage_test)
 kvmem_add_test(native_residency_test)
 kvmem_add_test(kv_content_test)
 kvmem_add_test(mean_key_retrieval_test)
+kvmem_add_test(query_diversification_test)
 if (NOT WIN32 OR NOT KVMEM_ENABLE_NVME)
     # The runtime suite already guards its only NVMe case with this option.
     kvmem_add_test(kvmem_runtime_test)

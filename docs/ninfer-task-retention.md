@@ -20,7 +20,8 @@ active User ranges. No message or model token is removed or rewritten.
 | Selected task before a completed Assistant, followed only by sourced reminders | Same bounded task tail; reminders do not create a replacement task |
 | Images | Existing complete-image pins |
 | Sink and rolling recent tail | Existing configured page counts |
-| Scoring query | Last eligible real User; explicitly sourced runtime reminders are skipped |
+| Default scoring queries | First nonempty real User and latest two nonempty real Users in the open group, deduplicated by message and ordered chronologically; at most three |
+| Explicit-origin scoring query | Last eligible real User; explicitly sourced runtime reminders are skipped |
 
 A User pin here means a provenance-backed User-role input, including runtime
 snapshots. Pins do not classify content as human or clock text. A non-tool Assistant
@@ -29,6 +30,29 @@ final Assistant keeps its current group open. User-role tool-response wrappers,
 Tool contents and quoted ChatML do not become task provenance. Unsupported
 custom serialization without proven User block boundaries cannot acquire exact
 User pins. Raw-token prompts have no invented chat semantics.
+
+The default query policy requires no client changes or new message fields. It
+uses role structure and rendered provenance, without classifying who authored a
+User message. A later runtime snapshot cannot remove the first User's query
+within the same open group. Ordinary corrections and cancellations remain
+eligible as recent queries; the first query stays until the group closes. A
+completed Assistant followed by an unmarked reminder starts another group, so
+the server cannot infer that an earlier task continues. Runtime context embedded
+inside one User message cannot be separated by this policy.
+If the open group has no eligible User, the existing last-eligible-User fallback
+remains; this does not add a closed task's mandatory pin.
+
+Each selected span gets independent Q sums and token counts. Intervening Tool
+and Assistant tokens are excluded. Historical pages are scored separately for
+each query using the existing cosine scorer. Rankings take turns in chronological
+query order, skip mandatory pages and already emitted pages, and use ascending
+page ID to resolve equal scores. Constant or zero-score rankings have no vote;
+all-constant multi-query input supplies recency scores. Optional LRFU can still
+alter the selector's final order; it remains disabled by default. A single query, including
+one informative query among constant alternatives, keeps its original scores.
+All queries share the existing scored-history budget. There is no per-query
+window allocation or extra attention capacity. Custom layouts with overlapping
+query spans fall back to the original primary query.
 
 Pins use original logical page coordinates, count overlapping pages once, and
 are clipped to the computed frontier. Admission evaluates the exact pin/recent union through the admitted target
@@ -52,6 +76,9 @@ forms translate the provenance offsets along with the rest of the prompt.
 | `backends/ninfer/tests/models/qwen3_5/test_memory_context.cpp` | Synthetic token coordinates/frontiers passed to the production selector: old-history scores win, yet current-task/control and partial-tail pages must remain within 576 pages. The old sink/recent-only control must lose the task. Separately checks an exact 512-token-tail page set, overlap accounting, independently computed request pins, frontier clipping and capacity rejection. This does not run actual prefill/decode or concurrent lanes. |
 | `test_frontend.cpp::test_memory_active_task_provenance` | Old task + completed answer + current task + runtime User + assistant tool call + 20 KB Tool/quoted fake User; decoded active ranges must equal `{CURRENT_TASK, snapshot}`, then a subsequent completed turn must contain only `NEXT_TASK`. |
 | `test_frontend.cpp::test_memory_runtime_query_origin` | Multiple explicitly marked reminders leave the exact query at `CURRENT_TASK`; the same unmarked text remains eligible. Marking preserves tokens, positions and checkpoint, and preserves control/User ranges in an open chain. A reminder after a completed answer adds the selected task tail; a reminder before completion does not reopen the task. The next task replaces the query and runtime-only input has no trusted query. Invalid typed origins are rejected. |
+| `test_frontend.cpp::test_memory_unmodified_client_queries` | Unmarked task plus six User contexts retains the first task and latest two contexts. A human cancellation remains eligible, a completed Assistant starts a new task group, an empty User keeps the earlier nonempty query, and a long Tool with quoted fake User contributes no query. |
+| `kvmem/tests/query_diversification_test.cpp` | Exact single-query scores, opposed rankings, mandatory exclusion, deterministic ties, flat/zero handling, finite/geometry validation, actual cosine scoring and fixed-budget production selection. |
+| `tests/experimental/memory_query_statistics.cpp` in the backend | Independent BF16-to-FP64 oracle checks three disjoint spans, huge intervening values, zero and opposite queries, chunk crossings and slot/layer layout. Eager and captured execution reuse the same graph from three queries to one and reset empty slots. |
 | `test_openai_schema.cpp::test_runtime_reminder_origin` | Chat Completions wire origin reaches typed prompt preparation without changing content. Null/unknown/wrong-type values and non-User origins return HTTP 400. |
 | `test_frontend.cpp::test_memory_context_tokenization_invariance` | Text encoded token IDs are identical with/without context boundaries. Expanded-image preparation carries nonempty instruction and one in-bounds User range; this is not an image token-invariance or GPU Vision test. |
 | `test_frontend.cpp::test_prompt_graft` / `test_direct_graft_context_cache` | Query begin and first active User begin move by the graft prefix length; active User range counts agree. |
@@ -61,7 +88,7 @@ The Linux host CI prepares and verifies the pinned backend and runs
 page-selection helper and selector without CUDA or a model. Frontend/media/graft
 checks run in the dedicated `ninfer_qwen3_5_memory_context_frontend_test` target
 (`ninfer_tests ninfer_qwen3_5_frontend_test --memory-context-only`); this runs nine
-frontend functions. The default full `ninfer_qwen3_5_frontend_test` is retained.
+frontend functions plus the unmodified-client query check (ten total). The default full `ninfer_qwen3_5_frontend_test` is retained.
 Frontend checks are not implied by the model-free host CI result. Real-model
 execution and any default-suite failure must be reported separately.
 
@@ -69,12 +96,14 @@ Chat Completions supports the optional message field
 `"ninfer_origin": "runtime_reminder"`, lowered to typed `MessageOrigin::RuntimeReminder`.
 It is a caller assertion that a User message came from runtime instrumentation;
 the server never guesses origin from substrings, quoted text or control tokens.
-Only marked reminders are skipped when choosing the scoring query. Without a
-mark, identical text keeps the previous last-User behavior. A runtime-only input
-has no trusted query and uses the existing recency fallback. Invalid field values
-or a non-User role fail explicitly. C++ callers may supply the same typed origin.
-Clients must set it; existing unmarked requests do not acquire the improvement.
-Responses and Anthropic adapters do not support the extension.
+When any message carries this explicit origin, the existing single-query path
+selects the last eligible User and skips marked reminders. Fully unmarked input
+uses the default bounded multi-query policy above, including identical
+reminder-like human text. A marked runtime-only input has no trusted query and
+uses the existing recency fallback. Invalid field values or a non-User role fail
+explicitly. C++ callers may supply the same typed origin. Responses and Anthropic
+adapters do not support the extension; their role-based default queries require
+no extension.
 
 This changes neither Jinja input nor model tokens, thinking-history rendering,
 or rewrite checkpoints. Within an open tool chain mandatory ranges are unchanged.
@@ -98,6 +127,18 @@ or cause different transfers; sparse attention remains approximate and neither
 answer equivalence nor throughput improvement is claimed. A legal custom ChatML
 template may merge formatting newlines in BPE: instruction pins end at the
 closing special token, not a potentially merged trailing newline.
+
+KVMem Program GPU/pinned query scratch now reserves three slots per layer;
+each active sequence and retained history holds its own expanded host query
+sums. Extra empty
+reductions still execute when fewer slots are used. Multi-query input can perform
+up to three host scoring passes and ranking sorts. Cache restoration requires
+every query span and its completed count to agree; changed query sets invalidate
+later checkpoints and may recompute from a safe earlier frontier even when the
+prompt fits the physical window. Thus unchanged clients are accepted without wire
+changes, but retrieval, transfer and cache performance can change. Stable sets
+can reuse completed statistics. The default policy does not recover the budget
+spent on complete instruction/tool-schema pins.
 
 `test_admitted_frontier_charge()` checks overlapping and disjoint recent tails,
 B < F <= B+R, first overflow, non-page-aligned speculative scratch limits, and
