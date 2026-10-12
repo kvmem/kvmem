@@ -162,6 +162,10 @@ int main(int argc,char** argv) try {
     auto reminder=fixture("task","runtime",true).back();
     closed.push_back(reminder);
     const auto closed_marked=fi::encode_rendered_chat(t,renderer.render(closed));
+    auto before_answer=closed;
+    std::swap(before_answer[before_answer.size()-2],before_answer.back());
+    require(fi::encode_rendered_chat(t,renderer.render(before_answer)).memory_active_users.empty(),
+        "reminder before a completed answer revived a closed task pin");
     closed.back().origin=ninfer::MessageOrigin::Unspecified;
     const auto closed_plain=fi::encode_rendered_chat(t,renderer.render(closed));
     require(closed_marked.input_ids==closed_plain.input_ids,"post-answer origin changed tokens");
