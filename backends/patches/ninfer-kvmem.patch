@@ -2784,7 +2784,7 @@ index dbc8d09..1d4eab4 100644
      return out;
  }
 diff --git a/src/models/qwen3_5/frontend/chat_template.cpp b/src/models/qwen3_5/frontend/chat_template.cpp
-index 1bdf3ef..1ba985a 100644
+index 1bdf3ef..c934dfa 100644
 --- a/src/models/qwen3_5/frontend/chat_template.cpp
 +++ b/src/models/qwen3_5/frontend/chat_template.cpp
 @@ -375,6 +375,15 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
@@ -2803,7 +2803,7 @@ index 1bdf3ef..1ba985a 100644
      result.starts_in_reasoning          = layout.starts_in_reasoning;
      result.media_placeholders           = layout.media_placeholders;
      result.rewrite_execution_boundaries = layout.execution_boundaries;
-@@ -433,6 +442,28 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
+@@ -433,6 +442,42 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
          if (extent) message_blocks[i] = containing_message(layout, *extent);
          if (message_blocks[i]) ++block_users[*message_blocks[i]];
      }
@@ -2815,17 +2815,31 @@ index 1bdf3ef..1ba985a 100644
 +            break;
 +        }
 +    }
-+    for (std::size_t i = active_begin; i < messages.size(); ++i) {
-+        if (!real_user(messages[i]) || !message_blocks[i]) continue;
++    const auto user_pin = [&](std::size_t i) -> std::optional<text::ByteSpan> {
++        if (!real_user(messages[i]) || !message_blocks[i]) return std::nullopt;
 +        const auto index = *message_blocks[i];
 +        const auto& block = layout.messages[index];
 +        if (block.role == ChatRole::User && block_users[index] == 1 &&
 +            block.content_begin < block.content_end)
-+            result.memory_active_users.push_back({block.content_begin, block.content_end});
++            return text::ByteSpan{block.content_begin, block.content_end};
++        return std::nullopt;
++    };
++    for (std::size_t i = active_begin; i < messages.size(); ++i) {
++        if (const auto span = user_pin(i)) result.memory_active_users.push_back(*span);
 +    }
++    bool skipped_runtime = false;
 +    for (std::size_t i = messages.size(); i > 0; --i) {
-+        if (messages[i - 1].origin != MessageOrigin::RuntimeReminder && real_user(messages[i - 1])) {
++        if (messages[i - 1].origin == MessageOrigin::RuntimeReminder) {
++            skipped_runtime = true;
++            continue;
++        }
++        if (real_user(messages[i - 1])) {
 +            result.memory_query = content_regions[i - 1];
++            // A sourced reminder after a completed Assistant is not a new task.
++            // Keep the selected task's bounded tail even outside the open chain.
++            if (skipped_runtime && i - 1 < active_begin)
++                if (const auto span = user_pin(i - 1))
++                    result.memory_active_users.insert(result.memory_active_users.begin(), *span);
 +            break;
 +        }
 +    }
@@ -14658,7 +14672,7 @@ index 08e0238..46a9d98 100644
              while (first < want.size() && first < got.size() && want[first] == got[first]) { ++first; }
              std::cerr << "  first difference at token " << first << '\n';
 diff --git a/tests/models/qwen3_5/test_frontend.cpp b/tests/models/qwen3_5/test_frontend.cpp
-index f558929..1258e05 100644
+index f558929..b311798 100644
 --- a/tests/models/qwen3_5/test_frontend.cpp
 +++ b/tests/models/qwen3_5/test_frontend.cpp
 @@ -349,7 +349,7 @@ ninfer::PromptInput image_input() {
@@ -14759,7 +14773,7 @@ index f558929..1258e05 100644
                   "request-pinned media payload did not survive its Frontend cache owner");
  }
  
-@@ -3027,6 +3068,253 @@ int test_media_preparation_cancellation() {
+@@ -3027,6 +3068,277 @@ int test_media_preparation_cancellation() {
      return check(false, "cancelled media preparation completed successfully");
  }
  
@@ -14879,6 +14893,30 @@ index f558929..1258e05 100644
 +    const auto next = frontend.prepare(input);
 +    failures += check(query_text(FrontendFactory::inspect(next)) == "NEXT_TASK",
 +                      "previous task query survived a new task");
++    auto after_answer = input;
++    after_answer.messages.pop_back(); // Remove reminder: NEXT_TASK is last.
++    ninfer::ChatMessage answer;
++    answer.role = ninfer::ChatRole::Assistant;
++    answer.parts.push_back({.text = "Completed answer"});
++    after_answer.messages.push_back(answer);
++    after_answer.messages.push_back(input.messages.back());
++    const auto resumed = frontend.prepare(after_answer);
++    const auto& resumed_data = FrontendFactory::inspect(resumed);
++    const auto resumed_ranges = active_user_ranges(resumed_data);
++    failures += check(query_text(resumed_data) == "NEXT_TASK" && resumed_ranges.size() == 2,
++                      "sourced reminder after an answer lost its task protection");
++    if (resumed_ranges.size() == 2) {
++        std::string pinned;
++        for (std::size_t i = resumed_ranges[0].first;
++             i < resumed_ranges[0].first + resumed_ranges[0].second; ++i)
++            pinned += frontend.token_bytes(resumed_data.token_ids.at(i));
++        failures += check(pinned == "NEXT_TASK", "reminder retained an unrelated earlier task");
++    }
++    after_answer.messages.back().origin = ninfer::MessageOrigin::Unspecified;
++    const auto ordinary = frontend.prepare(after_answer);
++    failures += check(active_user_ranges(FrontendFactory::inspect(ordinary)).size() == 1 &&
++                      resumed_data.token_ids == FrontendFactory::inspect(ordinary).token_ids,
++                      "unmarked User gained an old-task pin or marking changed model input");
 +    ninfer::PromptInput only;
 +    only.messages.push_back(input.messages.back());
 +    const auto no_task = frontend.prepare(only);
@@ -15013,7 +15051,7 @@ index f558929..1258e05 100644
  int test_ngram_proposal_only_sources() {
      ninfer::models::qwen3_5::FrontendOptions options;
      options.vision_enabled        = false;
-@@ -3187,7 +3475,8 @@ int test_forced_tool_call(const Frontend& frontend) {
+@@ -3187,7 +3499,8 @@ int test_forced_tool_call(const Frontend& frontend) {
          input.options.tool_jsons.emplace_back(kForcedToolDefinition);
          auto prompt  = frontend.prepare(std::move(input));
          auto session = frontend.make_output_session(
@@ -15023,7 +15061,7 @@ index f558929..1258e05 100644
          const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(continuation);
          (void)session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
                                      ninfer::FinishReason::OutputLimit);
-@@ -3224,11 +3513,37 @@ int test_forced_tool_call(const Frontend& frontend) {
+@@ -3224,11 +3537,37 @@ int test_forced_tool_call(const Frontend& frontend) {
      return failures;
  }
  
@@ -15062,7 +15100,7 @@ index f558929..1258e05 100644
      failures += test_ngram_proposal_only_sources();
      failures += test_tokenizer_config_merge();
      failures += test_bpe_merge_order();
-@@ -3286,4 +3601,8 @@ int main() {
+@@ -3286,4 +3625,8 @@ int main() {
      failures += test_invalid_media_classification();
      failures += test_disabled_vision();
      return failures == 0 ? 0 : 1;

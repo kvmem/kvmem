@@ -17,6 +17,7 @@ active User ranges. No message or model token is removed or rewritten.
 |---|---|
 | System/Developer blocks, including rendered tool schemas | Complete blocks |
 | Each real User in the open tool chain | Last 512 tokens; complete when shorter |
+| Selected task before a completed Assistant, followed only by sourced reminders | Same bounded task tail; reminders do not create a replacement task |
 | Images | Existing complete-image pins |
 | Sink and rolling recent tail | Existing configured page counts |
 | Scoring query | Last eligible real User; explicitly sourced runtime reminders are skipped |
@@ -76,7 +77,11 @@ Clients must set it; existing unmarked requests do not acquire the improvement.
 Responses and Anthropic adapters do not support the extension.
 
 This changes neither Jinja input nor model tokens, thinking-history rendering,
-rewrite checkpoints, nor mandatory page ranges. In particular, reminder contents
+or rewrite checkpoints. Within an open tool chain mandatory ranges are unchanged.
+When sourced reminders follow a completed Assistant without a new real User, the
+selected earlier task also keeps its bounded tail. That adds at most one bounded
+User tail (plus page rounding) to the required union; it can displace scored
+history or change admission at a capacity boundary. In particular, reminder contents
 remain retained under #115, and complete System/Developer blocks, including rendered
 tool schemas, still consume their
 existing budget. Selecting a different query can change historical pages and
