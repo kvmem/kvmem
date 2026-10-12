@@ -105,3 +105,21 @@ The CUDA container job trusts only the exact checked-out workspace before
 preparing the pinned llama.cpp backend. It does not use a safe.directory wildcard
 or change the engine pin. This permits preparation when the container checkout
 and runner use different directory owners.
+
+## Tool-output fixture modes and Basic framing
+
+The legacy permissive-output fixtures `test_structured_tool_output`,
+`test_tool_marker_after_quoted_marker` and `test_forced_tool_call` select
+`Automatic` explicitly. Their omitted-empty, mismatch and recovery expectations
+remain unchanged. The forced-call fixture includes an extra leading LF after the
+prompt's existing LF, which is valid only on that permissive path.
+
+The default `Basic` grammar and decoder remain tested by
+`test_tool_constraints.cpp`. Canonical empty parameters have separate opening and
+closing framing LF bytes. A single LF in the same position can be the beginning
+of a nonempty untyped string, including literal parameter tags, even when the
+schema declares Boolean. Inferring an empty value from its declared type would
+destroy that legitimate mismatch string. The regression tests run the real grammar
+and decoder in 1-byte, 7-byte and whole-call feed chunks, checking canonical empty
+values followed by another argument and preservation of those literal bytes.
+No single-LF empty repair is enabled; consumer schema validation still matters.

@@ -15274,10 +15274,10 @@ index 0000000..d0c7e38
 +}
 diff --git a/tests/models/qwen3_5/test_tool_constraints.cpp b/tests/models/qwen3_5/test_tool_constraints.cpp
 new file mode 100644
-index 0000000..31780ec
+index 0000000..25a18aa
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_tool_constraints.cpp
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,198 @@
 +#include "models/qwen3_5/frontend/tool_call_parser.h"
 +#include "models/qwen3_5/frontend/tool_grammar.h"
 +#include "text/structured_output.h"
@@ -15403,6 +15403,39 @@ index 0000000..31780ec
 +    auto parallel = fi::select_tool_call_contract(base, {});
 +    fi::ToolCallOutputDecoder partial(parallel,128); (void)partial.feed(call+"\n<tool_call>\n<function=alpha>\n");
 +    require(partial.finish().tool_calls.size()==1, "keep completed call before truncated second call");
++    // Basic uses two framing LF bytes for an empty value. A single LF before
++    // </parameter> can instead begin nonempty untyped payload, even for Boolean.
++    // Guessing an empty value from the declared type would destroy that payload.
++    const std::vector<std::string> framing_def = {
++        R"({"function":{"name":"framing","parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"count":{"type":"integer"},"s":{"type":"string"}}}}})"};
++    ToolChoice basic_required; basic_required.mode = ToolChoiceMode::Required;
++    auto framing = fi::select_tool_call_contract(
++        fi::build_tool_call_output_contract(framing_def, true), basic_required);
++    const std::string framing_open = "<tool_call>\n<function=framing>\n";
++    const std::string framing_close = "</function>\n</tool_call>";
++    const std::string next_count = "<parameter=count>\n2\n</parameter>\n";
++    const std::vector<std::pair<std::string, Json>> framing_cases = {
++        {framing_open + "<parameter=enabled>\n\n</parameter>\n" + next_count +
++             "<parameter=s>\n\n</parameter>\n" + framing_close,
++         Json{{"count", 2}, {"s", ""}}},
++        {framing_open + "<parameter=enabled>\n</parameter>\n" + next_count + framing_close,
++         Json{{"enabled", "</parameter>\n<parameter=count>\n2"}}},
++        {framing_open + "<parameter=s>\n</parameter>leading literal\n</parameter>\n" + framing_close,
++         Json{{"s", "</parameter>leading literal"}}},
++    };
++    for (const auto& [value, expected] : framing_cases) {
++        auto grammar = compiler.compile_model(fi::tool_grammar(*framing, {}), {}, "");
++        grammar->accept(bytes(value)); grammar->accept({&end, 1});
++        for (std::size_t chunk : {1U, 7U, 10000U}) {
++            fi::ToolCallOutputDecoder decoder(framing,128);
++            for (std::size_t pos = 0; pos < value.size(); pos += chunk)
++                (void)decoder.feed(std::string_view(value).substr(pos, chunk));
++            const auto parsed = decoder.finish();
++            require(parsed.tool_calls.size()==1, "Basic framing lost the completed call");
++            require(Json::parse(parsed.tool_calls.front().arguments_json)==expected,
++                    "Basic framing lost an empty value, later parameter or literal delimiter");
++        }
++    }
 +    ToolChoice automatic; automatic.constraints = ToolConstraintMode::Automatic;
 +    require(!fi::select_tool_call_contract(base, automatic)->constrained, "auto opt-out retains free decoder");
 +    require(fi::select_tool_call_contract(fi::build_tool_call_output_contract(strict_def,true), automatic)->constrained, "strict remains mandatory under auto opt-out");
