@@ -83,4 +83,55 @@ std::vector<double> mean_key_retrieval_scores(const RawKvStore& keys, uint32_t b
     }
     return scores;
 }
+std::vector<double> diversify_retrieval_scores(const std::vector<std::vector<double>>& queries,
+                                               const std::vector<uint32_t>& mandatory) {
+    if (queries.empty()) return {};
+    const auto blocks = queries.front().size();
+    for (const auto& scores : queries) {
+        if (scores.size() != blocks) throw std::invalid_argument("query ranking sizes differ");
+        for (const auto score : scores)
+            if (!std::isfinite(score)) throw std::invalid_argument("nonfinite query ranking");
+    }
+    if (queries.size() == 1) return queries.front();
+    std::vector<bool> excluded(blocks);
+    for (const auto block : mandatory) if (block < blocks) excluded[block] = true;
+    std::vector<std::size_t> candidates;
+    for (std::size_t block = 0; block < blocks; ++block) if (!excluded[block]) candidates.push_back(block);
+    std::vector<std::size_t> active;
+    for (std::size_t query = 0; query < queries.size(); ++query) {
+        if (candidates.size() > 1 && std::any_of(candidates.begin() + 1, candidates.end(), [&](auto block) {
+            return queries[query][block] != queries[query][candidates.front()];
+        })) active.push_back(query);
+    }
+    if (active.size() == 1) return queries[active.front()];
+    std::vector<double> out(blocks);
+    if (active.empty()) {
+        // Constant/zero scores have no retrieval information. Prefer recent
+        // candidates rather than letting arbitrary page-ID ties gain a vote.
+        for (const auto block : candidates) out[block] = double(block + 1) / double(blocks + 1);
+        return out;
+    }
+    std::vector<std::vector<std::size_t>> ranks(active.size(), candidates);
+    for (std::size_t query = 0; query < active.size(); ++query) {
+        auto& rank = ranks[query];
+        std::sort(rank.begin(), rank.end(), [&](auto a, auto b) {
+            const auto& scores = queries[active[query]];
+            return scores[a] != scores[b] ? scores[a] > scores[b] : a < b;
+        });
+    }
+    std::vector<std::size_t> cursors(active.size());
+    std::vector<bool> emitted(blocks);
+    std::size_t count = 0;
+    while (count < candidates.size()) {
+        for (std::size_t query = 0; query < active.size() && count < candidates.size(); ++query) {
+            auto& cursor = cursors[query];
+            while (cursor < candidates.size() && emitted[ranks[query][cursor]]) ++cursor;
+            if (cursor == candidates.size()) continue;
+            const auto block = ranks[query][cursor++];
+            emitted[block] = true;
+            out[block] = static_cast<double>(candidates.size() - count++) / static_cast<double>(candidates.size());
+        }
+    }
+    return out;
+}
 } // namespace kvmem
