@@ -322,6 +322,7 @@ Prepare the chosen backend before GPU builds. Configure llama.cpp from the repos
 | [Tiering validation](docs/active-kv-tiering-validation-20261010.md) | 已测范围与限制 / Qualification evidence |
 | [Memory backend contract](docs/memory-backend-contract.md) | 新后端接入 / Backend integration contracts |
 | [Migration validation](docs/ninfer-all-migration-validation.md) | 固定 NInfer 基线 / Pinned engine migration |
+| [Documentation-only CI](docs/ci.md) | 文档修改跳过编译测试 / Build and test skipping |
 | [Windows guide](scripts/windows/README.md) | llama.cpp 构建与快捷入口 / llama.cpp build and launcher details |
 | [ROCm guide](docs/rocm.md) | HIP/ROCm 路径 / AMD builds |
 | [llama.cpp multimodal report](docs/multimodal-implementation-report-2026-09-14.md) | 历史图像实现 / Earlier image implementation |
