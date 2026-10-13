@@ -82,6 +82,14 @@ layouts, independent User and instruction fallbacks, whitespace admission, contr
 provenance, media/graft offsets, covering BPE/NFC boundaries and marker independence.
 The default full Frontend suite retains the legacy `Automatic` recovery fixtures;
 `Basic` canonical-empty and literal-tag framing remains tested independently.
+The integrated upstream parser also accepts compact non-strict empty framing
+without consuming a subsequent parameter. Strict raw strings keep their literal
+markup. An ambiguous non-strict string beginning with a closing tag followed by
+the next parameter framing is therefore interpreted as parameter boundaries;
+This matches Automatic's existing boundary interpretation. A stop token inside
+open reasoning closes that block and continues the
+reply; a turn-level stop after reasoning still ends it. The focused Frontend modes
+`--tool-output-only` and `--reasoning-stop-only` exercise these contracts.
 
 For a running two-lane server configured as documented in the HTTP test:
 
