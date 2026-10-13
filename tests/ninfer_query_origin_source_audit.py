@@ -65,7 +65,7 @@ body = new_pred[new_pred.index('{'):]
     + old_pred[old_pred.index('{'):] + '\n')
 history_function = function(window_new, 'std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(')
 admission = function(window_new, 'bool ProgramImpl::memory_query_checkpoint_compatible(')
-assert 'if (!memory_query_checkpoint_compatible(*history, prompt, frontier))' in history_function
+assert '!memory_query_checkpoint_compatible(*history,prompt,frontier)' in ''.join(history_function.split())
 (out / 'cache_admission.inc').write_text(
     'bool Predicate::memory_query_checkpoint_compatible(const Window& window, const Prompt& prompt, std::uint32_t frontier) const '
     + admission[admission.index('{'):] + '\n')

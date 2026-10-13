@@ -225,7 +225,7 @@ int main(int argc,char** argv) try {
     auto many=fixture("CURRENT_TASK","clock snapshot",false);
     for(unsigned i=0;i<6;++i) many.push_back(message(ninfer::ChatRole::User,"context "+std::to_string(i)));
     const auto many_queries=query_candidates(t,fi::encode_rendered_chat(t,renderer.render(many)));
-    require(many_queries.size()==3 && many_queries.front()=="CURRENT_TASK" && many_queries.back()=="context 5",
+    require(many_queries==std::vector<std::string>{"CURRENT_TASK","context 5"},
         "repeated unmodified User context lost the anchor or newest query");
     many.push_back(message(ninfer::ChatRole::User,"Cancel the old task; use the new requirement"));
     const auto cancelled=query_candidates(t,fi::encode_rendered_chat(t,renderer.render(many)));
