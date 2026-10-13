@@ -118,7 +118,9 @@ Run eight isolated processes in old/new/new/old, new/old/old/new order. The entr
 requires five successful requests, exact synthetic request hashes, two running
 lanes with average Decode batch at least 1.9, three full 1,536-token outputs,
 at least two history swaps in both C1/C2 measurements and no request errors or
-engine recoveries. `--audit-existing-results rows.json` verifies existing rows
+engine recoveries. The optional stderr check detects logged transfer failures;
+it does not enable transfer verification or require exact-verification records.
+`--audit-existing-results rows.json` verifies existing rows
 and logs without new inference; omit `--server` in that mode. Small samples and
 run-to-run variance do not establish statistical equivalence or a general speedup.
 

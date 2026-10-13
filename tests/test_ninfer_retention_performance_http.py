@@ -6,6 +6,8 @@ Start a fresh server per run with the quality runner's configuration and
 python3 tests/test_ninfer_retention_performance_http.py --server http://127.0.0.1:18087 --request-log events.jsonl --output performance.json
 Use eight fresh processes in O,N,N,O,N,O,O,N order for two balanced ABBA blocks.
 This script does not start/stop servers or execute external tools.
+The optional stderr check only detects logged transfer failures; it does not
+enable transfer verification or require exact-verification records.
 """
 import argparse
 import concurrent.futures
@@ -61,7 +63,7 @@ def summarize(rows, events, stderr):
             for r in rows if r['case'] in ('decode_C1', 'decode_C2_batch')),
         'no_request_errors': not any(e.get('event') in ('request_error', 'request_rejected') for e in events),
         'no_engine_recoveries': not any(e.get('engine_recoveries', 0) for e in throughput),
-        'transfer_verification': None if stderr is None else re.search(r'(?:payload_exact|state_exact)=0', stderr) is None,
+        'no_logged_transfer_failures': None if stderr is None else re.search(r'(?:payload_exact|state_exact)=0', stderr) is None,
     }
     by_name = {r['case']: r for r in rows}
     decode = long_done[0]['engine_timing']['decode'] if long_done else {}
