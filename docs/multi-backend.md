@@ -2,7 +2,7 @@
 
 本文对应 `master` 的 0.18.0 多后端源码，包含活跃 KV 的 RAM/SSD 分层。Windows NInfer [0.18.0 正式版](https://github.com/kvmem/kvmem/releases/tag/v0.18.0)基于 RC3 引擎，默认 sink=12288 tokens（12K）、recent=1024 tokens（1K）。两后端参数差异见 [实现差异](multi-backend-differences.md)，历史验收范围见 [分层验收记录](active-kv-tiering-validation-20261010.md)。
 
-0.18.0 源码采用 `iamwavecut/ninfer-all` 的固定提交 `8319e8f51247`，llama.cpp 基线保持原值。当前迁移验收进度见 [迁移记录](ninfer-all-migration-validation.md)；下文各有日期的实验是旧基线证据，不能视为新基线已经完成同等覆盖。KVMem 暂不支持新增的 `qwen4_exp`、模型 suspend、prompt graft 和 router，开启这些组合时明确报错。
+当前 0.18.1 RC 源码采用 `iamwavecut/ninfer-all` 的固定提交 `1383a50e4153`，llama.cpp 基线保持原值。本次接入与验收范围见 [升级记录](ninfer-all-upgrade-20261014.md)；下文各有日期的实验是旧基线证据，不能视为新基线已经完成同等覆盖。KVMem 暂不支持新增的 `qwen4_exp`、`gemma4`、模型 suspend、prompt graft 和 router，开启这些组合时明确报错。
 
 Windows 入口 `scripts/windows/start-backend.ps1` 在启动时选择 `llamacpp` 或 `ninfer`。两个 worker 分进程运行，各自拥有推理引擎和 GPU 内存；公共 KVMem 策略库直接链接在 worker 内。
 

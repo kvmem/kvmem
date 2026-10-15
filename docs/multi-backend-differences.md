@@ -2,7 +2,7 @@
 
 更新日期：2026 年 10 月 10 日。适用于多后端分支的活跃 KV 分层候选集成（本次工作分支 `feat/active-kv-tiering`，基线 `eb98424e7654`）。两个后端的完整集成改动在 `backends/patches/`，准备后的精确树哈希在 `backends/versions.json`。
 
-迁移候选的 ninfer 上游为 `iamwavecut/ninfer-all`，固定在 `8319e8f51247`。KVMem 保留 Qwen3.5/3.8 Dense 的既有边界，新增的 `qwen4_exp`、suspend、graft 和 router 尚未适配，组合会被拒绝。Q2_0/Q4_0/Q5_0 是权重量化格式，不能据此推断新的模型架构已经支持 KVMem。新基线的实际验证范围见 [迁移记录](ninfer-all-migration-validation.md)。
+迁移候选的 ninfer 上游为 `iamwavecut/ninfer-all`，固定在 `1383a50e4153`。KVMem 保留 Qwen3.5/3.8 Dense 的既有边界，新增的 `qwen4_exp`、`gemma4`、suspend、graft 和 router 尚未适配，组合会被拒绝。Q2_0/Q4_0/Q5_0 是权重量化格式，不能据此推断新的模型架构已经支持 KVMem。新基线的实际验证范围见 [本次升级记录](ninfer-all-upgrade-20261014.md)。
 
 llama.cpp 与 ninfer 共用 KVMem 策略和内存契约，但保留各自的推理、页池、请求处理和参数解析。切换后端时，需要同时核对参数名称、默认值、计量范围和执行行为。下表比较的是本项目的 `llama-kvmem-server` 与 ninfer KVMem worker，不是上游两个引擎的全部能力。
 

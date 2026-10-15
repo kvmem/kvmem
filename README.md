@@ -45,6 +45,10 @@ These packages retain their own feature and parameter scope. The 0.18.0 binary r
 
 </details>
 
+当前 NInfer 源码已升级到 2026-10-14 基线；新的源码、功能边界与验证范围见 [升级记录](docs/ninfer-all-upgrade-20261014.md)。上表 0.18.0 已发布运行包保留其发布时的行为。
+
+RTX 20 / TITAN RTX 与 V100 的首轮 Windows 构建作为 [0.18.1 NInfer RC1](docs/releases/v0.18.1-ninfer-rc1.md) 提供，用于征集实卡验证；这两类卡目前只有编译、目标架构和依赖检查，没有实卡资格结论。
+
 ## 0.18.0 功能 / What's in 0.18.0
 
 - **多后端源码 / Multi-backend source**：共享 KVMem 内存、检索和存储契约；llama.cpp 与 NInfer 分别保留原生推理和服务实现。上游版本、集成补丁与完整来源由 [backend manifest](backends/versions.json) 固定。 / Shared memory, retrieval and storage contracts with separate native engine workers and pinned integration patches.
