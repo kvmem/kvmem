@@ -4,6 +4,8 @@
 
 KVMem 在有限显存中管理长对话与 Agent 工具历史：完整原生 KV 保存在 Host RAM，可选下沉到 SSD；GPU 按当前查询保留所需历史和生成工作空间。`master` 已包含 **0.18.0 多后端源码**，Windows RTX 30/40/50 的 **NInfer 0.18.0 正式运行包**已发布。
 
+**RTX 20 / TITAN RTX 与 Tesla V100：**新的 **[NInfer v0.18.1 RC1](https://github.com/kvmem/kvmem/releases/tag/v0.18.1-ninfer-rc1)** 实机试用包已经发布，并已内置 Web UI。[下载 RTX 20 / sm75](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-rtx20-sm75.zip) · [下载 V100 / sm70](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-v100-sm70.zip)
+
 仓库现名为 **[kvmem/kvmem](https://github.com/kvmem/kvmem)**。旧地址 [kvmem/kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp) 由 GitHub 自动跳转；旧发布与下载链接继续可用。请勿重新创建旧名称仓库，以免覆盖跳转。
 
 **QQ 交流群：1040777853**
@@ -15,6 +17,19 @@ KVMem 在有限显存中管理长对话与 Agent 工具历史：完整原生 KV 
 ## 下载
 
 **运行包和模型使用英文路径，完整路径不能含中文，包括用户名、上级目录和文件名。**
+
+### RTX 20 / TITAN RTX 与 Tesla V100 · v0.18.1 RC1
+
+| 显卡 | Windows x64 NInfer v0.18.1 RC1 | 构建 | 大小 |
+|---|---|---|---:|
+| RTX 20 / TITAN RTX | [下载 ZIP](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-rtx20-sm75.zip) | sm75 / CUDA 13.2 | 1161.3 MiB |
+| Tesla V100 | [下载 ZIP](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-v100-sm70.zip) | sm70 / CUDA 12.9 | 939.4 MiB |
+
+[RC1 完整发布说明](https://github.com/kvmem/kvmem/releases/tag/v0.18.1-ninfer-rc1) · [ZIP SHA256](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/SHA256SUMS-ninfer-old-gpu.txt) · [运行包验证记录](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/PACKAGE-VALIDATION.json)
+
+两个包都内置 Web UI，当前用于老卡实机试用。构建目标、依赖和压缩包均已检查，但 RTX 20、TITAN RTX 与 V100 的实卡资格验证仍待完成。
+
+### RTX 30 / 40 / 50 · v0.18.0 正式版
 
 | 显卡 | Windows x64 NInfer 0.18.0 | 大小 |
 |---|---|---:|

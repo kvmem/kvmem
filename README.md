@@ -4,6 +4,8 @@
 
 KVMem manages long conversations and agent tool histories within a bounded GPU working set. Native KV history lives in Host RAM, with optional SSD tiering; retrieval brings selected history onto the GPU. **`master` contains the 0.18.0 multi-backend source**, and **stable NInfer 0.18.0 packages** are available for Windows RTX 30/40/50 GPUs.
 
+**RTX 20 / TITAN RTX and Tesla V100:** the new **[NInfer v0.18.1 RC1](https://github.com/kvmem/kvmem/releases/tag/v0.18.1-ninfer-rc1)** hardware-trial packages are available now, with the Web UI built in. [Download RTX 20 / sm75](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-rtx20-sm75.zip) · [Download V100 / sm70](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-v100-sm70.zip)
+
 The repository is now **[kvmem/kvmem](https://github.com/kvmem/kvmem)**. GitHub redirects the former [kvmem/kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp) URL, including existing release and download links. Do not reuse the old repository name, which would replace the redirect.
 
 **QQ community: 1040777853**
@@ -15,6 +17,19 @@ The repository is now **[kvmem/kvmem](https://github.com/kvmem/kvmem)**. GitHub 
 ## Downloads
 
 **Use English paths for the package and model. The full path, including the username, parent directories and filename, must not contain Chinese characters.**
+
+### RTX 20 / TITAN RTX and Tesla V100 · v0.18.1 RC1
+
+| GPU | Windows x64 NInfer v0.18.1 RC1 | Build | Size |
+|---|---|---|---:|
+| RTX 20 / TITAN RTX | [Download ZIP](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-rtx20-sm75.zip) | sm75 / CUDA 13.2 | 1161.3 MiB |
+| Tesla V100 | [Download ZIP](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-v100-sm70.zip) | sm70 / CUDA 12.9 | 939.4 MiB |
+
+[RC1 release notes](https://github.com/kvmem/kvmem/releases/tag/v0.18.1-ninfer-rc1) · [ZIP SHA256](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/SHA256SUMS-ninfer-old-gpu.txt) · [Package validation](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/PACKAGE-VALIDATION.json)
+
+These packages include the embedded Web UI and are intended for hardware trials. Their build targets, dependencies and archives have been checked, but RTX 20, TITAN RTX and V100 physical-GPU qualification is still pending.
+
+### RTX 30 / 40 / 50 · v0.18.0 stable
 
 | GPU | Windows x64 NInfer 0.18.0 | Size |
 |---|---|---:|
