@@ -104,4 +104,13 @@ if (KVMEM_BUILD_LLAMA)
     target_include_directories(kvmem-output-limit-test PRIVATE tools llama.cpp/vendor/cpp-httplib)
     target_link_libraries(kvmem-output-limit-test PRIVATE llama-common cpp-httplib)
     add_test(NAME kvmem-output-limit-test COMMAND kvmem-output-limit-test)
+
+    add_executable(kvmem-model-card-test tests/model-card-test.cpp)
+    target_include_directories(kvmem-model-card-test PRIVATE tools llama.cpp/vendor)
+    add_test(NAME kvmem-model-card-test COMMAND kvmem-model-card-test)
+
+    add_executable(kvmem-chat-tools-test tests/chat-tools-test.cpp)
+    target_include_directories(kvmem-chat-tools-test PRIVATE tools)
+    target_link_libraries(kvmem-chat-tools-test PRIVATE llama-common)
+    add_test(NAME kvmem-chat-tools-test COMMAND kvmem-chat-tools-test)
 endif()
