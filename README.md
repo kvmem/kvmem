@@ -153,6 +153,11 @@ NInfer supports a layer pipeline across up to eight GPUs of the same CUDA comput
 
 Text and resident/CPU image requests support up to eight active lanes. B/R are per request and H/D are per process, so increasing concurrency increases resource requirements. Concurrent ngram widths above 15 are clamped to 15; CPU image encoding remains serial. Fast prefill is admitted only for INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8. NInfer KVMem rejects video, overlay vision, DFlash, parallel prefill and legacy `--lookup-ngram`. See [multi-backend runtime](docs/multi-backend.md) for parameter ranges, model boundaries and qualified combinations.
 
+NInfer can opt into [resident checkpoint host buffers](docs/ninfer-checkpoint-residency.md)
+with `NINFER_KVMEM_CHECKPOINT_RESIDENT=1` to move checkpoint pinning and page
+population to startup. It trades additional page-locked host residency and
+startup work for reduced allocation stalls; it is disabled by default.
+
 <a id="performance"></a>
 
 ## Completed RC3 performance results
