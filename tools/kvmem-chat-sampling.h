@@ -3,7 +3,9 @@
 #include "common.h"
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <string>
 
@@ -36,13 +38,31 @@ inline bool kvmem_chat_reasoning_budget_override(
 
 inline bool kvmem_chat_reasoning_budget_supported(
         const common_params_sampling & sp, bool thinking, std::string & err) {
-    if (thinking && sp.reasoning_budget_tokens >= 0 &&
+    if (!thinking) {
+        // 思考被禁用，budget_tokens 没有意义——直接忽略，不报错。
+        // 这样 harness 在 disabled 模式下残留的 budget 字段不会 400。
+        return true;
+    }
+    if (sp.reasoning_budget_tokens >= 0 &&
             (sp.reasoning_budget_start.empty() || sp.reasoning_budget_end.empty() ||
              sp.reasoning_budget_forced.empty())) {
-        err = "the current chat template has no usable thinking markers; cannot enforce reasoning_budget_tokens";
-        return false;
+        // 思考启用但模板没 budget 标记——降级：用 CLI --reasoning-budget
+        // 的全局默认值，不再让整条请求 400。
+        err.clear();
+        return true;
     }
     return true;
+}
+
+// Reserve room for the final answer/tool payload when a thinking budget would
+// otherwise consume the entire max_tokens allowance.
+inline int kvmem_effective_reasoning_budget(
+        bool thinking, int requested_budget, int max_tokens, int answer_reserve) {
+    if (!thinking || requested_budget <= 0) return requested_budget;
+    if (answer_reserve < 0) answer_reserve = 0;
+    if (max_tokens <= 0) return requested_budget;
+    const int cap = std::max(0, max_tokens - answer_reserve);
+    return std::min(requested_budget, cap);
 }
 
 // Qwen3.8-27B model card, Best Practices (2026-09-13).

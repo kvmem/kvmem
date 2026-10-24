@@ -4,7 +4,9 @@
 #include "kvmem-spec.h"
 #include "kvmem-chat-sampling.h"
 #include "kvmem-chat-template.h"
+#include "kvmem-chat-tools.h"
 #include "kvmem-chat-id.h"
+#include "kvmem-model-card.h"
 #include "kvmem-webui.h"
 #include "kvmem-server-options.h"
 #include "kvmem-server-auth.h"
@@ -1442,8 +1444,9 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
             if (tc.is_string()) {
                 out.tool_choice = common_chat_tool_choice_parse_oaicompat(tc.get<std::string>());
             } else if (tc.is_object()) {
-                // OpenAI named-function form → required (template/grammar in T2).
-                out.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+                if (!kvmem_apply_named_tool_choice(tc, out.tools, out.tool_choice, err)) {
+                    return false;
+                }
             } else {
                 err = "tool_choice must be a string or object";
                 return false;
@@ -2012,8 +2015,11 @@ int main(int argc, char ** argv) {
     std::unordered_set<std::string> ui_paths;
     if (!kvmem_mount_ui(svr, ui_dir, no_ui, argv[0], &ui_paths)) return 1;
     kvmem_install_auth(svr, options.api_keys, std::move(ui_paths));
-    const int generation_limit = st.kparams.enabled && st.kparams.gen_reserve > 0 ?
-        std::min(n_ctx, (int) st.kparams.gen_reserve) : n_ctx;
+    // generation_limit = 默认 max_tokens 的硬上限（取进程 -n/--n-predict 与 n_ctx 的较小者）。
+    // 注意：gen_reserve 是 KVMem decode 阶段预留的 KV 空间（防 cache miss OOM），
+    // 与最大输出 token 数无关，不能用来当输出上限。
+    const int generation_limit = st.n_predict_default > 0 ?
+        std::min(st.n_predict_default, n_ctx) : n_ctx;
     startup["context_actual"] = llama_n_ctx(st.ctx);
     startup["batch_actual"] = llama_n_batch(st.ctx);
     startup["ubatch_actual"] = llama_n_ubatch(st.ctx);
@@ -2125,9 +2131,23 @@ int main(int argc, char ** argv) {
         res.set_content(json::array({slot}).dump(), "application/json");
     });
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
+        bool supports_tools = true;
+        if (st.tmpls) {
+            const auto caps = common_chat_templates_get_caps(st.tmpls.get());
+            const auto it = caps.find("supports_tools");
+            if (it != caps.end()) supports_tools = it->second;
+        }
+        // template_kwargs 里的值是 JSON 序列化后的字符串（如 "\"low\""）。
+        std::string default_effort;
+        if (const auto it = st.template_kwargs.find("reasoning_effort"); it != st.template_kwargs.end()) {
+            const json effort = json::parse(it->second, nullptr, false);
+            if (effort.is_string()) default_effort = effort.get<std::string>();
+        }
         json j = {
             {"object", "list"},
-            {"data", json::array({json{{"id", st.model_name}, {"name", st.model_name}, {"object", "model"}, {"status", {{"value", "loaded"}}}}})},
+            {"data", json::array({kvmem_model_card_json(st.model_name, n_ctx, st.n_predict_default,
+                generation_limit, st.vision != nullptr, supports_tools, st.enable_thinking_default,
+                st.reasoning_budget_default, default_effort)})},
         };
         res.set_content(j.dump(), "application/json");
     });
@@ -2301,6 +2321,15 @@ int main(int argc, char ** argv) {
             res.set_content(json{{"error", err}}.dump(), "application/json");
             return;
         }
+        const int answer_reserve = cr.tools.empty() ? 1024 : 2048;
+        const int requested_budget = sparams.reasoning_budget_tokens;
+        sparams.reasoning_budget_tokens = kvmem_effective_reasoning_budget(
+                cr.enable_thinking, requested_budget, cr.max_tokens, answer_reserve);
+        if (sparams.reasoning_budget_tokens != requested_budget) {
+            kvmem_diag("KVMEM_TRACE reasoning_budget clamp requested=%d effective=%d max_tokens=%d tools=%d reserve=%d\n",
+                    requested_budget, sparams.reasoning_budget_tokens, cr.max_tokens,
+                    (int) !cr.tools.empty(), answer_reserve);
+        }
         kvmem_diag("KVMEM_TRACE sampling thinking=%d temperature=%.6g top_p=%.6g top_k=%d min_p=%.6g "
                 "presence_penalty=%.6g frequency_penalty=%.6g repetition_penalty=%.6g seed=%u\n",
                 (int) cr.enable_thinking, sparams.temp, sparams.top_p, sparams.top_k, sparams.min_p,
@@ -2334,9 +2363,7 @@ int main(int argc, char ** argv) {
         }
 
         if ((st.vision || st.query_policy_user) && st.spec.ok && !use_spec) {
-            res.status = 400;
-            res.set_content("{\"error\":\"MTP sampler could not initialize for this request\"}", "application/json");
-            return;
+            kvmem_diag("KVMEM_TRACE MTP unavailable for this request; continuing with greedy decode\n");
         }
 
         json request_params = default_params;
