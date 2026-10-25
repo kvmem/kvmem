@@ -165,7 +165,7 @@ static void print_usage(const char * argv0) {
             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
-            "  --spec-type TYPE           none | draft-mtp | draft-dflash (default none)\n"
+            "  --spec-type TYPE           none | draft-mtp | draft-dflash | draft-dspark (default none)\n"
             "  --spec-kv-dtype TYPE       draft K/V type (default f16)\n"
             "  --spec-draft-n-max N       draft tokens (default 3)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
@@ -1033,10 +1033,12 @@ int main(int argc, char ** argv) {
                 st.spec_algorithm = kvmem::SpeculativeAlgorithm::Mtp;
             } else if (eq(t, "draft-dflash") || eq(t, "dflash2")) {
                 st.spec_algorithm = kvmem::SpeculativeAlgorithm::DFlash2;
+            } else if (eq(t, "draft-dspark") || eq(t, "dspark")) {
+                st.spec_algorithm = kvmem::SpeculativeAlgorithm::DSpark;
             } else if (eq(t, "none")) {
                 st.spec_algorithm = kvmem::SpeculativeAlgorithm::None;
             } else {
-                fprintf(stderr, "unsupported --spec-type %s (none|draft-mtp|draft-dflash)\n", t);
+                fprintf(stderr, "unsupported --spec-type %s (none|draft-mtp|draft-dflash|draft-dspark)\n", t);
                 return 1;
             }
             st.spec_enabled = st.spec_algorithm != kvmem::SpeculativeAlgorithm::None;
@@ -1237,10 +1239,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "invalid GPU configuration: %s\n", e.what());
         return 1;
     }
-    if (st.spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 &&
+    if ((st.spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 ||
+         st.spec_algorithm == kvmem::SpeculativeAlgorithm::DSpark) &&
             (st.spec_draft_model.empty() || device_config.devices.size() > 2 ||
              mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR)) {
-        fprintf(stderr, "KVMEM_STARTUP_ERROR DFlash2 requires --spec-draft-model and one GPU\n");
+        fprintf(stderr, "KVMEM_STARTUP_ERROR DFlash2/DSpark requires --spec-draft-model and one GPU\n");
         return 1;
     }
     if (mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR && st.spec_enabled && st.kparams.enabled && st.kparams.mtp_state != 0) {
@@ -1314,8 +1317,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to load model\n");
         return 1;
     }
-    if (st.spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 && llama_model_n_devices(st.model) > 1) {
-        fprintf(stderr, "KVMEM_STARTUP_ERROR DFlash2 requires a single target GPU; select one device\n");
+    if ((st.spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 ||
+         st.spec_algorithm == kvmem::SpeculativeAlgorithm::DSpark) && llama_model_n_devices(st.model) > 1) {
+        fprintf(stderr, "KVMEM_STARTUP_ERROR DFlash2/DSpark requires a single target GPU; select one device\n");
         return 1;
     }
     st.vocab = llama_model_get_vocab(st.model);
@@ -1505,6 +1509,17 @@ int main(int argc, char ** argv) {
     httplib::Server svr;
     svr.set_read_timeout(options.timeout, 0);
     svr.set_write_timeout(options.timeout, 0);
+    svr.set_exception_handler([](const httplib::Request & req, httplib::Response & res, std::exception_ptr ep) {
+        const char * msg = "unknown exception";
+        try {
+            if (ep) std::rethrow_exception(ep);
+        } catch (const std::exception & e) {
+            msg = e.what();
+        } catch (...) {}
+        fprintf(stderr, "KVMEM_HTTP_500 %s: %s\n", req.path.c_str(), msg);
+        res.status = 500;
+        res.set_content(json{{"error", msg}}.dump(), "application/json");
+    });
     const int http_workers = options.threads_http_set ?
         (options.threads_http > 0 ? options.threads_http :
             std::max(2 * options.parallel, std::max(5, static_cast<int>(std::thread::hardware_concurrency()) - 1))) :
@@ -1899,6 +1914,14 @@ int main(int argc, char ** argv) {
             res.status = 400;
             res.set_content("{\"error\":\"empty prompt\"}", "application/json");
             return;
+        }
+        if (cr.max_tokens > 0) {
+            const int n_ctx = (int) llama_n_ctx(st.ctx);
+            if ((int) toks.size() + cr.max_tokens > n_ctx) {
+                // llama-server clamps instead of rejecting: the webui echoes
+                // default max_tokens (= n_ctx) back verbatim, which must not 400
+                cr.max_tokens = std::max(1, n_ctx - (int) toks.size());
+            }
         }
         if ((int) toks.size() + cr.max_tokens > (int) llama_n_ctx(st.ctx)) {
             res.status = 400;

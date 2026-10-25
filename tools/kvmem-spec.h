@@ -52,7 +52,8 @@ struct kvmem_spec_session {
     bool use_gdn_replay = false;
     uint32_t n_rs_tgt = 0;
     bool ok = false;
-    bool independent_draft() const { return config.algorithm == kvmem::SpeculativeAlgorithm::DFlash2; }
+    bool independent_draft() const { return config.algorithm == kvmem::SpeculativeAlgorithm::DFlash2 ||
+                                             config.algorithm == kvmem::SpeculativeAlgorithm::DSpark; }
 };
 
 bool kvmem_spec_start(kvmem_spec_session & sess,
@@ -98,7 +99,9 @@ struct kvmem_spec_gen_stats {
     double wall_ms = 0.0;
     bool failed = false;
     nlohmann::json metrics() const {
-        return {{"backend", algorithm == kvmem::SpeculativeAlgorithm::DFlash2 ? "draft-dflash" : "draft-mtp"},
+        return {{"backend", algorithm == kvmem::SpeculativeAlgorithm::DFlash2 ? "draft-dflash"
+                             : algorithm == kvmem::SpeculativeAlgorithm::DSpark ? "draft-dspark"
+                             : "draft-mtp"},
             {"timing_scope", "generation_loop"}, {"drafted_tokens", draft_tokens},
             {"accepted_tokens", accepted_tokens}, {"verification_steps", verification_steps},
             {"generation_rounds", generation_rounds}, {"fallback_rounds", fallback_rounds},

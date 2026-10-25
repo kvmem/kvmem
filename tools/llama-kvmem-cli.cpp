@@ -68,7 +68,7 @@ static void print_usage(const char * argv0) {
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
             "  --seed N                   RNG seed; -1=random (ordinary default 0, MTP random)\n"
-            "  --spec-type TYPE           none | draft-mtp | draft-dflash (default none)\n"
+            "  --spec-type TYPE           none | draft-mtp | draft-dflash | draft-dspark (default none)\n"
             "  --spec-kv-dtype TYPE       draft K/V type (default: inherit target K/V types)\n"
             "  --spec-draft-n-max N       draft tokens (default 2)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
@@ -270,10 +270,12 @@ int main(int argc, char ** argv) {
                 spec_algorithm = kvmem::SpeculativeAlgorithm::Mtp;
             } else if (eq(t, "draft-dflash") || eq(t, "dflash2")) {
                 spec_algorithm = kvmem::SpeculativeAlgorithm::DFlash2;
+            } else if (eq(t, "draft-dspark") || eq(t, "dspark")) {
+                spec_algorithm = kvmem::SpeculativeAlgorithm::DSpark;
             } else if (eq(t, "none")) {
                 spec_algorithm = kvmem::SpeculativeAlgorithm::None;
             } else {
-                fprintf(stderr, "unsupported --spec-type %s (none|draft-mtp|draft-dflash)\n", t);
+                fprintf(stderr, "unsupported --spec-type %s (none|draft-mtp|draft-dflash|draft-dspark)\n", t);
                 return 1;
             }
             spec_enabled = spec_algorithm != kvmem::SpeculativeAlgorithm::None;
@@ -371,9 +373,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "invalid GPU configuration: %s\n", e.what());
         return 1;
     }
-    if (spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 &&
+    if ((spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 ||
+         spec_algorithm == kvmem::SpeculativeAlgorithm::DSpark) &&
             (spec_draft_model.empty() || device_config.devices.size() > 2 || model_params.split_mode == LLAMA_SPLIT_MODE_TENSOR)) {
-        fprintf(stderr, "DFlash2 requires --spec-draft-model and one GPU\n");
+        fprintf(stderr, "DFlash2/DSpark requires --spec-draft-model and one GPU\n");
         return 1;
     }
     if (model_params.split_mode == LLAMA_SPLIT_MODE_TENSOR && spec_enabled && kparams.enabled && kparams.mtp_state != 0) {
@@ -394,8 +397,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to load model: %s\n", model_path.c_str());
         return 1;
     }
-    if (spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 && llama_model_n_devices(model) > 1) {
-        fprintf(stderr, "DFlash2 requires a single target GPU; select one device\n");
+    if ((spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 ||
+         spec_algorithm == kvmem::SpeculativeAlgorithm::DSpark) && llama_model_n_devices(model) > 1) {
+        fprintf(stderr, "DFlash2/DSpark requires a single target GPU; select one device\n");
         llama_model_free(model);
         return 1;
     }
