@@ -79,15 +79,19 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
 
     common_params p;
     const bool dflash2 = opts.algorithm == kvmem::SpeculativeAlgorithm::DFlash2;
-    if (dflash2 && (opts.n_max < 1 || opts.n_max > 15)) {
-        fprintf(stderr, "DFlash2 draft count must be in 1..15\n");
+    const bool dspark = opts.algorithm == kvmem::SpeculativeAlgorithm::DSpark;
+    const bool independent = dflash2 || dspark;
+    if (independent && (opts.n_max < 1 || opts.n_max > 15)) {
+        fprintf(stderr, "DFlash2/DSpark draft count must be in 1..15\n");
         return false;
     }
-    if (dflash2 && opts.draft_model.empty()) {
-        fprintf(stderr, "DFlash2 requires --spec-draft-model with a compatible draft GGUF\n");
+    if (independent && opts.draft_model.empty()) {
+        fprintf(stderr, "DFlash2/DSpark requires --spec-draft-model with a compatible draft GGUF\n");
         return false;
     }
-    p.speculative.types = { dflash2 ? COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH : COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    p.speculative.types = { dspark ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK
+                          : dflash2 ? COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+                                    : COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
     p.speculative.draft.n_max = opts.n_max;
     p.speculative.draft.n_min = opts.n_min;
     p.speculative.draft.p_min = opts.p_min;
@@ -125,14 +129,14 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
         sess.init.reset(); sess.ctx_dft = nullptr;
         return false;
     }
-    if (dflash2) {
+    if (independent) {
         const auto * draft = llama_get_model(sess.ctx_dft);
         const int32_t * layers = llama_model_target_layer_ids(draft);
         const uint32_t count = llama_model_target_layer_ids_n(draft);
         bool compatible = count > 0 && llama_model_n_embd(draft) == llama_model_n_embd(model_tgt);
         for (uint32_t i = 0; i < count; ++i) compatible &= layers[i] >= 0 && layers[i] < llama_model_n_layer(model_tgt);
         if (!compatible) {
-            fprintf(stderr, "DFlash2 draft feature width/layers do not match the target model\n");
+            fprintf(stderr, "DFlash2/DSpark draft feature width/layers do not match the target model\n");
             sess.init.reset(); sess.ctx_dft = nullptr;
             return false;
         }

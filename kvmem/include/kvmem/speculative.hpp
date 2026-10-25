@@ -9,12 +9,13 @@
 #include <utility>
 
 namespace kvmem {
-enum class SpeculativeAlgorithm { None, Mtp, DFlash, DFlash2 };
+enum class SpeculativeAlgorithm { None, Mtp, DFlash, DFlash2, DSpark };
 inline const char * speculative_name(SpeculativeAlgorithm value) noexcept {
     switch (value) {
         case SpeculativeAlgorithm::Mtp: return "mtp";
         case SpeculativeAlgorithm::DFlash: return "dflash";
         case SpeculativeAlgorithm::DFlash2: return "dflash2";
+        case SpeculativeAlgorithm::DSpark: return "dspark";
         default: return "none";
     }
 }
