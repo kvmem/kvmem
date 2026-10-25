@@ -20,6 +20,8 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--tokenizer", type=Path, help="explicit same-model export; omitted: export this GGUF to the local model-specific cache")
     parser.add_argument("--gpu", required=True)
+    parser.add_argument("--backend", choices=("cuda", "hip"), default="cuda",
+                        help="cuda: --gpu is an NVIDIA UUID; hip: --gpu is a HIP device ordinal (Linux KFD order)")
     parser.add_argument("--log", type=Path)
     parser.add_argument("--model-alias", default="kvmem-polystrata-qwen35")
     parser.add_argument("--chat-template-file", type=Path)
@@ -132,8 +134,11 @@ def main():
     if args.vision_worker and (not args.vision_worker.is_file() or not args.mmproj.is_file()):
         parser.error("vision worker or mmproj is missing")
     gpu_uuids = [args.gpu.strip()]
-    if not re.fullmatch(r"GPU-[0-9a-fA-F-]{8,64}",gpu_uuids[0]):
-        parser.error("this integration requires one GPU UUID")
+    if args.backend == "cuda":
+        if not re.fullmatch(r"GPU-[0-9a-fA-F-]{8,64}",gpu_uuids[0]):
+            parser.error("this integration requires one GPU UUID")
+    elif not re.fullmatch(r"\d+",gpu_uuids[0]):
+        parser.error("the hip backend requires one device ordinal (--gpu N)")
     if args.host not in ("127.0.0.1", "localhost", "::1") and not os.environ.get("STRATA_API_KEY"):
         parser.error("a non-loopback listener requires STRATA_API_KEY")
     extra = args.worker_args[1:] if args.worker_args[:1] == ["--"] else args.worker_args
@@ -171,23 +176,29 @@ def main():
         worker_args += ["--kvmem-sessions", str(args.retained_sessions)]
     worker_args += extra
     indices = [0]
-    if not args.dry_run:
+    if args.backend == "hip":
+        indices = [int(gpu_uuids[0])]
+    elif not args.dry_run:
         devices = subprocess.check_output(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"], text=True)
         found = {row.split(",")[1].strip(): int(row.split(",")[0]) for row in devices.splitlines()}
         if any(uuid not in found for uuid in gpu_uuids):
             parser.error("one or more GPU UUIDs were not found")
         indices = [found[uuid] for uuid in gpu_uuids]
+    env = {"KVMEM_POLY_STORAGE_METRICS": "1",
+           "KVMEM_POLY_SESSION_METRICS": "1",
+           "STRATA_FATTN": os.environ.get("STRATA_FATTN", "1"),
+           "STRATA_FDEC": os.environ.get("STRATA_FDEC", "1")}
+    if args.backend == "cuda":
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     config = {
         "exe": str(args.worker), "args": worker_args, "cwd": str(args.source),
         "tokenizer": str(args.tokenizer), "model_name": args.model_alias,
-        "backend": "cuda", "gpu": indices[0],
-        "env": {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "KVMEM_POLY_STORAGE_METRICS": "1",
-                "KVMEM_POLY_SESSION_METRICS": "1",
-                "STRATA_FATTN": os.environ.get("STRATA_FATTN", "1"),
-                "STRATA_FDEC": os.environ.get("STRATA_FDEC", "1")},
-        "kvmem_monitor_gpu_uuid": gpu_uuids[0],
+        "backend": args.backend, "gpu": indices[0],
+        "env": env,
         "warm_start": False, "kvmem_default_max_tokens": args.max_tokens or None,
     }
+    if args.backend == "cuda":
+        config["kvmem_monitor_gpu_uuid"] = gpu_uuids[0]
     if args.log:
         config["log"]=str(args.log.resolve())
     effort = args.reasoning_effort

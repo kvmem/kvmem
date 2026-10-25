@@ -205,6 +205,32 @@ Prior integration validation also covered C2/C4/C8, SSD, acceptance faults and C
 vision. Those full matrices were not all rerun for mainline adaptation. No performance
 comparison was run as part of this merge validation.
 
+## HIP (ROCm) backend
+
+`backends/patches/polystrata-hip-kvmem.patch` builds the opt-in qwen35moe KVMem
+adapter on HIP. When `STRATA_ENABLE_HIP` selects a HIP build, the portable core's
+query scorer (`kvmem/src/cuda/page_softmax.cu`) is compiled as HIP against the same
+`hip_compat` headers as `src/poly`'s kernels and linked as a `kvmem_recall_hip`
+object library instead of `kvmem_enable_cuda_recall()`, `src/poly/kvmem_capture.cu`
+is compiled as HIP, the KVMem gate accepts `STRATA_ENABLE_HIP` as well as
+`STRATA_ENABLE_CUDA`, and the GDN MTP state and elastic tests link the selected
+`${_strata_poly_driver}` rather than `CUDA::cuda_driver`. The CUDA build is
+unchanged.
+
+`tools/polystrata/server.py` keeps `--backend cuda` as the default and adds
+`--backend hip`, where `--gpu N` is a HIP device ordinal in Linux KFD order: the
+launcher skips the `nvidia-smi` UUID lookup, does not set `CUDA_DEVICE_ORDER`, and
+leaves `kvmem_monitor_gpu_uuid` unset. A CUDA launch with `--gpu GPU-...` behaves as
+before, including its UUID validation.
+
+On an RX 7900 XT (gfx1100) under Linux ROCm, with a Q8_0 qwen35moe model at the
+pinned upstream base, the prepared tree built as a HIP worker and the launcher
+started the service with `--backend hip --gpu 0`. Text turns passed, CPU vision
+encoding of a document image passed, and a forced recall probe answered a key that
+the KV budget had evicted. Vision residency was CPU; no GPU vision, more than one
+concurrent sequence, multi-device staging, or Windows HIP build is claimed for this
+backend, and no CUDA-versus-HIP performance comparison was run.
+
 ## Native CI coverage
 
 The `polystrata-cuda-build-linux` job prepares and verifies the pinned patch
