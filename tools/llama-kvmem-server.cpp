@@ -318,8 +318,23 @@ static bool stream_heartbeat(StreamIo * io) {
     if (now - io->last_beat < std::chrono::seconds(10)) {
         return true;
     }
-    static const char beat[] = ": keepalive\n\n";
-    if (!io->sink->write(beat, sizeof(beat) - 1)) {
+    // Send a real ChatCompletionChunk as heartbeat so clients that ignore SSE
+    // comments (e.g. langchain_openai stream_chunk_timeout) do not time out
+    // during long prompt prefill phases. Must match the official
+    // server-context.cpp format exactly to pass OpenAI SDK validation.
+    const json heartbeat = {
+        {"id",      "heartbeat"},
+        {"object",  "chat.completion.chunk"},
+        {"created", (int64_t)std::time(nullptr)},
+        {"model",   ""},
+        {"choices", {{{
+            {"index",        0},
+            {"delta",        json::object()},
+            {"finish_reason", nullptr}
+        }}}}
+    };
+    const std::string beat = "data: " + heartbeat.dump() + "\n\n";
+    if (!io->sink->write(beat.c_str(), beat.size())) {
         io->aborted = true;
         return false;
     }
