@@ -46,7 +46,11 @@ inline bool kvmem_chat_template_override(const nlohmann::json & body, bool & thi
         } else if (level == "default") {
             merged.erase("reasoning_effort");
         } else {
-            merged["reasoning_effort"] = effort->dump();
+            // 跨 provider effort 名兼容：有些 harness 发 high/max，
+            // 但 llama.cpp 本地模板只认 xhigh/medium/low。
+            std::string normalized = level;
+            if (normalized == "high" || normalized == "max") normalized = "xhigh";
+            merged["reasoning_effort"] = json(normalized).dump();
         }
     }
     // Avoid a stale default kwarg overriding a request's explicit switch during rendering.
