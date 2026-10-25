@@ -327,11 +327,11 @@ static bool stream_heartbeat(StreamIo * io) {
         {"object",  "chat.completion.chunk"},
         {"created", (int64_t)std::time(nullptr)},
         {"model",   ""},
-        {"choices", {{{
+        {"choices", {{
             {"index",        0},
             {"delta",        json::object()},
             {"finish_reason", nullptr}
-        }}}}
+        }}}
     };
     const std::string beat = "data: " + heartbeat.dump() + "\n\n";
     if (!io->sink->write(beat.c_str(), beat.size())) {
