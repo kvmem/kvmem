@@ -1822,6 +1822,12 @@ int main(int argc, char ** argv) {
         cr.reasoning_budget_tokens = st.reasoning_budget_default;
         cr.reasoning_budget_message = st.reasoning_budget_message;
         std::string err;
+        // kvmem_output_limit fills an omitted max_tokens with generation_limit (= n_ctx),
+        // which can never satisfy prompt + max_tokens <= n_ctx. Track explicitness so
+        // the default can be clamped to the remaining context instead of rejecting
+        // every legal bare request (issue #192).
+        const bool explicit_max_tokens = body.contains("max_tokens") ||
+                                         body.contains("max_completion_tokens");
         if (!parse_chat_request(body, cr, err) ||
             !kvmem_output_limit(body, generation_limit, cr.max_tokens, err)) {
             res.status = 400;
@@ -1896,9 +1902,15 @@ int main(int argc, char ** argv) {
             return;
         }
         if ((int) toks.size() + cr.max_tokens > (int) llama_n_ctx(st.ctx)) {
-            res.status = 400;
-            res.set_content("{\"error\":\"prompt + max_tokens exceeds n_ctx\"}", "application/json");
-            return;
+            const int room = (int) llama_n_ctx(st.ctx) - (int) toks.size();
+            if (explicit_max_tokens || room <= 0) {
+                res.status = 400;
+                res.set_content("{\"error\":\"prompt + max_tokens exceeds n_ctx\"}", "application/json");
+                return;
+            }
+            // The request asked for "whatever fits": an omitted max_tokens is the
+            // server default, not a demand for exactly generation_limit tokens.
+            cr.max_tokens = room;
         }
         try {
             llama_driver_validate_capacity(st, *parsed_prompt, (int) toks.size());
