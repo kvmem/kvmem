@@ -144,6 +144,19 @@ The resulting workers are `build-backends/llamacpp/bin/llama-kvmem-server.exe` a
 
 ## Development and release
 
+### README maintenance
+
+Keep `README.md` and `README.zh-CN.md` as a concise, version-independent project
+introduction, quick start and documentation index. Keep the two languages in sync.
+Use `/releases/latest` for the stable release and `/releases` for previews and history.
+
+Routine version releases and package refreshes do not require README edits. Put
+version numbers, per-GPU downloads, package sizes, checksums, driver requirements,
+release-specific defaults and qualification results in GitHub Releases, package
+notes and the relevant documentation. Update the homepage only when the project
+scope, basic startup steps or permanent navigation changes, or when correcting an
+error. Do not replace its stable links with direct versioned asset URLs.
+
 Backend changes are an ordered `patches` list in `backends/versions.json`. Each
 entry records its `id`, repository-relative `path`, SHA-256, preceding `requires`,
 and exact `after_tree`. The backend's `patched_tree` is the final entry's tree.
