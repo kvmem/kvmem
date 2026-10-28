@@ -12,7 +12,8 @@
 
 图片与动画直接复用发布视频素材，由模型生成的原始 HTML 在浏览器中渲染、录制；没有重绘模型输出。
 首页直接嵌入 GIF，加载后即可观看循环动画。medium 的录制裁去了网页外边距并保留完整 SVG 场景，
-xhigh 保留完整页面；GIF 沿用录制时间，统一输出为 15 fps、960 像素宽。
+xhigh 保留完整页面。首页 GIF 从原视频素材的 960 像素宽、15 fps 压缩为
+480 像素宽、12 fps、96 色，保持约 9.5 秒的完整循环；两张合计约 3.2 MB，比原文件缩小约 80%。
 
 KVMem 的生成预留空间 R（Gen reserve）可以循环使用：追加空间不足时，
 从 GPU 驻留 KV 中重新选择工作集，释放追加空间后继续生成。因此一次回答可以超过 R，
@@ -32,8 +33,10 @@ Hardware, model and setting information was supplied by the operator of these ru
 The images and animations reuse the video's assets, captured by rendering the
 model's original HTML in a browser. The artwork was not redrawn. The medium capture
 removes page margins while retaining the complete SVG scene; xhigh retains the
-whole page. GIFs preserve capture timing at 15 fps and 960 pixels wide. The README
-embeds the GIFs directly so the looping animations play on the homepage.
+whole page. For the homepage, the original 960-pixel-wide, 15 fps GIFs are compressed
+to 480 pixels wide, 12 fps and 96 colors, retaining the full loop of about 9.5 seconds.
+Together they total about 3.2 MB, roughly 80% smaller than the originals. The README
+embeds these GIFs directly for looping playback.
 
 KVMem reuses its generation reserve R: when append space runs short, it selects a
 working set from resident GPU KV and frees space to continue generating. A response
