@@ -7,8 +7,19 @@
 KVMem 将完整原生 KV 历史保存在内存中，可选下沉到 SSD；GPU 只保留当前请求需要的历史和生成工作空间。项目支持 llama.cpp 与 NInfer 后端，提供本地 Web UI 和兼容 OpenAI 的 API。
 
 - **长上下文**：按查询召回历史 KV，在固定显存预算内管理长对话和工具历史。
+- **Extra-long / xhigh 长推理**：循环复用 GPU 生成空间，在有限显存下持续生成长推理与回答，支持 `xhigh` 推理档位。
 - **状态复用**：支持多轮对话、工具续接和会话管理，按后端规则复用前缀与检查点。
 - **内存分层**：统一管理 RAM / SSD 中的 KV 历史，按需调入 GPU。
+
+## Demo：16GB 显卡上的 xhigh 推理
+
+**RTX 5060 Ti 16GB · 27B IQ3 模型 · 本地实测。** 下图是发布视频中使用的两份鹈鹕骑行 HTML 动画，分别由 `medium` 与 `xhigh` 推理档位生成。点击预览图可查看动画。
+
+| `medium` | `xhigh` |
+|:---:|:---:|
+| [![medium 推理档位生成的鹈鹕骑行 HTML](docs/assets/pelican-reasoning/medium.png)](docs/assets/pelican-reasoning/medium.gif) | [![xhigh 推理档位生成的鹈鹕骑行 HTML](docs/assets/pelican-reasoning/xhigh.png)](docs/assets/pelican-reasoning/xhigh.gif) |
+
+KVMem 在生成过程中持续腾出空间，**Gen reserve 是可循环使用的工作空间，不是累计输出上限**；仍遵循上下文、请求限制与模型停止条件。这里展示的是单次生成实例，来源与范围见 [示例说明](docs/demos/pelican-reasoning.md)。
 
 <a id="downloads"></a>
 
