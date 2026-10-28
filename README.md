@@ -4,7 +4,7 @@
 
 **Long-context conversations and AI agents on limited GPU memory.**
 
-KVMem keeps complete native KV history in system RAM, with optional SSD tiering. The GPU holds the history needed for the current request and space for generation. It supports llama.cpp and NInfer backends, with a local Web UI and OpenAI-compatible APIs.
+KVMem keeps complete native KV history in system RAM, with optional SSD tiering. The GPU holds the history needed for the current request and space for generation. It supports multiple inference backends — **NInfer, llama.cpp and PolyStrata**, with more coming soon — through a local Web UI and OpenAI-compatible APIs.
 
 - **Long context:** Retrieve relevant KV history to manage long conversations and tool histories within a fixed GPU budget.
 - **Extra-long / xhigh reasoning:** Reuse GPU generation space to sustain long reasoning and answers on limited VRAM, including the `xhigh` reasoning setting.

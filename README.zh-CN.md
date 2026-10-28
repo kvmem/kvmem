@@ -4,7 +4,7 @@
 
 **在有限显存中运行长上下文对话与 AI Agent。**
 
-KVMem 将完整原生 KV 历史保存在内存中，可选下沉到 SSD；GPU 只保留当前请求需要的历史和生成工作空间。项目支持 llama.cpp 与 NInfer 后端，提供本地 Web UI 和兼容 OpenAI 的 API。
+KVMem 将完整原生 KV 历史保存在内存中，可选下沉到 SSD；GPU 只保留当前请求需要的历史和生成工作空间。项目支持 **NInfer、llama.cpp、PolyStrata** 等多种推理后端，并持续接入更多后端，提供本地 Web UI 和兼容 OpenAI 的 API。
 
 - **长上下文**：按查询召回历史 KV，在固定显存预算内管理长对话和工具历史。
 - **Extra-long / xhigh 长推理**：循环复用 GPU 生成空间，在有限显存下持续生成长推理与回答，支持 `xhigh` 推理档位。
