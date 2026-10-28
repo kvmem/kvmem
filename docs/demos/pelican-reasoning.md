@@ -11,7 +11,7 @@
 | ![medium 鹈鹕骑行动画](../assets/pelican-reasoning/medium.gif) | ![xhigh 鹈鹕骑行动画](../assets/pelican-reasoning/xhigh.gif) |
 
 图片与动画直接复用发布视频素材，由模型生成的原始 HTML 在浏览器中渲染、录制；没有重绘模型输出。
-首页使用静态预览，点击后打开对应动画。medium 的录制裁去了网页外边距并保留完整 SVG 场景，
+首页直接嵌入 GIF，加载后即可观看循环动画。medium 的录制裁去了网页外边距并保留完整 SVG 场景，
 xhigh 保留完整页面；GIF 沿用录制时间，统一输出为 15 fps、960 像素宽。
 
 KVMem 的生成预留空间 R（Gen reserve）可以循环使用：追加空间不足时，
@@ -29,11 +29,11 @@ These pelican cycling HTML animations appeared in the KVMem release video on
 and a **27B IQ3 model**, with **medium** and **xhigh** reasoning settings.
 Hardware, model and setting information was supplied by the operator of these runs.
 
-The previews and animations reuse the video's assets, captured by rendering the
+The images and animations reuse the video's assets, captured by rendering the
 model's original HTML in a browser. The artwork was not redrawn. The medium capture
 removes page margins while retaining the complete SVG scene; xhigh retains the
 whole page. GIFs preserve capture timing at 15 fps and 960 pixels wide. The README
-uses still previews that link to the animations above.
+embeds the GIFs directly so the looping animations play on the homepage.
 
 KVMem reuses its generation reserve R: when append space runs short, it selects a
 working set from resident GPU KV and frees space to continue generating. A response

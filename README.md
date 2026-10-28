@@ -13,11 +13,11 @@ KVMem keeps complete native KV history in system RAM, with optional SSD tiering.
 
 ## Demo: xhigh reasoning on a 16 GB GPU
 
-**RTX 5060 Ti 16 GB · 27B IQ3 model · real local runs.** The pelican cycling animations below are original HTML outputs from the release video, generated with `medium` and `xhigh` reasoning settings. Click either preview to see its animation.
+**RTX 5060 Ti 16 GB · 27B IQ3 model · real local runs.** The pelican cycling animations below are original HTML outputs from the release video, generated with `medium` and `xhigh` reasoning settings.
 
 | `medium` | `xhigh` |
 |:---:|:---:|
-| [![Pelican cycling HTML output with medium reasoning](docs/assets/pelican-reasoning/medium.png)](docs/assets/pelican-reasoning/medium.gif) | [![Pelican cycling HTML output with xhigh reasoning](docs/assets/pelican-reasoning/xhigh.png)](docs/assets/pelican-reasoning/xhigh.gif) |
+| ![Pelican cycling HTML output with medium reasoning](docs/assets/pelican-reasoning/medium.gif) | ![Pelican cycling HTML output with xhigh reasoning](docs/assets/pelican-reasoning/xhigh.gif) |
 
 KVMem makes room as generation proceeds, so **Gen reserve is reusable workspace, not the cumulative output limit**. Context, request limits and model stop conditions still apply. These are individual examples; see the [demo notes](docs/demos/pelican-reasoning.md) for provenance and scope.
 

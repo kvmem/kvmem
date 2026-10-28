@@ -13,11 +13,11 @@ KVMem 将完整原生 KV 历史保存在内存中，可选下沉到 SSD；GPU �
 
 ## Demo：16GB 显卡上的 xhigh 推理
 
-**RTX 5060 Ti 16GB · 27B IQ3 模型 · 本地实测。** 下图是发布视频中使用的两份鹈鹕骑行 HTML 动画，分别由 `medium` 与 `xhigh` 推理档位生成。点击预览图可查看动画。
+**RTX 5060 Ti 16GB · 27B IQ3 模型 · 本地实测。** 下图是发布视频中使用的两份鹈鹕骑行 HTML 动画，分别由 `medium` 与 `xhigh` 推理档位生成。
 
 | `medium` | `xhigh` |
 |:---:|:---:|
-| [![medium 推理档位生成的鹈鹕骑行 HTML](docs/assets/pelican-reasoning/medium.png)](docs/assets/pelican-reasoning/medium.gif) | [![xhigh 推理档位生成的鹈鹕骑行 HTML](docs/assets/pelican-reasoning/xhigh.png)](docs/assets/pelican-reasoning/xhigh.gif) |
+| ![medium 推理档位生成的鹈鹕骑行 HTML](docs/assets/pelican-reasoning/medium.gif) | ![xhigh 推理档位生成的鹈鹕骑行 HTML](docs/assets/pelican-reasoning/xhigh.gif) |
 
 KVMem 在生成过程中持续腾出空间，**Gen reserve 是可循环使用的工作空间，不是累计输出上限**；仍遵循上下文、请求限制与模型停止条件。这里展示的是单次生成实例，来源与范围见 [示例说明](docs/demos/pelican-reasoning.md)。
 
