@@ -21,7 +21,6 @@ CONSOLE_PATHS = {
     'scripts/requirements-console.txt', 'scripts/speculative-capabilities.json',
     'scripts/linux/start-ui.sh', 'scripts/linux/package-console.py',
     'scripts/windows/start-ui.ps1', 'scripts/windows/package-console.ps1',
-    'scripts/windows/package-chat-update.py',
     'scripts/windows/describe-launch-json.ps1', 'scripts/install-console-dependency.py',
     'ui/package.json', 'ui/package-lock.json',
 }

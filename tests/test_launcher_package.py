@@ -11,7 +11,7 @@ import zipfile
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('linux_package', ROOT/'scripts/linux/package-console.py')
 package=importlib.util.module_from_spec(spec); spec.loader.exec_module(package)
-spec=importlib.util.spec_from_file_location('chat_update', ROOT/'scripts/windows/package-chat-update.py')
+spec=importlib.util.spec_from_file_location('chat_update', ROOT/'scripts/launcher/chat_update.py')
 chat_update=importlib.util.module_from_spec(spec); spec.loader.exec_module(chat_update)
 
 
