@@ -34,7 +34,8 @@ class DocumentationChangesTest(unittest.TestCase):
 
     def test_console_changes_run_host_scripts_without_engine_builds(self):
         paths = ['scripts/local-console.py', 'scripts/launcher/plan.py', 'scripts/linux/start-ui.sh',
-                 'ui/monitor/launcher.js', 'tests/test_launcher_services.py', 'docs/linux-launcher.md']
+                 'ui/monitor/launcher.js', 'tests/test_launcher_services.py', 'docs/linux-launcher.md',
+                 'scripts/windows/package-chat-update.py', 'tests/test_launcher_package.py']
         self.assertTrue(changes.requires_ci(paths))
         self.assertFalse(changes.requires_native(paths))
         self.assertFalse(changes.requires_cuda(paths, 'a', 'b'))
