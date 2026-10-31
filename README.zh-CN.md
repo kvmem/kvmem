@@ -6,6 +6,22 @@
 
 KVMem 将完整原生 KV 历史保存在内存中，可选下沉到 SSD；GPU 只保留当前请求需要的历史和生成工作空间。项目支持 **NInfer、llama.cpp、PolyStrata** 等多种推理后端，并持续接入更多后端，提供本地 Web UI 和兼容 OpenAI 的 API。
 
+## 支持哪些模型？按后端选择
+
+以下是**启用 KVMem 历史管理时**支持的主要模型范围。选择模型时，请同时确认后端和文件格式。
+
+| 后端 | 模型 | 模型格式 |
+|---|---|---|
+| **[NInfer](docs/multi-backend-differences.md)** | **Qwen3.5 Dense**（0.8B / 2B / 4B / 9B / 27B）、**Qwen3.6 / Qwen3.8 27B**，以及兼容的微调模型，包括 **Ternary Bonsai 2 27B** | `.ninfer`，需使用兼容的模型文件或先转换权重 |
+| **[llama.cpp](docs/multi-backend.md)** | **Qwen3.5 Dense**、**Qwen3.6 / Qwen3.8 27B**、**Ternary Bonsai 2 27B**，以及其他兼容的全注意力 GGUF 模型 | `.gguf` |
+| **[PolyStrata](docs/polystrata-integration.md)** | **Qwen3.6-35B-A3B**、**Ornith 1.5**、**Tiel Coder / Cyber-Tiel 35B-A3B** 等兼容的 `qwen35moe` 模型 | `.gguf`；图片输入还需匹配的 `mmproj` |
+
+NInfer 的 KVMem 接入目前覆盖 **Dense** 模型；PolyStrata 覆盖 **`qwen35moe` MoE** 架构。这两个上游引擎支持的其他模型尚不在上述 KVMem 范围内。llama.cpp 的 KVMem 适配器会跳过滑动窗口注意力（SWA）及纯循环架构模型。
+
+架构支持不代表每个尺寸、量化和功能组合都已实测。具体范围见 [Qwen3.5 Dense 家族验收](docs/qwen35-dense-family.md)、[Bonsai 接入](docs/bonsai-integration.md) 和 [PolyStrata 接入](docs/polystrata-integration.md)。实际可用模型、视觉与 MTP 能力还取决于模型组件及所选[运行包](https://github.com/kvmem/kvmem/releases)。
+
+## KVMem 能做什么
+
 - **长上下文**：按查询召回历史 KV，在固定显存预算内管理长对话和工具历史。
 - **Extra-long / xhigh 长推理**：循环复用 GPU 生成空间，在有限显存下持续生成长推理与回答，支持 `xhigh` 推理档位。
 - **状态复用**：支持多轮对话、工具续接和会话管理，按后端规则复用前缀与检查点。

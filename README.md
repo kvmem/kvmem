@@ -6,6 +6,22 @@
 
 KVMem keeps complete native KV history in system RAM, with optional SSD tiering. The GPU holds the history needed for the current request and space for generation. It supports multiple inference backends — **NInfer, llama.cpp and PolyStrata**, with more coming soon — through a local Web UI and OpenAI-compatible APIs.
 
+## Supported models by backend
+
+These are the main model families supported with **KVMem history management enabled**. Choose the backend and model format together.
+
+| Backend | Models | Model format |
+|---|---|---|
+| **[NInfer](docs/multi-backend-differences.md)** | **Qwen3.5 Dense** (0.8B / 2B / 4B / 9B / 27B), **Qwen3.6 / Qwen3.8 27B**, and compatible fine-tunes, including **Ternary Bonsai 2 27B** | `.ninfer` — use a compatible artifact or convert the weights first |
+| **[llama.cpp](docs/multi-backend.md)** | **Qwen3.5 Dense**, **Qwen3.6 / Qwen3.8 27B**, **Ternary Bonsai 2 27B**, and other compatible full-attention GGUF models | `.gguf` |
+| **[PolyStrata](docs/polystrata-integration.md)** | **Qwen3.6-35B-A3B**, **Ornith 1.5**, **Tiel Coder / Cyber-Tiel 35B-A3B**, and compatible `qwen35moe` models | `.gguf`; image input also needs a matching `mmproj` |
+
+NInfer's KVMem integration currently covers **Dense** models; PolyStrata's covers the **`qwen35moe` MoE** architecture. Other models supported by those upstream engines are outside this KVMem scope. llama.cpp's KVMem adapter skips sliding-window-attention (SWA) and purely recurrent models.
+
+Architecture support does not mean every size, quantization or feature combination has been tested. See the [Qwen3.5 Dense family coverage](docs/qwen35-dense-family.md), [Bonsai integration](docs/bonsai-integration.md) and [PolyStrata integration](docs/polystrata-integration.md). Availability, vision and MTP support depend on the model components and the [release package](https://github.com/kvmem/kvmem/releases).
+
+## What KVMem does
+
 - **Long context:** Retrieve relevant KV history to manage long conversations and tool histories within a fixed GPU budget.
 - **Extra-long / xhigh reasoning:** Reuse GPU generation space to sustain long reasoning and answers on limited VRAM, including the `xhigh` reasoning setting.
 - **State reuse:** Reuse prefixes and checkpoints across conversations and tool continuations according to each backend's rules.
