@@ -36,7 +36,9 @@ struct SessionIdentity {
     uint64_t incarnation = 0; // changes on reset/replacement; edits advance content/history versions
     bool operator==(const SessionIdentity & other) const;
 };
-enum class PayloadPlaneKind { Key, Value, KeyScale, ValueScale };
+// PackedKeyValue preserves a backend-native page (including its scales) as an
+// opaque byte record. Append new kinds to preserve existing serialized values.
+enum class PayloadPlaneKind { Key, Value, KeyScale, ValueScale, PackedKeyValue };
 struct PayloadPlane {
     uint32_t layer = 0; // model layer identity, not a dense attention-layer index
     PayloadPlaneKind kind = PayloadPlaneKind::Key;

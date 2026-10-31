@@ -302,6 +302,21 @@ static void policy_and_checkpoint() {
     }
 }
 int main() {
+    // Native packed pages carry their scales inside the opaque record. They
+    // cannot advertise per-token addressing or overlap split K/V planes.
+    PayloadLayout packed{"packed-test", 1, 128, 256, 1,
+        {{0, PayloadPlaneKind::PackedKeyValue, 0, 256, 1, 0}}};
+    packed.validate();
+    auto invalid = packed;
+    invalid.planes[0].token_stride = 1;
+    rejects(MemoryErrorCode::InvalidPlan, [&] { invalid.validate(); });
+    for (auto kind : {PayloadPlaneKind::Key, PayloadPlaneKind::Value,
+                     PayloadPlaneKind::KeyScale, PayloadPlaneKind::ValueScale}) {
+        invalid = packed;
+        invalid.record_bytes = 512;
+        invalid.planes.push_back({0, kind, 256, 256, 1, 0});
+        rejects(MemoryErrorCode::InvalidPlan, [&] { invalid.validate(); });
+    }
     for (int profile = 0; profile < 3; ++profile) success(profile);
     planning_failures();
     no_op_and_park();

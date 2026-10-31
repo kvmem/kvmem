@@ -2,6 +2,8 @@
 
 # KVMem
 
+AMD RDNA4 backend: [Radiance on Windows and Linux](docs/radiance-integration.md), with build and deployment commands, default settings, and [full benchmark comparisons](docs/radiance/PERFORMANCE-COMPARISON.md).
+
 **Long-context conversations and AI agents on limited GPU memory.**
 
 KVMem keeps complete native KV history in system RAM, with optional SSD tiering. The GPU holds the history needed for the current request and space for generation. It supports multiple inference backends — **NInfer, llama.cpp and PolyStrata**, with more coming soon — through a local Web UI and OpenAI-compatible APIs.

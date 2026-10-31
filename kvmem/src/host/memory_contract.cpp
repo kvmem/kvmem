@@ -62,6 +62,10 @@ void PayloadLayout::validate() const {
         switch (p.kind) {
         case PayloadPlaneKind::Key: case PayloadPlaneKind::Value:
         case PayloadPlaneKind::KeyScale: case PayloadPlaneKind::ValueScale: break;
+        case PayloadPlaneKind::PackedKeyValue:
+            if (p.token_stride)
+                fail(MemoryErrorCode::InvalidPlan, "packed KV pages require opaque token addressing");
+            break;
         default: fail(MemoryErrorCode::InvalidPlan, "unknown payload plane kind");
         }
         end = add(p.offset, p.bytes);
@@ -69,7 +73,10 @@ void PayloadLayout::validate() const {
             fail(MemoryErrorCode::InvalidPlan, "payload plane exceeds its record");
     }
     for (const auto & layer : layers) {
-        if (!layer.second.count(PayloadPlaneKind::Key) || !layer.second.count(PayloadPlaneKind::Value))
+        const bool packed = layer.second.count(PayloadPlaneKind::PackedKeyValue) != 0;
+        const bool key = layer.second.count(PayloadPlaneKind::Key) != 0;
+        const bool value = layer.second.count(PayloadPlaneKind::Value) != 0;
+        if (packed ? layer.second.size() != 1 : (!key || !value))
             fail(MemoryErrorCode::InvalidPlan, "every attention layer requires key and value planes");
     }
 }
