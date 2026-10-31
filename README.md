@@ -20,6 +20,20 @@ NInfer's KVMem integration currently covers **Dense** models; PolyStrata's cover
 
 Architecture support does not mean every size, quantization or feature combination has been tested. See the [Qwen3.5 Dense family coverage](docs/qwen35-dense-family.md), [Bonsai integration](docs/bonsai-integration.md) and [PolyStrata integration](docs/polystrata-integration.md). Availability, vision and MTP support depend on the model components and the [release package](https://github.com/kvmem/kvmem/releases).
 
+## Supported GPUs by backend
+
+The table covers the main GPU families for **KVMem**, with package and source-build differences noted below.
+
+| Backend | GPU families / example cards | Scope |
+|---|---|---|
+| **NInfer** | **NVIDIA RTX 20 / 30 / 40 / 50**, **TITAN RTX**, **Tesla V100** | CUDA only. V100 needs an `sm_70` / CUDA 12 build or a matching older package. A100-class `sm_80` is a source compatibility target without KVMem hardware qualification. |
+| **llama.cpp** | **NVIDIA RTX 20 / 30 / 40 / 50** (CUDA); **AMD Radeon RX 6800 / 6900**, **RX 7700 XT / 7800 XT / 7900 XT / XTX**, **RX 9060 XT / 9070 / 9070 XT** (HIP/ROCm) | AMD availability depends on the SDK, OS and compiled GPU targets; see the [ROCm guide](docs/rocm.md). RX 9060 XT has recorded KVMem long-context tests. |
+| **PolyStrata** | **NVIDIA RTX 20 / 30 / 40 / 50** | KVMem uses one CUDA GPU. The opt-in AMD HIP source integration is **experimental**, pending AMD inference qualification; see [integration status](docs/polystrata-integration.md). |
+
+RTX examples include **2060 / 2080 Ti**, **3060 / 3090**, **4060 Ti / 4090**, and **5050 Laptop / 5060 Ti / 5090**. The series name alone does not guarantee enough VRAM for a chosen model and configuration.
+
+Choose a [release package](https://github.com/kvmem/kvmem/releases) matching your GPU, OS and backend. The unified Windows packages cover RTX 20 / 30 / 40 / 50 with NInfer and PolyStrata; llama.cpp and AMD use separate packages or source builds. A compiled target is not a test of every card: check the package's instructions and validation report for driver requirements and actual hardware coverage.
+
 ## What KVMem does
 
 - **Long context:** Retrieve relevant KV history to manage long conversations and tool histories within a fixed GPU budget.

@@ -20,6 +20,20 @@ NInfer 的 KVMem 接入目前覆盖 **Dense** 模型；PolyStrata 覆盖 **`qwen
 
 架构支持不代表每个尺寸、量化和功能组合都已实测。具体范围见 [Qwen3.5 Dense 家族验收](docs/qwen35-dense-family.md)、[Bonsai 接入](docs/bonsai-integration.md) 和 [PolyStrata 接入](docs/polystrata-integration.md)。实际可用模型、视觉与 MTP 能力还取决于模型组件及所选[运行包](https://github.com/kvmem/kvmem/releases)。
 
+## 支持哪些显卡？按后端选择
+
+下表列出 **KVMem** 的主要显卡系列，并说明运行包与源码构建的区别。
+
+| 后端 | 显卡系列 / 代表型号 | 支持范围 |
+|---|---|---|
+| **NInfer** | **NVIDIA RTX 20 / 30 / 40 / 50 系**、**TITAN RTX**、**Tesla V100** | 仅 CUDA。V100 需 `sm_70` / CUDA 12 构建或匹配的历史运行包。A100 类 `sm_80` 有源码兼容目标，尚无 KVMem 实卡验收。 |
+| **llama.cpp** | **NVIDIA RTX 20 / 30 / 40 / 50 系**（CUDA）；**AMD Radeon RX 6800 / 6900**、**RX 7700 XT / 7800 XT / 7900 XT / XTX**、**RX 9060 XT / 9070 / 9070 XT**（HIP/ROCm） | AMD 可用范围取决于 SDK、操作系统与编译目标，见 [ROCm 指南](docs/rocm.md)。RX 9060 XT 已有 KVMem 长上下文实测记录。 |
+| **PolyStrata** | **NVIDIA RTX 20 / 30 / 40 / 50 系** | KVMem 当前使用 CUDA 单卡。源码中的 AMD HIP 入口仍为**实验性**，尚待 AMD 实卡推理验收，见[接入状态](docs/polystrata-integration.md)。 |
+
+RTX 代表型号包括 **2060 / 2080 Ti**、**3060 / 3090**、**4060 Ti / 4090**，以及 **5050 Laptop / 5060 Ti / 5090**。显卡系列符合要求后，仍需确认显存足够容纳所选模型和配置。
+
+请在[发布页](https://github.com/kvmem/kvmem/releases)选择与显卡、系统和后端匹配的运行包。Windows 双后端统一包覆盖 RTX 20 / 30 / 40 / 50 系，包含 NInfer 和 PolyStrata；llama.cpp 与 AMD 使用独立运行包或源码构建。编译目标覆盖不等于每个型号都已实卡测试，驱动要求与实际验收范围以随包说明和验证报告为准。
+
 ## KVMem 能做什么
 
 - **长上下文**：按查询召回历史 KV，在固定显存预算内管理长对话和工具历史。
