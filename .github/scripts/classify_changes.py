@@ -15,6 +15,7 @@ NON_CUDA_PATHS = {
     'scripts/windows/test-launcher.ps1',
 }
 CONSOLE_PATHS = {
+    '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
     'START-HERE-CN.sh', 'START-HERE-EN.sh', 'START-HERE-CN.bat', 'START-HERE-EN.bat',
     'scripts/local-console.py', 'scripts/launcher-cli.py', 'scripts/launcher-capabilities.json',
     'scripts/console_chat.py', 'scripts/console_hardware.py', 'scripts/model_health.py',
@@ -23,7 +24,8 @@ CONSOLE_PATHS = {
     'scripts/windows/start-ui.ps1', 'scripts/windows/package-console.ps1',
     'scripts/windows/package-unified.py', 'scripts/windows/native-process.ps1',
     'scripts/windows/describe-launch-json.ps1', 'scripts/install-console-dependency.py',
-    'ui/package.json', 'ui/package-lock.json',
+    'scripts/windows/start-polystrata.ps1', 'scripts/windows/select-model.ps1',
+    'ui/package.json', 'ui/package-lock.json', 'ui/README.md',
 }
 
 

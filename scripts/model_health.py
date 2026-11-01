@@ -261,8 +261,18 @@ class Inspection:
             self.check('poly_arch', 'warning', '架构不在当前 PolyStrata 启动器声明范围', 'Architecture outside the current PolyStrata launcher profile', f'actual={arch}, profile=qwen35moe', 'worker')
         if self.p.get('Vision'):
             if self.p['Backend'] == 'polystrata':
-                projector = self.path(self.p['Mmproj']) if self.p.get('Mmproj') else path.parent / 'mmproj-BF16.gguf'
-                if self.required_file(projector, 'projector', '视觉投影文件', 'Vision projector', 'disable_vision'):
+                explicit = self.p.get('Mmproj')
+                if explicit:
+                    projector = self.path(explicit)
+                else:
+                    exact = [p for p in (path.with_name(path.stem + '-mmproj.gguf'), path.with_name('mmproj-' + path.stem + '.gguf')) if p.is_file()]
+                    candidates = exact or sorted(p for p in path.parent.iterdir() if p != path and p.is_file() and 'mmproj' in p.name.lower() and p.suffix.lower() == '.gguf')
+                    projector = candidates[0] if len(candidates) == 1 else None
+                if projector is None:
+                    self.check('projector_missing', 'error', '请在“模板与图像 → 图像配套文件”选择匹配的视觉投影文件', 'Select the matching projector in Templates & vision > Vision assets', 'Mmproj: no unique adjacent GGUF', 'config', 'disable_vision')
+                elif projector.suffix.lower() != '.gguf':
+                    self.check('projector_invalid', 'error', '视觉投影文件必须是 GGUF', 'Vision projector must be a GGUF file', str(projector), 'config', 'disable_vision')
+                elif self.required_file(projector, 'projector', '视觉投影文件', 'Vision projector', 'disable_vision'):
                     try:
                         self.gguf(projector)
                         self.report['features']['vision'] = 'present'
