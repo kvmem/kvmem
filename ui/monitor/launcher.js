@@ -1001,7 +1001,18 @@
         const input=field(grid,p,key,zh,en,'text',null,key==='Mmproj'?['选择与主模型配套的 GGUF，文件名不限。留空时优先查找同名配套文件，否则使用同目录唯一的 mmproj GGUF；多个候选时请手动选择。','Choose a GGUF matching the model; any filename is accepted. If empty, prefer a model-named projector, then the only adjacent mmproj GGUF. Select explicitly when ambiguous.']:null);input.placeholder=tr('自动检测','Auto-detect');input.closest('label').classList.remove('l-row');input.title=input.value;
         if(key==='Mmproj'&&info.native_picker!==false&&!info.script_export_version){
           const row=inputActions(input),choose=make('button',{type:'button',class:'s-button l-secondary','data-browse-mmproj':''},tr('选择文件','Choose file'));row.append(choose);
-          choose.onclick=async()=>{choose.disabled=true;try{const result=await api('browse-mmproj',{backend:b,current_path:input.value||root.querySelector('[data-param=Model]').value},315000);if(result.path){input.value=result.path;input.title=result.path;input.dispatchEvent(new Event('change',{bubbles:true}));}}catch(e){message(e.message,true);}finally{choose.disabled=false;}};
+          choose.onclick=async()=>{
+            const original=input.value,modelInput=root.querySelector('[data-param=Model]'),originalModel=modelInput.value;
+            choose.disabled=true;
+            try{
+              const result=await api('browse-mmproj',{backend:b,current_path:original||originalModel},315000);
+              if(result.path){
+                if(input.isConnected&&!configurationLocked()&&input.value===original&&modelInput.value===originalModel){
+                  input.value=result.path;input.title=result.path;input.dispatchEvent(new Event('change',{bubbles:true}));
+                }else message(tr('选择期间配置已改变，保留当前路径。','Configuration changed while choosing; the current path was kept.'));
+              }
+            }catch(e){message(e.message,true);}finally{choose.disabled=configurationLocked();}
+          };
         }
       }
     }

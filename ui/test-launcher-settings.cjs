@@ -202,6 +202,28 @@ module.exports = async function settingsChecks({browser,base,info}) {
   await saved();await page.reload();await field('Mmproj').waitFor({state:'attached'});
   assert.equal(await field('Mmproj').inputValue(),projector,'projector survives reload');
   assert.equal((await preview()).Mmproj,projector,'chosen projector reaches active launch payload');
+  await group(3);await page.locator('[data-vision-assets] summary').click();
+  await page.unroute('**/api/launcher/browse-mmproj');
+  // Hold the dialog response while the user makes a newer edit on the page.
+  async function delayedProjector(edit){
+    let release,received;
+    const arrived=new Promise(resolve=>received=resolve),pending=new Promise(resolve=>release=resolve);
+    await page.route('**/api/launcher/browse-mmproj',async route=>{
+      received();await pending;await route.fulfill({json:{path:'C:/models/stale-dialog-choice.gguf'}});
+    });
+    await page.locator('[data-browse-mmproj]').click();await arrived;
+    try{await edit();}finally{release();}
+    await page.waitForFunction(()=>!document.querySelector('[data-browse-mmproj]').disabled);
+    await page.unroute('**/api/launcher/browse-mmproj');
+  }
+  const manual='C:/models/new-manual-choice.gguf';
+  await delayedProjector(()=>field('Mmproj').fill(manual));
+  assert.equal(await field('Mmproj').inputValue(),manual,'late picker cannot overwrite a newer manual path');
+  assert.equal((await preview()).Mmproj,manual,'newer path reaches launch preview');
+  await delayedProjector(()=>field('Model').fill('C:/models/new-model.gguf'));
+  assert.equal(await field('Mmproj').inputValue(),manual,'a projector chosen for an old model cannot replace the current path');
+  await saved();await page.reload();await field('Mmproj').waitFor({state:'attached'});
+  assert.equal(await field('Mmproj').inputValue(),manual,'newer manual path survives reload after the late response');
   await field('Backend').selectOption('ninfer');
   assert.equal(await field('BlockTokens').count(),0,'block switch is PolyStrata only');
   await field('Model').fill('C:/models/ui fixture.ninfer');
