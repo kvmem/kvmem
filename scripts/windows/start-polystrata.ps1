@@ -77,7 +77,7 @@ if(Setting 'Vision' $false) {
         $folder=Split-Path $model
         $stem=[IO.Path]::GetFileNameWithoutExtension($model)
         $exact=@(@((Join-Path $folder "$stem-mmproj.gguf"),(Join-Path $folder "mmproj-$stem.gguf")) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
-        $candidates=@(if($exact.Count) { $exact } else { Get-ChildItem -LiteralPath $folder -File | Where-Object { $_.Name -match 'mmproj' -and $_.Extension -eq '.gguf' -and $_.FullName -ne $model } | ForEach-Object { $_.FullName } })
+        $candidates=@(if($exact.Count) { $exact } else { Get-ChildItem -LiteralPath $folder -File -Force | Where-Object { $_.Name -match 'mmproj' -and $_.Extension -eq '.gguf' -and $_.FullName -ne $model } | ForEach-Object { $_.FullName } })
         if($candidates.Count -ne 1) { throw 'Vision requires -Mmproj: no unique adjacent projector was found; select the matching GGUF in Templates & vision > Vision assets' }
         $mmproj=$candidates[0]
     }

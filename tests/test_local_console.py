@@ -589,6 +589,10 @@ class ConsoleTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'nt', 'Windows canonical launcher')
     def test_polystrata_projector_plan_matches_discovery_and_explicit_choice(self):
+        import ctypes
+        import model_health
+        from test_model_health import gguf
+
         root=Path(self.tmp.name)
         frontend=root/'frontend/serve';frontend.mkdir(parents=True)
         tokenizer=root/'tokenizer';tokenizer.mkdir()
@@ -608,6 +612,27 @@ class ConsoleTests(unittest.TestCase):
                 plan()
             projector=root/'MMPROJ-Q8_0.GGUF';projector.touch()
             chosen(projector)
+            # Windows enumeration must include hidden files just like static inspection.
+            gguf(root/'model.gguf',meta={'general.architecture':'qwen35moe'})
+            gguf(projector)
+            (root/'strata-vision.exe').write_bytes(b'fixture')
+            health_params={k:params[k] for k in ('Backend','Model','Vision','VisionWorker')}
+            attrs=ctypes.windll.kernel32.GetFileAttributesW(str(projector))
+            self.assertNotEqual(attrs,-1)
+            self.assertTrue(ctypes.windll.kernel32.SetFileAttributesW(str(projector),attrs|2))
+            try:
+                self.assertTrue(model_health.Inspection(health_params,root).run()['can_start'])
+                chosen(projector)
+                visible=root/'visible-mmproj.gguf';gguf(visible)
+                try:
+                    self.assertFalse(model_health.Inspection(health_params,root).run()['can_start'])
+                    with self.assertRaisesRegex(ValueError,'no unique adjacent projector'):
+                        plan()
+                    chosen(projector,Mmproj=str(projector))
+                finally:
+                    visible.unlink()
+            finally:
+                self.assertTrue(ctypes.windll.kernel32.SetFileAttributesW(str(projector),attrs))
             default=root/'mmproj-BF16.gguf';default.touch()
             with self.assertRaisesRegex(ValueError,'no unique adjacent projector'):
                 plan()
