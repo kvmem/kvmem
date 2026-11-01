@@ -435,12 +435,14 @@ class Controller:
         finally:
             Path(name).unlink(missing_ok=True)
 
-    def browse_model(self, data, folder=False, template=False):
+    def browse_model(self, data, folder=False, template=False, projector=False):
         if not isinstance(data, dict) or set(data) - {'backend', 'current_path'}:
             raise ValueError('Expected backend and optional current_path')
         backend, current = data.get('backend'), data.get('current_path', '')
         if backend not in self.backends or not isinstance(current, str) or '\x00' in current or len(current) > 8192:
             raise ValueError('Invalid model picker request')
+        if projector and backend not in ('llamacpp', 'polystrata'):
+            raise ValueError('This backend does not use an external GGUF projector')
         if os.name != 'nt':
             raise ValueError('The native model picker currently requires Windows')
         picker = ROOT / 'scripts/windows/select-model.ps1'
@@ -462,7 +464,7 @@ class Controller:
             powershell = str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
             result = subprocess.run([powershell, '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass',
                                      '-File', str(picker),
-                                     '-Backend', backend, '-InitialDirectory', str(initial.resolve())] + (['-Folder'] if folder else ['-Template'] if template else []),
+                                     '-Backend', backend, '-InitialDirectory', str(initial.resolve())] + (['-Folder'] if folder else ['-Template'] if template else ['-Projector'] if projector else []),
                                     capture_output=True, encoding='utf-8', errors='replace', timeout=300,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
             if result.returncode:
@@ -1422,6 +1424,7 @@ class Handler(BaseHTTPRequestHandler):
 
                        '/api/launcher/adjust-budget': self.control.adjust_budget,
                        '/api/launcher/browse-model': self.control.browse_model,
+                       '/api/launcher/browse-mmproj': lambda data: self.control.browse_model(data, projector=True),
                        '/api/launcher/browse-template': lambda data: self.control.browse_model(data, template=True),
                        '/api/launcher/browse-model-folder': lambda data: self.control.browse_model(data, folder=True),
                        '/api/launcher/scan-models': self.control.scan_models,

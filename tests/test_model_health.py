@@ -91,6 +91,29 @@ class HealthTests(unittest.TestCase):
         projector.write_bytes(b'corrupt')
         self.assertFalse(self.inspect(model,Vision=True,Mmproj=str(projector))['can_start'])
 
+    def test_polystrata_projector_discovery_and_explicit_override(self):
+        model=self.root/'model.gguf';gguf(model,meta={'general.architecture':'qwen35moe'})
+        worker=self.root/'strata-vision.exe';worker.write_bytes(b'fixture')
+        def inspect(**kwargs):
+            return self.inspect(model,'polystrata',Vision=True,VisionWorker=str(worker),**kwargs)
+        self.assertFalse(inspect()['can_start'])
+        projector=self.root/'MMPROJ-Q8_0.GGUF';gguf(projector)
+        self.assertTrue(inspect()['can_start'])
+        default=self.root/'mmproj-BF16.gguf';gguf(default)
+        self.assertFalse(inspect()['can_start'],'multiple projectors require a choice, even with BF16 present')
+        self.assertTrue(inspect(Mmproj=str(projector))['can_start'])
+        exact=self.root/'model-mmproj.gguf';gguf(exact)
+        self.assertTrue(inspect()['can_start'],'model-named projector takes priority')
+        gguf(self.root/'mmproj-model.gguf')
+        self.assertFalse(inspect()['can_start'],'two model-named projectors are ambiguous')
+        custom=self.root/"视觉 & ' $custom.gguf";gguf(custom)
+        self.assertTrue(inspect(Mmproj=str(custom))['can_start'])
+        self.assertFalse(inspect(Mmproj=str(self.root/'missing.gguf'))['can_start'])
+        wrong=self.root/'projector.txt';gguf(wrong)
+        self.assertFalse(inspect(Mmproj=str(wrong))['can_start'])
+        custom.write_bytes(b'corrupt')
+        self.assertFalse(inspect(Mmproj=str(custom))['can_start'])
+
     def test_bonsai_gguf_block_extents(self):
         path = self.root/'bonsai.gguf'
         for kind, size in [(142,34),(143,28)]:

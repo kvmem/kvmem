@@ -71,10 +71,19 @@ foreach($value in $scoring) {
 }
 if(Setting 'Vision' $false) {
     $visionWorker=Setting 'VisionWorker' (Join-Path (Split-Path $worker) 'strata-vision.exe')
-    $mmproj=Setting 'Mmproj' (Join-Path (Split-Path $model) 'mmproj-BF16.gguf')
+    $mmproj=Setting 'Mmproj' ''
     if(!$visionWorker) { $visionWorker=Join-Path (Split-Path $worker) 'strata-vision.exe' }
-    if(!$mmproj) { $mmproj=Join-Path (Split-Path $model) 'mmproj-BF16.gguf' }
+    if(!$mmproj) {
+        $folder=Split-Path $model
+        $stem=[IO.Path]::GetFileNameWithoutExtension($model)
+        $exact=@(@((Join-Path $folder "$stem-mmproj.gguf"),(Join-Path $folder "mmproj-$stem.gguf")) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+        $candidates=@(if($exact.Count) { $exact } else { Get-ChildItem -LiteralPath $folder -File | Where-Object { $_.Name -match 'mmproj' -and $_.Extension -eq '.gguf' -and $_.FullName -ne $model } | ForEach-Object { $_.FullName } })
+        if($candidates.Count -ne 1) { throw 'Vision requires -Mmproj: no unique adjacent projector was found; select the matching GGUF in Templates & vision > Vision assets' }
+        $mmproj=$candidates[0]
+    }
+    if([IO.Path]::GetExtension($mmproj) -ne '.gguf') { throw 'Mmproj must be an existing matching GGUF file' }
     foreach($asset in @($visionWorker,$mmproj)) { if(!(Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing PolyStrata vision asset: $asset" } }
+    $mmproj=(Resolve-Path -LiteralPath $mmproj).Path
     $arguments+=@('--vision-worker',$visionWorker,'--mmproj',$mmproj,'--vision-tokens',[string](Setting 'VisionTokens' 1024),'--vision-device',$(if((Setting 'VisionResidency' 'resident') -eq 'cpu'){'cpu'}else{'gpu'}))
 }
 if($WorkerArgs.Count) { $arguments+=@('--')+$WorkerArgs }

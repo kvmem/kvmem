@@ -998,7 +998,11 @@
       const assets=make('details',{class:'l-advanced l-wide','data-vision-assets':''});assets.append(make('summary',{},tr('图像配套文件','Vision assets')));
       const grid=make('div',{class:'l-fields l-vision-assets'});assets.append(grid);panels[3].append(assets);
       for(const [key,zh,en] of [...(poly?[['VisionWorker','图像编码程序','Vision encoder executable']]:[]),['Mmproj','图像投影 GGUF','Vision projection GGUF']]){
-        const input=field(grid,p,key,zh,en);input.placeholder=tr('自动检测','Auto-detect');input.closest('label').classList.remove('l-row');input.title=input.value;
+        const input=field(grid,p,key,zh,en,'text',null,key==='Mmproj'?['选择与主模型配套的 GGUF，文件名不限。留空时优先查找同名配套文件，否则使用同目录唯一的 mmproj GGUF；多个候选时请手动选择。','Choose a GGUF matching the model; any filename is accepted. If empty, prefer a model-named projector, then the only adjacent mmproj GGUF. Select explicitly when ambiguous.']:null);input.placeholder=tr('自动检测','Auto-detect');input.closest('label').classList.remove('l-row');input.title=input.value;
+        if(key==='Mmproj'&&info.native_picker!==false&&!info.script_export_version){
+          const row=inputActions(input),choose=make('button',{type:'button',class:'s-button l-secondary','data-browse-mmproj':''},tr('选择文件','Choose file'));row.append(choose);
+          choose.onclick=async()=>{choose.disabled=true;try{const result=await api('browse-mmproj',{backend:b,current_path:input.value||root.querySelector('[data-param=Model]').value},315000);if(result.path){input.value=result.path;input.title=result.path;input.dispatchEvent(new Event('change',{bubbles:true}));}}catch(e){message(e.message,true);}finally{choose.disabled=false;}};
+        }
       }
     }
     const native=make('details',{class:'s-card l-native'});

@@ -188,11 +188,25 @@ module.exports = async function settingsChecks({browser,base,info}) {
   await page.locator('[data-gpu-choice]').first().check();
   await group(4);await field('Concurrency').fill('1');
   assert.equal((await preview()).BlockTokens,32,'block size reaches active launch payload');
+  await group(3);await page.locator('[data-vision-assets] summary').click();
+  const projector="C:/models/视觉 & ' $custom.GGUF",pickerRequests=[];
+  let selection=projector;
+  await page.route('**/api/launcher/browse-mmproj',async route=>{pickerRequests.push(route.request().postDataJSON());await route.fulfill({json:{path:selection}});});
+  await field('Mmproj').fill('');
+  await page.locator('[data-browse-mmproj]').click();
+  await page.waitForFunction(value=>document.querySelector('[data-param=Mmproj]').value===value,projector);
+  assert.deepEqual(pickerRequests.at(-1),{backend:'polystrata',current_path:'C:/models/ui fixture.gguf'});
+  selection=null;await page.locator('[data-browse-mmproj]').click();
+  await page.waitForFunction(()=>!document.querySelector('[data-browse-mmproj]').disabled);
+  assert.equal(await field('Mmproj').inputValue(),projector,'cancelling preserves the chosen projector');
+  await saved();await page.reload();await field('Mmproj').waitFor({state:'attached'});
+  assert.equal(await field('Mmproj').inputValue(),projector,'projector survives reload');
+  assert.equal((await preview()).Mmproj,projector,'chosen projector reaches active launch payload');
   await field('Backend').selectOption('ninfer');
   assert.equal(await field('BlockTokens').count(),0,'block switch is PolyStrata only');
   await field('Model').fill('C:/models/ui fixture.ninfer');
   assert.equal(Object.hasOwn(await preview(),'BlockTokens'),false);
-  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/browse-template','/api/launcher/inspect-model'].includes(url)),'settings checks never start/save/stop inference');
+  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/browse-template','/api/launcher/browse-mmproj','/api/launcher/inspect-model'].includes(url)),'settings checks never start/save/stop inference');
   assert.deepEqual(errors,[]);
   console.log('PASS: help, resource placement, feature dependencies, draft/template retention, credentials, native settings and active preview payloads (no inference)');
  } finally { await context.close(); }
