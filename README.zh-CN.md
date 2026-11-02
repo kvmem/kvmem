@@ -14,9 +14,9 @@ KVMem 将完整原生 KV 历史保存在内存中，可选下沉到 SSD；GPU �
 |---|---|---|
 | **[NInfer](docs/multi-backend-differences.md)** | **Qwen3.5 Dense**（0.8B / 2B / 4B / 9B / 27B）、**Qwen3.6 / Qwen3.8 27B**，以及兼容的微调模型，包括 **Ternary Bonsai 2 27B** | `.ninfer`，需使用兼容的模型文件或先转换权重 |
 | **[llama.cpp](docs/multi-backend.md)** | **Qwen3.5 Dense**、**Qwen3.6 / Qwen3.8 27B**、**Ternary Bonsai 2 27B**，以及其他兼容的全注意力 GGUF 模型 | `.gguf` |
-| **[PolyStrata](docs/polystrata-integration.md)** | **Qwen3.6-35B-A3B**、**Ornith 1.5**、**Tiel Coder / Cyber-Tiel 35B-A3B** 等兼容的 `qwen35moe` 模型 | `.gguf`；图片输入还需匹配的 `mmproj` |
+| **[PolyStrata](docs/polystrata-integration.md)** | **Qwen3.6-35B-A3B**、**Ornith 1.5**、**Tiel Coder / Cyber-Tiel 35B-A3B** 等兼容的 `qwen35moe` 模型，以及 **Gemma 4 26B-A4B** | `.gguf`；图片输入还需匹配的 `mmproj` |
 
-NInfer 的 KVMem 接入目前覆盖 **Dense** 模型；PolyStrata 覆盖 **`qwen35moe` MoE** 架构。这两个上游引擎支持的其他模型尚不在上述 KVMem 范围内。llama.cpp 的 KVMem 适配器会跳过滑动窗口注意力（SWA）及纯循环架构模型。
+NInfer 的 KVMem 接入目前覆盖 **Dense** 模型；PolyStrata 覆盖 **`qwen35moe` MoE** 模型和 **Gemma 4 26B-A4B**。这两个上游引擎支持的其他模型尚不在上述 KVMem 范围内。llama.cpp 的 KVMem 适配器会跳过滑动窗口注意力（SWA）及纯循环架构模型。
 
 架构支持不代表每个尺寸、量化和功能组合都已实测。具体范围见 [Qwen3.5 Dense 家族验收](docs/qwen35-dense-family.md)、[Bonsai 接入](docs/bonsai-integration.md) 和 [PolyStrata 接入](docs/polystrata-integration.md)。实际可用模型、视觉与 MTP 能力还取决于模型组件及所选[运行包](https://github.com/kvmem/kvmem/releases)。
 

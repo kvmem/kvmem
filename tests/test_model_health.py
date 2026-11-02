@@ -74,6 +74,17 @@ class HealthTests(unittest.TestCase):
             self.assertEqual(result['model']['tensors'], 1)
             self.assertEqual(result['checks'][-1]['status'], 'unknown')
 
+    def test_gemma_native_kv_and_required_assistant(self):
+        model=self.root/'gemma.gguf';gguf(model,meta={'general.architecture':'gemma4'})
+        for kv in ('f16','int8','int8k'):
+            self.assertTrue(self.inspect(model,'polystrata',KvType=kv)['can_start'])
+        bad=self.inspect(model,'polystrata',KvType='q8_0')
+        self.assertIn('poly_kv',[c['code'] for c in bad['checks'] if c['status']=='error'])
+        missing=self.inspect(model,'polystrata',SpeculativeMode='mtp')
+        self.assertIn('gemma_assistant_missing',[c['code'] for c in missing['checks']])
+        assistant=self.root/'assistant.gguf';gguf(assistant,meta={'general.architecture':'gemma4-assistant'})
+        self.assertTrue(self.inspect(model,'polystrata',SpeculativeMode='mtp',DraftModel=str(assistant))['can_start'])
+
     def test_extension_cannot_disguise_wrong_container(self):
         path=self.root/'fake.gguf'; path.write_bytes(b'not a model'*10)
         self.assertFalse(self.inspect(path)['can_start'])

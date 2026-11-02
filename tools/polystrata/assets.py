@@ -10,6 +10,11 @@ import tempfile
 
 FILES = ('vocab.json', 'merges.txt', 'tokenizer.json', 'token_type.json', 'chat_template.jinja')
 
+def tokenizer_files(target: Path) -> tuple[str, ...]:
+    # Gemma's UTF-8 pieces can contain newlines; its exporter writes JSON.
+    merge='merges.json' if (target/'merges.json').is_file() else 'merges.txt'
+    return tuple(merge if name=='merges.txt' else name for name in FILES)
+
 
 def model_identity(model: Path, source: Path) -> dict:
     stat = model.stat()
@@ -29,11 +34,12 @@ def tokenizer_path(model: Path, source: Path, *, prepare: bool, cache: Path | No
     root = cache / key
     target = root / 'tokenizer'
     manifest = root / 'source.json'
-    if manifest.is_file() and all((target / name).is_file() for name in FILES):
+    files=tokenizer_files(target)
+    if manifest.is_file() and all((target / name).is_file() for name in files):
         record = json.loads(manifest.read_text(encoding='utf-8'))
-        if record.get('model') == identity and all(
+        if record.get('model') == identity and set(record.get('files',{}))==set(files) and all(
                 hashlib.sha256((target / name).read_bytes()).hexdigest() == record.get('files', {}).get(name)
-                for name in FILES):
+                for name in files):
             return target
         raise ValueError(f'Cached tokenizer was modified: {root}; select an explicit tokenizer or remove that cache entry')
     if not prepare:
@@ -47,9 +53,10 @@ def tokenizer_path(model: Path, source: Path, *, prepare: bool, cache: Path | No
             extract(model, staging)
         finally:
             sys.path.pop(0)
-        if not all((staging / 'tokenizer' / name).is_file() for name in FILES):
+        files=tokenizer_files(staging/'tokenizer')
+        if not all((staging / 'tokenizer' / name).is_file() for name in files):
             raise ValueError('The GGUF must contain its own complete tokenizer and chat template')
-        record = {'model': identity, 'files': {name: hashlib.sha256((staging / 'tokenizer' / name).read_bytes()).hexdigest() for name in FILES}}
+        record = {'model': identity, 'files': {name: hashlib.sha256((staging / 'tokenizer' / name).read_bytes()).hexdigest() for name in files}}
         (staging / 'source.json').write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
         # Publish only a complete export; concurrent identical launches can share the winner.
         try:

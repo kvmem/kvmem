@@ -75,6 +75,16 @@ class BackendLaunch(unittest.TestCase):
                     self.invoke(["--backend", backend, "--gpu", gpu])
                 self.assertEqual(error.exception.code, 2)
 
+    def test_gemma_formats_and_external_assistant_reach_worker(self):
+        assistant=Path(self.directory.name)/'assistant.gguf'
+        assistant.write_bytes(b'GGUF fixture')
+        for kv in ('f16','int8','int8k'):
+            cfg=self.invoke(['--gpu','GPU-12345678','--kv-type',kv,'--mtp-drafts','3','--draft-model',str(assistant)])
+            argv=cfg['args']
+            self.assertEqual(argv[argv.index('--kv')+1], 'fp16' if kv=='f16' else kv)
+            self.assertEqual(argv[argv.index('--draft-model')+1],str(assistant.resolve()))
+            self.assertIn('--kvmem-mtp',argv)
+
 
 if __name__ == "__main__":
     unittest.main()

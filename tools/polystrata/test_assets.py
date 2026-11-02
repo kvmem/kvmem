@@ -9,6 +9,22 @@ from assets import FILES, tokenizer_path
 
 
 class AssetsTest(unittest.TestCase):
+    def test_gemma_json_merges_are_published_and_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'source';(source/'tools').mkdir(parents=True)
+            for name in ('strata_tokenizer.py','gguf_reader.py'):(source/'tools'/name).write_text('exporter')
+            model=root/'model.gguf';model.write_bytes(b'GGUF fixture')
+            def extract(model,out):
+                target=out/'tokenizer';target.mkdir()
+                for name in FILES:
+                    (target/('merges.json' if name=='merges.txt' else name)).write_text('valid '+name)
+            with patch.dict('sys.modules',{'strata_tokenizer':SimpleNamespace(extract=extract)}):
+                target=tokenizer_path(model,source,prepare=True,cache=root/'cache')
+                self.assertEqual(tokenizer_path(model,source,prepare=True,cache=root/'cache'),target)
+                (target/'merges.json').write_text('modified newline merges')
+                with self.assertRaisesRegex(ValueError,'modified'):
+                    tokenizer_path(model,source,prepare=True,cache=root/'cache')
+
     def test_identity_and_complete_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);source=root/'source';(source/'tools').mkdir(parents=True)
