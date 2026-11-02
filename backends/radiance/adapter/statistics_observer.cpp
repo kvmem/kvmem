@@ -98,7 +98,12 @@ int StatisticsObserver::configure(const rad::Config& cfg, rad::CtxDesc& desc) no
             const uint32_t native_block = positive(g.block_size);
             block_tokens = (block_tokens / std::gcd(block_tokens, uint64_t(native_block))) * native_block;
             require(block_tokens <= uint64_t(INT32_MAX), "selection block size overflow");
-            const auto hd = positive(g.decl.head_dim);
+            const auto hd = positive(p.meta.head_dim);
+            const auto packing = cfg.kv_cache_dtype == "fp8_v4" ? KvPacking::Fp8V4 :
+                                 cfg.kv_cache_dtype == "k6_v4" ? KvPacking::K6V4 : KvPacking::Plain;
+            require(2 * positive(g.decl.head_dim) == kv_row_elements(hd, packing) &&
+                    (packing == KvPacking::Plain || (hd == 256 && g.decl.dtype == RAD_F8E4M3)),
+                    "native KV row layout differs from configured packing");
             const auto kh = positive(g.decl.n_head_kv);
             require(hd == positive(p.meta.head_dim) && uint64_t(kh)*world_size_ == positive(p.meta.n_head_kv),
                     "per-group heads differ from the model metadata");
@@ -106,7 +111,7 @@ int StatisticsObserver::configure(const rad::Config& cfg, rad::CtxDesc& desc) no
                 // MTP shares these physical pages, but its Q/K do not score
                 // target-model retrieval. groups_ below keeps ALL payload layers.
                 if (layer < p.meta.n_layers)
-                    layers.push_back({layer, rad_kvgroup(group), 0, hd, positive(p.meta.n_head/cfg.tp), kh});
+                    layers.push_back({layer, rad_kvgroup(group), 0, hd, positive(p.meta.n_head/cfg.tp), kh, packing});
                 else require(serial_drafter_, "unexpected non-trunk FULL KV layer");
             }
         }
@@ -148,7 +153,7 @@ int StatisticsObserver::configure(const rad::Config& cfg, rad::CtxDesc& desc) no
                     rank->materialize_gdn = fn;
                 }
         }
-        identity_ = {"radiance", KVMEM_RADIANCE_UPSTREAM_REVISION, cfg.model, "full-native-pages-v1/tp"+std::to_string(world_size_)};
+        identity_ = {"radiance", KVMEM_RADIANCE_UPSTREAM_REVISION, cfg.model, "full-native-pages-v2:" + cfg.kv_cache_dtype + ":" + cfg.state_cache_dtype + "/tp"+std::to_string(world_size_)};
         rank->capture = std::make_unique<StatisticsCapture>(desc.device, layers, positive(cfg.max_tok));
         if (options_.budget_tokens) {
             rank->attention = std::make_unique<AttentionCapture>(desc.device, layers, max_rows_,
@@ -234,6 +239,8 @@ void StatisticsObserver::clear_session() {
         finishing_id_=0;
     }
     pending_finish_.reset();
+    pending_input_.reset(); input_parking_.reset(); input_.reset(); fallback_.reset();
+    update_input_charge(0);
     draining_prefix_failure_=false;
     pending_cache_=0;
     pending_prefix_.reset();prefix_payload_.reset();
@@ -247,11 +254,238 @@ void StatisticsObserver::clear_session() {
     recall_.reset(); checkpoint_recall_.reset(); prefix_recall_.reset();
     accepted_view_ = {};
 }
+uint64_t StatisticsObserver::CacheState::sharing_credit(const RetainedSession* extra) const {
+    SharedPayloadAccounting out;
+    const auto saved=[&](auto&& self,const RetainedSession& point)->void {
+        if(point.memory)point.memory->account_archive(out);
+        if(point.prefix)point.prefix->account(out);
+        if(point.input)self(self,*point.input);
+        if(point.fallback)self(self,*point.fallback);
+    };
+    for(const auto& point:sessions)saved(saved,point);
+    // Parking workers mutate only their prefix payload. Its logical reservation
+    // stays charged in full until the scheduler publishes the completed result.
+    for(const auto& pending:parking)saved(saved,pending->saved);
+    for(const auto* owner:observers) {
+        if(owner->archive_charge_ && owner->memory_)owner->memory_->account_archive(out);
+        if(owner->input_charge_) {
+            if(owner->input_)saved(saved,*owner->input_);
+            if(owner->fallback_)saved(saved,*owner->fallback_);
+            if(owner->input_parking_)saved(saved,owner->input_parking_->saved);
+        }
+    }
+    if(extra)saved(saved,*extra);
+    return out.credit();
+}
+uint64_t StatisticsObserver::history_allowance(const RetainedSession* extra) const {
+    const auto limit=options_.history_bytes(),credit=cache_->sharing_credit(extra);
+    require(credit<=UINT64_MAX-limit,"shared history allowance overflow");
+    return limit+credit;
+}
 void StatisticsObserver::update_archive_charge() {
     require(cache_->active_archive_bytes>=archive_charge_,"invalid active archive accounting");
     cache_->active_archive_bytes-=archive_charge_;
     archive_charge_=memory_ ? memory_->archive_bytes() : 0;
     cache_->active_archive_bytes+=archive_charge_;
+    update_input_charge(input_extra_bytes());
+}
+void StatisticsObserver::update_input_charge(uint64_t bytes) {
+    require(cache_->active_checkpoint_bytes>=input_charge_, "invalid input checkpoint accounting");
+    cache_->active_checkpoint_bytes-=input_charge_;
+    input_charge_=bytes;
+    cache_->active_checkpoint_bytes+=input_charge_;
+}
+uint64_t StatisticsObserver::retained_bytes(const RetainedSession& saved) {
+    require(saved.prefix && saved.memory && saved.store && saved.policy && saved.recall &&
+        saved.recall_snapshot && saved.identity, "incomplete checkpoint accounting");
+    return saved.prefix->page_bytes()+saved.prefix->state_bytes()+saved.memory->archive_bytes()+
+        saved.store->allocated_bytes()+saved.policy->allocated_bytes()+saved.recall->allocated_bytes()+
+        saved.recall_snapshot->graph.bytes()+saved.recall_snapshot->feedback.bytes()+
+        saved.mean.size()*sizeof(float)+saved.identity->tokens.size()*sizeof(int32_t)+
+        saved.identity->images.size()*sizeof(ImageIdentity);
+}
+uint64_t StatisticsObserver::input_extra_bytes() const {
+    uint64_t total=0;
+    for(const auto* saved:{input_.get(),fallback_.get(),input_parking_ ? &input_parking_->saved : nullptr}) {
+        if(!saved)continue;
+        const auto bytes=saved->bytes;
+        require(bytes<=UINT64_MAX-total,"input checkpoint charge overflow");total+=bytes;
+    }
+    return total;
+}
+StatisticsObserver::RetainedSession* StatisticsObserver::select_checkpoint(RetainedSession& saved,
+                                                                         const rad::Request& request, bool shared) {
+    std::vector<PrefixCandidate> candidates;
+    auto add=[&](RetainedSession& point,CheckpointPurpose purpose) {
+        const auto& identity=*point.identity;
+        candidates.push_back({&identity.tokens,&point,purpose,(shared ? identity.scope!=request.cache_owner : identity.scope==request.cache_owner) &&
+            image_prefix_matches(identity.images,request.media.get(),request.prompt.size(),identity.tokens.size())});
+    };
+    add(saved,CheckpointPurpose::Endpoint);
+    if(saved.input)add(*saved.input,CheckpointPurpose::ReuseAnchor);
+    if(saved.fallback)add(*saved.fallback,CheckpointPurpose::InputFallback);
+    return const_cast<RetainedSession*>(static_cast<const RetainedSession*>(select_prefix_checkpoint(
+        request.prompt,candidates,request.query_begin<0 ? UINT64_MAX : uint64_t(request.query_begin))));
+}
+void StatisticsObserver::retain_input(const rad::StepEntry& entry) {
+    if(!policy_ || !options_.cache_sessions || !entry.is_prefill || !entry.req ||
+       pending_input_ || input_parking_) return;
+    const bool fallback=entry.req->history_fallback_end>0 && frontier_==uint64_t(entry.req->history_fallback_end) &&
+        entry.req->history_fallback_end!=entry.req->history_reuse_end;
+    const auto target=fallback ? entry.req->history_fallback_end : entry.req->history_reuse_end;
+    if(target<=0 || (fallback ? bool(fallback_) : bool(input_)))return;
+    const auto end=uint64_t(target);
+    if(frontier_!=end || !rolling::retainable_prefix_boundary(frontier_,end,store_config_.block_tokens))return;
+    for(const auto& image:images_)if(uint64_t(image.begin)<end && end<uint64_t(image.end)) {
+        RAD_INFO("KVMEM_INPUT_SKIP session=%llu reason=image_boundary",(unsigned long long)session_.id);return;
+    }
+    // A probe is not committed history. Tool continuation has no Query, and
+    // must not inherit an old one merely to obtain an input checkpoint.
+    if(query_begin_>=0 && !replay_done_ && !replaying_ && entry.req->prompt.size()>options_.budget_tokens &&
+       !(fallback && frontier_<=uint64_t(query_begin_)))return;
+    auto identity=std::make_shared<CachedIdentity>();identity->fallback=fallback;
+    identity->tokens.assign(entry.req->prompt.begin(),entry.req->prompt.begin()+end);
+    identity->images=image_prefix(images_,end);identity->scope=entry.req->cache_owner;
+    pending_input_=std::move(identity);
+    (void)poll_input();
+}
+void StatisticsObserver::capture_input(std::shared_ptr<const CachedIdentity> identity) {
+    SchedulerDeviceReturn device_return{device_};
+    drain_ranks("drain input checkpoint producers");
+    require(identity && identity->tokens.size()==frontier_ && !(identity->fallback ? bool(fallback_) : bool(input_)) && !input_parking_ && !pending_selection_,
+        "input checkpoint lost its drained boundary");
+    sync_memory();
+    require(next_incarnation_!=UINT64_MAX,"input checkpoint incarnation exhausted");
+    auto saved=std::make_unique<RetainedSession>();
+    saved->session={session_.id,next_incarnation_++};saved->content_version=content_version_;saved->identity=std::move(identity);
+    saved->prefix=std::make_unique<RankPrefix>();
+    for(auto& rank:ranks_) {
+        auto lease=std::make_unique<PrefixLease>(rank->resources.lifetime,*rank->resources.kv,active_request_,
+            saved->identity->tokens,rank->device,rank->resources.ctx->stream());
+        saved->prefix->add_rank(rank->device,rank->resources.ctx->stream(),*rank->resources.kv,std::move(lease));
+    }
+    saved->mean=store_->mean_checkpoint(frontier_);
+    saved->store=store_->fork_mean_prefix(frontier_);
+    saved->policy=std::make_unique<KvMemStore>(*policy_);
+    saved->recall=std::make_unique<RecallPolicy>(options_,store_config_.block_tokens,graph_budget_);
+    saved->recall_snapshot=std::make_unique<RecallSnapshot>(recall_->checkpoint());
+    saved->recall->restore(*saved->recall_snapshot);
+    memory_->retain_view();saved->memory=memory_->fork_retained(saved->session);
+    saved->bytes=retained_bytes(*saved);
+    const auto extra=saved->bytes;
+    const auto active=cache_->active_archive_bytes+cache_->active_checkpoint_bytes;
+    if(active>history_allowance(saved.get()) || extra>history_allowance(saved.get())-active) {
+        RAD_INFO("KVMEM_INPUT_SKIP session=%llu reason=host_budget",(unsigned long long)session_.id);return;
+    }
+    auto fits=[&]{const auto limit=history_allowance(saved.get());return active<=limit && extra<=limit-active && cache_->bytes<=limit-active-extra;};
+    while(!cache_->sessions.empty() && !fits())evict_session();
+    if(!fits()) {
+        RAD_INFO("KVMEM_INPUT_SKIP session=%llu reason=pending_cache_capacity",(unsigned long long)session_.id);return;
+    }
+    // No extra persistent GPU view: copy once, release page references before
+    // the next append/Pressure, then let the bounded storage worker seal it.
+    saved->prefix->demote(saved->prefix->page_bytes());
+    if(asynchronous_ && cache_->payload && cache_->io) {
+        input_parking_=std::make_unique<PendingPark>();
+        input_parking_->work=std::make_shared<ParkWork>();input_parking_->work->storage=cache_->payload;
+        input_parking_->work->prefix=std::move(saved->prefix);
+        input_parking_->saved=std::move(*saved);
+    } else {
+        if(cache_->payload)saved->prefix->park(cache_->payload,cache_->io);
+        (saved->identity->fallback ? fallback_ : input_)=std::move(saved);
+    }
+    update_input_charge(input_extra_bytes());
+    RAD_INFO("KVMEM_INPUT_RETAIN request=%llu frontier=%u query=%d state_and_pages=1 extra_bytes=%llu",
+        (unsigned long long)active_request_,frontier_,query_begin_>=0,(unsigned long long)extra);
+}
+bool StatisticsObserver::poll_input() {
+    if(pending_input_) {
+        if(pending_selection_)return false;
+        auto identity=std::move(pending_input_);
+        try {capture_input(std::move(identity));}
+        catch(const MemoryError& error) {
+            if(error.code()!=MemoryErrorCode::BudgetExceeded)throw;
+            RAD_INFO("KVMEM_INPUT_SKIP session=%llu reason=storage_budget",(unsigned long long)session_.id);
+        } catch(const std::length_error&) {
+            RAD_INFO("KVMEM_INPUT_SKIP session=%llu reason=metadata_budget",(unsigned long long)session_.id);
+        } catch(const std::bad_alloc&) {
+            RAD_INFO("KVMEM_INPUT_SKIP session=%llu reason=allocation",(unsigned long long)session_.id);
+        }
+    }
+    if(!input_parking_)return true;
+    auto& pending=*input_parking_;
+    try {
+        if(!pending.ticket) {
+            const auto work=pending.work;
+            pending.ticket=cache_->io->submit(work->prefix->host_bytes()+work->prefix->state_bytes(),[work]{work->run();});
+        }
+        if(!pending.ticket.ready())return false;
+        pending.ticket.wait();pending.saved.prefix=std::move(pending.work->prefix);
+        const auto ready_frontier=pending.saved.identity->tokens.size();
+        (pending.saved.identity->fallback ? fallback_ : input_)=std::make_unique<RetainedSession>(std::move(pending.saved));input_parking_.reset();
+        RAD_INFO("KVMEM_INPUT_READY request=%llu frontier=%zu",(unsigned long long)active_request_,ready_frontier);
+    } catch(const StorageFailure& error) {
+        input_parking_.reset();update_input_charge(input_extra_bytes());
+        RAD_ERR("KVMem optional input parking dropped: %s",error.what());
+    } catch(const MemoryError& error) {
+        if(error.code()==MemoryErrorCode::Pending)return false;
+        if(error.code()!=MemoryErrorCode::BudgetExceeded)throw;
+        input_parking_.reset();update_input_charge(input_extra_bytes());
+        RAD_INFO("KVMEM_INPUT_SKIP session=%llu reason=io_budget",(unsigned long long)session_.id);
+    } catch(const std::bad_alloc&) {
+        input_parking_.reset();update_input_charge(input_extra_bytes());
+        RAD_INFO("KVMEM_INPUT_SKIP session=%llu reason=io_allocation",(unsigned long long)session_.id);
+    }
+    return true;
+}
+void StatisticsObserver::promote_input() {
+    require(input_ && !input_parking_ && !pending_selection_,"input fallback is incomplete");
+    auto saved=std::move(input_);memory_session_.reset();
+    session_=saved->session;content_version_=saved->content_version;
+    prefix_=std::move(saved->prefix);prefix_mean_=std::move(saved->mean);
+    store_=std::move(saved->store);policy_=std::move(saved->policy);memory_=std::move(saved->memory);
+    recall_=std::move(saved->recall);prefix_recall_=std::move(saved->recall_snapshot);
+    std::atomic_store(&cached_identity_,saved->identity);update_archive_charge();
+}
+std::unique_ptr<StatisticsObserver::RetainedSession> StatisticsObserver::carry_input(
+        const RetainedSession& saved,const RetainedSession& selected,const rad::Request& request,bool fallback) {
+    // A retry or short append can restore AT/AFTER its next input boundary.
+    // There will be no forward callback there to recapture it. Keep the proven
+    // earlier state, otherwise a second retry loses reuse when cache_sessions=1.
+    if(request.history_end>0 && uint64_t(request.history_end)>selected.identity->tokens.size())return {};
+    if(fallback && !saved.fallback)return {};
+    const auto* point=fallback ? saved.fallback.get() : saved.input ? saved.input.get() : &selected;
+    if(!point->identity->prefix_matches(request) ||
+       (request.query_begin>=0 && uint64_t(request.query_begin)<point->identity->tokens.size()))return {};
+    require(next_incarnation_!=UINT64_MAX,"carried checkpoint incarnation exhausted");
+    auto next=std::make_unique<RetainedSession>();
+    try {
+        next->session={request.id,next_incarnation_++};next->content_version=point->content_version;
+        auto identity=std::make_shared<CachedIdentity>(*point->identity);identity->scope=request.cache_owner;
+        next->identity=std::move(identity);next->prefix=point->prefix->fork();next->mean=point->mean;
+        next->store=point->store->fork_mean_prefix(uint32_t(point->identity->tokens.size()));
+        next->policy=std::make_unique<KvMemStore>(*point->policy);
+        next->memory=point->memory->fork_retained(next->session);
+        next->recall=std::make_unique<RecallPolicy>(options_,store_config_.block_tokens,graph_budget_);
+        next->recall_snapshot=std::make_unique<RecallSnapshot>(*point->recall_snapshot);
+        next->recall->restore(*next->recall_snapshot);next->bytes=retained_bytes(*next);
+        return next;
+    } catch(const MemoryError& error) {if(error.code()!=MemoryErrorCode::BudgetExceeded)throw;}
+      catch(const std::length_error&) {} catch(const std::bad_alloc&) {}
+    return {};
+}
+void StatisticsObserver::admit_carried_input(std::unique_ptr<RetainedSession> saved) {
+    if(!saved)return;
+    require(memory_ && !(saved->identity->fallback ? bool(fallback_) : bool(input_)) && !input_parking_,"carried checkpoint needs an active owner");
+    const auto extra=saved->bytes;
+    const auto active=cache_->active_archive_bytes+cache_->active_checkpoint_bytes;
+    auto fits=[&]{const auto limit=history_allowance(saved.get());return active<=limit && extra<=limit-active && cache_->bytes<=limit-active-extra;};
+    while(!cache_->sessions.empty() && !fits())evict_session();
+    if(!fits())return;
+    const auto session=saved->session.id,frontier=saved->identity->tokens.size();
+    (saved->identity->fallback ? fallback_ : input_)=std::move(saved);update_input_charge(input_extra_bytes());
+    RAD_INFO("KVMEM_INPUT_CARRY request=%llu frontier=%zu immutable_payload_shared=1",
+        (unsigned long long)session,frontier);
 }
 void StatisticsObserver::evict_session() {
     require(!cache_->sessions.empty() && cache_->bytes >= cache_->sessions.front().bytes, "invalid cache accounting");
@@ -267,23 +501,24 @@ void StatisticsObserver::park_session() {
     require(identity && memory_ && store_ && policy_ && recall_, "incomplete session cache entry");
     // Count inactive KV, recurrent state and statistical metadata against one
     // retained-host allowance. Model/runtime workspace is not a cache payload.
-    const uint64_t fixed = prefix_->state_bytes() + memory_->archive_bytes() + store_->allocated_bytes() +
+    const uint64_t fixed = input_extra_bytes() + prefix_->state_bytes() + memory_->archive_bytes() + store_->allocated_bytes() +
         policy_->allocated_bytes() + recall_->allocated_bytes() + prefix_recall_->graph.bytes() +
         prefix_recall_->feedback.bytes() + prefix_mean_.size()*sizeof(float) + identity->tokens.size()*sizeof(int32_t) +
         identity->images.size()*sizeof(ImageIdentity);
     const uint64_t pages = prefix_->page_bytes();
-    const uint64_t other=cache_->active_archive_bytes-archive_charge_;
-    require(other<=options_.history_bytes(),"other active archives exceed host allowance");
-    const uint64_t available=options_.history_bytes()-other;
-    if (fixed > available || pages > available - fixed) {
+    const uint64_t other=cache_->active_archive_bytes-archive_charge_+cache_->active_checkpoint_bytes-input_charge_;
+    require(other<=history_allowance(),"other active archives exceed host allowance");
+    auto available=[&]{const auto limit=history_allowance();return limit>other ? limit-other : 0;};
+    if (fixed > available() || pages > available() - fixed) {
         RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=host_budget required_bytes=%llu limit=%llu",
             (unsigned long long)session_.id, (unsigned long long)(fixed+pages), (unsigned long long)options_.history_bytes());
         clear_session(); return;
     }
     const uint64_t bytes = fixed + pages;
-    while (!cache_->sessions.empty() && (cache_->count() >= options_.cache_sessions || cache_->bytes > available-bytes))
+    auto fits=[&]{return bytes<=available() && cache_->bytes<=available()-bytes;};
+    while (!cache_->sessions.empty() && (cache_->count() >= options_.cache_sessions || !fits()))
         evict_session();
-    if(cache_->count()>=options_.cache_sessions || cache_->bytes>available-bytes || cache_->next_park==UINT64_MAX) {
+    if(cache_->count()>=options_.cache_sessions || !fits() || cache_->next_park==UINT64_MAX) {
         RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=pending_cache_capacity",(unsigned long long)session_.id);
         clear_session();return;
     }
@@ -307,6 +542,7 @@ void StatisticsObserver::park_session() {
     saved.session=session_; saved.content_version=content_version_; saved.bytes=bytes; saved.identity=identity;
     saved.prefix=std::move(prefix_); saved.mean=std::move(prefix_mean_); saved.store=std::move(store_);
     saved.policy=std::move(policy_); saved.memory=std::move(memory_); saved.recall=std::move(recall_);
+    saved.input=std::move(input_);saved.fallback=std::move(fallback_);
     update_archive_charge();
     saved.recall_snapshot=std::move(prefix_recall_);
     if(parking) {
@@ -320,44 +556,60 @@ void StatisticsObserver::park_session() {
 void StatisticsObserver::activate_session(const rad::Request& request) {
     require(!active_request_ && !store_, "cache activation requires an idle observer");
     auto best=cache_->sessions.end();
-    for (auto it=cache_->sessions.begin(); it!=cache_->sessions.end(); ++it)
-        if (it->identity->matches(request) &&
-            (request.query_begin<0 || uint64_t(request.query_begin)>=it->prefix->frontier()) &&
-            (best==cache_->sessions.end() || it->prefix->frontier()>best->prefix->frontier())) best=it;
-    size_t longest=best==cache_->sessions.end() ? 0 : best->prefix->frontier();
+    RetainedSession* point=nullptr;
+    for(unsigned pass=0;pass<2 && !point && !pending_cache_;++pass) {
+    const bool shared=pass!=0;
+    if(shared && !(request.query_begin>=0 && request.query_end>request.query_begin))break;
+    for (auto it=cache_->sessions.begin(); it!=cache_->sessions.end(); ++it) {
+        auto* candidate=select_checkpoint(*it,request,shared);
+        if(candidate && (!point || candidate->identity->tokens.size()>point->identity->tokens.size())) {
+            best=it;point=candidate;
+        }
+    }
+    size_t longest=point ? point->identity->tokens.size() : 0;
     for(const auto& pending:cache_->parking) {
-        const auto& identity=pending->saved.identity;
-        if(identity->tokens.size()>longest && identity->matches(request) &&
-           (request.query_begin<0 || uint64_t(request.query_begin)>=identity->tokens.size())) {
-            pending_cache_=pending->id;longest=identity->tokens.size();
+        auto* candidate=select_checkpoint(pending->saved,request,shared);
+        if(candidate && candidate->identity->tokens.size()>longest) {
+            pending_cache_=pending->id;longest=candidate->identity->tokens.size();
         }
     }
     for(const auto& pending:cache_->finishing) {
-        const auto& identity=pending.identity;
-        if(identity->tokens.size()>longest && identity->matches(request) &&
-           (request.query_begin<0 || uint64_t(request.query_begin)>=identity->tokens.size())) {
-            pending_cache_=pending.id;longest=identity->tokens.size();
+        for(const auto& identity:{pending.identity,pending.input_identity,pending.fallback_identity}) {
+            if(identity && identity->tokens.size()>longest &&
+               (shared ? identity->scope!=request.cache_owner : identity->scope==request.cache_owner) && identity->prefix_matches(request) &&
+               (request.query_begin<0 || uint64_t(request.query_begin)>=identity->tokens.size())) {
+                pending_cache_=pending.id;longest=identity->tokens.size();
+            }
         }
+    }
     }
     if(pending_cache_)return;
     if (best==cache_->sessions.end()) return;
-    const auto total=options_.history_bytes();
-    // Retain the reusable root while a branch owns an independent catalog and
-    // statistics. Shared sealed KV/state bytes carry only one physical charge.
-    // Logical branch accounting remains conservative; when it cannot fit, move
-    // the entry as before rather than refusing an otherwise valid continuation.
-    if(cache_->bytes<=total && cache_->active_archive_bytes<=total-cache_->bytes &&
-       best->memory->archive_bytes()<=total-cache_->bytes-cache_->active_archive_bytes) {
+    const auto& previous=best->identity->tokens;
+    const auto n=std::min(previous.size(),request.prompt.size());
+    const auto lcp=std::mismatch(previous.begin(),previous.begin()+n,request.prompt.begin()).first-previous.begin();
+    RAD_INFO("KVMEM_CHECKPOINT_SELECT request=%llu purpose=%s frontier=%zu lcp=%zu",
+        (unsigned long long)request.id,point==&*best ? "terminal" : "input",point->identity->tokens.size(),size_t(lcp));
+    auto carried=carry_input(*best,*point,request);
+    auto carried_fallback=carry_input(*best,*point,request,true);
+    const auto active=cache_->active_archive_bytes+cache_->active_checkpoint_bytes;
+    {
         RetainedSession branch;
         try {
-            branch.session={request.id,next_incarnation_};branch.content_version=best->content_version;
-            branch.prefix=best->prefix->fork();branch.mean=best->mean;branch.identity=best->identity;
-            branch.store=best->store->fork_mean_prefix(uint32_t(best->prefix->frontier()));
-            branch.policy=std::make_unique<KvMemStore>(*best->policy);
-            branch.memory=best->memory->fork_retained(branch.session);
+            branch.session={request.id,next_incarnation_};branch.content_version=point->content_version;
+            branch.prefix=point->prefix->fork();branch.mean=point->mean;
+            auto identity=std::make_shared<CachedIdentity>(*point->identity);identity->scope=request.cache_owner;
+            branch.identity=std::move(identity);
+            branch.store=point->store->fork_mean_prefix(uint32_t(point->prefix->frontier()));
+            branch.policy=std::make_unique<KvMemStore>(*point->policy);
+            branch.memory=point->memory->fork_retained(branch.session);
             branch.recall=std::make_unique<RecallPolicy>(options_,options_.block_tokens,graph_budget_);
-            branch.recall->restore(*best->recall_snapshot);
-            branch.recall_snapshot=std::make_unique<RecallSnapshot>(*best->recall_snapshot);
+            branch.recall->restore(*point->recall_snapshot);
+            branch.recall_snapshot=std::make_unique<RecallSnapshot>(*point->recall_snapshot);
+            branch.bytes=retained_bytes(branch);
+            const auto total=history_allowance(&branch);
+            if(active>total || cache_->bytes>total-active || branch.bytes>total-active-cache_->bytes)
+                branch={};
         } catch(const MemoryError& error) {
             if(error.code()!=MemoryErrorCode::BudgetExceeded)throw;
             branch={}; // release the incomplete fork before the move fallback
@@ -369,26 +621,32 @@ void StatisticsObserver::activate_session(const rad::Request& request) {
         if(branch.memory) {
             ++next_incarnation_;++cache_->hits;++cache_->forks;
             RAD_INFO("KVMEM_SESSION_FORK source=%llu branch=%llu frontier=%zu immutable_payload_shared=1",
-                (unsigned long long)best->session.id,(unsigned long long)branch.session.id,best->prefix->frontier());
+                (unsigned long long)point->session.id,(unsigned long long)branch.session.id,point->prefix->frontier());
             session_=branch.session;content_version_=branch.content_version;
             prefix_=std::move(branch.prefix);prefix_mean_=std::move(branch.mean);store_=std::move(branch.store);
             policy_=std::move(branch.policy);memory_=std::move(branch.memory);recall_=std::move(branch.recall);
             prefix_recall_=std::move(branch.recall_snapshot);update_archive_charge();
             std::atomic_store(&cached_identity_,branch.identity);
             std::rotate(best,std::next(best),cache_->sessions.end());
+            admit_carried_input(std::move(carried));admit_carried_input(std::move(carried_fallback));
             return;
         }
+    }
+    if(point->identity->scope!=request.cache_owner || request.cache_owner.empty()) {
+        RAD_INFO("KVMEM_SESSION_SKIP request=%llu reason=fork_capacity source_preserved=1",(unsigned long long)request.id);
+        return;
     }
     ++cache_->hits;
     require(cache_->bytes>=best->bytes,"invalid cache hit accounting");
     cache_->bytes-=best->bytes;
-    session_=best->session; content_version_=best->content_version;
-    prefix_=std::move(best->prefix); prefix_mean_=std::move(best->mean); store_=std::move(best->store);
-    policy_=std::move(best->policy); memory_=std::move(best->memory); recall_=std::move(best->recall);
+    session_=point->session; content_version_=point->content_version;
+    prefix_=std::move(point->prefix); prefix_mean_=std::move(point->mean); store_=std::move(point->store);
+    policy_=std::move(point->policy); memory_=std::move(point->memory); recall_=std::move(point->recall);
     update_archive_charge();
-    prefix_recall_=std::move(best->recall_snapshot);
-    std::atomic_store(&cached_identity_,best->identity);
+    prefix_recall_=std::move(point->recall_snapshot);
+    std::atomic_store(&cached_identity_,point->identity);
     cache_->sessions.erase(best);
+    admit_carried_input(std::move(carried));admit_carried_input(std::move(carried_fallback));
 }
 int StatisticsObserver::resume(const rad::StepPlan& plan, int64_t* resumed, std::string* refusal) noexcept {
     SchedulerDeviceReturn device_return{device_};
@@ -457,6 +715,8 @@ int StatisticsObserver::resume(const rad::StepPlan& plan, int64_t* resumed, std:
     } catch (const std::exception& e) { return failure("resume", e); }
 }
 void StatisticsObserver::start_request(const rad::Request& request) {
+    RAD_INFO("KVMEM_HISTORY_BOUNDARY request=%llu prompt=%zu history_end=%d",
+        (unsigned long long)request.id,request.prompt.size(),request.history_end);
     images_=image_identity(request.media.get(),request.prompt.size());
     image_budget_check(images_,store_config_.block_tokens,options_.budget_tokens,keep_.sink_blocks,keep_.recent_blocks);
     require((request.query_begin == -1 && request.query_end == -1) ||
@@ -607,9 +867,13 @@ int StatisticsObserver::after_forward(const rad::StepPlan& plan, int64_t* rewind
             // checkpoint only during the corrected replay, never the probe.
             if (!replay_done_ && !replaying_ && e.req->prompt.size() <= options_.budget_tokens)
                 replay_done_ = true;
+            if(!serial_drafter_)retain_input(e);
             return RAD_OK;
         }
-        if (!query_frozen_) return RAD_OK;
+        if (!query_frozen_) {
+            if(!serial_drafter_)retain_input(e);
+            return RAD_OK;
+        }
         if (replaying_) {
             replaying_ = false; replay_done_ = true;
             RAD_INFO("KVMEM_QUERY_REPLAY_DONE session=%llu begin=%u end=%u before_sampler=1",
@@ -678,6 +942,7 @@ int StatisticsObserver::after_forward(const rad::StepPlan& plan, int64_t* rewind
             RAD_INFO("KVMEM_QUERY_REPLAY session=%llu begin=%u end=%u scorer=%s fixed_selection=1 before_sampler=1",
                 (unsigned long long)session_.id, replay_start_, probe_end,query_scorer_name(options_.scorer));
         } else replay_done_ = true;
+        if(*rewind<0 && !serial_drafter_)retain_input(e);
         return RAD_OK;
     } catch (const std::exception& e) { return failure("replay", e); }
 }
@@ -693,6 +958,7 @@ int StatisticsObserver::collect(const rad::StepPlan& plan, const rad::Scheduler:
             if (serial_drafter_) {
                 rollback_ranks(plan.e[0].seq,frontier_,"trim serial lookahead before page publication");
                 if (deferred_selection_) reselect(SelectionReason::PrefillPressure);
+                retain_input(plan.e[0]);
             }
             return RAD_OK;
         }
@@ -860,18 +1126,27 @@ void StatisticsObserver::publish_selection(const std::vector<uint32_t>& selected
     const std::vector<uint64_t> chosen(selected.begin(), selected.end()), required(mandatory.begin(), mandatory.end());
     // Only completed, inactive sessions retain leases; active pages can be recycled.
     require(!prefix_, "active pressure cannot borrow a retained session lease");
-    const auto other=cache_->active_archive_bytes-archive_charge_;
-    require(other<=options_.history_bytes(),"active archives exceed shared host allowance");
-    while (!cache_->sessions.empty() && cache_->bytes>options_.history_bytes()-other) evict_session();
-    if(cache_->bytes>options_.history_bytes()-other)
+    const auto other=cache_->active_archive_bytes-archive_charge_+cache_->active_checkpoint_bytes;
+    require(other<=history_allowance(),"active archives exceed shared host allowance");
+    auto available=[&]{const auto limit=history_allowance();return limit>other ? limit-other : 0;};
+    while (!cache_->sessions.empty() && cache_->bytes>available()) evict_session();
+    if(other>history_allowance() || cache_->bytes>available())
         throw MemoryError(MemoryErrorCode::BudgetExceeded,"pending cache reservations exhaust history allowance");
     MemoryBudget budget{options_.budget_tokens, uint64_t(max_rows_) + block,
-                        device_tokens_, options_.history_bytes() - cache_->bytes-other};
+                        device_tokens_, available()-cache_->bytes};
     for (;;) {
         try { (void)plan_working_set(memory_->descriptor(),memory_->snapshot(),chosen,required,budget); break; }
         catch (const MemoryError& error) {
-            if (error.code()!=MemoryErrorCode::BudgetExceeded || cache_->sessions.empty()) throw;
-            evict_session(); budget.host_payload_bytes=options_.history_bytes()-cache_->bytes-other;
+            if (error.code()!=MemoryErrorCode::BudgetExceeded)throw;
+            if(!cache_->sessions.empty())evict_session();
+            else if(input_ || fallback_) {
+                if(input_)input_.reset();else fallback_.reset();
+                update_input_charge(input_extra_bytes());
+                RAD_INFO("KVMEM_INPUT_DROP session=%llu reason=pressure_budget",(unsigned long long)session_.id);
+            } else throw;
+            const auto occupied=cache_->bytes+cache_->active_archive_bytes-archive_charge_+cache_->active_checkpoint_bytes;
+            const auto limit=history_allowance();
+            budget.host_payload_bytes=limit>occupied ? limit-occupied : 0;
         }
     }
     const auto& selection = memory_session_->prepare(memory_->stamp(), chosen, required, budget);
@@ -918,7 +1193,7 @@ int StatisticsObserver::poll_pending_selection() noexcept {
         }
         if(pending_cache_ && !cache_->pending(pending_cache_))pending_cache_=0;
         (void)poll_prefix();
-        if(poll_selection() && pending_finish_) {
+        if(poll_selection() && poll_input() && pending_finish_) {
             capture_terminal(*pending_finish_);pending_finish_.reset();
         }
         return RAD_OK;
@@ -976,14 +1251,15 @@ int StatisticsObserver::finish(const rad::StepEntry& e, const rad::Request& requ
         require(identity->tokens.size()>=frontier_,"terminal KV extends beyond emitted history");
         identity->tokens.resize(frontier_); // exclude the sampled, unevaluated tail
         identity->images=image_prefix(images_,frontier_);
-        identity->scope=request.session_label;
+        identity->scope=request.cache_owner;
         auto terminal=std::make_unique<TerminalSnapshot>();terminal->identity=std::move(identity);
         terminal->request=request.id;terminal->output_tokens=request.output.size();
         terminal->accepted_rows=e.is_prefill ? 0u : uint32_t(frontier_-e.ctx_len);
-        if(!poll_selection(!asynchronous_)) {
+        if(!poll_selection(!asynchronous_) || !poll_input()) {
             require(cache_->next_park!=UINT64_MAX,"cache ticket identity exhausted");
             const auto id=cache_->next_park++;
-            cache_->finishing.push_back({id,terminal->identity});finishing_id_=id;
+            const auto input_identity=input_ ? input_->identity : input_parking_ ? input_parking_->saved.identity : pending_input_;
+            cache_->finishing.push_back({id,terminal->identity,input_identity,fallback_ ? fallback_->identity : nullptr});finishing_id_=id;
             pending_finish_=std::move(terminal);
             RAD_INFO("KVMEM_SESSION_FINISH_PENDING session=%llu",(unsigned long long)session_.id);
             return RAD_OK;
@@ -1001,21 +1277,22 @@ void StatisticsObserver::capture_terminal(const TerminalSnapshot& terminal) {
             else if (p.kind==RAD_KV_FULL)
                 native_bytes+=rank->resources.kv->block_table(active_request_,p.index).size()*uint64_t(p.bytes_per_block);
         }
-        const uint64_t needed=native_bytes+memory_->archive_bytes()+store_->allocated_bytes()+
+        const uint64_t needed=input_extra_bytes()+native_bytes+memory_->archive_bytes()+store_->allocated_bytes()+
             policy_->allocated_bytes()+2*recall_->allocated_bytes()+terminal.identity->tokens.size()*sizeof(int32_t)+
             terminal.identity->images.size()*sizeof(ImageIdentity)+
             uint64_t(store_config_.n_layer)*(store_config_.n_embd_k+1)*sizeof(float);
-        const auto other=cache_->active_archive_bytes-archive_charge_;
-        require(other<=options_.history_bytes(),"active archive quota exceeded");
-        const auto available=options_.history_bytes()-other;
-        if (needed>available) {
+        const auto other=cache_->active_archive_bytes-archive_charge_+cache_->active_checkpoint_bytes-input_charge_;
+        require(other<=history_allowance(),"active archive quota exceeded");
+        auto available=[&]{const auto limit=history_allowance();return limit>other ? limit-other : 0;};
+        if (needed>available()) {
             RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=host_budget required_bytes=%llu limit=%llu",
                 (unsigned long long)session_.id,(unsigned long long)needed,(unsigned long long)options_.history_bytes());
             return;
         }
-        while (!cache_->sessions.empty() && (cache_->bytes>available-needed || cache_->count()>=options_.cache_sessions))
+        auto fits=[&]{return needed<=available() && cache_->bytes<=available()-needed;};
+        while (!cache_->sessions.empty() && (!fits() || cache_->count()>=options_.cache_sessions))
             evict_session();
-        if(cache_->bytes>available-needed || cache_->count()>=options_.cache_sessions) {
+        if(!fits() || cache_->count()>=options_.cache_sessions) {
             RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=pending_cache_capacity",(unsigned long long)session_.id);
             return;
         }
@@ -1065,6 +1342,10 @@ void StatisticsObserver::retire(uint64_t id) noexcept {
                 (unsigned long long)reuse.journal_bytes_peak, (unsigned long long)reuse.rollbacks);
         }
     } catch (const std::exception& e) { failure("retire", e); }
+    if(!prefix_ && (input_ || fallback_)) {
+        try {if(!input_)input_=std::move(fallback_);promote_input();}
+        catch(const std::exception& e){failure("input fallback",e);clear_session();return;}
+    }
     if (prefix_ && prefix_recall_) {
         try {
             frontier_ = uint32_t(prefix_->frontier());

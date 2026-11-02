@@ -2,6 +2,7 @@
 #include "kvmem/memory_contract.hpp"
 #include "rad_runtime.h"
 #include "rank_statistics.hpp"
+#include "packed_kv.hpp"
 #include <memory>
 #include <vector>
 namespace kvmem { class RawKvStore; }
@@ -12,6 +13,7 @@ struct StatisticsLayer {
     rad_kvgroup group;
     uint32_t ordinal; // shared RawKvStore attention-layer ordinal
     uint32_t head_dim, query_heads, kv_heads;
+    KvPacking packing = KvPacking::Plain;
 };
 
 // Bounded correctness path for post-normalization/pre-RoPE observation. Captures

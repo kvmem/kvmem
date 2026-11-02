@@ -1,4 +1,4 @@
-"""Create an isolated, pinned ABI15 Radiance checkout and verify its patch."""
+"""Create an isolated, pinned Radiance checkout and verify its patch."""
 import argparse
 import hashlib
 import json
@@ -34,7 +34,7 @@ def main():
     manifest = {'revision': meta['revision'], 'patches': [s['sha256'] for s in specs],
                 'files': {name: hashlib.sha256((dest/name).read_bytes()).hexdigest() for name in paths if name}}
     (dest/'.radiance-source-manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
-    print(f'Prepared ABI15 source: {dest}')
+    print(f"Prepared ABI{meta['abi']} source: {dest}")
 
 
 if __name__ == '__main__':

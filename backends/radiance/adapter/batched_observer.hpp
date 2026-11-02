@@ -13,6 +13,8 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
     struct Slot {
         uint64_t request=0;
         bool retiring=false;
+        bool reuse_observed=false, shared_restore=false;
+        uint64_t planned_reuse=0;
         std::unique_ptr<StatisticsObserver> observer;
         struct Capture {
             rad::CtxDesc::KvObserver keys=nullptr, attention=nullptr;
@@ -43,12 +45,17 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
     std::shared_ptr<GraphStatisticsBudget> graph_=std::make_shared<GraphStatisticsBudget>(256u<<20);
     size_t peak_batch_=0;
     RequestMonitor monitor_;
+    nlohmann::json runtime_=nlohmann::json::object();
     std::shared_ptr<const nlohmann::json> cache_snapshot_;
     void publish_monitor() noexcept {
         try {
             const auto io=cache_->payload ? cache_->payload->io_stats() : SpillIoStats{};
+            const auto sharing_credit=cache_->sharing_credit();
             auto value=std::make_shared<nlohmann::json>(nlohmann::json{
-                {"retained_sessions",cache_->sessions.size()},{"history_hits",cache_->hits},
+                {"retained_sessions",cache_->sessions.size()},{"planned_history_hits",cache_->hits},
+                {"history_hits",cache_->actual_own_hits+cache_->actual_shared_hits},
+                {"own_history_hits",cache_->actual_own_hits},{"shared_history_hits",cache_->actual_shared_hits},
+                {"history_misses",cache_->actual_misses},
                 {"parking_sessions",cache_->parking.size()},{"cache_park_errors",cache_->park_errors},
                 {"finishing_sessions",cache_->finishing.size()},
                 {"history_forks",cache_->forks},
@@ -59,14 +66,19 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
                 {"disk_read_bytes",io.read_bytes},{"disk_written_bytes",io.written_bytes},
                 {"disk_reads",io.reads},{"disk_writes",io.writes},{"disk_errors",io.errors},
                 {"retained_logical_bytes",cache_->bytes},{"active_archive_bytes",cache_->active_archive_bytes},
+                {"active_checkpoint_bytes",cache_->active_checkpoint_bytes},
+                {"shared_payload_credit_bytes",sharing_credit},
+                {"accounted_cache_bytes",cache_->bytes+cache_->active_archive_bytes+cache_->active_checkpoint_bytes-sharing_credit},
                 {"reserve_tokens",options_.replay_tokens},{"max_concurrency",slots_.size()}});
+            value->update(runtime_);
             std::atomic_store(&cache_snapshot_,std::shared_ptr<const nlohmann::json>(std::move(value)));
         } catch(...) { RAD_ERR("KVMem cache monitor metadata allocation failed"); }
     }
     size_t slot_for(uint64_t request, bool create=false) {
         for (size_t i=0;i<slots_.size();++i) if (slots_[i].request==request) return i;
         if (create) for (size_t i=0;i<slots_.size();++i) if (!slots_[i].request) {
-            slots_[i].request=request; return i;
+            slots_[i].request=request; slots_[i].reuse_observed=false;
+            slots_[i].shared_restore=false;slots_[i].planned_reuse=0;return i;
         }
         throw std::runtime_error("missing per-sequence statistics controller");
     }
@@ -179,7 +191,9 @@ public:
                 for(int64_t i=0;i<cfg.max_seqs;++i) {
                     Slot slot;slot.observer=std::make_unique<StatisticsObserver>(options_);
                     slot.observer->asynchronous_=true;
-                    slot.observer->cache_=cache_;slot.observer->graph_budget_=graph_;
+                    slot.observer->cache_->observers.erase(slot.observer.get());
+                    slot.observer->cache_=cache_;cache_->observers.insert(slot.observer.get());
+                    slot.observer->graph_budget_=graph_;
                     slots_.push_back(std::move(slot));
                 }
             }
@@ -202,6 +216,22 @@ public:
                 return rank.owner->observe(rank.rank,true,layer,group,dim,q,k,batch,stream);
             };
             desc.kv_observer_data=dispatch.get();rank_dispatch_.push_back(std::move(dispatch));
+            runtime_={{"enabled",options_.budget_tokens>0},{"scoring",{
+                {"scorer",options_.scorer==QueryScorer::PageSoftmax ? "page-softmax" : "meanq-cosine"},
+                {"agg",options_.aggregation==0 ? "mean" : "max"},{"lrfu",options_.lrfu},
+                {"lambda",options_.lrfu_lambda},{"top_frac",options_.lrfu_top_fraction},
+                {"graph_alpha",options_.graph_alpha},{"query_max_tokens",options_.query_tokens},
+                {"query_replay_max_tokens",options_.query_replay_tokens},{"block_tokens",options_.block_tokens}}},
+                {"kv_type",cfg.kv_cache_dtype},{"state_cache_type",cfg.state_cache_dtype},
+                {"block_tokens",options_.block_tokens},{"prefill_tokens",cfg.max_tok},
+                {"vram_reserve_mib",cfg.gpu_headroom_mib},{"draft_policy",rad::draft_window_name(cfg.draft_window)},
+                {"sink_tokens",slots_.front().observer->keep_.sink_blocks*options_.block_tokens},
+                {"recent_tokens",slots_.front().observer->keep_.recent_blocks*options_.block_tokens},
+                {"query_scorer",options_.scorer==QueryScorer::PageSoftmax ? "page-softmax" : "meanq-cosine"},
+                {"graph_alpha",options_.graph_alpha},{"query_max_tokens",options_.query_tokens},
+                {"query_replay_max_tokens",options_.query_replay_tokens},{"rolling_generation",options_.rolling_generation},
+                {"capabilities",{{"disk_budget_bytes",options_.disk_bytes},{"ssd_enabled",options_.disk_bytes>0},
+                    {"retained_sessions_limit",options_.cache_sessions},{"max_active_requests",cfg.max_seqs}}}};
             publish_monitor();
             return RAD_OK;
         } catch (const std::exception& error) { RAD_ERR("KVMem batch configure: %s",error.what()); return RAD_E_STATE; }
@@ -244,7 +274,23 @@ public:
             if (plan.e.size()!=1 || !plan.e[0].is_prefill) return RAD_OK;
             const int mirrored=mirror_rank_metadata();if(mirrored<0)return mirrored;
             auto& slot=slots_[slot_for(plan.e[0].seq,true)];
+            const bool fresh=!slot.reuse_observed && plan.e[0].ctx_len==0 && slot.observer->active_request_!=plan.e[0].seq;
+            const auto before_forks=cache_->forks;
             const auto status=slot.observer->resume(plan,frontier,refusal);
+            if(fresh) {
+                slot.shared_restore=slot.shared_restore || cache_->forks>before_forks;
+                if(slot.observer->prefix_)slot.planned_reuse=std::max<uint64_t>(slot.planned_reuse,slot.observer->prefix_->frontier());
+                if(*frontier>0)slot.planned_reuse=std::max<uint64_t>(slot.planned_reuse,uint64_t(*frontier));
+                const bool waiting=slot.observer->pending_cache_ || slot.observer->pending_prefix_;
+                if(status<0 || !refusal->empty() || *frontier>0 || !waiting) {
+                    const auto actual=*frontier>0 ? uint64_t(*frontier) : 0;
+                    monitor_.reuse(plan.e[0].seq,slot.planned_reuse,actual,slot.shared_restore);
+                    if(!actual)++cache_->actual_misses;
+                    else if(slot.shared_restore)++cache_->actual_shared_hits;
+                    else ++cache_->actual_own_hits;
+                    slot.reuse_observed=true;publish_monitor();
+                }
+            }
             if(status==RAD_E_FULL || status==RAD_E_IO)slot.observer->clear_session();
             return status;
         } catch(const std::exception& error) {RAD_ERR("KVMem batch resume: %s",error.what());return RAD_E_STATE;}
@@ -322,7 +368,8 @@ public:
     }
     void shutdown() noexcept override {
         for(auto& slot:slots_)slot.observer->shutdown();
-        frames_.clear();slots_.clear();rank_dispatch_.clear();cache_->parking.clear();cache_->sessions.clear();cache_->bytes=0;cache_->active_archive_bytes=0;
+        frames_.clear();slots_.clear();rank_dispatch_.clear();cache_->parking.clear();cache_->sessions.clear();
+        cache_->bytes=0;cache_->active_archive_bytes=0;cache_->active_checkpoint_bytes=0;
     }
 };
 } // namespace kvmem::radiance

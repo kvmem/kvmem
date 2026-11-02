@@ -215,6 +215,7 @@ namespace kvmem { class SnapshotWriter; class SnapshotReader; struct SnapshotBuf
 LLAMA_API bool llama_kvmem_store_compatible_with_execution(const llama_kvmem_execution_state * other);
 struct llama_kvmem_store_bundle;
 LLAMA_API llama_kvmem_store_bundle * llama_kvmem_store_bundle_create();
+LLAMA_API llama_kvmem_store_bundle * llama_kvmem_store_bundle_fork(llama_kvmem_store_bundle * source = nullptr);
 LLAMA_API void llama_kvmem_store_bundle_free(llama_kvmem_store_bundle * bundle);
 LLAMA_API bool llama_kvmem_store_bundle_swap(llama_kvmem_store_bundle * bundle);
 LLAMA_API void llama_kvmem_store_bundle_reset(llama_kvmem_store_bundle * bundle);

@@ -54,6 +54,8 @@ struct MultimodalCheckpointData {
     std::vector<uint8_t> draft_carry;
     kvmem::SpillExtent cold;
     size_t cold_recurrent = 0, cold_carry = 0;
+    uint64_t cold_identity = 0;
+    mutable std::atomic<bool> shared{false};
     llama_kvmem_tail_mean_state tail_mean;
     std::shared_ptr<MultimodalCheckpointAccounting> accounting;
     size_t resident_bytes() const { return recurrent.size() + draft_carry.size() + tail_mean.values.size()*sizeof(float) + tail_mean.history.scores->size()*sizeof(double) + tail_mean.graph.bytes() + tail_mean.feedback.bytes(); }
@@ -68,6 +70,11 @@ struct MultimodalCheckpoint {
         return {uint64_t(row), purposes, data.get(), data ? data->bytes() : 0};
     }
 };
+
+// Engine-private restore entry: shared cold state materializes into a private
+// result. The caller must retain that result through restore and rollback.
+[[nodiscard]] std::shared_ptr<const MultimodalCheckpointData> llama_driver_materialize_checkpoint(
+    LlamaEngineState &, const std::shared_ptr<const MultimodalCheckpointData> &);
 
 struct MultimodalQuery {
     int begin = -1, end = -1, force = -1;
@@ -103,6 +110,9 @@ struct kvmem_conversation {
     std::shared_ptr<const MultimodalQuery> mm_query;
     int last_n_gen = 0;
 };
+
+kvmem_conversation llama_driver_fork_conversation(const kvmem_conversation&, int keep);
+kvmem_conversation llama_driver_fork_conversation(const LlamaEngineState&, int keep);
 
 struct kvmem_conv_counts {
     uint64_t disk_bytes = 0, disk_bytes_max = 0;

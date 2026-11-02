@@ -1,0 +1,554 @@
+diff --git a/docs/maintainer/resource-scheduling-and-context-cache.md b/docs/maintainer/resource-scheduling-and-context-cache.md
+index 5cbc95d6a56dbbeb4388bd701ebf50f91d7e63fb..d30eda1e6eb49a942f8b4b2302ad5dd5331b64c1 100644
+--- a/docs/maintainer/resource-scheduling-and-context-cache.md
++++ b/docs/maintainer/resource-scheduling-and-context-cache.md
+@@ -1145,3 +1145,21 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive
+ | public capacity options | `include/ninfer/engine_options.h` |
+ 
+ 路径用于定位当前实现，不改变本文定义的所有权边界。
++
++## KVMem bounded history 的共享归属
++
++Qwen3.5 KVMem 路径在 `legacy` 和 `spread` 两种策略下都先查当前归属，
++再允许带当前 user Query 的请求查找其他命名或匿名归属的完整前缀。Chat
++归属字段通过 common `kvmem/cache_owner.hpp` 解析；归属相同本身不证明可复用。
++查找只读取目录元数据，选中后仍须验证精确 token、media/position、accepted
++frontier、StateImage 和 KV coverage，再由原生 materialization transaction 恢复。
++
++跨归属命中必须 fork。历史 sealed KV 和不可变 StateImage 可共享物理记录，
++selector、statistics、feedback、catalog 与运行中的 recurrent state 独立。
++匿名的原生 continuation 证明继续保留；较深的匿名分支编辑使用 fork，不能
++因为两个 session_key 都为空而消费来源。取消和读取失败只能释放未发布的子分支。
++普通工具续接不因此获得外部缓存发现或 cached-Q 冷历史重选权限。
++
++此实现不把 GPU page、Program 或不兼容模型的 KV 合并；请求归属也不承担租户
++安全隔离。校验入口包含 OpenAI schema、两阶段 document/question 的真实请求、
++`tests/experimental/ssd_failure.cpp --fork` 的冷读取失败及取消测试。
+diff --git a/docs/serving.md b/docs/serving.md
+index 72761e382eb742b617af7789128e69dc303e2023..dfa590d905b2a7e377f8b6b1b68871a6a190ca5a 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -810,6 +810,21 @@ the 27B, so even a short session is a few hundred MB: a 39-token Qwen3.8-27B ses
+ 
+ ### Metrics
+ 
++The KVMem integration adds `kvmem.cache_reuse` to generation responses and the
++same fields to the unified request monitor: `planned_cached_tokens`,
++`actual_cached_tokens`, `planned_cache_source` and `cache_source` (`own`,
++`shared`, `miss`). The existing cached-token wire accounting remains the exact
++admission quote. A best-effort failed restore can recompute that quoted prefix;
++the independent native actual observation is zero in that case. An unobserved
++value is null, including runtime families without this observation. This does
++not change the native timing or Prometheus series' existing meaning.
++
++KVMem memory summaries distinguish logical owner bytes from the global native
++physical H/D charge, sealed-record references from unique allocations, and
++logical/physical read-only checkpoint bytes. Shared records are charged once;
++selectors, MeanK, graph feedback, Query state and mutable GPU state remain
++private. These counters do not bound process RSS or represent VRAM savings.
++
+ `GET /metrics` serves the Prometheus text format, also on `--stats-port`. Like `/v1/load` it
+ requires the API key when one is configured and reads only already-published counters. The
+ `llamacpp:` series keep the names and meanings of llama.cpp's `--metrics`, so dashboards and
+diff --git a/include/ninfer/observability/execution.h b/include/ninfer/observability/execution.h
+index 3040d7bead70850c1f74e7178488297fed3aa44f..356f50dfc99c3c7f0ef61e0329c07cc14e01edd4 100644
+--- a/include/ninfer/observability/execution.h
++++ b/include/ninfer/observability/execution.h
+@@ -168,6 +168,10 @@ materialization_search_phase_name(MaterializationSearchPhase phase) noexcept {
+ }
+ 
+ struct MaterializationDiagnostics {
++    // Admission accounting remains stable if a best-effort restore falls back.
++    // This independent native observation reports only the prefix actually restored.
++    std::optional<std::uint32_t> actual_reused_prompt_tokens;
++    std::uint32_t planned_reused_prompt_tokens = 0;
+     std::uint64_t predicted_now_ns           = 0;
+     std::uint64_t predicted_future_loss_ns   = 0;
+     std::uint64_t predicted_total_ns         = 0;
+diff --git a/include/ninfer/observability/resources.h b/include/ninfer/observability/resources.h
+index fbf4a93792d9ec59dada5ff4572dda244292eb9a..4c44514168386e5c55bf8efe876b423b4763c7f4 100644
+--- a/include/ninfer/observability/resources.h
++++ b/include/ninfer/observability/resources.h
+@@ -120,6 +120,10 @@ struct KvmemMemorySummary {
+     std::uint32_t evaluated_tokens = 0, checkpoint_tokens = 0, resident_pages = 0;
+     std::uint32_t history_swaps = 0;
+     std::uint64_t history_spilled_bytes = 0, history_restored_bytes = 0;
++    std::uint64_t logical_payload_bytes = 0, physical_payload_bytes = 0, sharing_credit_bytes = 0;
++    std::uint64_t payload_references = 0, unique_payload_records = 0;
++    std::uint64_t logical_state_bytes = 0, physical_state_bytes = 0, state_sharing_credit_bytes = 0;
++    std::uint64_t state_references = 0;
+ };
+ 
+ struct TensorRankSummary {
+diff --git a/include/ninfer/request.h b/include/ninfer/request.h
+index d7478db81fad8591473a14e7ffefbc46e149a3fd..26a7b3cebcfe47db86b2818e59539c891d8c7ad6 100644
+--- a/include/ninfer/request.h
++++ b/include/ninfer/request.h
+@@ -593,6 +593,7 @@ struct PromptProgress {
+     std::uint32_t reused_prompt_tokens    = 0;
+     std::uint32_t processed_prompt_tokens = 0;
+     std::uint64_t elapsed_ns              = 0;
++    std::optional<std::uint32_t> actual_reused_prompt_tokens;
+ };
+ 
+ // Cumulative timing snapshot at one stable output-commit boundary. Generated tokens count model
+diff --git a/src/models/qwen3_5/program/planning/request_plan.cpp b/src/models/qwen3_5/program/planning/request_plan.cpp
+index 0de09ab79ef478d707ca838537ab52687b11dca0..5160d7de8b3974fa20ab62b2273f1fc7bcd09e71 100644
+--- a/src/models/qwen3_5/program/planning/request_plan.cpp
++++ b/src/models/qwen3_5/program/planning/request_plan.cpp
+@@ -1001,7 +1001,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+     plan->summary.prefix_reuse_path      = plan->reuse;
+     if (plan->memory_restore_frontier) {
+         if (const auto match = memory_restorable_history(prompt,&base.prefix_digests)) {
+-            plan->summary.prefix_reuse_path = match->kind == KvmemCheckpointKind::Endpoint
++            plan->summary.prefix_reuse_path = match->fork ? PrefixReusePath::SharedStablePrefix : match->kind == KvmemCheckpointKind::Endpoint
+                 ? PrefixReusePath::PrivateEndpoint : (match->kind == KvmemCheckpointKind::InputFallback ||
+                                                        match->kind == KvmemCheckpointKind::Reconstruction)
+                 ? PrefixReusePath::PrivateTurnClosure : PrefixReusePath::PrivateResponseReplay;
+diff --git a/src/models/qwen3_5/program/prefill.cpp b/src/models/qwen3_5/program/prefill.cpp
+index f0c27b558d2eb6e93ffd0384d97b44824e4663a6..192c31794596c9aff6d6a7c712fc170b11bf5a9d 100644
+--- a/src/models/qwen3_5/program/prefill.cpp
++++ b/src/models/qwen3_5/program/prefill.cpp
+@@ -818,6 +818,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
+             }
+         }
+ 
++        const auto planned_reuse = staged.memory_restore_frontier ? staged.memory_restore_frontier
++                                 : staged.disk_restore_frontier ? staged.disk_restore_frontier : staged.base;
++        staged.actual_reused_prompt_tokens = planned_reuse - std::min(planned_reuse, staged.hidden_replay_tokens);
+         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+         request.lifecycle = Lifecycle::Prefilling;
+     } catch (...) {
+@@ -1873,6 +1876,7 @@ runtime::PrefillStepResult ProgramImpl::complete_prefill_step(
+     bool drafts_pending, runtime::ExecutionTimingRecorder& timing) {
+     RequestControl::Prefill& staged   = *request.prefill;
+     const std::uint32_t prompt_tokens = staged.prompt_tokens;
++    const auto actual_reuse = staged.actual_reused_prompt_tokens;
+     sequence.window.query_replay_active = false;
+ 
+     validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
+@@ -1921,6 +1925,7 @@ runtime::PrefillStepResult ProgramImpl::complete_prefill_step(
+         .processed_prompt_tokens = processed_prompt_tokens,
+         .complete                = true,
+         .timing                  = timing.finish(),
++        .actual_reused_prompt_tokens = actual_reuse,
+     };
+ }
+ 
+diff --git a/src/models/qwen3_5/program/program.h b/src/models/qwen3_5/program/program.h
+index 5e11772d3c900b544d951275821381527cb5934c..c3702e0f516541272aca084d3174a8d4f3c83e79 100644
+--- a/src/models/qwen3_5/program/program.h
++++ b/src/models/qwen3_5/program/program.h
+@@ -871,6 +871,7 @@ struct PrefillProgress {
+     std::optional<CaptureOffer> capture;
+     // A completed branched read: one record per branch, in branch order.
+     std::vector<runtime::RawTokenLogprob> branches;
++    std::optional<std::uint32_t> actual_reused_prompt_tokens;
+ };
+ 
+ // One sequence's share of a shared prefill pass (Program::prefill_batch_unit).
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index fbae7e1d76b310771ce4edacba57c56216a95816..1809bca4aef337ffe37cc3cadeffa5f88f12414d 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -1,3 +1,4 @@
++#include <unordered_set>
+ #include "kvmem/spill_io.hpp"
+ #include "models/qwen3_5/program/structured_round.h"
+ #include "models/qwen3_5/program/program_impl.h"
+@@ -1121,11 +1122,28 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+         memory.retained_payload_budget_bytes = memory_retained_budget;
+         for (const auto& request : requests) memory.active_payload_reservation_bytes += request.memory_payload_reservation;
+         std::vector<const KvmemPrefixCheckpoint*> seen;
++        std::unordered_set<const void*> payload_records, state_records;
++        const auto collect_state = [&](const KvmemPrefixCheckpoint& checkpoint) {
++            const auto* identity = checkpoint.state ? static_cast<const void*>(checkpoint.state.get())
++                                                   : checkpoint.cold_state.storage_identity();
++            if (!identity) return;
++            const auto bytes = checkpoint.state_bytes();
++            memory.logical_state_bytes += bytes; ++memory.state_references;
++            if (state_records.insert(identity).second) memory.physical_state_bytes += bytes;
++        };
+         const auto collect = [&](const KvmemWindowState& window) {
+             // Moves into the history directory leave scalar fields behind until lane
+             // retirement. Ownership of statistics identifies the live history.
+             if (!window.statistics) return;
+             memory.statistics_bytes += window.statistics->allocated_bytes();
++            for (const auto& record : window.archive) if (record) {
++                memory.logical_payload_bytes += record.size(); ++memory.payload_references;
++                payload_records.insert(record.storage_identity());
++            }
++            std::unordered_set<const KvmemPrefixCheckpoint*> owner_states;
++            for (const auto kind : checkpoint_kinds(window))
++                if (const auto* checkpoint = memory_checkpoint(window, kind);
++                    checkpoint && owner_states.insert(checkpoint).second) collect_state(*checkpoint);
+             memory.evaluated_tokens = std::max(memory.evaluated_tokens, window.statistics_frontier);
+             memory.history_swaps += window.swaps;
+             memory.history_spilled_bytes += window.spilled_bytes;
+@@ -1152,6 +1170,13 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+         if(memory_coverage_transfer && std::find(seen.begin(),seen.end(),memory_coverage_transfer->checkpoint.get())==seen.end())
+             memory.checkpoint_bytes+=memory_coverage_transfer->checkpoint->metadata_bytes();
+         memory.host_payload_bytes = memory_payload_storage.charged_bytes();
++        memory.physical_payload_bytes = memory.host_payload_bytes + memory.disk_payload_bytes;
++        memory.unique_payload_records = payload_records.size();
++        // The physical account also covers retained cold checkpoint images and
++        // leased/in-flight records; this is a conservative confirmed saving.
++        memory.sharing_credit_bytes = memory.logical_payload_bytes > memory.physical_payload_bytes
++            ? memory.logical_payload_bytes-memory.physical_payload_bytes : 0;
++        memory.state_sharing_credit_bytes = memory.logical_state_bytes-memory.physical_state_bytes;
+     }
+     out.device          = device.device;
+     out.max_context     = capacity;
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index 96271f93500fcc3041f6dddd871b34912b71b51d..c86b03810ab160a2d1d76ef40dedf688d8598d8d 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -565,6 +565,7 @@ struct KvmemHistoryMatch {
+     std::size_t history;
+     KvmemCheckpointKind kind;
+     std::uint32_t frontier;
++    bool fork = false; // anonymous/shared discovery never consumes its source
+ };
+ 
+ using KvmemHostRecord = kvmem::HostKvRecord;
+@@ -827,6 +828,7 @@ struct RequestControl {
+         std::uint64_t memory_restore_generation = 0;
+         bool waiting_for_storage = false;
+         std::uint32_t hidden_replay_tokens  = 0;
++        std::optional<std::uint32_t> actual_reused_prompt_tokens;
+         std::uint32_t prompt_tokens         = 0;
+         std::uint32_t initial_mtp_extent    = 0;
+         // A request without drafting runs the drafter's prompt work (the MTP bridge and KV, the
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index abd4aa90c3e9e7e036d9c3c7b94040d0b843d9f6..a510dd3c7b29fbb85382445843332cacedbaf6ec 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -3,6 +3,7 @@
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/storage/kvmem_transfer_trace.h"
+ #include "models/qwen3_5/program/storage/checkpoint_recompute_policy.h"
++#include "kvmem/cache_owner.hpp"
+ 
+ #include <atomic>
+ #include <cstdio>
+@@ -1622,18 +1623,18 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+     std::optional<KvmemHistoryMatch> best;
+     bool fork=false;
+     for (unsigned pass=0; pass<2 && !best; ++pass) {
+-        // Tool continuation remains append plus resident-only Pressure. Only a
+-        // named request with a current user Query may discover another owner.
+-        if (pass && (!prompt.context_cache.session_key || !prompt.memory_query ||
+-                     !prompt.memory_query->count)) break;
++        // Anonymous requests may discover immutable prefixes too. A current
++        // user Query remains required; tool continuation does not gain recall.
++        if (pass && !kvmem::may_discover_shared_prefix(prompt.memory_query &&
++                     prompt.memory_query->count)) break;
+         std::vector<Candidate> candidates;
+         for (size_t index=0; index<memory_histories.size(); ++index) {
+             const auto& history=memory_histories[index];
+             if (!history || !history->stamp.valid) continue;
+             const bool own=history->session_key==prompt.context_cache.session_key;
+-            if (own != (pass==0)) continue;
+-            if (pass && (!history->session_key || !history->coverage.policy().enabled)) continue;
+-            if (!pass && history->coverage.policy().enabled && !history->session_key) {
++            if (!pass && !own) continue;
++            if (pass && own && prompt.context_cache.session_key) continue;
++            if (!pass && !history->session_key) {
+                 const KvmemPrefixCheckpoint* latest=nullptr;
+                 for (const auto kind:checkpoint_kinds(*history)) {
+                     const auto* cp=memory_checkpoint(*history,kind);
+@@ -1665,7 +1666,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+                     const auto& record=history->archive[page];
+                     if(!record.resident_bytes()) cold+=record.size();
+                 }
+-                candidates.push_back({{index,kind,static_cast<uint32_t>(cp->prefix.size())},cp,cold,order});
++                candidates.push_back({{index,kind,static_cast<uint32_t>(cp->prefix.size()),pass!=0},cp,cold,order});
+             }
+         }
+         std::stable_sort(candidates.begin(),candidates.end(),[&](const auto& a,const auto& b) {
+@@ -1786,7 +1787,7 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+             pending->history=match->history;
+             pending->generation=source.stamp.session.id;
+             pending->selected=match->kind;
+-            if(source.session_key!=staged.prompt.context_cache.session_key) {
++            if(match->fork) {
+                 uint64_t required=transaction.plan->impl_->memory_payload_reservation;
+                 for(const auto& active:requests) required+=active.memory_payload_reservation;
+                 const auto* checkpoint=memory_checkpoint(source,match->kind);
+diff --git a/src/models/qwen3_5/program/transactions/commit.cpp b/src/models/qwen3_5/program/transactions/commit.cpp
+index 077025c3e193c23d21b5c2705e5cb8392feb372c..965b7299819ce1bd93cc36fd0ca0d74b8cf5eda1 100644
+--- a/src/models/qwen3_5/program/transactions/commit.cpp
++++ b/src/models/qwen3_5/program/transactions/commit.cpp
+@@ -49,6 +49,9 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
+ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step) {
+     PrefillProgress out;
+     out.summary                 = step.summary;
++    out.actual_reused_prompt_tokens = step.actual_reused_prompt_tokens;
++    if (!out.actual_reused_prompt_tokens && requests[lane].prefill)
++        out.actual_reused_prompt_tokens = requests[lane].prefill->actual_reused_prompt_tokens;
+     out.processed_prompt_tokens = step.processed_prompt_tokens;
+     out.waiting_for_storage = requests[lane].prefill && requests[lane].prefill->waiting_for_storage;
+     out.complete                = step.complete;
+diff --git a/src/runtime/contract/execution.h b/src/runtime/contract/execution.h
+index a372a4b2d009aa53cbc111a903a0ba967ed10ec1..3332841b77ef6bdb9cfa611a4be34c781441c93c 100644
+--- a/src/runtime/contract/execution.h
++++ b/src/runtime/contract/execution.h
+@@ -100,6 +100,7 @@ struct PrefillStepResult {
+     std::uint32_t processed_prompt_tokens = 0;
+     bool complete                         = false;
+     ExecutionTiming timing;
++    std::optional<std::uint32_t> actual_reused_prompt_tokens;
+ };
+ 
+ struct RoundBudget {
+diff --git a/src/runtime/engine/engine_core.h b/src/runtime/engine/engine_core.h
+index 0b218d10c0f118960e4b514f9e7b650f9f7a02a1..86446c191c30a4463e53b034fa8e273eee3e2b89 100644
+--- a/src/runtime/engine/engine_core.h
++++ b/src/runtime/engine/engine_core.h
+@@ -1270,6 +1270,7 @@ private:
+             .reused_prompt_tokens    = begin.reused_prompt_tokens,
+             .processed_prompt_tokens = begin.reused_prompt_tokens + request->computed_prompt_tokens,
+             .elapsed_ns              = elapsed_ns(*request->admitted_at, Clock::now()),
++            .actual_reused_prompt_tokens = request->materialization_diagnostics.actual_reused_prompt_tokens,
+         };
+         {
+             std::lock_guard lock(request->mutex);
+@@ -2156,6 +2157,12 @@ private:
+             throw std::logic_error("prefill progress has no committed admission summary");
+         }
+         const BeginSummary& begin = *request->admitted_begin;
++        if constexpr (requires { progress.actual_reused_prompt_tokens; }) {
++            if (progress.actual_reused_prompt_tokens) {
++                request->materialization_diagnostics.actual_reused_prompt_tokens = progress.actual_reused_prompt_tokens;
++                request->materialization_diagnostics.planned_reused_prompt_tokens = begin.reused_prompt_tokens;
++            }
++        }
+         if (begin.reused_prompt_tokens > begin.prompt_tokens) {
+             throw std::logic_error("admitted prefix exceeds its prompt");
+         }
+diff --git a/src/serve/generation_service.cpp b/src/serve/generation_service.cpp
+index e0a0ffd98be8302d522df7f80bb68eaead26de16..0d19b16ba78866159a69c90d8c343430f01a4d13 100644
+--- a/src/serve/generation_service.cpp
++++ b/src/serve/generation_service.cpp
+@@ -247,26 +247,32 @@ public:
+     void start(ninfer::GenerationStart start) override {
+         prompt_ = start.prompt.prompt_tokens;
+         cached_ = start.reused_prompt_tokens;
+-        if (monitor_) monitor_({{"status", "reading"}, {"prompt_tokens", prompt_}, {"cached_tokens", cached_}});
++        actual_cached_.reset();
++        if (monitor_) monitor_({{"status", "reading"}, {"prompt_tokens", prompt_}, {"cached_tokens", cached_},
++            {"planned_cached_tokens", cached_}, {"reuse_accounting_scope", "admission_quote"}});
+         if (sink_->on_start) { sink_->on_start(start); }
+     }
+ 
+     void progress(ninfer::PromptProgress progress) override {
+         cached_ = progress.reused_prompt_tokens;
++        actual_cached_ = progress.actual_reused_prompt_tokens;
+         if (monitor_) monitor_({{"status", "reading"}, {"prompt_tokens", progress.total_prompt_tokens}, {"cached_tokens", cached_}});
+-        if (monitor_) monitor_({{"prompt_processed_tokens", progress.processed_prompt_tokens},
+-            {"prefill_elapsed_ms", progress.elapsed_ns / 1e6}});
++        const bool replayed_quote = progress.actual_reused_prompt_tokens && *progress.actual_reused_prompt_tokens != progress.reused_prompt_tokens;
++        if (monitor_) monitor_({{"prompt_processed_tokens", replayed_quote ? nlohmann::json(nullptr) : nlohmann::json(progress.processed_prompt_tokens)},
++            {"prefill_elapsed_ms", progress.elapsed_ns / 1e6},
++            {"actual_cached_tokens", progress.actual_reused_prompt_tokens ? nlohmann::json(*progress.actual_reused_prompt_tokens) : nlohmann::json(nullptr)}});
+         if (sink_->on_progress) { sink_->on_progress(progress); }
+     }
+ 
+     void timing(ninfer::GenerationTimingObservation timing) override {
+-        const auto native = completion_timings_json(prompt_, cached_, timing);
++        const auto effective_cached = actual_cached_.value_or(cached_);
++        const auto native = completion_timings_json(prompt_, effective_cached, timing);
+         nlohmann::json values{{"status", "generating"}, {"generated_tokens", timing.generated_tokens},
+             {"decode_tps", native.at("predicted_per_second")},
+             {"decode_tps_mean", native.at("predicted_per_second")},
+             {"prefill_tps", native.at("prompt_per_second")}, {"prefill_ms", native.at("prompt_ms")},
+             {"ttft_ms", native.at("prompt_ms")}, {"ttft_scope", "execution"},
+-            {"decode_ms", native.at("predicted_ms")}, {"prompt_new_tokens", prompt_ - cached_}};
++            {"decode_ms", native.at("predicted_ms")}, {"prompt_new_tokens", prompt_ - effective_cached}};
+         values.update(rate_.sample(timing.generated_tokens, timing.generation_elapsed_ns, kvmem::monitor::now_ms()));
+         if (monitor_) monitor_(values);
+         if (sink_->on_timing) { sink_->on_timing(timing); }
+@@ -289,6 +295,7 @@ private:
+     const StreamSink* sink_ = nullptr;
+     std::function<void(const nlohmann::json&)> monitor_;
+     int prompt_ = 0, cached_ = 0;
++    std::optional<std::uint32_t> actual_cached_;
+     kvmem::monitor_rate_window rate_;
+     std::string phase_;
+ };
+diff --git a/src/serve/kvmem_metrics.h b/src/serve/kvmem_metrics.h
+index 02dad3ab4dcf294a637a1fe87f7f209eca5d4732..a66a651a450a5b78894269dd8f74b5bce2d1c614 100644
+--- a/src/serve/kvmem_metrics.h
++++ b/src/serve/kvmem_metrics.h
+@@ -7,6 +7,20 @@
+ 
+ namespace ninfer::serve {
+ 
++inline const char* kvmem_reuse_source(PrefixReusePath path, std::uint32_t tokens) {
++    if (!tokens) return "miss";
++    return path == PrefixReusePath::SharedStablePrefix ? "shared" : "own";
++}
++
++inline nlohmann::json kvmem_cache_reuse(const GenerationMetrics& metrics) {
++    using Json = nlohmann::json;
++    const auto actual = metrics.materialization.actual_reused_prompt_tokens;
++    return {{"planned_cached_tokens", metrics.prefix_cache_hit_tokens},
++            {"actual_cached_tokens", actual ? Json(*actual) : Json(nullptr)},
++            {"planned_cache_source", kvmem_reuse_source(metrics.prefix_reuse_path, metrics.prefix_cache_hit_tokens)},
++            {"cache_source", actual ? Json(kvmem_reuse_source(metrics.prefix_reuse_path, *actual)) : Json(nullptr)}};
++}
++
+ // Additive diagnostics; the native usage, timings and Prometheus series stay intact.
+ inline nlohmann::json kvmem_generation_metrics(const GenerationOutcome& outcome) {
+     using Json = nlohmann::json;
+@@ -35,7 +49,7 @@ inline nlohmann::json kvmem_generation_metrics(const GenerationOutcome& outcome)
+         spec["mtp_drafted_tokens"] = m.speculative_draft_tokens - m.ngram_drafted_tokens;
+         spec["mtp_accepted_tokens"] = m.speculative_accepted_tokens - m.ngram_accepted_tokens;
+     }
+-    return {{"speculative", std::move(spec)}};
++    return {{"speculative", std::move(spec)}, {"cache_reuse", kvmem_cache_reuse(m)}};
+ }
+ 
+ // Native request results, independent of whether the client requested SSE timing
+@@ -65,6 +79,14 @@ inline nlohmann::json kvmem_monitor_outcome(const GenerationOutcome& outcome) {
+         {"ttft_scope", "execution"}, {"finish_reason", finish},
+         {"drafts_offered", m.speculative_draft_tokens},
+         {"drafts_accepted", m.speculative_accepted_tokens}, {"speculative", std::move(spec)}};
++    result.update(kvmem_cache_reuse(m));
++    result["reuse_accounting_scope"] = "admission_quote_with_independent_native_actual";
++    if (const auto actual = m.materialization.actual_reused_prompt_tokens) {
++        const auto fresh = std::max(0, outcome.prompt_tokens - int(*actual));
++        result["prompt_new_tokens"] = fresh;
++        const auto ms = timings.at("prompt_ms").get<double>();
++        result["prefill_tps"] = ms > 0 ? Json(1000.0 * fresh / ms) : Json(nullptr);
++    }
+     // Native total speculation includes copy drafts. Do not label them as MTP.
+     if (m.speculative_backend == SpeculativeBackend::Mtp &&
+         m.speculative_draft_tokens >= m.ngram_drafted_tokens &&
+diff --git a/src/serve/kvmem_status_json.h b/src/serve/kvmem_status_json.h
+index e317a8a2b36e2aaa80cc18ee973d7ace94c17979..0cbbed8b7c13cfac2a2f336d7cf42457b30baed1 100644
+--- a/src/serve/kvmem_status_json.h
++++ b/src/serve/kvmem_status_json.h
+@@ -21,6 +21,11 @@ inline nlohmann::json kvmem_status_json(const KvmemMemorySummary& m) {
+         {"active_payload_reservation_bytes", m.active_payload_reservation_bytes},
+         {"checkpoint_tokens", m.checkpoint_tokens}, {"resident_pages", m.resident_pages},
+         {"history_swaps", m.history_swaps}, {"history_spilled_bytes", m.history_spilled_bytes},
+-        {"history_restored_bytes", m.history_restored_bytes}};
++        {"history_restored_bytes", m.history_restored_bytes},
++        {"logical_payload_bytes", m.logical_payload_bytes}, {"physical_payload_bytes", m.physical_payload_bytes},
++        {"sharing_credit_bytes", m.sharing_credit_bytes}, {"payload_references", m.payload_references},
++        {"unique_payload_records", m.unique_payload_records}, {"logical_state_bytes", m.logical_state_bytes},
++        {"physical_state_bytes", m.physical_state_bytes}, {"state_sharing_credit_bytes", m.state_sharing_credit_bytes},
++        {"state_references", m.state_references}};
+ }
+ } // namespace ninfer::serve
+diff --git a/src/serve/openai_chat_request.cpp b/src/serve/openai_chat_request.cpp
+index fab1e411c23036cae4ba43ff10e3170af1ef3d8f..e4999726674ffbc4193146adf53e5fc2a90ae7ae 100644
+--- a/src/serve/openai_chat_request.cpp
++++ b/src/serve/openai_chat_request.cpp
+@@ -2,6 +2,7 @@
+ #include "serve/openai_chat.h"
+ #include "serve/openai_common.h"
+ #include "serve/request_validation.h"
++#include "kvmem/cache_owner.hpp"
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -1009,6 +1010,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
+ 
+ ContextCacheHints parse_chat_context_cache_hints(const RequestJson& body) {
+     ContextCacheHints hints;
++    kvmem::CacheOwnerHints owner;
+     const auto key = [&](const RequestJson& value, const char* field, bool allow_empty) {
+         if (!value.is_string()) { bad_request(std::string(field) + " must be a string", field); }
+         auto result = value.get<std::string>();
+@@ -1023,19 +1025,17 @@ ContextCacheHints parse_chat_context_cache_hints(const RequestJson& body) {
+     for (const char* field : {"prompt_cache_key", "promptCacheKey"}) {
+         if (!body.contains(field) || body.at(field).is_null()) { continue; }
+         auto value = key(body.at(field), field, true);
+-        if (value.empty()) { continue; }
+-        if (hints.session_key && *hints.session_key != value) {
+-            bad_request("prompt_cache_key and promptCacheKey must agree", field);
+-        }
+-        hints.session_key = std::move(value);
++        (field==std::string("prompt_cache_key") ? owner.prompt : owner.sdk_prompt)=std::move(value);
+     }
+     if (body.contains("kvmem") && !body.at("kvmem").is_null()) {
+         const auto& extension = body.at("kvmem");
+         if (!extension.is_object()) { bad_request("kvmem must be an object", "kvmem"); }
+         if (extension.contains("conversation_id") && !extension.at("conversation_id").is_null()) {
+-            hints.session_key = key(extension.at("conversation_id"), "kvmem.conversation_id", false);
++            owner.conversation = key(extension.at("conversation_id"), "kvmem.conversation_id", false);
+         }
+     }
++    try{hints.session_key=kvmem::resolve_cache_owner(owner);}
++    catch(const std::invalid_argument& error){bad_request(error.what(),"promptCacheKey");}
+     if (hints.session_key) {
+         hints.retention = CacheRetentionHint::LiveSession;
+         hints.update_session_index = true;
+diff --git a/tests/experimental/ssd_failure.cpp b/tests/experimental/ssd_failure.cpp
+index b60d519982551c59824f1f291ed7baf6deb47f7e..34d782ba99ab0786563a8dca354ed5040431835a 100644
+--- a/tests/experimental/ssd_failure.cpp
++++ b/tests/experimental/ssd_failure.cpp
+@@ -256,6 +256,8 @@ void checkpoint_fork(const char* artifact) {
+         auto fresh=response_options; fresh.execution.allow_prefix_reuse=false;
+         const auto reference=engine.submit(engine.prepare(cold),fresh).wait();
+         require(!reference.reused_prompt_tokens,"reference unexpectedly reused a prefix");
++        require(reference.materialization.actual_reused_prompt_tokens == 0,
++                "fresh native execution did not report zero actual reuse");
+         const auto answer_begin=reference.content.find_first_not_of(" \t\r\n");
+         const auto answer_end=reference.content.find_last_not_of(" \t\r\n");
+         require(answer_begin!=std::string::npos &&
+@@ -265,6 +267,10 @@ void checkpoint_fork(const char* artifact) {
+             auto input=question; input.context_cache.session_key=key;
+             auto result=engine.submit(engine.prepare(input),response_options).wait();
+             require(!expected_hit || result.reused_prompt_tokens>0,"fork or parent missed its checkpoint");
++            require(result.materialization.actual_reused_prompt_tokens.has_value(), "native actual reuse was not observed");
++            require(expected_hit ? *result.materialization.actual_reused_prompt_tokens>0
++                                 : *result.materialization.actual_reused_prompt_tokens==0,
++                    "native actual reuse disagrees with restored/fallback state");
+             std::cout<<"FORK_OUTPUT "<<key<<" reference="<<reference.content<<" restored="<<result.content<<"\nreference_ids:";
+             for(auto id:reference.generated_token_ids) std::cout<<' '<<id;
+             std::cout<<"\nrestored_ids:";for(auto id:result.generated_token_ids) std::cout<<' '<<id;
+@@ -272,11 +278,17 @@ void checkpoint_fork(const char* artifact) {
+             require(result.generated_token_ids==reference.generated_token_ids,"fork/fallback output differs from fresh prefill");
+             require(engine.is_available(),"fork disabled Engine");
+             const auto memory=engine.memory_summary().kvmem;
++            require(memory.physical_payload_bytes==memory.host_payload_bytes+memory.disk_payload_bytes,
++                    "physical payload disagrees with the native account");
++            require(memory.payload_references>=memory.unique_payload_records &&
++                    memory.logical_state_bytes>=memory.physical_state_bytes,
++                    "shared reference accounting is inconsistent");
+             observed_disk_payload=std::max(observed_disk_payload,memory.disk_payload_bytes);
+             require(memory.host_payload_bytes<=options.kvmem.host_bytes &&
+                 memory.disk_payload_bytes<=options.kvmem.disk_bytes && !memory.resident_pages,
+                 "fork leaked quota or native pages");
+             std::cout<<"FORK_CASE "<<key<<" reused="<<result.reused_prompt_tokens
++                     <<" actual_reused="<<*result.materialization.actual_reused_prompt_tokens
+                      <<" native_hits="<<memory.history_hits<<" reads="<<memory.disk_read_bytes
+                      <<" errors="<<memory.disk_errors<<" disk_payload="<<memory.disk_payload_bytes
+                      <<" exact=1"<<std::endl;
+diff --git a/tests/test_openai_schema.cpp b/tests/test_openai_schema.cpp
+index fc5a6f61429f533b994778f41e171d3e32f6b374..8f13bbe4f4fe35fb8e0d107e5f83cb7ddfcceefa 100644
+--- a/tests/test_openai_schema.cpp
++++ b/tests/test_openai_schema.cpp
+@@ -1263,6 +1263,19 @@ int test_monitor_outcome() {
+     failures += check(kvmem_monitor_outcome(outcome)["ttft_ms"].is_null(), "no first token means unavailable TTFT");
+     outcome.metrics.speculative_backend = ninfer::SpeculativeBackend::None;
+     failures += check(!kvmem_monitor_outcome(outcome).contains("mtp_drafts_offered"), "copy-only runs do not claim MTP");
++    outcome.prompt_tokens = 100;
++    outcome.metrics.prefix_cache_hit_tokens = 80;
++    outcome.metrics.computed_prefill_tokens = 20;
++    outcome.metrics.prompt_wall_seconds = 0.1;
++    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::SharedStablePrefix;
++    outcome.metrics.materialization.actual_reused_prompt_tokens = 0;
++    const auto fallback = kvmem_monitor_outcome(outcome);
++    failures += check(fallback["planned_cached_tokens"] == 80 && fallback["actual_cached_tokens"] == 0 &&
++                          fallback["cache_source"] == "miss" && fallback["planned_cache_source"] == "shared",
++                      "failed restore separates planned and actual native cache source");
++    failures += check(fallback["prompt_new_tokens"] == 100 && fallback["prefill_tps"] == 1000 &&
++                          completion_timings_json(outcome)["cache_n"] == 80,
++                      "monitor accounts fallback computation without changing the admission wire contract");
+     return failures;
+ }
+ 

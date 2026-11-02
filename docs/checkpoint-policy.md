@@ -5,6 +5,114 @@ NInfer Qwen3.5 KVMem paths. The default remains `legacy`. PolyStrata keeps its o
 native checkpoint policy. This feature does not add a request mode or persistence
 across process restarts.
 
+## Shared owners across backends
+
+For Chat Completions, `kvmem.conversation_id` names the mutable lineage;
+`prompt_cache_key` and the SDK spelling `promptCacheKey` are aliases with lower
+priority. Conflicting nonempty aliases are rejected, including when an explicit
+conversation ID is present. Keys preserve all bytes up to the 256-byte limit.
+Radiance also accepts its existing `session_id` as a legacy fallback; the
+128-byte dashboard label is separate from cache identity. Longer legacy labels
+remain accepted for display without becoming an owner key.
+
+The same owner contract applies to llama.cpp and PolyStrata. An explicit owner
+selects a mutable lineage, not a bypass for token, media, position, accepted-state
+or model/layout checks. An anonymous request may discover a reusable native
+prefix; it does not acquire a durable named conversation. Keys are bounded by
+UTF-8 bytes, not dashboard label length. Invalid types, empty explicit owners and
+conflicting aliases return an input error.
+
+| Backend | Native source and independent branch | Boundaries |
+|---|---|---|
+| NInfer Qwen3.5 KVMem | Owner-first native history lookup; sealed archive references and immutable state images, private selectors/Query/rollback | `legacy` and `spread`; active GPU pages and mutable recurrent state remain per lane |
+| llama.cpp KVMem | Exact native checkpoints; source-preserving bundles, sealed packed KV and read-only recurrent/draft checkpoint references | Modern host/SSD tier or multi-conversation mode; old pinned CPU arenas disable foreign forks; SSD requires Flash Attention |
+| PolyStrata KVMem | Native accepted stamp and recurrent checkpoint; parked source preserved while child enters, shared sealed archive/state | CUDA qualification; solo MTP and ordinary batch decode keep their native execution modes; HIP hardware validation is separate |
+| Radiance KVMem | Native rank-prefix state, accepted token/media proof and independent rank memory policy | CPU/portable validation is separate from AMD execution; remote GPU qualification requires the machine to be running |
+
+These are host/SSD and read-only checkpoint references within one loaded
+backend/model configuration. They are not a portable KV format, a cross-process
+cache, or a promise that separate GPU working sets share their physical pages.
+Different backends keep their native restore rules. No second cache manager or
+document-ingestion endpoint is introduced.
+
+No key is required for sharing. A new user Query may discover a complete exact
+prefix from another owner, including an anonymous owner, in either NInfer
+`legacy` or `spread` mode. The selected checkpoint must still prove model/layout,
+token and media identity, original positions, accepted frontier and native
+recurrent state. Lookup examines RAM metadata and reads only selected cold
+payloads. Hashes and longest common prefixes are candidate filters, never a
+substitute for those proofs. Tool continuation does not enable foreign-owner
+discovery or cold-history Query reselection; it uses append and resident-only
+Pressure. Existing proven continuations remain eligible for native restore.
+
+llama.cpp clones an active source without switching its GPU working set first;
+normal lane handover then restores the child. A partial archive tail is private,
+and restored checkpoint statistics supply its exact state. PolyStrata preserves
+the selected parked source until the branch is published; failed enter/restore
+does not consume it. Checkpoint wrappers, coverage catalogs, MeanK, LRFU, graph
+feedback, Query buffers and draft rollback are mutable per owner even when
+their sealed byte allocations are shared.
+
+Capacity admission charges the native physical H/D account once, plus new
+growth and outstanding reservations. Logical bytes summed across owners can
+exceed physical bytes. Metadata, statistics, model weights, OS file cache,
+temporary transfers, process RSS and GPU VRAM have separate scopes; H is not an
+RSS limit. An LRU directory eviction releases only its own references. The last
+reader or owner releases the allocation and its quota.
+
+The monitor distinguishes `planned_cached_tokens`, `actual_cached_tokens` and
+`cache_source` (`own`, `shared`, `miss`). Missing native observations stay absent
+or null. NInfer's pre-existing `cached_tokens` wire accounting is an admission
+quote: a best-effort failed restore can silently recompute that prefix. Its new
+independent actual observation reports zero in that case, and the monitor uses
+the actual value when available. This does not rewrite the original wire
+timings or Prometheus admission accounting. A created fork is not an actual
+cache hit until native restore succeeds. llama.cpp's physical checkpoint bytes
+also include private retrieval metadata and are labelled separately from pure
+recurrent-state bytes.
+
+PolyStrata reports the first successful native restore boundary per HTTP request;
+input computed before an internal yield is not newly credited on resume. This
+is not net compute saved across every later replay. Its scope-version-2 memory
+snapshot includes all native sequence archives, slot checkpoint references and
+parked histories. Foreign discovery requires more than one retained history;
+with one history, different named owners start fresh. Internal solo/batch/MTP
+continuations after decode retain the owner with an empty Query span. A prefill
+yielded before its new Query retains that still-pending bounded span.
+
+A foreign hit forks the native history. Historical sealed RAM/SSD records and
+read-only state may share physical allocations; mutable selectors, feedback,
+catalogs and live recurrent state belong to each branch. Releasing or editing one
+owner cannot change bytes still leased by another. Normal capacity eviction may
+remove an idle directory entry, and physical release waits for its last lease.
+For NInfer anonymous requests, the existing native continuation proof still
+permits dropped output and a re-templated input tail of at most 64 tokens; deeper
+shared prefixes now use a fork. An anonymous request is not a durable named
+conversation. Clients that need reliable lineage selection should send a key.
+
+Radiance retains both a deep input point and a conservative point before the
+first assistant message, when those are safe native chunk boundaries. An input
+edit or template rewrite may require falling back or recomputation. It cannot
+restore recurrent state at an arbitrary LCP. The scheduler respects native
+prefill quantum and speculative refill requirements. Extra prefill cuts can
+change floating-point accumulation; text equality is not the sole correctness
+test.
+
+Radiance admission counts repeated sealed allocation identities once across
+active histories, input points and parked sessions. Independent captures of
+equal bytes and per-branch metadata remain charged separately. The monitor
+exposes logical bytes, proven sharing credit and accounted cache bytes, alongside
+the storage account's actual RAM/SSD payload charges. Pending parking retains a
+conservative full reservation until publication. These counters do not describe
+total process RSS, model weights or transient runtime workspace.
+
+This scope shares physical host/SSD records inside one worker and compatible
+native model instance. It does not add a common GPU page pool, transfer KV
+between backends or persist caches across restart. Radiance retains its existing
+native prefix references. Owner keys are routing hints, not a tenant
+security boundary. Concurrent requests are native snapshot branches; applications
+requiring a single ordered conversation must serialize submissions themselves.
+
 ## Configuration
 
 Set these environment variables before starting the worker:
@@ -246,14 +354,15 @@ Keep the identity stable through append, regenerate and rollback. Separate conve
 should use distinct identities; sharing a key shares one owner, so a suffix edit can discard
 checkpoints another branch would otherwise reuse. A key identifies an owner; token/media,
 native-state and KV proofs still govern every restore. Missing/null/empty cache keys remain
-anonymous. Spread protects anonymous histories from consumptive
+anonymous. Both NInfer policies protect anonymous histories from consumptive
 restores by unrelated requests sharing only the system prefix: a continuation
 must reach the previous accepted input boundary, allowing a 64-token template
-tail margin. Earlier edits without a session key start a separate history. This
+tail margin. Earlier edits without a session key start a separate history or fork
+a proven foreign prefix. This
 keeps a short unrelated conversation from truncating the retained long history.
 
-NInfer spread mode first searches that named owner's checkpoints. If none is
-valid, a request with a current user Query may discover another named owner's
+NInfer first searches the current owner's checkpoints. If none is
+valid, a request with a current user Query may discover another named or anonymous owner's
 matching prefix. The bounded retained directory, token/media/position digests,
 coverage and placement metadata live in RAM. Digest filtering reads no SSD
 payload; at most 16 foreign candidates receive exact prefix checks. Candidates
@@ -280,8 +389,8 @@ history hit is recorded. Previously quoted API reuse counters can still include
 the planned prefix on that fallback; use the native restore log to distinguish
 completed reuse. OpenCode needs no parent ID or fork protocol change: its new
 session/cache key selects a new owner with an identical serialized prefix.
-This cross-owner policy is specific to the NInfer Qwen3.5 KVMem path; the llama
-ownership rules above remain unchanged.
+The payload format and restore proof remain specific to the NInfer Qwen3.5 KVMem
+path; the shared owner contract above also applies to the other backends.
 
 Ordinary tool continuation still appends with resident-only Pressure. A saved Q
 does not authorize cold-history recall. Checkpoint policy does not change the

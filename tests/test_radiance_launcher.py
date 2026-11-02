@@ -29,6 +29,14 @@ class RadiancePlanTest(unittest.TestCase):
         parameters.update(settings)
         return build_plan(dict(schema_version=1,parameters=parameters))
 
+    def test_packed_kv_and_recurrent_state(self):
+        for kv in ('fp8','bf16','fp8_v4','k6_v4'):
+            for state in ('f32','f16'):
+                args=self.plan(KvType=kv,StateCacheType=state)['argv']
+                self.assertEqual(args[args.index('--kv-cache-dtype')+1],kv)
+                self.assertEqual(args[args.index('--state-cache-dtype')+1],state)
+        with self.assertRaises(ValueError):self.plan(StateCacheType='bf16')
+
     def test_units_identity_scoring_and_backend_flags(self):
         p=self.plan(Concurrency=8,SpeculativeMode='mtp',DraftTokens=3,RetainedSessions=0,
             QueryScorer='meanq-cosine',Lrfu=True,LrfuTopFraction=.75,QueryMaxTokens=128,
@@ -89,11 +97,24 @@ class RadiancePlanTest(unittest.TestCase):
             args=self.plan(Vision=True,VisionTokens=1024)['argv']
             self.assertEqual(args[args.index('--mm-max-patches')+1],'4096')
             self.assertEqual(args[args.index('--image-max-pixels')+1],'1048576')
-            for values in (dict(VisionResidency='cpu'),dict(VisionTokens=63),dict(VisionTokens=16385)):
+            for residency in ('cpu','resident'):
+                plan=self.plan(Vision=True,VisionResidency=residency)
+                argv=plan['argv']
+                self.assertEqual(argv[argv.index('--vision-residency')+1],residency)
+                self.assertEqual(plan['effective_parameters']['VisionResidency'],residency)
+            for values in (dict(VisionResidency='invalid'),dict(VisionTokens=63),dict(VisionTokens=16385)):
                 with self.subTest(values=values),self.assertRaises(ValueError):self.plan(Vision=True,**values)
         args=self.plan(Vision=False)['argv']
         self.assertEqual(args[args.index('--mm-max-patches')+1],'0')
         self.assertNotIn('--image-max-pixels',args)
+        self.assertNotIn('--vision-residency',args)
+
+    def test_text_embedding_placement(self):
+        for placement in ('ram','vram'):
+            plan=self.plan(EmbeddingPlacement=placement)
+            self.assertEqual(plan['argv'][plan['argv'].index('--embedding-placement')+1],placement)
+            self.assertEqual(plan['effective_parameters']['EmbeddingPlacement'],placement)
+        with self.assertRaises(ValueError):self.plan(EmbeddingPlacement='disk')
 
     def test_mtp_default_and_legacy_alias(self):
         for values in (dict(SpeculativeMode='mtp'),dict(MtpDrafts=3)):

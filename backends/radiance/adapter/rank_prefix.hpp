@@ -16,6 +16,7 @@ class RankPrefix {
         if(b>UINT64_MAX-a)throw std::runtime_error("rank prefix size overflow");return a+b;
     }
 public:
+    void account(SharedPayloadAccounting& out) const {for(const auto& r:ranks_)r.lease->account(out);}
     struct Payload {std::vector<PrefixLease::Payload> ranks;};
     void add_rank(int device,RadStream stream,rad::KVManager& kv,std::unique_ptr<PrefixLease> lease) {
         if(!lease || (!ranks_.empty() && lease->frontier()!=frontier()))throw std::runtime_error("rank prefix frontiers differ");

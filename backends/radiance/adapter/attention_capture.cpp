@@ -87,7 +87,7 @@ int AttentionCapture::observe(int layer, rad_kvgroup group, int64_t hd, const Ra
         return RAD_E_SHAPE;
     AttentionKernelArgs a{q,cache,kv->block_table,static_cast<const uint32_t*>(s.device_rows->p),
         static_cast<const AttentionPage*>(s.device_pages->p),uint32_t(s.rows.size()),uint32_t(s.pages.size()),
-        it->query_heads,it->head_dim,s.first,static_cast<float*>(s.scratch->p),static_cast<float*>(s.device_masses[i]->p)};
+        it->query_heads,it->head_dim,s.first,static_cast<float*>(s.scratch->p),static_cast<float*>(s.device_masses[i]->p),it->packing};
     const int rc=attention_page_masses(a,stream);
     if (rc<0) return rc;
     s.seen[i]=true;

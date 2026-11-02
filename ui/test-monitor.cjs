@@ -187,6 +187,13 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     assert.equal(await page.locator('[data-value="history"]').textContent(),'5 / 2');
     assert.equal(await page.locator('[data-bar="host"]').evaluate(e=>e.style.width),'12.5%');
     assert.notEqual(await page.locator('.s-state').getAttribute('data-stale'),'true');
+    fixtureScenario={backend:'llamacpp',monitorCache:{host_payload_bytes:1048576,host_payload_budget_bytes:8388608,
+      disk_payload_bytes:0,disk_payload_budget_bytes:0,logical_payload_bytes:2097152,physical_payload_bytes:1048576,
+      sharing_credit_bytes:1048576,shared_forks:1,physical_state_bytes:1048576,retained_sessions:2}};
+    await page.waitForFunction(()=>document.querySelector('[data-cache-metrics]')?.textContent.includes('KV 共享节省下界'));
+    assert.match(await page.locator('[data-cache-metrics]').textContent(),/RAM\/SSD 物理计费/);
+    assert.equal(await page.locator('[data-bar="host"]').evaluate(e=>e.style.width),'12.5%');
+    assert.match(await page.locator('[data-cache-metrics]').textContent(),/2.00 MiB/);
     fixtureScenario={};
     for (const backend of ['llamacpp', 'ninfer', 'polystrata']) {
       const media = {has_media:true, status:'processing', generated_tokens:0};
@@ -337,11 +344,28 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     await page.waitForFunction(() => document.querySelector('[data-value="decode"]').textContent === '8.0');
     await expectPrefill('50');
     assert.equal(await page.locator('[data-backend-metrics]').isVisible(),false);
-    recent=[{...record(),id:'expert-history',status:'completed',expert_hit_rate:.75,drafts_offered:40,drafts_accepted:30,decode_ms:2500}];
+    // An admission quote is still unverified during restore. Do not render it as an actual hit.
+    fixtureScenario.active=[{...record(),id:'restore-pending',planned_cached_tokens:90,
+      reuse_accounting_scope:'admission_quote'}];
+    await page.waitForFunction(()=>document.querySelector('[data-value="reused-tokens"]').textContent.startsWith('— /'));
+    assert.equal(await page.locator('[data-value="reuse"]').textContent(),'未采集');
+    fixtureScenario.active=[{...fixtureScenario.active[0],reuse_accounting_scope:'admission_quote_with_independent_native_actual',actual_cached_tokens:null}];
+    await page.waitForTimeout(1200);
+    assert.match(await page.locator('[data-value="reused-tokens"]').textContent(),/^— \//);
+    fixtureScenario.active=[{...fixtureScenario.active[0],actual_cached_tokens:0,cache_source:'miss'}];
+    await page.waitForFunction(()=>document.querySelector('[data-value="reused-tokens"]').textContent.startsWith('0 /'));
+    assert.equal(await page.locator('[data-value="reuse"]').textContent(),'0%');
+    fixtureScenario.active=undefined;
+    recent=[{...record(),id:'expert-history',status:'completed',expert_hit_rate:.75,drafts_offered:40,drafts_accepted:30,decode_ms:2500,
+      planned_cached_tokens:90,actual_cached_tokens:0,cache_source:'miss'}];
     await page.waitForFunction(()=>document.querySelector('[data-requests]')?.textContent.includes('已完成'));
     await page.locator('[data-requests] button').last().click();
     assert.match(await page.locator('[data-detail-body]').textContent(),/专家命中率 75.0%/);
     assert.match(await page.locator('[data-detail-body]').textContent(),/接受 30/);
+    assert.match(await page.locator('[data-detail-body]').textContent(),/计划复用: 90 tokens/);
+    assert.match(await page.locator('[data-detail-body]').textContent(),/实际复用: 0 tokens/);
+    assert.match(await page.locator('[data-detail-body]').textContent(),/缓存来源: miss/);
+    assert.match(await page.locator('[data-detail-body]').textContent(),/复用 0/);
     await page.locator('[data-close]').click();recent=[];
     fixtureScenario = {};
     await page.waitForFunction(() => document.querySelector('[data-value="decode"]').textContent === '—');

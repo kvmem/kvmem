@@ -28,9 +28,11 @@ public:
     uint64_t evaluated() const noexcept { return evaluated_; }
     uint64_t allocated_bytes() const noexcept {
         return sizeof(*this) + versions_.capacity()*sizeof(uint64_t) +
-            prefixes_.capacity()*sizeof(std::weak_ptr<ContentPrefix>) + prefixes_.size()*sizeof(ContentPrefix);
+            prefixes_.capacity()*sizeof(std::weak_ptr<ContentPrefix>) + prefixes_.size()*sizeof(ContentPrefix) +
+            inherited_.capacity()*sizeof(std::shared_ptr<const ContentPrefix>);
     }
     std::shared_ptr<const ContentPrefix> prefix(uint64_t end);
+    std::unique_ptr<KvContent> fork() const;
     bool contains(const std::shared_ptr<const ContentPrefix> & prefix) const noexcept;
     void reserve(uint64_t end);
     void complete(uint64_t begin, uint64_t end, bool accepted = true);
@@ -48,6 +50,7 @@ private:
     MemoryStamp stamp_;
     std::vector<uint64_t> versions_;
     std::vector<std::weak_ptr<ContentPrefix>> prefixes_;
+    std::vector<std::shared_ptr<const ContentPrefix>> inherited_;
     void revoke_prefixes(uint64_t keep, bool all = false) noexcept;
 };
 } // namespace kvmem

@@ -228,16 +228,15 @@ try:
                         normalized = ''.join(text.strip().strip('。.!').split())
                         check('inference ' + expected, status == 200 and normalized == expected)
                         check('response alias', response.get('model') == 'compat-model')
-                    # kvmem.conversation_id was an unrecognized key before
-                    # multi-conversation support, so a client that sends one
-                    # must still be served on a default single-store server,
-                    # whatever it sends. The value is dropped, never rejected.
-                    for bad in [123, '', 'a' * 129, 'has space', None]:
+                    # Owner parsing is strict independently of catalog capacity.
+                    # A longer UTF-8 key and spaces are valid; null is absent.
+                    for value, expected_status in [(123,400),('',400),('a'*257,400),
+                            ('a'*129,200),('has space',200),('界'*60,200),(None,200)]:
                         payload = {'messages': [{'role': 'user', 'content': 'What is 2+3? Answer with the number only.'}],
                                    'max_tokens': 4, 'reasoning_effort': 'none', 'temperature': 0,
-                                   'stream': False, 'kvmem': {'conversation_id': bad}}
+                                   'stream': False, 'kvmem': {'conversation_id': value}}
                         status, body = request('/v1/chat/completions', json.dumps(payload).encode(), headers)
-                        check(f'unusable conversation_id ignored {bad!r}', status == 200)
+                        check(f'owner validation {value!r}', status == expected_status)
                     payload = {'messages': [{'role': 'user', 'content': 'What is 2+3? Answer with the number only.'}],
                                'max_tokens': 32, 'reasoning_effort': 'none', 'temperature': 0, 'stream': True}
                     status, body = request('/v1/chat/completions', json.dumps(payload).encode(), headers)
@@ -348,8 +347,12 @@ try:
                             proc.kill()
                             proc.wait()
             logtext = (out / 'server.log').read_text(encoding='utf-8', errors='replace')
-            check('target effective threads/ubatch', 'KVMEM_CONTEXT target threads=2 threads_batch=3 ubatch=128' in logtext)
-            check('HTTP thread configuration applied', 'KVMEM_HTTP threads=2 timeout=2' in logtext)
+            ready = next(json.loads(line.split('ready=',1)[1]) for line in logtext.splitlines()
+                         if line.startswith('KVMEM_STARTUP ready='))
+            check('target effective threads/ubatch', ready['threads_actual']==2 and
+                  ready['threads_batch_actual']==3 and ready['ubatch_actual']==128)
+            check('HTTP thread configuration applied', ready['http']['threads']==2 and
+                  ready['http']['max_threads']==2 and ready['http']['timeout']==2)
             if a.mtp:
                 check('draft effective threads/ubatch', 'KVMEM_CONTEXT draft threads=2 threads_batch=3 ubatch=128' in logtext)
             check('keys absent from logs', all(key not in logtext for key in ['first-key', 'second-key', 'file-key']))

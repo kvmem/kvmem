@@ -1,0 +1,366 @@
+--- a/core/build/rad_build.h
++++ b/core/build/rad_build.h
+@@ -177,6 +177,8 @@
+      * has to be able to convert the model. */
+     void set_instances(bool on) { instances_ = on; }
+ 
++    int place_vision_on_cpu();
++
+     Program&       program()       { return prog_; }
+     const Program& program() const { return prog_; }
+ 
+--- a/core/build/rad_builder.cpp
++++ b/core/build/rad_builder.cpp
+@@ -1598,6 +1598,50 @@
+     }
+ }
+ 
++/* Qwen's declared vision tower is one contiguous run. Move its entire run, including
++ * weightless RoPE and attention, before layouts and buffer arenas are finalized.
++ * Refuse a different graph contract rather than silently placing part of it on CPU. */
++int Builder::place_vision_on_cpu() {
++    auto vision = [](const std::string& name) { return name.rfind("v.", 0) == 0; };
++    if (!ref_ && (prog_.encoder_name != "vision" || !prog_.encoder.out ||
++                  !vision(prog_.buffers[prog_.encoder.out].name))) {
++        err(RAD_E_UNSUPPORTED, "CPU vision requires the native Qwen vision tower");
++        return RAD_E_UNSUPPORTED;
++    }
++    size_t first = prog_.ops.size(), last = 0;
++    for (size_t i = 1; i < prog_.ops.size(); ++i)
++        for (rad_weight w : prog_.ops[i].weights)
++            if (w && vision(prog_.weights[w].name)) {
++                first = std::min(first, i); last = std::max(last, i);
++            }
++    if (first > last) {
++        err(RAD_E_UNSUPPORTED, "CPU vision found no complete native vision op run");
++        return RAD_E_UNSUPPORTED;
++    }
++    for (size_t i = first; i <= last; ++i) {
++        const OpInfo& o = prog_.ops[i];
++        for (rad_weight w : o.weights)
++            if (w && !vision(prog_.weights[w].name)) {
++                err(RAD_E_UNSUPPORTED, "CPU vision run mixes language-model weights");
++                return RAD_E_UNSUPPORTED;
++            }
++        if (!ref_) for (const Band& band : o.bands) {
++            const Resolved& host = band.dom[RAD_DOMAIN_HOST];
++            if (!host || host.scratch_bytes > 0) {
++                err(RAD_E_UNSUPPORTED, "CPU vision op '%s' needs a host kernel with no device scratch", o.op.c_str());
++                return RAD_E_UNSUPPORTED;
++            }
++        }
++    }
++    for (size_t i = first; i <= last; ++i) {
++        OpInfo& o = prog_.ops[i]; o.host_forced = true;
++        for (Band& band : o.bands) band.dom[RAD_DOMAIN_DEVICE] = Resolved{};
++    }
++    for (BufferInfo& b : prog_.buffers) if (vision(b.name)) b.decl.domain = RAD_DOMAIN_HOST;
++    if (!ref_) RAD_INFO("vision: CPU execution, ops %zu..%zu; weights mapped from container, activations on host", first, last);
++    return RAD_OK;
++}
++
+ int Builder::finish() {
+     if (finished_) return status_;
+     finished_ = true;
+--- a/core/config.cpp
++++ b/core/config.cpp
+@@ -120,6 +120,7 @@
+     { "--port",               "N",      "listen port" },
+     { "--api-key",            "KEY",    "require `Authorization: Bearer KEY` on every request but /health, /ping and the dashboard page" },
+     { "--served-model-name",  "NAME",   "the model id /v1/models lists and responses carry; default the container's name" },
++    { "--vision-residency", "WHERE", "resident (default) | cpu: execute the complete Qwen vision tower on the selected site" },
+     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
+                                         "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
+                                         "serves text only and keeps the tower off the card" },
+@@ -548,6 +549,14 @@
+             if (!*v) { RAD_ERR("--served-model-name takes a non-empty name"); return RAD_E_INVAL; }
+             c->served_model_name = v;
+         }
++        else if (S("--vision-residency")) {
++            if (!(v = need(i))) return RAD_E_INVAL;
++            if (std::strcmp(v, "resident") && std::strcmp(v, "cpu")) {
++                RAD_ERR("--vision-residency takes resident or cpu, not '%s'", v);
++                return RAD_E_INVAL;
++            }
++            c->vision_cpu = !std::strcmp(v, "cpu");
++        }
+         else if (S("--mm-max-patches")) {
+             if (!(v = need(i))) return RAD_E_INVAL;
+             if (!std::strcmp(v, "auto")) c->mm_max_patches = -1;
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -995,6 +995,7 @@
+             const RadBuildCtx bc = build_ctx(ri, cfg_.max_tok);
+             st[(size_t)ri] = rad_tools_declare(plugins_, meta_, bc, &r->program,
+                                                [this, ri](RadBuilder* bb, int64_t lw) {
++                                                   if (cfg_.vision_cpu) RAD_TRY(static_cast<Builder*>(bb)->place_vision_on_cpu());
+                                                    return declare_sampler(ri, bb, lw);
+                                                },
+                                                nullptr, sources());
+@@ -1173,6 +1174,7 @@
+                     Program probe;
+                     const int st = rad_tools_declare(plugins_, meta_, bc, &probe,
+                                                      [this, &r](RadBuilder* bb, int64_t lw) {
++                                                         if (cfg_.vision_cpu) RAD_TRY(static_cast<Builder*>(bb)->place_vision_on_cpu());
+                                                          return declare_sampler(r.index, bb, lw,
+                                                                                 true);
+                                                      },
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -304,6 +304,7 @@
+     std::vector<int32_t>  weight_opd;
+     const RadOpSchema*    schema = nullptr;
+     int32_t               index = 0;    /* position in the declared order */
++    bool                  host_forced = false; /* explicit whole-encoder CPU execution */
+     bool                  issued = false;   /* did the run phase ever issue it */
+ };
+ 
+@@ -851,6 +852,7 @@
+      * when the container carries a vision tower and 0 when it does not. 0 serves text only and
+      * keeps a tower the container carries off the card. */
+     int64_t mm_max_patches = -1;
++    bool vision_cpu = false; /* --vision-residency resident|cpu */
+     /* The audio encoder's pass in frames, resolved at bring-up from the plugin's probe when the
+      * container carries an audio encoder; --mm-max-patches 0 (text only) turns it off too. */
+     int64_t mm_audio_frames = -1;
+--- a/core/runtime/ctx.cpp
++++ b/core/runtime/ctx.cpp
+@@ -434,7 +434,7 @@
+          * own memory and an op with no device kernel in any band runs its host kernel -- the
+          * whole model on libavx (or libref) with no switch to set. An op that does carry device
+          * rows there is a test registering fakes, and keeps them. */
+-        int dom = RAD_DOMAIN_DEVICE;
++        int dom = oi.host_forced ? RAD_DOMAIN_HOST : RAD_DOMAIN_DEVICE;
+         if (device_is_host()) {
+             bool any_device = false;
+             for (int b = 0; b < p.n_bands && !any_device; ++b)
+--- a/core/sched/batch.cpp
++++ b/core/sched/batch.cpp
+@@ -1329,7 +1329,8 @@
+             at += np;
+         }
+     }
+-    for (size_t r = 0; r < ranks_.size(); ++r) {
++    const bool cpu_pass = cfg_.vision_cpu && (enc.modalities & RAD_MM_IMAGE);
++    for (size_t r = 0; !cpu_pass && r < ranks_.size(); ++r) {
+         RadStream st = ranks_[r].stream;
+         if (rad_memcpy_async(enc_pix_dev_[r], enc_pix_host_,
+                              n_patch * enc_dim * (int64_t)sizeof(uint16_t), st) < 0 ||
+@@ -1351,10 +1352,10 @@
+         B.kv = o.kv[r].data();
+         B.enc = (int32_t)enc.modalities;
+         B.enc_n_patch = n_patch;
+-        B.enc_pixels = enc_pix_dev_[r];
+-        B.enc_coord = static_cast<const int32_t*>(enc_coord_dev_[r]);
++        B.enc_pixels = cpu_pass ? enc_pix_host_ : enc_pix_dev_[r];
++        B.enc_coord = cpu_pass ? enc_coord_host_ : static_cast<const int32_t*>(enc_coord_dev_[r]);
+         B.enc_n_seg = n_seg;
+-        B.enc_cu = static_cast<const int32_t*>(enc_cu_dev_[r]);
++        B.enc_cu = cpu_pass ? enc_cu_host_ : static_cast<const int32_t*>(enc_cu_dev_[r]);
+         B.enc_max_seg = (int32_t)max_seg;
+     }
+     out_last_ = out_next_;
+--- a/libavx/avx_gemm.cpp
++++ b/libavx/avx_gemm.cpp
+@@ -734,6 +734,29 @@
+     if (bias && numel(bias) < N) return RAD_E_SHAPE;
+ 
+     if (res && numel(res) < M * N) return RAD_E_SHAPE;
++
++    // The GEMM writes Y before its epilogue runs. Preserve the incoming
++    // residual in a separate view: the vision tower passes res == Y, and
++    // strided or partially overlapping views need the same protection.
++    // Widening to f32 is exact; GEMM, activation and final-output rounding
++    // boundaries below stay unchanged.
++    std::vector<float> residual_copy;
++    RadTensor residual_view{};
++    if (res) {
++        residual_copy.resize((size_t)(M * N));
++        const int64_t rr = res->rank >= 2 ? res->stride[res->rank - 2] : N;
++        const int64_t rs = laststride(res);
++        for (int64_t m = 0; m < M; ++m)
++            for (int64_t n = 0; n < N; ++n)
++                residual_copy[(size_t)(m * N + n)] = ldt(res, m * rr + n * rs);
++        residual_view = *res;
++        residual_view.data = residual_copy.data();
++        residual_view.dtype = RAD_F32;
++        residual_view.rank = 2;
++        residual_view.shape[0] = M; residual_view.shape[1] = N;
++        residual_view.stride[0] = N; residual_view.stride[1] = 1;
++        res = &residual_view;
++    }
+ 
+     const Mat ma = as_mat(A, K), mb = as_mat(B, K);
+ #if AVX_LEVEL == 3
+--- a/libref/ref_gemm.cpp
++++ b/libref/ref_gemm.cpp
+@@ -229,6 +229,29 @@
+ 
+     if (res && numel(res) < M * N) return RAD_E_SHAPE;
+ 
++    // The GEMM writes Y before its epilogue runs. Preserve the incoming
++    // residual in a separate view: the vision tower passes res == Y, and
++    // strided or partially overlapping views need the same protection.
++    // Widening to f32 is exact; GEMM, activation and final-output rounding
++    // boundaries below stay unchanged.
++    std::vector<float> residual_copy;
++    RadTensor residual_view{};
++    if (res) {
++        residual_copy.resize((size_t)(M * N));
++        const int64_t rr = row_stride(res, N);
++        const int64_t rs = laststride(res);
++        for (int64_t m = 0; m < M; ++m)
++            for (int64_t n = 0; n < N; ++n)
++                residual_copy[(size_t)(m * N + n)] = ldt(res, m * rr + n * rs);
++        residual_view = *res;
++        residual_view.data = residual_copy.data();
++        residual_view.dtype = RAD_F32;
++        residual_view.rank = 2;
++        residual_view.shape[0] = M; residual_view.shape[1] = N;
++        residual_view.stride[0] = N; residual_view.stride[1] = 1;
++        res = &residual_view;
++    }
++
+     const Mat ma = as_mat(A, M, K), mb = as_mat(B, N, K);
+     PlainFn fn = pick_plain(A->dtype, B->dtype);
+     if (fn) fn(ma, mb, Y, bias, M, N, K, 1.0f);
+--- /dev/null
++++ b/tests/cpu_residual_alias_test.cpp
+@@ -0,0 +1,98 @@
++// Independent arithmetic oracle: libref and libavx used to share the alias bug.
++#include "rad_abi.h"
++#include "rad_plugin.h"
++#include "platform/module.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++struct Storage {
++    uint32_t dtype;
++    std::vector<uint32_t> words;
++    Storage(uint32_t dt, int n):dtype(dt),words(n,0){}
++    void* ptr(int offset=0) {return reinterpret_cast<char*>(words.data())+offset*(dtype==RAD_F32?4:2);}
++    void put(int i,float value) {
++        if(dtype==RAD_F32)std::memcpy(ptr(i),&value,4);
++        else {uint16_t v=rad_f32_to_bf16(value);std::memcpy(ptr(i),&v,2);}
++    }
++    float get(int i) {
++        if(dtype==RAD_F32){float v;std::memcpy(&v,ptr(i),4);return v;}
++        uint16_t v;std::memcpy(&v,ptr(i),2);return rad_bf16_to_f32(v);
++    }
++};
++static RadTensor tensor(Storage& s,int m,int n,int pitch,int cs=1,int offset=0) {
++    RadTensor t{};t.data=s.ptr(offset);t.dtype=s.dtype;t.rank=2;
++    t.shape[0]=m;t.shape[1]=n;t.stride[0]=pitch;t.stride[1]=cs;return t;
++}
++static float round_to(float x,uint32_t dt){return dt==RAD_F32?x:rad_bf16_to_f32(rad_f32_to_bf16(x));}
++static float activate(float x,int act){
++    if(act==1)return .5f*x*(1.f+std::erf(x*.70710678118654752f));
++    if(act==2)return .5f*x*(1.f+std::tanh(.7978845608028654f*(x+.044715f*x*x*x)));
++    return x;
++}
++static void run_case(const RadKernelInfo* kernel,uint32_t dt,int act,int mode,int shape) {
++    const int M=shape?3:1,N=shape?7:2,K=shape?33:2;
++    const int cs=mode==3?2:1,pitch=mode==3?2*N+3:N;
++    Storage a(dt,M*K),w(dt,N*K),bias(dt,N),res(dt,M*pitch+N*cs+8),out(dt,M*pitch+N*cs+8);
++    for(int i=0;i<M*K;++i)a.put(i,shape?float(i%13-6)/16:float(i+1));
++    for(int i=0;i<N*K;++i)w.put(i,shape?float(i%9-4)/8:float(i+3));
++    for(int n=0;n<N;++n)bias.put(n,shape?float(n%3-1)/128:0.f);
++    std::vector<float> expected(M*N);
++    for(int m=0;m<M;++m)for(int n=0;n<N;++n){
++        const float r=shape?float((m*N+n)%11-5)/16:float(100*(n+1));
++        res.put(m*pitch+n*cs,r);
++        float product=0;
++        for(int k=0;k<K;++k)product+=a.get(m*K+k)*w.get(n*K+k);
++        float v=round_to(product+bias.get(n),dt);
++        v=round_to(activate(v,act),dt);
++        expected[m*N+n]=mode==4?v:round_to(v+round_to(r,dt),dt);
++    }
++    RadTensor y=mode==0||mode==4?tensor(out,M,N,pitch,cs):tensor(res,M,N,pitch,cs,mode==2?1:0);
++    RadTensor t[]={tensor(a,M,K,K),tensor(w,N,K,K),tensor(bias,1,N,N),tensor(res,M,N,pitch,cs),y};
++    if(mode==4)t[3].data=nullptr;
++    const char* acts[]={"none","gelu","gelu_tanh"};
++    RadParam params[]={RAD_INT("M",M),RAD_INT("N",N),RAD_INT("K",K),RAD_STR("dtype",dt==RAD_F32?"f32":"bf16"),RAD_STR("act",acts[act])};
++    RadArgs args{};args.t=t;args.n_t=5;args.p=params;args.n_p=5;
++    const int rc=kernel->launch(&args,nullptr);
++    if(rc<0)throw std::runtime_error("kernel refused alias test: "+std::to_string(rc));
++    Storage& actual=mode==0||mode==4?out:res;
++    for(int m=0;m<M;++m)for(int n=0;n<N;++n){
++        float v=actual.get(m*pitch+n*cs+(mode==2?1:0)),want=expected[m*N+n];
++        const float tolerance=dt==RAD_F32?2e-5f:0.f;
++        if(!std::isfinite(v)||std::abs(v-want)>tolerance){
++            std::fprintf(stderr,"%s dtype=%u act=%d alias=%d shape=%d at=%d,%d actual=%.9g expected=%.9g\n",kernel->name,dt,act,mode,shape,m,n,v,want);
++            throw std::runtime_error("independent residual arithmetic check failed");
++        }
++    }
++}
++int main(int argc,char** argv) try {
++    const char* home=std::getenv("RADIANCE_HOME");
++    const std::string root=argc>1?argv[1]:(home?home:"radiance_home");
++    int total=0;
++    for(const char* name:{"libavx","libref"}){
++        std::string error;void* handle=rad::platform::module_open(root+"/kernels/"+name+rad::platform::module_suffix,&error);
++        if(!handle)throw std::runtime_error(error);
++        auto open=(int(*)())rad::platform::module_symbol(handle,"rad_plugin_open");
++        if(open&&open()<0)throw std::runtime_error("plugin open failed");
++        auto count=(int(*)())rad::platform::module_symbol(handle,"rad_kernel_count");
++        auto at=(const RadKernelInfo*(*)(int))rad::platform::module_symbol(handle,"rad_kernel_at");
++        auto force=(int(*)(int))rad::platform::module_symbol(handle,"avx_isa_force");
++        auto detect=(int(*)())rad::platform::module_symbol(handle,"avx_isa_detect");
++        const RadKernelInfo* kernel=nullptr;
++        for(int i=0;i<count();++i){auto row=at(i);if(!std::strcmp(row->op,"gemm_nt_bias")){kernel=row;break;}}
++        if(!kernel)throw std::runtime_error("no CPU GEMM kernel");
++        const int cap=detect?detect():0;
++        for(int level=0;level<=cap;++level){
++            if(force&&force(level)!=level)throw std::runtime_error("ISA level not actually selected");
++            int cases=0;
++            for(uint32_t dt:{RAD_F32,RAD_BF16})for(int act=0;act<3;++act)for(int mode=0;mode<5;++mode)for(int shape=0;shape<2;++shape){run_case(kernel,dt,act,mode,shape);++cases;}
++            std::printf("PASS %s ISA=%d cases=%d (disjoint, exact/partial/strided alias, absent residual; F32/BF16; none/GELU/tanh GELU)\n",name,level,cases);total+=cases;
++        }
++    }
++    std::printf("PASS total independent arithmetic cases=%d\n",total);return 0;
++}catch(const std::exception& e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}
+--- /dev/null
++++ b/tests/cpu_vision_test.cpp
+@@ -0,0 +1,36 @@
++#include "build/rad_build.h"
++#include <cstdio>
++#include <stdexcept>
++using namespace rad;
++static void require(bool yes) { if (!yes) throw std::runtime_error("CPU vision contract failed"); }
++int main() {
++    for (const char* value : {"cpu", "resident", "invalid"}) {
++        Config c;
++        char a[]="test", b[]="--model", d[]="/model.rad", e[]="--vision-residency";
++        char* argv[]={a,b,d,e,const_cast<char*>(value)};
++        int rc=config_parse(5,argv,&c);
++        require(std::string(value)=="invalid" ? rc<0 : rc==0 && c.vision_cpu==(std::string(value)=="cpu"));
++    }
++    // A weighted run with weightless attention between its endpoints, plus a
++    // separate text op: the entire tower must move and the text op must stay.
++    for (int fault=0; fault<4; ++fault) {
++        Registry registry; RadModelMeta meta{}; RadBuildCtx ctx{};
++        Builder builder(registry,meta,ctx); Program& p=builder.program();
++        p.weights.resize(4);p.buffers.resize(3);p.ops.resize(5);
++        p.weights[1].name="v.patch.weight";p.weights[2].name="v.merger.weight";p.weights[3].name="lm.weight";
++        p.buffers[1].name="v.out";p.buffers[2].name="text.x";
++        p.encoder_name="vision";p.encoder.out=1;
++        p.ops[1].weights={1};p.ops[2].op="attn_dense";p.ops[3].weights={2};p.ops[4].weights={3};
++        KernelRow row;
++        for (int i=1;i<5;++i) { Band b;b.dom[RAD_DOMAIN_HOST].row=&row;b.dom[RAD_DOMAIN_DEVICE].row=&row;p.ops[i].bands.push_back(b); }
++        if(fault==1)p.ops[2].bands[0].dom[RAD_DOMAIN_HOST]=Resolved{};
++        if(fault==2)p.ops[2].weights={3};
++        if(fault==3)p.encoder_name="other";
++        int rc=builder.place_vision_on_cpu();
++        if(fault){require(rc<0);require(!p.ops[1].host_forced);continue;}
++        require(rc==0 && p.buffers[1].decl.domain==RAD_DOMAIN_HOST && p.buffers[2].decl.domain==RAD_DOMAIN_DEVICE);
++        for(int i=1;i<=3;++i)require(p.ops[i].host_forced && !p.ops[i].bands[0].dom[RAD_DOMAIN_DEVICE]);
++        require(!p.ops[4].host_forced && bool(p.ops[4].bands[0].dom[RAD_DOMAIN_DEVICE]));
++    }
++    std::puts("CPU vision configuration, complete-run placement and refusal contracts passed");
++}

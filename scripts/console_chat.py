@@ -13,6 +13,7 @@ import socket
 import threading
 import time
 from urllib.parse import urlsplit
+from console_radiance import effective_settings, speculative_event
 
 MAX_BODY = 64 * 1024 * 1024
 PARAMS = ('temperature', 'top_p', 'top_k', 'min_p', 'seed', 'max_tokens',
@@ -28,7 +29,7 @@ def request_metrics(record, snapshot, row, backend):
         # decode_tps on C++ monitors is a cumulative mean, not a live rate.
         live = None
         active = row in snapshot.get('active', []) and row.get('status') == 'generating'
-        if active and backend in ('llamacpp','ninfer'):
+        if active and backend in ('llamacpp','ninfer','radiance'):
             rate, window, sampled = (row.get(k) for k in
                                      ('decode_tps_live','decode_tps_window_ms','decode_tps_sampled_at_ms'))
             now = time.time() * 1000
@@ -80,8 +81,14 @@ def context_payload(state, props, settings=None):
                        ('ReasoningEffort','reasoning_effort'), ('PreserveThinking','preserve_thinking')]:
         if field not in effective:
             value = launch.get(key)
+            # The Radiance launcher uses 0 to omit its native budget flag;
+            # the native request protocol uses -1 for no bound and 0 to close
+            # reasoning immediately. Report the actual startup meaning.
+            if backend == 'radiance' and key == 'ThinkingBudget' and value == 0: value = -1
             if backend == 'ninfer' and key == 'PreserveThinking' and value is False: value = None
             put(field, value, 'launch')
+    if backend == 'radiance' and settings:
+        for key,value in effective_settings(settings).items(): put(key,value)
     mode = launch.get('ThinkingMode')
     if 'enable_thinking' not in effective and mode in ('on','off'):
         put('enable_thinking', mode == 'on', 'launch')
@@ -112,16 +119,21 @@ def context_payload(state, props, settings=None):
                                ['minimal','low','medium','high','xhigh','max'],
                     'vision': bool(props.get('modalities', {}).get('vision', native.get('vision', False))),
                     'tools': False}
+    if backend == 'radiance' and settings:
+        caps=settings.get('capabilities',{})
+        capabilities.update(thinking=bool(caps.get('reasoning')),budget=bool(caps.get('reasoning')),
+            preserve=bool(props.get('chat_template_caps',{}).get('supports_preserve_reasoning')),
+            efforts=caps.get('reasoning_efforts',[]),vision=bool(caps.get('image')))
     return {'schema_version':1, 'state':state['state'], 'instance':state.get('instance'),
             'backend':backend, 'model':props.get('model_name') or props.get('model_alias') or props.get('model'),
             'context':generation.get('n_ctx', launch.get('Context')),
             'limit':native.get('generation_limit') or generation.get('n_ctx') or launch.get('Context'),
             'effective':effective, 'sources':sources, 'capabilities':capabilities,
-            'budget_min':1 if backend=='ninfer' else 0,
+            'budget_min':1 if backend=='ninfer' else -1 if backend=='radiance' else 0,
             'sampling_by_mode':native.get('sampling', {}),
             'sampling_by_effort':{('xhigh' if backend == 'polystrata' and k == 'high' else k): v
                                   for k, v in (settings or {}).get('sampling_by_effort', {}).items()},
-            'history_export_url':state.get('url','') + ('/kvmem-history-export' if backend=='polystrata' else '/history-export.html')}
+            'history_export_url':None if backend=='radiance' else state.get('url','') + ('/kvmem-history-export' if backend=='polystrata' else '/history-export.html')}
 
 
 class ChatBridge:
@@ -160,7 +172,8 @@ class ChatBridge:
             return {'schema_version':1,'state':state['state'],'instance':state.get('instance'),
                     'effective':{},'capabilities':{},'backend':None,'model':None}
         props = self.get_json(state, '/props')
-        settings = self.get_json(state, '/settings') if state['active_config']['parameters']['Backend']=='polystrata' else None
+        backend=state['active_config']['parameters']['Backend']
+        settings = self.get_json(state, '/settings' if backend=='polystrata' else '/server_info') if backend in ('polystrata','radiance') else None
         if state.get('instance') != self.control.status().get('instance'):
             raise ValueError('Service changed while reading settings')
         return context_payload(state, props, settings)
@@ -227,6 +240,9 @@ class ChatBridge:
                     raise ValueError('Conflicting thinking budgets')
                 payload['thinking_budget'] = budget
                 raw = json.dumps(payload, ensure_ascii=False).encode()
+            if state.get('active_config', {}).get('parameters', {}).get('Backend') == 'radiance':
+                payload['stream_options']=dict(payload.get('stream_options') or {},include_usage=True)
+                raw=json.dumps(payload,ensure_ascii=False).encode()
             parsed = urlsplit(state['url'])
             conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
             cancel = threading.Event()
@@ -313,6 +329,9 @@ class ChatBridge:
                                 if choice.get('finish_reason'): record['finish_reason']=choice['finish_reason']
                             if event.get('timings'): record['timings']=event['timings']
                             if event.get('usage'): record['usage']=event['usage']
+                        if record['backend']=='radiance':
+                            speculative_event(event)
+                            data=b'data: '+json.dumps(event,ensure_ascii=False).encode()+b'\n'
                 handler.wfile.write(data);handler.wfile.flush()
                 if done:
                     handler.wfile.write(b'\n');handler.wfile.flush()

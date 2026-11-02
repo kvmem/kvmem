@@ -6,6 +6,7 @@
 namespace rad { class KVManager; struct KVGroupInfo; }
 namespace kvmem { class HostKvStorage; class StorageIoQueue; }
 namespace kvmem::radiance {
+class SharedPayloadAccounting;
 
 // First engine boundary: one rank, FULL attention. Incomplete accepted tail
 // blocks stay resident and unarchived until they close.
@@ -62,6 +63,8 @@ public:
     // Caller proves token/query identity and restores recurrent state first.
     void rebind_sequence(uint64_t sequence, bool relocated_prefix = false);
     uint64_t archive_bytes() const noexcept;
+    void account_archive(SharedPayloadAccounting&) const;
+    uint64_t shared_archive_bytes(const NativeMemory&) const noexcept;
     bool needs_unleased_pages(const std::vector<uint64_t>& selected,
                               const std::vector<uint64_t>& mandatory, const MemoryBudget&) const;
     void invalidate() noexcept override;

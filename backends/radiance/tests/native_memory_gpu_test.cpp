@@ -21,6 +21,9 @@ using namespace kvmem;
 using namespace kvmem::radiance;
 #define CHECK(x) do { if (!(x)) throw std::runtime_error(#x); } while (false)
 
+// Exercise bytewise archival/checkpoints for both packed widths and f16 state.
+static unsigned packed_row_half = 8;
+static uint32_t state_type = RAD_F32;
 struct Engine {
     rad::Pools pools;
     rad::KVManager kv;
@@ -37,14 +40,14 @@ struct Engine {
             auto& info = infos[g];
             info.name = "full-" + std::to_string(g);
             info.decl.kind = RAD_KV_FULL; info.decl.dtype = dtype;
-            info.decl.n_head_kv = 1; info.decl.head_dim = 8;
+            info.decl.n_head_kv = 1; info.decl.head_dim = packed_row_half;
             info.block_size = 16 * g; info.layers = {3 * g};
         }
         if (hybrid) {
             infos.resize(5);
             auto& linear = infos[3];
             linear.name = "linear"; linear.layers = {1, 4};
-            linear.decl.kind = RAD_KV_LINEAR; linear.decl.dtype = RAD_F32;
+            linear.decl.kind = RAD_KV_LINEAR; linear.decl.dtype = state_type;
             linear.decl.n_head_kv = 2; linear.decl.state_dim[0] = 8; linear.decl.state_dim[1] = 8;
             auto& conv = infos[4];
             conv.name = "conv"; conv.layers = {1, 4};
@@ -127,9 +130,12 @@ int main(int argc, char** argv) {
             ("kvmem-radiance-native-"+std::to_string(std::random_device{}()));
         CHECK(std::filesystem::create_directory(disk_directory));
         for (bool disk_backed : {false,true})
-        for (uint32_t dtype : {uint32_t(RAD_BF16), uint32_t(RAD_F8E4M3)})
+        for (unsigned format : {0u,1u,2u,3u})
         for (bool hybrid : {false, true})
         for (bool speculative : {false, true}) {
+        const uint32_t dtype = format ? RAD_F8E4M3 : RAD_BF16;
+        packed_row_half = format==2 ? 200 : format==3 ? 176 : 8;
+        state_type = format>=2 ? RAD_F16 : RAD_F32;
         if (speculative && !hybrid) continue; // This fixture's drafter follows its recurrent groups.
         auto engine = std::make_shared<Engine>(hybrid, 1, dtype, speculative);
         const auto initial_window = speculative ? engine->kv.block_table(17, 5) : std::vector<int32_t>{};
@@ -478,9 +484,9 @@ int main(int argc, char** argv) {
                 for (const auto& t : sparse) for (auto page : t.blocks) CHECK(kv.block_refcount(t.group, page) == 2);
                 lease->demote(device, leased_engine->stream, 1024 * 1024);
                 if(disk_backed) {
-                    auto storage=std::make_shared<HostKvStorage>(512,std::make_shared<SpillFile>(disk_directory,1024*1024));
+                    auto storage=std::make_shared<HostKvStorage>(std::max<uint64_t>(512,pages.layout().record_bytes),std::make_shared<SpillFile>(disk_directory,1024*1024));
                     lease->park(storage,shared_io);
-                    CHECK(storage->charged_bytes()<=512 && storage->disk_bytes()>0);
+                    CHECK(storage->charged_bytes()<=storage->capacity_bytes() && storage->disk_bytes()>0);
                 }
                 CHECK(lease->host_bytes() > 0);
                 for (const auto& t : sparse) {
@@ -619,7 +625,7 @@ int main(int argc, char** argv) {
             for(const auto& p:kv.plans())if(p.base && p.pool_bytes)
                 CHECK(rad_memset_async(p.base,61,p.pool_bytes,branched->stream)==RAD_OK);
             CHECK(rad_stream_sync(branched->stream)==RAD_OK);kv.clear_state_clears();
-            auto storage=std::make_shared<HostKvStorage>(disk_backed ? 4096 : 1024*1024,
+            auto storage=std::make_shared<HostKvStorage>(disk_backed ? std::max<uint64_t>(4096,pages.layout().record_bytes) : 1024*1024,
                 disk_backed ? std::make_shared<SpillFile>(disk_directory,1024*1024) : nullptr);
             const MemoryStamp mark{true,{17,333},1,0,128,1};
             std::vector<BlockDescriptor> blocks;
@@ -641,6 +647,8 @@ int main(int argc, char** argv) {
             prefix->demote(device,branched->stream,1024*1024);prefix->park(storage,shared_io);
             const auto charged=storage->charged_bytes()+storage->disk_bytes();
             auto a=root->fork_retained({29,334}),c=root->fork_retained({41,335});
+            CHECK(root->shared_archive_bytes(*a)==root->archive_bytes());
+            CHECK(a->shared_archive_bytes(*c)==root->archive_bytes());
             auto pa=prefix->fork(),pc=prefix->fork();
             CHECK(storage->charged_bytes()+storage->disk_bytes()==charged);
             kv.free_sequence(17);prompt.push_back(9);
@@ -668,7 +676,29 @@ int main(int argc, char** argv) {
             CHECK(kv.ensure(29,145)==RAD_OK);
             a->accept_append(145,{{a->stamp().session,4,128,17,2,2}});
             CHECK(c->stamp()==c_before.stamp && kv.seq_tokens(41)==128);
-            kv.free_sequence(29);a.reset();prefix.reset();root.reset();
+            // Preserve an input checkpoint while a second, later accepted
+            // endpoint gets different recurrent bytes. Restore both after the
+            // producing sequence is gone; neither frontier may borrow the other.
+            for(const auto& p:kv.plans())if(p.stateful())for(int layer=0;layer<p.n_layers;++layer)
+                CHECK(rad_memset_async(kv.state_ptr(p.index,layer,kv.state_slot(29,p.index)),73,
+                    p.layer_bytes_per_state(),branched->stream)==RAD_OK);
+            CHECK(rad_stream_sync(branched->stream)==RAD_OK);
+            std::vector<int32_t> terminal_tokens(145,7);
+            auto terminal=std::make_unique<PrefixLease>(branched,kv,29,terminal_tokens,device,branched->stream);
+            a->retain_view();terminal->demote(device,branched->stream,1024*1024);terminal->park(storage,shared_io);
+            kv.free_sequence(29);
+            CHECK(kv.add_sequence(53)==RAD_OK && kv.ensure(53,1)==RAD_OK);kv.clear_state_clears();
+            terminal_tokens.push_back(9);terminal->restore(kv,53,terminal_tokens,device,branched->stream);
+            a->rebind_sequence(53,true);CHECK(a->stamp().frontier==145 && c->stamp().frontier==128);
+            for(const auto& p:kv.plans())if(p.stateful())for(int layer=0;layer<p.n_layers;++layer) {
+                const auto* ptr=static_cast<char*>(kv.state_ptr(p.index,layer,kv.state_slot(53,p.index)));
+                PageTransfer read(device,p.layer_bytes_per_state(),branched->stream);
+                read.spill({{p.index,uint64_t(ptr-static_cast<char*>(p.base)),0,uint64_t(p.layer_bytes_per_state())}},
+                    {{p.index,p.base,uint64_t(p.pool_bytes)}},branched->stream);
+                CHECK(read.drain());for(auto byte:read.payload())CHECK(byte==73);
+            }
+            terminal.reset();kv.free_sequence(53);
+            a.reset();prefix.reset();root.reset();
             select_branch(c,{0,3}); // source and sibling no longer exist
             const SessionIdentity expected_branch{41,335};CHECK(c->stamp().session==expected_branch);
             for(const auto& p:kv.plans())if(p.stateful())for(int layer=0;layer<p.n_layers;++layer) {
@@ -731,9 +761,9 @@ int main(int argc, char** argv) {
             StateCheckpoint retained;
             retained.save(continuation.kv, 17, device, continuation.stream);
             if(disk_backed) {
-                auto storage=std::make_shared<HostKvStorage>(512,std::make_shared<SpillFile>(disk_directory,1024*1024));
+                auto storage=std::make_shared<HostKvStorage>(std::max<uint64_t>(512,pages.layout().record_bytes),std::make_shared<SpillFile>(disk_directory,1024*1024));
                 retained.park(storage,shared_io);
-                CHECK(storage->charged_bytes()<=512);
+                CHECK(storage->charged_bytes()<=storage->capacity_bytes());
             }
             bool strict_refused = false, other_engine_refused = false;
             try { retained.restore(continuation.kv, 29, device, continuation.stream); }

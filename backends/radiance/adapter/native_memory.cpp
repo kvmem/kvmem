@@ -622,6 +622,10 @@ std::shared_ptr<NativeMemory> NativeMemory::fork_retained(SessionIdentity branch
     return std::shared_ptr<NativeMemory>(new NativeMemory(std::make_shared<State>(source,branch)));
 }
 uint64_t NativeMemory::archive_bytes() const noexcept { return state_->archive.bytes(); }
+void NativeMemory::account_archive(SharedPayloadAccounting& out) const {state_->archive.account(out);}
+uint64_t NativeMemory::shared_archive_bytes(const NativeMemory& other) const noexcept {
+    return state_->archive.shared_bytes(other.state_->archive);
+}
 bool NativeMemory::needs_unleased_pages(const std::vector<uint64_t>& selected,
                                       const std::vector<uint64_t>& mandatory, const MemoryBudget& budget) const {
     const auto& s = *state_;

@@ -60,6 +60,7 @@ def main():
     parser.add_argument("--host-mib", type=int, default=4096)
     parser.add_argument("--disk-path", type=Path)
     parser.add_argument("--disk-mib", type=int, default=0)
+    parser.add_argument("--verify-transfers", action="store_true", help="verify restored native KV and recurrent state bytes")
     parser.add_argument("--prefill", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--thinking-mode", choices=("default", "on", "off"), default="default")
@@ -191,6 +192,8 @@ def main():
     if args.concurrency>1:
         worker_args += ["--batch",str(args.concurrency)]
     worker_args += ["--kvmem-mtp"] if args.mtp_drafts else ["--no-draft"]
+    if args.verify_transfers:
+        worker_args += ["--kvmem-verify-transfers"]
     if args.disk_path:
         worker_args += ["--kvmem-disk-path",str(args.disk_path.resolve()),"--kvmem-disk-mib",str(args.disk_mib)]
     if args.lrfu or (args.query_scorer=="meanq-cosine" and not args.no_lrfu):

@@ -129,6 +129,7 @@ public:
         if(!valid_)throw std::runtime_error("cannot park an incomplete recurrent checkpoint");
         park_buffer(bytes_,parked_,storage,io);io_=io;
     }
+    void account(SharedPayloadAccounting& out) const {if(parked_)parked_->account(out);}
     size_t bytes() const noexcept { return parked_ ? parked_->size() : bytes_.size(); }
 };
 } // namespace kvmem::radiance

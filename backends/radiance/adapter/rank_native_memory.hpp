@@ -28,10 +28,21 @@ public:
         for(const auto& rank:native_)branch.push_back(rank->fork_retained(session));
         return std::make_shared<RankNativeMemory>(std::move(branch),descriptor().identity);
     }
+    void account_archive(SharedPayloadAccounting& out) const {for(const auto& rank:native_)rank->account_archive(out);}
     uint64_t archive_bytes() const noexcept {
         uint64_t total=0;for(const auto& rank:native_) {
             const auto bytes=rank->archive_bytes();if(bytes>UINT64_MAX-total)return UINT64_MAX;total+=bytes;
         }return total;
+    }
+    uint64_t shared_archive_bytes(const RankNativeMemory& other) const noexcept {
+        if(native_.size()!=other.native_.size())return 0;
+        uint64_t total=0;
+        for(size_t i=0;i<native_.size();++i) {
+            const auto bytes=native_[i]->shared_archive_bytes(*other.native_[i]);
+            if(bytes>UINT64_MAX-total)return UINT64_MAX;
+            total+=bytes;
+        }
+        return total;
     }
     NativeMemory::ReuseStats reuse_stats() const noexcept {
         NativeMemory::ReuseStats out;

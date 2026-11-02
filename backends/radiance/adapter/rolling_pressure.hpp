@@ -31,6 +31,8 @@ inline void canonicalize_mandatory(std::vector<uint32_t>& blocks) {
 }
 inline bool retainable_prefix_boundary(uint64_t frontier, uint64_t end, uint32_t block) {
     check(block != 0, "zero prefix block");
-    return frontier == end && frontier != 0 && frontier % block == 0;
+    // The scheduler proves the native kernel quantum. A statistics block is
+    // not a state boundary: complete native checkpoints may have partial pages.
+    return frontier == end && frontier != 0;
 }
 } // namespace kvmem::radiance::rolling

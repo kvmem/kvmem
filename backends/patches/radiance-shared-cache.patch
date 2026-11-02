@@ -1,0 +1,273 @@
+diff --git a/core/kvmem/cache_owner.hpp b/core/kvmem/cache_owner.hpp
+new file mode 100644
+--- /dev/null
++++ b/core/kvmem/cache_owner.hpp
+@@ -0,0 +1,35 @@
++#pragma once
++#include <optional>
++#include <stdexcept>
++#include <string>
++
++namespace kvmem {
++// Owners identify mutable conversation lineages. They do not authorize reuse;
++// native token/media/position, accepted-state and Query proofs remain required.
++struct CacheOwnerHints {
++    std::optional<std::string> conversation, prompt, sdk_prompt, legacy_session;
++};
++inline std::optional<std::string> resolve_cache_owner(const CacheOwnerHints& hints) {
++    const auto valid=[](const std::optional<std::string>& key,bool empty) {
++        if(key && (key->size()>256 || (!empty && key->empty())))
++            throw std::invalid_argument("cache owner must contain " + std::string(empty?"0":"1") + " to 256 bytes");
++    };
++    valid(hints.conversation,false);valid(hints.prompt,true);valid(hints.sdk_prompt,true);
++    auto chosen=hints.prompt;
++    if(chosen && chosen->empty())chosen.reset();
++    if(hints.sdk_prompt && !hints.sdk_prompt->empty()) {
++        if(chosen && *chosen!=*hints.sdk_prompt)
++            throw std::invalid_argument("prompt_cache_key and promptCacheKey must agree");
++        chosen=hints.sdk_prompt;
++    }
++    if(hints.conversation)return hints.conversation;
++    if(chosen)return chosen;
++    // session_id was a display-only external extension. Preserve acceptance
++    // of long labels, without turning a truncated label into a cache owner.
++    if(hints.legacy_session && !hints.legacy_session->empty() && hints.legacy_session->size()<=256)return hints.legacy_session;
++    return std::nullopt;
++}
++// Discovery of a different lineage is a new-user Query operation. Restoring a
++// proven continuation is separate, and never grants cold-history reselection.
++inline bool may_discover_shared_prefix(bool current_user_query) { return current_user_query; }
++} // namespace kvmem
+diff --git a/core/rad_core.h b/core/rad_core.h
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -583,6 +583,8 @@
+     // Optional frontend-proven end of rendered history, before generation-only
+     // template tokens. An integration may checkpoint this exact prefill boundary.
+     int32_t history_end = -1;
++    int32_t history_reuse_end = -1;
++    int32_t history_fallback_end = -1;
+     std::vector<std::pair<int32_t,int32_t>> message_spans; // frontend-proven token boundaries
+     std::vector<int32_t> output;
+     SamplingParams       sp;
+@@ -658,6 +660,7 @@
+      * none: carried to the session the prefix cache records for it, as a label on /sessions and
+      * the dashboard. It changes nothing about how the request is served. */
+     std::string          session_label;
++    std::string          cache_owner; // full identity, independent of the UI label
+ 
+     std::string          finish_reason;
+     void*                sink = nullptr;      /* the server's per-request stream sink */
+diff --git a/core/sched/scheduler.cpp b/core/sched/scheduler.cpp
+--- a/core/sched/scheduler.cpp
++++ b/core/sched/scheduler.cpp
+@@ -17,9 +17,11 @@
+     // A history checkpoint is NON-FINAL prefill: honor the kernel-resolved
+     // linear-state/attention quantum, just like every other intermediate chunk.
+     const auto q = std::max<int64_t>(quantum, 1);
+-    const auto end = r.history_end > 0 ? r.history_end / q * q : -1;
+-    return !r.embed && end > r.n_computed &&
+-        end < int64_t(r.prompt.size()) ? std::min<int64_t>(target, end) : target;
++    for(const auto boundary:{r.history_fallback_end,r.history_reuse_end}) {
++        const auto end=boundary>0 ? boundary/q*q : -1;
++        if(!r.embed && end>r.n_computed && end<int64_t(r.prompt.size()))target=std::min<int64_t>(target,end);
++    }
++    return target;
+ }
+ 
+ /* Wall-clock microseconds on a monotonic base. Used only by the live request table -- the step
+@@ -951,6 +953,8 @@
+     Request& r = *s.req;
+     if (r.history_end > 0) {
+         const auto q = std::max<int64_t>(geo_.quantum, 1);
++        r.history_reuse_end=int32_t(std::max<int64_t>(0,int64_t(r.history_reuse_end)-draft_refill_)/q*q);
++        r.history_fallback_end=r.history_fallback_end>0 ? int32_t(int64_t(r.history_fallback_end)/q*q) : -1;
+         // Retain an already natural prefill boundary. Splitting a native chunk
+         // just to save history changes recurrent FP arithmetic even before any
+         // KV selection. A checkpoint interval can split the batch as well.
+diff --git a/core/server/oai.cpp b/core/server/oai.cpp
+--- a/core/server/oai.cpp
++++ b/core/server/oai.cpp
+@@ -1,6 +1,7 @@
+ #include "oai.h"
+ #include "json_partial.h"
+ #include "query_span.h"
++#include "kvmem/cache_owner.hpp"
+ #include "rad_internal.h"
+ #include "mm/processor.h"
+ 
+@@ -235,6 +236,7 @@
+     "dry_sequence_breakers", "samplers",
+     "grammar", "json_schema", "priority", "logprobs", "ignore_eos",
+     "timings_per_token", "return_progress", "session_id", "n_probs",
++    "prompt_cache_key", "promptCacheKey", "kvmem",
+ };
+ 
+ const char* kAcceptedChat[] = {
+@@ -255,7 +257,7 @@
+  * missing branch -- and so the debug line of ignored names lists only what nobody decided on. */
+ const char* kInert[] = {
+     /* OpenAI's and OpenRouter's bookkeeping */
+-    "user", "metadata", "store", "service_tier", "safety_identifier", "prompt_cache_key",
++    "user", "metadata", "store", "service_tier", "safety_identifier",
+     "prediction",
+     /* llama.cpp's own speed, slot and transport knobs */
+     "cache_prompt", "id_slot", "n_cache_reuse", "backend_sampling", "reasoning_control",
+@@ -891,10 +893,31 @@
+     if (!get_bool(b, "return_progress", &r->return_progress, err)) return RAD_E_INVAL;
+ 
+     /* OpenRouter's `session_id`: which conversation the request belongs to, as the client names
+-     * it. It labels the conversation on /sessions and the dashboard and changes nothing else. A
++     * it. It labels the conversation on /sessions and the dashboard; the full value also supplies
++     * a legacy cache owner when no explicit cache key was provided. A
+      * value that is not a string is not a label and is ignored, as the field is everywhere. */
+     auto sid = b.find("session_id");
+     if (sid != b.end() && sid->is_string()) r->session_label = session_label_of(sid->get<std::string>());
++
++    kvmem::CacheOwnerHints owner;
++    if(sid!=b.end() && sid->is_string())owner.legacy_session=sid->get<std::string>();
++    for(const char* name:{"prompt_cache_key","promptCacheKey"}) {
++        auto value=b.find(name);if(value==b.end() || value->is_null())continue;
++        if(!value->is_string()){*err=err_bad(name,"expected a string");return RAD_E_INVAL;}
++        (name==std::string("prompt_cache_key") ? owner.prompt : owner.sdk_prompt)=value->get<std::string>();
++    }
++    auto ext=b.find("kvmem");
++    if(ext!=b.end() && !ext->is_null()) {
++        if(!ext->is_object()){*err=err_bad("kvmem","expected an object");return RAD_E_INVAL;}
++        auto key=ext->find("conversation_id");
++        if(key!=ext->end() && !key->is_null()) {
++            if(!key->is_string()){*err=err_bad("kvmem.conversation_id","expected a string");return RAD_E_INVAL;}
++            owner.conversation=key->get<std::string>();
++        }
++    }
++    try{r->cache_owner=kvmem::resolve_cache_owner(owner).value_or("");}
++    catch(const std::invalid_argument& error){*err=err_bad("cache_owner",error.what());return RAD_E_INVAL;}
++
+ 
+     RAD_TRY(apply_sampler_order(b, &r->sp, err));
+ 
+@@ -2113,6 +2136,8 @@
+         json prefix_messages = json::array();
+         int32_t boundary = 0;
+         for (const auto& message : messages) {
++            if(p.history_fallback_end<0 && message.value("role",std::string{})=="assistant")
++                p.history_fallback_end=boundary;
+             prefix_messages.push_back(message);
+             ChatRender partial; std::string why;
+             if (d.chat->apply(prefix_messages,tools,history_opt,&partial,&why) < 0) {
+diff --git a/core/server/oai.h b/core/server/oai.h
+--- a/core/server/oai.h
++++ b/core/server/oai.h
+@@ -74,6 +74,8 @@
+     std::vector<int32_t> tokens;
+     int32_t query_begin = -1, query_end = -1;
+     int32_t history_end = -1;
++    int32_t history_reuse_end = -1;
++    int32_t history_fallback_end = -1;
+     std::vector<std::pair<int32_t,int32_t>> message_spans;
+     std::string          text;    /* the rendered prompt; needed for `echo` and for the logs */
+     /* The media parts, processed and placed; null for a text prompt (Request::media). */
+@@ -96,6 +98,7 @@
+     /* The conversation as the client names it (OpenRouter's `session_id`), "" when it names none:
+      * a label on /sessions, nothing else. */
+     std::string session_label;
++    std::string cache_owner;
+     /* The build, as OpenAI's `system_fingerprint` and llama.cpp's own: what produced the reply. */
+     std::string system_fingerprint;
+ 
+diff --git a/core/server/server.cpp b/core/server/server.cpp
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -433,6 +433,8 @@
+             rq.prompt = r.prompts[p].tokens;
+             rq.query_begin = r.prompts[p].query_begin;
+             rq.history_end = r.prompts[p].history_end;
++            rq.history_reuse_end = r.prompts[p].history_end;
++            rq.history_fallback_end = r.prompts[p].history_fallback_end;
+             rq.message_spans = r.prompts[p].message_spans;
+             rq.query_end = r.prompts[p].query_end;
+             rq.sp = r.sp;
+@@ -448,6 +450,7 @@
+             rq.stream = r.stream;
+             rq.media = r.prompts[p].media;
+             rq.session_label = r.session_label;
++            rq.cache_owner = r.cache_owner;
+             rq.sink = g.sink.get();
+             if (opt_.validate_request) {
+                 const auto why = opt_.validate_request(rq);
+diff --git a/tests/sched_test.cpp b/tests/sched_test.cpp
+--- a/tests/sched_test.cpp
++++ b/tests/sched_test.cpp
+@@ -2876,6 +2876,30 @@
+     CHECK_EQ(f.sch.find(id)->output.size(), 1u);
+ }
+ 
++TEST(shared_input_points_obey_native_quantum_and_are_not_resampled) {
++    Fixture f;
++    f.build(4096,64,128);
++    f.cfg.prefix_cache=false;f.cfg.max_seqs=1;f.pc.allow_checkpoints=false;
++    CHECK_OK(f.start());
++    const auto id=f.submit(273,4);
++    auto* request=f.sch.find(id);
++    request->history_end=269;request->history_reuse_end=269;request->history_fallback_end=93;
++    int64_t accepted=0;
++    for(int round=0;accepted<273 && round<12;++round) {
++        REQUIRE(f.sch.step()!=nullptr);
++        const auto& entry=f.sch.plan().e[0];
++        const auto quantum=f.sch.geometry().quantum;
++        CHECK_EQ(request->history_fallback_end,93/quantum*quantum);
++        CHECK_EQ(request->history_reuse_end,269/quantum*quantum);
++        accepted+=entry.n_tokens;
++        CHECK(accepted==273 || accepted%quantum==0);
++        CHECK_EQ(entry.produces_token,accepted==273);
++        f.commit_plain(42);
++    }
++    CHECK_EQ(accepted,273);
++    CHECK_EQ(request->output.size(),size_t(1));
++}
++
+ TEST(cancelled_prefix_resume_is_not_resurrected) {
+     Fixture f;
+     f.build(); f.cfg.prefix_cache = false; f.cfg.max_seqs = 1; f.pc.allow_checkpoints = false;
+diff --git a/tests/server_test.cpp b/tests/server_test.cpp
+--- a/tests/server_test.cpp
++++ b/tests/server_test.cpp
+@@ -281,6 +281,7 @@
+     SamplingParams last_sp;              /* what the last submitted request was to sample with */
+     std::vector<std::string> last_stop;  /* ...and the stop strings it was handed */
+     std::string last_label;              /* ...its session label */
++    std::string last_owner;
+     int32_t last_max_tokens = 0;         /* ...and its max_tokens */
+     std::vector<uint64_t> cancelled;
+     std::vector<std::thread> workers;
+@@ -301,6 +302,7 @@
+             last_sp = r.sp;
+             last_stop = r.stop;
+             last_label = r.session_label;
++            last_owner = r.cache_owner;
+             last_max_tokens = r.max_tokens;
+         }
+         void* sink = r.sink;
+@@ -3975,4 +3977,22 @@
+     f.sched.join_all();
+ }
+ 
++TEST(cache_owners_preserve_full_identity_and_validate_aliases) {
++    for(const auto* field:{"prompt_cache_key","promptCacheKey"}) {
++        Fixture f;const auto owner=std::string(128,'x')+"A";
++        const auto body=json{{"messages",json::array({{{"role","user"},{"content","hi"}}})},
++                             {field,owner},{"session_id","label"}};
++        CHECK_EQ(f.post("/v1/chat/completions",body.dump()).status,200);f.sched.join_all();
++        std::lock_guard<std::mutex> lock(f.sched.mu);
++        CHECK_EQ(f.sched.last_owner,owner);CHECK_EQ(f.sched.last_label,std::string("label"));
++    }
++    Fixture f;
++    const std::string base=R"({"messages":[{"role":"user","content":"hi"}])";
++    CHECK_EQ(f.post("/v1/chat/completions",base+R"(,"prompt_cache_key":"A","promptCacheKey":"B"})").status,400);
++    CHECK_EQ(f.post("/v1/chat/completions",base+R"(,"prompt_cache_key":7})").status,400);
++    CHECK_EQ(f.post("/v1/chat/completions",base+R"(,"kvmem":{"conversation_id":""}})").status,400);
++    CHECK_EQ(f.post("/v1/chat/completions",base+R"(,"prompt_cache_key":"A","kvmem":{"conversation_id":"B"}})").status,200);
++    f.sched.join_all();std::lock_guard<std::mutex> lock(f.sched.mu);CHECK_EQ(f.sched.last_owner,std::string("B"));
++}
++
+ RAD_TEST_MAIN()
