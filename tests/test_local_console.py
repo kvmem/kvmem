@@ -281,8 +281,12 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(console.normalize(value,['polystrata'])['parameters']['DraftPolicy'],'adaptive')
         thinking={**value['parameters'],'ThinkingMode':'on','ThinkingBudget':128,'ReasoningEffort':'xhigh','PreserveThinking':True}
         self.assertEqual(console.normalize({'schema_version':1,'parameters':thinking},['polystrata'])['parameters']['ThinkingBudget'],128)
+        for kv in ('f16','q8_0','int8','int8k'):
+            with self.subTest(kv=kv):
+                parameters={**value['parameters'],'KvType':kv,'SpeculativeMode':'none','DraftTokens':0}
+                self.assertEqual(console.normalize({'schema_version':1,'parameters':parameters},['polystrata'])['parameters']['KvType'],kv)
         for invalid in ({'DraftTokens':4},{'DraftModel':'draft.gguf'},{'DraftPolicy':'unknown'},
-                        {'KvType':'int8'},{'Gpu':'GPU-12345678,GPU-87654321'},
+                        {'KvType':'fp8'},{'Gpu':'GPU-12345678,GPU-87654321'},
                         {'ReasoningEffort':'max'},{'ThinkingMode':'on','ReasoningEffort':'none'}):
             with self.subTest(invalid=invalid),self.assertRaises(ValueError):
                 console.normalize({'schema_version':1,'parameters':{**value['parameters'],**invalid}},['polystrata'])

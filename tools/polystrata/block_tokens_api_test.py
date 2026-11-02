@@ -17,15 +17,21 @@ def main():
     ap.add_argument('--gpu',required=True)
     ap.add_argument('--block-tokens',type=int,choices=(32,64),required=True)
     ap.add_argument('--kv-type',choices=('f16','q8_0'),default='q8_0')
+    ap.add_argument('--draft-model',type=Path)
+    ap.add_argument('--mtp-drafts',type=int,choices=range(4),default=2)
+    ap.add_argument('--host-mib',type=int,default=512)
+    ap.add_argument('--context',type=int,default=32768)
     ap.add_argument('--port',type=int,default=18540)
     a=ap.parse_args();a.out.mkdir(parents=True,exist_ok=True)
     native=a.out/'native.log'
     cmd=[sys.executable,str(Path(__file__).with_name('server.py')),
          '--source',str(a.source),'--worker',str(a.worker),'--model',str(a.model),'--tokenizer',str(a.tokenizer),
          '--gpu',a.gpu,'--port',str(a.port),'--kvmem-block-tokens',str(a.block_tokens),'--kv-type',a.kv_type,
-         '--context','32768','--budget','2048','--reserve','512','--prefill','128','--host-mib','512',
-         '--sink','64','--recent','64','--mtp-drafts','2','--retained-sessions','4',
+         '--context',str(a.context),'--budget','2048','--reserve','512','--prefill','128','--host-mib',str(a.host_mib),
+         '--sink','64','--recent','64','--mtp-drafts',str(a.mtp_drafts),'--retained-sessions','4',
          '--log',str(native),'--','--threads','8','--stage-mib','512','--tail-skip','0','--expert-swaps','0']
+    if a.draft_model:
+        at=cmd.index('--');cmd[at:at]=['--draft-model',str(a.draft_model)]
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
     def req(path,payload=None,timeout=300):
         data=None if payload is None else json.dumps(payload,ensure_ascii=False).encode()

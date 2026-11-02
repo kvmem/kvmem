@@ -51,7 +51,7 @@ __device__ float warp_sum(float value) {
     return value;
 }
 __global__ void page_logits(const half* queries, const half* means, float* logits,
-                            int blocks, int qheads, int kvheads, int dim) {
+                            int blocks, int qheads, int kvheads, int dim, float scale) {
     const int page=int(blockIdx.x)*4+int(threadIdx.x)/32;
     const int lane=int(threadIdx.x)%32;
     const int distribution=int(blockIdx.y);
@@ -63,7 +63,7 @@ __global__ void page_logits(const half* queries, const half* means, float* logit
     float dot=0;
     for (int d=lane;d<dim;d+=32) dot=fmaf(__half2float(q[d]),__half2float(k[d]),dot);
     dot=warp_sum(dot);
-    if (lane==0) logits[size_t(distribution)*blocks+page]=dot*rsqrtf(float(dim));
+    if (lane==0) logits[size_t(distribution)*blocks+page]=dot*scale;
 }
 __global__ void normalize_pages(const float* logits, float* norms, int blocks) {
     __shared__ float reduction[128];
@@ -231,7 +231,7 @@ std::vector<double> PageSoftmaxCuda::score(const RawKvStore& keys, PageQueryView
             const int distributions=int(rows*q.query_heads);
             page_logits<<<dim3(unsigned((blocks+3)/4),unsigned(distributions)),128,0,w.stream>>>(
                 static_cast<half*>(w.queries.data),static_cast<half*>(w.means.data),
-                static_cast<float*>(w.logits.data),int(blocks),int(q.query_heads),int(q.kv_heads),int(q.head_dim));
+                static_cast<float*>(w.logits.data),int(blocks),int(q.query_heads),int(q.kv_heads),int(q.head_dim),q.attention_scale > 0 ? q.attention_scale : 1.f/std::sqrt(float(q.head_dim)));
             normalize_pages<<<distributions,128,0,w.stream>>>(static_cast<float*>(w.logits.data),static_cast<float*>(w.norms.data),int(blocks));
             if (aggregation == GqaScoreAggregation::Mean) {
                 accumulate_pages<<<unsigned((blocks+127)/128),128,0,w.stream>>>(static_cast<float*>(w.logits.data),

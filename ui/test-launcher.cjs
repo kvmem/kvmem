@@ -196,6 +196,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  await page.unroute('**/api/launcher/scan-models');
  await require('./test-model-library.cjs')({page,api,state});
  await require('./test-backend-switch.cjs')({browser,base,info});
+ await require('./test-gemma4.cjs')({browser,base,info});
  await require('./test-kv-types.cjs')({browser,base,info});
  // Applying a recipe is a local draft edit, never a save/start request.
  const mutations=[];page.on('request',request=>{if(request.method()==='POST')mutations.push(request.url());});
