@@ -75,15 +75,16 @@ def main():
     parser.add_argument("--graph-alpha", type=float)
     parser.add_argument("--query-max-tokens", type=int, default=512)
     parser.add_argument("--replay-max-tokens", type=int, default=2048)
-    parser.add_argument("--kv-type", choices=("f16","q8_0"), default="f16")
+    parser.add_argument("--kv-type", choices=("f16","q8_0","int8","int8k"), default="f16")
     parser.add_argument("--lrfu", action="store_true")
     parser.add_argument("--no-lrfu", action="store_true")
     parser.add_argument("--history-reuse", action=argparse.BooleanOptionalAction, default=True, help="reuse identical managed conversation prefixes")
     parser.add_argument("--retained-sessions", type=int, default=None, help="1..16 retained histories including the GPU owner; N>1 requires reuse")
     parser.add_argument("--concurrency", type=int, choices=range(1, 9), default=1,
                         help="1..8 active requests in one GPU worker; each slot owns B+R KV")
+    parser.add_argument("--draft-model", type=Path, help="matching Gemma 4 assistant GGUF for MTP")
     parser.add_argument("--mtp-drafts", type=int, choices=range(4), default=0,
-                        help="opt-in embedded MTP draft tokens (1..3)")
+                        help="opt-in MTP draft tokens (1..3); Gemma requires --draft-model")
     parser.add_argument("--vision-worker", type=Path, help="strata-vision executable; requires --mmproj")
     parser.add_argument("--mmproj", type=Path, help="matching multimodal projection GGUF; requires --vision-worker")
     parser.add_argument("--vision-device", choices=("cpu", "gpu"), default="cpu")
@@ -155,8 +156,8 @@ def main():
             args.tokenizer = tokenizer_path(args.model, args.source, prepare=not args.dry_run)
         except (OSError, ValueError) as error:
             parser.error(str(error))
-    tokenizer_files = ("vocab.json", "merges.txt", "tokenizer.json", "token_type.json", "chat_template.jinja")
-    if not (automatic_tokenizer and args.dry_run) and not all((args.tokenizer / name).is_file() for name in tokenizer_files):
+    from assets import tokenizer_files
+    if not (automatic_tokenizer and args.dry_run) and not all((args.tokenizer / name).is_file() for name in tokenizer_files(args.tokenizer)):
         parser.error("worker, model or same-GGUF exported tokenizer/template is missing")
     if args.vision_worker and (not args.vision_worker.is_file() or not args.mmproj.is_file()):
         parser.error("vision worker or mmproj is missing")
@@ -194,6 +195,10 @@ def main():
     worker_args += ["--kvmem-mtp"] if args.mtp_drafts else ["--no-draft"]
     if args.verify_transfers:
         worker_args += ["--kvmem-verify-transfers"]
+    if args.draft_model:
+        if not args.mtp_drafts or not args.draft_model.is_file() or args.draft_model.suffix.lower() != '.gguf':
+            parser.error('--draft-model requires enabled MTP and an existing matching GGUF')
+        worker_args += ['--draft-model', str(args.draft_model.resolve())]
     if args.disk_path:
         worker_args += ["--kvmem-disk-path",str(args.disk_path.resolve()),"--kvmem-disk-mib",str(args.disk_mib)]
     if args.lrfu or (args.query_scorer=="meanq-cosine" and not args.no_lrfu):

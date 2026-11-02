@@ -55,6 +55,21 @@ class DocumentationChangesTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(changes.requires_cuda(paths + [path], 'a', 'b'))
 
+    def test_projector_picker_changes_run_console_checks_without_engine_builds(self):
+        paths = ['.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
+                 'scripts/windows/start-polystrata.ps1', 'scripts/windows/select-model.ps1',
+                 'scripts/local-console.py', 'scripts/model_health.py', 'ui/monitor/launcher.js',
+                 'ui/test-launcher-settings.cjs', 'tests/test_local_console.py',
+                 'tests/test_model_health.py', 'ui/README.md']
+        self.assertTrue(changes.requires_ci(paths))
+        self.assertFalse(changes.requires_native(paths))
+        self.assertFalse(changes.requires_cuda(paths, 'a', 'b'))
+        for extra in ('backends/polystrata', 'backends/patches/polystrata-kvmem.patch',
+                      'CMakeLists.txt', 'scripts/windows/build-backends.ps1'):
+            with self.subTest(extra=extra):
+                self.assertTrue(changes.requires_native(paths + [extra]))
+                self.assertTrue(changes.requires_cuda(paths + [extra], 'a', 'b'))
+
     def test_workflow_eligibility_is_separate_from_cuda_recipe(self):
         original = ('name: Test\non: pull_request\njobs:\n  cuda-build-linux:\n'
                     "    needs: changes\n    if: needs.changes.outputs.run_ci == 'true'\n"

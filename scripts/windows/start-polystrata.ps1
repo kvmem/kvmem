@@ -22,7 +22,7 @@ if(((Setting 'ThinkingMode' 'default') -eq 'off' -and (Setting 'ReasoningEffort'
 $mode=Setting 'SpeculativeMode' $(if((Setting 'MtpDrafts' 0) -gt 0){'mtp'}else{'none'})
 $count=Setting 'DraftTokens' (Setting 'MtpDrafts' $(if($mode -eq 'mtp'){2}else{0}))
 if($Parameters.ContainsKey('MtpDrafts') -and $Parameters.ContainsKey('DraftTokens') -and $Parameters.MtpDrafts -ne $count) { throw 'DraftTokens conflicts with MtpDrafts' }
-if($mode -notin @('none','mtp') -or ($mode -eq 'none' -and $count) -or ($mode -eq 'mtp' -and ($count -lt 1 -or $count -gt 3)) -or (Setting 'DraftPolicy' 'adaptive') -notin @('fixed','adaptive') -or (Setting 'DraftModel' '')) { throw 'PolyStrata supports native adaptive embedded MTP with a 1..3 draft ceiling in solo execution; native batch uses ordinary decode' }
+if($mode -notin @('none','mtp') -or ($mode -eq 'none' -and $count) -or ($mode -eq 'mtp' -and ($count -lt 1 -or $count -gt 3)) -or (Setting 'DraftPolicy' 'adaptive') -notin @('fixed','adaptive')) { throw 'PolyStrata supports native adaptive MTP with a 1..3 draft ceiling in solo execution; native batch uses ordinary decode' }
 $gpu=Setting 'Gpu' $env:CUDA_VISIBLE_DEVICES
 if($gpu -notmatch '^GPU-[0-9a-fA-F-]{8,64}$') { throw 'PolyStrata requires one GPU UUID' }
 $worker=Setting 'Worker' (Join-Path $Root 'workers/polystrata/strata-poly.exe')
@@ -59,8 +59,13 @@ foreach($key in $map.Keys) {
     elseif($defaults.ContainsKey($name)) { $arguments+=@(('--'+$key.ToLowerInvariant()),[string]$defaults[$name]) }
 }
 $kv=Setting 'KvType' 'f16'
-if($kv -notin @('f16','q8_0')) { throw 'PolyStrata KV format must be f16 or q8_0' }
+if($kv -notin @('f16','q8_0','int8','int8k')) { throw 'PolyStrata KV: Qwen supports f16/q8_0; Gemma supports f16/int8/int8k' }
 $arguments+=@('--kv-type',$kv,'--mtp-drafts',[string]$count)
+$draft=Setting 'DraftModel' ''
+if($draft) {
+    if(!$count -or !(Test-Path -LiteralPath $draft -PathType Leaf) -or [IO.Path]::GetExtension($draft) -ne '.gguf') {throw 'DraftModel requires enabled MTP and an existing matching GGUF'}
+    $arguments+=@('--draft-model',(Resolve-Path -LiteralPath $draft).Path)
+}
 # Reuse the shared default/validation contract, translating only flag names.
 $scoring=@(Get-KVMemQueryScoringArgs $Parameters)
 foreach($value in $scoring) {
@@ -71,10 +76,19 @@ foreach($value in $scoring) {
 }
 if(Setting 'Vision' $false) {
     $visionWorker=Setting 'VisionWorker' (Join-Path (Split-Path $worker) 'strata-vision.exe')
-    $mmproj=Setting 'Mmproj' (Join-Path (Split-Path $model) 'mmproj-BF16.gguf')
+    $mmproj=Setting 'Mmproj' ''
     if(!$visionWorker) { $visionWorker=Join-Path (Split-Path $worker) 'strata-vision.exe' }
-    if(!$mmproj) { $mmproj=Join-Path (Split-Path $model) 'mmproj-BF16.gguf' }
+    if(!$mmproj) {
+        $folder=Split-Path $model
+        $stem=[IO.Path]::GetFileNameWithoutExtension($model)
+        $exact=@(@((Join-Path $folder "$stem-mmproj.gguf"),(Join-Path $folder "mmproj-$stem.gguf")) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+        $candidates=@(if($exact.Count) { $exact } else { Get-ChildItem -LiteralPath $folder -File -Force | Where-Object { $_.Name -match 'mmproj' -and $_.Extension -eq '.gguf' -and $_.FullName -ne $model } | ForEach-Object { $_.FullName } })
+        if($candidates.Count -ne 1) { throw 'Vision requires -Mmproj: no unique adjacent projector was found; select the matching GGUF in Templates & vision > Vision assets' }
+        $mmproj=$candidates[0]
+    }
+    if([IO.Path]::GetExtension($mmproj) -ne '.gguf') { throw 'Mmproj must be an existing matching GGUF file' }
     foreach($asset in @($visionWorker,$mmproj)) { if(!(Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing PolyStrata vision asset: $asset" } }
+    $mmproj=(Resolve-Path -LiteralPath $mmproj).Path
     $arguments+=@('--vision-worker',$visionWorker,'--mmproj',$mmproj,'--vision-tokens',[string](Setting 'VisionTokens' 1024),'--vision-device',$(if((Setting 'VisionResidency' 'resident') -eq 'cpu'){'cpu'}else{'gpu'}))
 }
 if($WorkerArgs.Count) { $arguments+=@('--')+$WorkerArgs }
@@ -99,7 +113,7 @@ if(Setting 'DryRun' $false) {
         $safeEnv.STRATA_FATTN=$resolved.env.STRATA_FATTN
         $safeEnv.STRATA_FDEC=$resolved.env.STRATA_FDEC
     } finally { $check.Dispose() }
-    @{token_settings=$TokenPlan;effective_settings=@{block_tokens=[int](Setting 'BlockTokens' 32);draft_policy=$(if($count){'adaptive'}else{'fixed'});draft_tokens=$count;model_alias=$resolved.model_name;max_tokens=$resolved.kvmem_default_max_tokens;preserve_thinking=$resolved.preserve_thinking;vram_reserve_mib=$resolved.kvmem_vram_reserve_mib};backend='polystrata';native_argv=@($resolved.exe)+@($resolved.args);argv=@($python)+$arguments;environment=$safeEnv;capabilities=@{architecture='qwen35moe';gpu_count=1;batch_mtp=$false;solo_mtp=($count -gt 0);concurrency=(Setting 'Concurrency' 1);kv_type=$kv;storage_quota='process'}} | ConvertTo-Json -Depth 8
+    @{token_settings=$TokenPlan;effective_settings=@{block_tokens=[int](Setting 'BlockTokens' 32);draft_policy=$(if($count){'adaptive'}else{'fixed'});draft_tokens=$count;model_alias=$resolved.model_name;max_tokens=$resolved.kvmem_default_max_tokens;preserve_thinking=$resolved.preserve_thinking;vram_reserve_mib=$resolved.kvmem_vram_reserve_mib};backend='polystrata';native_argv=@($resolved.exe)+@($resolved.args);argv=@($python)+$arguments;environment=$safeEnv;capabilities=@{architectures=@('qwen35moe','gemma4');gpu_count=1;batch_mtp=$false;solo_mtp=($count -gt 0);concurrency=(Setting 'Concurrency' 1);kv_type=$kv;storage_quota='process'}} | ConvertTo-Json -Depth 8
     return
 }
 $info=New-KVMemProcessInfo $python $arguments

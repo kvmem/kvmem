@@ -203,7 +203,15 @@ Closing the dialog cancels its browser request; late responses cannot replace a 
 Drive roots/network shares, child symlinks/junctions, hidden dependency folders, named
 `mmproj`/projector files and non-first GGUF shards are excluded. Filename matching is only
 candidate discovery, not architecture/quantization compatibility validation.
-The portable package includes `scripts/windows/select-model.ps1` for model/folder/template
+Under **Templates & vision > Vision assets**, the **Vision projection GGUF** field
+accepts any matching GGUF filename. Windows users can use **Choose file**; other
+hosts can paste a path. For PolyStrata, an explicit path takes priority. When empty,
+the launcher first checks `<model-stem>-mmproj.gguf` and `mmproj-<model-stem>.gguf`,
+then falls back to a single adjacent GGUF whose name contains `mmproj` (case-insensitive).
+Missing or multiple candidates require an explicit selection; `mmproj-BF16.gguf`
+has no special priority. Static inspection uses the same selection rules.
+
+The portable package includes `scripts/windows/select-model.ps1` for model/folder/template/projector
 selection. Missing/failed/invalid native picker results produce readable guidance with path
 pasting as a fallback; raw PowerShell errors are not shown. After copying new UI files over
 a running older controller, restart guidance is shown instead of sending incompatible scan requests.

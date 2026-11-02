@@ -281,8 +281,12 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(console.normalize(value,['polystrata'])['parameters']['DraftPolicy'],'adaptive')
         thinking={**value['parameters'],'ThinkingMode':'on','ThinkingBudget':128,'ReasoningEffort':'xhigh','PreserveThinking':True}
         self.assertEqual(console.normalize({'schema_version':1,'parameters':thinking},['polystrata'])['parameters']['ThinkingBudget'],128)
+        for kv in ('f16','q8_0','int8','int8k'):
+            with self.subTest(kv=kv):
+                parameters={**value['parameters'],'KvType':kv,'SpeculativeMode':'none','DraftTokens':0}
+                self.assertEqual(console.normalize({'schema_version':1,'parameters':parameters},['polystrata'])['parameters']['KvType'],kv)
         for invalid in ({'DraftTokens':4},{'DraftModel':'draft.gguf'},{'DraftPolicy':'unknown'},
-                        {'KvType':'int8'},{'Gpu':'GPU-12345678,GPU-87654321'},
+                        {'KvType':'fp8'},{'Gpu':'GPU-12345678,GPU-87654321'},
                         {'ReasoningEffort':'max'},{'ThinkingMode':'on','ReasoningEffort':'none'}):
             with self.subTest(invalid=invalid),self.assertRaises(ValueError):
                 console.normalize({'schema_version':1,'parameters':{**value['parameters'],**invalid}},['polystrata'])
@@ -567,6 +571,88 @@ class ConsoleTests(unittest.TestCase):
                 stdout='{"path":null}', stderr='')):
             self.assertEqual(self.controller.browse_model(request, template=True), {'path': None})
         self.assertFalse(self.controller.picker_lock.locked())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows native picker')
+    def test_projector_picker_accepts_any_gguf_name_and_cancel(self):
+        projector=Path(self.tmp.name)/"视觉 & ' $custom.GGUF";projector.touch()
+        request={'backend':'polystrata','current_path':str(projector)}
+        with patch.object(console.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps({'path':str(projector)}),stderr='')) as run:
+            self.assertEqual(self.controller.browse_model(request,projector=True)['path'],str(projector.resolve()))
+            self.assertIn('-Projector',run.call_args.args[0])
+            self.assertIn(str(projector.parent.resolve()),run.call_args.args[0])
+            self.assertNotIn('shell',run.call_args.kwargs)
+        with patch.object(console.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout='{"path":null}',stderr='')):
+            self.assertEqual(self.controller.browse_model(request,projector=True),{'path':None})
+        wrong=projector.with_suffix('.txt');wrong.touch()
+        with patch.object(console.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps({'path':str(wrong)}),stderr='')):
+            with self.assertRaises(ValueError):
+                self.controller.browse_model(request,projector=True)
+        with self.assertRaises(ValueError):
+            self.controller.browse_model({'backend':'ninfer'},projector=True)
+        self.assertFalse(self.controller.picker_lock.locked())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows canonical launcher')
+    def test_polystrata_projector_plan_matches_discovery_and_explicit_choice(self):
+        import ctypes
+        import model_health
+        from test_model_health import gguf
+
+        root=Path(self.tmp.name)
+        frontend=root/'frontend/serve';frontend.mkdir(parents=True)
+        tokenizer=root/'tokenizer';tokenizer.mkdir()
+        for path in (root/'worker.exe',root/'model.gguf',root/'strata-vision.exe',frontend/'server.py',frontend/'kvmem.py',
+                     *(tokenizer/name for name in ('vocab.json','merges.txt','tokenizer.json','token_type.json','chat_template.jinja'))):
+            path.touch()
+        params=dict(Backend='polystrata',Model=str(root/'model.gguf'),Worker=str(root/'worker.exe'),
+                    Vision=True,VisionWorker=str(root/'strata-vision.exe'),Tokenizer=str(tokenizer),
+                    PolystrataSource=str(frontend.parent),Python=sys.executable,Gpu='GPU-12345678')
+        def plan(**kwargs):
+            return self.controller.plan({'schema_version':1,'parameters':dict(params,**kwargs)})
+        def chosen(expected,**kwargs):
+            argv=plan(**kwargs)['argv']
+            self.assertEqual(argv[argv.index('--mmproj')+1],str(expected.resolve()))
+        with patch.object(self.controller,'worker_capabilities',return_value={'block_tokens':{'supported':[32,64]}}):
+            with self.assertRaisesRegex(ValueError,'no unique adjacent projector'):
+                plan()
+            projector=root/'MMPROJ-Q8_0.GGUF';projector.touch()
+            chosen(projector)
+            # Windows enumeration must include hidden files just like static inspection.
+            gguf(root/'model.gguf',meta={'general.architecture':'qwen35moe'})
+            gguf(projector)
+            (root/'strata-vision.exe').write_bytes(b'fixture')
+            health_params={k:params[k] for k in ('Backend','Model','Vision','VisionWorker')}
+            attrs=ctypes.windll.kernel32.GetFileAttributesW(str(projector))
+            self.assertNotEqual(attrs,-1)
+            self.assertTrue(ctypes.windll.kernel32.SetFileAttributesW(str(projector),attrs|2))
+            try:
+                self.assertTrue(model_health.Inspection(health_params,root).run()['can_start'])
+                chosen(projector)
+                visible=root/'visible-mmproj.gguf';gguf(visible)
+                try:
+                    self.assertFalse(model_health.Inspection(health_params,root).run()['can_start'])
+                    with self.assertRaisesRegex(ValueError,'no unique adjacent projector'):
+                        plan()
+                    chosen(projector,Mmproj=str(projector))
+                finally:
+                    visible.unlink()
+            finally:
+                self.assertTrue(ctypes.windll.kernel32.SetFileAttributesW(str(projector),attrs))
+            default=root/'mmproj-BF16.gguf';default.touch()
+            with self.assertRaisesRegex(ValueError,'no unique adjacent projector'):
+                plan()
+            chosen(projector,Mmproj=str(projector))
+            exact=root/'model-mmproj.gguf';exact.touch()
+            chosen(exact)
+            (root/'mmproj-model.gguf').touch()
+            with self.assertRaisesRegex(ValueError,'no unique adjacent projector'):
+                plan()
+            custom=root/"视觉 & ' $custom.gguf";custom.touch()
+            chosen(custom,Mmproj=str(custom))
+            with self.assertRaisesRegex(ValueError,'Missing PolyStrata vision asset'):
+                plan(Mmproj=str(root/'missing.gguf'))
+            wrong=root/'projector.txt';wrong.touch()
+            with self.assertRaisesRegex(ValueError,'Mmproj must be'):
+                plan(Mmproj=str(wrong))
 
     def test_scan_filters_backend_auxiliary_and_split_files_without_loading(self):
         folder = Path(self.tmp.name)

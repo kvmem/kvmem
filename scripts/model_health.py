@@ -18,7 +18,7 @@ MAX_RESOURCE = 1024 * 1024
 MAX_TENSORS = 200000
 MAX_PARTS = 128
 FIELDS = {'Backend', 'Model', 'Worker', 'Vision', 'Mmproj', 'VisionWorker',
-          'Tokenizer', 'ChatTemplateFile', 'SpeculativeMode', 'MtpDrafts', 'DraftModel'}
+          'Tokenizer', 'ChatTemplateFile', 'SpeculativeMode', 'MtpDrafts', 'DraftModel', 'KvType'}
 
 
 class Incomplete(Exception):
@@ -257,12 +257,37 @@ class Inspection:
         self.check('gguf_directory', 'pass', 'GGUF 目录与分片检查通过', 'GGUF directory and shards checked', f'{len(names)} tensors / {count} files')
         if unknown:
             self.check('gguf_types', 'unknown', '部分量化格式尚未验证尺寸', 'Some quantization sizes are unverified', ', '.join(map(str, sorted(unknown))))
-        if self.p['Backend'] == 'polystrata' and arch != 'qwen35moe':
-            self.check('poly_arch', 'warning', '架构不在当前 PolyStrata 启动器声明范围', 'Architecture outside the current PolyStrata launcher profile', f'actual={arch}, profile=qwen35moe', 'worker')
+        if self.p['Backend'] == 'polystrata' and arch not in {'qwen35moe','gemma4'}:
+            self.check('poly_arch', 'warning', '架构不在当前 PolyStrata 启动器声明范围', 'Architecture outside the current PolyStrata launcher profile', f'actual={arch}, profile=qwen35moe/gemma4', 'worker')
+        if self.p['Backend'] == 'polystrata' and arch in {'qwen35moe','gemma4'}:
+            allowed={'f16','int8','int8k'} if arch=='gemma4' else {'f16','q8_0'}
+            kv=self.p.get('KvType','f16')
+            if kv not in allowed:
+                self.check('poly_kv', 'error', 'KV 格式与模型架构不兼容', 'KV format is incompatible with the model architecture', f'{arch}: {", ".join(sorted(allowed))}', 'config')
+            if arch=='gemma4':
+                self.report['features']['mtp']='external'
+                if self.p.get('SpeculativeMode')=='mtp' or self.p.get('MtpDrafts',0)>0:
+                    draft=self.p.get('DraftModel')
+                    if not draft:
+                        self.check('gemma_assistant_missing','error','Gemma 4 MTP 需要匹配的 assistant GGUF','Gemma 4 MTP requires its matching assistant GGUF','DraftModel','config')
+                    elif self.required_file(self.path(draft),'draft','草稿模型','Draft model'):
+                        assistant=self.gguf(self.path(draft))['metadata']
+                        if assistant.get('general.architecture')!='gemma4-assistant':
+                            self.check('gemma_assistant_arch','error','Gemma 草稿架构不匹配','Gemma assistant architecture does not match',str(assistant.get('general.architecture')),'config')
         if self.p.get('Vision'):
             if self.p['Backend'] == 'polystrata':
-                projector = self.path(self.p['Mmproj']) if self.p.get('Mmproj') else path.parent / 'mmproj-BF16.gguf'
-                if self.required_file(projector, 'projector', '视觉投影文件', 'Vision projector', 'disable_vision'):
+                explicit = self.p.get('Mmproj')
+                if explicit:
+                    projector = self.path(explicit)
+                else:
+                    exact = [p for p in (path.with_name(path.stem + '-mmproj.gguf'), path.with_name('mmproj-' + path.stem + '.gguf')) if p.is_file()]
+                    candidates = exact or sorted(p for p in path.parent.iterdir() if p != path and p.is_file() and 'mmproj' in p.name.lower() and p.suffix.lower() == '.gguf')
+                    projector = candidates[0] if len(candidates) == 1 else None
+                if projector is None:
+                    self.check('projector_missing', 'error', '请在“模板与图像 → 图像配套文件”选择匹配的视觉投影文件', 'Select the matching projector in Templates & vision > Vision assets', 'Mmproj: no unique adjacent GGUF', 'config', 'disable_vision')
+                elif projector.suffix.lower() != '.gguf':
+                    self.check('projector_invalid', 'error', '视觉投影文件必须是 GGUF', 'Vision projector must be a GGUF file', str(projector), 'config', 'disable_vision')
+                elif self.required_file(projector, 'projector', '视觉投影文件', 'Vision projector', 'disable_vision'):
                     try:
                         self.gguf(projector)
                         self.report['features']['vision'] = 'present'
@@ -437,7 +462,8 @@ class Inspection:
                 self.required_file(self.path(self.p['ChatTemplateFile']), 'template_override', '自定义聊天模板文件', 'Custom chat template file')
             if self.p['Backend'] == 'polystrata' and self.p.get('Tokenizer'):
                 directory = self.path(self.p['Tokenizer'])
-                for name in ('vocab.json', 'merges.txt', 'tokenizer.json', 'token_type.json', 'chat_template.jinja'):
+                merge='merges.json' if (directory/'merges.json').is_file() else 'merges.txt'
+                for name in ('vocab.json', merge, 'tokenizer.json', 'token_type.json', 'chat_template.jinja'):
                     self.required_file(directory / name, 'poly_tokenizer', '外部 tokenizer 资源', 'External tokenizer resource')
                 self.check('tokenizer_pair', 'unknown', '外部分词器与模型的语义一致性未验证', 'External tokenizer/model semantic pairing is unverified', layer='worker')
             if self.p.get('DraftModel'):

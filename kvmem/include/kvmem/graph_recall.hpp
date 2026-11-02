@@ -34,6 +34,7 @@ struct PageQueryView {
     const uint32_t* layer_rows = nullptr;
     uint32_t layers = 0, rows = 0, query_heads = 0, kv_heads = 0, head_dim = 0;
     const float* const* layer_data = nullptr; // optional disjoint per-layer storage
+    float attention_scale = 0; // 0 selects 1/sqrt(head_dim); Gemma uses 1
 };
 
 // Explicit FP16 operand boundary shared by CPU qualification and CUDA staging.

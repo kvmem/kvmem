@@ -107,7 +107,7 @@ module.exports=async({browser,base,info})=>{
   await page.waitForFunction(()=>document.querySelector('[data-draft-state]').textContent.includes('已自动保存'));
   await page.reload();await field('Backend').waitFor();assert.deepEqual(await order(),[gpus[1].uuid]);
   await field('Backend').selectOption('ninfer');assert.equal(await field('Context').inputValue(),'123456','other engine draft survives a reload');
-  await field('Backend').selectOption('polystrata');assert.equal(await field('Prefill').inputValue(),'512');assert.equal(await field('DraftTokens').inputValue(),'2');assert.equal(await field('ReasoningEffort').inputValue(),'xhigh');assert.equal(await field('Vision').isChecked(),false);assert.equal(await page.locator('[data-preset]').getAttribute('data-preset'),'polystrata-default');
+  await field('Backend').selectOption('polystrata');assert.equal(await field('Prefill').inputValue(),'512');assert.equal(await field('DraftTokens').inputValue(),'2');assert.equal(await field('ReasoningEffort').inputValue(),'xhigh');assert.equal(await field('Vision').isChecked(),false);assert.equal(await page.locator('[data-preset=polystrata-default]').count(),1);assert.equal(await page.locator('[data-preset=polystrata-gemma4]').count(),1);
   await field('Backend').selectOption('llamacpp');await page.setViewportSize({width:390,height:900});
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'GPU cards fit a narrow screen');
   if(process.env.SCREENSHOT_DIR)await page.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'backend-switch-mobile.png'),fullPage:true});
