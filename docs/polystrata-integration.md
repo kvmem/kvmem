@@ -81,6 +81,17 @@ Model-free benchmark guards preserve failed HTTP turns and bounded server error
 bodies, require question-scoped Query/replay evidence, and reject smoke-only or
 incomplete measurements from performance summaries.
 
+The [Gemma performance comparison](benchmarks/polystrata-gemma4-performance-20261102.json)
+uses three interleaved rounds on one RTX 5060 Ti, F16 KV, graphs, prompt batch 512,
+256 output tokens, and all 3840 experts resident. At 4K input the prefill/decode
+gap to the fixed native worker fell from 7.1%/4.7% to 4.7%/1.8%; at 12K it fell
+from 8.4%/10.9% to 2.9%/2.3%. The change specializes 512-dimension sampled attention
+by page and GQA group, and reuses dead attention scratch for pre-RoPE statistics.
+The same 4K CUDA diagnostic reduced feedback-kernel time from 65.1 to 16.8 ms.
+Sampling, recall and checkpoint guarantees remain the same. Two-turn HTTP checks
+retained the correct answer and 12501 cached tokens in both resident and sparse
+cases; sparse question latency still includes state restoration and Query replay.
+
 The backend provides bounded Query/replay, resident-only Pressure on tool
 continuations, process-shared RAM/SSD history storage, native concurrent sequences,
 solo MTP and CPU/GPU vision. Batch execution uses ordinary decode.

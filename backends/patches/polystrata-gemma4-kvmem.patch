@@ -88,7 +88,7 @@ index 83f0a213e5e17323c4996d2f6c1d0ca9ccd430c1..21eeeab7b6bcc0560e97bf9c11550f8b
      rows_ = opt_.dump ? 1 : std::min(opt_.prompt_batch, opt_.max_context);
      const size_t most = std::min<size_t>(kReadBytes / ((size_t) streams() * n_embd_ * sizeof(float)), opt_.max_context);
 diff --git a/src/poly/gemma4.cpp b/src/poly/gemma4.cpp
-index db5349d0d82e8bfe726d0e3c5e2bf7276bbbacf9..fa2e87517996cec9f53abd854667807490985638 100644
+index db5349d0d82e8bfe726d0e3c5e2bf7276bbbacf9..d538f9ff8adb964ff2d24debeb0c30fff87dac91 100644
 --- a/src/poly/gemma4.cpp
 +++ b/src/poly/gemma4.cpp
 @@ -2,6 +2,9 @@
@@ -186,8 +186,8 @@ index db5349d0d82e8bfe726d0e3c5e2bf7276bbbacf9..fa2e87517996cec9f53abd8546678074
 +        // that scratch rather than displacing routed experts from VRAM. Tiny
 +        // physical contexts can have less score scratch than a full Q batch.
 +        const size_t score_floats=size_t(chunk_)*n_head_*cache_capacity();
-+        memory_kpre_ = fbuf(n * n_kv_ * head_dim_);
-+        memory_qpre_ = fbuf(n * n_head_ * head_dim_);
++        memory_kpre_ = score_floats >= n * n_kv_ * head_dim_ ? score_ : fbuf(n * n_kv_ * head_dim_);
++        memory_qpre_ = score_floats >= n * n_head_ * head_dim_ ? score_ : fbuf(n * n_head_ * head_dim_);
 +        const size_t key_count = memory_groups_ * n_attn_ * n_kv_ * head_dim_;
 +        memory_stats_stride_=key_count+size_t(n_attn_)*n_head_*head_dim_;
 +        memory_stats_all_ = fbuf(memory_stats_stride_*size_t(opt_.batch+1));
@@ -848,7 +848,7 @@ index e1a4f12f1344c604af9237b60c8b01d3cb98f0be..9904aeb63d039d19d89afc3f32508c3d
      int64_t compact_position(int64_t logical) const;
      int64_t visible_tokens() const noexcept { return visible_; }
 diff --git a/src/poly/kvmem_capture.cu b/src/poly/kvmem_capture.cu
-index e91c2effefdfc7ae1b800d89def474b841099a0f..67e1333b1ca0ac3d5c42bcee3d6fa3273aaa5e3d 100644
+index e91c2effefdfc7ae1b800d89def474b841099a0f..a041c67fff45006a4ded467e55ab9283aad2e947 100644
 --- a/src/poly/kvmem_capture.cu
 +++ b/src/poly/kvmem_capture.cu
 @@ -28,7 +28,7 @@ __device__ float max_warp(float value) {
@@ -904,7 +904,7 @@ index e91c2effefdfc7ae1b800d89def474b841099a0f..67e1333b1ca0ac3d5c42bcee3d6fa327
                  if(lane==0)logits[warp][g][i]=key<end?score:-CUDART_INF_F;
              }
          }
-@@ -272,7 +271,7 @@ void kvmem_pack_key_sums(const float* source,float* packed,int width,int groups,
+@@ -272,37 +271,50 @@ void kvmem_pack_key_sums(const float* source,float* packed,int width,int groups,
  template<int BlockTokens>
  void dispatch_page_mass(const float* query,const uint16_t* keys,Kvq8 q8,int dim,int heads,int kv_heads,
      int rows,const int64_t* cfg,const int32_t* map,float* mass,int stride,int layers,void* stream,
@@ -912,13 +912,27 @@ index e91c2effefdfc7ae1b800d89def474b841099a0f..67e1333b1ca0ac3d5c42bcee3d6fa327
 +    float* scratch,size_t scratch_floats,float scale) {
      // score_ is dead after attention. Reusing it avoids a persistent allocation
      // that would displace experts. Keep the small-context / unsupported fallback.
-     if(scratch && scratch_floats>=size_t(rows)*heads*stride*2 && (dim==256 || dim==32)) {
-@@ -280,29 +279,30 @@ void dispatch_page_mass(const float* query,const uint16_t* keys,Kvq8 q8,int dim,
+-    if(scratch && scratch_floats>=size_t(rows)*heads*stride*2 && (dim==256 || dim==32)) {
++    if(scratch && scratch_floats>=size_t(rows)*heads*stride*2 && (dim==512 || dim==256 || dim==32)) {
+         auto* parts=reinterpret_cast<float2*>(scratch);
          const unsigned grid=unsigned(std::min(size_t(256),size_t(stride)*heads*rows));
          const auto st=static_cast<cudaStream_t>(stream);
-         if(dim==256 && (heads/kv_heads)%8==0) {
+-        if(dim==256 && (heads/kv_heads)%8==0) {
 -            if(q8.codes)page_mass_warp_parts<BlockTokens,256,true,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
 -            else page_mass_warp_parts<BlockTokens,256,false,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
++        if(dim==512 && (heads/kv_heads)%8==0) {
++            // Gemma global attention shares one K head across eight Q heads.
++            // Read each page once for that group rather than scanning all K
++            // twice per Q head. Normalize across pages in the existing merge.
++            if(q8.codes)page_mass_warp_parts<BlockTokens,512,true,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_warp_parts<BlockTokens,512,false,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++        } else if(dim==512 && (heads/kv_heads)%4==0) {
++            if(q8.codes)page_mass_parts<BlockTokens,512,true,4><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_parts<BlockTokens,512,false,4><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++        } else if(dim==512) {
++            if(q8.codes)page_mass_parts<BlockTokens,512,true><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_parts<BlockTokens,512,false><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++        } else if(dim==256 && (heads/kv_heads)%8==0) {
 +            if(q8.codes)page_mass_warp_parts<BlockTokens,256,true,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
 +            else page_mass_warp_parts<BlockTokens,256,false,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
          } else if(dim==256 && (heads/kv_heads)%4==0) {
@@ -1205,10 +1219,10 @@ index ef41357bb6d4ab68af2d8537f83b6860743d5a0f..23f63647311565cb91dc191c6f264c64
          "  --kvmem-sessions N (1..16 retained histories including the GPU owner; requires reuse for N>1)\n"
 diff --git a/tools/poly_gemma_kvmem_test.cpp b/tools/poly_gemma_kvmem_test.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c745b5feef28a8eab382f01f15c3bd6d7591feb5
+index 0000000000000000000000000000000000000000..341c806ce2acd216d232e0931da4e2d136422a1f
 --- /dev/null
 +++ b/tools/poly_gemma_kvmem_test.cpp
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,182 @@
 +#include "../src/poly/engine.hpp"
 +#include <algorithm>
 +#include <cmath>
@@ -1273,6 +1287,7 @@ index 0000000000000000000000000000000000000000..c745b5feef28a8eab382f01f15c3bd6d
 +        opt.memory.sink=32;opt.memory.recent=64;opt.memory.verify=true;
 +        for(int i=2;i<argc;++i) {
 +            if(std::string(argv[i])=="--graphs")opt.graphs=true;
++            else if(std::string(argv[i])=="--wide")opt.memory.budget=512;
 +            else if(std::string(argv[i])=="--block64") {opt.memory.block_tokens=64;opt.memory.sink=64;}
 +            else if(std::string(argv[i])=="--int8")opt.kv_format=KvFmt::kInt8;
 +            else if(std::string(argv[i])=="--int8k")opt.kv_format=KvFmt::kInt8K;
@@ -1292,7 +1307,7 @@ index 0000000000000000000000000000000000000000..c745b5feef28a8eab382f01f15c3bd6d
 +            check(engine->read(tokens.data()+i,n),"layer-major Gemma prefill was cancelled");i+=n;
 +        }
 +        auto& memory=engine->memory();
-+        check(memory.visible_tokens()<=384,"physical KV exceeds B+R");
++        check(memory.visible_tokens()<=int64_t(opt.memory.budget+opt.memory.reserve),"physical KV exceeds B+R");
 +        check(!memory.complete_prefix(),"fixture never evicted a global page");
 +        auto cp=memory.checkpoint();
 +        const auto native=KvmemTestAccess::kv(memory);
@@ -1391,7 +1406,7 @@ index 0000000000000000000000000000000000000000..c745b5feef28a8eab382f01f15c3bd6d
 +    } catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
 +}
 diff --git a/tools/poly_kvmem_kernel_test.cpp b/tools/poly_kvmem_kernel_test.cpp
-index 40b0404a6d14427e484a678f033d5306738ef31a..cbd6838f814f52fee4a678cfbd8c1810e67e71be 100644
+index 40b0404a6d14427e484a678f033d5306738ef31a..3c0b50f7e9e50c3019d0d19e16a621fc8f398a4a 100644
 --- a/tools/poly_kvmem_kernel_test.cpp
 +++ b/tools/poly_kvmem_kernel_test.cpp
 @@ -17,7 +17,7 @@ void close(float a, float b, float tolerance, const char* label) {
@@ -1421,15 +1436,63 @@ index 40b0404a6d14427e484a678f033d5306738ef31a..cbd6838f814f52fee4a678cfbd8c1810
                      }
                      for(auto& value:weights){value=std::exp(value-top);total+=value;}
                      for(int key=0;key<end;++key)expected[key/block_tokens]+=weights[key]/total/heads;
-@@ -133,6 +133,8 @@ void feedback_graph_test(int block_tokens) {
+@@ -74,8 +74,8 @@ void feedback_reference_test(int dim=32,int count=128,int heads=8,int block_toke
+     cudaFree(dq);cudaFree(dk);cudaFree(hk);cudaFree(codes);cudaFree(scales);cudaFree(config);cudaFree(samples);cudaFree(mass);cudaFree(scratch);
+ }
  
- int main() {
+-void feedback_benchmark(int block_tokens) {
+-    const int dim=256,heads=16,kvheads=2,rows=16,count=34816,pages=count/block_tokens;
++void feedback_benchmark(int block_tokens,int dim=256) {
++    const int heads=16,kvheads=2,rows=16,count=34816,pages=count/block_tokens;
+     auto* q=allocate<float>(rows*heads*dim);auto* k=allocate<int8_t>(count*kvheads*dim);
+     auto* scales=allocate<uint16_t>(count*kvheads*dim/32);auto* cfg=allocate<int64_t>(7);
+     auto* map=allocate<int32_t>(rows);auto* mass=allocate<float>(rows*pages);
+@@ -93,14 +93,14 @@ void feedback_benchmark(int block_tokens) {
+         for(int i=0;i<3;++i)run();check(cudaEventRecord(start));
+         for(int i=0;i<20;++i)run();check(cudaEventRecord(stop));check(cudaEventSynchronize(stop));
+         float ms=0;check(cudaEventElapsedTime(&ms,start,stop));
+-        std::printf("feedback block_tokens=%d context=%d samples=%d fast=%d ms=%.5f\n",block_tokens,context,samples,int(fast),ms/20);
++        std::printf("feedback dim=%d block_tokens=%d context=%d samples=%d fast=%d ms=%.5f\n",dim,block_tokens,context,samples,int(fast),ms/20);
+     }
+     cudaEventDestroy(start);cudaEventDestroy(stop);cudaFree(q);cudaFree(k);cudaFree(scales);cudaFree(cfg);
+     cudaFree(map);cudaFree(mass);cudaFree(scratch);
+ }
+ 
+-void feedback_graph_test(int block_tokens) {
+-    constexpr int dim=256,heads=4,kvheads=2,pages=4,rows=3;
++void feedback_graph_test(int block_tokens,int dim=256,int heads=4) {
++    constexpr int kvheads=2,pages=4,rows=3;
+     auto* q=allocate<float>(rows*heads*dim);auto* k=allocate<uint16_t>(pages*block_tokens*kvheads*dim);
+     auto* config=allocate<int64_t>(7);auto* samples=allocate<int32_t>(4);
+     auto* mass=allocate<float>(4*pages);auto* scratch=allocate<float>(2*heads*pages*2);
+@@ -131,16 +131,25 @@ void feedback_graph_test(int block_tokens) {
+     cudaFree(q);cudaFree(k);cudaFree(config);cudaFree(samples);cudaFree(mass);cudaFree(scratch);
+ }
+ 
+-int main() {
++int main(int argc,char** argv) {
      try {
++        const bool benchmark=argc==1;
++        if(argc>2 || (argc==2 && std::strcmp(argv[1],"--no-benchmark")!=0))
++            throw std::runtime_error("usage: poly_kvmem_kernel_test [--no-benchmark]");
 +        feedback_reference_test(512,128,16,32,1.f);
 +        feedback_reference_test(512,128,16,64,1.f);
          for(int block_tokens:{32,64}) {
++            for(int heads:{4,8,16})feedback_reference_test(512,2*block_tokens+1,heads,block_tokens,1.f);
++            feedback_reference_test(512,8192,16,block_tokens,1.f);
++            feedback_graph_test(block_tokens,512,16);
++            if(benchmark)feedback_benchmark(block_tokens,512);
              for(int count:{block_tokens-1,block_tokens,block_tokens+1,2*block_tokens-1,2*block_tokens,2*block_tokens+1}) {
                  feedback_reference_test(32,count,8,block_tokens);
+                 for(int heads:{4,8,16}) feedback_reference_test(256,count,heads,block_tokens);
+             }
+             feedback_reference_test(256,32768,16,block_tokens);
+             feedback_graph_test(block_tokens);
+-            feedback_benchmark(block_tokens);
++            if(benchmark)feedback_benchmark(block_tokens);
+         }
+         constexpr int dim = 256, heads = 2, width = dim * heads, max_rows = 129, groups = 6;
+         std::vector<float> input(width * max_rows), weight(dim), native(input.size()), rotated(input.size()), raw(input.size());
 diff --git a/tools/poly_kvmem_mtp_test.cpp b/tools/poly_kvmem_mtp_test.cpp
 index 45437906da56ca8a40ede3173bff0d3e371fba63..567bcd8ab89b4fc6241c3a3deb9ae2741ec8e9f5 100644
 --- a/tools/poly_kvmem_mtp_test.cpp
