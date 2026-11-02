@@ -20,7 +20,7 @@ class CacheProtocolTest(unittest.TestCase):
 
     def test_mode_switch_retains_full_owner_without_recalling_old_query(self):
         from serve.kvmem import Prompt
-        engine=self.engine_class()();engine.batch=2;engine.info={'kvmem':1}
+        engine=self.engine_class()();engine.batch=2;engine.info={'kvmem':1};engine.turn_ids={3}
         owner='界'*60+'x'*20+'branch-B'
         prompt=Prompt([1,2,3,4],(1,4),owner)
         initial=engine.turn_key(prompt)
@@ -29,6 +29,8 @@ class CacheProtocolTest(unittest.TestCase):
         self.assertIn('query_begin=0 query_end=0',continued)
         self.assertIn('cache_owner='+owner.encode().hex(),initial)
         self.assertIn('cache_owner='+owner.encode().hex(),continued)
+        self.assertIn('turn_at=2',initial)
+        self.assertIn('turn_at=2',continued)
         self.assertGreater(len(owner.encode()),128)
 
     def test_yield_keeps_first_restore_observation_separate_from_legacy_done(self):
