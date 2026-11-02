@@ -1,0 +1,2218 @@
+diff --git a/docs/README.md b/docs/README.md
+index 1c96d4a7e5cbccc838f1df614c63ce871e1380f8..f86dbd3b4ddc4d872f586f0aaf48ebe15c580026 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -18,6 +18,7 @@ spelling and defaults.
+ | [Performance](performance.md) | every measured result card by card: largest context, decode and prompt rates by model, KV format, depth and drafter, several requests at once, Flash-Next's expert placements, quality; the measurement pages and users' field reports |
+ | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
+ | [GGUF block formats](gguf.md) | GGUF releases with a ggml type per tensor: the eighteen block formats, their products, serving and measurements |
++| [Experimental GGUF MXFP8 prefill](gguf-mxfp8-prefill.md) | opt-in Blackwell block-scaled prefill, numerical tradeoffs, width limits and qualification |
+ | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md) | converting the GSQ-RCO GGUF releases and their n-gram table; experts on one or several GPUs, in host memory or on disk; measurements |
+ | [Gemma 4 26B-A4B](gemma4.md) | converting Google's QAT GGUF release with its MTP assistant and vision tower, what runs, speculative decoding, images and video, the defaults, measurements against llama.cpp and the numerical checks |
+ | [Flint](flint.md) | converting a GGUF of Recursive's Flint, what runs, reasoning and GLM-4.7 tool calls, expert residency, measurements against llama.cpp and the numerical checks |
+diff --git a/docs/gguf-mxfp8-prefill.md b/docs/gguf-mxfp8-prefill.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..85ca209b181d706eaa6b5272a50126e3ac814e70
+--- /dev/null
++++ b/docs/gguf-mxfp8-prefill.md
+@@ -0,0 +1,75 @@
++# Experimental MXFP8 GGUF prefill
++
++Set `NINFER_GGUF_PREFILL_MXFP8=1` before starting the process to enable this
++explicit, lossy numerical profile. Unset or `0` retains the existing q8_1 path.
++The switch is immutable after its first query and must precede workspace planning.
++Use `NINFER_GGUF_PREFILL_NVFP4=0` when qualifying FP8 alone. The stored model
++weights and selected KV representation are unchanged.
++
++## Supported calls and routes
++
++The experiment supports an sm120 image on compute capability 12.x, positive K
++divisible by 256, and IQ3_XXS, IQ3_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ4_XS, Q2_K and
++Q4_K. Unsupported devices/formats and calls below 256 columns retain the existing
++route. Supported decode/verification batches are at most 128 columns and remain
++on q8_1. Prefill errors can still affect later KV/GDN state and generated output.
++
++- At 256 through 1023 columns, a fused 128-row by 128-column tile uses producer
++  warps with cp.async staging and native block-scaled E4M3 MMA consumer warps.
++  Results pass directly through the existing store, residual or gate epilogue.
++- At 1024 columns and above, a bounded weight image feeds cuBLASLt. GEMM
++  accumulation and output are FP32, followed by the existing epilogue/BF16 cast.
++
++This width/type gate is a support rule, not a measured profitability rule for
++every device and matrix shape. There is no per-device FP8-tile/Q8-matrix selector
++in this implementation. The existing device profiles for other kernels remain
++separate. In particular, support for FP8 does not prove that FP8 is faster.
++
++## Numerical and resource boundaries
++
++Activations, after their optional column gather, and decoded FP32 weights use
++one E4M3 representation and one UE8M0 power-of-two scale per 32 values. The scale
++is `2^ceil(log2(amax/448))`, clamped to the finite UE8M0 range. All-zero groups use
++scale one. The encoder uses round-to-nearest-even and finite saturation.
++
++The five grid i-quants decode raw selectors through lookup entries carrying the
++actual maximum selector. This preserves actual per-group amax, signed scales
++and direct FP32-to-E4M3 rounding. Other supported types retain their FP32 value
++decoder. There is no FP16 weight intermediate or type-range-bound replacement.
++MMA accumulates in FP32. Dynamic shared-memory attributes are initialized per
++CUDA device; this is independent of the runtime stream or CUDA Graph.
++
++All activation, scale, padded-output, fallback and weight-image storage is
++caller-owned and included in workspace planning. The cuBLASLt weight image is
++capped at 64 MiB except for a minimum 128-row tile, rather than a full-model FP8
++copy. Its larger slab and FP32 output plane cost more transient storage than
++the historical 8 MiB implementation. Tile-only plans do not reserve an unused
++cuBLASLt slab. cuBLASLt plans are cached per device and geometry.
++
++The enabled Qwen prefill signature and all-family snapshot binding identify
++`mxfp8-e4m3-e8m0-f32-tile-v1`. Default signatures are unchanged. State from a
++different numerical profile must not be treated as interchangeable.
++
++## Qualification and use
++
++Independent CPU packed-GGUF decoders, a CPU E4M3 encoder and naive FP64 products
++qualify represented operands, including gathers, tails, extreme scales, stores,
++residual/gated epilogues, graph replay and a large slab boundary. Encoded-operand
++accuracy does not measure the quantization loss against the original model;
++model perplexity and request behavior are separate acceptance evidence.
++
++```powershell
++$env:NINFER_GGUF_PREFILL_MXFP8 = '1'
++$env:NINFER_GGUF_PREFILL_NVFP4 = '0'
++.\ninfer-serve.exe MODEL.ninfer --prefill-chunk 256
++```
++
++Restart with MXFP8 set to `0` to use q8_1. This remains default-off and
++experimental. The former two-pass-only 8 MiB implementation and its timings
++are historical, and do not describe this fused-tile implementation.
++
++The pipeline is adapted from `2-com-org/ninfer-5060-qwen` at
++`08c4fb70bec11063cae42eafe1c1b0dc3a7f993e`. Local actual-amax scaling, FP32
++interpretation and output boundaries differ from that repository's optimized
++scale-bound and some FP16/BF16 paths. Its numerical and performance results
++cannot substitute for qualification of this implementation.
+diff --git a/include/ninfer/ops/linear.h b/include/ninfer/ops/linear.h
+index 1bccc9db09540797fc90201832fdb548ce13ff3b..e9125e18ada4ec421d65d7ca3659451256d00beb 100644
+--- a/include/ninfer/ops/linear.h
++++ b/include/ninfer/ops/linear.h
+@@ -23,6 +23,10 @@ namespace ninfer::ops {
+  * The policy constrains private route selection; it does not select a kernel or prescribe a
+  * particular MMA instruction. The public activation and output tensors remain BF16 for every
+  * policy.
++ * GGUF normally uses its q8_1 compute contract regardless of this activation allowance.
++ * The process-start experimental NINFER_GGUF_PREFILL_MXFP8=1 override explicitly opts into
++ * additional E4M3/E8M0 quantization for supported wide GGUF calls; see
++ * docs/gguf-mxfp8-prefill.md. It does not widen the permissions of other weight formats.
+  */
+ enum class LinearPolicy : std::uint8_t {
+     A16Only, ///< Admit only A16 compute profiles.
+diff --git a/src/models/qwen3_5/measurement.cpp b/src/models/qwen3_5/measurement.cpp
+index a3455f192ca74249c88b20acd481680f9c5f58cb..e66e96466132e6930dee033d7083e82063f12524 100644
+--- a/src/models/qwen3_5/measurement.cpp
++++ b/src/models/qwen3_5/measurement.cpp
+@@ -1,6 +1,7 @@
+ #include "models/qwen3_5/measurement.h"
+ 
+ #include "models/qwen3_5/frontend/digest.h"
++#include "ops/linear/gguf/gguf_mxfp8.h"
+ 
+ #include <nlohmann/json.hpp>
+ 
+@@ -22,6 +23,12 @@ std::string prefill_signature(const Model& model) {
+                {"num_hidden_layers", t.num_hidden_layers},
+                {"rms_norm_eps", t.rms_norm_eps},
+                {"layer_types", t.layer_types}};
++    // This opt-in changes both prefill arithmetic and its measured cost. Keep the default
++    // signature stable, and isolate MXFP8 state/cost presets from the q8_1 profile.
++    if (ops::gguf::mxfp8::enabled()) {
++        facts["gguf_prefill_compute"] = {"mxfp8-e4m3-e8m0-f32-tile-v1",
++                                         ops::gguf::mxfp8::kMinColumns};
++    }
+     // Explicit NVFP4 weight modes alter represented activations. Bind cached state and
+     // measured prefill costs to that choice; leave the default signature unchanged.
+     if (model.options().nvfp4_w4a16 || model.options().nvfp4_w4a8_int) {
+diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
+index a75c819a9675f5aa238e539e652101ffea0f005a..f1b9da185ccc1421ee823194e21879481a70a03f 100644
+--- a/src/ops/CMakeLists.txt
++++ b/src/ops/CMakeLists.txt
+@@ -5,7 +5,7 @@ ninfer_cuda_archive(ninfer_ops)
+ target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+ # The opt-in cuBLAS prefill route hands its GEMM to cuBLAS; see
+ # ops/linear_swiglu/q4cublas/w4_cublas_prefill.h for why that route exists.
+-target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
++target_link_libraries(ninfer_ops PRIVATE CUDA::cublas CUDA::cublasLt)
+ 
+ # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
+ # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
+@@ -83,6 +83,6 @@ if(NINFER_WINDOWS_KERNEL_DLL)
+   math(EXPR _ninfer_small_t_i8_exports "2 * ${NINFER_SMALL_T_I8_INSTANTIATIONS}")
+   ninfer_export_archive_instantiations(ninfer_kernels ninfer_small_t_i8
+     "(launch_small_t_i8|load_small_t_i8)" ${_ninfer_small_t_i8_exports})
+-  target_link_libraries(ninfer_kernels PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cublas)
++  target_link_libraries(ninfer_kernels PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cublas CUDA::cublasLt)
+   target_link_libraries(ninfer_ops PRIVATE ninfer_kernels)
+ endif()
+diff --git a/src/ops/linear/gguf/gguf_linear.cpp b/src/ops/linear/gguf/gguf_linear.cpp
+index e0e8439aeef863bbfa8383a34648fb05576834bd..814fb1b76f00e4a142964810a9cab672538e714c 100644
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -1,4 +1,7 @@
+ #include "ops/linear/gguf/gguf_linear.h"
++#include "ops/linear/gguf/gguf_mxfp8.h"
++#include <cstdlib>
++#include <string_view>
+ 
+ #include "core/layout.h"
+ #include "ops/linear/sm70/sm70_gemm.h"
+@@ -8,6 +11,18 @@
+ #include <string>
+ #include <vector>
+ 
++namespace ninfer::ops::gguf::mxfp8 {
++bool enabled() {
++    static const bool value=[] {
++        const char* raw=std::getenv("NINFER_GGUF_PREFILL_MXFP8");
++        if(raw==nullptr || std::string_view(raw)=="0")return false;
++        if(std::string_view(raw)=="1")return true;
++        throw std::invalid_argument("NINFER_GGUF_PREFILL_MXFP8 must be 0 or 1");
++    }();
++    return value;
++}
++} // namespace ninfer::ops::gguf::mxfp8
++
+ namespace ninfer::ops::detail {
+ namespace {
+ 
+@@ -260,6 +275,20 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
+         if (dequantized) { (void)layout.alloc_bytes(std::size_t(k) * t * 2); }
+         widest = std::max(widest, layout.peak_bytes(1));
+     }
++    // The old capacity remains the bound for mixed supported/fallback products. Add the
++    // caller-owned MXFP8 activations and one reusable slab, including arena alignment.
++    if (gguf::mxfp8::enabled() && max_tokens >= gguf::mxfp8::kMinColumns) {
++        std::size_t scratch=0, count=0;
++        for(const auto& shape:shapes) {
++            if(gguf::mxfp8::supported(gguf_type(shape.qtype),shape.k)) {
++                ++count;
++                if(max_tokens>=1024)scratch=std::max(scratch,gguf::mxfp8::scratch_bytes(k,shape.rows,max_tokens));
++            }
++        }
++        std::size_t activation=gguf::mxfp8::activation_bytes(k,max_tokens);
++        if(min_tokens<1024)activation=std::max(activation,gguf::mxfp8::tile_activation_bytes(k,std::min(max_tokens,1023)));
++        if(count)widest+=scratch+count*activation+(count+1)*256;
++    }
+     return widest;
+ }
+ 
+@@ -315,6 +344,12 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+     auto* plane = static_cast<float*>(
+         workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
+     void* fixup = workspace.alloc_bytes(fixup_bound()).data;
++    std::size_t mx_bytes=0;
++    if(gguf::mxfp8::enabled() && t>=gguf::mxfp8::kMinColumns) {
++        for(const auto& p:products)if(gguf::mxfp8::supported(gguf_type(p.weight->qtype),k) && !gguf::mxfp8::takes_tile(gguf_type(p.weight->qtype),k,t))
++            mx_bytes=std::max(mx_bytes,gguf::mxfp8::scratch_bytes(k,p.weight->n,t));
++    }
++    void* mx_scratch=mx_bytes?workspace.alloc_bytes(mx_bytes).data:nullptr;
+     void* vector_activation = nullptr;
+     void* scratch           = nullptr;
+     if (dequantized) {
+@@ -329,6 +364,29 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+         const bool direct = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
+         float* out        = direct ? p.f32 + p.row : plane;
+         const std::int64_t stride = direct ? p.f32_rows : w.n;
++        if(gguf::mxfp8::enabled() && gguf::mxfp8::takes_tile(type,k,t)) {
++            constexpr int tile_layout=-3;
++            auto found=std::find_if(activations.begin(),activations.end(),[&](const Activation& a){return a.layout==tile_layout&&a.columns==w.input_columns;});
++            if(found==activations.end()) {
++                void* data=workspace.alloc_bytes(gguf::mxfp8::tile_activation_bytes(k,t)).data;
++                gguf::mxfp8::quantize_tile(xb,k,t,w.input_columns,data,stream);
++                activations.push_back({tile_layout,w.input_columns,data});found=activations.end()-1;
++            }
++            gguf::mxfp8::tile_product(type,w.qdata,row_bytes(w),w.n,k,found->data,t,output(p,0),stream);
++            continue;
++        }
++        if(mx_scratch && gguf::mxfp8::supported(type,k)) {
++            constexpr int mx_layout=-1;
++            auto found=std::find_if(activations.begin(),activations.end(),[&](const Activation& a){return a.layout==mx_layout&&a.columns==w.input_columns;});
++            if(found==activations.end()) {
++                void* data=workspace.alloc_bytes(gguf::mxfp8::activation_bytes(k,t)).data;
++                gguf::mxfp8::quantize(xb,k,t,w.input_columns,data,stream);
++                activations.push_back({mx_layout,w.input_columns,data});found=activations.end()-1;
++            }
++            gguf::mxfp8::product(type,w.qdata,row_bytes(w),w.n,k,found->data,t,out,stride,mx_scratch,mx_bytes,stream);
++            if(!direct)gguf::store_plane(plane,w.n,w.n,t,output(p,0),stream);
++            continue;
++        }
+         if (gguf::has_matrix_kernel(type)) {
+             const int layout = gguf::matrix_activation_layout(type);
+             auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {
+diff --git a/src/ops/linear/gguf/gguf_linear.h b/src/ops/linear/gguf/gguf_linear.h
+index 39ad57a55b42868a377f760c7d4e57ccf8db71c4..39a56de7568bcce8e32bd0cc04d16f93c2a8aaa3 100644
+--- a/src/ops/linear/gguf/gguf_linear.h
++++ b/src/ops/linear/gguf/gguf_linear.h
+@@ -1,9 +1,13 @@
+ #pragma once
+ 
+-// Products of GGUF block matrices (QType::GGUF_*, QuantLayout::GgufBlocks). Every product quantizes
++// Products of GGUF block matrices (QType::GGUF_*, QuantLayout::GgufBlocks). The default route quantizes
+ // its activation to ggml's q8_1 exactly as llama.cpp does -- that is the format's arithmetic, so it
+ // happens whatever the Use's policy says -- and accumulates in FP32: ggml's vector kernel through
+ // eight columns, its integer tensor-core kernel above.
++// Explicit experiment NINFER_GGUF_PREFILL_MXFP8=1 admits per-32 E4M3/E8M0 operands
++// at >=256 columns on sm120, with FP32 accumulation; default off. Narrow calls and
++// unsupported formats/devices retain q8_1. This adds quantization error, including
++// for A16Only Uses whose GGUF arithmetic already otherwise requires q8_1.
+ 
+ #include "core/arena.h"
+ #include "core/tensor.h"
+diff --git a/src/ops/linear/gguf/gguf_mxfp8.cu b/src/ops/linear/gguf/gguf_mxfp8.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e48ec2d85697ffdfdffce12ad3684c58f892a6c
+--- /dev/null
++++ b/src/ops/linear/gguf/gguf_mxfp8.cu
+@@ -0,0 +1,447 @@
++// Adapted from 2-com-org/ninfer-5060-qwen (7f189ba2; source blobs recorded in provenance).
++// MXFP8 only: actual per-32 amax on decoded FP32 weights, FP32 GEMM output, caller-owned slabs.
++// No FP16 weight intermediate, NVFP4 route, or change to the existing q8_1 decoder/mainloop.
++#include "gguf_mxfp8.h"
++#include "ggml_bridge_vec.cuh"
++#include "gguf_mxfp8_tile.cuh"
++#include "../../common/device_tier.h"
++#include <cublasLt.h>
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <map>
++#include <mutex>
++#include <stdexcept>
++
++namespace ninfer::ops::gguf::mxfp8 {
++namespace {
++namespace vec = ninfer::ops::gguf::detail::vec;
++using ninfer::ops::gguf::detail::check;
++using ninfer::ops::gguf::detail::device_facts;
++constexpr int kImageThreads = 256;
++constexpr int kTileQuantizeThreads = 128;
++// A bounded 64 MiB image amortizes cuBLASLt dispatch on the dense prefill shapes.
++constexpr std::size_t kImageBytes = 64ULL << 20;
++std::size_t round256(std::size_t n) { return (n + 255) / 256 * 256; }
++int pad128(int n) { return (n + 127) / 128 * 128; }
++__host__ __device__ constexpr std::size_t lt_scale_offset(int row,int group,int groups) {
++    return (std::size_t(row/128)*std::size_t((groups+3)/4)+std::size_t(group/4))*512 +
++           std::size_t(row%32)*16 + std::size_t(row%128/32)*4 + std::size_t(group%4);
++}
++std::size_t scale_bytes(int rows,int k) { return std::size_t(pad128(rows)) * ((k/32+3)/4)*4; }
++int max_pass(int k,int rows) { return std::min(pad128(rows),std::max(128,int(kImageBytes/k)/128*128)); }
++// ceil(log2(amax/448)), clamped to E8M0's finite scale range. frexp avoids underflow
++// of amax/448 for tiny finite BF16 values. All-zero blocks use scale one.
++__device__ __forceinline__ unsigned exponent(float amax) {
++    if (amax == 0.0f) return 127;
++    int e=0;const float f=frexpf(amax,&e);
++    e-=9;if(f>0.875f)++e;
++    return unsigned(max(-127,min(127,e))+127);
++}
++struct ImageArgs {
++    const std::uint8_t* weight; std::int64_t row_bytes; int rows;int k;
++    std::uint8_t* image;std::uint8_t* scales;int padded_rows;
++};
++template <ggml_type type>
++__device__ __forceinline__ void slice_values(const vec::Slice& s, float (&v)[32]) {
++#pragma unroll
++    for (int i = 0; i < 32; ++i) {
++        const unsigned byte = (unsigned(s.w[i / 4]) >> (8 * (i % 4))) & 0xFFu;
++        if constexpr (type == GGML_TYPE_Q2_K) {
++            v[i] = i < 16 ? s.f[0] * float(byte) - s.f[2] : s.f[1] * float(byte) - s.f[3];
++        } else if constexpr (type == GGML_TYPE_IQ1_S) {
++            v[i] = s.f[0] * (float(byte) + s.f[1]);
++        } else if constexpr (type == GGML_TYPE_IQ1_M) {
++            v[i] = (i < 16 ? s.f[0] : s.f[1]) * (float(byte) + s.f[2 + i / 8]);
++        } else if constexpr (type == GGML_TYPE_Q4_K) {
++            v[i] = s.f[0] * float(byte) - s.f[1];
++        } else {
++            const float c = float(static_cast<signed char>(byte));
++            if constexpr (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
++                          type == GGML_TYPE_Q6_K) {
++                v[i] = (i < 16 ? s.f[0] : s.f[1]) * c;
++            } else {
++                v[i] = s.f[0] * c;
++            }
++        }
++    }
++}
++
++// Slice `at` of a [rows][k] GGUF matrix (row-major over the rows' 32-value slices) as 32 floats,
++// its row and its first value's column; false past the last row.
++template <ggml_type type>
++__device__ __forceinline__ bool decode_slice(const std::uint8_t* weight, std::int64_t row_bytes,
++                                             int rows, int k, std::int64_t at,
++                                             const std::uint32_t* table, int& row,
++                                             std::int64_t& first, float (&v)[32]) {
++    using D                      = vec::Decoder<type>;
++    constexpr int kSlices        = D::kBlockElems / 32;
++    const int blocks             = k / D::kBlockElems;
++    const int u                  = int(at % kSlices);
++    const std::int64_t row_block = at / kSlices;
++    const int b                  = int(row_block % blocks);
++    row                          = int(row_block / blocks);
++    first                        = std::int64_t(b) * D::kBlockElems + 32 * u;
++    if (row >= rows) { return false; }
++    vec::Slice s;
++    D::decode(weight + std::int64_t(row) * row_bytes + std::int64_t(b) * D::kBlockBytes, u, table,
++              s);
++    slice_values<type>(s, v);
++    return true;
++}
++
++// The decoder's grid table in shared memory (every thread of the block calls this first).
++template <ggml_type type>
++__device__ __forceinline__ const std::uint32_t* stage_table() {
++    using D = vec::Decoder<type>;
++    __shared__ std::uint32_t table[D::kTableWords > 0 ? D::kTableWords : 1];
++    if constexpr (D::kTableWords > 0) {
++        for (int i = threadIdx.x; i < D::kTableWords; i += blockDim.x) { table[i] = D::table()[i]; }
++        __syncthreads();
++    }
++    return table;
++}
++
++template <bool kLt>
++__global__ void quantize_fp8_kernel(const __nv_bfloat16* __restrict__ x,
++                                    const std::int32_t* __restrict__ input_columns,
++                                    std::uint8_t* __restrict__ qs, void* __restrict__ scales, int k,
++                                    int columns, int columns_pad) {
++
++#if defined(NINFER_SM120_FP8) && __CUDA_ARCH__ >= 1200
++    const int i0     = (blockDim.x * blockIdx.y + threadIdx.x) * 4;
++    const int column = blockIdx.x;
++    if (i0 >= k) { return; }
++    const auto put = [&](unsigned e) {
++        if constexpr (kLt) {
++            static_cast<std::uint8_t*>(scales)[lt_scale_offset(column, i0 / 32, k / 32)] =
++                static_cast<std::uint8_t>(e);
++        } else {
++            static_cast<float*>(scales)[std::int64_t(i0 / 32) * columns_pad + column] =
++                __uint_as_float(e << 23);
++        }
++    };
++    if (column >= columns) {
++        *reinterpret_cast<unsigned*>(qs + std::int64_t(column) * k + i0) = 0;
++        if (i0 % 32 == 0) { put(127u); }
++        return;
++    }
++    const __nv_bfloat16* source = x + std::int64_t(column) * k;
++    float4 xi;
++    if (input_columns != nullptr) {
++        xi = make_float4(__bfloat162float(source[input_columns[i0 + 0]]),
++                         __bfloat162float(source[input_columns[i0 + 1]]),
++                         __bfloat162float(source[input_columns[i0 + 2]]),
++                         __bfloat162float(source[input_columns[i0 + 3]]));
++    } else {
++        const uint2 words = *reinterpret_cast<const uint2*>(source + i0);
++        const float2 lo   = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words.x));
++        const float2 hi   = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words.y));
++        xi                = make_float4(lo.x, lo.y, hi.x, hi.y);
++    }
++    float amax = fabsf(xi.x);
++    amax       = fmaxf(amax, fabsf(xi.y));
++    amax       = fmaxf(amax, fabsf(xi.z));
++    amax       = fmaxf(amax, fabsf(xi.w));
++#pragma unroll
++    for (int offset = 4; offset > 0; offset >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
++    }
++    // Scale 2^E with amax * 2^-E in (224, 448]: no value saturates.
++    const unsigned e = exponent(amax);
++    const float unscale = ldexpf(1.0f, 127 - int(e));
++    unsigned short lo, hi;
++    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
++        : "=h"(lo)
++        : "f"(xi.y * unscale), "f"(xi.x * unscale));
++    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
++        : "=h"(hi)
++        : "f"(xi.w * unscale), "f"(xi.z * unscale));
++    *reinterpret_cast<unsigned*>(qs + std::int64_t(column) * k + i0) =
++        unsigned(lo) | (unsigned(hi) << 16);
++    if (i0 % 32 == 0) { put(e); }
++#else
++    __trap();
++#endif
++}
++
++template <ggml_type type>
++__launch_bounds__(kImageThreads) __global__ void image_kernel(ImageArgs p) {
++#if defined(NINFER_SM120_FP8) && __CUDA_ARCH__ >= 1200
++    const std::uint32_t* table=stage_table<type>();
++    const std::int64_t at=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
++    int row=0;std::int64_t first=0;float v[32]{};
++    const bool valid=decode_slice<type>(p.weight,p.row_bytes,p.rows,p.k,at,table,row,first,v);
++    float amax=0;
++#pragma unroll
++    for(int i=0;i<32;++i)amax=fmaxf(amax,fabsf(v[i]));
++    const unsigned e=exponent(amax);const float inv=ldexpf(1.0f,127-int(e));
++    const unsigned e1=__shfl_down_sync(0xffffffff,e,1),e2=__shfl_down_sync(0xffffffff,e,2),e3=__shfl_down_sync(0xffffffff,e,3);
++    if(row>=p.padded_rows)return;
++    auto* dst=reinterpret_cast<unsigned*>(p.image+std::int64_t(row)*p.k+first);
++#pragma unroll
++    for(int i=0;i<8;++i){
++        unsigned short a,b;
++        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;":"=h"(a):"f"(v[4*i+1]*inv),"f"(v[4*i]*inv));
++        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;":"=h"(b):"f"(v[4*i+3]*inv),"f"(v[4*i+2]*inv));
++        dst[i]=unsigned(a)|(unsigned(b)<<16);
++    }
++    const int group=int(first/32);
++    if(group%4==0)*reinterpret_cast<unsigned*>(p.scales+lt_scale_offset(row,group,p.k/32))=e|(e1<<8)|(e2<<16)|(e3<<24);
++#else
++    __trap();
++#endif
++}
++template<ggml_type Type> void image_launch(const ImageArgs& p,cudaStream_t s){
++    image_kernel<Type><<<unsigned(std::int64_t(p.padded_rows)*(p.k/32)/kImageThreads),kImageThreads,0,s>>>(p);
++    check(cudaGetLastError(),"MXFP8 weight image");
++}
++void image(GgmlType type,const ImageArgs& p,cudaStream_t s){
++    switch(type){
++#define IMAGE(T) case GgmlType::T:return image_launch<GGML_TYPE_##T>(p,s)
++    IMAGE(IQ3_XXS);IMAGE(IQ3_S);IMAGE(IQ2_XXS);IMAGE(IQ2_XS);IMAGE(IQ2_S);IMAGE(IQ4_XS);IMAGE(Q2_K);IMAGE(Q4_K);
++#undef IMAGE
++    default:throw std::invalid_argument("unsupported MXFP8 weight type");
++    }
++}
++__global__ void crop(const float* in,int padded,int rows,int columns,float* out,std::int64_t ld){
++    const std::int64_t i=std::int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
++    if(i<std::int64_t(rows)*columns)out[(i/rows)*ld+i%rows]=in[(i/rows)*padded+i%rows];
++}
++int lt_wave_pass(int rows, int columns, int k, int most, bool stacked) {
++    const std::int64_t sms          = std::max(1, device_facts().sm_count);
++    const std::int64_t column_tiles = (columns + 127) / 128;
++    const auto waves                = [&](int count) {
++        const std::int64_t row_tiles = (count + 127) / 128 * (stacked ? 2 : 1);
++        return (row_tiles * column_tiles + sms - 1) / sms;
++    };
++    const double pass_cost = 1024.0 / double(std::max(k, 1024));
++    int best               = most;
++    double best_cost       = 0.0;
++    for (int pass = most; pass >= 128; pass -= 128) {
++        const int full = rows / pass, rest = rows % pass;
++        const int passes = full + (rest != 0 ? 1 : 0);
++        const double cost =
++            double(full * waves(pass) + (rest != 0 ? waves(rest) : 0)) + pass_cost * passes;
++        if (pass == most || cost < best_cost - 1e-9) {
++            best      = pass;
++            best_cost = cost;
++        }
++    }
++    return best;
++}
++
++void check_lt(cublasStatus_t status, const char* what) {
++    if (status != CUBLAS_STATUS_SUCCESS) {
++        throw std::runtime_error(std::string("gguf cuBLASLt ") + what + ": status " +
++                                 std::to_string(int(status)));
++    }
++}
++
++cublasLtHandle_t lt_handle() {
++    static std::array<cublasLtHandle_t, 16> handles{};
++    static std::array<std::once_flag, 16> once;
++    int device = 0;
++    check(cudaGetDevice(&device), "device");
++    if (device < 0 || device >= int(handles.size())) {
++        throw std::invalid_argument("gguf: device ordinal out of range");
++    }
++    // As blas_handle: the first use may be inside a CUDA graph capture.
++    std::call_once(once[device], [&] {
++        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
++        check(cudaThreadExchangeStreamCaptureMode(&mode), "capture mode");
++        const cublasStatus_t created = cublasLtCreate(&handles[device]);
++        check(cudaThreadExchangeStreamCaptureMode(&mode), "capture mode");
++        check_lt(created, "create");
++    });
++    return handles[device];
++}
++
++// D[m, n] (FP32, column-major, columns ld apart) = image[m, k] x activation[n, k]^T,
++// plus D when accumulating. E4M3 operands under VEC32_UE8M0 scales, FP32 accumulation,
++// no cuBLASLt workspace; operand and output buffers belong to the caller.
++struct LtKey {
++    int device;
++    int m;
++    int n;
++    int k;
++    std::int64_t ld;
++    bool accumulate;
++    auto operator<=>(const LtKey&) const = default;
++};
++
++struct LtPlan {
++    cublasLtMatmulDesc_t op  = nullptr;
++    cublasLtMatrixLayout_t a = nullptr;
++    cublasLtMatrixLayout_t b = nullptr;
++    cublasLtMatrixLayout_t d = nullptr;
++    cublasLtMatmulAlgo_t algo{};
++};
++
++void lt_gemm(int m, int n, int k, const std::uint8_t* image, const std::uint8_t* image_scales,
++             const std::uint8_t* x, const std::uint8_t* x_scales, float* out,
++             std::int64_t ld, bool accumulate, cudaStream_t stream) {
++    static std::mutex mutex;
++    static std::map<LtKey, LtPlan> plans;
++    int device = 0;
++    check(cudaGetDevice(&device), "device");
++    const cublasLtHandle_t handle = lt_handle();
++    const std::lock_guard lock(mutex);
++    const auto set_scales = [&](cublasLtMatmulDesc_t op) {
++        check_lt(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
++                                                &image_scales, sizeof image_scales),
++                 "image scales");
++        check_lt(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
++                                                &x_scales, sizeof x_scales),
++                 "activation scales");
++    };
++    auto [found, inserted] = plans.try_emplace(LtKey{device, m, n, k, ld, accumulate});
++    LtPlan& plan           = found->second;
++    if (inserted) {
++        try {
++            check_lt(cublasLtMatmulDescCreate(&plan.op, CUBLAS_COMPUTE_32F, CUDA_R_32F), "desc");
++            const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
++            check_lt(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
++                                                    sizeof ta),
++                     "transa");
++            check_lt(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb,
++                                                    sizeof tb),
++                     "transb");
++            const cublasLtMatmulMatrixScale_t mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
++            check_lt(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
++                                                    &mode, sizeof mode),
++                     "image scale mode");
++            check_lt(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
++                                                    &mode, sizeof mode),
++                     "activation scale mode");
++            // The heuristic requires the scale pointers set (it finds no algorithm without them).
++            set_scales(plan.op);
++            const cudaDataType_t in_type = CUDA_R_8F_E4M3;
++            check_lt(cublasLtMatrixLayoutCreate(&plan.a, in_type, k, m, k), "image layout");
++            check_lt(cublasLtMatrixLayoutCreate(&plan.b, in_type, k, n, k), "x layout");
++            check_lt(cublasLtMatrixLayoutCreate(&plan.d, CUDA_R_32F, m, n, ld), "out layout");
++            cublasLtMatmulPreference_t preference = nullptr;
++            check_lt(cublasLtMatmulPreferenceCreate(&preference), "preference");
++            const std::size_t workspace = 0;
++            const cublasStatus_t set   = cublasLtMatmulPreferenceSetAttribute(
++                preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace, sizeof workspace);
++            cublasLtMatmulHeuristicResult_t results[8]{};
++            int count                  = 0;
++            const cublasStatus_t heuristic =
++                set == CUBLAS_STATUS_SUCCESS
++                    ? cublasLtMatmulAlgoGetHeuristic(handle, plan.op, plan.a, plan.b, plan.d,
++                                                     plan.d, preference, 8, results, &count)
++                    : set;
++            cublasLtMatmulPreferenceDestroy(preference);
++            check_lt(heuristic, "heuristic");
++            if (count == 0) {
++                throw std::runtime_error("gguf cuBLASLt: no block-scaled algorithm for m=" +
++                                         std::to_string(m) + " n=" + std::to_string(n) +
++                                         " k=" + std::to_string(k));
++            }
++            // Prefer an unsplit candidate, as in the ported host planner. This is a
++            // scheduling heuristic, not an assertion about MXFP8 speed on every geometry.
++            plan.algo = results[0].algo;
++            for (int c = 0; c < count; ++c) {
++                std::uint32_t splits = 0;
++                std::size_t written  = 0;
++                if (cublasLtMatmulAlgoConfigGetAttribute(&results[c].algo,
++                                                         CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splits,
++                                                         sizeof splits, &written) ==
++                        CUBLAS_STATUS_SUCCESS &&
++                    written == sizeof splits && splits == 1) {
++                    plan.algo = results[c].algo;
++                    break;
++                }
++            }
++        } catch (...) {
++            if (plan.d != nullptr) { cublasLtMatrixLayoutDestroy(plan.d); }
++            if (plan.b != nullptr) { cublasLtMatrixLayoutDestroy(plan.b); }
++            if (plan.a != nullptr) { cublasLtMatrixLayoutDestroy(plan.a); }
++            if (plan.op != nullptr) { cublasLtMatmulDescDestroy(plan.op); }
++            plans.erase(found);
++            throw;
++        }
++    } else {
++        set_scales(plan.op);
++    }
++    const float alpha = 1.0f;
++    const float beta  = accumulate ? 1.0f : 0.0f;
++    const float* alpha_pointer = &alpha;
++    const float* beta_pointer  = &beta;
++    check_lt(cublasLtMatmul(handle, plan.op, alpha_pointer, image, plan.a, x, plan.b, beta_pointer,
++                            out, plan.d, out, plan.d, &plan.algo, nullptr, 0, stream),
++             "matmul");
++}
++
++
++} // namespace
++bool supported(GgmlType type,int k){
++#if defined(NINFER_SM120_FP8)
++    if(!current_device_blackwell() || k<=0 || k%256 || device_facts().cc<1200 || device_facts().cc>=1300 || cublasLtGetVersion()<120800)return false;
++    switch(type){case GgmlType::IQ3_XXS:case GgmlType::IQ3_S:case GgmlType::IQ2_XXS:case GgmlType::IQ2_XS:case GgmlType::IQ2_S:case GgmlType::IQ4_XS:case GgmlType::Q2_K:case GgmlType::Q4_K:return true;default:return false;}
++#else
++    return false;
++#endif
++}
++std::size_t activation_bytes(int k,int t){return round256(std::size_t(k)*pad128(t))+round256(scale_bytes(pad128(t),k));}
++bool takes_tile(GgmlType type,int k,int columns) {
++    return columns>=kMinColumns && columns<1024 && supported(type,k);
++}
++std::size_t tile_activation_bytes(int k,int columns) {
++    return round256(std::size_t(k)*pad128(columns)) + round256(std::size_t(k/32)*pad128(columns)*sizeof(float));
++}
++void quantize_tile(const __nv_bfloat16* x,int k,int columns,const std::int32_t* gather,void* activation,cudaStream_t stream) {
++    auto* data=static_cast<std::uint8_t*>(activation);
++    const int padded=pad128(columns);
++    quantize_fp8_kernel<false><<<dim3(padded,(k+511)/512),kTileQuantizeThreads,0,stream>>>(
++        x,gather,data,data+round256(std::size_t(k)*padded),k,columns,padded);
++    check(cudaGetLastError(),"MXFP8 tile activation");
++}
++void tile_product(GgmlType type,const void* weight,std::int64_t rb,int rows,int k,
++                  const void* activation,int columns,const VectorOutput& out,cudaStream_t stream) {
++    if(!supported(type,k)||rows<=0||columns<=0||rb<std::int64_t(k/256)*block_shape(type).bytes||
++       weight==nullptr||activation==nullptr||out.column_stride<rows||
++       ((out.bf16==nullptr)==(out.f32==nullptr))||
++       (out.epilogue==Epilogue::GateProduct && (out.gate==nullptr||out.gate_column_stride<rows))) {
++        throw std::invalid_argument("invalid MXFP8 tile product");
++    }
++    namespace tile=detail::mxfp8_tile;
++    const auto* data=static_cast<const std::uint8_t*>(activation);
++    const tile::TileArgs args{static_cast<const std::uint8_t*>(weight),rb,rows,k,columns,pad128(columns),
++        reinterpret_cast<const std::int8_t*>(data),
++        reinterpret_cast<const float*>(data+round256(std::size_t(k)*pad128(columns))),
++        detail::VecStore{out.bf16,out.f32,out.column_stride,out.epilogue,out.gate,out.gate_column_stride,int(out.activation)},true};
++    switch(type) {
++#define TILE(T) case GgmlType::T:return tile::launch<GGML_TYPE_##T>(args,stream)
++    TILE(IQ3_XXS);TILE(IQ3_S);TILE(IQ2_XXS);TILE(IQ2_XS);TILE(IQ2_S);TILE(IQ4_XS);TILE(Q2_K);TILE(Q4_K);
++#undef TILE
++    default:throw std::invalid_argument("unsupported MXFP8 tile weight type");
++    }
++}
++std::size_t scratch_bytes(int k,int rows,int t){const int p=max_pass(k,rows);return round256(std::size_t(k)*p)+round256(scale_bytes(p,k))+round256(std::size_t(p)*pad128(t)*sizeof(float));}
++void quantize(const __nv_bfloat16* x,int k,int t,const std::int32_t* gather,void* activation,cudaStream_t s){
++    const int padded=pad128(t);auto* data=static_cast<std::uint8_t*>(activation);
++    auto* scales=data+round256(std::size_t(k)*padded);
++    quantize_fp8_kernel<true><<<dim3(padded,(k+511)/512),kTileQuantizeThreads,0,s>>>(x,gather,data,scales,k,t,padded);
++    check(cudaGetLastError(),"MXFP8 activation");
++}
++void product(GgmlType type,const void* weight,std::int64_t rb,int rows,int k,const void* activation,int columns,float* out,std::int64_t stride,void* scratch,std::size_t bytes,cudaStream_t s){
++    if(!supported(type,k)||rows<=0||columns<=0||stride<rows||bytes<scratch_bytes(k,rows,columns))throw std::invalid_argument("invalid MXFP8 product/workspace");
++    static std::once_flag announced;
++    std::call_once(announced,[&]{std::fprintf(stderr,"GGUF_MXFP8 first product type=%d rows=%d k=%d columns=%d FP32 accumulation\n",int(type),rows,k,columns);});
++    const int pass=lt_wave_pass(rows,columns,k,max_pass(k,rows),false),np=pad128(columns);
++    auto* codes=static_cast<std::uint8_t*>(scratch);
++    auto* scales=codes+round256(std::size_t(pass)*k);
++    auto* plane=reinterpret_cast<float*>(scales+round256(scale_bytes(pass,k)));
++    const auto* x=static_cast<const std::uint8_t*>(activation);
++    const auto* xs=x+round256(std::size_t(k)*np);
++    for(int first=0;first<rows;first+=pass){
++        const int count=std::min(pass,rows-first),mp=pad128(count);
++        image(type,{static_cast<const std::uint8_t*>(weight)+std::int64_t(first)*rb,rb,count,k,codes,scales,mp},s);
++        const bool direct=count==mp&&columns==np&&stride%4==0&&reinterpret_cast<std::uintptr_t>(out+first)%16==0;
++        lt_gemm(mp,np,k,codes,scales,x,xs,direct?out+first:plane,direct?stride:mp,false,s);
++        if(!direct){const auto total=std::int64_t(count)*columns;crop<<<unsigned((total+255)/256),256,0,s>>>(plane,mp,count,columns,out+first,stride);check(cudaGetLastError(),"MXFP8 output crop");}
++    }
++}
++} // namespace ninfer::ops::gguf::mxfp8
+diff --git a/src/ops/linear/gguf/gguf_mxfp8.h b/src/ops/linear/gguf/gguf_mxfp8.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1068a080f8e2e646c1da06c1d79cae875b03ba9a
+--- /dev/null
++++ b/src/ops/linear/gguf/gguf_mxfp8.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++#include "ggml_bridge.h"
++
++// Experimental GGUF prefill: per-32 E4M3 operands / E8M0 power-of-two scales,
++// native block-scaled GEMM with FP32 accumulation/output. All storage is caller-owned.
++// The environment switch is read once at process start and must precede workspace planning.
++namespace ninfer::ops::gguf::mxfp8 {
++inline constexpr int kMinColumns = 256; // above every supported decode/verify batch (<=128)
++[[nodiscard]] bool enabled();
++[[nodiscard]] bool supported(GgmlType type, int k);
++[[nodiscard]] bool takes_tile(GgmlType type, int k, int columns);
++[[nodiscard]] std::size_t tile_activation_bytes(int k, int columns);
++void quantize_tile(const __nv_bfloat16* x, int k, int columns,
++                   const std::int32_t* input_columns, void* activation, cudaStream_t stream);
++void tile_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
++                  const void* activation, int columns, const VectorOutput& out,
++                  cudaStream_t stream);
++[[nodiscard]] std::size_t activation_bytes(int k, int columns);
++[[nodiscard]] std::size_t scratch_bytes(int k, int rows, int columns);
++void quantize(const __nv_bfloat16* x, int k, int columns,
++              const std::int32_t* input_columns, void* activation, cudaStream_t stream);
++void product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
++             const void* activation, int columns, float* out, std::int64_t stride,
++             void* scratch, std::size_t scratch_size, cudaStream_t stream);
++} // namespace ninfer::ops::gguf::mxfp8
+diff --git a/src/ops/linear/gguf/gguf_mxfp8_tile.cuh b/src/ops/linear/gguf/gguf_mxfp8_tile.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..a48b0fd6f58bcdb8f9f566f95da202010499ec48
+--- /dev/null
++++ b/src/ops/linear/gguf/gguf_mxfp8_tile.cuh
+@@ -0,0 +1,732 @@
++#pragma once
++// Pipeline adapted from 2-com-org/ninfer-5060-qwen at 08c4fb70bec11063cae42eafe1c1b0dc3a7f993e.
++// FP8-only private implementation. The local decoder, exact amax and direct FP32 -> E4M3
++// conversion preserve this branch's numerical boundaries. No q8_1 route changes.
++#include "ggml_bridge_vec.cuh"
++#include <mutex>
++#include <set>
++namespace ninfer::ops::gguf::detail::mxfp8_tile {
++struct TileArgs {
++    const std::uint8_t* weight;
++    std::int64_t row_bytes;
++    int rows;
++    int k;
++    int columns;
++    int columns_pad;       // columns rounded up to the 128-column tile
++    const std::int8_t* qs; // [columns][k]: int8, or e4m3 bytes in the MXFP8 form
++    const float* d;        // [k/32][columns_pad]: carrier bits = UE8M0 exponent << 23
++    VecStore out;
++    bool mxfp8; // the MXFP8 form (a 120a build): e4m3 weights and activations, UE8M0 scales
++};
++enum Epi : int {
++    kEpiF32      = 0, // FP32 Store
++    kEpiBf16     = 1, // BF16 Store
++    kEpiBf16Add  = 2, // BF16 Accumulate
++    kEpiBf16Silu = 3, // BF16 GateProduct with SiLU
++    kEpiGeneric  = 4, // vec_store
++};
++
++// What the epilogue reads at (row, column): the gate of a gated product, the output it accumulates
++// into, nothing for a store.
++template <int EPI>
++__device__ __forceinline__ float epi_operand(const VecStore& out, int row, int column) {
++    const std::int64_t at = std::int64_t(column) * out.column_stride + row;
++    if constexpr (EPI == kEpiBf16Add) {
++        return __bfloat162float(out.bf16[at]);
++    } else if constexpr (EPI == kEpiBf16Silu) {
++        return out.gate[std::int64_t(column) * out.gate_column_stride + row];
++    } else if constexpr (EPI == kEpiGeneric) {
++        if (out.epilogue == Epilogue::GateProduct) {
++            return out.gate[std::int64_t(column) * out.gate_column_stride + row];
++        }
++        if (out.epilogue == Epilogue::Accumulate) {
++            return out.f32 != nullptr ? out.f32[at] : __bfloat162float(out.bf16[at]);
++        }
++        return 0.0f;
++    } else {
++        return 0.0f;
++    }
++}
++
++// vec_store's arithmetic given the operand epi_operand read.
++template <int EPI>
++__device__ __forceinline__ void epi_finish(const VecStore& out, int row, int column, float value,
++                                           float operand) {
++    const std::int64_t at = std::int64_t(column) * out.column_stride + row;
++    if constexpr (EPI == kEpiF32) {
++        out.f32[at] = value;
++    } else if constexpr (EPI == kEpiBf16) {
++        out.bf16[at] = __float2bfloat16(value);
++    } else if constexpr (EPI == kEpiBf16Add) {
++        out.bf16[at] = __float2bfloat16(value + operand);
++    } else if constexpr (EPI == kEpiBf16Silu) {
++        out.bf16[at] = __float2bfloat16(value * vec_silu(operand));
++    } else {
++        if (out.epilogue == Epilogue::GateProduct) { value *= vec_gate(operand, out.activation); }
++        if (out.epilogue == Epilogue::Accumulate) { value = operand + value; }
++        if (out.f32 != nullptr) {
++            out.f32[at] = value;
++        } else {
++            out.bf16[at] = __float2bfloat16(value);
++        }
++    }
++}
++
++// The compiled epilogue of a destination.
++[[nodiscard]] inline int store_epi(const VecStore& o) {
++    if (o.epilogue == Epilogue::Store) { return o.f32 != nullptr ? kEpiF32 : kEpiBf16; }
++    if (o.f32 != nullptr) { return kEpiGeneric; }
++    if (o.epilogue == Epilogue::Accumulate) { return kEpiBf16Add; }
++    if (o.epilogue == Epilogue::GateProduct && o.activation == 0) { return kEpiBf16Silu; }
++    return kEpiGeneric;
++}
++constexpr int kBM = 128, kBN = 128, kStepK = 64, kSubs = kStepK / 32;
++constexpr int kConsumers = 256, kProducers = 128, kThreads = kConsumers + kProducers;
++constexpr int kASlots = 3, kQSlots = 4;
++constexpr int kActSlotQ = kBN * kStepK;
++constexpr int kActSlot  = kActSlotQ + kSubs * kBN * 4;
++constexpr int kAPlane   = kBM * 32;
++constexpr int kFull = 1, kEmpty = 1 + kASlots, kProducerBar = 1 + 2 * kASlots;
++
++template <ggml_type type>
++inline constexpr int kScales =
++    type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_Q2_K ? 2 : 1;
++
++// The K-quants (minimum terms, Q2_K's per-16 scales) have only the MXFP8 form. Q6_K's 210-byte
++// blocks overflow the raw ring's shared memory and stay on the matrix kernel.
++template <ggml_type type>
++inline constexpr bool kFp8Only = type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q4_K;
++
++// Raw-ring copy unit and the guaranteed alignment of a block's first byte: IQ4_XS decodes with
++// 8-byte loads (its 136-byte blocks are 8-byte aligned), every other type with 2-byte ones. A copy
++// covers the block's unit-aligned superset; 8-byte units halve the producers' copy instructions
++// against 4-byte ones (+4-7% kernel rate); 16-byte ones gain less outside Q4_K (bank conflicts
++// in the decode at 16-byte row strides). The over-read stays inside the 256-byte payload padding.
++template <ggml_type type>
++inline constexpr int kCopy = type == GGML_TYPE_Q4_K ? 16 : 8;
++// How the producers copy a block from each of their rows. A row per thread puts 32 rows behind
++// every copy instruction. In the MXFP8 form, blocks of 98 bytes and more go a row at a time across
++// 16 lanes (32 for IQ4_XS's 17 units), so an instruction covers two rows' contiguous bytes; on the
++// RTX 5060 Ti that measured IQ3_XXS +2-4%, IQ3_S +4-6%, IQ4_XS 0-3% and Q4_K +4-10%. The two-bit
++// types (66-84 bytes, half those lanes idle) lost about 2% that way and the q8_1 form 1-7%.
++template <ggml_type type>
++inline constexpr bool kRowCopies = vec::Decoder<type>::kBlockBytes >= 98;
++template <ggml_type type>
++inline constexpr int kAlign = type == GGML_TYPE_Q4_K    ? 16
++                              : type == GGML_TYPE_IQ4_XS ? 8
++                              : type == GGML_TYPE_Q2_K   ? 4
++                                                         : 2;
++
++// One-scale types visit token tiles fastest, so the token tiles of a row block share its weights
++// in L2 (the 27B's large matrices exceed it); the two-scale ones keep row tiles fastest, which
++// measured faster for them (their 2.3-2.5 bits per weight matrices mostly fit L2).
++template <ggml_type type>
++inline constexpr bool kTokensFastest = kScales<type> == 1;
++
++template <ggml_type type>
++struct Layout {
++    using D                     = vec::Decoder<type>;
++    static constexpr int kTable = D::kTableWords; // Q4_K's layout fills 101376 bytes exactly
++    // A block's copy-unit-aligned superset at an odd unit stride: a row stride of a 16-byte
++    // multiple puts the producers' same-offset decode loads from 32 rows into one bank.
++    static constexpr int kUnits =
++        ((D::kBlockBytes + kCopy<type> - kAlign<type> + kCopy<type> - 1) / kCopy<type>) | 1;
++    static constexpr int kRawRow  = kUnits * kCopy<type>;
++    static constexpr int kRawSlot = kBM * kRawRow;
++    static constexpr int kASlot   = kSubs * kAPlane + kSubs * kBM * kScales<type> * 4;
++    static constexpr int kRawOff  = kTable * 4;
++    static constexpr int kAOff    = kRawOff + 2 * kRawSlot;
++    static constexpr int kActOff  = kAOff + kASlots * kASlot;
++    static constexpr int kBytes   = kActOff + kQSlots * kActSlot;
++};
++
++__device__ __forceinline__ void cp_async4(void* smem, const void* gmem) {
++    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(s), "l"(gmem));
++}
++__device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
++    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(s), "l"(gmem));
++}
++__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
++    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(gmem));
++}
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::); }
++template <int N>
++__device__ __forceinline__ void cp_async_wait() {
++    asm volatile("cp.async.wait_group %0;" ::"n"(N));
++}
++
++__device__ __forceinline__ void bar_sync(int id, int n) {
++    asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory");
++}
++__device__ __forceinline__ void bar_arrive(int id, int n) {
++    asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(n) : "memory");
++}
++
++__device__ __forceinline__ void ldmatrix_x4(int (&a)[4], const void* smem) {
++    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
++                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
++                 : "r"(s));
++}
++
++__device__ __forceinline__ void mma_k32(int (&c)[4], const int (&a)[4], int b0, int b1) {
++    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
++                 "{%8,%9}, {%10,%10,%10,%10};"
++                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
++}
++__device__ __forceinline__ void mma_k16(int (&c)[4], int a0, int a1, int b0) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "
++                 "{%7,%7,%7,%7};"
++                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
++                 : "r"(a0), "r"(a1), "r"(b0), "r"(0));
++}
++
++// The MXFP8 product, block-scaled e4m3: lane 4g supplies A row g's scale, lane 4g + 1 A row g + 8's
++// and lane 4g B column g's (thread and byte selector 0).
++__device__ __forceinline__ void mma_e4m3_k32(float (&c)[4], const int (&a)[4], int b0, int b1,
++                                             unsigned sa, unsigned sb) {
++    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X."
++                 "m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
++                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, "
++                 "{%13}, {%14,%15};"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sa),
++                   "h"((unsigned short)0), "h"((unsigned short)0), "r"(sb),
++                   "h"((unsigned short)0), "h"((unsigned short)0));
++}
++
++
++// Decode grid indices directly to E4M3. The table carries the actual maximum
++// selector of each entry, so this retains actual amax rather than a grid bound.
++template <ggml_type type>
++inline constexpr bool kRawLookup=type==GGML_TYPE_IQ3_XXS || type==GGML_TYPE_IQ3_S ||
++    type==GGML_TYPE_IQ2_XXS || type==GGML_TYPE_IQ2_XS || type==GGML_TYPE_IQ2_S;
++namespace raw_lookup {
++__device__ __forceinline__ unsigned selectors(unsigned w,int shift) {
++    return ((w>>shift)&7u)|(((w>>(8+shift))&7u)<<4)|
++           (((w>>(16+shift))&7u)<<8)|(((w>>(24+shift))&7u)<<12);
++}
++__device__ __forceinline__ unsigned selector_max(unsigned s) {
++    return max(max(s&7u,(s>>4)&7u),max((s>>8)&7u,(s>>12)&7u));
++}
++template <ggml_type type>
++__device__ __forceinline__ unsigned table_word(const std::uint32_t* grid,int i) {
++    if constexpr(type==GGML_TYPE_IQ3_S || type==GGML_TYPE_IQ3_XXS) {
++        const unsigned s=selectors(grid[i],type==GGML_TYPE_IQ3_S?1:3);
++        return s|(selector_max(s)<<16);
++    } else {
++        const unsigned a=selectors(grid[2*i],4),b=selectors(grid[2*i+1],4);
++        return a|(b<<16)|(max(selector_max(a),selector_max(b))<<30);
++    }
++}
++__device__ __forceinline__ unsigned pair(float hi,float lo) {
++    unsigned short r;asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;":"=h"(r):"f"(hi),"f"(lo));return r;
++}
++template <ggml_type type>
++__device__ __forceinline__ float magnitude(unsigned i) {
++    if constexpr(type==GGML_TYPE_IQ3_S)return float(1+2*i);
++    if constexpr(type==GGML_TYPE_IQ3_XXS)return i==7?62.0f:float(4+8*i);
++    return i==0?8.0f:i==1?25.0f:43.0f;
++}
++template <ggml_type type>
++__device__ __forceinline__ unsigned decode(const std::uint8_t* b,int u,const std::uint32_t* table,int (&v)[8]) {
++    constexpr bool iq3=type==GGML_TYPE_IQ3_S || type==GGML_TYPE_IQ3_XXS;
++    constexpr bool two=type==GGML_TYPE_IQ2_S || type==GGML_TYPE_IQ2_XS;
++    const float d=vec::half_at(b);float f0,f1;
++    unsigned sel[8],sign[8],maximum[2]={0,0};
++    if constexpr(type==GGML_TYPE_IQ3_XXS) {
++        const unsigned q0=vec::u32_a2(b+2+8*u),q1=vec::u32_a2(b+6+8*u),aux=vec::u32_a2(b+66+4*u);
++        f0=d*(.5f+float(aux>>28))*.5f;f1=f0;
++#pragma unroll
++        for(int l=0;l<4;++l) {
++            const unsigned q=(l<2?q0:q1)>>(16*(l&1)),sg=vec::ksigns((aux>>(7*l))&127u);
++            sel[2*l]=table[q&255u];sel[2*l+1]=table[(q>>8)&255u];
++            sign[2*l]=sg;sign[2*l+1]=sg>>4;
++        }
++    } else if constexpr(type==GGML_TYPE_IQ3_S) {
++        const unsigned q0=vec::u32_a2(b+2+8*u),q1=vec::u32_a2(b+6+8*u),qh=b[66+u],sg=vec::u32_a2(b+74+4*u);
++        f0=d*float(1+2*((b[106+u/2]>>(4*(u&1)))&15u));f1=f0;
++#pragma unroll
++        for(int w=0;w<8;++w) {
++            const unsigned index=(((w<4?q0:q1)>>(8*(w&3)))&255u)|((qh<<(8-w))&256u);
++            sel[w]=table[index];sign[w]=sg>>(4*w);
++        }
++    } else {
++        unsigned ids[4],sg[4];
++        if constexpr(type==GGML_TYPE_IQ2_XXS) {
++            const unsigned idx=vec::u32_a2(b+2+8*u),aux=vec::u32_a2(b+6+8*u);
++            f0=d*(.5f+float(aux>>28))*.25f;f1=f0;
++#pragma unroll
++            for(int l=0;l<4;++l){ids[l]=(idx>>(8*l))&255u;sg[l]=vec::ksigns((aux>>(7*l))&127u);}
++        } else if constexpr(type==GGML_TYPE_IQ2_XS) {
++            const unsigned sc=b[66+u],q0=vec::u32_a2(b+2+8*u),q1=vec::u32_a2(b+6+8*u);
++            f0=d*(.5f+float(sc&15u))*.25f;f1=d*(.5f+float(sc>>4))*.25f;
++#pragma unroll
++            for(int l=0;l<4;++l){unsigned q=(l<2?q0:q1)>>(16*(l&1));ids[l]=q&511u;sg[l]=vec::ksigns((q&65535u)>>9);}
++        } else {
++            static_assert(type==GGML_TYPE_IQ2_S);
++            const unsigned sc=b[74+u],qs=vec::u32_a2(b+2+4*u),signs=vec::u32_a2(b+34+4*u),qh=b[66+u];
++            f0=d*(.5f+float(sc&15u))*.25f;f1=d*(.5f+float(sc>>4))*.25f;
++#pragma unroll
++            for(int l=0;l<4;++l){ids[l]=((qs>>(8*l))&255u)|((qh<<(8-2*l))&768u);sg[l]=signs>>(8*l);}
++        }
++#pragma unroll
++        for(int l=0;l<4;++l) {
++            const unsigned word=table[ids[l]];const int h=two?l/2:0;
++            maximum[h]=max(maximum[h],word>>30);
++            sel[2*l]=word&0x3333u;sel[2*l+1]=(word>>16)&0x3333u;
++            sign[2*l]=sg[l];sign[2*l+1]=sg[l]>>4;
++        }
++    }
++    if constexpr(iq3) {
++#pragma unroll
++        for(int j=0;j<8;++j){maximum[0]=max(maximum[0],sel[j]>>16);sel[j]&=65535u;}
++    }
++    float amax=fabsf(f0*magnitude<type>(maximum[0]));
++    if constexpr(two)amax=fmaxf(amax,fabsf(f1*magnitude<type>(maximum[1])));
++    int e=0;const float fraction=frexpf(amax,&e);e-=9;if(fraction>.875f)++e;
++    const unsigned exponent=amax==0?127u:unsigned(max(-127,min(127,e))+127);
++    const float inv=ldexpf(1.0f,127-int(exponent));unsigned lo[2],hi[2];
++#pragma unroll
++    for(int h=0;h<(two?2:1);++h) {
++        const float f=h?f1:f0;
++        if constexpr(iq3) {
++            float m[8];
++#pragma unroll
++            for(int j=0;j<8;++j)m[j]=(magnitude<type>(j)*f)*inv;
++            lo[h]=pair(m[1],m[0])|(pair(m[3],m[2])<<16);
++            hi[h]=pair(m[5],m[4])|(pair(m[7],m[6])<<16);
++        } else {lo[h]=pair((25.f*f)*inv,(8.f*f)*inv)|(pair(0,(43.f*f)*inv)<<16);hi[h]=0;}
++    }
++#pragma unroll
++    for(int j=0;j<8;++j) {
++        const int h=two?j/4:0;
++        const unsigned flips=(((sign[j]&15u)*0x10204080u)&0x80808080u);
++        // XOR also handles a negative or signed-zero stored block scale.
++        v[j]=int(__byte_perm(lo[h],hi[h],sel[j])^flips);
++    }
++    return exponent;
++}
++} // namespace raw_lookup
++
++// Match the existing cuBLASLt path: decode stored blocks in FP32, actual per-32 amax,
++// round directly to E4M3 under a power-of-two scale; no FP16 intermediate or range bound.
++template <ggml_type type>
++__device__ __forceinline__ unsigned fp8_decode(const std::uint8_t* b, int u,
++                                               const std::uint32_t* tab, int (&out)[8]) {
++    if constexpr(kRawLookup<type>)return raw_lookup::decode<type>(b,u,tab,out);
++    vec::Slice sl;
++    vec::Decoder<type>::decode(b,u,tab,sl);
++    float v[32]; float amax=0.0f;
++#pragma unroll
++    for(int j=0;j<32;++j) {
++        const unsigned byte=(unsigned(sl.w[j/4])>>(8*(j%4)))&255u;
++        if constexpr(type==GGML_TYPE_Q2_K) {
++            v[j]=j<16? sl.f[0]*float(byte)-sl.f[2] : sl.f[1]*float(byte)-sl.f[3];
++        } else if constexpr(type==GGML_TYPE_Q4_K) {
++            v[j]=sl.f[0]*float(byte)-sl.f[1];
++        } else {
++            const float c=float(static_cast<signed char>(byte));
++            if constexpr(type==GGML_TYPE_IQ2_XS || type==GGML_TYPE_IQ2_S) {
++                v[j]=(j<16?sl.f[0]:sl.f[1])*c;
++            } else v[j]=sl.f[0]*c;
++        }
++        amax=fmaxf(amax,fabsf(v[j]));
++    }
++    int e=0;const float f=frexpf(amax,&e);
++    e-=9;if(f>0.875f)++e;
++    const unsigned exponent=amax==0.0f?127u:unsigned(max(-127,min(127,e))+127);
++    const float inv=ldexpf(1.0f,127-int(exponent));
++#pragma unroll
++    for(int j=0;j<8;++j) {
++        unsigned short lo,hi;
++        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;":"=h"(lo):"f"(v[4*j+1]*inv),"f"(v[4*j]*inv));
++        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;":"=h"(hi):"f"(v[4*j+3]*inv),"f"(v[4*j+2]*inv));
++        out[j]=int(unsigned(lo)|(unsigned(hi)<<16));
++    }
++    return exponent;
++}
++
++// Byte offset of half h (16 bytes) of weight row r in a 32-value plane, swizzled for ldmatrix.
++__device__ __forceinline__ int a_offset(int r, int h) { return r * 32 + ((h ^ ((r >> 2) & 1)) << 4); }
++
++// Chunk c (16 bytes) of token r in an activation stage (64 values per token), swizzled for ldmatrix.
++__device__ __forceinline__ int act_offset(int r, int c) {
++    return r * kStepK + ((c ^ ((r >> 1) & 3)) << 4);
++}
++
++// Row-scale slot of row r: rows r and r + 8 of a 16-row tile are adjacent (one load per tile).
++__device__ __forceinline__ int scale_index(int r) {
++    return (r & ~15) | ((r & 7) << 1) | ((r >> 3) & 1);
++}
++
++// Stages before the end at which the producers pull the epilogue's reads into L2.
++constexpr int kPrefetchStages = 16;
++
++template <ggml_type type, int KS, int EPI, bool FP8 = false>
++__launch_bounds__(kThreads, 1) __global__ void kernel(TileArgs p) {
++#if !defined(NINFER_SM120_FP8) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200)
++    __trap(); // dispatched on sm_120 only
++#else
++    using D                       = vec::Decoder<type>;
++    using L                       = Layout<type>;
++    constexpr int kS              = kScales<type>;
++    constexpr int kStagesPerBlock = D::kBlockElems / kStepK;
++    static_assert(kSubs == 2, "tile kernel: two 32-value sub-blocks per stage");
++    extern __shared__ __align__(16) std::uint8_t smem[];
++    auto* table = reinterpret_cast<std::uint32_t*>(smem);
++    if constexpr (D::kTableWords > 0) {
++        // Keep global table loads independent before the shared stores.
++        constexpr int count=kRawLookup<type> && type!=GGML_TYPE_IQ3_XXS && type!=GGML_TYPE_IQ3_S ? D::kTableWords/2 : D::kTableWords;
++        constexpr int n=(count+kThreads-1)/kThreads;
++        std::uint32_t words[n];
++#pragma unroll
++        for(int j=0;j<n;++j) {
++            int i=int(threadIdx.x)+j*kThreads;
++            if(i<count) {
++                if constexpr(kRawLookup<type>)words[j]=raw_lookup::table_word<type>(D::table(),i);
++                else words[j]=D::table()[i];
++            }
++        }
++#pragma unroll
++        for(int j=0;j<n;++j) {int i=int(threadIdx.x)+j*kThreads;if(i<count)table[i]=words[j];}
++    }
++    __syncthreads();
++    const int tid   = threadIdx.x;
++    const int k     = KS != 0 ? KS : p.k;
++    const int iters = k / kStepK;
++    const int nb    = k / D::kBlockElems;
++    const int row0  = (kTokensFastest<type> ? blockIdx.y : blockIdx.x) * kBM;
++    const int tok0  = (kTokensFastest<type> ? blockIdx.x : blockIdx.y) * kBN;
++
++    if (tid >= kConsumers) {
++        // Producers: thread pt owns weight row pt (raw copies and decode) and a share of the
++        // activation copies.
++        const int pt             = tid - kConsumers;
++        const int row            = min(row0 + pt, p.rows - 1);
++        const std::uint8_t* wrow = p.weight + std::int64_t(row) * p.row_bytes;
++        const auto issue_raw     = [&](int b) {
++            if constexpr (FP8 && kRowCopies<type>) {
++                constexpr int kLanes = L::kUnits <= 16 ? 16 : 32; // per row
++                static_assert(L::kUnits <= 32);
++                std::uint8_t* slot = smem + L::kRawOff + (b & 1) * L::kRawSlot;
++                const int lane = pt & 31, unit = lane % kLanes;
++#pragma unroll 4
++                for (int j = 0; j < kLanes; ++j) {
++                    const int r = (pt & ~31) + j * (32 / kLanes) + lane / kLanes;
++                    const std::uint8_t* src =
++                        p.weight + std::int64_t(min(row0 + r, p.rows - 1)) * p.row_bytes +
++                        std::int64_t(b) * D::kBlockBytes;
++                    const auto* base = reinterpret_cast<const std::uint8_t*>(
++                        reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t(kCopy<type> - 1));
++                    const int n =
++                        int((src + D::kBlockBytes - base + kCopy<type> - 1) / kCopy<type>);
++                    if (unit < n) {
++                        std::uint8_t* dst = slot + r * L::kRawRow + kCopy<type> * unit;
++                        if constexpr (kCopy<type> == 16) {
++                            cp_async16(dst, base + 16 * unit);
++                        } else {
++                            cp_async8(dst, base + 8 * unit);
++                        }
++                    }
++                }
++                return;
++            }
++            const std::uint8_t* src = wrow + std::int64_t(b) * D::kBlockBytes;
++            const auto* base        = reinterpret_cast<const std::uint8_t*>(
++                reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t(kCopy<type> - 1));
++            const int n       = int((src + D::kBlockBytes - base + kCopy<type> - 1) / kCopy<type>);
++            std::uint8_t* dst = smem + L::kRawOff + (b & 1) * L::kRawSlot + pt * L::kRawRow;
++            for (int j = 0; j < n; ++j) {
++                if constexpr (kCopy<type> == 16) {
++                    cp_async16(dst + 16 * j, base + 16 * j);
++                } else if constexpr (kCopy<type> == 8) {
++                    cp_async8(dst + 8 * j, base + 8 * j);
++                } else {
++                    cp_async4(dst + 4 * j, base + 4 * j);
++                }
++            }
++        };
++        const auto issue_act = [&](int i) {
++            std::uint8_t* q = smem + L::kActOff + (i % kQSlots) * kActSlot;
++#pragma unroll
++            for (int j = 0; j < kActSlotQ / 16 / kProducers; ++j) {
++                const int c = pt + j * kProducers;
++                const int r = c >> 2, part = c & 3;
++                const int source = min(tok0 + r, p.columns - 1);
++                cp_async16(q + act_offset(r, part),
++                           p.qs + std::int64_t(source) * k + i * kStepK + part * 16);
++            }
++            if (pt < kSubs * kBN / 4) {
++                const int u = pt / (kBN / 4), c = pt % (kBN / 4);
++                cp_async16(q + kActSlotQ + (u * kBN + 4 * c) * 4,
++                           p.d + std::int64_t(i * kSubs + u) * p.columns_pad + tok0 + 4 * c);
++            }
++        };
++        // The epilogue's reads (the residual it accumulates into, the gate it multiplies by) are
++        // pulled into L2 some stages before the consumers need them: with one CTA per SM nothing
++        // else hides their DRAM latency.
++        const auto prefetch_epilogue = [&] {
++            const bool gated = p.out.epilogue == Epilogue::GateProduct;
++            if (!gated && p.out.epilogue != Epilogue::Accumulate) { return; }
++            const int bytes         = gated || p.out.f32 != nullptr ? 4 : 2;
++            const int rows_per_line = 128 / bytes;
++            const int lines         = kBM / rows_per_line;
++            for (int j = pt; j < kBN * lines; j += kProducers) {
++                const int col = tok0 + j / lines, r = row0 + (j % lines) * rows_per_line;
++                if (col >= p.columns || r >= p.rows) { continue; }
++                const void* at =
++                    gated ? static_cast<const void*>(p.out.gate + std::int64_t(col) * p.out.gate_column_stride + r)
++                    : p.out.f32 != nullptr
++                        ? static_cast<const void*>(p.out.f32 + std::int64_t(col) * p.out.column_stride + r)
++                        : static_cast<const void*>(p.out.bf16 + std::int64_t(col) * p.out.column_stride + r);
++                asm volatile("prefetch.global.L2 [%0];" ::"l"(at));
++            }
++        };
++        const int prefetch_at = max(0, iters - kPrefetchStages);
++        issue_raw(0);
++        issue_act(0);
++        cp_async_commit();
++        for (int i = 0; i < iters; ++i) {
++            const int s = i % kASlots;
++            if (i >= kASlots) { bar_sync(kEmpty + s, kThreads); } // consumers are done with i - 3
++            if constexpr (EPI == kEpiBf16Add || EPI == kEpiBf16Silu || EPI == kEpiGeneric) {
++                if (i == prefetch_at) { prefetch_epilogue(); }
++            }
++            if (i + 1 < iters) { issue_act(i + 1); }
++            if (i % kStagesPerBlock == 0 && i / kStagesPerBlock + 1 < nb) {
++                issue_raw(i / kStagesPerBlock + 1);
++            }
++            cp_async_commit();
++            cp_async_wait<1>();
++            bar_sync(kProducerBar, kProducers);
++            const int b  = i / kStagesPerBlock;
++            const int ph = int((reinterpret_cast<std::uintptr_t>(wrow) +
++                                std::uint64_t(b) * D::kBlockBytes) & (kCopy<type> - 1));
++            const std::uint8_t* blk =
++                smem + L::kRawOff + (b & 1) * L::kRawSlot + pt * L::kRawRow + ph;
++            std::uint8_t* as = smem + L::kAOff + s * L::kASlot;
++            auto* sc         = reinterpret_cast<float*>(as + kSubs * kAPlane);
++#pragma unroll
++            for (int us = 0; us < kSubs; ++us) {
++                std::uint8_t* a = as + us * kAPlane;
++                if constexpr (FP8) {
++                    int v[8];
++                    const unsigned e =
++                        fp8_decode<type>(blk, (i % kStagesPerBlock) * kSubs + us, table, v);
++                    *reinterpret_cast<int4*>(a + a_offset(pt, 0)) =
++                        make_int4(v[0], v[1], v[2], v[3]);
++                    *reinterpret_cast<int4*>(a + a_offset(pt, 1)) =
++                        make_int4(v[4], v[5], v[6], v[7]);
++                    reinterpret_cast<unsigned*>(sc)[us * kBM + scale_index(pt)] = e;
++                    continue;
++                }
++                vec::Slice sl;
++                D::decode(blk, (i % kStagesPerBlock) * kSubs + us, table, sl);
++                *reinterpret_cast<int4*>(a + a_offset(pt, 0)) =
++                    make_int4(sl.w[0], sl.w[1], sl.w[2], sl.w[3]);
++                *reinterpret_cast<int4*>(a + a_offset(pt, 1)) =
++                    make_int4(sl.w[4], sl.w[5], sl.w[6], sl.w[7]);
++                if constexpr (kS == 1) {
++                    sc[us * kBM + scale_index(pt)] = sl.f[0];
++                } else {
++                    *reinterpret_cast<float2*>(sc + (us * kBM + scale_index(pt)) * 2) =
++                        make_float2(sl.f[0], sl.f[1]);
++                }
++            }
++            bar_arrive(kFull + s, kThreads);
++        }
++        cp_async_wait<0>();
++        return;
++    }
++
++    const int warp = tid >> 5, lane = tid & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int wm = warp >> 2, wn = warp & 3;
++    const int lm_row = (lane & 7) + 8 * ((lane >> 3) & 1), lm_half = lane >> 4;
++    float acc[4][4][4];
++#pragma unroll
++    for (int m = 0; m < 4; ++m) {
++#pragma unroll
++        for (int n = 0; n < 4; ++n) {
++#pragma unroll
++            for (int j = 0; j < 4; ++j) { acc[m][n][j] = 0.0f; }
++        }
++    }
++    // Fragments of one 32-value sub-block: A for the warp's 4 row tiles, B for its 4 token tiles.
++    struct Frag {
++        int a[4][4];
++        int b[2][4];
++    };
++    const auto load_frag = [&](Frag& f, int i, int su) {
++        const std::uint8_t* as = smem + L::kAOff + (i % kASlots) * L::kASlot + su * kAPlane;
++        const std::uint8_t* q  = smem + L::kActOff + (i % kQSlots) * kActSlot;
++#pragma unroll
++        for (int m = 0; m < 4; ++m) {
++            ldmatrix_x4(f.a[m], as + a_offset(wm * 64 + m * 16 + lm_row, lm_half));
++        }
++#pragma unroll
++        for (int np = 0; np < 2; ++np) {
++            const int j   = lane >> 3;
++            const int tok = wn * 32 + (2 * np + (j >> 1)) * 8 + (lane & 7);
++            ldmatrix_x4(f.b[np], q + act_offset(tok, 2 * su + (j & 1)));
++        }
++    };
++    const auto compute = [&](const Frag& f, int i, int su) {
++        const float* rsc = reinterpret_cast<const float*>(smem + L::kAOff +
++                                                          (i % kASlots) * L::kASlot +
++                                                          kSubs * kAPlane);
++        const float* dsm = reinterpret_cast<const float*>(smem + L::kActOff +
++                                                          (i % kQSlots) * kActSlot + kActSlotQ);
++        if constexpr (FP8) {
++            const auto* rsu = reinterpret_cast<const unsigned*>(rsc);
++            unsigned sb[4];
++#pragma unroll
++            for (int n = 0; n < 4; ++n) {
++                sb[n] = __float_as_uint(dsm[su * kBN + wn * 32 + n * 8 + g]) >> 23;
++            }
++#pragma unroll
++            for (int m = 0; m < 4; ++m) {
++                const unsigned sa = rsu[su * kBM + wm * 64 + m * 16 + 2 * g + (t & 1)];
++#pragma unroll
++                for (int n = 0; n < 4; ++n) {
++                    mma_e4m3_k32(acc[m][n], f.a[m], f.b[n >> 1][2 * (n & 1)],
++                                 f.b[n >> 1][2 * (n & 1) + 1], sa, sb[n]);
++                }
++            }
++        } else {
++            float2 dv[4];
++#pragma unroll
++            for (int n = 0; n < 4; ++n) {
++                dv[n] = *reinterpret_cast<const float2*>(dsm + su * kBN + wn * 32 + n * 8 + 2 * t);
++            }
++#pragma unroll
++            for (int m = 0; m < 4; ++m) {
++                // Rows g and g + 8 (scale_index).
++                const int rs = su * kBM + wm * 64 + m * 16 + 2 * g;
++#pragma unroll
++                for (int n = 0; n < 4; ++n) {
++                    const int b0 = f.b[n >> 1][2 * (n & 1)], b1 = f.b[n >> 1][2 * (n & 1) + 1];
++                    if constexpr (kS == 1) {
++                        const float2 sr = *reinterpret_cast<const float2*>(rsc + rs);
++                        int c[4];
++                        mma_k32(c, f.a[m], b0, b1);
++                        acc[m][n][0] = fmaf(float(c[0]), sr.x * dv[n].x, acc[m][n][0]);
++                        acc[m][n][1] = fmaf(float(c[1]), sr.x * dv[n].y, acc[m][n][1]);
++                        acc[m][n][2] = fmaf(float(c[2]), sr.y * dv[n].x, acc[m][n][2]);
++                        acc[m][n][3] = fmaf(float(c[3]), sr.y * dv[n].y, acc[m][n][3]);
++                    } else {
++                        const float4 sr = *reinterpret_cast<const float4*>(rsc + rs * 2);
++                        int c0[4], c1[4];
++                        mma_k16(c0, f.a[m][0], f.a[m][1], b0);
++                        mma_k16(c1, f.a[m][2], f.a[m][3], b1);
++                        acc[m][n][0] = fmaf(fmaf(float(c0[0]), sr.x, float(c1[0]) * sr.y), dv[n].x,
++                                            acc[m][n][0]);
++                        acc[m][n][1] = fmaf(fmaf(float(c0[1]), sr.x, float(c1[1]) * sr.y), dv[n].y,
++                                            acc[m][n][1]);
++                        acc[m][n][2] = fmaf(fmaf(float(c0[2]), sr.z, float(c1[2]) * sr.w), dv[n].x,
++                                            acc[m][n][2]);
++                        acc[m][n][3] = fmaf(fmaf(float(c0[3]), sr.z, float(c1[3]) * sr.w), dv[n].y,
++                                            acc[m][n][3]);
++                    }
++                }
++            }
++        }
++    };
++    Frag f0, f1;
++    bar_sync(kFull, kThreads);
++    if constexpr (kS == 2 && !FP8) {
++        // Two-scale types run twice the MMAs per value; their fragments are not double-buffered
++        // (registers).
++        for (int i = 0; i < iters; ++i) {
++            if (i > 0) { bar_sync(kFull + i % kASlots, kThreads); }
++#pragma unroll
++            for (int su = 0; su < kSubs; ++su) {
++                load_frag(f0, i, su);
++                compute(f0, i, su);
++            }
++            bar_arrive(kEmpty + i % kASlots, kThreads);
++        }
++    } else {
++        // The next sub-block's fragments load while this one multiplies.
++        load_frag(f0, 0, 0);
++        for (int i = 0; i < iters; ++i) {
++            load_frag(f1, i, 1);
++            compute(f0, i, 0);
++            if (i + 1 < iters) {
++                bar_sync(kFull + (i + 1) % kASlots, kThreads);
++                load_frag(f0, i + 1, 0);
++            }
++            compute(f1, i, 1);
++            bar_arrive(kEmpty + i % kASlots, kThreads);
++        }
++    }
++    (void)f1;
++    // Per 16-row tile, every operand the epilogue reads (the residual, the gate) is loaded before
++    // any store, so the loads overlap instead of each waiting behind the stores it might alias.
++#pragma unroll
++    for (int m = 0; m < 4; ++m) {
++        float operand[4][4];
++#pragma unroll
++        for (int n = 0; n < 4; ++n) {
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const int r = row0 + wm * 64 + m * 16 + g + 8 * (j >> 1);
++                const int c = tok0 + wn * 32 + n * 8 + 2 * t + (j & 1);
++                operand[n][j] = r < p.rows && c < p.columns ? epi_operand<EPI>(p.out, r, c) : 0.0f;
++            }
++        }
++#pragma unroll
++        for (int n = 0; n < 4; ++n) {
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const int r = row0 + wm * 64 + m * 16 + g + 8 * (j >> 1);
++                const int c = tok0 + wn * 32 + n * 8 + 2 * t + (j & 1);
++                if (r < p.rows && c < p.columns) {
++                    epi_finish<EPI>(p.out, r, c, acc[m][n][j], operand[n][j]);
++                }
++            }
++        }
++    }
++#endif
++}
++
++template <ggml_type type, int KS, int EPI, bool FP8>
++void launch_k(const TileArgs& args, cudaStream_t stream) {
++    auto* kern = kernel<type, KS, EPI, FP8>;
++    int device=0;
++    check(cudaGetDevice(&device),"tile current device");
++    static std::mutex attribute_mutex;
++    static std::set<int> raised;
++    {
++        std::lock_guard lock(attribute_mutex);
++        if(!raised.contains(device)) {
++            check(cudaFuncSetAttribute(kern,cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                       Layout<type>::kBytes),"tile shared memory");
++            raised.insert(device);
++        }
++    }
++    const unsigned row_tiles   = (args.rows + kBM - 1) / kBM;
++    const unsigned token_tiles = (args.columns + kBN - 1) / kBN;
++    const dim3 grid = kTokensFastest<type> ? dim3(token_tiles, row_tiles) : dim3(row_tiles, token_tiles);
++    kern<<<grid, kThreads, Layout<type>::kBytes, stream>>>(args);
++    check(cudaGetLastError(), "tile product launch");
++}
++
++
++template <ggml_type type>
++void launch(const TileArgs& args,cudaStream_t stream) {
++    switch(store_epi(args.out)) {
++    case kEpiF32:return launch_k<type,0,kEpiF32,true>(args,stream);
++    case kEpiBf16:return launch_k<type,0,kEpiBf16,true>(args,stream);
++    case kEpiBf16Add:return launch_k<type,0,kEpiBf16Add,true>(args,stream);
++    case kEpiBf16Silu:return launch_k<type,0,kEpiBf16Silu,true>(args,stream);
++    default:return launch_k<type,0,kEpiGeneric,true>(args,stream);
++    }
++}
++
++} // namespace ninfer::ops::gguf::detail::mxfp8_tile
+diff --git a/src/ops/linear/gguf/sources.cmake b/src/ops/linear/gguf/sources.cmake
+index e3a77782bdba1e7b23352d76612ead3cd6291851..58d88b075361678604b4fa3df68b4556f7dc7459 100644
+--- a/src/ops/linear/gguf/sources.cmake
++++ b/src/ops/linear/gguf/sources.cmake
+@@ -7,6 +7,7 @@ if(NINFER_WINDOWS_KERNEL_DLL)
+ endif()
+ add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
+   "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/gguf_mxfp8.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/ggml_fattn.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq1_s.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2_s.cu"
+@@ -59,7 +60,7 @@ ninfer_cuda_non_rdc_archive(ninfer_ggml_quants)
+ target_compile_options(ninfer_ggml_quants PRIVATE
+   $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+   $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=177>)
+-target_link_libraries(ninfer_ggml_quants PRIVATE ${NINFER_CUDART_TARGET} CUDA::cublas)
++target_link_libraries(ninfer_ggml_quants PRIVATE ${NINFER_CUDART_TARGET} CUDA::cublas CUDA::cublasLt)
+ # In a Windows kernel-DLL build the kernel DLL links these objects (src/ops/CMakeLists.txt).
+ if(NOT NINFER_WINDOWS_KERNEL_DLL)
+   target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants)
+diff --git a/src/runtime/engine/engine.cpp b/src/runtime/engine/engine.cpp
+index ac53cd923c0c25e5d7474346c694fb1f65a52d2e..a774fa64abf4c7e9af2cdc4f9f02db1cd976623a 100644
+--- a/src/runtime/engine/engine.cpp
++++ b/src/runtime/engine/engine.cpp
+@@ -1,5 +1,6 @@
+ #include "ninfer/engine.h"
+ #include "text/structured_output.h"
++#include "ops/linear/gguf/gguf_mxfp8.h"
+ 
+ #include "artifact/reader.h"
+ #include "models/qwen3_5/load/vision_cpu_cache.h"
+@@ -351,6 +352,9 @@ std::string slot_model_binding(const EngineOptions& options, const LoadSummary&
+     std::string binding = load.architecture + '\n' + load.model_name + '\n';
+     for (const std::string& format : load.weight_formats) { binding += format + ','; }
+     binding += '\n' + load.prefill_signature + '\n';
++    // Other model families have coarser load signatures. The process-wide arithmetic
++    // opt-in must still prevent their session snapshots crossing numerical profiles.
++    if (ops::gguf::mxfp8::enabled()) { binding += "gguf-mxfp8-e4m3-e8m0-f32-tile-v1\n"; }
+     std::error_code size_error;
+     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, size_error);
+     binding += size_error ? std::string("?") : std::to_string(size);
+diff --git a/tests/ops/linear/gguf_cpu_oracle.c b/tests/ops/linear/gguf_cpu_oracle.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac5c5846eea3d6784959bc76023ac8944ebce34a
+--- /dev/null
++++ b/tests/ops/linear/gguf_cpu_oracle.c
+@@ -0,0 +1,373 @@
++// Independent scalar CPU decode from llama.cpp ggml-quants.c; used only by qualification.
++// Original file and extracted function hashes are recorded in oracle-provenance.json.
++#define GGML_COMMON_DECL_C
++#define GGML_COMMON_IMPL_C
++#include "ggml-common.h"
++#include <assert.h>
++#include <string.h>
++#include <math.h>
++#define GGML_RESTRICT
++static float oracle_half(uint16_t h) {
++    unsigned sign=(h&0x8000u)<<16, e=(h>>10)&31u, m=h&1023u, bits;
++    if(e==0) return (h&0x8000u?-1.0f:1.0f)*ldexpf((float)m,-24);
++    bits=sign|((e==31?255:e+112)<<23)|(m<<13);float value;memcpy(&value,&bits,4);return value;
++}
++#define GGML_FP16_TO_FP32 oracle_half
++static inline void get_scale_min_k4(int j, const uint8_t * GGML_RESTRICT q, uint8_t * GGML_RESTRICT d, uint8_t * GGML_RESTRICT m) {
++    if (j < 4) {
++        *d = q[j] & 63; *m = q[j + 4] & 63;
++    } else {
++        *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
++        *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
++    }
++}
++void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int nb = k / QK_K;
++
++    for (int i = 0; i < nb; i++) {
++
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++        const float min = GGML_FP16_TO_FP32(x[i].dmin);
++
++        const uint8_t * q = x[i].qs;
++
++        int is = 0;
++        float dl, ml;
++        for (int n = 0; n < QK_K; n += 128) {
++            int shift = 0;
++            for (int j = 0; j < 4; ++j) {
++
++                uint8_t sc = x[i].scales[is++];
++                dl = d * (sc & 0xF); ml = min * (sc >> 4);
++                for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l] >> shift) & 3)) - ml;
++
++                sc = x[i].scales[is++];
++                dl = d * (sc & 0xF); ml = min * (sc >> 4);
++                for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l+16] >> shift) & 3)) - ml;
++
++                shift += 2;
++            }
++            q += 32;
++        }
++    }
++}
++
++void dequantize_row_q4_K(const block_q4_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int nb = k / QK_K;
++
++    for (int i = 0; i < nb; i++) {
++        const uint8_t * q = x[i].qs;
++
++        const float d   = GGML_FP16_TO_FP32(x[i].d);
++        const float min = GGML_FP16_TO_FP32(x[i].dmin);
++
++        int is = 0;
++        uint8_t sc, m;
++        for (int j = 0; j < QK_K; j += 64) {
++            get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
++            const float d1 = d * sc; const float m1 = min * m;
++            get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
++            const float d2 = d * sc; const float m2 = min * m;
++            for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
++            for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l]  >> 4) - m2;
++            q += 32; is += 2;
++        }
++    }
++}
++
++void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++
++    for (int i = 0; i < nb; i++) {
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++
++        const uint8_t * GGML_RESTRICT ql = x[i].ql;
++        const uint8_t * GGML_RESTRICT qh = x[i].qh;
++        const int8_t  * GGML_RESTRICT sc = x[i].scales;
++
++        for (int n = 0; n < QK_K; n += 128) {
++            for (int l = 0; l < 32; ++l) {
++                int is = l/16;
++                const int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
++                const int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
++                const int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
++                const int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
++                y[l +  0] = d * sc[is + 0] * q1;
++                y[l + 32] = d * sc[is + 2] * q2;
++                y[l + 64] = d * sc[is + 4] * q3;
++                y[l + 96] = d * sc[is + 6] * q4;
++            }
++            y  += 128;
++            ql += 64;
++            qh += 32;
++            sc += 8;
++        }
++    }
++}
++
++void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++
++    uint32_t aux32[2];
++    const uint8_t * aux8 = (const uint8_t *)aux32;
++
++    for (int i = 0; i < nb; i++) {
++
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++
++        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
++            memcpy(aux32, x[i].qs + 4*ib32, 2*sizeof(uint32_t));
++            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
++            for (int l = 0; l < 4; ++l) {
++                const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
++                const uint8_t  signs = ksigns_iq2xs[(aux32[1] >> 7*l) & 127];
++                for (int j = 0; j < 8; ++j) {
++                    y[j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
++                }
++                y += 8;
++            }
++        }
++    }
++}
++
++void dequantize_row_iq2_xs(const block_iq2_xs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++
++    float db[2];
++
++    for (int i = 0; i < nb; i++) {
++
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++
++        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
++            db[0] = d * (0.5f + (x[i].scales[ib32] & 0xf)) * 0.25f;
++            db[1] = d * (0.5f + (x[i].scales[ib32] >>  4)) * 0.25f;
++            for (int l = 0; l < 4; ++l) {
++                const uint8_t * grid = (const uint8_t *)(iq2xs_grid + (x[i].qs[4*ib32 + l] & 511));
++                const uint8_t  signs = ksigns_iq2xs[x[i].qs[4*ib32 + l] >> 9];
++                for (int j = 0; j < 8; ++j) {
++                    y[j] = db[l/2] * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
++                }
++                y += 8;
++            }
++        }
++    }
++}
++
++void dequantize_row_iq2_s(const block_iq2_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++
++    float db[2];
++
++    for (int i = 0; i < nb; i++) {
++
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++        const uint8_t * qs = x[i].qs;
++        const uint8_t * qh = x[i].qh;
++        const uint8_t * signs = qs + QK_K/8;
++
++        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
++            db[0] = d * (0.5f + (x[i].scales[ib32] & 0xf)) * 0.25f;
++            db[1] = d * (0.5f + (x[i].scales[ib32] >>  4)) * 0.25f;
++            for (int l = 0; l < 4; ++l) {
++                const float dl = db[l/2];
++                const uint8_t * grid = (const uint8_t *)(iq2s_grid + (qs[l] | (qh[ib32] << (8-2*l) & 0x300)));
++                for (int j = 0; j < 8; ++j) {
++                    y[j] = dl * grid[j] * (signs[l] & kmask_iq2xs[j] ? -1.f : 1.f);
++                }
++                y += 8;
++            }
++            qs += 4;
++            signs += 4;
++        }
++    }
++}
++
++void dequantize_row_iq3_xxs(const block_iq3_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++
++    uint32_t aux32;
++
++    for (int i = 0; i < nb; i++) {
++
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++        const uint8_t * qs = x[i].qs;
++        const uint8_t * scales_and_signs = qs + QK_K/4;
++
++        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
++            memcpy(&aux32, scales_and_signs + 4*ib32, sizeof(uint32_t));
++            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
++            for (int l = 0; l < 4; ++l) {
++                const uint8_t  signs = ksigns_iq2xs[(aux32 >> 7*l) & 127];
++                const uint8_t * grid1 = (const uint8_t *)(iq3xxs_grid + qs[2*l+0]);
++                const uint8_t * grid2 = (const uint8_t *)(iq3xxs_grid + qs[2*l+1]);
++                for (int j = 0; j < 4; ++j) {
++                    y[j+0] = db * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
++                    y[j+4] = db * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
++                }
++                y += 8;
++            }
++            qs += 8;
++        }
++    }
++}
++
++void dequantize_row_iq3_s(const block_iq3_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++
++    for (int i = 0; i < nb; i++) {
++
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++        const uint8_t * qs = x[i].qs;
++        const uint8_t * qh = x[i].qh;
++        const uint8_t * signs = x[i].signs;
++
++        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
++            const float db1 = d * (1 + 2*(x[i].scales[ib32/2] & 0xf));
++            const float db2 = d * (1 + 2*(x[i].scales[ib32/2] >>  4));
++            for (int l = 0; l < 4; ++l) {
++                const uint8_t * grid1 = (const uint8_t *)(iq3s_grid + (qs[2*l+0] | ((qh[0] << (8-2*l)) & 256)));
++                const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[0] << (7-2*l)) & 256)));
++                for (int j = 0; j < 4; ++j) {
++                    y[j+0] = db1 * grid1[j] * (signs[l] & kmask_iq2xs[j+0] ? -1.f : 1.f);
++                    y[j+4] = db1 * grid2[j] * (signs[l] & kmask_iq2xs[j+4] ? -1.f : 1.f);
++                }
++                y += 8;
++            }
++            qs += 8;
++            signs += 4;
++            for (int l = 0; l < 4; ++l) {
++                const uint8_t * grid1 = (const uint8_t *)(iq3s_grid + (qs[2*l+0] | ((qh[1] << (8-2*l)) & 256)));
++                const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[1] << (7-2*l)) & 256)));
++                for (int j = 0; j < 4; ++j) {
++                    y[j+0] = db2 * grid1[j] * (signs[l] & kmask_iq2xs[j+0] ? -1.f : 1.f);
++                    y[j+4] = db2 * grid2[j] * (signs[l] & kmask_iq2xs[j+4] ? -1.f : 1.f);
++                }
++                y += 8;
++            }
++            qh += 2;
++            qs += 8;
++            signs += 4;
++        }
++    }
++}
++
++void dequantize_row_iq1_s(const block_iq1_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++
++    for (int i = 0; i < nb; i++) {
++
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++        const uint8_t  * qs = x[i].qs;
++        const uint16_t * qh = x[i].qh;
++
++        for (int ib = 0; ib < QK_K/32; ++ib) {
++            const float dl = d * (2*((qh[ib] >> 12) & 7) + 1);
++            const float delta = qh[ib] & 0x8000 ? -IQ1S_DELTA : IQ1S_DELTA;
++            for (int l = 0; l < 4; ++l) {
++                const int8_t * grid = (const int8_t *)(iq1s_grid + (qs[l] | (((qh[ib] >> 3*l) & 7) << 8)));
++                for (int j = 0; j < 8; ++j) {
++                    y[j] = dl * (grid[j] + delta);
++                }
++                y += 8;
++            }
++            qs += 4;
++        }
++    }
++}
++
++void dequantize_row_iq1_m(const block_iq1_m * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++
++    float delta[4];
++    uint16_t idx[4];
++
++    iq1m_scale_t scale;
++
++    for (int i = 0; i < nb; i++) {
++
++        const uint16_t * sc = (const uint16_t *)x[i].scales;
++        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
++        const float d = GGML_FP16_TO_FP32(scale.f16);
++
++        const uint8_t * qs = x[i].qs;
++        const uint8_t * qh = x[i].qh;
++
++        for (int ib = 0; ib < QK_K/32; ++ib) {
++            const float dl1 = d * (2*((sc[ib/2] >> (6*(ib%2)+0)) & 0x7) + 1);
++            const float dl2 = d * (2*((sc[ib/2] >> (6*(ib%2)+3)) & 0x7) + 1);
++
++            idx[0] = qs[0] | ((qh[0] << 8) & 0x700);
++            idx[1] = qs[1] | ((qh[0] << 4) & 0x700);
++            idx[2] = qs[2] | ((qh[1] << 8) & 0x700);
++            idx[3] = qs[3] | ((qh[1] << 4) & 0x700);
++            delta[0] = qh[0] & 0x08 ? -IQ1S_DELTA : IQ1S_DELTA;
++            delta[1] = qh[0] & 0x80 ? -IQ1S_DELTA : IQ1S_DELTA;
++            delta[2] = qh[1] & 0x08 ? -IQ1S_DELTA : IQ1S_DELTA;
++            delta[3] = qh[1] & 0x80 ? -IQ1S_DELTA : IQ1S_DELTA;
++            for (int l = 0; l < 2; ++l) {
++                const int8_t * grid = (const int8_t *)(iq1s_grid + idx[l]);
++                for (int j = 0; j < 8; ++j) {
++                    y[j] = dl1 * (grid[j] + delta[l]);
++                }
++                y += 8;
++            }
++            for (int l = 2; l < 4; ++l) {
++                const int8_t * grid = (const int8_t *)(iq1s_grid + idx[l]);
++                for (int j = 0; j < 8; ++j) {
++                    y[j] = dl2 * (grid[j] + delta[l]);
++                }
++                y += 8;
++            }
++            qs += 4;
++            qh += 2;
++        }
++    }
++}
++
++void dequantize_row_iq4_xs(const block_iq4_xs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++
++    for (int i = 0; i < nb; i++) {
++
++        const uint8_t * qs = x[i].qs;
++
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++
++        for (int ib = 0; ib < QK_K/32; ++ib) {
++            const int ls = ((x[i].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[i].scales_h >> 2*ib) & 3) << 4);
++            const float dl = d * (ls - 32);
++            for (int j = 0; j < 16; ++j) {
++                y[j+ 0] = dl * kvalues_iq4nl[qs[j] & 0xf];
++                y[j+16] = dl * kvalues_iq4nl[qs[j] >>  4];
++            }
++            y  += 32;
++            qs += 16;
++        }
++    }
++}
++
++void gguf_cpu_decode(int type,const void* raw,float* out,int k) { switch(type) {
++case 10: dequantize_row_q2_K((const block_q2_K*)raw,out,k);return;
++case 12: dequantize_row_q4_K((const block_q4_K*)raw,out,k);return;
++case 14: dequantize_row_q6_K((const block_q6_K*)raw,out,k);return;
++case 16: dequantize_row_iq2_xxs((const block_iq2_xxs*)raw,out,k);return;
++case 17: dequantize_row_iq2_xs((const block_iq2_xs*)raw,out,k);return;
++case 22: dequantize_row_iq2_s((const block_iq2_s*)raw,out,k);return;
++case 18: dequantize_row_iq3_xxs((const block_iq3_xxs*)raw,out,k);return;
++case 21: dequantize_row_iq3_s((const block_iq3_s*)raw,out,k);return;
++case 19: dequantize_row_iq1_s((const block_iq1_s*)raw,out,k);return;
++case 29: dequantize_row_iq1_m((const block_iq1_m*)raw,out,k);return;
++case 23: dequantize_row_iq4_xs((const block_iq4_xs*)raw,out,k);return;
++default: assert(0); } }
+diff --git a/tests/ops/linear/test_gguf_mxfp8.cpp b/tests/ops/linear/test_gguf_mxfp8.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc8c0fa2d2fdc1c80ced52b45e301170c8ad9864
+--- /dev/null
++++ b/tests/ops/linear/test_gguf_mxfp8.cpp
+@@ -0,0 +1,279 @@
++#include "core/arena.h"
++#include "core/weight.h"
++#include "ninfer/ops/linear.h"
++#include "ninfer/ops/linear_add.h"
++#include "ninfer/ops/linear_swiglu.h"
++#include "ops/linear/gguf/gguf_linear.h"
++#include "ops/linear/gguf/gguf_mxfp8.h"
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <iostream>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++#include <string_view>
++#include <vector>
++extern "C" void gguf_cpu_decode(int, const void*, float*, int);
++
++namespace {
++using namespace ninfer;
++namespace mx=ops::gguf::mxfp8;
++void checked(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
++double fp8_value(unsigned c){
++    const int e=(c>>3)&15,m=c&7;
++    const double a=e==0?std::ldexp(double(m),-9):std::ldexp(1.0+double(m)/8,e-7);
++    return c&128?-a:a;
++}
++unsigned fp8_code(double v){
++    const bool neg=std::signbit(v);v=std::abs(v);
++    static const auto table=[] {std::array<double,127>a{};for(unsigned i=0;i<127;++i)a[i]=fp8_value(i);return a;}();
++    auto hi=std::lower_bound(table.begin(),table.end(),v);
++    unsigned c=unsigned(hi-table.begin());
++    if(c>=127)c=126;
++    else if(c&&((v-table[c-1]<table[c]-v)||(v-table[c-1]==table[c]-v&&((c-1)&1)==0)))--c;
++    return c|(neg?128:0);
++}
++int scale_exponent(const float* x){
++    double a=0;for(int i=0;i<32;++i)a=std::max(a,std::abs(double(x[i])));
++    if(a==0)return 0;
++    return std::clamp(int(std::ceil(std::log2(a/448.0))),-127,127);
++}
++std::size_t scale_at(int r,int g,int groups){
++    const int tile_r=r/128,tile_g=g/4;
++    return std::size_t(tile_r*((groups+3)/4)+tile_g)*512+(r%32)*16+(r%128/32)*4+g%4;
++}
++void quantize_reference(std::vector<float>& x,int rows,int k){
++    for(int r=0;r<rows;++r)for(int g=0;g<k;g+=32){
++        float* p=x.data()+std::size_t(r)*k+g;const int e=scale_exponent(p);
++        for(int j=0;j<32;++j)p[j]=float(std::ldexp(fp8_value(fp8_code(std::ldexp(double(p[j]),-e))),e));
++    }
++}
++double error(const std::vector<float>& got,const std::vector<double>& ref,double max_bound,double rms_bound,const char* label){
++    double d=0,s=0,peak=0,worst=0;
++    for(std::size_t i=0;i<got.size();++i){
++        if(!std::isfinite(got[i])||!std::isfinite(ref[i]))throw std::runtime_error(std::string(label)+" nonfinite");
++        const double delta=got[i]-ref[i];d+=delta*delta;s+=ref[i]*ref[i];peak=std::max(peak,std::abs(ref[i]));worst=std::max(worst,std::abs(delta));
++    }
++    const double rms=std::sqrt(d/std::max(s,1e-30)),rel=worst/std::max(peak,1e-30);
++    std::cout<<label<<" rms="<<rms<<" peak="<<rel<<"\n";
++    if(rms>rms_bound||rel>max_bound)throw std::runtime_error(std::string(label)+" numerical bound");
++    return rms;
++}
++void activation_codec(){
++    constexpr int k=256,t=5,padded=128;
++    std::vector<__nv_bfloat16> x(k*t);
++    for(std::size_t i=0;i<x.size();++i)x[i]=__float2bfloat16(float(int(i%139)-69)*.03125f);
++    for(int i=0;i<32;++i)x[i]=__float2bfloat16(0);
++    for(int i=32;i<64;++i)x[i]=__float2bfloat16((i&1?-1:1)*1e-38f);
++    for(int i=64;i<96;++i)x[i]=__float2bfloat16((i&1?-1:1)*1e30f);
++    std::vector<int> gather(k);std::iota(gather.begin(),gather.end(),0);std::reverse(gather.begin(),gather.end());
++    DeviceBuffer dx(x.size()*2),dg(k*4),encoded(std::max(mx::activation_bytes(k,t),mx::tile_activation_bytes(k,t)));
++    dx.copy_from_host(x.data(),x.size()*2);dg.copy_from_host(gather.data(),k*4);
++    for(bool permute:{false,true}){
++      for(bool tile:{false,true}){
++        if(tile)mx::quantize_tile(static_cast<const __nv_bfloat16*>(dx.p),k,t,permute?static_cast<int*>(dg.p):nullptr,encoded.p,nullptr);
++        else
++        mx::quantize(static_cast<const __nv_bfloat16*>(dx.p),k,t,permute?static_cast<int*>(dg.p):nullptr,encoded.p,nullptr);
++        std::vector<unsigned char> data(encoded.bytes);encoded.copy_to_host(data.data(),data.size());
++        for(int r=0;r<padded;++r)for(int g=0;g<k/32;++g){
++            float v[32]{};if(r<t)for(int i=0;i<32;++i)v[i]=__bfloat162float(x[r*k+(permute?gather[32*g+i]:32*g+i)]);
++            const int e=scale_exponent(v);
++            if(tile) {
++                // Tile scales are exponent carriers, consumed as bits >> 23 by MMA.
++                // Biased exponent zero encodes 2^-127, although its carrier is float zero.
++                std::uint32_t scale;std::memcpy(&scale,data.data()+k*padded+4*(g*padded+r),4);
++                if(scale!=(unsigned(e+127)<<23))throw std::runtime_error("tile activation scale mismatch");
++            } else if(data[k*padded+scale_at(r,g,k/32)]!=e+127)throw std::runtime_error("activation scale code mismatch");
++            for(int i=0;i<32;++i)if(data[r*k+32*g+i]!=fp8_code(std::ldexp(double(v[i]),-e)))throw std::runtime_error("activation FP8 code mismatch");
++        }
++      }
++    }
++    std::cout<<"MXFP8 codec exact: zero/tiny/large/negative/gather/padding passed\n";
++}
++struct Format{QType q;const char* name;std::vector<int> scales;};
++void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
++    std::mt19937 rng(9017+k+t);const auto block=gguf_block_shape(f.q);const auto rb=std::int64_t(k/block.elements)*block.bytes;
++    const int weight_rows=2*n;
++    std::vector<unsigned char> raw(std::size_t(weight_rows)*rb);
++    for(auto&v:raw)v=static_cast<unsigned char>(rng()%256);
++    const auto h=__float2half(.0125f);unsigned short hs;std::memcpy(&hs,&h,2);
++    if(scale_case==1)hs=1; // smallest positive FP16 subnormal
++    if(scale_case==2)hs=0xfbff; // negative largest finite FP16
++    if(scale_case==3)hs=0;
++    for(std::size_t b=0;b<raw.size();b+=block.bytes)for(int off:f.scales)std::memcpy(raw.data()+b+off,&hs,2);
++    DeviceBuffer dw(raw.size()+256);dw.fill(0);
++    dw.copy_from_host(raw.data(),raw.size());
++    const auto type=ops::detail::gguf_type(f.q);
++    std::vector<float> exact(std::size_t(weight_rows)*k);
++    gguf_cpu_decode(int(type),raw.data(),exact.data(),weight_rows*k);
++    auto qw=exact;quantize_reference(qw,weight_rows,k);
++    std::normal_distribution<float> normal(0,1);std::vector<__nv_bfloat16> x(k*t);
++    for(auto&v:x)v=__float2bfloat16(normal(rng));
++    DeviceBuffer dx(x.size()*2);dx.copy_from_host(x.data(),x.size()*2);
++    Tensor tx(dx.p,DType::BF16,{k,t});
++    Weight w;w.qtype=f.q;w.layout=QuantLayout::GgufBlocks;w.scale_dtype=DType::FP16;w.n=n;w.k=k;w.qdata=dw.p;
++    Weight parent=w;parent.n=2*n;
++    const auto capacity=std::max(ops::linear_workspace_capacity_bytes(f.q,n,k,ops::LinearPolicy::A16Only,1,t),ops::linear_swiglu_workspace_capacity_bytes(f.q,2*n,k,ops::LinearPolicy::A16Only,1,t));
++    WorkspaceArena workspace(capacity);
++    DeviceBuffer out(std::size_t(n)*t*4+32);out.fill(0x42);
++    auto* fp=static_cast<float*>(out.p)+4;Tensor ty(fp,DType::FP32,{n,t});
++    std::vector<float> got(std::size_t(n)*t);
++    std::vector<int> columns(k);std::iota(columns.begin(),columns.end(),0);std::shuffle(columns.begin(),columns.end(),rng);
++    DeviceBuffer dg(k*4);dg.copy_from_host(columns.data(),k*4);
++    for(bool gather:{false,true}){
++        w.input_columns=gather?static_cast<int*>(dg.p):nullptr;
++        std::vector<float> qx(x.size());for(int c=0;c<t;++c)for(int j=0;j<k;++j)qx[c*k+j]=__bfloat162float(x[c*k+(gather?columns[j]:j)]);
++        quantize_reference(qx,t,k);
++        std::vector<double> ref(std::size_t(n)*t),original(ref.size()),upper(ref.size());
++        for(int c=0;c<t;++c)for(int r=0;r<n;++r){
++            double sum=0,old=0,up=0;
++            for(int j=0;j<k;++j){sum+=double(qw[r*k+j])*qx[c*k+j];up+=double(qw[(r+n)*k+j])*qx[c*k+j];old+=double(exact[r*k+j])*__bfloat162float(x[c*k+(gather?columns[j]:j)]);}
++            ref[c*n+r]=sum;original[c*n+r]=old;upper[c*n+r]=up;
++        }
++        ops::linear(tx,w,ty,ops::LinearPolicy::A16Only,workspace,nullptr);checked(cudaDeviceSynchronize());
++        checked(cudaMemcpy(got.data(),fp,got.size()*4,cudaMemcpyDeviceToHost));
++        std::cout<<f.name<<" N="<<n<<" K="<<k<<" T="<<t<<" gather="<<gather<<" ";
++        error(got,ref,1e-4,3e-5,"MXFP8 FP64 encoded-product oracle");
++        error(got,original,.20,.08,"MXFP8 vs original-weight FP64 diagnostic");
++        if(fusion) {
++            // Generic fused epilogues also admit FP32 outputs and GELU gates.
++            // Use the public product boundary, with independently computed gate values.
++            std::vector<float> gate(ref.size());for(std::size_t i=0;i<gate.size();++i)gate[i]=float(int(i%17)-8)*.25f;
++            DeviceBuffer dgates(gate.size()*4);dgates.copy_from_host(gate.data(),gate.size()*4);
++            ops::detail::GgufProduct product{&w,nullptr,0,ops::detail::GgufEpilogue::Accumulate};
++            product.f32=fp;product.f32_rows=n;
++            std::vector<float> initial(got.size(),.25f);checked(cudaMemcpy(fp,initial.data(),initial.size()*4,cudaMemcpyHostToDevice));
++            ops::detail::gguf_project(tx,std::span(&product,1),workspace,nullptr);
++            checked(cudaMemcpy(got.data(),fp,got.size()*4,cudaMemcpyDeviceToHost));
++            auto add=ref;for(auto&v:add)v+=.25;error(got,add,1e-4,3e-5,"MXFP8 FP32 residual");
++            product.epilogue=ops::detail::GgufEpilogue::GateProduct;product.gate=static_cast<const float*>(dgates.p);
++            product.activation=ops::gguf::GateActivation::GeluTanh;
++            ops::detail::gguf_project(tx,std::span(&product,1),workspace,nullptr);
++            checked(cudaMemcpy(got.data(),fp,got.size()*4,cudaMemcpyDeviceToHost));
++            auto gated=ref;for(std::size_t i=0;i<gated.size();++i){double g=gate[i];gated[i]*=.5*g*(1+std::tanh(.7978845608028654*(g+.044715*g*g*g)));}
++            error(got,gated,1e-4,3e-5,"MXFP8 FP32 GeGLU");
++        }
++        std::vector<unsigned char> guards(out.bytes);out.copy_to_host(guards.data(),guards.size());
++        for(int i=0;i<16;++i)if(guards[i]!=0x42||guards[guards.size()-1-i]!=0x42)throw std::runtime_error("output guard overwritten");
++        DeviceBuffer bf(std::size_t(n)*t*2);Tensor by(bf.p,DType::BF16,{n,t});
++        ops::linear(tx,w,by,ops::LinearPolicy::A16Only,workspace,nullptr);
++        std::vector<__nv_bfloat16> bh(n*t);bf.copy_to_host(bh.data(),bh.size()*2);
++        for(std::size_t i=0;i<got.size();++i)got[i]=__bfloat162float(bh[i]);
++        error(got,ref,.004,.003,"MXFP8 BF16 store");
++        std::fill(bh.begin(),bh.end(),__float2bfloat16(.25f));bf.copy_from_host(bh.data(),bh.size()*2);
++        ops::linear_add(tx,w,by,ops::LinearPolicy::A16Only,workspace,nullptr);
++        bf.copy_to_host(bh.data(),bh.size()*2);auto add=ref;for(auto&v:add)v+=.25;
++        for(std::size_t i=0;i<got.size();++i)got[i]=__bfloat162float(bh[i]);error(got,add,.004,.003,"MXFP8 residual");
++        if(fusion){
++            parent.input_columns=w.input_columns;
++            ops::linear_swiglu(tx,parent,by,ops::LinearPolicy::A16Only,workspace,nullptr);bf.copy_to_host(bh.data(),bh.size()*2);
++            auto fused=ref;for(std::size_t i=0;i<fused.size();++i){fused[i]=ref[i]/(1+std::exp(-ref[i]))*upper[i];got[i]=__bfloat162float(bh[i]);}
++            error(got,fused,.005,.003,"MXFP8 SwiGLU");
++        }
++        // A prewarmed captured public call must reproduce the same encoded product.
++        cudaStream_t stream;checked(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
++        checked(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
++        ops::linear(tx,w,ty,ops::LinearPolicy::A16Only,workspace,stream);
++        cudaGraph_t graph;checked(cudaStreamEndCapture(stream,&graph));cudaGraphExec_t exe;
++        checked(cudaGraphInstantiate(&exe,graph,nullptr,nullptr,0));checked(cudaGraphLaunch(exe,stream));checked(cudaStreamSynchronize(stream));
++        checked(cudaMemcpy(got.data(),fp,got.size()*4,cudaMemcpyDeviceToHost));error(got,ref,1e-4,3e-5,"MXFP8 graph");
++        checked(cudaGraphExecDestroy(exe));checked(cudaGraphDestroy(graph));checked(cudaStreamDestroy(stream));
++    }
++    if(workspace.peak_used()>capacity)throw std::runtime_error("workspace exceeds capacity query");
++}
++void bench(const Format& f,int n,int k,int t) {
++    const auto b=gguf_block_shape(f.q);const auto rb=std::int64_t(k/b.elements)*b.bytes;
++    std::mt19937 rng(5526);std::vector<unsigned char> raw(n*rb+256);for(auto&v:raw)v=static_cast<unsigned char>(rng()%256);
++    const auto h=__float2half(.0125f);unsigned short hs;std::memcpy(&hs,&h,2);
++    for(std::size_t at=0;at<std::size_t(n)*rb;at+=b.bytes)for(int off:f.scales)std::memcpy(raw.data()+at+off,&hs,2);
++    std::vector<__nv_bfloat16>x(k*t);for(std::size_t i=0;i<x.size();++i)x[i]=__float2bfloat16(float(int(i%131)-65)*.015625f);
++    DeviceBuffer dw(raw.size()),dx(x.size()*2),dy(std::size_t(n)*t*4);
++    dw.copy_from_host(raw.data(),raw.size());dx.copy_from_host(x.data(),x.size()*2);
++    Weight w;w.qtype=f.q;w.layout=QuantLayout::GgufBlocks;w.scale_dtype=DType::FP16;w.n=n;w.k=k;w.qdata=dw.p;
++    Tensor tx(dx.p,DType::BF16,{k,t}),ty(dy.p,DType::FP32,{n,t});
++    DeviceBuffer activation(mx::tile_activation_bytes(k,t));
++    mx::quantize_tile(static_cast<const __nv_bfloat16*>(dx.p),k,t,nullptr,activation.p,nullptr);checked(cudaDeviceSynchronize());
++    ops::gguf::VectorOutput out;out.f32=static_cast<float*>(dy.p);out.column_stride=n;
++    for(int trial=0;trial<4;++trial) {
++    cudaStream_t stream;checked(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
++    for(int i=0;i<3;++i)mx::tile_product(ops::detail::gguf_type(f.q),dw.p,rb,n,k,activation.p,t,out,stream);
++    checked(cudaStreamSynchronize(stream));
++    constexpr int batch=16,repeats=32;
++    checked(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
++    for(int i=0;i<batch;++i)mx::tile_product(ops::detail::gguf_type(f.q),dw.p,rb,n,k,activation.p,t,out,stream);
++    cudaGraph_t graph;checked(cudaStreamEndCapture(stream,&graph));cudaGraphExec_t exe;
++    checked(cudaGraphInstantiate(&exe,graph,nullptr,nullptr,0));checked(cudaGraphLaunch(exe,stream));checked(cudaStreamSynchronize(stream));
++    cudaEvent_t start,end;checked(cudaEventCreate(&start));checked(cudaEventCreate(&end));
++    checked(cudaEventRecord(start,stream));for(int i=0;i<repeats;++i)checked(cudaGraphLaunch(exe,stream));checked(cudaEventRecord(end,stream));checked(cudaEventSynchronize(end));
++    float ms;checked(cudaEventElapsedTime(&ms,start,end));
++    std::cout<<"MXFP8_BENCH type="<<f.name<<" n="<<n<<" k="<<k<<" t="<<t<<" trial="<<trial<<" milliseconds="<<ms/(batch*repeats)<<" graph=1\n";
++    checked(cudaEventDestroy(start));checked(cudaEventDestroy(end));checked(cudaGraphExecDestroy(exe));checked(cudaGraphDestroy(graph));checked(cudaStreamDestroy(stream));
++    }
++}
++void large_slab(const Format& f) {
++    // Cross the former 1536-row / 8 MiB boundary at K=5120. Independently decode
++    // every packed value, then evaluate FP64 dots at both sides of that boundary
++    // and the actual/padded row and column tile tails.
++    constexpr int n=1665,k=5120,t=1024;
++    const auto b=gguf_block_shape(f.q);const auto rb=std::int64_t(k/b.elements)*b.bytes;
++    std::mt19937 rng(8826);std::vector<unsigned char> raw(n*rb+256);
++    for(std::size_t i=0;i<std::size_t(n)*rb;++i)raw[i]=static_cast<unsigned char>(rng()%256);
++    const auto h=__float2half(.0125f);unsigned short hs;std::memcpy(&hs,&h,2);
++    for(std::size_t i=0;i<std::size_t(n)*rb;i+=b.bytes)for(int off:f.scales)std::memcpy(raw.data()+i+off,&hs,2);
++    std::vector<float> qw(n*k);gguf_cpu_decode(int(ops::detail::gguf_type(f.q)),raw.data(),qw.data(),n*k);
++    quantize_reference(qw,n,k);
++    std::vector<__nv_bfloat16>x(k*t);for(auto&v:x)v=__float2bfloat16(float(int(rng()%131)-65)*.015625f);
++    std::vector<float> qx(x.size());for(std::size_t i=0;i<x.size();++i)qx[i]=__bfloat162float(x[i]);quantize_reference(qx,t,k);
++    DeviceBuffer dw(raw.size()),dx(x.size()*2),dy(std::size_t(n)*t*4+32);dy.fill(0x42);
++    dw.copy_from_host(raw.data(),raw.size());dx.copy_from_host(x.data(),x.size()*2);
++    auto* result=static_cast<float*>(dy.p)+4;Tensor tx(dx.p,DType::BF16,{k,t}),ty(result,DType::FP32,{n,t});
++    Weight w;w.qtype=f.q;w.layout=QuantLayout::GgufBlocks;w.scale_dtype=DType::FP16;w.n=n;w.k=k;w.qdata=dw.p;
++    WorkspaceArena work(ops::linear_workspace_capacity_bytes(f.q,n,k,ops::LinearPolicy::A16Only,1,t));
++    ops::linear(tx,w,ty,ops::LinearPolicy::A16Only,work,nullptr);checked(cudaDeviceSynchronize());
++    cudaStream_t stream;checked(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));checked(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
++    ops::linear(tx,w,ty,ops::LinearPolicy::A16Only,work,stream);
++    cudaGraph_t graph;checked(cudaStreamEndCapture(stream,&graph));cudaGraphExec_t exe;checked(cudaGraphInstantiate(&exe,graph,nullptr,nullptr,0));checked(cudaGraphLaunch(exe,stream));checked(cudaStreamSynchronize(stream));
++    std::vector<float> all(n*t);checked(cudaMemcpy(all.data(),result,all.size()*4,cudaMemcpyDeviceToHost));
++    std::vector<float> got;std::vector<double> ref;
++    for(int c:{0,1,127,128,1023})for(int r:{0,127,128,1535,1536,1664}) {
++        double sum=0;for(int j=0;j<k;++j)sum+=double(qw[r*k+j])*qx[c*k+j];
++        ref.push_back(sum);got.push_back(all[c*n+r]);
++    }
++    error(got,ref,1e-4,3e-5,"MXFP8 larger slab FP64 boundary samples");
++    std::vector<unsigned char> guards(dy.bytes);dy.copy_to_host(guards.data(),guards.size());
++    for(int i=0;i<16;++i)if(guards[i]!=0x42 || guards[guards.size()-1-i]!=0x42)throw std::runtime_error("large slab output guard");
++    if(work.peak_used()>work.capacity())throw std::runtime_error("large slab workspace bound");
++    checked(cudaGraphExecDestroy(exe));checked(cudaGraphDestroy(graph));checked(cudaStreamDestroy(stream));
++}
++} // namespace
++int main(int argc,char** argv){try{
++    if(!mx::enabled())throw std::runtime_error("test requires NINFER_GGUF_PREFILL_MXFP8=1");
++    if(!mx::supported(ops::gguf::GgmlType::IQ3_S,256)){std::cout<<"SKIP MXFP8 requires sm120\n";return 77;}
++    activation_codec();
++    std::vector<Format> formats={{QType::GGUF_IQ3_XXS,"iq3_xxs",{0}},{QType::GGUF_IQ3_S,"iq3_s",{0}},{QType::GGUF_IQ2_XXS,"iq2_xxs",{0}},{QType::GGUF_IQ2_XS,"iq2_xs",{0}},{QType::GGUF_IQ2_S,"iq2_s",{0}},{QType::GGUF_IQ4_XS,"iq4_xs",{0}},{QType::GGUF_Q2_K,"q2_k",{80,82}},{QType::GGUF_Q4_K,"q4_k",{0,2}}};
++    if(argc==2 && std::string_view(argv[1])=="--two-device") {
++        int count=0;checked(cudaGetDeviceCount(&count));if(count<2)return 77;
++        for(int device=0;device<2;++device) {
++            checked(cudaSetDevice(device));activation_codec();
++            for(const auto& f:formats)run(f,17,256,257,true);
++            std::cout<<"MXFP8 device "<<device<<" independent qualification passed\n";
++        }
++        return 0;
++    }
++    if(argc==2 && std::string_view(argv[1])=="--bench") {
++        for(int i=0;i<5;++i)bench(formats[i],5120,5120,256);
++        bench(formats[1],17408,5120,256);bench(formats[1],5120,17408,256);
++        bench(formats[1],8192,5120,256);return 0;
++    }
++    for(const auto& f:formats)run(f,17,256,257,true);
++    run(formats[1],128,5120,256,false);run(formats[2],33,6144,1024,false);run(formats[5],17,17408,256,false);
++    run(formats[7],129,512,1023,true);
++    for(const auto& f:formats)for(int scale_case=1;scale_case<=3;++scale_case)run(f,3,256,257,false,scale_case);
++    large_slab(formats[1]);
++    std::cout<<"MXFP8 independent codec/FP64/public-Op qualification passed\n";return 0;
++}catch(const std::exception&e){std::cerr<<e.what()<<"\n";return 1;}}
+diff --git a/tests/ops/linear/tests.cmake b/tests/ops/linear/tests.cmake
+index 29c8adda31edc90e79350b345ddf3ca1220babe7..fd97b84fb24c510caa65a2af8d01b0fe53f65a9d 100644
+--- a/tests/ops/linear/tests.cmake
++++ b/tests/ops/linear/tests.cmake
+@@ -94,6 +94,16 @@ ninfer_add_op_test(ninfer_linear_gguf_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf.cpp"
+   LIBRARIES ninfer_ops)
+ 
++ninfer_add_op_test(ninfer_linear_gguf_mxfp8_test STANDALONE
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mxfp8.cpp"
++          "${CMAKE_CURRENT_LIST_DIR}/gguf_cpu_oracle.c"
++  LIBRARIES ninfer_ops)
++target_include_directories(ninfer_linear_gguf_mxfp8_test PRIVATE
++  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
++ninfer_stage_runtime_dlls(ninfer_linear_gguf_mxfp8_test)
++set_tests_properties(ninfer_linear_gguf_mxfp8_test PROPERTIES
++  ENVIRONMENT "NINFER_GGUF_PREFILL_MXFP8=1;NINFER_GGUF_PREFILL_NVFP4=0")
++
+ ninfer_add_op_test(ninfer_linear_gguf_mmq_store_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mmq_store.cu"
+   LIBRARIES ninfer_ops)

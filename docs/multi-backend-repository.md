@@ -15,6 +15,41 @@ core, adapters, engine revisions and integration patches together.
 | `scripts/windows/` | Build, launcher and packaging entry points |
 | `backends/versions.json` | Baseline revisions, licenses, patch hashes and prepared tree hashes |
 
+## Native optimization ownership and NInfer patch layers
+
+Hardware detection, kernel calibration, device profiles, arithmetic dispatch and
+workspace planning belong to each native inference backend. KVMem's portable
+memory policy and native adapter own retrieval/Pressure/replay and state transfer.
+The UI/launcher forwards supported configuration, may trigger backend calibration,
+and displays results; it does not maintain GPU-to-kernel selection tables.
+
+The 2026-11-02 low-precision work uses these independently reviewable layers:
+
+| Patch id | Responsibility |
+|---|---|
+| `gguf-coop-5060` | Measured 5060 Ti Q4_K/Q6_K device-profile entries |
+| `gguf-mxfp8-prefill` | Generic FP8 arithmetic, fused tile/Lt paths, numerical signatures and independent CPU/FP64 qualification |
+| `gguf-nvfp4-prefill` | Generic NVFP4 arithmetic, explicit A4 permissions, FFN integration and tests |
+| `kvmem-statistics-readback` | Precision-independent native KVMem Mean-K/Query copy coalescing and sampled-attention readback |
+
+FP8/NVFP4 remain usable without KVMem. The common CPU packed-GGUF oracle is
+introduced with FP8 and reused by NVFP4. Device-specific FP8/Q8 profitability
+selection remains a proposal; this reorganization does not implement it.
+Further FP4 experiments remain paused, and unfinished artifact-tool variants
+are not included in the prepared backend.
+
+On a ninfer-all refresh, compare upstream mathematical, ownership and resource
+contracts with each layer, remove equivalent superseded patches, and rebase only
+the remaining changes. Preserve independent tests where upstream evidence does
+not cover our contract. Update the pinned revision, ordered dependencies, patch
+hashes and every intermediate/final tree together, then replay the full chain
+and run affected checks. A same-named FP8/FP4 feature alone is not equivalence:
+actual-amax, FP32/FP16 casts and accumulation/output boundaries matter.
+
+The source boundaries and current evidence are documented in
+[FP8 validation](ninfer-mxfp8-prefill-validation-20261101.md) and the historical
+[NVFP4 qualification](ninfer-nvfp4-prefill-qualification-20261102.md).
+
 Each backend keeps its existing license and third-party notices. Source-only
 upstream vocabulary and test fixtures are included; inference model weights,
 builds, logs, session snapshots and personal DSH configuration are not.

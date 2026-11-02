@@ -1,0 +1,3048 @@
+diff --git a/apps/perplexity/main.cpp b/apps/perplexity/main.cpp
+index 377788475de00ba4cef419f20ca939ea5c97206c..91f069eeb05eebd30897a5dbfc93dca9bf965b1b 100644
+--- a/apps/perplexity/main.cpp
++++ b/apps/perplexity/main.cpp
+@@ -1,6 +1,7 @@
+ #include "ninfer_build_id.h"
+ #include "corpus.h"
+ #include "evaluation.h"
++#include "ops/linear/gguf/gguf_prefill_modes.h"
+ 
+ #include "ninfer/engine.h"
+ #include "product/logging/engine_diagnostics.h"
+@@ -625,6 +626,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
+           {"windows", options.disjoint ? "disjoint" : "sliding"},
+           {"prefill_chunk_tokens", 1024},
+           {"score_tile_tokens", 1024},
++          {"gguf_prefill_nvfp4", ninfer::ops::gguf::nvfp4_enabled()},
++          {"gguf_prefill_mxfp8", ninfer::ops::gguf::mxfp8::enabled()},
+           {"kv_dtype", kv_name(kv)}}},
+         {"timing",
+          {{"load_seconds", load.load_seconds},
+diff --git a/docs/README.md b/docs/README.md
+index f86dbd3b4ddc4d872f586f0aaf48ebe15c580026..61463104ae34bc6336ba86d97122d807c89ae2dd 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -19,6 +19,7 @@ spelling and defaults.
+ | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
+ | [GGUF block formats](gguf.md) | GGUF releases with a ggml type per tensor: the eighteen block formats, their products, serving and measurements |
+ | [Experimental GGUF MXFP8 prefill](gguf-mxfp8-prefill.md) | opt-in Blackwell block-scaled prefill, numerical tradeoffs, width limits and qualification |
++| [Experimental GGUF NVFP4 prefill](gguf-nvfp4-prefill.md) | A4-permitted GGUF prefill, immutable scale-choice caches, precision scopes and qualification |
+ | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md) | converting the GSQ-RCO GGUF releases and their n-gram table; experts on one or several GPUs, in host memory or on disk; measurements |
+ | [Gemma 4 26B-A4B](gemma4.md) | converting Google's QAT GGUF release with its MTP assistant and vision tower, what runs, speculative decoding, images and video, the defaults, measurements against llama.cpp and the numerical checks |
+ | [Flint](flint.md) | converting a GGUF of Recursive's Flint, what runs, reasoning and GLM-4.7 tool calls, expert residency, measurements against llama.cpp and the numerical checks |
+diff --git a/docs/gguf-nvfp4-prefill.md b/docs/gguf-nvfp4-prefill.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce569683babb8347ad9b83e2c178d11c7f57b560
+--- /dev/null
++++ b/docs/gguf-nvfp4-prefill.md
+@@ -0,0 +1,69 @@
++# Experimental GGUF NVFP4 prefill
++
++`NINFER_GGUF_PREFILL_NVFP4=1` admits NVFP4 products of GGUF matrices whose logical
++Use grants `AllowA4`. Set the variable before model loading; unset or `0` keeps
++the normal route. This experiment is qualified separately from the MXFP8
++experiment. The NVFP4 qualification uses `NINFER_GGUF_PREFILL_MXFP8=0`.
++
++The stored GGUF blocks remain the model's weights. Wide products decode bounded
++slabs into E2M1 values with an E4M3 scale per 16 values and a power-of-two global
++per operand. Four candidate scales are compared with FP16 error sums. GEMM uses
++FP32 accumulation and BF16 output. Gate/up products round to BF16 before SiLU.
++The fused feed-forward producer encodes that same BF16 intermediate for down,
++preserving the separate producer's rounding boundary. Globals are bounded to
++`2^-60..2^60` to keep the combined FP32 multiplier finite; very small/large values
++can underflow or saturate, as with the other low-precision representations.
++
++The route requires an sm120 device/build, K divisible by 256, and cuBLASLt's
++block-scaled GEMM. It supports IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
++IQ3_S, IQ4_XS, Q2_K, Q4_K and Q6_K. It begins at 129 columns, above every
++supported decode/verification batch. BF16 Store and Accumulate destinations
++require 16-byte aligned columns; other destinations and unsupported products
++keep their previous arithmetic. Load-time preparation is currently connected
++to Qwen3.5-family Parameters, including its MTP/draft and rank operands.
++
++Parameters own the immutable weight maxima and scale-choice cache. Each cache
++records two bits per 16 weights, rounded to 128 bytes per operand, in pinned host
++memory; identical operands at one global share a table. Calls own their transient
++activation and image slabs through the Program workspace. No permanent FP4 copy
++of model weights is created. Preparation adds startup work and host memory.
++Precision mode is included in prefill signatures and session snapshot bindings.
++
++KVMem's statistics-copy adapter also coalesces contiguous layers into one 2D
++transfer per rank. Key and Query runs remain separate; partial accepted Query
++prefixes keep their original per-layer gaps. This changes transfer scheduling,
++without changing any statistics bytes, Query/Pressure decisions or precision.
++The host `ninfer_memory_statistics_layout` test checks independent whole-buffer
++values and canaries for unequal head shards, layer partitions, Mean-Q and
++partial/full Query prefixes, with both separate and coalesced copies.
++
++An existing GGUF artifact often grants only `AllowA8`. A permission-only copy can
++be created through the artifact writer, without changing physical tensor bytes:
++
++```powershell
++python -m tools.artifact.gguf_a4 SOURCE.ninfer A4.ninfer --scope all-projections --report a4.json
++$env:NINFER_GGUF_PREFILL_NVFP4 = '1'
++$env:NINFER_GGUF_PREFILL_MXFP8 = '0'
++.\ninfer-serve.exe A4.ninfer --prefill-chunk 1024
++```
++
++`--scope mlp-gate-up` grants A4 only to text-layer MLP gate/up Uses; attention,
++down projections, output heads and sensitive Uses retain their permissions. The
++`mlp-gate-up-middle-half` scope further restricts this to the middle half of text
++layers (16 through 47 in the measured 64-layer model). The
++tool promotes only existing GGUF `AllowA8` Uses, writes a new artifact identity,
++and verifies each physical object's hash after copying. It requires space for a
++second artifact. Existing `A16Only` Uses and other physical formats are preserved.
++
++NVFP4 adds quantization error. Passing a bounded corpus and recall suite is a
++qualification of that model/profile/workload, rather than a universal quality
++guarantee. Keep the experiment off until the intended profile passes its speed
++and quality criteria. Benchmark with the same GPU UUID and settings; use
++`NINFER_PREFILL_ALIGN=0` when measuring exact requested chunk widths.
++
++The native `ninfer_linear_gguf_nvfp4_test` qualifies codecs, independently decoded
++packed weights, FP64 products, residuals, SwiGLU, fused down production, mapped
++host scale caches, workspace bounds, canaries, graph replay and fallback widths.
++Run it on an idle sm120 GPU with the NVFP4 variable set to `1`. Run its
++`--boundary-only` form with the variable both `0` and `1` and compare the printed
++checksum to check protected q8 calls.
+diff --git a/include/ninfer/ops/linear_swiglu_add.h b/include/ninfer/ops/linear_swiglu_add.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae86e556a161335b76a7bf0f49ede11b0b7ee507
+--- /dev/null
++++ b/include/ninfer/ops/linear_swiglu_add.h
+@@ -0,0 +1,21 @@
++#pragma once
++#include "ninfer/ops/linear.h"
++#include "core/arena.h"
++#include "core/tensor.h"
++#include "core/weight.h"
++
++namespace ninfer::ops {
++// residual += down * BF16(silu(gate*x) * (up*x)), under each product's policy.
++// GGUF block matrices only; a null up names a stacked [gate;up] parent. On the
++// optional NVFP4 route, gate and up products round to BF16 before SiLU, and the
++// fused producer encodes that same BF16 activation for down. Other widths/policies
++// reproduce linear_swiglu followed by linear_add. Workspace is scoped to this call.
++void linear_swiglu_add(const Tensor& x, const Weight& gate, const Weight* up, const Weight& down,
++                       Tensor& residual, LinearPolicy gate_policy, LinearPolicy down_policy,
++                       WorkspaceArena& workspace, cudaStream_t stream);
++[[nodiscard]] std::size_t
++linear_swiglu_add_workspace_capacity_bytes(QType gate, const QType* up, std::int32_t gate_rows,
++                                           std::int32_t k, QType down, std::int32_t output_rows,
++                                           LinearPolicy gate_policy, LinearPolicy down_policy,
++                                           std::int32_t min_tokens, std::int32_t max_tokens);
++} // namespace ninfer::ops
+diff --git a/src/core/weight.h b/src/core/weight.h
+index f557db4e11906a9046c4b759e6381a20d7eb9d92..167400bc07f0d8d2a793b8c64a3f5430d064e117 100644
+--- a/src/core/weight.h
++++ b/src/core/weight.h
+@@ -187,6 +187,12 @@ struct Weight {
+     // INT32 [K] input gather of a GGUF matrix whose stored columns are a permutation of its
+     // input's: column c multiplies input element input_columns[c]. Null for every other matrix.
+     const std::int32_t* input_columns = nullptr;
++
++    // Immutable GGUF NVFP4 preparation, owned by model execution Parameters. The global
++    // covers a gate/up pair where needed; each table records two bits per 16 weights.
++    float gguf_amax = 0.0F;
++    const std::uint8_t* fp4_choices = nullptr;
++    float fp4_choices_amax = 0.0F;
+ };
+ 
+ } // namespace ninfer
+diff --git a/src/models/qwen3_5/execution/ffn.cpp b/src/models/qwen3_5/execution/ffn.cpp
+index 3c0dbd591c28f37937a9e01dc82d15c7781c7959..b94a093fbcb2693d0c8117f8117ff7e7bd967cab 100644
+--- a/src/models/qwen3_5/execution/ffn.cpp
++++ b/src/models/qwen3_5/execution/ffn.cpp
+@@ -8,6 +8,7 @@
+ #include "ninfer/ops/linear.h"
+ #include "ninfer/ops/linear_add.h"
+ #include "ninfer/ops/linear_swiglu.h"
++#include "ninfer/ops/linear_swiglu_add.h"
+ #include "ninfer/ops/residual_add.h"
+ #include "ninfer/ops/silu_mul.h"
+ 
+@@ -101,6 +102,11 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
+     if (rotated_dense(p) && !partial) {
+         return rotated_dense_workspace_bytes(p, first, last, wide_verification);
+     }
++    if (is_gguf(gu.qtype) && is_gguf(down.qtype) && !partial) {
++        const QType* up=p.up ? &p.up->weight.qtype : nullptr;
++        return ops::linear_swiglu_add_workspace_capacity_bytes(gu.qtype,up,gu.n,gu.k,
++            down.qtype,down.n,p.gate_up.policy,p.down.policy,first,last);
++    }
+     if (is_gguf(gu.qtype) || partial) {
+         // A share rotates its input and its SwiGLU output when its parameters are rotated.
+         WorkspaceLayoutBuilder layout;
+@@ -261,6 +267,11 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
+     }
+     const auto& gu   = p.gate_up.weight;
+     const auto& down = p.down.weight;
++    if (is_gguf(gu.qtype) && is_gguf(down.qtype)) {
++        ops::linear_swiglu_add(hidden,gu,p.up ? &p.up->weight : nullptr,down,residual,
++            p.gate_up.policy,p.down.policy,workspace,stream);
++        return;
++    }
+     if (is_gguf(gu.qtype)) {
+         Tensor activation = workspace.alloc(DType::BF16, {p.up ? gu.n : gu.n / 2, columns});
+         {
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index 607fca9b54140fe1e2ee7db3801eb4ab8b28e490..f1094467f62cea9904483bb7effc5c23d4a18a58 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -2,6 +2,12 @@
+ #include "models/qwen3_5/execution/rotation.h"
+ 
+ #include "core/weight_view.h"
++#include "core/arena.h"
++#include "ops/linear/gguf/gguf_linear.h"
++#include "ops/linear/gguf/gguf_nvfp4.h"
++#include <map>
++#include <set>
++#include <tuple>
+ #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+ #include "ops/linear/ptq1/ptq1_dispatch.h"
+ 
+@@ -701,6 +707,120 @@ private:
+     const Model& model_;
+ };
+ 
++class Fp4Operands {
++public:
++    void linear(LinearParameters& p) { measure(p.weight,p.policy); add(p.weight, p.policy, p.weight.gguf_amax); }
++
++    void projection(ops::ProjectionWeights& projection) {
++        if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
++            linear(*single);
++        } else if (auto* gguf = std::get_if<ops::PartProjectionWeights>(&projection)) {
++            for (auto& part : gguf->parts) {
++                measure(part.weight,gguf->policy); add(part.weight, gguf->policy, part.weight.gguf_amax);
++            }
++        }
++    }
++
++    void dense(DenseParameters& p) {
++        if (p.up) {
++            measure(p.gate_up.weight,p.gate_up.policy); measure(p.up->weight,p.gate_up.policy);
++            const float pair = std::max(p.gate_up.weight.gguf_amax, p.up->weight.gguf_amax);
++            add(p.gate_up.weight, p.gate_up.policy, pair);
++            add(p.up->weight, p.gate_up.policy, pair);
++        } else {
++            linear(p.gate_up);
++        }
++        linear(p.down);
++    }
++
++    void ffn(FfnParameters& p) {
++        if (auto* d = std::get_if<DenseParameters>(&p)) { dense(*d); }
++    }
++
++    // Builds every table into one pinned host allocation and points the operands at theirs.
++    // Operands over the same rows at the same max |w| share one. An operand outside device memory
++    // keeps none (its products search).
++    std::optional<PinnedHostBuffer> build() {
++        using Key = std::tuple<const void*, std::int32_t, std::int32_t, float>;
++        std::map<Key, std::size_t> offsets;
++        std::vector<std::size_t> at(operands_.size());
++        std::vector<bool> first(operands_.size(), false);
++        std::size_t bytes = 0;
++        for (std::size_t i = 0; i < operands_.size(); ++i) {
++            const Operand& o = operands_[i];
++            const auto [found, inserted] =
++                offsets.try_emplace(Key{o.weight->qdata, o.weight->n, o.weight->k, o.amax}, bytes);
++            at[i]    = found->second;
++            first[i] = inserted;
++            if (inserted) { bytes += o.bytes; }
++        }
++        if (bytes == 0) { return std::nullopt; }
++        PinnedHostBuffer storage(bytes);
++        auto* base = static_cast<std::uint8_t*>(storage.data());
++        std::set<int> devices;
++        for (std::size_t i = 0; i < operands_.size(); ++i) {
++            if (!first[i]) { continue; }
++            const Operand& o = operands_[i];
++            const DeviceBinding bind(o.device);
++            ops::gguf::fp4_choices(ops::detail::gguf_type(o.weight->qtype),o.weight->qdata,row_bytes(*o.weight),o.weight->n,o.weight->k,o.amax,base+at[i],nullptr);
++            devices.insert(o.device);
++        }
++        for (const int device : devices) {
++            const DeviceBinding bind(device);
++            if (const cudaError_t e = cudaDeviceSynchronize(); e != cudaSuccess) {
++                throw std::runtime_error(std::string("NVFP4 scale-choice tables: ") +
++                                         cudaGetErrorString(e));
++            }
++        }
++        for (std::size_t i = 0; i < operands_.size(); ++i) {
++            operands_[i].weight->fp4_choices      = base + at[i];
++            operands_[i].weight->fp4_choices_amax = operands_[i].amax;
++        }
++        return storage;
++    }
++
++private:
++    static std::int64_t row_bytes(const Weight& w) {
++        auto shape=gguf_block_shape(w.qtype); return std::int64_t(w.k/shape.elements)*shape.bytes;
++    }
++    void measure(Weight& w,ops::LinearPolicy policy) {
++        if (!ops::gguf::nvfp4_enabled() || !ops::allows_a4(policy) || !is_gguf(w.qtype)) return;
++        const int device=memory_device(w.qdata);
++        if (device<0) return;
++        const DeviceBinding binding(device);
++        if (!ops::gguf::has_lt_product(ops::detail::gguf_type(w.qtype),w.k,ops::gguf::LtForm::Nvfp4)) return;
++        const auto key=std::tuple{w.qdata,w.n,w.k};
++        auto found=maxima_.find(key);
++        if (found==maxima_.end()) {
++            const DeviceBinding bind(device); DeviceBuffer word(sizeof(unsigned));
++            ops::gguf::matrix_amax(ops::detail::gguf_type(w.qtype),w.qdata,row_bytes(w),w.n,w.k,static_cast<unsigned*>(word.p),nullptr);
++            CUDA_CHECK(cudaStreamSynchronize(nullptr)); float value=0; word.copy_to_host(&value,sizeof(value));
++            found=maxima_.emplace(key,std::max(value,std::numeric_limits<float>::min())).first;
++        }
++        w.gguf_amax=found->second;
++    }
++    std::map<std::tuple<const void*,int,int>,float> maxima_;
++    struct Operand {
++        Weight* weight;
++        float amax;
++        std::size_t bytes;
++        int device;
++    };
++
++    void add(Weight& w, ops::LinearPolicy policy, float amax) {
++        if (!is_gguf(w.qtype) || !(amax > 0.0F)) { return; }
++        const int device = memory_device(w.qdata);
++        if (device < 0) { return; }
++        const DeviceBinding binding(device);
++        const std::size_t bytes = ops::allows_a4(policy) && ops::gguf::has_lt_product(ops::detail::gguf_type(w.qtype),w.k,ops::gguf::LtForm::Nvfp4) ? ops::gguf::fp4_choice_bytes(w.n,w.k) : 0;
++        if (bytes == 0) { return; }
++        operands_.push_back({&w, amax, bytes, device});
++    }
++
++    std::vector<Operand> operands_;
++};
++
++
+ } // namespace
+ 
+ Parameters::Parameters(const Model& source) : model(source) {
+@@ -760,6 +880,39 @@ Parameters::Parameters(const Model& source) : model(source) {
+             ProposalParameters{prepare.head(w.proposal->head), std::nullopt, w.proposal->rows};
+         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
+     }
++    Fp4Operands operands;
++    operands.linear(text.output_head);
++    const auto block=[&](auto& layer) {
++        if (auto* a=std::get_if<AttentionParameters>(&layer.mixer)) {
++            operands.projection(a->projection); operands.linear(a->output);
++        } else {
++            auto& g=std::get<GdnParameters>(layer.mixer);
++            operands.projection(g.projection); operands.projection(g.control); operands.linear(g.output);
++        }
++        operands.ffn(layer.ffn);
++    };
++    for(auto& layer:text.layers) block(layer);
++    for(auto& rank:text.rank_layers) for(auto& layer:rank) block(layer);
++    if(mtp) {
++        operands.linear(mtp->input_projection);
++        if(mtp->projection.packed.weight.qdata) operands.linear(mtp->projection.packed);
++        if(mtp->projection.rows) for(auto& row:*mtp->projection.rows) operands.linear(row);
++        operands.linear(mtp->output); operands.ffn(mtp->ffn); operands.linear(mtp->output_head);
++    }
++    if(draft) {
++        operands.linear(draft->feature_projection);
++        for(auto& layer:draft->layers) {
++            operands.linear(layer.query_key_value); operands.linear(layer.context_key); operands.linear(layer.context_value);
++            operands.linear(layer.output); operands.dense(layer.mlp);
++            if(layer.attention_conv) operands.linear(layer.attention_conv->kernel_projection);
++            if(layer.mlp_conv) operands.linear(layer.mlp_conv->kernel_projection);
++        }
++        if(draft->selector) operands.linear(draft->selector->hidden_projection);
++        operands.linear(draft->output_head);
++    }
++    if(proposal) operands.linear(proposal->head);
++    fp4_choices_=operands.build();
++
+ }
+ 
+ } // namespace ninfer::models::qwen3_5::execution
+diff --git a/src/models/qwen3_5/execution/parameters.h b/src/models/qwen3_5/execution/parameters.h
+index 498c22e211933988cba2aced22b80286170ff709..4aefacfd8f52717b3d7c1bd47eca237cbbba7196 100644
+--- a/src/models/qwen3_5/execution/parameters.h
++++ b/src/models/qwen3_5/execution/parameters.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "models/qwen3_5/model.h"
++#include "core/arena.h"
+ #include "ninfer/ops/weight_input.h"
+ 
+ #include <array>
+@@ -209,6 +210,9 @@ public:
+     std::optional<VisionParameters> vision;
+     std::optional<DraftParameters> draft;
+     std::optional<ProposalParameters> proposal;
++    [[nodiscard]] std::size_t fp4_choice_bytes() const noexcept { return fp4_choices_ ? fp4_choices_->size() : 0; }
++private:
++    std::optional<PinnedHostBuffer> fp4_choices_;
+ };
+ 
+ } // namespace ninfer::models::qwen3_5::execution
+diff --git a/src/models/qwen3_5/measurement.cpp b/src/models/qwen3_5/measurement.cpp
+index e66e96466132e6930dee033d7083e82063f12524..3116aef3daff6c963be04adffe32ea53277ed443 100644
+--- a/src/models/qwen3_5/measurement.cpp
++++ b/src/models/qwen3_5/measurement.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "models/qwen3_5/frontend/digest.h"
+ #include "ops/linear/gguf/gguf_mxfp8.h"
++#include "ops/linear/gguf/gguf_nvfp4.h"
+ 
+ #include <nlohmann/json.hpp>
+ 
+@@ -29,6 +30,9 @@ std::string prefill_signature(const Model& model) {
+         facts["gguf_prefill_compute"] = {"mxfp8-e4m3-e8m0-f32-tile-v1",
+                                          ops::gguf::mxfp8::kMinColumns};
+     }
++    if (ops::gguf::nvfp4_enabled()) {
++        facts["gguf_nvfp4_prefill"] = {"e2m1-e4m3-mse4-bf16-v1",129};
++    }
+     // Explicit NVFP4 weight modes alter represented activations. Bind cached state and
+     // measured prefill costs to that choice; leave the default signature unchanged.
+     if (model.options().nvfp4_w4a16 || model.options().nvfp4_w4a8_int) {
+diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
+index f1b9da185ccc1421ee823194e21879481a70a03f..924624ae29b03bd47f6c8ad23d848994a28a2e44 100644
+--- a/src/ops/CMakeLists.txt
++++ b/src/ops/CMakeLists.txt
+@@ -23,6 +23,8 @@ if(NINFER_ARCH_BLACKWELL)
+   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_non_rdc)
+ endif()
+ 
++target_sources(ninfer_ops PRIVATE wrapper/linear_swiglu_add.cpp)
++
+ include(basic_sources.cmake)
+ include("${CMAKE_CURRENT_LIST_DIR}/token_sums/sources.cmake")
+ include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
+diff --git a/src/ops/linear/gguf/gguf_linear.cpp b/src/ops/linear/gguf/gguf_linear.cpp
+index 814fb1b76f00e4a142964810a9cab672538e714c..fe471cb67cf255d490489817c49fe57afa9eda7c 100644
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -1,5 +1,6 @@
+ #include "ops/linear/gguf/gguf_linear.h"
+ #include "ops/linear/gguf/gguf_mxfp8.h"
++#include "ops/linear/gguf/gguf_nvfp4.h"
+ #include <cstdlib>
+ #include <string_view>
+ 
+@@ -289,11 +290,22 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
+         if(min_tokens<1024)activation=std::max(activation,gguf::mxfp8::tile_activation_bytes(k,std::min(max_tokens,1023)));
+         if(count)widest+=scratch+count*activation+(count+1)*256;
+     }
++    if (gguf::nvfp4_enabled() && max_tokens >= 129) {
++        constexpr auto form = gguf::LtForm::Nvfp4;
++        std::size_t scratch = 0, count = 0;
++        for (const auto& shape : shapes) {
++            if (gguf::has_lt_product(gguf_type(shape.qtype), shape.k, form)) {
++                ++count;
++                scratch = std::max(scratch, gguf::lt_planned_scratch_bytes(k, shape.rows, max_tokens, false, form));
++            }
++        }
++        if (count) widest += scratch + count * gguf::lt_activation_bytes(k, max_tokens, form) + (count+1)*256;
++    }
+     return widest;
+ }
+ 
+ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+-                  WorkspaceArena& workspace, cudaStream_t stream) {
++                  WorkspaceArena& workspace, cudaStream_t stream, LinearPolicy policy) {
+     require_activation(x, "gguf product");
+     if (products.empty()) { return; }
+     for (const auto& p : products) { require_product(x, p); }
+@@ -350,6 +362,16 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+             mx_bytes=std::max(mx_bytes,gguf::mxfp8::scratch_bytes(k,p.weight->n,t));
+     }
+     void* mx_scratch=mx_bytes?workspace.alloc_bytes(mx_bytes).data:nullptr;
++    constexpr auto fp4_form = gguf::LtForm::Nvfp4;
++    std::size_t fp4_bytes = 0;
++    const bool fp4 = gguf::nvfp4_enabled() && allows_a4(policy) && t >= 129;
++    if (fp4) {
++        for (const auto& p : products) {
++            if (gguf::lt_takes_output(output(p,0)) && gguf::has_lt_product(gguf_type(p.weight->qtype),k,fp4_form))
++                fp4_bytes = std::max(fp4_bytes, gguf::lt_planned_scratch_bytes(k,p.weight->n,t,false,fp4_form));
++        }
++    }
++    void* fp4_scratch = fp4_bytes ? workspace.alloc_bytes(fp4_bytes).data : nullptr;
+     void* vector_activation = nullptr;
+     void* scratch           = nullptr;
+     if (dequantized) {
+@@ -364,6 +386,18 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+         const bool direct = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
+         float* out        = direct ? p.f32 + p.row : plane;
+         const std::int64_t stride = direct ? p.f32_rows : w.n;
++        if (fp4_scratch && w.gguf_amax > 0 && gguf::lt_takes_output(output(p,0)) && gguf::has_lt_product(type,k,fp4_form)) {
++            constexpr int fp4_layout = -2;
++            auto found=std::find_if(activations.begin(),activations.end(),[&](const Activation& a){return a.layout==fp4_layout && a.columns==w.input_columns;});
++            if (found==activations.end()) {
++                void* data=workspace.alloc_bytes(gguf::lt_activation_bytes(k,t,fp4_form)).data;
++                gguf::quantize_lt_activation(xb,k,t,w.input_columns,fp4_form,data,stream);
++                activations.push_back({fp4_layout,w.input_columns,data}); found=activations.end()-1;
++            }
++            gguf::lt_product(type,w.qdata,row_bytes(w),w.n,k,fp4_form,w.gguf_amax,
++                             {w.fp4_choices,w.fp4_choices_amax},found->data,t,output(p,0),fp4_scratch,fp4_bytes,stream);
++            continue;
++        }
+         if(gguf::mxfp8::enabled() && gguf::mxfp8::takes_tile(type,k,t)) {
+             constexpr int tile_layout=-3;
+             auto found=std::find_if(activations.begin(),activations.end(),[&](const Activation& a){return a.layout==tile_layout&&a.columns==w.input_columns;});
+@@ -444,7 +478,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+ }
+ 
+ void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
+-                 cudaStream_t stream) {
++                 cudaStream_t stream, LinearPolicy policy) {
+     GgufProduct product{&w, &out, 0, GgufEpilogue::Store};
+     if (out.dtype == DType::FP32) {
+         if (!out.is_contiguous() || out.ne[0] != w.n || out.ne[1] != x.ne[1]) {
+@@ -453,17 +487,29 @@ void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena&
+         product.f32      = static_cast<float*>(out.data);
+         product.f32_rows = out.ne[0];
+     }
+-    gguf_project(x, {&product, 1}, workspace, stream);
++    gguf_project(x, {&product, 1}, workspace, stream, policy);
+ }
+ 
+ void gguf_linear_add(const Tensor& x, const Weight& w, Tensor& residual,
+-                     WorkspaceArena& workspace, cudaStream_t stream) {
++                     WorkspaceArena& workspace, cudaStream_t stream, LinearPolicy policy) {
+     const GgufProduct product{&w, &residual, 0, GgufEpilogue::Accumulate};
+-    gguf_project(x, {&product, 1}, workspace, stream);
++    gguf_project(x, {&product, 1}, workspace, stream, policy);
+ }
+ 
+ std::size_t gguf_swiglu_workspace_bytes(const GgufShape& gate, const GgufShape* up,
+                                         std::int32_t min_tokens, std::int32_t max_tokens) {
++    if (gguf::nvfp4_enabled() && max_tokens >= 129 &&
++        gguf::has_lt_product(gguf_type(gate.qtype),gate.k,gguf::LtForm::Nvfp4) &&
++        (up == nullptr || gguf::has_lt_product(gguf_type(up->qtype),up->k,gguf::LtForm::Nvfp4))) {
++        const int rows = up ? gate.rows : gate.rows/2;
++        const auto fp4 = gguf::LtForm::Nvfp4;
++        // The fallback can coexist within this interval. Sum is a conservative capacity bound.
++        const GgufShape shapes[]={{gate.qtype,rows,gate.k},{up?up->qtype:gate.qtype,rows,gate.k}};
++        return gguf_project_workspace_bytes(shapes,min_tokens,max_tokens) +
++               std::size_t(rows)*max_tokens*sizeof(float)+
++               2*gguf::lt_activation_bytes(gate.k,max_tokens,fp4)+
++               gguf::lt_planned_scratch_bytes(gate.k,rows,max_tokens,true,fp4)+1024;
++    }
+     if (up == nullptr) {
+         const GgufShape halves[] = {{gate.qtype, gate.rows / 2, gate.k},
+                                     {gate.qtype, gate.rows / 2, gate.k}};
+@@ -477,7 +523,7 @@ std::size_t gguf_swiglu_workspace_bytes(const GgufShape& gate, const GgufShape*
+ 
+ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& out,
+                  WorkspaceArena& workspace, cudaStream_t stream,
+-                 gguf::GateActivation activation) {
++                 gguf::GateActivation activation, LinearPolicy policy, void* output_activation) {
+     require_activation(x, "gguf swiglu");
+     require_gguf(gate, "gguf swiglu gate");
+     const std::int32_t t    = x.ne[1];
+@@ -504,6 +550,7 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor&
+         up_rows     = gate;
+         up_rows.n   = rows;
+         up_rows.qdata = static_cast<const std::byte*>(gate.qdata) + std::int64_t(rows) * row_bytes(gate);
++        up_rows.fp4_choices = gguf::fp4_choice_rows(gate.fp4_choices,rows,gate.k);
+     } else {
+         require_gguf(*up, "gguf swiglu up");
+         if (gate.n != rows || up->n != rows || up->k != gate.k) {
+@@ -511,6 +558,28 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor&
+         }
+         up_rows = *up;
+     }
++    constexpr auto fp4_form = gguf::LtForm::Nvfp4;
++    if (gguf::nvfp4_enabled() && allows_a4(policy) && t >= 129 && rows % 8 == 0 &&
++        gate_rows.gguf_amax > 0 && up_rows.gguf_amax > 0 &&
++        gguf::has_lt_product(gguf_type(gate_rows.qtype),gate.k,fp4_form) &&
++        gguf::has_lt_product(gguf_type(up_rows.qtype),gate.k,fp4_form)) {
++        void* gx=workspace.alloc_bytes(gguf::lt_activation_bytes(gate.k,t,fp4_form)).data;
++        gguf::quantize_lt_activation(static_cast<const __nv_bfloat16*>(x.data),gate.k,t,gate_rows.input_columns,fp4_form,gx,stream);
++        void* ux=nullptr;
++        if (gate_rows.input_columns != up_rows.input_columns) {
++            ux=workspace.alloc_bytes(gguf::lt_activation_bytes(gate.k,t,fp4_form)).data;
++            gguf::quantize_lt_activation(static_cast<const __nv_bfloat16*>(x.data),gate.k,t,up_rows.input_columns,fp4_form,ux,stream);
++        }
++        const auto bytes=gguf::lt_planned_scratch_bytes(gate.k,rows,t,true,fp4_form);
++        void* scratch=workspace.alloc_bytes(bytes).data;
++        gguf::lt_gated_product(gguf_type(gate_rows.qtype),gate_rows.qdata,row_bytes(gate_rows),
++                              gguf_type(up_rows.qtype),up_rows.qdata,row_bytes(up_rows),rows,gate.k,
++                              fp4_form,std::max(gate_rows.gguf_amax,up_rows.gguf_amax),
++                              {gate_rows.fp4_choices,gate_rows.fp4_choices_amax},
++                              {up_rows.fp4_choices,up_rows.fp4_choices_amax},gx,ux,t,
++                              static_cast<__nv_bfloat16*>(out.data),rows,activation,output_activation,scratch,bytes,stream);
++        return;
++    }
+     auto* gate_plane =
+         static_cast<float*>(workspace.alloc_bytes(std::size_t(rows) * t * sizeof(float)).data);
+     GgufProduct products[2];
+@@ -522,7 +591,7 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor&
+     products[1].epilogue   = GgufEpilogue::GateProduct;
+     products[1].gate       = gate_plane;
+     products[1].activation = activation;
+-    gguf_project(x, products, workspace, stream);
++    gguf_project(x, products, workspace, stream, policy);
+ }
+ 
+ void gguf_embedding(const Weight& table, const Tensor& ids, Tensor& out, cudaStream_t stream) {
+diff --git a/src/ops/linear/gguf/gguf_linear.h b/src/ops/linear/gguf/gguf_linear.h
+index 39a56de7568bcce8e32bd0cc04d16f93c2a8aaa3..13930983a34e58741f460fc62167bb5147e9a1a0 100644
+--- a/src/ops/linear/gguf/gguf_linear.h
++++ b/src/ops/linear/gguf/gguf_linear.h
+@@ -10,6 +10,7 @@
+ // for A16Only Uses whose GGUF arithmetic already otherwise requires q8_1.
+ 
+ #include "core/arena.h"
++#include "ninfer/ops/linear.h"
+ #include "core/tensor.h"
+ #include "core/weight.h"
+ #include "ops/linear/gguf/ggml_bridge.h"
+@@ -63,18 +64,21 @@ struct GgufShape {
+ // Runs every product against one BF16 activation x [K,T], quantizing x once per activation layout
+ // (and once more per distinct input gather).
+ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+-                  WorkspaceArena& workspace, cudaStream_t stream);
++                  WorkspaceArena& workspace, cudaStream_t stream,
++                  LinearPolicy policy = LinearPolicy::A16Only);
+ 
+ void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
+-                 cudaStream_t stream);
++                 cudaStream_t stream, LinearPolicy policy = LinearPolicy::A16Only);
+ void gguf_linear_add(const Tensor& x, const Weight& w, Tensor& residual,
+-                     WorkspaceArena& workspace, cudaStream_t stream);
++                     WorkspaceArena& workspace, cudaStream_t stream,
++                  LinearPolicy policy = LinearPolicy::A16Only);
+ 
+ // out = act(gate x) * (up x), act SiLU unless `activation` says GELU (tanh). `up` null means
+ // `gate` is one [gate; up] parent of 2 * out rows.
+ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& out,
+                  WorkspaceArena& workspace, cudaStream_t stream,
+-                 gguf::GateActivation activation = gguf::GateActivation::Silu);
++                 gguf::GateActivation activation = gguf::GateActivation::Silu,
++                 LinearPolicy policy = LinearPolicy::A16Only, void* output_activation = nullptr);
+ // `up` null: `gate` is the one [gate; up] parent.
+ [[nodiscard]] std::size_t gguf_swiglu_workspace_bytes(const GgufShape& gate, const GgufShape* up,
+                                                       std::int32_t min_tokens,
+diff --git a/src/ops/linear/gguf/gguf_mxfp8.h b/src/ops/linear/gguf/gguf_mxfp8.h
+index 1068a080f8e2e646c1da06c1d79cae875b03ba9a..98ac9250c566996c02f89c465712d9af7d6f47d2 100644
+--- a/src/ops/linear/gguf/gguf_mxfp8.h
++++ b/src/ops/linear/gguf/gguf_mxfp8.h
+@@ -1,13 +1,13 @@
+ #pragma once
+ 
+ #include "ggml_bridge.h"
++#include "gguf_prefill_modes.h"
+ 
+ // Experimental GGUF prefill: per-32 E4M3 operands / E8M0 power-of-two scales,
+ // native block-scaled GEMM with FP32 accumulation/output. All storage is caller-owned.
+ // The environment switch is read once at process start and must precede workspace planning.
+ namespace ninfer::ops::gguf::mxfp8 {
+ inline constexpr int kMinColumns = 256; // above every supported decode/verify batch (<=128)
+-[[nodiscard]] bool enabled();
+ [[nodiscard]] bool supported(GgmlType type, int k);
+ [[nodiscard]] bool takes_tile(GgmlType type, int k, int columns);
+ [[nodiscard]] std::size_t tile_activation_bytes(int k, int columns);
+diff --git a/src/ops/linear/gguf/gguf_nvfp4.cu b/src/ops/linear/gguf/gguf_nvfp4.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..bba0775c1d2fcef7a750d06aab3cc01a34eabca9
+--- /dev/null
++++ b/src/ops/linear/gguf/gguf_nvfp4.cu
+@@ -0,0 +1,1083 @@
++// NVFP4 algorithms adapted from 2-com-org/ninfer-5060-qwen 08c4fb70.
++// Uses the existing GGUF decoder; all activation/image storage belongs to the caller.
++#include "gguf_nvfp4.h"
++#include "ggml_bridge_vec.cuh"
++#include "lt_fp4.cuh"
++#include <cublasLt.h>
++#include <algorithm>
++#include <array>
++#include <map>
++#include <mutex>
++#include <cstdlib>
++#include <string_view>
++
++namespace ninfer::ops::gguf {
++bool nvfp4_enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_GGUF_PREFILL_NVFP4");
++        if (value == nullptr || std::string_view(value) == "0") return false;
++        if (std::string_view(value) == "1") return true;
++        throw std::invalid_argument("NINFER_GGUF_PREFILL_NVFP4 must be 0 or 1");
++    }();
++    return enabled;
++}
++
++namespace detail {
++namespace {
++constexpr int kImageThreads = 256;
++
++struct Fp4ImageArgs {
++    const std::uint8_t* weight;
++    std::int64_t row_bytes;
++    int rows;
++    int k;
++    std::uint8_t* image;
++    std::uint8_t* scales;
++    float global;           // lt_fp4_global of the weight's max |w|
++    const unsigned* x_amax; // the activation's max |x| (FP32 bits)
++    float* alpha;
++    // The rows' scale-choice table: fp4_encode16's candidate index of each 16-value group, two
++    // bits, a 32-value slice's two in a nibble (its first group in the low bits), slice s of the
++    // rows (row major) in byte s / 2, the even slice in the low nibble. 128-byte aligned, read in
++    // whole 128-byte blocks of 256 slices. With it the image encodes each group's named candidate
++    // (fp4_encode16_pick), the search's result when the table holds the search's winners under
++    // this global; null: the image searches.
++    const std::uint8_t* choices = nullptr;
++};
++
++template <ggml_type type>
++void image_fp4_launch(const Fp4ImageArgs& args, cudaStream_t stream);
++
++// The table pass: the search's winners of rows [0, rows) under `global` into `table` (the layout
++// of Fp4ImageArgs::choices, whole 128-byte blocks written); no image, scales or alpha.
++template <ggml_type type>
++void fp4_choices_launch(const Fp4ImageArgs& args, std::uint8_t* table, cudaStream_t stream);
++
++// max |w| over the decoded values of rows [0, rows) into *amax as FP32 bits (atomicMax; the caller
++// zeroes it).
++struct AmaxArgs {
++    const std::uint8_t* weight;
++    std::int64_t row_bytes;
++    int rows;
++    int k;
++    unsigned* amax;
++};
++
++template <ggml_type type>
++void amax_launch(const AmaxArgs& args, cudaStream_t stream);
++
++template <ggml_type type>
++__device__ __forceinline__ void slice_values(const vec::Slice& s, float (&v)[32]) {
++#pragma unroll
++    for (int i = 0; i < 32; ++i) {
++        const unsigned byte = (unsigned(s.w[i / 4]) >> (8 * (i % 4))) & 0xFFu;
++        if constexpr (type == GGML_TYPE_Q2_K) {
++            v[i] = i < 16 ? s.f[0] * float(byte) - s.f[2] : s.f[1] * float(byte) - s.f[3];
++        } else if constexpr (type == GGML_TYPE_IQ1_S) {
++            v[i] = s.f[0] * (float(byte) + s.f[1]);
++        } else if constexpr (type == GGML_TYPE_IQ1_M) {
++            // This backend's exact IQ1_M decoder folds the per-eight offset into
++            // signed integers 8*c-7 or 8*c-9, and divides each half's scale by 8.
++            v[i] = (i < 16 ? s.f[0] : s.f[1]) * float(static_cast<signed char>(byte));
++        } else if constexpr (type == GGML_TYPE_Q4_K) {
++            v[i] = s.f[0] * float(byte) - s.f[1];
++        } else {
++            const float c = float(static_cast<signed char>(byte));
++            if constexpr (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
++                          type == GGML_TYPE_Q6_K) {
++                v[i] = (i < 16 ? s.f[0] : s.f[1]) * c;
++            } else {
++                v[i] = s.f[0] * c;
++            }
++        }
++    }
++}
++
++// Slice `at` of a [rows][k] GGUF matrix (row-major over the rows' 32-value slices) as 32 floats,
++// its row and its first value's column; false past the last row.
++template <ggml_type type>
++__device__ __forceinline__ bool
++decode_slice(const std::uint8_t* weight, std::int64_t row_bytes, int rows, int k, std::int64_t at,
++             const std::uint32_t* table, int& row, std::int64_t& first, float (&v)[32]) {
++    using D                      = vec::Decoder<type>;
++    constexpr int kSlices        = D::kBlockElems / 32;
++    const int blocks             = k / D::kBlockElems;
++    const int u                  = int(at % kSlices);
++    const std::int64_t row_block = at / kSlices;
++    const int b                  = int(row_block % blocks);
++    row                          = int(row_block / blocks);
++    first                        = std::int64_t(b) * D::kBlockElems + 32 * u;
++    if (row >= rows) { return false; }
++    vec::Slice s;
++    D::decode(weight + std::int64_t(row) * row_bytes + std::int64_t(b) * D::kBlockBytes, u, table,
++              s);
++    slice_values<type>(s, v);
++    return true;
++}
++
++// The decoder's grid table in shared memory (every thread of the block calls this first).
++template <ggml_type type>
++__device__ __forceinline__ const std::uint32_t* stage_table() {
++    using D = vec::Decoder<type>;
++    __shared__ std::uint32_t table[D::kTableWords > 0 ? D::kTableWords : 1];
++    if constexpr (D::kTableWords > 0) {
++        for (int i = threadIdx.x; i < D::kTableWords; i += blockDim.x) { table[i] = D::table()[i]; }
++        __syncthreads();
++    }
++    return table;
++}
++
++template <ggml_type type>
++__launch_bounds__(kImageThreads) __global__ void amax_kernel(AmaxArgs p) {
++    const std::uint32_t* table = stage_table<type>();
++    const std::int64_t at      = std::int64_t(blockIdx.x) * kImageThreads + threadIdx.x;
++    float v[32];
++    int row            = 0;
++    std::int64_t first = 0;
++    float m            = 0.0f;
++    if (decode_slice<type>(p.weight, p.row_bytes, p.rows, p.k, at, table, row, first, v)) {
++#pragma unroll
++        for (int i = 0; i < 32; ++i) { m = fmaxf(m, fabsf(v[i])); }
++    }
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFF, m, offset));
++    }
++    if ((threadIdx.x & 31) == 0) { atomicMax(p.amax, __float_as_uint(m)); }
++}
++
++// How the NVFP4 image pass takes each group's scale: Search runs fp4_encode16's candidate search,
++// Pick encodes the candidate the choice table names (Fp4ImageArgs::choices), Choices runs the
++// search and writes only the table.
++enum Fp4ImageMode : int { kFp4Search, kFp4Pick, kFp4Choices };
++
++// A block covers 256 slices, whose choices are its 128 table bytes: eight 16-byte words, which
++// Pick loads before the decode (the table is mapped host memory; the bus latency then overlaps the
++// decode) and Choices stores after the search.
++template <ggml_type type, int Mode>
++__launch_bounds__(kImageThreads) __global__
++    void image_fp4_kernel(Fp4ImageArgs p, std::uint8_t* table_out) {
++#if defined(NINFER_SM120_FP8)
++    constexpr int kWords = kImageThreads / 32;
++    __shared__ uint4 block_choices[kWords];
++    uint4 loaded = make_uint4(0u, 0u, 0u, 0u);
++    if constexpr (Mode == kFp4Pick) {
++        if (threadIdx.x < kWords) {
++            loaded = reinterpret_cast<const uint4*>(
++                p.choices + std::int64_t(blockIdx.x) * (kImageThreads / 2))[threadIdx.x];
++        }
++    }
++    const std::uint32_t* table = stage_table<type>();
++    const std::int64_t at      = std::int64_t(blockIdx.x) * kImageThreads + threadIdx.x;
++    if constexpr (Mode != kFp4Choices) {
++        if (at == 0) {
++            p.alpha[0] = 1.0f / (p.global * lt_fp4_global(__uint_as_float(*p.x_amax)));
++            p.alpha[1] = 0.0f;
++            p.alpha[2] = 1.0f;
++        }
++    }
++    float v[32];
++    int row            = 0;
++    std::int64_t first = 0;
++    const bool live =
++        decode_slice<type>(p.weight, p.row_bytes, p.rows, p.k, at, table, row, first, v);
++    if constexpr (Mode == kFp4Pick) {
++        if (threadIdx.x < kWords) { block_choices[threadIdx.x] = loaded; }
++        __syncthreads();
++    }
++    unsigned nibble = 0;
++    if (live) {
++#    pragma unroll
++        for (int i = 0; i < 32; ++i) { v[i] *= p.global; }
++        uint2 c0, c1;
++        unsigned short s0, s1;
++        if constexpr (Mode == kFp4Pick) {
++            nibble =
++                (unsigned(reinterpret_cast<const std::uint8_t*>(block_choices)[threadIdx.x / 2]) >>
++                 (4 * (threadIdx.x % 2))) &
++                0xFu;
++            s0 = fp4_encode16_pick(v, nibble & 3u, c0);
++            s1 = fp4_encode16_pick(v + 16, nibble >> 2, c1);
++        } else {
++            unsigned w0 = 0, w1 = 0;
++            s0     = fp4_encode16(v, c0, Mode == kFp4Choices ? &w0 : nullptr);
++            s1     = fp4_encode16(v + 16, c1, Mode == kFp4Choices ? &w1 : nullptr);
++            nibble = w0 | (w1 << 2);
++        }
++        if constexpr (Mode != kFp4Choices) {
++            *reinterpret_cast<uint4*>(p.image + std::int64_t(row) * (p.k / 2) + first / 2) =
++                make_uint4(c0.x, c0.y, c1.x, c1.y);
++            *reinterpret_cast<unsigned short*>(p.scales +
++                                               lt_scale_offset(row, int(first / 16), p.k / 16)) =
++                static_cast<unsigned short>((s0 & 0xFFu) | ((s1 & 0xFFu) << 8));
++        }
++    }
++    if constexpr (Mode == kFp4Choices) {
++        // A slice past the rows writes 0.
++        const unsigned next = __shfl_down_sync(0xFFFFFFFFu, nibble, 1);
++        if (threadIdx.x % 2 == 0) {
++            reinterpret_cast<std::uint8_t*>(block_choices)[threadIdx.x / 2] =
++                static_cast<std::uint8_t>(nibble | (next << 4));
++        }
++        __syncthreads();
++        if (threadIdx.x < kWords) {
++            reinterpret_cast<uint4*>(table_out +
++                                     std::int64_t(blockIdx.x) * (kImageThreads / 2))[threadIdx.x] =
++                block_choices[threadIdx.x];
++        }
++    }
++#else
++    __trap(); // a 120a build only
++#endif
++}
++
++template <ggml_type type>
++void image_fp4_launch(const Fp4ImageArgs& args, cudaStream_t stream) {
++#if defined(NINFER_SM120_FP8)
++    const std::int64_t slices = std::int64_t(args.rows) * (args.k / 32);
++    const auto grid           = static_cast<unsigned>((slices + kImageThreads - 1) / kImageThreads);
++    if (args.choices != nullptr) {
++        image_fp4_kernel<type, kFp4Pick><<<grid, kImageThreads, 0, stream>>>(args, nullptr);
++    } else {
++        image_fp4_kernel<type, kFp4Search><<<grid, kImageThreads, 0, stream>>>(args, nullptr);
++    }
++    check(cudaGetLastError(), "NVFP4 image launch");
++#else
++    (void)args;
++    (void)stream;
++    throw std::invalid_argument("gguf NVFP4 image: this build has no NVFP4 form");
++#endif
++}
++
++template <ggml_type type>
++void fp4_choices_launch(const Fp4ImageArgs& args, std::uint8_t* table, cudaStream_t stream) {
++#if defined(NINFER_SM120_FP8)
++    const std::int64_t slices = std::int64_t(args.rows) * (args.k / 32);
++    const auto grid           = static_cast<unsigned>((slices + kImageThreads - 1) / kImageThreads);
++    image_fp4_kernel<type, kFp4Choices><<<grid, kImageThreads, 0, stream>>>(args, table);
++    check(cudaGetLastError(), "NVFP4 choice table launch");
++#else
++    (void)args;
++    (void)table;
++    (void)stream;
++    throw std::invalid_argument("gguf NVFP4 choice table: this build has no NVFP4 form");
++#endif
++}
++
++template <ggml_type type>
++void amax_launch(const AmaxArgs& args, cudaStream_t stream) {
++    const std::int64_t slices = std::int64_t(args.rows) * (args.k / 32);
++    const auto grid           = static_cast<unsigned>((slices + kImageThreads - 1) / kImageThreads);
++    amax_kernel<type><<<grid, kImageThreads, 0, stream>>>(args);
++    check(cudaGetLastError(), "GGUF amax launch");
++}
++
++#if defined(NINFER_SM120_FP8)
++// x BF16 [columns][k] (input columns gathered when given) -> lt_fp4_encode_group's activation, a
++// thread a group of 16 values; max |x| over all groups goes to the zeroed slot.
++// lt_fp4_scale_kernel then takes the scales to the global.
++__launch_bounds__(kFp4EncodeThreads) __global__
++    void lt_fp4_encode_kernel(const __nv_bfloat16* __restrict__ x,
++                              const std::int32_t* __restrict__ input_columns,
++                              std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ scales,
++                              std::int8_t* __restrict__ shifts, int k, int columns,
++                              unsigned* __restrict__ slot) {
++    const int groups     = k / 16;
++    const std::int64_t i = blockIdx.x * std::int64_t(kFp4EncodeThreads) + threadIdx.x;
++    float amax           = 0.0f;
++    if (i < std::int64_t(columns) * groups) {
++        const int column = int(i / groups);
++        const int group  = int(i - std::int64_t(column) * groups);
++        float v[16];
++        lt_fp4_load16(x, input_columns, k, column, group, v);
++#    pragma unroll
++        for (int j = 0; j < 16; ++j) { amax = fmaxf(amax, fabsf(v[j])); }
++        lt_fp4_encode_group(v, amax, codes, scales, shifts, k, column, group);
++    }
++    lt_fp4_block_max(amax, slot);
++}
++
++// lt_fp4_encode_kernel's activation at its global g = 2^G (lt_fp4_global of the slot), a thread
++// four scale bytes: the four groups of one column in a 128x4 scale tile, one aligned word of scales
++// and one of shifts. fp4_encode16 is invariant under power-of-two scaling while every candidate
++// scale stays a normal, unsaturated E4M3 value at both powers: a group at 2^n has its candidates in
++// [0x5B, 0x69] (max |x| 2^n in [128, 256)), which moved by m = G - n octaves stay in [0x0B, 0x79]
++// for m in [-10, 2], so its code moves by m octaves and its e2m1 codes stand. Any other group,
++// among them the one holding max |x| (m 3 or 4), is encoded here from x g. Zero scales for the
++// padding of the last 128-column tile and of the last 4-group tile.
++__global__ void lt_fp4_scale_kernel(const __nv_bfloat16* __restrict__ x,
++                                    const std::int32_t* __restrict__ input_columns,
++                                    std::uint8_t* __restrict__ codes,
++                                    std::uint8_t* __restrict__ scales,
++                                    const std::int8_t* __restrict__ shifts, int k, int columns,
++                                    std::int64_t scale_bytes, const unsigned* __restrict__ slot) {
++    const std::int64_t at = 4 * (blockIdx.x * std::int64_t(blockDim.x) + threadIdx.x);
++    if (at >= scale_bytes) { return; }
++    // The inverse of lt_scale_offset; the word's bytes are groups group0 .. group0 + 3.
++    const int groups        = k / 16;
++    const int tile_groups   = (groups + 3) / 4;
++    const std::int64_t tile = at / 512;
++    const int within        = int(at % 512);
++    const int column        = int(tile / tile_groups) * 128 + (within % 16) / 4 * 32 + within / 16;
++    const int group0        = int(tile % tile_groups) * 4;
++    auto* word              = reinterpret_cast<unsigned*>(scales + at);
++    if (column >= columns) {
++        *word = 0u;
++        return;
++    }
++    const unsigned scale4 = *word;
++    const unsigned shift4 = *reinterpret_cast<const unsigned*>(shifts + at);
++    const float global    = lt_fp4_global(__uint_as_float(*slot));
++    const int power       = int((__float_as_uint(global) >> 23) & 0xFFu) - 127;
++    unsigned moved        = 0u;
++    unsigned reencode     = 0u; // bit b: group group0 + b is encoded from x
++#    pragma unroll
++    for (int b = 0; b < 4; ++b) {
++        const int scale = int((scale4 >> (8 * b)) & 0xFFu);
++        const int shift = int(static_cast<std::int8_t>((shift4 >> (8 * b)) & 0xFFu));
++        if (group0 + b >= groups || (scale == 0 && shift == 0)) { continue; } // zero at any global
++        const int move = power - shift;
++        if (shift != kFp4Reencode && move >= -10 && move <= 2) {
++            moved |= unsigned(scale + 8 * move) << (8 * b);
++        } else {
++            reencode |= 1u << b;
++        }
++    }
++#    pragma unroll 1
++    for (int b = 0; b < 4; ++b) {
++        if ((reencode >> b & 1u) == 0u) { continue; }
++        float v[16];
++        lt_fp4_load16(x, input_columns, k, column, group0 + b, v);
++#    pragma unroll
++        for (int j = 0; j < 16; ++j) { v[j] *= global; }
++        uint2 c;
++        const unsigned short s = fp4_encode16(v, c);
++        *reinterpret_cast<uint2*>(codes + std::int64_t(column) * (k / 2) + 8 * (group0 + b)) = c;
++        moved |= unsigned(s & 0xFFu) << (8 * b);
++    }
++    *word = moved;
++}
++#endif
++
++// out[c, r] = act(plane[c, r]) * plane[c, up + r] for a gated two-pass slab: its BF16 products,
++// gate rows from 0 and up rows from `up`, columns `ld` apart. A thread takes eight rows, in 16-byte
++// accesses where all eight lie in the slab: the plane, `ld`, `up`, out and its column stride keep
++// every group of eight rows aligned.
++__global__ void lt_gate_kernel(const __nv_bfloat16* __restrict__ plane, std::int64_t ld, int up,
++                               int rows, __nv_bfloat16* __restrict__ out,
++                               std::int64_t out_column_stride, int activation) {
++    const int row0   = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
++    const int column = blockIdx.y;
++    if (row0 >= rows) { return; }
++    const __nv_bfloat16* c = plane + column * ld;
++    __nv_bfloat16* o       = out + column * out_column_stride;
++    const auto product     = [&](__nv_bfloat16 gate, __nv_bfloat16 value) {
++        return __float2bfloat16(vec_gate(__bfloat162float(gate), activation) *
++                                    __bfloat162float(value));
++    };
++    if (row0 + 8 <= rows) {
++        const uint4 gate  = *reinterpret_cast<const uint4*>(c + row0);
++        const uint4 value = *reinterpret_cast<const uint4*>(c + up + row0);
++        const auto* g     = reinterpret_cast<const __nv_bfloat16*>(&gate);
++        const auto* v     = reinterpret_cast<const __nv_bfloat16*>(&value);
++        uint4 result;
++        auto* r = reinterpret_cast<__nv_bfloat16*>(&result);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) { r[j] = product(g[j], v[j]); }
++        *reinterpret_cast<uint4*>(o + row0) = result;
++        return;
++    }
++    for (int row = row0; row < rows; ++row) { o[row] = product(c[row], c[up + row]); }
++}
++
++#if defined(NINFER_SM120_FP8)
++// lt_gate_kernel's products, a thread sixteen rows, for a pass whose rows start at row `first` of
++// out, the BF16 [columns][k] input of the next product: they go to out and, encoded from their
++// BF16 values, to that input's NVFP4 activation in lt_fp4_encode_kernel's form (codes, scales and
++// shifts at their places, max |product| to the slot). `rows` and `first` are whole groups.
++__launch_bounds__(kFp4EncodeThreads) __global__
++    void lt_gate_fp4_kernel(const __nv_bfloat16* __restrict__ plane, std::int64_t ld, int up,
++                            int rows, int columns, int first, int k,
++                            __nv_bfloat16* __restrict__ out, int activation,
++                            std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ scales,
++                            std::int8_t* __restrict__ shifts, unsigned* __restrict__ slot) {
++    const int pass_groups = rows / 16;
++    const std::int64_t i  = blockIdx.x * std::int64_t(kFp4EncodeThreads) + threadIdx.x;
++    float amax            = 0.0f;
++    if (i < std::int64_t(columns) * pass_groups) {
++        const int column       = int(i / pass_groups);
++        const int group        = int(i - std::int64_t(column) * pass_groups);
++        const __nv_bfloat16* c = plane + column * ld + 16 * group;
++        const uint4 gate[2]    = {reinterpret_cast<const uint4*>(c)[0],
++                                  reinterpret_cast<const uint4*>(c)[1]};
++        const uint4 value[2]   = {reinterpret_cast<const uint4*>(c + up)[0],
++                                  reinterpret_cast<const uint4*>(c + up)[1]};
++        const auto* g          = reinterpret_cast<const __nv_bfloat16*>(gate);
++        const auto* u          = reinterpret_cast<const __nv_bfloat16*>(value);
++        uint4 result[2];
++        auto* r = reinterpret_cast<__nv_bfloat16*>(result);
++        float v[16];
++#    pragma unroll
++        for (int j = 0; j < 16; ++j) {
++            r[j] = __float2bfloat16(vec_gate(__bfloat162float(g[j]), activation) *
++                                    __bfloat162float(u[j]));
++            v[j] = __bfloat162float(r[j]);
++            amax = fmaxf(amax, fabsf(v[j]));
++        }
++        // Evict-first: only lt_fp4_scale_kernel's rare re-encodes read the products back.
++        auto* o = reinterpret_cast<uint4*>(out + std::int64_t(column) * k + first + 16 * group);
++        __stcs(o, result[0]);
++        __stcs(o + 1, result[1]);
++        lt_fp4_encode_group(v, amax, codes, scales, shifts, k, column, first / 16 + group);
++    }
++    lt_fp4_block_max(amax, slot);
++}
++#endif
++
++constexpr std::size_t kLtAlign = 256;
++
++// Bytes of an image or activation row of k values, and its scale groups.
++std::size_t lt_row_bytes(int k, LtForm form) {
++    return form == LtForm::Nvfp4 ? std::size_t(k) / 2 : std::size_t(k);
++}
++
++int lt_groups(int k, LtForm form) { return form == LtForm::Nvfp4 ? k / 16 : k / 32; }
++
++// Nvfp4: the slot after an activation's scales (its max |x| as FP32 bits) and after a pass's
++// ({alpha, 0, 1} of its gate or only half, then the up half's).
++constexpr std::size_t kLtFp4Slot = 256;
++
++std::size_t lt_round(std::size_t bytes) { return (bytes + kLtAlign - 1) / kLtAlign * kLtAlign; }
++
++// Scale bytes of `rows` rows of `groups` groups: whole 128-row x 4-group tiles.
++std::size_t lt_scale_bytes(int rows, int groups) {
++    return std::size_t((rows + 127) / 128) * 128 * std::size_t((groups + 3) / 4) * 4;
++}
++
++// Rows per pass of a product of `rows` rows over `columns` columns, at most `most`: the GEMM
++// (cuBLASLt's 128 x 128-tile block-scaled kernel, one CTA per SM) takes ceil(tiles / SMs) waves, so
++// the pass is the multiple of 128 that runs the product in the fewest waves, weighed against the
++// passes' own cost (an image launch and a GEMM ramp each, about 1024 / k of a wave), the largest on
++// a tie. `stacked`: a pass is one GEMM over its gate and up rows. On the RTX 5060 Ti (36 SMs) at
++// 1152 columns, 5120 rows of K = 6144 take 1536-row passes (3 + 3 + 3 + 1 waves) instead of
++// 1792-row ones (4 + 4 + 3), 5.5% faster.
++int lt_wave_pass(int rows, int columns, int k, int most, bool stacked) {
++    const std::int64_t sms          = std::max(1, device_facts().sm_count);
++    const std::int64_t column_tiles = (columns + 127) / 128;
++    const auto waves                = [&](int count) {
++        const std::int64_t row_tiles = (count + 127) / 128 * (stacked ? 2 : 1);
++        return (row_tiles * column_tiles + sms - 1) / sms;
++    };
++    const double pass_cost = 1024.0 / double(std::max(k, 1024));
++    int best               = most;
++    double best_cost       = 0.0;
++    for (int pass = most; pass >= 128; pass -= 128) {
++        const int full = rows / pass, rest = rows % pass;
++        const int passes = full + (rest != 0 ? 1 : 0);
++        const double cost =
++            double(full * waves(pass) + (rest != 0 ? waves(rest) : 0)) + pass_cost * passes;
++        if (pass == most || cost < best_cost - 1e-9) {
++            best      = pass;
++            best_cost = cost;
++        }
++    }
++    return best;
++}
++
++void check_lt(cublasStatus_t status, const char* what) {
++    if (status != CUBLAS_STATUS_SUCCESS) {
++        throw std::runtime_error(std::string("gguf cuBLASLt ") + what + ": status " +
++                                 std::to_string(int(status)));
++    }
++}
++
++cublasLtHandle_t lt_handle() {
++    static std::array<cublasLtHandle_t, 16> handles{};
++    static std::array<std::once_flag, 16> once;
++    int device = 0;
++    check(cudaGetDevice(&device), "device");
++    if (device < 0 || device >= int(handles.size())) {
++        throw std::invalid_argument("gguf: device ordinal out of range");
++    }
++    // As blas_handle: the first use may be inside a CUDA graph capture.
++    std::call_once(once[device], [&] {
++        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
++        check(cudaThreadExchangeStreamCaptureMode(&mode), "capture mode");
++        const cublasStatus_t created = cublasLtCreate(&handles[device]);
++        check(cudaThreadExchangeStreamCaptureMode(&mode), "capture mode");
++        check_lt(created, "create");
++    });
++    return handles[device];
++}
++
++// D[m, n] (BF16, column-major, columns ld apart) = image[m, k] x activation[n, k]^T, plus D when
++// accumulating, FP32 accumulation, no workspace. Mxfp8: e4m3 operands under VEC32_UE8M0 scales;
++// Nvfp4 (`fp4_slots` {alpha, 0, 1} on device): e2m1 under VEC16_UE4M3 scales, times alpha.
++struct LtKey {
++    int device;
++    int m;
++    int n;
++    int k;
++    std::int64_t ld;
++    bool accumulate;
++    bool fp4;
++    auto operator<=>(const LtKey&) const = default;
++};
++
++struct LtPlan {
++    cublasLtMatmulDesc_t op  = nullptr;
++    cublasLtMatrixLayout_t a = nullptr;
++    cublasLtMatrixLayout_t b = nullptr;
++    cublasLtMatrixLayout_t d = nullptr;
++    cublasLtMatmulAlgo_t algo{};
++};
++
++void lt_gemm(int m, int n, int k, const std::uint8_t* image, const std::uint8_t* image_scales,
++             const std::uint8_t* x, const std::uint8_t* x_scales, __nv_bfloat16* out,
++             std::int64_t ld, bool accumulate, const float* fp4_slots, cudaStream_t stream) {
++    const bool fp4 = fp4_slots != nullptr;
++    static std::mutex mutex;
++    static std::map<LtKey, LtPlan> plans;
++    int device = 0;
++    check(cudaGetDevice(&device), "device");
++    const cublasLtHandle_t handle = lt_handle();
++    const std::lock_guard lock(mutex);
++    const auto set_scales = [&](cublasLtMatmulDesc_t op) {
++        check_lt(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
++                                                &image_scales, sizeof image_scales),
++                 "image scales");
++        check_lt(cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &x_scales,
++                                                sizeof x_scales),
++                 "activation scales");
++    };
++    auto [found, inserted] = plans.try_emplace(LtKey{device, m, n, k, ld, accumulate, fp4});
++    LtPlan& plan           = found->second;
++    if (inserted) {
++        try {
++            check_lt(cublasLtMatmulDescCreate(&plan.op, CUBLAS_COMPUTE_32F, CUDA_R_32F), "desc");
++            const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
++            check_lt(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
++                                                    sizeof ta),
++                     "transa");
++            check_lt(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb,
++                                                    sizeof tb),
++                     "transb");
++            const cublasLtMatmulMatrixScale_t mode = fp4 ? CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3
++                                                         : CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
++            if (fp4) {
++                const cublasLtPointerMode_t pointers = CUBLASLT_POINTER_MODE_DEVICE;
++                check_lt(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_POINTER_MODE,
++                                                        &pointers, sizeof pointers),
++                         "pointer mode");
++            }
++            check_lt(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
++                                                    &mode, sizeof mode),
++                     "image scale mode");
++            check_lt(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
++                                                    &mode, sizeof mode),
++                     "activation scale mode");
++            // The heuristic requires the scale pointers set (it finds no algorithm without them).
++            set_scales(plan.op);
++            const cudaDataType_t in_type = fp4 ? CUDA_R_4F_E2M1 : CUDA_R_8F_E4M3;
++            check_lt(cublasLtMatrixLayoutCreate(&plan.a, in_type, k, m, k), "image layout");
++            check_lt(cublasLtMatrixLayoutCreate(&plan.b, in_type, k, n, k), "x layout");
++            check_lt(cublasLtMatrixLayoutCreate(&plan.d, CUDA_R_16BF, m, n, ld), "out layout");
++            cublasLtMatmulPreference_t preference = nullptr;
++            check_lt(cublasLtMatmulPreferenceCreate(&preference), "preference");
++            const std::size_t workspace = 0;
++            const cublasStatus_t set    = cublasLtMatmulPreferenceSetAttribute(
++                preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace, sizeof workspace);
++            cublasLtMatmulHeuristicResult_t results[8]{};
++            int count = 0;
++            const cublasStatus_t heuristic =
++                set == CUBLAS_STATUS_SUCCESS
++                    ? cublasLtMatmulAlgoGetHeuristic(handle, plan.op, plan.a, plan.b, plan.d,
++                                                     plan.d, preference, 8, results, &count)
++                    : set;
++            cublasLtMatmulPreferenceDestroy(preference);
++            check_lt(heuristic, "heuristic");
++            if (count == 0) {
++                throw std::runtime_error(
++                    "gguf cuBLASLt: no block-scaled algorithm for m=" + std::to_string(m) +
++                    " n=" + std::to_string(n) + " k=" + std::to_string(k));
++            }
++            // The candidates share one kernel and differ in split-K and cluster shape. On the RTX
++            // 5060 Ti (cuBLASLt 13.1) NVFP4's split-K ones ran at half the rate at K = 17408 or
++            // 17408 rows and 3% slower at 2048 x 5120, the cluster shapes alike, and the
++            // heuristic can rank split-K first: take the first without it.
++            plan.algo = results[0].algo;
++            for (int c = 0; c < count; ++c) {
++                std::uint32_t splits = 0;
++                std::size_t written  = 0;
++                if (cublasLtMatmulAlgoConfigGetAttribute(
++                        &results[c].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splits, sizeof splits,
++                        &written) == CUBLAS_STATUS_SUCCESS &&
++                    written == sizeof splits && splits == 1) {
++                    plan.algo = results[c].algo;
++                    break;
++                }
++            }
++        } catch (...) {
++            if (plan.d != nullptr) { cublasLtMatrixLayoutDestroy(plan.d); }
++            if (plan.b != nullptr) { cublasLtMatrixLayoutDestroy(plan.b); }
++            if (plan.a != nullptr) { cublasLtMatrixLayoutDestroy(plan.a); }
++            if (plan.op != nullptr) { cublasLtMatmulDescDestroy(plan.op); }
++            plans.erase(found);
++            throw;
++        }
++    } else {
++        set_scales(plan.op);
++    }
++    const float alpha          = 1.0f;
++    const float beta           = accumulate ? 1.0f : 0.0f;
++    const float* alpha_pointer = fp4 ? fp4_slots : &alpha;
++    const float* beta_pointer  = fp4 ? fp4_slots + (accumulate ? 2 : 1) : &beta;
++    check_lt(cublasLtMatmul(handle, plan.op, alpha_pointer, image, plan.a, x, plan.b, beta_pointer,
++                            out, plan.d, out, plan.d, &plan.algo, nullptr, 0, stream),
++             "matmul");
++}
++
++// The NVFP4 image of `rows` rows under the weight's global, taking the rows' choice table where
++// given; pass slots {alpha, 0, 1} for the activation whose max |x| is at x_amax.
++void image_fp4(GgmlType type, const std::uint8_t* weight, std::int64_t row_bytes, int rows, int k,
++               float global, const std::uint8_t* choices, std::uint8_t* image, std::uint8_t* scales,
++               const unsigned* x_amax, float* slots, cudaStream_t stream) {
++    const Fp4ImageArgs args{weight, row_bytes, rows,   k,     image,
++                            scales, global,    x_amax, slots, choices};
++    switch (type) {
++    case GgmlType::IQ3_XXS:
++        return image_fp4_launch<GGML_TYPE_IQ3_XXS>(args, stream);
++    case GgmlType::IQ3_S:
++        return image_fp4_launch<GGML_TYPE_IQ3_S>(args, stream);
++    case GgmlType::IQ2_XXS:
++        return image_fp4_launch<GGML_TYPE_IQ2_XXS>(args, stream);
++    case GgmlType::IQ4_XS:
++        return image_fp4_launch<GGML_TYPE_IQ4_XS>(args, stream);
++    case GgmlType::IQ2_XS:
++        return image_fp4_launch<GGML_TYPE_IQ2_XS>(args, stream);
++    case GgmlType::IQ2_S:
++        return image_fp4_launch<GGML_TYPE_IQ2_S>(args, stream);
++    case GgmlType::Q2_K:
++        return image_fp4_launch<GGML_TYPE_Q2_K>(args, stream);
++    case GgmlType::Q4_K:
++        return image_fp4_launch<GGML_TYPE_Q4_K>(args, stream);
++    case GgmlType::IQ1_S:
++        return image_fp4_launch<GGML_TYPE_IQ1_S>(args, stream);
++    case GgmlType::IQ1_M:
++        return image_fp4_launch<GGML_TYPE_IQ1_M>(args, stream);
++    case GgmlType::Q6_K:
++        return image_fp4_launch<GGML_TYPE_Q6_K>(args, stream);
++    default:
++        break;
++    }
++    throw std::invalid_argument("gguf NVFP4 image: no NVFP4 form for this block type");
++}
++
++bool has_fp4_image(GgmlType type) {
++    switch (type) {
++    case GgmlType::IQ3_XXS:
++    case GgmlType::IQ3_S:
++    case GgmlType::IQ2_XXS:
++    case GgmlType::IQ4_XS:
++    case GgmlType::IQ2_XS:
++    case GgmlType::IQ2_S:
++    case GgmlType::Q2_K:
++    case GgmlType::Q4_K:
++    case GgmlType::IQ1_S:
++    case GgmlType::IQ1_M:
++    case GgmlType::Q6_K:
++        return true;
++    default:
++        return false;
++    }
++}
++
++
++} // namespace
++} // namespace detail
++
++bool has_lt_product(GgmlType type, int k, LtForm form) {
++#if !defined(NINFER_SM120_FP8)
++    return false;
++#endif
++    (void)form;
++    const detail::DeviceFacts& facts = detail::device_facts();
++    if (!detail::has_fp4_image(type) || facts.cc < 1200 || facts.cc >= 1300 || k <= 0 ||
++        k % 256 != 0 || std::size_t(k) * sizeof(__nv_bfloat16) > facts.shared_per_block_optin) {
++        return false;
++    }
++    static const bool block_scaled = cublasLtGetVersion() >= 120800;
++    return block_scaled;
++}
++
++bool lt_takes_output(const VectorOutput& out) {
++    return out.bf16 != nullptr && out.f32 == nullptr && out.epilogue != Epilogue::GateProduct &&
++           reinterpret_cast<std::uintptr_t>(out.bf16) % 16 == 0 && out.column_stride % 8 == 0;
++}
++
++std::size_t lt_activation_scales_offset(int k, int columns, LtForm form) {
++    return detail::lt_round(detail::lt_row_bytes(k, form) * columns);
++}
++
++std::size_t lt_activation_bytes(int k, int columns, LtForm form) {
++    const std::size_t scales =
++        detail::lt_round(detail::lt_scale_bytes(columns, detail::lt_groups(k, form)));
++    return lt_activation_scales_offset(k, columns, form) + scales +
++           (form == LtForm::Nvfp4 ? detail::kLtFp4Slot + scales : 0);
++}
++
++namespace {
++// An Nvfp4 activation's max |x| slot.
++const unsigned* lt_fp4_activation_slot(const void* activation, int k, int columns) {
++    return reinterpret_cast<const unsigned*>(
++        static_cast<const std::uint8_t*>(activation) +
++        lt_activation_scales_offset(k, columns, LtForm::Nvfp4) +
++        detail::lt_round(detail::lt_scale_bytes(columns, detail::lt_groups(k, LtForm::Nvfp4))));
++}
++
++#if defined(NINFER_SM120_FP8)
++LtFp4Parts fp4_parts(void* activation, int k, int columns) {
++    auto* base = static_cast<std::uint8_t*>(activation);
++    auto* slot = const_cast<unsigned*>(lt_fp4_activation_slot(activation, k, columns));
++    return {base, base + lt_activation_scales_offset(k, columns, LtForm::Nvfp4),
++            reinterpret_cast<std::int8_t*>(slot) + detail::kLtFp4Slot, slot};
++}
++
++// The scale pass after the encode of x [columns][k] into `parts` (see lt_fp4_scale_kernel).
++void fp4_scale_pass(const __nv_bfloat16* x, const std::int32_t* input_columns,
++                    const LtFp4Parts& parts, int k, int columns, cudaStream_t stream) {
++    const auto scale_bytes = std::int64_t(detail::lt_scale_bytes(columns, k / 16));
++    detail::lt_fp4_scale_kernel<<<int((scale_bytes / 4 + 255) / 256), 256, 0, stream>>>(
++        x, input_columns, parts.codes, parts.scales, parts.shifts, k, columns, scale_bytes,
++        parts.slot);
++}
++#endif
++} // namespace
++
++void quantize_lt_activation(const __nv_bfloat16* x, int k, int columns,
++                            const std::int32_t* input_columns, LtForm form, void* out,
++                            cudaStream_t stream) {
++    if (k <= 0 || k % 256 != 0 || columns <= 0) {
++        throw std::invalid_argument("gguf two-pass activation: K must be whole 256-value steps");
++    }
++#if defined(NINFER_SM120_FP8)
++    auto* base = static_cast<std::uint8_t*>(out);
++    if (form == LtForm::Nvfp4) {
++        // One pass encodes every group at its own power of two and finds max |x|; the scale pass
++        // then takes the scales to the global (see lt_fp4_scale_kernel).
++        const LtFp4Parts parts = fp4_parts(out, k, columns);
++        detail::check(cudaMemsetAsync(parts.slot, 0, sizeof(unsigned), stream), "NVFP4 amax reset");
++        const std::int64_t total = std::int64_t(columns) * (k / 16);
++        const auto blocks =
++            int((total + detail::kFp4EncodeThreads - 1) / detail::kFp4EncodeThreads);
++        detail::lt_fp4_encode_kernel<<<blocks, detail::kFp4EncodeThreads, 0, stream>>>(
++            x, input_columns, parts.codes, parts.scales, parts.shifts, k, columns, parts.slot);
++        fp4_scale_pass(x, input_columns, parts, k, columns, stream);
++        detail::check(cudaGetLastError(), "NVFP4 activation launch");
++        return;
++    }
++#else
++    (void)x;
++    (void)input_columns;
++    (void)form;
++    (void)out;
++    (void)stream;
++    throw std::invalid_argument("gguf two-pass activation: this build has no block-scaled form");
++#endif
++}
++
++LtFp4Parts begin_lt_fp4_activation(void* activation, int k, int columns, cudaStream_t stream) {
++    if (activation == nullptr || k <= 0 || k % 256 != 0 || columns <= 0) {
++        throw std::invalid_argument("gguf NVFP4 activation: K must be whole 256-value steps");
++    }
++#if defined(NINFER_SM120_FP8)
++    const LtFp4Parts parts = fp4_parts(activation, k, columns);
++    detail::check(cudaMemsetAsync(parts.slot, 0, sizeof(unsigned), stream), "NVFP4 amax reset");
++    return parts;
++#else
++    (void)stream;
++    throw std::invalid_argument("gguf NVFP4 activation: this build has no NVFP4 form");
++#endif
++}
++
++void finish_lt_fp4_activation(const __nv_bfloat16* x, const std::int32_t* input_columns, int k,
++                              int columns, const LtFp4Parts& parts, cudaStream_t stream) {
++#if defined(NINFER_SM120_FP8)
++    fp4_scale_pass(x, input_columns, parts, k, columns, stream);
++    detail::check(cudaGetLastError(), "NVFP4 activation scale pass");
++#else
++    (void)x;
++    (void)input_columns;
++    (void)k;
++    (void)columns;
++    (void)parts;
++    (void)stream;
++    throw std::invalid_argument("gguf NVFP4 activation: this build has no NVFP4 form");
++#endif
++}
++
++std::size_t lt_scratch_bytes(int k, int rows, int columns, bool gated, LtForm form) {
++    const int image_rows = gated ? 2 * rows : rows;
++    std::size_t bytes =
++        detail::lt_round(std::size_t(image_rows) * detail::lt_row_bytes(k, form)) +
++        detail::lt_round(detail::lt_scale_bytes(image_rows, detail::lt_groups(k, form)));
++    if (gated) { bytes += detail::lt_round(std::size_t(image_rows) * columns * 2); }
++    if (form == LtForm::Nvfp4) { bytes += detail::kLtFp4Slot; }
++    return bytes;
++}
++
++namespace {
++
++// The table an Nvfp4 product of weight global `global` reads (Fp4Choices), or null.
++const std::uint8_t* product_choices(const Fp4Choices& choices, float global) {
++    if (choices.table == nullptr || reinterpret_cast<std::uintptr_t>(choices.table) % 128 != 0 ||
++        !(choices.weight_amax > 0.0f) || detail::lt_fp4_global(choices.weight_amax) != global) {
++        return nullptr;
++    }
++    return choices.table;
++}
++
++} // namespace
++
++std::size_t fp4_choice_bytes(int rows, int k) {
++    const std::size_t bytes = (std::size_t(rows) * std::size_t(k / 32) + 1) / 2;
++    return (bytes + 127) / 128 * 128;
++}
++
++const std::uint8_t* fp4_choice_rows(const std::uint8_t* table, int first, int k) {
++    const std::size_t slices = std::size_t(first) * std::size_t(k / 32);
++    return table == nullptr || slices % 2 != 0 ? nullptr : table + slices / 2;
++}
++
++void fp4_choices(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
++                 float weight_amax, std::uint8_t* table, cudaStream_t stream) {
++    if (!detail::has_fp4_image(type) || rows <= 0 || k <= 0 || k % 256 != 0 ||
++        !(weight_amax > 0.0f) || table == nullptr ||
++        reinterpret_cast<std::uintptr_t>(table) % 128 != 0) {
++        throw std::invalid_argument("gguf NVFP4 choice table: invalid matrix or table");
++    }
++    const detail::Fp4ImageArgs args{
++        static_cast<const std::uint8_t*>(weight), row_bytes, rows,   k, nullptr, nullptr,
++        detail::lt_fp4_global(weight_amax),       nullptr,   nullptr};
++    switch (type) {
++    case GgmlType::IQ3_XXS:
++        return detail::fp4_choices_launch<GGML_TYPE_IQ3_XXS>(args, table, stream);
++    case GgmlType::IQ3_S:
++        return detail::fp4_choices_launch<GGML_TYPE_IQ3_S>(args, table, stream);
++    case GgmlType::IQ2_XXS:
++        return detail::fp4_choices_launch<GGML_TYPE_IQ2_XXS>(args, table, stream);
++    case GgmlType::IQ4_XS:
++        return detail::fp4_choices_launch<GGML_TYPE_IQ4_XS>(args, table, stream);
++    case GgmlType::IQ2_XS:
++        return detail::fp4_choices_launch<GGML_TYPE_IQ2_XS>(args, table, stream);
++    case GgmlType::IQ2_S:
++        return detail::fp4_choices_launch<GGML_TYPE_IQ2_S>(args, table, stream);
++    case GgmlType::Q2_K:
++        return detail::fp4_choices_launch<GGML_TYPE_Q2_K>(args, table, stream);
++    case GgmlType::Q4_K:
++        return detail::fp4_choices_launch<GGML_TYPE_Q4_K>(args, table, stream);
++    case GgmlType::IQ1_S:
++        return detail::fp4_choices_launch<GGML_TYPE_IQ1_S>(args, table, stream);
++    case GgmlType::IQ1_M:
++        return detail::fp4_choices_launch<GGML_TYPE_IQ1_M>(args, table, stream);
++    case GgmlType::Q6_K:
++        return detail::fp4_choices_launch<GGML_TYPE_Q6_K>(args, table, stream);
++    default:
++        break;
++    }
++}
++
++int lt_rows_per_pass(int k, int columns, bool gated, LtForm form, std::size_t scratch_bytes) {
++    int rows = 0;
++    while (rows < (1 << 20) &&
++           lt_scratch_bytes(k, rows + 128, columns, gated, form) <= scratch_bytes) {
++        rows += 128;
++    }
++    return rows;
++}
++
++std::size_t lt_planned_scratch_bytes(int k, int rows, int columns, bool gated, LtForm form) {
++    // Rows of an MXFP8 slab of kLtImageBytes, in either form (an Nvfp4 slab holds half the bytes).
++    const int image_rows = std::max(128, int(kLtImageBytes / std::size_t(k)) / 128 * 128);
++    const int pass       = std::min(gated ? std::max(128, image_rows / 256 * 128) : image_rows,
++                              (rows + 127) / 128 * 128);
++    return lt_scratch_bytes(k, pass, columns, gated, form);
++}
++
++void lt_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
++                LtForm form, float weight_amax, const Fp4Choices& choices, const void* activation,
++                int columns, const VectorOutput& out, void* scratch, std::size_t scratch_bytes,
++                cudaStream_t stream) {
++    const bool fp4 = form == LtForm::Nvfp4;
++    if (!lt_takes_output(out) || rows <= 0 || columns <= 0 || !has_lt_product(type, k, form) ||
++        (fp4 && !(weight_amax > 0.0f))) {
++        throw std::invalid_argument("gguf two-pass product: invalid product");
++    }
++    const int most = lt_rows_per_pass(k, columns, false, form, scratch_bytes);
++    if (most <= 0) { throw std::invalid_argument("gguf two-pass product: scratch too small"); }
++    const int pass = detail::lt_wave_pass(rows, columns, k, most, false);
++    auto* image    = static_cast<std::uint8_t*>(scratch);
++    auto* image_scales =
++        image + detail::lt_round(std::size_t(pass) * detail::lt_row_bytes(k, form));
++    auto* slots = reinterpret_cast<float*>(
++        image_scales + detail::lt_round(detail::lt_scale_bytes(pass, detail::lt_groups(k, form))));
++    const auto* x             = static_cast<const std::uint8_t*>(activation);
++    const auto* x_scales      = x + lt_activation_scales_offset(k, columns, form);
++    const float global        = fp4 ? detail::lt_fp4_global(weight_amax) : 1.0f;
++    const std::uint8_t* table = fp4 ? product_choices(choices, global) : nullptr;
++    for (int first = 0; first < rows; first += pass) {
++        const int count         = std::min(pass, rows - first);
++        const auto* rows_weight = static_cast<const std::uint8_t*>(weight) + first * row_bytes;
++        if (fp4) {
++            detail::image_fp4(type, rows_weight, row_bytes, count, k, global,
++                              fp4_choice_rows(table, first, k), image, image_scales,
++                              lt_fp4_activation_slot(activation, k, columns), slots, stream);
++        }
++        detail::lt_gemm(count, columns, k, image, image_scales, x, x_scales, out.bf16 + first,
++                        out.column_stride, out.epilogue == Epilogue::Accumulate,
++                        fp4 ? slots : nullptr, stream);
++    }
++}
++
++void lt_gated_product(GgmlType gate_type, const void* gate, std::int64_t gate_row_bytes,
++                      GgmlType up_type, const void* up, std::int64_t up_row_bytes, int rows, int k,
++                      LtForm form, float weight_amax, const Fp4Choices& gate_choices,
++                      const Fp4Choices& up_choices, const void* activation,
++                      const void* up_activation, int columns, __nv_bfloat16* out,
++                      std::int64_t out_column_stride, GateActivation gate_activation,
++                      void* out_activation, void* scratch, std::size_t scratch_bytes,
++                      cudaStream_t stream) {
++    const bool fp4 = form == LtForm::Nvfp4;
++    if (out == nullptr || reinterpret_cast<std::uintptr_t>(out) % 16 != 0 ||
++        out_column_stride % 8 != 0 || rows <= 0 || columns <= 0 ||
++        !has_lt_product(gate_type, k, form) || !has_lt_product(up_type, k, form) ||
++        (fp4 && !(weight_amax > 0.0f)) ||
++        (out_activation != nullptr && (!fp4 || out_column_stride != rows || rows % 256 != 0))) {
++        throw std::invalid_argument("gguf two-pass gated product: invalid product");
++    }
++#if defined(NINFER_SM120_FP8)
++    LtFp4Parts encoded{};
++    if (out_activation != nullptr) {
++        encoded = fp4_parts(out_activation, rows, columns);
++        detail::check(cudaMemsetAsync(encoded.slot, 0, sizeof(unsigned), stream),
++                      "NVFP4 amax reset");
++    }
++#else
++    if (out_activation != nullptr) {
++        throw std::invalid_argument("gguf two-pass gated product: this build has no NVFP4 form");
++    }
++#endif
++    const int most = lt_rows_per_pass(k, columns, true, form, scratch_bytes);
++    if (most <= 0) {
++        throw std::invalid_argument("gguf two-pass gated product: scratch too small");
++    }
++    const bool stacked = up_activation == nullptr;
++    const int pass     = detail::lt_wave_pass(rows, columns, k, most, stacked);
++    // A pass of `count` rows: gate rows at image rows [0, count), up rows from `offset` (whole
++    // 128-row scale tiles), products in a BF16 plane of 2 * offset rows a column. Nvfp4: gate and
++    // up share the pair's global, so over one activation their stacked GEMM takes one alpha.
++    const std::size_t row_image = detail::lt_row_bytes(k, form);
++    const int groups            = detail::lt_groups(k, form);
++    auto* image                 = static_cast<std::uint8_t*>(scratch);
++    auto* image_scales          = image + detail::lt_round(std::size_t(2) * pass * row_image);
++    auto* plane                 = reinterpret_cast<__nv_bfloat16*>(
++        image_scales + detail::lt_round(detail::lt_scale_bytes(2 * pass, groups)));
++    auto* gate_slots =
++        reinterpret_cast<float*>(reinterpret_cast<std::uint8_t*>(plane) +
++                                 detail::lt_round(std::size_t(2) * pass * columns * 2));
++    auto* up_slots                 = gate_slots + 4;
++    const auto* x                  = static_cast<const std::uint8_t*>(activation);
++    const auto* x_scales           = x + lt_activation_scales_offset(k, columns, form);
++    const auto* ux                 = stacked ? x : static_cast<const std::uint8_t*>(up_activation);
++    const float global             = fp4 ? detail::lt_fp4_global(weight_amax) : 1.0f;
++    const std::uint8_t* gate_table = fp4 ? product_choices(gate_choices, global) : nullptr;
++    const std::uint8_t* up_table   = fp4 ? product_choices(up_choices, global) : nullptr;
++    for (int first = 0; first < rows; first += pass) {
++        const int count         = std::min(pass, rows - first);
++        const int offset        = (count + 127) / 128 * 128;
++        const auto* gate_weight = static_cast<const std::uint8_t*>(gate) + first * gate_row_bytes;
++        const auto* up_weight   = static_cast<const std::uint8_t*>(up) + first * up_row_bytes;
++        std::uint8_t* up_image  = image + std::size_t(offset) * row_image;
++        std::uint8_t* up_scales = image_scales + detail::lt_scale_bytes(offset, groups);
++        if (fp4) {
++            detail::image_fp4(gate_type, gate_weight, gate_row_bytes, count, k, global,
++                              fp4_choice_rows(gate_table, first, k), image, image_scales,
++                              lt_fp4_activation_slot(activation, k, columns), gate_slots, stream);
++            detail::image_fp4(up_type, up_weight, up_row_bytes, count, k, global,
++                              fp4_choice_rows(up_table, first, k), up_image, up_scales,
++                              lt_fp4_activation_slot(ux, k, columns), up_slots, stream);
++        }
++        if (stacked) {
++            detail::lt_gemm(offset + count, columns, k, image, image_scales, x, x_scales, plane,
++                            2 * offset, false, fp4 ? gate_slots : nullptr, stream);
++        } else {
++            detail::lt_gemm(count, columns, k, image, image_scales, x, x_scales, plane, 2 * offset,
++                            false, fp4 ? gate_slots : nullptr, stream);
++            detail::lt_gemm(count, columns, k, up_image, up_scales, ux,
++                            ux + lt_activation_scales_offset(k, columns, form), plane + offset,
++                            2 * offset, false, fp4 ? up_slots : nullptr, stream);
++        }
++        // Passes start at whole 128-row tiles, so out + first keeps out's 16-byte alignment.
++#if defined(NINFER_SM120_FP8)
++        if (out_activation != nullptr) {
++            const std::int64_t total = std::int64_t(columns) * (count / 16);
++            detail::lt_gate_fp4_kernel<<<int((total + detail::kFp4EncodeThreads - 1) /
++                                             detail::kFp4EncodeThreads),
++                                         detail::kFp4EncodeThreads, 0, stream>>>(
++                plane, 2 * offset, offset, count, columns, first, rows, out,
++                static_cast<int>(gate_activation), encoded.codes, encoded.scales, encoded.shifts,
++                encoded.slot);
++            detail::check(cudaGetLastError(), "two-pass gate launch");
++            continue;
++        }
++#endif
++        detail::lt_gate_kernel<<<dim3((count + 1023) / 1024, columns, 1), 128, 0, stream>>>(
++            plane, 2 * offset, offset, count, out + first, out_column_stride,
++            static_cast<int>(gate_activation));
++        detail::check(cudaGetLastError(), "two-pass gate launch");
++    }
++#if defined(NINFER_SM120_FP8)
++    if (out_activation != nullptr) {
++        fp4_scale_pass(out, nullptr, encoded, rows, columns, stream);
++        detail::check(cudaGetLastError(), "NVFP4 activation launch");
++    }
++#endif
++}
++
++void matrix_amax(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
++                 unsigned* amax, cudaStream_t stream) {
++    if (!detail::has_fp4_image(type) || rows <= 0 || k <= 0 || k % 256 != 0 || amax == nullptr) {
++        throw std::invalid_argument("gguf matrix amax: invalid matrix");
++    }
++    detail::check(cudaMemsetAsync(amax, 0, sizeof(unsigned), stream), "amax reset");
++    const detail::AmaxArgs args{static_cast<const std::uint8_t*>(weight), row_bytes, rows, k, amax};
++    switch (type) {
++    case GgmlType::IQ3_XXS:
++        return detail::amax_launch<GGML_TYPE_IQ3_XXS>(args, stream);
++    case GgmlType::IQ3_S:
++        return detail::amax_launch<GGML_TYPE_IQ3_S>(args, stream);
++    case GgmlType::IQ2_XXS:
++        return detail::amax_launch<GGML_TYPE_IQ2_XXS>(args, stream);
++    case GgmlType::IQ4_XS:
++        return detail::amax_launch<GGML_TYPE_IQ4_XS>(args, stream);
++    case GgmlType::IQ2_XS:
++        return detail::amax_launch<GGML_TYPE_IQ2_XS>(args, stream);
++    case GgmlType::IQ2_S:
++        return detail::amax_launch<GGML_TYPE_IQ2_S>(args, stream);
++    case GgmlType::Q2_K:
++        return detail::amax_launch<GGML_TYPE_Q2_K>(args, stream);
++    case GgmlType::Q4_K:
++        return detail::amax_launch<GGML_TYPE_Q4_K>(args, stream);
++    case GgmlType::IQ1_S:
++        return detail::amax_launch<GGML_TYPE_IQ1_S>(args, stream);
++    case GgmlType::IQ1_M:
++        return detail::amax_launch<GGML_TYPE_IQ1_M>(args, stream);
++    case GgmlType::Q6_K:
++        return detail::amax_launch<GGML_TYPE_Q6_K>(args, stream);
++    default:
++        break;
++    }
++}
++
++
++} // namespace ninfer::ops::gguf
+diff --git a/src/ops/linear/gguf/gguf_nvfp4.h b/src/ops/linear/gguf/gguf_nvfp4.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2460c6723bff343b461bd23ce005fa8e08a5fb8c
+--- /dev/null
++++ b/src/ops/linear/gguf/gguf_nvfp4.h
+@@ -0,0 +1,122 @@
++#pragma once
++#include "ggml_bridge.h"
++#include "gguf_prefill_modes.h"
++
++namespace ninfer::ops::gguf {
++// GGUF NVFP4 prefill, explicitly enabled at process start and admitted only by AllowA4.
++// Each slab decodes weights into E2M1 codes with an E4M3 scale per 16 values. Activations
++// use the same form, with one power-of-two global per operand (max |v| g <= 2688).
++// Each scale is selected from four candidates using half-precision squared-error sums.
++// cuBLASLt accumulates in FP32 into BF16; gated products round each product to BF16
++// before SiLU/GELU. Caller-owned activation/image scratch; immutable weight globals
++// and optional scale-choice tables are prepared before sizing/capture.
++
++enum class LtForm : std::uint8_t { Nvfp4 };
++
++// Keep every supported decode/verification batch (<=128) on its existing arithmetic.
++[[nodiscard]] constexpr int lt_min_columns(LtForm form) {
++    (void)form;
++    return 129;
++}
++
++// The row budget is based on this many one-byte values; an FP4 image uses half the bytes.
++inline constexpr std::size_t kLtImageBytes = std::size_t{21} << 19; // 10.5 MiB
++
++// Requires a 120a build/device, supported packed type, whole 256-value K steps, and cuBLASLt.
++[[nodiscard]] bool has_lt_product(GgmlType type, int k, LtForm form);
++
++// Whether an output can take it: BF16 Store or Accumulate, 16-byte aligned columns.
++[[nodiscard]] bool lt_takes_output(const VectorOutput& out);
++
++// Its activation: values [columns][k] from byte 0 (e2m1 codes, two a byte, the first value in the
++// low nibble), then from lt_activation_scales_offset() the scales in cuBLASLt's layout (Mxfp8:
++// UE8M0 exponents E of d = 2^(E - 127), E = 127 for the padding up to 128 columns; Nvfp4: E4M3,
++// zero for the padding), then for Nvfp4 the activation's max |x| (FP32 bits) and, in the scales'
++// layout, the quantizer's per-group powers of two.
++[[nodiscard]] std::size_t lt_activation_bytes(int k, int columns, LtForm form);
++[[nodiscard]] std::size_t lt_activation_scales_offset(int k, int columns, LtForm form);
++void quantize_lt_activation(const __nv_bfloat16* x, int k, int columns,
++                            const std::int32_t* input_columns, LtForm form, void* out,
++                            cudaStream_t stream);
++
++// The parts of an Nvfp4 activation of x [columns][k] for a producer outside the bridge that
++// encodes x as it forms it, in lt_fp4_encode_kernel's form (lt_fp4.cuh lt_fp4_encode_group and
++// lt_fp4_block_max): begin_lt_fp4_activation zeroes the max |x| slot; after the encode,
++// finish_lt_fp4_activation runs the scale pass over x, which leaves quantize_lt_activation(x, k,
++// columns, input_columns, Nvfp4) byte for byte for the gather the encode took.
++struct LtFp4Parts {
++    std::uint8_t* codes;
++    std::uint8_t* scales;
++    std::int8_t* shifts;
++    unsigned* slot;
++};
++
++[[nodiscard]] LtFp4Parts begin_lt_fp4_activation(void* activation, int k, int columns,
++                                                 cudaStream_t stream);
++void finish_lt_fp4_activation(const __nv_bfloat16* x, const std::int32_t* input_columns, int k,
++                              int columns, const LtFp4Parts& parts, cudaStream_t stream);
++
++// Scratch of a pass over `rows` rows, a gated pass's `rows` gate and `rows` up rows with their
++// BF16 products; the most rows per pass (whole 128-row tiles) a scratch of `scratch_bytes` holds
++// (a product runs passes of at most that many, as many as fill the GEMM's waves best); and the
++// scratch a product of `rows` rows plans (passes of up to a slab).
++[[nodiscard]] std::size_t lt_scratch_bytes(int k, int rows, int columns, bool gated, LtForm form);
++[[nodiscard]] int lt_rows_per_pass(int k, int columns, bool gated, LtForm form,
++                                   std::size_t scratch_bytes);
++[[nodiscard]] std::size_t lt_planned_scratch_bytes(int k, int rows, int columns, bool gated,
++                                                   LtForm form);
++
++// The scale-choice table of an Nvfp4 weight image: which of fp4_encode16's four candidate scales
++// (lt_fp4.cuh) each 16-value group of the image takes, two bits a group, row-major (k / 64 bytes a
++// row), built by fp4_choices under the power-of-two global of `weight_amax`. A product whose own
++// global is that one, given the table 128-byte aligned, encodes each group's recorded candidate
++// instead of searching: the same image, in about a third of the image pass's instructions
++// (decode-bound then). It ignores any other table and searches. The table may live in mapped host
++// memory: a pass reads one 2-bit choice per 16 weights over the bus.
++struct Fp4Choices {
++    const std::uint8_t* table = nullptr;
++    float weight_amax         = 0.0F;
++};
++
++// Bytes of the table of `rows` rows (whole 128-byte blocks); the table of rows [first, ...) of a
++// table (null where row `first` does not start a byte); the table of the search's winners for a
++// matrix that matrix_amax serves, into `table` (128-byte aligned, fp4_choice_bytes,
++// device-writable).
++[[nodiscard]] std::size_t fp4_choice_bytes(int rows, int k);
++[[nodiscard]] const std::uint8_t* fp4_choice_rows(const std::uint8_t* table, int first, int k);
++void fp4_choices(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
++                 float weight_amax, std::uint8_t* table, cudaStream_t stream);
++
++// out[r, c] <- epilogue(sum_k W[r, k] x[k, c]) for an output lt_takes_output accepts, rows [0,
++// rows) and columns [0, columns); `activation` from quantize_lt_activation in `form`. Nvfp4:
++// `weight_amax` is max |w| over the matrix (matrix_amax), positive; `choices` the weight's table,
++// if any.
++void lt_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
++                LtForm form, float weight_amax, const Fp4Choices& choices, const void* activation,
++                int columns, const VectorOutput& out, void* scratch, std::size_t scratch_bytes,
++                cudaStream_t stream);
++
++// out[r, c] = act(gate_r . x_c) * (up_r . x_c) in BF16 (out 16-byte aligned, out_column_stride a
++// multiple of 8), gate and up rows each of their own type. A pass stacks its gate and up rows in
++// one image and, over one activation (`up_activation` null), one GEMM; an up activation of its
++// own (another input gather) takes a GEMM per half. Nvfp4: `weight_amax` covers gate and up (and
++// the global each one's choice table must have), and a non-null `out_activation`
++// (lt_activation_bytes(rows, columns, Nvfp4), out contiguous [columns][rows], rows whole 256-value
++// steps) also receives quantize_lt_activation(out, rows, columns, no gather, Nvfp4), encoded as the
++// products are formed.
++void lt_gated_product(GgmlType gate_type, const void* gate, std::int64_t gate_row_bytes,
++                      GgmlType up_type, const void* up, std::int64_t up_row_bytes, int rows, int k,
++                      LtForm form, float weight_amax, const Fp4Choices& gate_choices,
++                      const Fp4Choices& up_choices, const void* activation,
++                      const void* up_activation, int columns, __nv_bfloat16* out,
++                      std::int64_t out_column_stride, GateActivation gate_activation,
++                      void* out_activation, void* scratch, std::size_t scratch_bytes,
++                      cudaStream_t stream);
++
++// max |w| over the decoded values of rows [0, rows) of a type has_lt_product serves in Nvfp4, into
++// *amax as FP32 bits (zeroed here first). Load-time preparation of the Nvfp4 form's weight global.
++void matrix_amax(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
++                 unsigned* amax, cudaStream_t stream);
++
++
++} // namespace ninfer::ops::gguf
+diff --git a/src/ops/linear/gguf/gguf_prefill_modes.h b/src/ops/linear/gguf/gguf_prefill_modes.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1499d1f53c0ecd3ed6088cf07dca7e816d4dd619
+--- /dev/null
++++ b/src/ops/linear/gguf/gguf_prefill_modes.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++// Process-start numerical modes, usable by host diagnostics without CUDA headers.
++// Configure them before loading models or querying workspace; each is immutable afterwards.
++namespace ninfer::ops::gguf {
++[[nodiscard]] bool nvfp4_enabled();
++namespace mxfp8 {
++[[nodiscard]] bool enabled();
++}
++}
+diff --git a/src/ops/linear/gguf/lt_fp4.cuh b/src/ops/linear/gguf/lt_fp4.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5de3024846bece5939846de07d5a8e3c3c41cab
+--- /dev/null
++++ b/src/ops/linear/gguf/lt_fp4.cuh
+@@ -0,0 +1,240 @@
++#pragma once
++
++// The NVFP4 activation encoder of the GGUF two-pass products (ggml_bridge.h, LtForm::Nvfp4) and the
++// cuBLASLt scale layout, free of the vendored ggml headers: the bridge includes it, and so do
++// producers outside it that encode their output in lt_fp4_encode_kernel's form (rmsnorm_lt.cu).
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_runtime.h>
++
++#include <cstddef>
++#include <cstdint>
++
++namespace ninfer::ops::gguf::detail {
++
++// Byte offset of the UE8M0 exponent of 32-value group `group` of row `row` in cuBLASLt's
++// VEC32_UE8M0 scale layout for rows of `groups` groups: 512-byte tiles of 128 rows x 4 groups,
++// row-major over (row / 128, group / 4), inside a tile (row % 32) * 16 + (row % 128 / 32) * 4 +
++// group % 4.
++__host__ __device__ constexpr std::size_t lt_scale_offset(int row, int group, int groups) {
++    return (std::size_t(row / 128) * std::size_t((groups + 3) / 4) + std::size_t(group / 4)) * 512 +
++           std::size_t(row % 32) * 16 + std::size_t(row % 128 / 32) * 4 + std::size_t(group % 4);
++}
++
++// The power of two g with max |x| g <= 6 x 448 = 2688, the largest NVFP4 value: an NVFP4
++// operand's global (1 for an all-zero operand; within 2^+-60, so alpha stays a normal FP32).
++__host__ __device__ inline float lt_fp4_global(float amax) {
++    if (!(amax > 0.0f)) { return 1.0f; }
++    if (amax < 1e-15f) { return ldexpf(1.0f, 60); }
++    int e = 0;
++    (void)frexpf(2688.0f / amax, &e); // 2688 / amax = f 2^e, f in [0.5, 1)
++    return ldexpf(1.0f, e - 1 < -60 ? -60 : e - 1);
++}
++
++// The 16 values of group `group` of column `column` of x [columns][k], input columns gathered
++// (value j of the column is x[input_columns[j]]) when given. x may be global or shared memory.
++__device__ __forceinline__ void lt_fp4_load16(const __nv_bfloat16* __restrict__ x,
++                                              const std::int32_t* __restrict__ input_columns,
++                                              int k, int column, int group, float* v) {
++    const __nv_bfloat16* row = x + std::int64_t(column) * k;
++    if (input_columns == nullptr) {
++        const auto* source = reinterpret_cast<const uint4*>(row + 16 * group);
++        const uint4 w[2]   = {source[0], source[1]};
++        const auto* h      = reinterpret_cast<const __nv_bfloat162*>(w);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            const float2 f = __bfloat1622float2(h[j]);
++            v[2 * j]       = f.x;
++            v[2 * j + 1]   = f.y;
++        }
++        return;
++    }
++#pragma unroll
++    for (int j = 0; j < 16; ++j) { v[j] = __bfloat162float(row[input_columns[16 * group + j]]); }
++}
++
++#if defined(NINFER_SM120_FP8)
++__device__ __forceinline__ unsigned short fp4_scale_code(float value) {
++    unsigned short code;
++    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(code) : "f"(0.0f), "f"(value));
++    return static_cast<unsigned short>(code & 0xFFu);
++}
++
++__device__ __forceinline__ float fp4_scale_value(unsigned short code) {
++    unsigned h2;
++    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(code));
++    return __half2float(__ushort_as_half(static_cast<unsigned short>(h2 & 0xFFFFu)));
++}
++
++// 1 / scale, __fdividef(1, scale) for an E4M3 scale (normal in FP32, so no subnormal guard), 0
++// for scale 0 (code 0).
++__device__ __forceinline__ float fp4_inverse(float scale) {
++    float inv;
++    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(scale));
++    return scale > 0.0f ? inv : 0.0f;
++}
++
++// 16 values -> their e2m1 codes and E4M3 scale code: of the candidates RN(amax / 6), RN(amax / 4)
++// and the next codes above each (indices 0 to 3), the one with the least squared error (the first
++// on a tie; a nonzero group takes at least code 1, 2^-9, which an underflowed RN would zero), its
++// index to *which when given. On the 27B (1m quick perplexity corpus, head on MXFP8) it costs +1.7%
++// perplexity against MXFP8 where RN(amax / 6) alone costs +2.2%.
++__device__ __forceinline__ unsigned short fp4_encode16(const float* v, uint2& out,
++                                                      unsigned* which = nullptr) {
++    float amax = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 16; ++i) { amax = fmaxf(amax, fabsf(v[i])); }
++    const unsigned short least = amax > 0.0f ? 1 : 0;
++    const unsigned short s6    = max(fp4_scale_code(amax * (1.0f / 6.0f)), least);
++    const unsigned short s4    = max(fp4_scale_code(amax * 0.25f), least);
++    // The values as half2 pairs once, for every candidate's error.
++    __half2 h[8];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) { h[i] = __floats2half2_rn(v[2 * i], v[2 * i + 1]); }
++    const unsigned short candidates[4] = {s6, s4,
++                                          static_cast<unsigned short>(s6 < 0x7Eu ? s6 + 1 : s6),
++                                          static_cast<unsigned short>(s4 < 0x7Eu ? s4 + 1 : s4)};
++    // Each candidate's squared error: h times 1 / its scale minus the values of the e2m1 codes of
++    // v times 1 / its scale, accumulated in half2 in units of the scale, then times its scale^2.
++    // The four sums run side by side, each in its own fixed order.
++    float scale[4], inv[4];
++    __half2 inv2[4], sum[4];
++#pragma unroll
++    for (int c = 0; c < 4; ++c) {
++        scale[c] = fp4_scale_value(candidates[c]);
++        inv[c]   = fp4_inverse(scale[c]);
++        inv2[c]  = __float2half2_rn(inv[c]);
++        sum[c]   = __float2half2_rn(0.0f);
++    }
++    uint2 codes[4];
++#pragma unroll
++    for (int w = 0; w < 2; ++w) {
++        const float* x = v + 8 * w;
++#pragma unroll
++        for (int c = 0; c < 4; ++c) {
++            unsigned word, d[4];
++            asm("{\n .reg .b8 q0, q1, q2, q3;\n"
++                " cvt.rn.satfinite.e2m1x2.f32 q0, %6, %5;\n"
++                " cvt.rn.satfinite.e2m1x2.f32 q1, %8, %7;\n"
++                " cvt.rn.satfinite.e2m1x2.f32 q2, %10, %9;\n"
++                " cvt.rn.satfinite.e2m1x2.f32 q3, %12, %11;\n"
++                " cvt.rn.f16x2.e2m1x2 %1, q0;\n"
++                " cvt.rn.f16x2.e2m1x2 %2, q1;\n"
++                " cvt.rn.f16x2.e2m1x2 %3, q2;\n"
++                " cvt.rn.f16x2.e2m1x2 %4, q3;\n"
++                " mov.b32 %0, {q0, q1, q2, q3};\n}"
++                : "=r"(word), "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
++                : "f"(x[0] * inv[c]), "f"(x[1] * inv[c]), "f"(x[2] * inv[c]), "f"(x[3] * inv[c]),
++                  "f"(x[4] * inv[c]), "f"(x[5] * inv[c]), "f"(x[6] * inv[c]), "f"(x[7] * inv[c]));
++            (w == 0 ? codes[c].x : codes[c].y) = word;
++#pragma unroll
++            for (int b = 0; b < 4; ++b) {
++                const __half2 e = __hfma2(h[4 * w + b], inv2[c],
++                                          __hneg2(*reinterpret_cast<const __half2*>(&d[b])));
++                sum[c]          = __hfma2(e, e, sum[c]);
++            }
++        }
++    }
++    unsigned short best_code = s6;
++    float best               = 0.0f;
++#pragma unroll
++    for (int c = 0; c < 4; ++c) {
++        const float2 pair = __half22float2(sum[c]);
++        const float error = (pair.x + pair.y) * scale[c] * scale[c];
++        if (c == 0 || error < best) {
++            best      = error;
++            best_code = candidates[c];
++            out       = codes[c];
++            if (which != nullptr) { *which = unsigned(c); }
++        }
++    }
++    return best_code;
++}
++
++// fp4_encode16's result for its candidate `which` by the same operations: when `which` is the
++// index fp4_encode16 reports for these values, the same codes and scale code, without the search.
++__device__ __forceinline__ unsigned short fp4_encode16_pick(const float* v, unsigned which,
++                                                           uint2& out) {
++    float amax = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 16; ++i) { amax = fmaxf(amax, fabsf(v[i])); }
++    const unsigned short least = amax > 0.0f ? 1 : 0;
++    unsigned short code =
++        max(fp4_scale_code(amax * ((which & 1u) != 0 ? 0.25f : (1.0f / 6.0f))), least);
++    if ((which & 2u) != 0 && code < 0x7Eu) { ++code; }
++    const float inv = fp4_inverse(fp4_scale_value(code));
++#pragma unroll
++    for (int w = 0; w < 2; ++w) {
++        const float* x = v + 8 * w;
++        unsigned word;
++        asm("{\n .reg .b8 q0, q1, q2, q3;\n"
++            " cvt.rn.satfinite.e2m1x2.f32 q0, %2, %1;\n"
++            " cvt.rn.satfinite.e2m1x2.f32 q1, %4, %3;\n"
++            " cvt.rn.satfinite.e2m1x2.f32 q2, %6, %5;\n"
++            " cvt.rn.satfinite.e2m1x2.f32 q3, %8, %7;\n"
++            " mov.b32 %0, {q0, q1, q2, q3};\n}"
++            : "=r"(word)
++            : "f"(x[0] * inv), "f"(x[1] * inv), "f"(x[2] * inv), "f"(x[3] * inv),
++              "f"(x[4] * inv), "f"(x[5] * inv), "f"(x[6] * inv), "f"(x[7] * inv));
++        (w == 0 ? out.x : out.y) = word;
++    }
++    return code;
++}
++
++// The shift of a group lt_fp4_scale_kernel encodes at the global: its max |x| lies below 2^-119,
++// so its own power of two leaves FP32's normal range.
++constexpr int kFp4Reencode = -128;
++
++constexpr int kFp4EncodeThreads = 256;
++
++// The NVFP4 activation of x [columns][k] before its global is known, for group `group` of column
++// `column` (values v, max |v| amax): fp4_encode16 of the group times its own power of two 2^n, the
++// n that takes amax into [128, 256), gives its e2m1 codes and E4M3 scale code, and n goes to
++// `shifts` at the scale's place (kFp4Reencode where 2^n is not a normal FP32).
++__device__ __forceinline__ void lt_fp4_encode_group(float* v, float amax,
++                                                    std::uint8_t* __restrict__ codes,
++                                                    std::uint8_t* __restrict__ scales,
++                                                    std::int8_t* __restrict__ shifts, int k,
++                                                    int column, int group) {
++    uint2 c              = make_uint2(0u, 0u);
++    unsigned short scale = 0;
++    int shift            = 0;
++    if (amax > 0.0f) {
++        // amax = f 2^(biased - 126), f in [0.5, 1): times 2^(134 - biased) it is f 2^8.
++        const int biased = int((__float_as_uint(amax) >> 23) & 0xFFu);
++        shift            = 134 - biased;
++        if (shift > 127) {
++            shift = kFp4Reencode;
++        } else {
++            const float norm = __uint_as_float(unsigned(127 + shift) << 23);
++#pragma unroll
++            for (int j = 0; j < 16; ++j) { v[j] *= norm; }
++            scale = fp4_encode16(v, c);
++        }
++    }
++    *reinterpret_cast<uint2*>(codes + std::int64_t(column) * (k / 2) + 8 * group) = c;
++    const std::size_t at = lt_scale_offset(column, group, k / 16);
++    scales[at]           = static_cast<std::uint8_t>(scale & 0xFFu);
++    shifts[at]           = static_cast<std::int8_t>(shift);
++}
++
++// Max of every amax of a Block-thread block into the slot (FP32 bits), one atomic.
++template <int Block = kFp4EncodeThreads>
++__device__ __forceinline__ void lt_fp4_block_max(float amax, unsigned* __restrict__ slot) {
++    __shared__ float warp_amax[Block / 32];
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
++    }
++    if ((threadIdx.x & 31) == 0) { warp_amax[threadIdx.x / 32] = amax; }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++#pragma unroll
++        for (int w = 1; w < Block / 32; ++w) { amax = fmaxf(amax, warp_amax[w]); }
++        atomicMax(slot, __float_as_uint(amax));
++    }
++}
++#endif
++
++} // namespace ninfer::ops::gguf::detail
+diff --git a/src/ops/linear/gguf/sources.cmake b/src/ops/linear/gguf/sources.cmake
+index 58d88b075361678604b4fa3df68b4556f7dc7459..dfc8f2aa848a7766cd098f0fac472bdbb521076a 100644
+--- a/src/ops/linear/gguf/sources.cmake
++++ b/src/ops/linear/gguf/sources.cmake
+@@ -8,6 +8,7 @@ endif()
+ add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
+   "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/gguf_mxfp8.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/gguf_nvfp4.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/ggml_fattn.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq1_s.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2_s.cu"
+diff --git a/src/ops/linear/linear.cpp b/src/ops/linear/linear.cpp
+index 9fe9c66067f7daeb2c44e825ddb4d7ee29b3f133..53f27ecb5715270ab94c8010f0fe291bc9a0fc8f 100644
+--- a/src/ops/linear/linear.cpp
++++ b/src/ops/linear/linear.cpp
+@@ -115,7 +115,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
+         if (workspace == nullptr) {
+             throw std::invalid_argument("linear: a GGUF weight needs the workspace overload");
+         }
+-        detail::gguf_linear(x, w, out, *workspace, stream);
++        detail::gguf_linear(x, w, out, *workspace, stream, policy);
+         return;
+     }
+     switch (w.qtype) {
+diff --git a/src/ops/linear/part_projection.cpp b/src/ops/linear/part_projection.cpp
+index f16bf538b5351cbf145591b4d038e744d69b13c5..b28fe5074c742ffc22f5481c655758213375a007 100644
+--- a/src/ops/linear/part_projection.cpp
++++ b/src/ops/linear/part_projection.cpp
+@@ -46,7 +46,7 @@ void project_parts(const Tensor& x, const PartProjectionWeights& weights,
+             product.row    = part.row;
+             products.push_back(product);
+         }
+-        gguf_project(x, products, workspace, stream);
++        gguf_project(x, products, workspace, stream, weights.policy);
+         return;
+     }
+     const std::int32_t columns = x.ne[1];
+diff --git a/src/ops/weight_input.cpp b/src/ops/weight_input.cpp
+index 565781d547a5d04d576dc94c926cc0c3b544a334..0bbfe3309b0d1f98c64a09ccdc036b530064d6ea 100644
+--- a/src/ops/weight_input.cpp
++++ b/src/ops/weight_input.cpp
+@@ -147,6 +147,9 @@ PartProjectionWeights part_projection(std::span<const WeightInput> inputs,
+                                       std::span<const std::int32_t> rows) {
+     PartProjectionWeights result;
+     const bool gguf = gguf_parent(inputs.front());
++    // q8_1 GGUF arithmetic needed no permission. The optional floating-point prefill
++    // routes do: a composed projection grants only what every logical Use permits.
++    if (gguf) { result.policy = common_policy(inputs); }
+     for (std::size_t i = 0; i < inputs.size(); ++i) {
+         require(gguf_parent(inputs[i]) == gguf, "input projection: parts cannot mix formats");
+         auto part = single(inputs.subspan(i, 1));
+diff --git a/src/ops/wrapper/linear_add.cpp b/src/ops/wrapper/linear_add.cpp
+index 3c6685b6b96335343e2c424c86e41f32cca8ac59..d7653114a6ace5a72030c73cd421f3818a956242 100644
+--- a/src/ops/wrapper/linear_add.cpp
++++ b/src/ops/wrapper/linear_add.cpp
+@@ -243,7 +243,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
+     }
+ 
+     if (is_gguf(w.qtype)) {
+-        detail::gguf_linear_add(x, w, residual_out, ws, stream);
++        detail::gguf_linear_add(x, w, residual_out, ws, stream, policy);
+         return;
+     }
+ 
+diff --git a/src/ops/wrapper/linear_swiglu.cpp b/src/ops/wrapper/linear_swiglu.cpp
+index ae15278ab4125de67861eb09a21aa1f667090b9d..9903322d701f304c84710b669ac1ea538ac06a22 100644
+--- a/src/ops/wrapper/linear_swiglu.cpp
++++ b/src/ops/wrapper/linear_swiglu.cpp
+@@ -216,7 +216,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
+     }
+     const std::int32_t t   = x.ne[1];
+     if (is_gguf(gate_up_weight.qtype)) {
+-        detail::gguf_swiglu(x, gate_up_weight, nullptr, out, ws, stream);
++        detail::gguf_swiglu(x, gate_up_weight, nullptr, out, ws, stream, gguf::GateActivation::Silu, policy);
+         return;
+     }
+     if (combined_share(gate_up_weight.qtype, gate_up_weight.n, gate_up_weight.k)) {
+@@ -376,7 +376,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_weight, const Weight& up_
+                    LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream) {
+     validate_policy(policy);
+     if (is_gguf(gate_weight.qtype) && is_gguf(up_weight.qtype)) {
+-        detail::gguf_swiglu(x, gate_weight, &up_weight, out, ws, stream);
++        detail::gguf_swiglu(x, gate_weight, &up_weight, out, ws, stream, gguf::GateActivation::Silu, policy);
+         return;
+     }
+     if (!fp32_pair(gate_weight.qtype, up_weight.qtype)) {
+diff --git a/src/ops/wrapper/linear_swiglu_add.cpp b/src/ops/wrapper/linear_swiglu_add.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..72640782df4e1e5d98820bfb65f46f4a55354aba
+--- /dev/null
++++ b/src/ops/wrapper/linear_swiglu_add.cpp
+@@ -0,0 +1,89 @@
++#include "ninfer/ops/linear_swiglu_add.h"
++#include "ops/linear/gguf/gguf_linear.h"
++#include "ops/linear/gguf/gguf_nvfp4.h"
++#include <algorithm>
++#include <stdexcept>
++
++namespace ninfer::ops {
++namespace {
++constexpr auto form = gguf::LtForm::Nvfp4;
++void require_policies(LinearPolicy gate, LinearPolicy down) {
++    if (!valid_linear_policy(gate) || !valid_linear_policy(down))
++        throw std::invalid_argument("linear_swiglu_add: invalid compute policy");
++}
++
++bool fused(QType gate, QType up, QType down, int k, int rows, int t, LinearPolicy gp,
++           LinearPolicy dp) {
++    return gguf::nvfp4_enabled() && allows_a4(gp) && allows_a4(dp) && t >= 129 && rows % 256 == 0 &&
++           gguf::has_lt_product(detail::gguf_type(gate), k, form) &&
++           gguf::has_lt_product(detail::gguf_type(up), k, form) &&
++           gguf::has_lt_product(detail::gguf_type(down), rows, form);
++}
++} // namespace
++
++std::size_t linear_swiglu_add_workspace_capacity_bytes(QType gate, const QType* up, int gate_rows,
++                                                       int k, QType down, int output_rows,
++                                                       LinearPolicy gp, LinearPolicy dp, int first,
++                                                       int last) {
++    if (!is_gguf(gate) || !is_gguf(down) || (up && !is_gguf(*up)) || first <= 0 || last < first ||
++        gate_rows <= 0 || (!up && gate_rows % 2 != 0) || k <= 0 || output_rows <= 0)
++        throw std::invalid_argument(
++            "linear_swiglu_add: GGUF matrices and a valid token interval required");
++    require_policies(gp,dp);
++    int rows = up ? gate_rows : gate_rows / 2;
++    detail::GgufShape g{gate, gate_rows, k}, u{up ? *up : gate, rows, k},
++        d{down, output_rows, rows};
++    const auto gated     = detail::gguf_swiglu_workspace_bytes(g, up ? &u : nullptr, first, last);
++    const auto projected = detail::gguf_project_workspace_bytes({&d, 1}, first, last);
++    auto bytes           = std::max(gated, projected);
++    if (fused(gate, up ? *up : gate, down, k, rows, last, gp, dp))
++        bytes = std::max(bytes, gguf::lt_activation_bytes(rows, last, form) +
++                                    std::max(gated, gguf::lt_planned_scratch_bytes(
++                                                        rows, output_rows, last, false, form)) +
++                                    512);
++    return std::size_t(rows) * last * 2 + bytes + 256;
++}
++
++void linear_swiglu_add(const Tensor& x, const Weight& gate, const Weight* up, const Weight& down,
++                       Tensor& residual, LinearPolicy gp, LinearPolicy dp,
++                       WorkspaceArena& workspace, cudaStream_t stream) {
++    detail::require_gguf(gate, "linear_swiglu_add gate");
++    detail::require_gguf(down, "linear_swiglu_add down");
++    if (up) detail::require_gguf(*up, "linear_swiglu_add up");
++    const int t = x.ne[1], rows = up ? gate.n : gate.n / 2;
++    if (down.k != rows || residual.dtype != DType::BF16 || !residual.is_contiguous() ||
++        residual.ne[0] != down.n || residual.ne[1] != t)
++        throw std::invalid_argument("linear_swiglu_add: incompatible down/residual geometry");
++    require_policies(gp,dp);
++    auto scope        = workspace.scope();
++    Tensor activation = workspace.alloc(DType::BF16, {rows, t});
++    gguf::VectorOutput out;
++    out.bf16          = static_cast<__nv_bfloat16*>(residual.data);
++    out.column_stride = down.n;
++    out.epilogue      = gguf::Epilogue::Accumulate;
++    if (!fused(gate.qtype, up ? up->qtype : gate.qtype, down.qtype, gate.k, rows, t, gp, dp) ||
++        gate.gguf_amax <= 0 || (up && up->gguf_amax <= 0) || down.gguf_amax <= 0 ||
++        down.input_columns || !gguf::lt_takes_output(out)) {
++        {
++            auto call = workspace.scope();
++            detail::gguf_swiglu(x, gate, up, activation, workspace, stream,
++                                gguf::GateActivation::Silu, gp);
++        }
++        detail::gguf_linear_add(activation, down, residual, workspace, stream, dp);
++        return;
++    }
++    void* encoded = workspace.alloc_bytes(gguf::lt_activation_bytes(rows, t, form)).data;
++    {
++        auto call = workspace.scope();
++        detail::gguf_swiglu(x, gate, up, activation, workspace, stream, gguf::GateActivation::Silu,
++                            gp, encoded);
++    }
++    const auto bytes = gguf::lt_planned_scratch_bytes(rows, down.n, t, false, form);
++    void* scratch    = workspace.alloc_bytes(bytes).data;
++    auto block       = gguf_block_shape(down.qtype);
++    gguf::lt_product(detail::gguf_type(down.qtype), down.qdata,
++                     std::int64_t(rows / block.elements) * block.bytes, down.n, rows, form,
++                     down.gguf_amax, {down.fp4_choices, down.fp4_choices_amax}, encoded, t, out,
++                     scratch, bytes, stream);
++}
++} // namespace ninfer::ops
+diff --git a/src/runtime/engine/engine.cpp b/src/runtime/engine/engine.cpp
+index a774fa64abf4c7e9af2cdc4f9f02db1cd976623a..493c8fefa4fec99a6624b71f45369069f809c879 100644
+--- a/src/runtime/engine/engine.cpp
++++ b/src/runtime/engine/engine.cpp
+@@ -1,6 +1,7 @@
+ #include "ninfer/engine.h"
+ #include "text/structured_output.h"
+ #include "ops/linear/gguf/gguf_mxfp8.h"
++#include "ops/linear/gguf/gguf_nvfp4.h"
+ 
+ #include "artifact/reader.h"
+ #include "models/qwen3_5/load/vision_cpu_cache.h"
+@@ -355,6 +356,7 @@ std::string slot_model_binding(const EngineOptions& options, const LoadSummary&
+     // Other model families have coarser load signatures. The process-wide arithmetic
+     // opt-in must still prevent their session snapshots crossing numerical profiles.
+     if (ops::gguf::mxfp8::enabled()) { binding += "gguf-mxfp8-e4m3-e8m0-f32-tile-v1\n"; }
++    if (ops::gguf::nvfp4_enabled()) { binding += "gguf-nvfp4-e2m1-e4m3-mse4-bf16-v1\n"; }
+     std::error_code size_error;
+     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, size_error);
+     binding += size_error ? std::string("?") : std::to_string(size);
+diff --git a/tests/artifact/test_gguf_a4.py b/tests/artifact/test_gguf_a4.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c7aa9ff812e3cd89fa1616a2525af7664469c05
+--- /dev/null
++++ b/tests/artifact/test_gguf_a4.py
+@@ -0,0 +1,42 @@
++import hashlib
++from pathlib import Path
++import tempfile
++import unittest
++from tools.artifact.gguf_a4 import permit_a4
++from tools.artifact.reader import Artifact
++from tools.artifact.schema import TensorSpec
++from tools.artifact.writer import ArtifactWriter
++
++class GgufA4ArtifactTest(unittest.TestCase):
++    def test_permission_scope_preserves_every_physical_byte_and_sensitive_use(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root=Path(directory);source=root/'source.ninfer'
++            bindings={name:{'object':obj} for name,obj in [
++                ('text/layers/0/mlp/gate','w'),('text/layers/0/attention/query','w'),
++                ('text/output_head','w'),('text/layers/0/mlp/up','b'),
++                ('text/layers/1/mlp/gate','w'),('text/layers/2/mlp/gate','w'),
++                ('text/layers/3/mlp/gate','w')]}
++            uses=[dict(parameter=name,input='hidden',activation_policy='A16Only' if name.startswith('text/layers/1/') else 'AllowA8') for name in bindings]
++            payload=bytes(range(256))+bytes(range(32))
++            with ArtifactWriter(source,[TensorSpec('w',(2,256),'gguf_q4_k','gguf_blocks_v1'),
++                                        TensorSpec('b',(2,2),'bf16','contiguous_le_v1')],
++                                components={'text':{'config':{}}},
++                                bindings=bindings,uses=uses) as writer:
++                writer.write_object('w',payload);writer.write_object('b',b'12345678');writer.finish()
++            original=hashlib.sha256(source.read_bytes()).hexdigest()
++            for scope,count in [('all-projections',4),('mlp-gate-up',3),('mlp-gate-up-middle-half',1)]:
++                target=root/(scope+'.ninfer');report=permit_a4(source,target,scope)
++                self.assertEqual(len(report['changed_uses']),count)
++                with Artifact(source) as before,Artifact(target) as after:
++                    self.assertNotEqual(before.artifact_id,after.artifact_id)
++                    for obj in before.objects:self.assertEqual(before.read_object(obj.id),after.read_object(obj.id))
++                    policies={u['parameter']:u['activation_policy'] for u in after.directory.uses}
++                    self.assertEqual(policies['text/layers/0/mlp/gate'],'AllowA8' if scope.endswith('middle-half') else 'AllowA4')
++                    self.assertEqual(policies['text/layers/2/mlp/gate'],'AllowA4')
++                    self.assertEqual(policies['text/layers/3/mlp/gate'],'AllowA8' if scope.endswith('middle-half') else 'AllowA4')
++                    self.assertEqual(policies['text/output_head'],'AllowA8')
++                    self.assertEqual(policies['text/layers/0/mlp/up'],'AllowA8')
++                    self.assertEqual(policies['text/layers/1/mlp/gate'],'A16Only')
++                self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),original)
++
++if __name__=='__main__':unittest.main()
+diff --git a/tests/ops/linear/test_gguf_nvfp4.cpp b/tests/ops/linear/test_gguf_nvfp4.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac32bf1a3e471899b7665854eca79fe94a500137
+--- /dev/null
++++ b/tests/ops/linear/test_gguf_nvfp4.cpp
+@@ -0,0 +1,550 @@
++// Public GGUF NVFP4 products against a scalar CPU packed-weight decoder, independent
++// table codecs and FP64 dot products. The CPU error calculation explicitly rounds each
++// half-precision candidate-error operation, while the actual GEMM accumulates in FP32.
++#include "core/arena.h"
++#include "core/weight.h"
++#include "ninfer/ops/linear.h"
++#include "ninfer/ops/linear_add.h"
++#include "ninfer/ops/linear_swiglu.h"
++#include "ninfer/ops/linear_swiglu_add.h"
++#include "ops/linear/gguf/gguf_linear.h"
++#include "ops/linear/gguf/gguf_nvfp4.h"
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++#include <string_view>
++#include <vector>
++extern "C" void gguf_cpu_decode(int, const void*, float*, int);
++
++namespace {
++using namespace ninfer;
++namespace g           = ops::gguf;
++constexpr auto form   = g::LtForm::Nvfp4;
++constexpr auto policy = ops::LinearPolicy::AllowA4;
++
++void ck(cudaError_t e) {
++    if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
++}
++
++double f8(unsigned c) {
++    int e = (c >> 3) & 15, m = c & 7;
++    return e ? std::ldexp(1.0 + m / 8.0, e - 7) : std::ldexp(double(m), -9);
++}
++
++unsigned f8code(float v) {
++    unsigned best = 0;
++    double error  = std::abs(double(v));
++    for (unsigned c = 1; c <= 126; ++c) {
++        const double d = std::abs(double(v) - f8(c));
++        if (d < error || (d == error && (c & 1) == 0)) {
++            best  = c;
++            error = d;
++        }
++    }
++    return best;
++}
++
++constexpr float f4table[] = {0, .5, 1, 1.5, 2, 3, 4, 6};
++
++unsigned f4code(float v) {
++    const unsigned sign = std::signbit(v) ? 8 : 0;
++    v                   = std::abs(v);
++    unsigned best       = 0;
++    float error         = v;
++    for (unsigned c = 1; c < 8; ++c) {
++        float d = std::abs(v - f4table[c]);
++        if (d < error || (d == error && (c & 1) == 0)) {
++            best  = c;
++            error = d;
++        }
++    }
++    return best | sign;
++}
++
++float f4(unsigned c) { return (c & 8 ? -1.f : 1.f) * f4table[c & 7]; }
++
++float half(float v) { return __half2float(__float2half_rn(v)); }
++
++float global(float a) {
++    if (a == 0) return 1;
++    if (a < 1e-15f) return std::ldexp(1.f, 60);
++    return std::ldexp(1.f, std::max(-60, int(std::floor(std::log2(2688.0 / double(a))))));
++}
++
++struct Group {
++    unsigned scale = 0, choice = 0;
++    std::array<unsigned, 16> codes{};
++};
++
++Group encode(const float* v) {
++    float a = 0;
++    for (int j = 0; j < 16; ++j) a = std::max(a, std::abs(v[j]));
++    const unsigned s6        = std::max(f8code(a * (1.f / 6.f)), a > 0 ? 1u : 0u),
++                   s4        = std::max(f8code(a * .25f), a > 0 ? 1u : 0u);
++    const unsigned choices[] = {s6, s4, std::min(126u, s6 + 1), std::min(126u, s4 + 1)};
++    Group best;
++    float best_error = 0;
++    for (unsigned c = 0; c < 4; ++c) {
++        Group trial;
++        trial.scale       = choices[c];
++        trial.choice      = c;
++        const float scale = float(f8(trial.scale)), inv = scale > 0 ? 1.f / scale : 0.f;
++        float sums[2] = {};
++        for (int j = 0; j < 16; ++j) {
++            trial.codes[j] = f4code(v[j] * inv);
++            const float e  = half(std::fma(half(v[j]), half(inv), -f4(trial.codes[j])));
++            sums[j % 2]    = half(std::fma(e, e, sums[j % 2]));
++        }
++        const float error = (sums[0] + sums[1]) * scale * scale;
++        if (c == 0 || error < best_error) {
++            best_error = error;
++            best       = trial;
++        }
++    }
++    return best;
++}
++
++void quantize(std::vector<float>& values, float amax = 0) {
++    if (amax == 0)
++        for (float v : values) amax = std::max(amax, std::abs(v));
++    const float gl = global(amax);
++    for (std::size_t at = 0; at < values.size(); at += 16) {
++        float v[16];
++        for (int j = 0; j < 16; ++j) v[j] = values[at + j] * gl;
++        const auto q = encode(v);
++        for (int j = 0; j < 16; ++j) values[at + j] = f4(q.codes[j]) * float(f8(q.scale)) / gl;
++    }
++}
++
++void compare(const std::vector<__nv_bfloat16>& got, const std::vector<double>& want,
++             const char* name, double limit = .008) {
++    double diff = 0, ref = 0, peak = 0, worst = 0;
++    for (std::size_t i = 0; i < want.size(); ++i) {
++        double value = __bfloat162float(got[i]);
++        if (!std::isfinite(value)) throw std::runtime_error("nonfinite");
++        diff += (value - want[i]) * (value - want[i]);
++        ref += want[i] * want[i];
++        peak  = std::max(peak, std::abs(want[i]));
++        worst = std::max(worst, std::abs(value - want[i]));
++    }
++    double rms = std::sqrt(diff / std::max(ref, 1e-30)), rel = worst / std::max(peak, 1e-30);
++    std::cout << name << " rms=" << rms << " peak=" << rel << "\n";
++    if (rms > limit || rel > 2 * limit)
++        throw std::runtime_error(std::string(name) + " independent FP64 bound");
++}
++
++std::size_t scale_at(int row, int group, int groups) {
++    return std::size_t(row / 128 * ((groups + 3) / 4) + group / 4) * 512 + (row % 32) * 16 +
++           (row % 128 / 32) * 4 + group % 4;
++}
++
++void activation_codec() {
++    constexpr int k = 256, t = 5;
++    std::vector<__nv_bfloat16> x(k * t);
++    std::mt19937 rng(5151);
++    std::normal_distribution<float> normal(0, 1);
++    for (auto& v : x) v = __float2bfloat16(normal(rng));
++    for (int j = 0; j < 16; ++j) x[j] = __float2bfloat16(0);
++    for (int j = 16; j < 32; ++j) x[j] = __float2bfloat16((j & 1 ? -1.f : 1.f) * 1e-38f);
++    for (int j = 32; j < 48; ++j) x[j] = __float2bfloat16((j & 1 ? -1.f : 1.f) * 1e8f);
++    DeviceBuffer dx(x.size() * 2), data(g::lt_activation_bytes(k, t, form));
++    dx.copy_from_host(x.data(), x.size() * 2);
++    std::vector<int> permutation(k);
++    std::iota(permutation.begin(), permutation.end(), 0);
++    std::reverse(permutation.begin(), permutation.end());
++    DeviceBuffer dp(k * 4);
++    dp.copy_from_host(permutation.data(), k * 4);
++    for (bool gather : {false, true}) {
++        g::quantize_lt_activation(static_cast<const __nv_bfloat16*>(dx.p), k, t,
++                                  gather ? static_cast<int*>(dp.p) : nullptr, form, data.p,
++                                  nullptr);
++        std::vector<unsigned char> bytes(data.bytes);
++        data.copy_to_host(bytes.data(), bytes.size());
++        float a = 0;
++        for (auto v : x) a = std::max(a, std::abs(__bfloat162float(v)));
++        const float gl = global(a);
++        int differing  = 0;
++        for (int c = 0; c < t; ++c)
++            for (int b = 0; b < k / 16; ++b) {
++                float v[16];
++                for (int j = 0; j < 16; ++j)
++                    v[j] = __bfloat162float(
++                               x[c * k + (gather ? permutation[16 * b + j] : 16 * b + j)]) *
++                           gl;
++                auto q = encode(v);
++                unsigned s =
++                    bytes[g::lt_activation_scales_offset(k, t, form) + scale_at(c, b, k / 16)];
++                bool same = s == q.scale;
++                for (int j = 0; j < 16; ++j) {
++                    unsigned code = (bytes[c * (k / 2) + 8 * b + j / 2] >> (4 * (j % 2))) & 15u;
++                    same &= code == q.codes[j];
++                    // Scalar nearest-code property at the actual scale, independent of candidate
++                    // selection.
++                    const float inv = s ? 1.f / float(f8(s)) : 0;
++                    if (code != f4code(v[j] * inv) &&
++                        std::abs(f4(code) - v[j] * inv) >
++                            std::abs(f4(f4code(v[j] * inv)) - v[j] * inv) + 1e-4f)
++                        throw std::runtime_error("FP4 code is not a nearest value");
++                }
++                differing += !same;
++            }
++        // rcp.approx can resolve a near-tie differently; explicitly retain the count.
++        std::cout << "codec gather=" << gather << " CPU candidate differences=" << differing << "/"
++                  << t * k / 16 << "\n";
++        if (differing > 1) throw std::runtime_error("activation codec disagreement");
++        for (int c = t; c < 128; ++c)
++            for (int b = 0; b < k / 16; ++b)
++                if (bytes[g::lt_activation_scales_offset(k, t, form) + scale_at(c, b, k / 16)] != 0)
++                    throw std::runtime_error("scale padding");
++    }
++}
++
++struct Format {
++    QType q;
++    const char* name;
++    std::vector<int> fields;
++};
++
++void fallback_boundaries() {
++    constexpr int k = 256, n = 128;
++    std::mt19937 rng(913);
++    const auto b = gguf_block_shape(QType::GGUF_Q4_K);
++    std::vector<unsigned char> raw(n * b.bytes);
++    for (auto& v : raw) v = static_cast<unsigned char>(rng());
++    unsigned short h = 0x2266;
++    for (int r = 0; r < n; ++r) {
++        std::memcpy(raw.data() + r * b.bytes, &h, 2);
++        std::memcpy(raw.data() + r * b.bytes + 2, &h, 2);
++    }
++    DeviceBuffer dw(raw.size());
++    dw.copy_from_host(raw.data(), raw.size());
++    Weight w;
++    w.qtype            = QType::GGUF_Q4_K;
++    w.layout           = QuantLayout::GgufBlocks;
++    w.n                = n;
++    w.k                = k;
++    w.qdata            = dw.p;
++    w.gguf_amax        = 32;
++    std::uint64_t hash = 1469598103934665603ULL;
++    for (int t : {1, 8, 32, 128, 129})
++        for (auto p : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8, policy}) {
++            if (t == 129 && p == policy) continue;
++            std::vector<__nv_bfloat16> x(k * t);
++            for (auto& v : x) v = __float2bfloat16(float(int(rng() % 131) - 65) * .01f);
++            DeviceBuffer dx(x.size() * 2), dy(n * t * 2);
++            dx.copy_from_host(x.data(), x.size() * 2);
++            Tensor tx(dx.p, DType::BF16, {k, t}), ty(dy.p, DType::BF16, {n, t});
++            WorkspaceArena ws(ops::linear_workspace_capacity_bytes(w.qtype, n, k, p, 1, t));
++            ops::linear(tx, w, ty, p, ws, nullptr);
++            std::vector<unsigned char> result(n * t * 2);
++            dy.copy_to_host(result.data(), result.size());
++            for (auto value : result) {
++                hash ^= value;
++                hash *= 1099511628211ULL;
++            }
++        }
++    // FP32 products also retain q8_1 at wide sizes.
++    constexpr int t = 129;
++    std::vector<__nv_bfloat16> x(k * t);
++    for (auto& v : x) v = __float2bfloat16(float(int(rng() % 131) - 65) * .01f);
++    DeviceBuffer dx(x.size() * 2), dy(n * t * 4);
++    dx.copy_from_host(x.data(), x.size() * 2);
++    Tensor tx(dx.p, DType::BF16, {k, t}), ty(dy.p, DType::FP32, {n, t});
++    WorkspaceArena ws(ops::linear_workspace_capacity_bytes(w.qtype, n, k, policy, 1, t));
++    ops::linear(tx, w, ty, policy, ws, nullptr);
++    std::vector<unsigned char> result(n * t * 4);
++    dy.copy_to_host(result.data(), result.size());
++    for (auto value : result) {
++        hash ^= value;
++        hash *= 1099511628211ULL;
++    }
++    std::cout << "q8 fallback checksum=" << hash << "\n";
++}
++
++void fused_feed_forward() {
++    constexpr int k = 256, m = 256, n = 16, t = 129;
++    const auto block = gguf_block_shape(QType::GGUF_Q4_K);
++    const int rb     = block.bytes;
++    std::mt19937 rng(8119);
++    std::vector<unsigned char> gr(2 * m * rb), dr(n * rb);
++    const unsigned short h = 0x1866;
++    for (auto* raw : {&gr, &dr}) {
++        for (auto& v : *raw) v = static_cast<unsigned char>(rng());
++        for (std::size_t r = 0; r < raw->size(); r += rb) {
++            std::memcpy(raw->data() + r, &h, 2);
++            std::memcpy(raw->data() + r + 2, &h, 2);
++        }
++    }
++    std::vector<float> gw(2 * m * k), dw(n * m);
++    gguf_cpu_decode(12, gr.data(), gw.data(), 2 * m * k);
++    gguf_cpu_decode(12, dr.data(), dw.data(), n * m);
++    float ga = 0, da = 0;
++    for (float v : gw) ga = std::max(ga, std::abs(v));
++    for (float v : dw) da = std::max(da, std::abs(v));
++    quantize(gw, ga);
++    quantize(dw, da);
++    std::normal_distribution<float> normal(0, .3f);
++    std::vector<__nv_bfloat16> x(k * t);
++    for (auto& v : x) v = __float2bfloat16(normal(rng));
++    std::vector<float> qx(x.size());
++    for (std::size_t i = 0; i < x.size(); ++i) qx[i] = __bfloat162float(x[i]);
++    quantize(qx);
++    std::vector<float> activation(m * t);
++    for (int c = 0; c < t; ++c)
++        for (int r = 0; r < m; ++r) {
++            double a = 0, b = 0;
++            for (int j = 0; j < k; ++j) {
++                a += double(gw[r * k + j]) * qx[c * k + j];
++                b += double(gw[(m + r) * k + j]) * qx[c * k + j];
++            }
++            const float gb        = __bfloat162float(__float2bfloat16(float(a))),
++                        ub        = __bfloat162float(__float2bfloat16(float(b)));
++            activation[c * m + r] = __bfloat162float(
++                __float2bfloat16(float(double(gb) / (1 + std::exp(-double(gb))) * ub)));
++        }
++    quantize(activation);
++    std::vector<double> ref(n * t, .25);
++    for (int c = 0; c < t; ++c)
++        for (int r = 0; r < n; ++r)
++            for (int j = 0; j < m; ++j)
++                ref[c * n + r] += double(dw[r * m + j]) * activation[c * m + j];
++    DeviceBuffer dg(gr.size()), dd(dr.size()), dx(x.size() * 2), dy(n * t * 2), dh(m * t * 2);
++    dg.copy_from_host(gr.data(), gr.size());
++    dd.copy_from_host(dr.data(), dr.size());
++    dx.copy_from_host(x.data(), x.size() * 2);
++    Weight gate;
++    gate.qtype     = QType::GGUF_Q4_K;
++    gate.layout    = QuantLayout::GgufBlocks;
++    gate.n         = 2 * m;
++    gate.k         = k;
++    gate.qdata     = dg.p;
++    gate.gguf_amax = ga;
++    Weight down    = gate;
++    down.n         = n;
++    down.k         = m;
++    down.qdata     = dd.p;
++    down.gguf_amax = da;
++    Tensor tx(dx.p, DType::BF16, {k, t}), ty(dy.p, DType::BF16, {n, t}),
++        th(dh.p, DType::BF16, {m, t});
++    const auto bytes = ops::linear_swiglu_add_workspace_capacity_bytes(
++        gate.qtype, nullptr, gate.n, k, down.qtype, n, policy, policy, 1, t);
++    WorkspaceArena ws(bytes);
++    std::vector<__nv_bfloat16> initial(n * t, __float2bfloat16(.25)), got(n * t), composed(n * t);
++    dy.copy_from_host(initial.data(), initial.size() * 2);
++    ops::linear_swiglu_add(tx, gate, nullptr, down, ty, policy, policy, ws, nullptr);
++    dy.copy_to_host(got.data(), got.size() * 2);
++    compare(got, ref, "fused FFN FP64", .012);
++    dy.copy_from_host(initial.data(), initial.size() * 2);
++    ops::linear_swiglu(tx, gate, th, policy, ws, nullptr);
++    ops::linear_add(th, down, ty, policy, ws, nullptr);
++    dy.copy_to_host(composed.data(), composed.size() * 2);
++    if (std::memcmp(got.data(), composed.data(), got.size() * 2))
++        throw std::runtime_error("fused down producer differs from BF16 composition");
++    std::cout << "fused down activation exactly matches separate BF16 producer\n";
++}
++
++void run(const Format& format, int n, int k, int t, bool fusion) {
++    std::mt19937 rng(1031 + int(format.q) + k + t);
++    const auto block = gguf_block_shape(format.q);
++    const auto rb    = std::size_t(k / block.elements) * block.bytes;
++    std::vector<unsigned char> raw(2 * n * rb);
++    for (auto& v : raw) v = static_cast<unsigned char>(rng());
++    const unsigned short h = 0x2266;
++    for (std::size_t b = 0; b < raw.size(); b += block.bytes) {
++        for (int off : format.fields) std::memcpy(raw.data() + b + off, &h, 2);
++        if (format.q == QType::GGUF_IQ1_M) {
++            for (int i = 0; i < 4; ++i) {
++                unsigned short s;
++                std::memcpy(&s, raw.data() + b + 48 + 2 * i, 2);
++                s = (s & 0xfff) | (((h >> (4 * i)) & 15) << 12);
++                std::memcpy(raw.data() + b + 48 + 2 * i, &s, 2);
++            }
++        }
++    }
++    std::vector<float> exact(std::size_t(2 * n) * k);
++    gguf_cpu_decode(int(ops::detail::gguf_type(format.q)), raw.data(), exact.data(), 2 * n * k);
++    float max_gate = 0, max_up = 0;
++    for (int i = 0; i < n * k; ++i) {
++        max_gate = std::max(max_gate, std::abs(exact[i]));
++        max_up   = std::max(max_up, std::abs(exact[n * k + i]));
++    }
++    const float pair = std::max(max_gate, max_up);
++    DeviceBuffer dw(raw.size()), amax(sizeof(unsigned));
++    dw.copy_from_host(raw.data(), raw.size());
++    g::matrix_amax(ops::detail::gguf_type(format.q), dw.p, rb, 2 * n, k,
++                   static_cast<unsigned*>(amax.p), nullptr);
++    float measured;
++    amax.copy_to_host(&measured, 4);
++    if (measured != pair) throw std::runtime_error("independent decoded amax differs");
++    std::normal_distribution<float> normal(0, .3f);
++    std::vector<__nv_bfloat16> x(k * t);
++    for (auto& v : x) v = __float2bfloat16(normal(rng));
++    DeviceBuffer dx(x.size() * 2), dy(std::size_t(n) * t * 2 + 32);
++    dx.copy_from_host(x.data(), x.size() * 2);
++    Tensor tx(dx.p, DType::BF16, {k, t}),
++        ty(static_cast<unsigned char*>(dy.p) + 16, DType::BF16, {n, t});
++    Weight w;
++    w.qtype          = format.q;
++    w.layout         = QuantLayout::GgufBlocks;
++    w.n              = n;
++    w.k              = k;
++    w.qdata          = dw.p;
++    w.gguf_amax      = max_gate;
++    Weight parent    = w;
++    parent.n         = 2 * n;
++    parent.gguf_amax = pair;
++    const auto capacity =
++        std::max(ops::linear_workspace_capacity_bytes(w.qtype, n, k, policy, 1, t),
++                 ops::linear_swiglu_workspace_capacity_bytes(w.qtype, 2 * n, k, policy, 1, t));
++    WorkspaceArena ws(capacity);
++    std::vector<int> permutation(k);
++    std::iota(permutation.begin(), permutation.end(), 0);
++    std::shuffle(permutation.begin(), permutation.end(), rng);
++    DeviceBuffer dp(k * 4);
++    dp.copy_from_host(permutation.data(), k * 4);
++    const auto choices_bytes = g::fp4_choice_bytes(2 * n, k);
++    PinnedHostBuffer choices(choices_bytes);
++    g::fp4_choices(ops::detail::gguf_type(w.qtype), dw.p, rb, 2 * n, k, pair,
++                   static_cast<unsigned char*>(choices.data()), nullptr);
++    for (bool gather : {false, true}) {
++        w.input_columns      = gather ? static_cast<int*>(dp.p) : nullptr;
++        parent.input_columns = w.input_columns;
++        std::vector<float> qx(k * t), qw(exact.begin(), exact.begin() + n * k), qpair = exact;
++        for (int c = 0; c < t; ++c)
++            for (int j = 0; j < k; ++j)
++                qx[c * k + j] = __bfloat162float(x[c * k + (gather ? permutation[j] : j)]);
++        quantize(qx);
++        quantize(qw, max_gate);
++        quantize(qpair, pair);
++        std::vector<double> ref(n * t), fused(n * t);
++        for (int c = 0; c < t; ++c)
++            for (int r = 0; r < n; ++r) {
++                double sum = 0, gate = 0, up = 0;
++                for (int j = 0; j < k; ++j) {
++                    sum += double(qw[r * k + j]) * qx[c * k + j];
++                    gate += double(qpair[r * k + j]) * qx[c * k + j];
++                    up += double(qpair[(n + r) * k + j]) * qx[c * k + j];
++                }
++                ref[c * n + r]   = sum;
++                float gb         = __bfloat162float(__float2bfloat16(float(gate))),
++                      ub         = __bfloat162float(__float2bfloat16(float(up)));
++                fused[c * n + r] = gb / (1 + std::exp(-double(gb))) * ub;
++            }
++        std::vector<__nv_bfloat16> got(n * t), search;
++        dy.fill(0x42);
++        ops::linear(tx, w, ty, policy, ws, nullptr);
++        ck(cudaDeviceSynchronize());
++        ck(cudaMemcpy(got.data(), ty.data, got.size() * 2, cudaMemcpyDeviceToHost));
++        search = got;
++        std::cout << format.name << " N=" << n << " K=" << k << " T=" << t << " gather=" << gather
++                  << " ";
++        compare(got, ref, "FP64 encoded product");
++        // Cache computed under this operand's own global must preserve every output bit.
++        g::fp4_choices(ops::detail::gguf_type(w.qtype), dw.p, rb, n, k, max_gate,
++                       static_cast<unsigned char*>(choices.data()), nullptr);
++        w.fp4_choices      = static_cast<unsigned char*>(choices.data());
++        w.fp4_choices_amax = max_gate;
++        ops::linear(tx, w, ty, policy, ws, nullptr);
++        ck(cudaMemcpy(got.data(), ty.data, got.size() * 2, cudaMemcpyDeviceToHost));
++        if (std::memcmp(got.data(), search.data(), got.size() * 2))
++            throw std::runtime_error("choice cache changes result");
++        std::fill(got.begin(), got.end(), __float2bfloat16(.25));
++        ck(cudaMemcpy(ty.data, got.data(), got.size() * 2, cudaMemcpyHostToDevice));
++        ops::linear_add(tx, w, ty, policy, ws, nullptr);
++        ck(cudaMemcpy(got.data(), ty.data, got.size() * 2, cudaMemcpyDeviceToHost));
++        auto add = ref;
++        for (auto& v : add) v += .25;
++        compare(got, add, "residual");
++        if (fusion) {
++            g::fp4_choices(ops::detail::gguf_type(w.qtype), dw.p, rb, 2 * n, k, pair,
++                           static_cast<unsigned char*>(choices.data()), nullptr);
++            parent.fp4_choices      = static_cast<unsigned char*>(choices.data());
++            parent.fp4_choices_amax = pair;
++            ops::linear_swiglu(tx, parent, ty, policy, ws, nullptr);
++            ck(cudaMemcpy(got.data(), ty.data, got.size() * 2, cudaMemcpyDeviceToHost));
++            compare(got, fused, "BF16-boundary SwiGLU", .012);
++            Weight gate_half=parent,up_half=parent;
++            gate_half.n=up_half.n=n;
++            up_half.qdata=static_cast<const unsigned char*>(dw.p)+std::size_t(n)*rb;
++            up_half.fp4_choices=g::fp4_choice_rows(parent.fp4_choices,n,k);
++            ops::linear_swiglu(tx,gate_half,up_half,ty,policy,ws,nullptr);
++            ck(cudaMemcpy(got.data(),ty.data,got.size()*2,cudaMemcpyDeviceToHost));
++            compare(got,fused,"separate-parent SwiGLU",.012);
++            // Distinct gathers take two GEMMs instead of the stacked one-GEMM form.
++            up_half.input_columns=gather?nullptr:static_cast<int*>(dp.p);
++            std::vector<float> up_x(k*t);
++            for(int c=0;c<t;++c)for(int j=0;j<k;++j)
++                up_x[c*k+j]=__bfloat162float(x[c*k+(gather?j:permutation[j])]);
++            quantize(up_x);
++            std::vector<double> separate(n*t);
++            for(int c=0;c<t;++c)for(int r=0;r<n;++r){
++                double gv=0,uv=0;
++                for(int j=0;j<k;++j){gv+=double(qpair[r*k+j])*qx[c*k+j];uv+=double(qpair[(n+r)*k+j])*up_x[c*k+j];}
++                const float gb=__bfloat162float(__float2bfloat16(float(gv))),ub=__bfloat162float(__float2bfloat16(float(uv)));
++                separate[c*n+r]=gb/(1+std::exp(-double(gb)))*ub;
++            }
++            ops::linear_swiglu(tx,gate_half,up_half,ty,policy,ws,nullptr);
++            ck(cudaMemcpy(got.data(),ty.data,got.size()*2,cudaMemcpyDeviceToHost));
++            compare(got,separate,"distinct-gather two-GEMM SwiGLU",.012);
++        }
++        w.fp4_choices = nullptr;
++        cudaStream_t stream;
++        ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++        ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
++        ops::linear(tx, w, ty, policy, ws, stream);
++        cudaGraph_t graph;
++        ck(cudaStreamEndCapture(stream, &graph));
++        cudaGraphExec_t exe;
++        ck(cudaGraphInstantiate(&exe, graph, nullptr, nullptr, 0));
++        ck(cudaGraphLaunch(exe, stream));
++        ck(cudaStreamSynchronize(stream));
++        ck(cudaMemcpy(got.data(), ty.data, got.size() * 2, cudaMemcpyDeviceToHost));
++        compare(got, ref, "graph");
++        ck(cudaGraphExecDestroy(exe));
++        ck(cudaGraphDestroy(graph));
++        ck(cudaStreamDestroy(stream));
++        std::vector<unsigned char> guards(dy.bytes);
++        dy.copy_to_host(guards.data(), guards.size());
++        for (int i = 0; i < 16; ++i)
++            if (guards[i] != 0x42 || guards[guards.size() - 1 - i] != 0x42)
++                throw std::runtime_error("output canary");
++        w.fp4_choices = nullptr;
++    }
++    if (ws.peak_used() > capacity) throw std::runtime_error("workspace bound");
++}
++} // namespace
++
++int main(int argc, char** argv) {
++    try {
++        fallback_boundaries();
++        if (argc > 1 && std::string_view(argv[1]) == "--boundary-only") return 0;
++        if (!g::nvfp4_enabled()) throw std::runtime_error("NINFER_GGUF_PREFILL_NVFP4=1 required");
++        if (!g::has_lt_product(g::GgmlType::IQ3_S, 256, form)) return 77;
++        activation_codec();
++        fused_feed_forward();
++        std::vector<Format> fs = {
++            {QType::GGUF_IQ3_XXS, "iq3_xxs", {0}}, {QType::GGUF_IQ3_S, "iq3_s", {0}},
++            {QType::GGUF_IQ2_XXS, "iq2_xxs", {0}}, {QType::GGUF_IQ2_XS, "iq2_xs", {0}},
++            {QType::GGUF_IQ2_S, "iq2_s", {0}},     {QType::GGUF_IQ4_XS, "iq4_xs", {0}},
++            {QType::GGUF_Q2_K, "q2_k", {80, 82}},  {QType::GGUF_Q4_K, "q4_k", {0, 2}},
++            {QType::GGUF_Q6_K, "q6_k", {208}},     {QType::GGUF_IQ1_S, "iq1_s", {0}},
++            {QType::GGUF_IQ1_M, "iq1_m", {}}};
++        for (auto& f : fs) run(f, 24, 256, 129, true);
++        run(fs[1], 128, 5120, 256, false);
++        run(fs[2], 32, 6144, 1024, false);
++        run(fs[5], 24, 17408, 257, false);
++        std::cout
++            << "NVFP4 independent CPU codec, packed decode, FP64 products and public Ops passed\n";
++        return 0;
++    } catch (const std::exception& e) {
++        std::cerr << e.what() << "\n";
++        return 1;
++    }
++}
+diff --git a/tests/ops/linear/tests.cmake b/tests/ops/linear/tests.cmake
+index fd97b84fb24c510caa65a2af8d01b0fe53f65a9d..9dd11885709da5c1252a0cc2458ac0dfddd2e953 100644
+--- a/tests/ops/linear/tests.cmake
++++ b/tests/ops/linear/tests.cmake
+@@ -94,6 +94,16 @@ ninfer_add_op_test(ninfer_linear_gguf_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf.cpp"
+   LIBRARIES ninfer_ops)
+ 
++ninfer_add_op_test(ninfer_linear_gguf_nvfp4_test STANDALONE
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_nvfp4.cpp"
++          "${CMAKE_CURRENT_LIST_DIR}/gguf_cpu_oracle.c"
++  LIBRARIES ninfer_ops)
++target_include_directories(ninfer_linear_gguf_nvfp4_test PRIVATE
++  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
++ninfer_stage_runtime_dlls(ninfer_linear_gguf_nvfp4_test)
++set_tests_properties(ninfer_linear_gguf_nvfp4_test PROPERTIES
++  ENVIRONMENT "NINFER_GGUF_PREFILL_NVFP4=1;NINFER_GGUF_PREFILL_MXFP8=0")
++
+ ninfer_add_op_test(ninfer_linear_gguf_mxfp8_test STANDALONE
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mxfp8.cpp"
+           "${CMAKE_CURRENT_LIST_DIR}/gguf_cpu_oracle.c"
+diff --git a/tools/artifact/gguf_a4.py b/tools/artifact/gguf_a4.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6d3cf712603e086acc5b39d150746dddf9da0e4
+--- /dev/null
++++ b/tools/artifact/gguf_a4.py
+@@ -0,0 +1,88 @@
++"""Make an explicit GGUF A4-permission artifact without changing physical tensor bytes.
++
++python -m tools.artifact.gguf_a4 source.ninfer output.ninfer --scope mlp-gate-up
++"""
++from __future__ import annotations
++import argparse
++import hashlib
++import json
++import re
++from pathlib import Path
++from .reader import Artifact
++from .schema import ResourceSpec, TensorObject, TensorSpec, binding_parts
++from .writer import ArtifactWriter
++
++def permit_a4(source: Path, output: Path, scope: str, *, verify_payload: bool = True) -> dict:
++    if scope not in {"all-projections", "mlp-gate-up", "mlp-gate-up-middle-half"}:
++        raise ValueError("unknown GGUF A4 scope")
++    if source.resolve() == output.resolve() or output.exists():
++        raise ValueError("output must be a new file distinct from the source")
++    with Artifact(source) as artifact:
++        description = artifact.directory.to_json()
++        layer_pattern=re.compile(r"text/layers/(\d+)/mlp/(gate|up)$")
++        layers=[int(m.group(1)) for name in description["bindings"]
++                if (m:=layer_pattern.fullmatch(name))]
++        count=max(layers)+1 if layers else 0
++        if scope=="mlp-gate-up-middle-half" and count<4:
++            raise ValueError("middle-half scope requires at least four text layers")
++        changed = []
++        for use in description["uses"]:
++            name = use["parameter"]
++            parts = binding_parts(description["bindings"][name], artifact.by_id)
++            gguf = all(isinstance(artifact.by_id[p[0]], TensorObject) and
++                       artifact.by_id[p[0]].format.startswith("gguf_") for p in parts)
++            match=layer_pattern.fullmatch(name)
++            selected = (not name.endswith("/output_head") if scope == "all-projections" else
++                        match is not None and (scope=="mlp-gate-up" or
++                        count//4<=int(match.group(1))<count-count//4))
++            if gguf and selected and use.get("activation_policy") == "AllowA8":
++                use["activation_policy"] = "AllowA4"
++                changed.append({"parameter": name, "input": use["input"]})
++        if not changed:
++            raise ValueError("scope selects no GGUF AllowA8 Uses")
++        specs = [TensorSpec(o.id, o.shape, o.format, o.layout, o.divisors)
++                 if isinstance(o, TensorObject) else ResourceSpec(o.id, o.bytes, o.encoding)
++                 for o in artifact.objects]
++        provenance = {**description["provenance"], "gguf_a4_permission": {
++            "source_artifact_id": artifact.artifact_id.hex(), "scope": scope,
++            "physical_objects": "unchanged", "changed_uses": changed}}
++        hashes = {}
++        with ArtifactWriter(output, specs, components=description["components"],
++                            bindings=description["bindings"], uses=description["uses"],
++                            metadata=description["metadata"], provenance=provenance) as writer:
++            for obj in artifact.objects:
++                digest = hashlib.sha256()
++                def chunks():
++                    for data in artifact.iter_range(obj.offset, obj.bytes):
++                        digest.update(data)
++                        yield data
++                writer.write_object(obj.id, chunks())
++                hashes[obj.id] = digest.hexdigest()
++            writer.finish()
++    with Artifact(output) as artifact:
++        if verify_payload:
++            for obj in artifact.objects:
++                digest = hashlib.sha256()
++                for data in artifact.iter_range(obj.offset, obj.bytes):
++                    digest.update(data)
++                if digest.hexdigest() != hashes[obj.id]:
++                    raise RuntimeError(f"physical object changed: {obj.id}")
++        return {"source": str(source), "output": str(output), "scope": scope,
++                "artifact_id": artifact.artifact_id.hex(), "changed_uses": changed,
++                "object_sha256": hashes, "payload_verified": verify_payload}
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("source", type=Path)
++    parser.add_argument("output", type=Path)
++    parser.add_argument("--scope", choices=("all-projections", "mlp-gate-up", "mlp-gate-up-middle-half"), required=True)
++    parser.add_argument("--report", type=Path)
++    args = parser.parse_args()
++    report = permit_a4(args.source, args.output, args.scope)
++    if args.report:
++        args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
++    print(json.dumps({**{k: v for k, v in report.items() if k not in {"object_sha256","changed_uses"}},
++                      "changed_uses":len(report["changed_uses"])}))
++
++if __name__ == "__main__":
++    main()
