@@ -1,5 +1,6 @@
 #include "statistics_observer.hpp"
 #include "pool_geometry.hpp"
+#include "checkpoint_handoff.hpp"
 #include "rolling_pressure.hpp"
 #include "kvmem/mean_key_retrieval.hpp"
 #include "mem/kv.h"
@@ -241,7 +242,7 @@ void StatisticsObserver::clear_session() {
     pending_finish_.reset();
     pending_input_.reset(); input_parking_.reset(); input_.reset(); fallback_.reset();
     update_input_charge(0);
-    draining_prefix_failure_=false;
+    draining_prefix_failure_=false;draining_selection_failure_=false;
     pending_cache_=0;
     pending_prefix_.reset();prefix_payload_.reset();
     pending_selection_.reset();
@@ -422,7 +423,9 @@ bool StatisticsObserver::poll_input() {
         if(!pending.ticket.ready())return false;
         pending.ticket.wait();pending.saved.prefix=std::move(pending.work->prefix);
         const auto ready_frontier=pending.saved.identity->tokens.size();
-        (pending.saved.identity->fallback ? fallback_ : input_)=std::make_unique<RetainedSession>(std::move(pending.saved));input_parking_.reset();
+        auto ready=std::make_unique<RetainedSession>(std::move(pending.saved));
+        publish_retained_checkpoint(std::move(ready),input_,fallback_);
+        input_parking_.reset();
         RAD_INFO("KVMEM_INPUT_READY request=%llu frontier=%zu",(unsigned long long)active_request_,ready_frontier);
     } catch(const StorageFailure& error) {
         input_parking_.reset();update_input_charge(input_extra_bytes());
@@ -620,6 +623,9 @@ void StatisticsObserver::activate_session(const rad::Request& request) {
         }
         if(branch.memory) {
             ++next_incarnation_;++cache_->hits;++cache_->forks;
+            // A private fork also protects an own continuation; only a
+            // different or anonymous owner is cross-session reuse.
+            if(request.cache_owner.empty() || point->identity->scope!=request.cache_owner)++cache_->cross_owner_forks;
             RAD_INFO("KVMEM_SESSION_FORK source=%llu branch=%llu frontier=%zu immutable_payload_shared=1",
                 (unsigned long long)point->session.id,(unsigned long long)branch.session.id,point->prefix->frontier());
             session_=branch.session;content_version_=branch.content_version;
@@ -1156,7 +1162,7 @@ void StatisticsObserver::publish_selection(const std::vector<uint32_t>& selected
     cache_->active_archive_bytes+=selection.host_payload_bytes_required-archive_charge_;
     archive_charge_=selection.host_payload_bytes_required;
     pending_selection_=PendingSelection{reason,selection.spill.size(),selection.restore.size(),
-        std::chrono::steady_clock::now()+std::chrono::seconds(30)};
+        std::chrono::steady_clock::now()+std::chrono::seconds(30),memory_};
     (void)poll_selection(!asynchronous_);
 }
 bool StatisticsObserver::poll_prefix() {
@@ -1173,9 +1179,26 @@ bool StatisticsObserver::poll_prefix() {
     read.ticket.wait();prefix_payload_=std::make_unique<RankPrefix::Payload>(std::move(read.work->payload));
     pending_prefix_.reset();return true;
 }
+void StatisticsObserver::cancel_selection() noexcept {
+    if(!pending_selection_)return;
+    draining_selection_failure_=true;
+    pending_selection_->storage->cancel_queued_storage();
+}
 int StatisticsObserver::poll_pending_selection() noexcept {
     SchedulerDeviceReturn device_return{device_};
     try {
+        if(draining_selection_failure_) {
+            if(!pending_selection_->storage->storage_quiescent()) {
+                if(std::chrono::steady_clock::now()>=pending_selection_->deadline &&
+                   !pending_selection_->storage->cpu_io_pending())
+                    throw std::runtime_error("device transfer timed out during storage drain");
+                return RAD_OK;
+            }
+            const auto result=memory_session_->abort();
+            if(result==AbortResult::SessionInvalidated)
+                throw std::runtime_error("device view invalidated during storage drain");
+            clear_session();return RAD_OK;
+        }
         if(draining_prefix_failure_) {
             if(!pending_prefix_->ticket.ready())return RAD_OK;
             try{pending_prefix_->ticket.wait();}
@@ -1188,6 +1211,7 @@ int StatisticsObserver::poll_pending_selection() noexcept {
             // Keep that bounded ownership until ready instead of blocking in a
             // ticket destructor on the engine thread while other requests run.
             draining_prefix_failure_=true;
+            pending_prefix_->ticket.cancel(); // A queued read can release its slot immediately.
             RAD_ERR("KVMem prefix read timed out; draining owned CPU I/O asynchronously");
             return RAD_E_IO;
         }
@@ -1203,14 +1227,26 @@ int StatisticsObserver::poll_pending_selection() noexcept {
 bool StatisticsObserver::poll_selection(bool wait) {
     if(!pending_selection_)return true;
     while(memory_session_->phase()!=MemoryPhase::Ready) {
-        require(std::chrono::steady_clock::now()<pending_selection_->deadline,"native working-set transfer timed out");
+        const auto& storage=pending_selection_->storage;
+        if(std::chrono::steady_clock::now()>=pending_selection_->deadline) {
+            if(storage->awaiting_storage() || storage->storage_error()) {
+                cancel_selection();
+                throw StorageFailure("active working-set storage timed out; draining asynchronously");
+            }
+            throw std::runtime_error("native working-set device transfer timed out");
+        }
         const auto before=memory_session_->phase();memory_session_->advance();
+        if(const auto error=storage->storage_error()) {
+            cancel_selection();
+            std::rethrow_exception(error);
+        }
         if(memory_session_->phase()==before) {
             if(!wait)return false;
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
-    const auto [reason,spill,restore,deadline]=*pending_selection_;
+    const auto reason=pending_selection_->reason;
+    const auto spill=pending_selection_->spill,restore=pending_selection_->restore;
     const auto view = memory_session_->publish();
     verify_rank_view(active_request_);
     pending_selection_.reset();

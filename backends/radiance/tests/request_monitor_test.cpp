@@ -58,6 +58,10 @@ int main() {
     check(cache_rows[0]["actual_cached_tokens"]==0 && cache_rows[0]["planned_cached_tokens"]==90);
     check(cache_rows[0]["cache_source"]=="miss" && cache_rows[1]["cache_source"]=="shared");
     check(monitor.snapshot()["active"].size()==2);
+    monitor.reuse(a.id,80,80,false);
+    const auto own=monitor.snapshot()["active"][0];
+    check(own["cache_source"]=="own" && own["planned_cache_source"]=="own");
+    check(own["actual_cached_tokens"]==80 && own["planned_cached_tokens"]==80);
     a.state=rad::ReqState::Running;a.n_computed=2;a.output={70000,80000};
     monitor.update(a,3000000,1000000);
     const auto row=monitor.snapshot()["active"][0];

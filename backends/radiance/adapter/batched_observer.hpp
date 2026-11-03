@@ -147,7 +147,7 @@ public:
                     if(refusal_count_>=capacity_refusals_.size())return RAD_E_STATE;
                     capacity_refusals_[refusal_count_++]={slot.request,status};
                 }
-                if(!slot.observer->draining_prefix_failure_)slot.observer->clear_session();
+                if(!slot.observer->draining_storage_failure())slot.observer->clear_session();
             } else if(status<0)return status;
             if(slot.retiring && !slot.observer->pending_io()) {
                 if(!slot.observer->active_request_)slot.observer->clear_session();
@@ -275,10 +275,10 @@ public:
             const int mirrored=mirror_rank_metadata();if(mirrored<0)return mirrored;
             auto& slot=slots_[slot_for(plan.e[0].seq,true)];
             const bool fresh=!slot.reuse_observed && plan.e[0].ctx_len==0 && slot.observer->active_request_!=plan.e[0].seq;
-            const auto before_forks=cache_->forks;
+            const auto before_forks=cache_->cross_owner_forks;
             const auto status=slot.observer->resume(plan,frontier,refusal);
             if(fresh) {
-                slot.shared_restore=slot.shared_restore || cache_->forks>before_forks;
+                slot.shared_restore=slot.shared_restore || cache_->cross_owner_forks>before_forks;
                 if(slot.observer->prefix_)slot.planned_reuse=std::max<uint64_t>(slot.planned_reuse,slot.observer->prefix_->frontier());
                 if(*frontier>0)slot.planned_reuse=std::max<uint64_t>(slot.planned_reuse,uint64_t(*frontier));
                 const bool waiting=slot.observer->pending_cache_ || slot.observer->pending_prefix_;
@@ -291,7 +291,7 @@ public:
                     slot.reuse_observed=true;publish_monitor();
                 }
             }
-            if(status==RAD_E_FULL || status==RAD_E_IO)slot.observer->clear_session();
+            if((status==RAD_E_FULL || status==RAD_E_IO) && !slot.observer->draining_storage_failure())slot.observer->clear_session();
             return status;
         } catch(const std::exception& error) {RAD_ERR("KVMem batch resume: %s",error.what());return RAD_E_STATE;}
     }
@@ -334,7 +334,7 @@ public:
             if(status==RAD_E_FULL || status==RAD_E_IO) {
                 if(refusal_count_>=capacity_refusals_.size())return RAD_E_STATE;
                 capacity_refusals_[refusal_count_++]={slot.request,status};
-                slot.observer->clear_session(); // free its host quota before the other entries publish
+                if(!slot.observer->draining_storage_failure())slot.observer->clear_session(); // retain in-flight storage ownership
             } else if(status<0)return status;
         }
         publish_monitor();
@@ -360,7 +360,16 @@ public:
             }
             // The sink is already closed. Keep ownership while a started CPU
             // transfer drains; other sequences can still be scheduled meanwhile.
-            if(slot.observer->pending_io()){slot.retiring=true;return;}
+            if(slot.observer->pending_io()){
+                if(!slot.observer->pending_finish_) {
+                    if(slot.observer->pending_prefix_) {
+                        slot.observer->draining_prefix_failure_=true;
+                        if(slot.observer->pending_prefix_->ticket)
+                            try{slot.observer->pending_prefix_->ticket.cancel();}catch(...){}
+                    } else slot.observer->cancel_selection();
+                }
+                slot.retiring=true;return;
+            }
             if(!slot.observer->active_request_)slot.observer->clear_session();
             else slot.observer->retire(request);
             slot.request=0;slot.retiring=false;publish_monitor();return;

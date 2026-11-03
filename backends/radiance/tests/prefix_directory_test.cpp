@@ -1,11 +1,38 @@
 #include "prefix_directory.hpp"
+#include "checkpoint_handoff.hpp"
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
 using namespace kvmem;
 using namespace kvmem::radiance;
 static void check(bool value,const char* why) {if(!value)throw std::runtime_error(why);}
+struct HandoffIdentity { bool fallback=false; };
+struct HandoffPoint { std::shared_ptr<HandoffIdentity> identity; std::unique_ptr<int> state; };
+static void checkpoint_publication_preserves_ownership() {
+    std::unique_ptr<HandoffPoint> input,fallback;
+    for(bool alternate:{false,true}) {
+        HandoffPoint pending{std::make_shared<HandoffIdentity>(HandoffIdentity{alternate}),std::make_unique<int>(alternate ? 29 : 17)};
+        const auto* identity=pending.identity.get();
+        const auto* state=pending.state.get();
+        const auto* other=alternate ? input.get() : fallback.get();
+        publish_retained_checkpoint(std::make_unique<HandoffPoint>(std::move(pending)),input,fallback);
+        const auto& ready=alternate ? fallback : input;
+        check(!pending.identity && !pending.state,"pending ownership must transfer completely");
+        check(ready && ready->identity.get()==identity && ready->state.get()==state,"publication must keep the original immutable payload");
+        check(*ready->state==(alternate ? 29 : 17),"published state differs from the completed checkpoint");
+        check((alternate ? input.get() : fallback.get())==other,"publication must preserve the other checkpoint");
+    }
+    const auto* before_input=input.get();const auto* before_fallback=fallback.get();
+    for(bool absent:{false,true}) {
+        bool rejected=false;
+        auto bad=absent ? std::unique_ptr<HandoffPoint>{} : std::make_unique<HandoffPoint>();
+        try{publish_retained_checkpoint(std::move(bad),input,fallback);}
+        catch(const std::invalid_argument&){rejected=true;}
+        check(rejected && input.get()==before_input && fallback.get()==before_fallback,"invalid completion must not replace published state");
+    }
+}
 int main() {
+    checkpoint_publication_preserves_ownership();
     std::vector<int32_t> input(128);std::iota(input.begin(),input.end(),1000);
     auto terminal=input;terminal.insert(terminal.end(),{21,22,23,24});
     int before=1,after=2;

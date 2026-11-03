@@ -5,6 +5,7 @@
 #include "kvmem/native_kv_payload.hpp"
 #include "tiered_archive.hpp"
 #include "storage_work.hpp"
+#include "storage_wait.hpp"
 #include "kvmem/spill_io.hpp"
 #include "mem/kv.h"
 #include <algorithm>
@@ -121,7 +122,7 @@ struct NativeMemory::State {
     }
 };
 
-class NativeMemory::Transaction final : public MemoryTransfer {
+class NativeMemory::Transaction final : public MemoryTransfer, public StorageWaiter {
     std::shared_ptr<State> s_;
     WorkingSetPlan plan_;
     MemorySnapshot next_;
@@ -392,6 +393,31 @@ public:
         s_->visible = view.visible_tokens;
         phase_ = Phase::Published;
         release();
+    }
+    bool awaiting_storage() const noexcept override {
+        return (phase_==Phase::Spilling && captured_ && !storage_done_) ||
+               (phase_==Phase::Restoring && rollback_work_ && !restore_issued_);
+    }
+    bool cpu_io_pending() const noexcept override {
+        return (storage_ticket_ && !storage_ticket_.ready()) || (rollback_ticket_ && !rollback_ticket_.ready());
+    }
+    bool storage_quiescent() override {
+        for(const auto* ticket:{&storage_ticket_,&rollback_ticket_})
+            if(*ticket && !ticket->ready())return false;
+        // CPU jobs never touch a device. Other ranks may still have their
+        // pre-I/O copy in flight; query its fence before abort may drain it.
+        for(auto* copy:{phase_!=Phase::Prepared ? spill_.get() : nullptr,
+                        restore_may_have_written_ ? restore_.get() : nullptr})if(copy) {
+            const auto result=copy->poll();
+            if(result.status==TransferStatus::Failed)
+                fail(MemoryErrorCode::TransferFailed,"device failed during storage drain");
+            if(result.status!=TransferStatus::Complete)return false;
+        }
+        return true;
+    }
+    void cancel_queued_storage() noexcept override {
+        for(const auto* ticket:{&storage_ticket_,&rollback_ticket_})if(*ticket)
+            try{ticket->cancel();}catch(...){}
     }
     AbortResult abort() noexcept override {
         if (phase_ == Phase::Published || phase_ == Phase::Aborted)

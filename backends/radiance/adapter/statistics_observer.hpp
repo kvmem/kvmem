@@ -141,7 +141,7 @@ private:
     struct CacheState {
         std::shared_ptr<HostKvStorage> payload;
         std::shared_ptr<StorageIoQueue> io;
-        uint64_t hits=0,evictions=0,forks=0;
+        uint64_t hits=0,evictions=0,forks=0,cross_owner_forks=0;
         uint64_t actual_own_hits=0,actual_shared_hits=0,actual_misses=0;
         std::deque<RetainedSession> sessions; // LRU, owns no live native sequence
         std::vector<std::unique_ptr<PendingPark>> parking;
@@ -190,8 +190,12 @@ private:
         SelectionReason reason;
         size_t spill,restore;
         std::chrono::steady_clock::time_point deadline;
+        std::shared_ptr<RankMemory> storage;
     };
     std::optional<PendingSelection> pending_selection_;
+    bool draining_selection_failure_=false;
+    bool draining_storage_failure() const noexcept {return draining_prefix_failure_ || draining_selection_failure_;}
+    void cancel_selection() noexcept;
     bool asynchronous_=false; // enabled only by a wrapper implementing scheduler holds
     struct PrefixReadWork {
         std::unique_ptr<RankPrefix> source;

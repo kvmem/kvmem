@@ -153,12 +153,30 @@ struct SpillExtentState {
     uint64_t offset = 0, size = 0;
     ~SpillExtentState() { if (size) file->release(range); }
 };
+struct StorageQueueState;
 struct StorageTaskState {
     std::mutex mutex;
     std::condition_variable changed;
     std::atomic<StorageTaskStatus> status{StorageTaskStatus::Pending};
-    bool running = false, cancel = false;
     std::exception_ptr error;
+    std::weak_ptr<StorageQueueState> queue;
+};
+struct StorageQueueState {
+    struct Job {
+        std::shared_ptr<StorageTaskState> state;
+        std::function<void()> work;
+        uint64_t bytes;
+    };
+    mutable std::mutex mutex;
+    mutable std::condition_variable completed;
+    std::condition_variable available;
+    std::deque<Job> jobs;
+    size_t outstanding = 0;
+    uint64_t bytes = 0, epoch = 0;
+    const size_t max_jobs;
+    const uint64_t max_bytes;
+    bool stopping = false;
+    StorageQueueState(size_t count, uint64_t capacity) : max_jobs(count), max_bytes(capacity) {}
 };
 } // namespace detail
 
@@ -309,9 +327,29 @@ StorageTaskStatus StorageTicket::status() const noexcept {
 }
 bool StorageTicket::cancel() const {
     if (!state_) return false;
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    if (state_->running || ready()) return false;
-    state_->cancel = true;
+    const auto queue = state_->queue.lock();
+    if (!queue) return false;
+    detail::StorageQueueState::Job job;
+    {
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        auto it = std::find_if(queue->jobs.begin(), queue->jobs.end(),
+            [&](const auto & candidate) { return candidate.state == state_; });
+        if (it == queue->jobs.end()) return false; // Running or already claimed.
+        job = std::move(*it);
+        queue->jobs.erase(it);
+    }
+    // Captured leases may take their own locks. Release them outside queue and
+    // ticket locks, before publishing completion or returning queue capacity.
+    job.work = {};
+    {
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        --queue->outstanding; queue->bytes -= job.bytes;
+        ++queue->epoch;
+        std::lock_guard<std::mutex> state_lock(state_->mutex);
+        state_->status.store(StorageTaskStatus::Cancelled, std::memory_order_release);
+    }
+    state_->changed.notify_all();
+    queue->completed.notify_all();
     return true;
 }
 void StorageTicket::wait() const {
@@ -323,60 +361,41 @@ void StorageTicket::wait() const {
         throw MemoryError(MemoryErrorCode::TransferFailed, "KV storage operation cancelled");
 }
 struct StorageIoQueue::Impl {
-    struct Job {
-        std::shared_ptr<detail::StorageTaskState> state;
-        std::function<void()> work;
-        uint64_t bytes;
-    };
-    mutable std::mutex mutex;
-    mutable std::condition_variable completed;
-    std::condition_variable available;
-    std::deque<Job> jobs;
+    std::shared_ptr<detail::StorageQueueState> queue;
     std::vector<std::thread> workers;
-    size_t outstanding = 0;
-    uint64_t bytes = 0, epoch = 0;
-    const size_t max_jobs;
-    const uint64_t max_bytes;
-    bool stopping = false;
-    Impl(size_t count, uint64_t bytes) : max_jobs(count), max_bytes(bytes) {}
+    Impl(size_t count, uint64_t bytes) : queue(std::make_shared<detail::StorageQueueState>(count, bytes)) {}
     ~Impl() {
-        { std::lock_guard<std::mutex> lock(mutex); stopping = true; }
-        available.notify_all();
+        { std::lock_guard<std::mutex> lock(queue->mutex); queue->stopping = true; }
+        queue->available.notify_all();
         for (auto & worker : workers) if (worker.joinable()) worker.join();
+        // A concurrent ticket cancellation may have detached a queued job and
+        // still be releasing its captures after all workers have exited.
+        std::unique_lock<std::mutex> lock(queue->mutex);
+        queue->completed.wait(lock, [&] { return queue->outstanding == 0; });
     }
     void run() {
         for (;;) {
-            Job job;
+            detail::StorageQueueState::Job job;
             {
-                std::unique_lock<std::mutex> lock(mutex);
-                available.wait(lock, [&] { return stopping || !jobs.empty(); });
-                if (jobs.empty()) return;
-                job = std::move(jobs.front()); jobs.pop_front();
-            }
-            bool cancelled;
-            {
-                std::lock_guard<std::mutex> lock(job.state->mutex);
-                cancelled = job.state->cancel;
-                job.state->running = true;
+                std::unique_lock<std::mutex> lock(queue->mutex);
+                queue->available.wait(lock, [&] { return queue->stopping || !queue->jobs.empty(); });
+                if (queue->jobs.empty()) return;
+                job = std::move(queue->jobs.front()); queue->jobs.pop_front();
             }
             std::exception_ptr error;
-            if (!cancelled) {
-                try { job.work(); } catch (...) { error = std::current_exception(); }
-            }
+            try { job.work(); } catch (...) { error = std::current_exception(); }
             job.work = {}; // Release captured leases before signalling completion.
             {
-                std::lock_guard<std::mutex> lock(mutex);
-                --outstanding; bytes -= job.bytes;
-            }
-            {
-                std::lock_guard<std::mutex> lock(job.state->mutex);
+                std::lock_guard<std::mutex> lock(queue->mutex);
+                --queue->outstanding; queue->bytes -= job.bytes;
+                ++queue->epoch;
+                std::lock_guard<std::mutex> state_lock(job.state->mutex);
                 job.state->error = error;
-                job.state->status.store(cancelled ? StorageTaskStatus::Cancelled :
-                    error ? StorageTaskStatus::Failed : StorageTaskStatus::Complete, std::memory_order_release);
+                job.state->status.store(error ? StorageTaskStatus::Failed : StorageTaskStatus::Complete,
+                    std::memory_order_release);
             }
             job.state->changed.notify_all();
-            { std::lock_guard<std::mutex> lock(mutex); ++epoch; }
-            completed.notify_all();
+            queue->completed.notify_all();
         }
     }
 };
@@ -391,26 +410,28 @@ StorageIoQueue::~StorageIoQueue() = default;
 StorageTicket StorageIoQueue::submit(uint64_t pinned_bytes, std::function<void()> work) {
     if (!work) throw MemoryError(MemoryErrorCode::InvalidPlan, "empty KV I/O job");
     auto state = std::make_shared<detail::StorageTaskState>();
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->stopping || impl_->outstanding >= impl_->max_jobs ||
-        pinned_bytes > impl_->max_bytes - impl_->bytes)
+    const auto & queue = impl_->queue;
+    std::lock_guard<std::mutex> lock(queue->mutex);
+    if (queue->stopping || queue->outstanding >= queue->max_jobs ||
+        pinned_bytes > queue->max_bytes - queue->bytes)
         throw MemoryError(MemoryErrorCode::Pending, "KV I/O queue is full");
-    impl_->jobs.push_back({state, std::move(work), pinned_bytes});
-    ++impl_->outstanding; impl_->bytes += pinned_bytes;
-    impl_->available.notify_one();
+    state->queue = queue;
+    queue->jobs.push_back({state, std::move(work), pinned_bytes});
+    ++queue->outstanding; queue->bytes += pinned_bytes;
+    queue->available.notify_one();
     return StorageTicket(std::move(state));
 }
 uint64_t StorageIoQueue::completion_epoch() const {
-    std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->epoch;
+    std::lock_guard<std::mutex> lock(impl_->queue->mutex); return impl_->queue->epoch;
 }
 void StorageIoQueue::wait_for_completion(uint64_t epoch, std::chrono::milliseconds timeout) const {
-    std::unique_lock<std::mutex> lock(impl_->mutex);
-    impl_->completed.wait_for(lock, timeout, [&] { return impl_->epoch != epoch; });
+    std::unique_lock<std::mutex> lock(impl_->queue->mutex);
+    impl_->queue->completed.wait_for(lock, timeout, [&] { return impl_->queue->epoch != epoch; });
 }
 size_t StorageIoQueue::pending_jobs() const {
-    std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->outstanding;
+    std::lock_guard<std::mutex> lock(impl_->queue->mutex); return impl_->queue->outstanding;
 }
 uint64_t StorageIoQueue::pinned_bytes() const {
-    std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->bytes;
+    std::lock_guard<std::mutex> lock(impl_->queue->mutex); return impl_->queue->bytes;
 }
 } // namespace kvmem
