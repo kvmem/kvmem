@@ -1,17 +1,100 @@
 # PolyStrata integration
 
-The opt-in `polystrata` backend pins upstream `v0.1.45-poly.5` at
-`bfd8911efbb8c27214d5aabc511907c6149171e7`. It supports qwen35moe GGUF models
-on one CUDA GPU, with F16 or Q8_0 KV. This revision also carries the opt-in HIP
+The opt-in `polystrata` backend pins upstream `v0.1.45-poly.7` at
+`fabae0d6445e524a1dc68b2c2fa99b53880f98e6`. It supports qwen35moe GGUF models
+with F16/Q8_0 KV and Gemma 4 26B-A4B with F16/int8/int8k KV on one CUDA GPU.
+This revision also carries the opt-in HIP
 integration, marked experimental and disabled by default. Its compile/link CI
 is a merge gate; AMD inference qualification is required before promoting it
 to validated hardware support, rather than blocking the validated CUDA update.
 The source submodule stays at the upstream commit; `backends/versions.json`
-identifies all twelve ordered patches and their resulting trees.
+identifies all sixteen ordered patches and their resulting trees.
+
+## Gemma 4 26B-A4B
+
+Gemma support is carried by the final `gemma4-kvmem` patch. It covers bounded
+Query/replay, resident-only Pressure, native RAM/SSD history, retained sessions,
+concurrent ordinary decode, solo assistant MTP and image input. This source
+change requires a rebuilt worker; older release binaries do not gain these
+capabilities from a console update alone.
+
+Select **PolyStrata · Gemma 4 26B-A4B** in the console. Its initial settings use
+F16 KV and ordinary decoding. Gemma also accepts `int8` and `int8k`; `q8_0` is
+the Qwen adapter's format. To enable MTP, select the matching independent
+`gemma4-assistant` GGUF in **Draft model** and choose a one-to-three-token draft
+ceiling. Native batches use ordinary decode. QAT and non-QAT releases need
+their own matching assistant and vision projection files.
+
+Direct launch, using the same model's tokenizer and chat template exported
+automatically from its GGUF:
+
+```powershell
+python tools/polystrata/server.py --source backends/polystrata --worker PATH/strata-poly.exe --model PATH/gemma-4-26B-A4B-it.gguf --gpu GPU-YOUR-UUID --model-alias kvmem-polystrata-gemma4 --context 262144 --budget 32768 --reserve 2048 --prefill 512 --host-mib 16384 --kv-type f16
+```
+
+Add `--mtp-drafts 3 --draft-model PATH/mtp-gemma-4-26B-A4B-it-Q8_0.gguf` for
+the assistant. Gemma's exported merges are JSON because token pieces can
+contain newlines; automatic export and an explicit tokenizer directory both
+accept `merges.json`. Images require a matching mmproj and `strata-vision`;
+CPU encoding is the validated route in this change.
+
+The five global layers participate in block recall. The 25 local layers keep
+their continuous 1024-token rings, saved with native checkpoints. Rotary
+positions stay logical when global rows move to compact physical positions.
+PageSoftmax and native attention feedback use Gemma's scale of 1. Checkpoints
+at image ends and the assistant turn boundary preserve safe prefixes across
+Gemma's generated and reconstructed assistant templates. Tool continuation
+keeps the ordinary `(0, 0)` no-Query contract.
+
+At this model's geometry, a full-window checkpoint occupies 200 MiB with F16,
+106.25 MiB with int8, or 153.125 MiB with int8k, plus 11 KiB when the assistant
+hidden state is present. These state images share the configured native RAM
+quota with KV records. Request admission includes one required state image
+and the KV replacement margin; with SSD, the state and resident staging must
+still fit RAM. Optional history marks are reclaimed before allocating their
+replacement, and an optional capture may be skipped under pressure. The live
+accepted prefix and an in-flight Query rollback image remain valid. A quota
+below the required state size is rejected before prompt evaluation. The full F16
+global KV is 20 KiB/token; local rings and execution workspaces are additional.
+These are layout sizes, not a measurement of total process memory.
+
+Windows CUDA 13.2 / MSVC / sm120a qualification used fixed UD-Q2_K_XL weights
+and matching assistant/mmproj. Necessary checks cover native F16/int8/int8k
+records, 32/64-token blocks, graphs, sparse Query/replay, parked histories,
+two active sequences, forced SSD reads, elastic experts, assistant acceptance
+boundaries and cancellation/reset. Separate document/question HTTP requests over a 12,508-token
+document reused 12,501 tokens, captured Query `[12511, 12527)` and answered
+correctly. The same document and question also passed an unchanged released
+PolyStrata worker with KVMem disabled and a fully resident KVMem reference.
+A retained-image follow-up reused 252 tokens and repeated the code correctly.
+The references are functional checks, not a throughput comparison. GPU choice
+and native evidence are recorded with the task's validation artifacts.
+
+Gemma validation selected idle RTX 5050 Laptop or RTX 5060 Ti; the shared Qwen
+Q8/MTP regression used RTX 5060 Ti. The two-slot HTTP check
+observed two active slots and correct isolated follow-ups with prefix reuse.
+No new AMD, SYCL or Linux GPU qualification is claimed. The 256K configuration
+probe reused the same 12.5K document; it is not a 256K-document quality test.
+The [validation record](benchmarks/polystrata-gemma4-26ba4b-20261102.json)
+distinguishes the initial native matrix from the later Host-quota checks.
+Model-free benchmark guards preserve failed HTTP turns and bounded server error
+bodies, require question-scoped Query/replay evidence, and reject smoke-only or
+incomplete measurements from performance summaries.
+
+The [Gemma performance comparison](benchmarks/polystrata-gemma4-performance-20261102.json)
+uses three interleaved rounds on one RTX 5060 Ti, F16 KV, graphs, prompt batch 512,
+256 output tokens, and all 3840 experts resident. At 4K input the prefill/decode
+gap to the fixed native worker fell from 7.1%/4.7% to 4.7%/1.8%; at 12K it fell
+from 8.4%/10.9% to 2.9%/2.3%. The change specializes 512-dimension sampled attention
+by page and GQA group, and reuses dead attention scratch for pre-RoPE statistics.
+The same 4K CUDA diagnostic reduced feedback-kernel time from 65.1 to 16.8 ms.
+Sampling, recall and checkpoint guarantees remain the same. Two-turn HTTP checks
+retained the correct answer and 12501 cached tokens in both resident and sparse
+cases; sparse question latency still includes state restoration and Query replay.
 
 The backend provides bounded Query/replay, resident-only Pressure on tool
 continuations, process-shared RAM/SSD history storage, native concurrent sequences,
-solo embedded MTP and CPU/GPU vision. Batch execution uses ordinary decode.
+solo MTP and CPU/GPU vision. Batch execution uses ordinary decode.
 See [launch and package instructions](multi-backend.md#polystrata-qwen35moe-接入2026-10-22-源码).
 
 The mainline adaptation preserves independent scorer, graph and LRFU controls.
@@ -26,19 +109,26 @@ workspace/KV/expert management, managed MTP and 32/64-token blocks. It includes
 upstream's Windows expert-file read-ahead, tiled router product and MMQ half-sum
 overflow protection. The new half-sum scratch buffer keeps its full lifetime
 while the larger local elastic workspaces shrink and grow. Native test targets
-link the new Flint source required by the upstream engine factory; KVMem model
-support remains limited to qwen35moe.
+link the new Flint source required by the upstream engine factory; that historical
+qualification covered qwen35moe. Current Gemma coverage is described above.
 
 `STRATA_GDN_MMA=1` is upstream's optional CUDA GDN prefill path and stays off by
 default. Its snapshot and graph-recording fallbacks are retained. It requires
 separate state/replay validation before claiming a speed or quality benefit.
 The web chat's send and regenerate paths share the same explicit request
 overrides, client-owned reasoning, native timing and incomplete-stream detection.
-The current pin excludes commits after the poly.5 release. The poly.5 update
-rebases the existing integration layers, adds HIP KVMem integration, links
-Kolibri sources into model test targets, and preserves the `(0, 0)` no-Query
-sentinel when image tokens are expanded. A continuation must not reinterpret
-that sentinel as a request to recall old history.
+The poly.5 qualification below is historical; the current pin is in
+`backends/versions.json`. The current pin excludes commits after the poly.7
+release. The poly.7 update adds `--ram-experts-mib` expert staging/spill, an
+optional streaming CPU store (`STRATA_POLY_STREAM_STAGE`) and a RAM expert
+pool; the rebase keeps the KVMem memory validation beside the new
+streaming-stage setup instead of replacing it. It also retains upstream's
+`gemma4-kvmem` layer, rebased onto poly.7, so Gemma 4 26B-A4B support is not
+dropped by the version bump.
+The poly.5 layer had rebased the integration, added HIP KVMem integration,
+linked Kolibri sources into model test targets, and preserved the `(0, 0)`
+no-Query sentinel when image tokens are expanded. A continuation must not
+reinterpret that sentinel as a request to recall old history.
 
 ### Direct HIP launch
 
@@ -59,6 +149,23 @@ and a projector matching the language model; the filename alone does not prove
 that their embedding widths match. HIP startup prints an experimental-status
 notice. Deployments still require inference checks on the intended AMD
 architecture; build success alone is not a correctness or performance claim.
+
+### Poly.7 HIP validation (2026-11-02)
+
+On Linux x64 with ROCm 10.1 / hipcc clang 24 and one gfx1100 RX 7900 XT, the
+worker was built with `-DSTRATA_ENABLE_HIP=ON` against the KVMem core, and the
+encoder with the local `STRATA_VISION_HIP=ON` layer (`gfx1100`). The native
+history, sessions and KVMem kernel targets passed; upstream's `poly_fattn_test`
+does not compile under HIP because it still uses `CUBLAS_TENSOR_OP_MATH`, so
+the build only targets the worker and the KVMem tests. With
+Ornith-1.5-35B-A3B Q6_K, q8_0 KV, a 65,536-token budget and a 512 MiB reserve,
+a 128,924-token prompt prefilled in 3m30.7s (612.4 tok/s) and answered
+correctly while parking 1.31 GiB of history. The follow-up reused 128,403
+tokens, moved 521 prompt tokens and answered in 3.74s, capturing Query
+`[128403, 128915)` with the page-softmax scorer and one bounded replay. Vision
+ran on the GPU (1.38 GiB); the worker and encoder together used 19.53 GiB of
+20.0 GiB usable VRAM. These are functional checks on one machine, not a
+performance claim.
 
 ### Poly.5 candidate validation (2026-10-28)
 
@@ -303,5 +410,6 @@ median prefill throughput was 279.8 tokens/s upstream and 259.3 tokens/s integra
 unresolved and does not establish a general throughput regression across configurations.
 
 Multi-GPU and batch MTP are unsupported in this integration. HIP and SYCL were not
-validated. SSD history is process-local. Host limits account for native KV payload,
-not total process memory or every checkpoint/workspace allocation.
+validated. SSD history is process-local. Host limits account for native KV payload
+and Gemma window-state images, not total process memory or every auxiliary
+checkpoint/workspace allocation.

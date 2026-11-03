@@ -251,7 +251,7 @@ std::vector<double> page_softmax_scores(const RawKvStore& keys, PageQueryView q,
     std::vector<float> means(enabled.size()*kw), key(kw), query(q.head_dim);
     std::vector<double> logits(enabled.size());
     std::vector<double> group_max(aggregation == GqaScoreAggregation::Max ? enabled.size() : 0);
-    const double scale = 1/std::sqrt(double(q.head_dim));
+    const double scale = q.attention_scale > 0 ? q.attention_scale : 1/std::sqrt(double(q.head_dim));
     for (uint32_t l = 0; l < q.layers; ++l) {
         if (!q.layer_rows[l]) continue;
         for (size_t j = 0; j < enabled.size(); ++j) {

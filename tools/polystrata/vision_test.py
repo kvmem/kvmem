@@ -14,13 +14,13 @@ import time
 import urllib.error
 import urllib.request
 
-from PIL import Image, ImageDraw, ImageFont
 
 
 CODE = "CODE-7319"
 
 
 def make_image() -> bytes:
+    from PIL import Image, ImageDraw, ImageFont
     image = Image.new("RGB", (1024, 512), "white")
     draw = ImageDraw.Draw(image)
     fonts = [Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / name
@@ -41,11 +41,12 @@ def main():
     parser.add_argument("--mtp-drafts", type=int, choices=range(4), default=2)
     parser.add_argument("--kv-type",choices=("f16","q8_0"),default="f16")
     parser.add_argument("--vision-device", choices=("cpu", "gpu"), default="cpu")
+    parser.add_argument("--image",type=Path,help="existing CODE-7319 PNG fixture; avoids the optional Pillow dependency")
     args = parser.parse_args()
     for name in ("source", "worker", "vision_worker", "mmproj", "model", "tokenizer", "out"):
         setattr(args, name, getattr(args, name).resolve())
     args.out.mkdir(parents=True, exist_ok=True)
-    png = make_image()
+    png = args.image.read_bytes() if args.image else make_image()
     (args.out / "code.png").write_bytes(png)
     image_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
     command = [sys.executable, str(Path(__file__).with_name("server.py")),
@@ -55,6 +56,7 @@ def main():
                "--max-tokens", "32", "--host-mib", "1024", "--history-reuse", "--mtp-drafts", str(args.mtp_drafts),
                "--vision-worker", str(args.vision_worker), "--mmproj", str(args.mmproj),
                "--vision-device", args.vision_device,"--kv-type",args.kv_type, "--vision-tokens", "300", "--vision-threads", "8",
+               "--log",str(args.out/'native.log'),
                "--", "--threads", "4", "--stage-mib", "256", "--tail-skip", "0"]
     base = f"http://127.0.0.1:{args.port}"
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -91,6 +93,7 @@ def main():
             assert props["modalities"]["vision"] is True, props
             assert props["kvmem"]["vision"] is True, props
             first = request("/v1/chat/completions", first_body)
+            result.update(first_request=first_body,first=first)
             answer = first["choices"][0]["message"]["content"].strip()
             assert answer == CODE, first
             second_body = dict(first_body)
@@ -99,6 +102,7 @@ def main():
                 {"role": "user", "content": "Repeat only the exact code from the image."},
             ]
             second = request("/v1/chat/completions", second_body)
+            result.update(second_request=second_body,second=second)
             repeated = second["choices"][0]["message"]["content"].strip()
             assert repeated == CODE, second
             cached = second["usage"]["prompt_tokens_details"]["cached_tokens"]

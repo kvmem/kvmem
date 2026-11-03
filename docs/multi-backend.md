@@ -128,6 +128,8 @@ ngram 默认关闭。
 
 `-MtpDrafts` 默认 0，可选固定 1–15；`-AdaptiveMtp` 要求 MTP，允许文本/图片 C1–8；`-FastPrefill` 允许 INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 的文本及 resident/CPU 图片 C1–8，可组合公共 SSD 分层；`-VisionResidency cpu` 要求 `-Vision`；`-NgramDrafts` 默认 0，可选 1–63，非零时要求 MTP：宽度 1–15 允许 C1–8；启动并发 C2–8 时，配置的 16–63 自动降至15并提示，C1 保留原宽度。文本及 resident/CPU 图片均允许 BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 九种 KV。多路上限 15 来自原生 GDN 验证工作区的 16 列容量；本次移除了 KVMem 额外的单路门禁。`-NgramMinMatch` 默认 12，可选 4–64。例如八路文本用 `-Concurrency 8 -MtpDrafts 3 -NgramDrafts 15 -KvType int8`，图片再加 `-Vision`。ngram 使用完整已提交 token 历史提出复制草稿，仍由目标模型验证；重复文本或代码更容易获益，不能承诺所有输入都加速。直接运行 server 开启 MTP 时，默认 ngram15 可用于多路；统一脚本默认仍显式传入 ngram0。快捷脚本默认单路/ngram31，改成多路时会自动使用 ngram15；以启动并发上限为准，当时只有一条活动请求也不改变宽度。MTP 独立 attention window、视频、overlay Vision、并行 prefill 仍被拒绝。`-DeviceProfile auto` 可选原生设备配置；公共 SSD 分层不提供重启恢复。`-RetainedSessions` 控制非活动 Host 历史数量，默认 4，上限 16。
 
+直接运行 NInfer worker 时，`--ngram-arbitration on|off` 控制 Qwen3.5 系列 MTP／DFlash／DFlash2 的复制收益仲裁，默认 on：先用两轮复制测量收益，后续仅在预计收益超过神经草稿的 1.3 倍时采用复制，每跳过八次候选再探测一次。拒绝复制时清除归档续拷游标；统计按请求隔离。off 可用于直接复制对照。此改动不引入 INT8 draft KV；生成文本及速度可能因提案选择而变化。
+
 本次 ninfer 实测制品是 Qwen3.8-27B-GSQ-RCO-IQ3_S，设备为 RTX 5060 Ti 16GB、CUDA 13.2、`sm_120a`。8K/64K/128K/256K 档的早期口令检索和后续追问通过；这组人工构造用例不代表通用长文问答质量，也不表示其他 GPU 架构已验收。示例的 B=2048、R=512、H=12 GiB 是实际通过的配置。
 
 - B 是每请求选中历史的 GPU token 预算，R 是追加工作空间，两者按 64-token 页对齐；C 条活动请求的 Main 页池按 C×(B+R) 配置。MTP 另有原生草稿页池，Main/MTP 的 Host payload 都计入 H。
@@ -193,7 +195,7 @@ H 必须容纳所有并发 lane 的基本工作区，H+D 还需为换页预留�
 
 ## PolyStrata qwen35moe 接入（2026-10-22 源码）
 
-此入口固定 PolyStrata `v0.1.45-poly.4` / `145493e66580`，本轮仅支持 CUDA 单卡的 `qwen35moe` GGUF、F16 或 Q8_0 KV。使用同一个 GGUF 导出的 tokenizer/template；图像输入还需要匹配的 mmproj 和 `strata-vision`。Python 运行环境需具备固定上游 requirements 中的 frontend 依赖。
+当前源码固定 PolyStrata `v0.1.45-poly.7` / `fabae0d6445e`，支持 CUDA 单卡的 `qwen35moe` GGUF（F16/Q8_0 KV）及 Gemma 4 26B-A4B（F16/int8/int8k KV）；HIP 为实验性路径，需用 `-DSTRATA_ENABLE_HIP=ON` 自行构建 worker 和图像编码器。Gemma 的独立 assistant、原生状态配额和验收边界见 [Gemma 接入说明](polystrata-integration.md#gemma-4-26b-a4b)。使用同一个 GGUF 导出的 tokenizer/template；图像输入还需要匹配的 mmproj 和 `strata-vision`。Python 运行环境需具备固定上游 requirements 中的 frontend 依赖。
 
 统一启动器和直接 Python 入口均可省略 Tokenizer：第一次启动从所选 GGUF 本地导出完整 tokenizer 与 chat template，缓存在用户本地 KVMem 目录中，不下载模型或修改模型目录。缓存按模型绝对路径、大小、修改时间、头部摘要及导出器版本隔离，并校验导出文件；显式 Tokenizer 仍要求完整的同模型导出。DryRun 只展示计划，不创建缓存。控制台的 Python、frontend、图像 worker 等可选路径留空时使用运行包内默认位置。
 

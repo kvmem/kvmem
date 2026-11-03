@@ -93,6 +93,7 @@
     {id:'llamacpp-default',title:['llama.cpp · 默认模板','llama.cpp · Default template'],parameters:{...commonPreset,Backend:'llamacpp',ThinkingMode:'on',KvTypeK:'q8_0',KvTypeV:'q8_0',Prefill:256,DraftTokens:3,DraftPolicy:'fixed',Vision:true}},
     {id:'polystrata-default',title:['PolyStrata · 默认模板','PolyStrata · Default template'],parameters:{...commonPreset,Backend:'polystrata',Budget:36*1024,Reserve:4*1024,ThinkingBudget:0,ThinkingMode:'on',KvType:'q8_0',Prefill:512,DraftTokens:2,DraftPolicy:'adaptive',Vision:false,RetainedSessions:2,VramReserveMiB:256,WorkerArgs:['--elastic-experts-headroom','--elastic-headroom-mib','128','--elastic-physical-reserve-mib','512']},
       note:['256K 上下文 · 36K 驻留 · 4K 生成预留 · 思考不限额','256K context · 36K resident · 4K reserve · no fixed thinking cap']},
+    {id:'polystrata-gemma4',title:['PolyStrata · Gemma 4 26B-A4B','PolyStrata · Gemma 4 26B-A4B'],parameters:{...commonPreset,Backend:'polystrata',Budget:32768,Reserve:2048,KvType:'f16',Prefill:512,ThinkingMode:'on',ThinkingBudget:0,SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',ModelAlias:'kvmem-polystrata-gemma4',Vision:false,RetainedSessions:2,VramReserveMiB:512},note:['Gemma 4 26B-A4B；启用 MTP 时选择匹配的 assistant GGUF。','Gemma 4 26B-A4B; select its matching assistant GGUF to enable MTP.']},
   ].map(p=>({...p,note:p.note||['256K 上下文 · 46K 驻留 · 2K 生成预留','256K context · 46K resident · 2K reserve']}));
   const enginePreset=backend=>structuredClone(presets.find(p=>p.parameters.Backend===backend).parameters);
   const BACKENDS_KEY='kvmem-launch-backends-v1';
@@ -105,7 +106,7 @@
   const make=(tag,attrs={},text)=>{const el=document.createElement(tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));if(text!==undefined)el.textContent=text;return el;};
   function healthParameters(){
     const parameters={};
-    for(const key of ['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftModel']){
+    for(const key of ['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftModel','KvType']){
       const el=root.querySelector(`[data-param=${key}]`);
       if(!el||el.disabled)continue;
       if(el.type==='checkbox')parameters[key]=el.checked;
@@ -486,7 +487,7 @@
     dependency('DraftPolicy',enabled&&!!cap.adaptive,tr('所选后端或草稿方式仅支持固定长度。','The selected backend or draft method supports fixed length only.'));
     dependency('NgramDrafts',enabled&&!!cap.ngram,tr('所选后端或草稿方式不支持 N-gram。','The selected backend or draft method does not support N-gram.'));
     dependency('NgramMinMatch',enabled&&!!cap.ngram&&Number(get('NgramDrafts')?.value)>0,tr('先启用 N-gram 草稿。','Enable N-gram drafts first.'));
-    dependency('DraftModel',enabled&&backend==='llamacpp',tr('NInfer 使用模型内置草稿组件；llama.cpp 需先选择草稿方式。','NInfer uses an embedded draft component. Select a draft method for llama.cpp first.'));
+    dependency('DraftModel',enabled&&['llamacpp','polystrata'].includes(backend),tr('NInfer 使用模型内置草稿组件；llama.cpp 需先选择草稿方式。','NInfer uses an embedded draft component. Select a draft method for llama.cpp first.'));
     if(get('DraftModel'))get('DraftModel').required=enabled&&cap.draft_asset==='required_gguf';
     const selectedGpu=get('Gpu'),selectedCount=selectedGpu?.multiple?selectedGpu.selectedOptions.length:(selectedGpu?.value||'').split(',').filter(Boolean).length;
     const specReason=enabled&&(!profiles[mode]||Number(get('Concurrency')?.value||1)>(cap.max_concurrency||1)||selectedCount>(cap.max_devices||1))?
@@ -790,7 +791,7 @@
     const layout=make('div',{class:'l-layout'}),main=make('div',{class:'l-main'}),side=make('aside',{class:'l-side'});layout.append(main,side);root.append(layout);
     const form=make('form',{'aria-label':tr('启动配置','Launch configuration')});form.style.display='contents';main.append(form);form.addEventListener('submit',e=>e.preventDefault());
     const core=make('section',{class:'s-card l-essential'});core.append(make('h2',{class:'s-title'},tr('模型与资源','Model & resources')));const fields=make('div',{class:'l-fields l-core'});core.append(fields);form.append(core);
-    const backend=field(fields,p,'Backend','推理引擎','Backend','text',Object.entries(names).filter(([v])=>info.backends.length!==1||info.backends.includes(v)).map(([v,t])=>[v,t]),['按 KVMem 当前支持范围区分：Dense 为稠密模型，MoE 为混合专家模型。PolyStrata 目前支持 Qwen3.5 MoE（包括 Tiel）。','Labels describe current KVMem support: Dense for dense models, MoE for mixture-of-experts models. PolyStrata currently supports Qwen3.5 MoE, including Tiel.']);Array.from(backend.options).forEach(o=>{o.disabled=!info.backends.includes(o.value);if(o.disabled)o.textContent+=' · '+tr('未安装','not installed');});
+    const backend=field(fields,p,'Backend','推理引擎','Backend','text',Object.entries(names).filter(([v])=>info.backends.length!==1||info.backends.includes(v)).map(([v,t])=>[v,t]),['按 KVMem 当前支持范围区分：Dense 为稠密模型，MoE 为混合专家模型。PolyStrata 支持 Qwen3.5 MoE（包括 Tiel）和 Gemma 4 26B-A4B。','Labels describe current KVMem support: Dense for dense models, MoE for mixture-of-experts models. PolyStrata supports Qwen3.5 MoE (including Tiel) and Gemma 4 26B-A4B.']);Array.from(backend.options).forEach(o=>{o.disabled=!info.backends.includes(o.value);if(o.disabled)o.textContent+=' · '+tr('未安装','not installed');});
     modelPicker(fields,p);
     fields.append(make('section',{class:'l-model-health l-wide','data-model-health':'','aria-label':tr('模型体检','Model inspection')}));
     const gpu=field(fields,p,'Gpu','推理显卡','Inference GPUs','text',info.gpus.map(g=>[g.uuid,g.name+' · '+g.uuid.slice(-8)]),['选择要使用的显卡。多卡按勾选顺序排列，可前移／后移；切换引擎保留当前选择。','Choose the GPUs to use. Multiple GPUs follow selection order and can be reordered. Switching engines retains your selection.']);
@@ -907,7 +908,7 @@
       help(kvTitle,tr('KV 格式','KV format'),tr('K 和 V 可分别选择：q8_0、q5_0、q4_0 可互配；f16、f32 可互配。浮点与量化不能混搭。','Choose K and V independently: q8_0, q5_0 and q4_0 can be combined; f16 and f32 can be combined. Floating-point and quantized types cannot be mixed.'));
       kvField.append(kvTitle,pair,make('p',{class:'l-muted l-error l-kv-status','data-kv-pair-status':'','aria-live':'polite',hidden:''}));panels[0].append(kvField);
     }else{
-      const kv=rad?['fp8','bf16']:poly?['f16','q8_0']:['int8','bf16','fp8','nvfp4','k8v4','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'];
+      const kv=rad?['fp8','bf16']:poly?['f16','q8_0','int8','int8k']:['int8','bf16','fp8','nvfp4','k8v4','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'];
       field(panels[0],{...p,KvType:p.KvType||kv[0]},'KvType','KV 格式','KV format','text',kv.map(v=>[v,v]));
     }
     // UI state only: the worker still receives the existing path/budget pair.
@@ -965,8 +966,8 @@
       ['fixed',tr('固定','Fixed')],['adaptive',tr('自动调整','Adaptive')]
     ],['自动调整仅在后端和所选草稿方式支持时生效。','Adaptive mode applies only when supported by the backend and draft method.']);
     const draftModel=field(panels[1],p,'DraftModel','草稿模型 GGUF','Draft model GGUF','text',null,
-      ['llama.cpp 的 DFlash2 需要与主模型匹配的独立草稿文件；NInfer 使用模型内置草稿组件。','DFlash2 on llama.cpp requires a separate draft matching the target. NInfer uses an embedded draft component.'],n||poly||rad);
-    if(!n&&!poly&&!rad&&info.native_picker!==false){const row=inputActions(draftModel),choose=make('button',{type:'button',class:'s-button l-secondary'},tr('选择文件','Choose file'));row.append(choose);choose.onclick=async()=>{try{const result=await api('browse-model',{backend:'llamacpp',current_path:draftModel.value});if(result.path){draftModel.value=result.path;draftModel.dispatchEvent(new Event('change',{bubbles:true}));}}catch(e){message(e.message,true);}};}
+      ['Gemma 4 MTP 和 llama.cpp DFlash2 需要匹配的独立草稿 GGUF；Qwen MTP 和 NInfer 使用内置草稿组件。','Gemma 4 MTP and llama.cpp DFlash2 require a matching draft GGUF; Qwen MTP and NInfer use embedded drafts.'],n||rad);
+    if(!n&&!rad&&info.native_picker!==false){const row=inputActions(draftModel),choose=make('button',{type:'button',class:'s-button l-secondary'},tr('选择文件','Choose file'));row.append(choose);choose.onclick=async()=>{try{const result=await api('browse-model',{backend:'llamacpp',current_path:draftModel.value});if(result.path){draftModel.value=result.path;draftModel.dispatchEvent(new Event('change',{bubbles:true}));}}catch(e){message(e.message,true);}};}
     if(n)field(panels[1],p,'FastPrefill','启用快速预填充','Enable fast prefill','checkbox',null,['支持 int8、rk8v4、rk4v4、rk4v4-e8、rk2v4-e8；还需模型支持。与 MTP、普通预填充块大小分别设置。','Supports int8, rk8v4, rk4v4, rk4v4-e8 and rk2v4-e8; model support is also required. Independent of MTP and the standard prefill chunk size.'],!n);
     const thinking=field(panels[2],p,'ThinkingMode','默认思考模式','Default thinking mode','text',[[(n||rad)?'default':'on',(n||rad)?tr('跟随模型','Model default'):tr('开启','On')],['off',tr('关闭','Off')]],['需要模型与模板支持。聊天请求中的显式设置优先。','Requires model/template support. Explicit chat settings take priority.']);
     const thinkingBudget=field(panels[2],p,'ThinkingBudget','默认思考预算 · tokens','Default thinking budget · tokens','number',null,poly?['0：根据输出上限自动给答案留空间；正数：思考 token 上限，也受总输出预算约束。','0: automatically reserve answer space within the output limit. Positive values cap reasoning tokens, subject to the total output budget.']:['0：不设置单独的思考限额，仍受总输出预算约束。正数：思考 token 上限。','0: no separate reasoning cap; the total output budget still applies. Positive values cap reasoning tokens.']);

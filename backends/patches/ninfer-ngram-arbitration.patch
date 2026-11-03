@@ -1,0 +1,321 @@
+diff --git a/include/ninfer/engine_options.h b/include/ninfer/engine_options.h
+--- a/include/ninfer/engine_options.h
++++ b/include/ninfer/engine_options.h
+@@ -420,6 +420,8 @@
+ // Optional sparse KV working set. B and R are independent whole-page budgets;
+ // Host retains native page records, including quantization scale planes.
+ struct KvmemOptions {
++    // Gate lookup copies against request-local neural draft yield.
++    bool ngram_arbitration = true;
+     std::uint32_t query_replay_max_tokens = 2048;
+     std::uint32_t query_max_tokens = 512; // tail of the actual last-user span, matching llama.cpp
+     bool lrfu = false;
+diff --git a/src/runtime/contract/mtp_adaptive.h b/src/runtime/contract/mtp_adaptive.h
+--- a/src/runtime/contract/mtp_adaptive.h
++++ b/src/runtime/contract/mtp_adaptive.h
+@@ -96,6 +96,67 @@
+     std::array<std::uint16_t, kAdaptiveMtpMaximumDrafts> observations_{};
+     std::array<std::uint8_t, kAdaptiveMtpMaximumDrafts> stale_rounds_{};
+     std::array<std::uint8_t, kAdaptiveMtpMaximumDrafts> success_streak_{};
++};
++
++// A copy (ngram) round commits the leading run of a matched continuation that survives
++// verification, so its yield is prefix-shaped and varies with the match length. The signal
++// tracks committed tokens per drafted token and only spends the wider ngram verification when
++// the measured yield still beats the neural drafter's expected tokens. A rejected match is
++// retried after a bounded run, so predictable content later in the request is not starved.
++class NgramCopySignal final {
++public:
++    void reset() noexcept { *this = NgramCopySignal{}; }
++
++    void observe(std::uint32_t drafted, std::uint32_t accepted) noexcept {
++        if (drafted == 0) { return; }
++        const float sample_drafted  = static_cast<float>(drafted);
++        const float sample_accepted = static_cast<float>(std::min(accepted, drafted));
++        if (observations_ == 0) {
++            drafted_  = sample_drafted;
++            accepted_ = sample_accepted;
++        } else {
++            drafted_  += kAlpha * (sample_drafted - drafted_);
++            accepted_ += kAlpha * (sample_accepted - accepted_);
++        }
++        if (observations_ != UINT16_MAX) { ++observations_; }
++        skipped_ = 0;
++    }
++
++    // `length` is the matched continuation the round would verify. `neural_expected` is the
++    // committed tokens of one neural round at its own width (1.0 when the drafter is bypassed).
++    [[nodiscard]] bool should_copy(std::uint32_t length, float neural_expected) noexcept {
++        if (length == 0) { return false; }
++        if (observations_ < kColdStartRounds) {
++            skipped_ = 0;
++            return true;
++        }
++        if (skipped_ >= kProbeRounds || expected(length) > neural_expected * kAdvantage) {
++            skipped_ = 0;
++            return true;
++        }
++        if (skipped_ != UINT8_MAX) { ++skipped_; }
++        return false;
++    }
++
++    [[nodiscard]] float expected(std::uint32_t length) const noexcept {
++        if (length == 0 || drafted_ <= 0.0F) { return 0.0F; }
++        const float rate = std::clamp(accepted_ / drafted_, 0.0F, 1.0F);
++        return static_cast<float>(length) * rate;
++    }
++
++private:
++    static constexpr float kAlpha                   = 0.25F;
++    // A copy round verifies at the wider ngram window and skips the drafter, while a neural
++    // round verifies its own narrow window and pays the drafter. Copy must add this much more
++    // than one neural round to win on wall time, not just on token count.
++    static constexpr float kAdvantage               = 1.3F;
++    static constexpr std::uint16_t kColdStartRounds = 2;
++    static constexpr std::uint8_t kProbeRounds      = 8;
++
++    float drafted_              = 0.0F;
++    float accepted_             = 0.0F;
++    std::uint16_t observations_ = 0;
++    std::uint8_t skipped_       = 0;
+ };
+ 
+ // Round cost by batch size and verification width, in seconds once measured. A width without
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -69,6 +69,7 @@
+ 
+ using runtime::MtpAdaptiveBatchController;
+ using runtime::MtpAdaptiveSignal;
++using runtime::NgramCopySignal;
+ using PreparedPromptData    = qwen3_5::PreparedPromptData;
+ using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
+ using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
+@@ -794,6 +795,7 @@
+     SpeculativeStats speculative_stats;
+     // Adaptive MTP: how far this request's drafts survive.
+     MtpAdaptiveSignal mtp_signal;
++    NgramCopySignal ngram_signal;
+     detail::PhysicalResources active_resources;
+     detail::PhysicalResources optional_resources;
+     bool publish_continuation = true;
+diff --git a/src/models/qwen3_5/program/decode.cpp b/src/models/qwen3_5/program/decode.cpp
+--- a/src/models/qwen3_5/program/decode.cpp
++++ b/src/models/qwen3_5/program/decode.cpp
+@@ -223,6 +223,7 @@
+             std::vector<std::uint64_t>(mtp_controller.has_value() ? draft_window : 0U, 0),
+     };
+     request.mtp_signal.reset();
++    request.ngram_signal.reset();
+     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
+                            request.sampling_host.frequency_penalty != 0.0F;
+     if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
+@@ -428,6 +429,7 @@
+ 
+ void ProgramImpl::record_ngram_round(RequestControl& request, const NgramProposer::Match& match,
+                                      std::uint32_t drafted, std::uint32_t accepted) noexcept {
++    request.ngram_signal.observe(drafted, accepted);
+     request.speculative_stats.ngram_rounds += 1;
+     request.speculative_stats.ngram_drafted_tokens += drafted;
+     request.speculative_stats.ngram_accepted_tokens += accepted;
+@@ -806,7 +808,17 @@
+     // without one verify their neural drafts inside it. Otherwise a fixed policy verifies the
+     // whole draft window, and adaptive MTP the width its controller selects, never below the
+     // narrowest width it captured.
+-    const std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
++    std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
++    for (std::size_t row = 0; row < lanes.size(); ++row) {
++        auto& request = requests[lanes[row]];
++        const auto length = static_cast<std::uint32_t>(matches[row].tokens.size());
++        if (kvmem_options.ngram_arbitration && length != 0 &&
++            !request.ngram_signal.should_copy(length, request.mtp_signal.expected_tokens(draft_window, available[row]))) {
++            matches[row].tokens.clear();
++            // A rejected copy must not continue the archive source on the next round.
++            request.ngram_copy_source = 0;
++        }
++    }
+     const bool copy_round =
+         std::any_of(matches.begin(), matches.end(),
+                     [](const NgramProposer::Match& match) { return !match.tokens.empty(); });
+@@ -977,7 +989,7 @@
+             if (!matches[row].tokens.empty()) {
+                 record_ngram_round(request, matches[row], pcur,
+                                    static_cast<std::uint32_t>(accepted_i));
+-            } else if (mtp_controller) {
++            } else if (mtp_controller || kvmem_options.ngram_arbitration) {
+                 request.mtp_signal.observe(pcur, static_cast<std::uint32_t>(accepted_i));
+             }
+             request.pending = PendingCandidate{
+@@ -1037,7 +1049,17 @@
+     // viewed at that width. At batch>1 the drafter also runs and the copy payload overlays it on
+     // the device, so a row without a copy keeps its neural proposal; at batch one the copy alone
+     // is verified.
+-    const std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
++    std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
++    for (std::size_t row = 0; row < lanes.size(); ++row) {
++        auto& request = requests[lanes[row]];
++        const auto length = static_cast<std::uint32_t>(matches[row].tokens.size());
++        if (kvmem_options.ngram_arbitration && length != 0 &&
++            !request.ngram_signal.should_copy(length, request.mtp_signal.expected_tokens(draft_window, draft_window))) {
++            matches[row].tokens.clear();
++            // A rejected copy must not continue the archive source on the next round.
++            request.ngram_copy_source = 0;
++        }
++    }
+     const bool copy_round =
+         std::any_of(matches.begin(), matches.end(),
+                     [](const NgramProposer::Match& match) { return !match.tokens.empty(); });
+@@ -1261,6 +1283,9 @@
+             if (!matches[row].tokens.empty()) {
+                 record_ngram_round(request, matches[row], extent,
+                                    static_cast<std::uint32_t>(accepted_i));
++            } else if (extent != 0) {
++                // Measure neural rounds separately from wider lookup copies.
++                request.mtp_signal.observe(extent, static_cast<std::uint32_t>(accepted_i));
+             }
+             sequence.dflash_context_frontier = base_E;
+             request.pending                  = PendingCandidate{
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -118,6 +118,7 @@
+            "\n"
+            "MODEL & CONTEXT\n"
+            "  --kvmem / --no-kvmem          enable/disable KVMem (default off; positive B enables)\n"
++           "  --ngram-arbitration on|off    yield gate for copy versus neural drafts (default on)\n"
+            "  --kvmem-budget N              positive selected history B (default 32768), rounded down to 64\n"
+            "  --kvmem-query-replay-max-tokens N  bound complete Query replay (default 2048)\n"
+             "  --kvmem-query-scorer NAME    page-softmax (default) | meanq-cosine\n"
+@@ -1262,6 +1263,14 @@
+                 parse_float_in(require_value("--draft-confidence"), "draft-confidence", 0.0F, 1.0F);
+             continue;
+         }
++        if (arg == "--ngram-arbitration") {
++            const std::string_view value = require_value("--ngram-arbitration");
++            if (value != "on" && value != "off") {
++                throw std::invalid_argument("--ngram-arbitration expects on or off");
++            }
++            options.kvmem.ngram_arbitration = value == "on";
++            continue;
++        }
+         if (arg == "--ngram-draft-tokens") {
+             options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
+                 parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
+diff --git a/tests/models/qwen3_5/test_mtp_adaptive.cpp b/tests/models/qwen3_5/test_mtp_adaptive.cpp
+--- a/tests/models/qwen3_5/test_mtp_adaptive.cpp
++++ b/tests/models/qwen3_5/test_mtp_adaptive.cpp
+@@ -18,6 +18,7 @@
+ using ninfer::runtime::MtpAdaptiveSignal;
+ using ninfer::runtime::MtpPackedPlanner;
+ using ninfer::runtime::MtpRoundCostModel;
++using ninfer::runtime::NgramCopySignal;
+ 
+ void require(bool condition, const char* message) {
+     if (!condition) { throw std::runtime_error(message); }
+@@ -37,6 +38,37 @@
+     MtpAdaptiveSignal rejecting;
+     for (int round = 0; round < 40; ++round) { rejecting.observe(5, 0); }
+     require(rejecting.expected_tokens(5, 5) < 1.1F, "no acceptance expects only the bonus token");
++}
++
++void copy_yield_gates_and_recovers() {
++    NgramCopySignal copy;
++    require(!copy.should_copy(0, 1.0F), "an empty match cannot replace neural drafting");
++    require(copy.should_copy(15, 10.0F), "the first copy round must measure yield");
++    copy.observe(15, 0);
++    require(copy.should_copy(15, 10.0F), "one sample must not disable cold-start measurement");
++    copy.observe(15, 0);
++    for (int skipped = 0; skipped < 8; ++skipped) {
++        require(!copy.should_copy(15, 1.0F), "unproductive copies must yield to the neural drafter");
++    }
++    require(copy.should_copy(15, 1.0F), "starved copy sources must receive a bounded probe");
++    copy.observe(15, 15);
++    require(copy.should_copy(15, 1.0F), "a productive probe must reopen copying");
++
++    NgramCopySignal productive;
++    productive.observe(10, 10);
++    productive.observe(10, 10);
++    require(productive.should_copy(10, 7.0F), "long productive copies should beat neural yield");
++    require(!productive.should_copy(2, 7.0F), "a shorter match must be priced at its actual length");
++    require(!productive.should_copy(10, 10.0F / 1.3F), "equal yield at the margin must keep neural drafting");
++    productive.reset();
++    require(productive.expected(10) == 0.0F && productive.should_copy(10, 100.0F),
++            "a new request must not inherit another request's yield or rejection streak");
++
++    NgramCopySignal independent;
++    independent.observe(15, 0);
++    independent.observe(15, 0);
++    require(!independent.should_copy(15, 1.0F) && productive.should_copy(15, 100.0F),
++            "concurrent request estimates must remain independent");
+ }
+ 
+ void costs_are_measured_then_scaled() {
+@@ -147,6 +179,7 @@
+ int main() {
+     try {
+         survival_follows_acceptance();
++        copy_yield_gates_and_recovers();
+         costs_are_measured_then_scaled();
+         the_controller_widens_and_narrows();
+         the_packed_plan_spends_rows_on_survival();
+@@ -154,6 +187,6 @@
+         std::fprintf(stderr, "FAIL: %s\n", error.what());
+         return 1;
+     }
+-    std::puts("adaptive MTP: survival, costs, width selection and packed plans ok");
++    std::puts("adaptive MTP: survival, costs, width selection, packed plans and copy arbitration ok");
+     return 0;
+ }
+diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
+--- a/tests/test_serve_options.cpp
++++ b/tests/test_serve_options.cpp
+@@ -40,6 +40,25 @@
+ 
+ int run_serve_option_tests() {
+     int failures = 0;
++    failures += check(parse({"ninfer-serve", "model.ninfer"}).kvmem.ngram_arbitration,
++                      "ngram arbitration must default to on");
++    for (const auto value : {"on", "off"}) {
++        const auto options = parse({"ninfer-serve", "model.ninfer", "--ngram-arbitration", value});
++        failures += check(options.kvmem.ngram_arbitration == (std::string_view(value) == "on"),
++                          "explicit ngram arbitration selection was lost");
++    }
++    for (const auto value : {"true", "1", "maybe"}) {
++        bool rejected = false;
++        try { (void)parse({"ninfer-serve", "model.ninfer", "--ngram-arbitration", value}); }
++        catch (const std::invalid_argument&) { rejected = true; }
++        failures += check(rejected, "invalid ngram arbitration value was accepted");
++    }
++    {
++        bool rejected = false;
++        try { (void)parse({"ninfer-serve", "model.ninfer", "--ngram-arbitration"}); }
++        catch (const std::invalid_argument&) { rejected = true; }
++        failures += check(rejected, "missing ngram arbitration value was accepted");
++    }
+     const auto query_defaults=parse({"ninfer-serve","model.ninfer"});
+     failures+=check(query_defaults.kvmem.query_max_tokens==512 &&
+                     query_defaults.kvmem.query_replay_max_tokens==2048,"Query/replay defaults differ");
+diff --git a/docs/ngram.md b/docs/ngram.md
+--- a/docs/ngram.md
++++ b/docs/ngram.md
+@@ -81,6 +81,19 @@
+ does not promise identical floating-point results between different widths.
+ 
+ ## Operation
++
++Qwen3.5-core requests compare lookup-copy yield with their measured neural draft yield.
++`ninfer-serve --ngram-arbitration on|off` controls this gate and defaults to `on`.
++The first two completed copy rounds establish an estimate. Later matches run when their
++estimated accepted-token count exceeds 1.3 times the neural round's expected committed tokens;
++after eight skipped matches, one probe is allowed. Rejecting a match also discards its archive
++continuation cursor. Estimates reset for each request, and target verification still decides
++which tokens are accepted. `off` retains direct lookup-copy admission for comparisons.
++
++The gate changes proposal selection, so it does not guarantee identical generated text or a
++speedup on every workload. It adds CPU request state and leaves the draft KV representation
++unchanged. The setting applies to the Qwen3.5-core MTP, DFlash and DFlash2 paths; it does not
++change other model families' lookup policies.
+ 
+ Each request owns a bounded CPU index of source positions. Lookups use 16-, 8- and 4-token
+ suffixes, compare hits exactly and extend matches backward through up to 64 committed

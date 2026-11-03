@@ -1,0 +1,1510 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cdedf768b521f528e8bc06e648cd1cdec6d6f47b..98db5ae8bf13ef0a8383dde9c2a9a4e95a39c874 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2175,6 +2175,16 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
+     target_include_directories(poly_kvmem_mtp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+     target_link_libraries(poly_kvmem_mtp_test PRIVATE kvmem strata_poly_mmq strata_kernels ggml-cpu ggml-base
+       ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} ${_strata_poly_driver} Threads::Threads)
++    # Explicit model qualification: never runs in ctest or the default build.
++    add_executable(poly_gemma_kvmem_test EXCLUDE_FROM_ALL tools/poly_gemma_kvmem_test.cpp
++      src/poly/engine.cpp src/poly/qwen35.cpp src/poly/glm5next.cpp src/poly/gemma4.cpp
++      src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp
++      src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
++      src/poly/kvmem.cpp src/poly/kvmem_capture.cu)
++    target_compile_definitions(poly_gemma_kvmem_test PRIVATE STRATA_KVMEM=1)
++    target_include_directories(poly_gemma_kvmem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
++    target_link_libraries(poly_gemma_kvmem_test PRIVATE kvmem strata_poly_mmq strata_kernels ggml-cpu ggml-base
++      ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} ${_strata_poly_driver} Threads::Threads)
+   endif()
+   # needs the model file, so it is run by hand: poly_expert_parity MODEL.gguf
+   add_executable(poly_expert_parity src/poly/expert_parity.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu)
+diff --git a/serve/server.py b/serve/server.py
+index ccec3f67595d21552bedc6f3d6cf201220a7506a..87e45b051f96ab980da413f8e78b19cf12362add 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1306,7 +1306,8 @@ class StrataEngine:
+             span = getattr(ids, "kvmem_query", None)
+             if span is None or not (span==(0,0) or 0<=span[0]<span[1]<=len(ids)):
+                 raise ValueError("KVMem requires the frontend's exact user-query span")
+-            return f" query_begin={span[0]} query_end={span[1]}"
++            at = next((i for i in range(len(ids)-1,0,-1) if ids[i] in self.turn_ids),None)
++            return f" query_begin={span[0]} query_end={span[1]}" + (f" turn_at={at}" if at is not None else "")
+         at = next((i for i in range(len(ids) - 1, 0, -1) if ids[i] in self.turn_ids), None)
+         return f" turn_at={at}" if at is not None else ""
+ 
+diff --git a/serve/test_gemma.py b/serve/test_gemma.py
+index 26609f6eaf0043cd76eacbcab66f97f8b28ef802..97ec8c90c27f5a68c5dc3c7f514ef2a6a5286fad 100644
+--- a/serve/test_gemma.py
++++ b/serve/test_gemma.py
+@@ -12,6 +12,16 @@ from serve.frontend import ChatTemplate, OutputParser, openai_to_messages, parse
+ from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
+ 
+ SP = ST.SPACE
++
++class ManagedTurnBoundary(unittest.TestCase):
++    def test_query_and_existing_turn_boundary_travel_together(self):
++        from serve.kvmem import Prompt
++        engine=StrataEngine('missing-executable',['--kvmem-budget','2048'],lazy=True)
++        engine.turn_ids={42}
++        for span in ((2,3),(0,0)):
++            ids=Prompt([1,42,7,8,42,9,10],span)
++            fields=dict(part.split('=') for part in engine.turn_key(ids).split())
++            self.assertEqual(fields,dict(query_begin=str(span[0]),query_end=str(span[1]),turn_at='4'))
+ BYTES = ["<0x%02X>" % b for b in range(256)]
+ TOKENS = ["<pad>", "<eos>", "<bos>", "<|turn>", "<turn|>", "\n", "\n\n", SP, "a", "b", "c", "ab", SP + "ab",
+           SP + "c", "abc"] + BYTES
+diff --git a/src/poly/engine.cpp b/src/poly/engine.cpp
+index 8703129ea62a46902a5fdd82fe2adc3290064c43..cde7072934a85eda109786e6b9263830844e9b69 100644
+--- a/src/poly/engine.cpp
++++ b/src/poly/engine.cpp
+@@ -1435,8 +1435,8 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
+     const MetaValue* arch = file.get("general.architecture");
+     const std::string name = arch ? arch->s : std::string();
+ #ifdef STRATA_KVMEM
+-    if (o.memory.budget && name != "qwen35moe")
+-        throw std::runtime_error("KVMem requires qwen35moe; this file declares '" + name + "'");
++    if (o.memory.budget && name != "qwen35moe" && name != "gemma4")
++        throw std::runtime_error("KVMem requires qwen35moe or gemma4; this file declares '" + name + "'");
+     if (o.memory.budget && !o.layer_split.empty())
+         throw std::runtime_error("KVMem layer splitting is not qualified; select one GPU");
+ #endif
+@@ -2571,11 +2571,15 @@ void Engine::alloc() {
+ #endif
+     elastic_enabled_ = opt_.elastic_experts && vmm_ && !split_ && opt_.batch == 0 && elastic_decode &&
+                        !freeze_experts_ && opt_.gpu_experts && opt_.stage_read_mib == 0 &&
+-                       gg_->get("general.architecture")->s == "qwen35moe";
++                       (gg_->get("general.architecture")->s == "qwen35moe"
++#ifdef STRATA_KVMEM
++                        || (opt_.memory.budget && gg_->get("general.architecture")->s == "gemma4")
++#endif
++                       );
+ #endif
+     if (opt_.elastic_experts)
+         std::fprintf(stderr, "strata-poly: elastic experts %s\n", elastic_enabled_ ? "enabled" :
+-                     "inactive (requires CUDA VMM, solo Qwen35 MoE, no freeze/stage-read override; draft requires managed KVMem MTP window 2..4)");
++                     "inactive (requires CUDA VMM, solo Qwen35 or managed Gemma4 MoE, no freeze/stage-read override; draft requires managed KVMem MTP window 2..4)");
+     // --dump-layers prints one token's stages
+     rows_ = opt_.dump ? 1 : std::min(opt_.prompt_batch, opt_.max_context);
+     const size_t most = std::min<size_t>(kReadBytes / ((size_t) streams() * n_embd_ * sizeof(float)), opt_.max_context);
+diff --git a/src/poly/gemma4.cpp b/src/poly/gemma4.cpp
+index db5349d0d82e8bfe726d0e3c5e2bf7276bbbacf9..d538f9ff8adb964ff2d24debeb0c30fff87dac91 100644
+--- a/src/poly/gemma4.cpp
++++ b/src/poly/gemma4.cpp
+@@ -2,6 +2,9 @@
+ #include "gemma4.hpp"
+ 
+ #include "runtime.hpp"
++#ifdef STRATA_KVMEM
++#include "kvmem_capture.hpp"
++#endif
+ #include "strata/poly/kernels.hpp"
+ #include "strata/kernels/native_mmvq.hpp"
+ 
+@@ -91,6 +94,16 @@ void Gemma4::load_geometry() {
+     const MetaValue* per_layer = find("embedding_length_per_layer_input");
+     need(!per_layer || per_layer->u == 0, "token embeddings of a layer's own");
+ 
++    n_attn_ = 0;
++    head_dim_ = dim_full_;
++    for (int il = 0; il < n_layer_; ++il) if (!swa_[size_t(il)]) {
++#ifdef STRATA_KVMEM
++        if (opt_.memory.budget && n_attn_ && n_kv_ != kv_[size_t(il)])
++            throw std::runtime_error("Gemma KVMem needs uniform global KV heads");
++#endif
++        n_kv_ = kv_[size_t(il)];
++        ++n_attn_;
++    }
+     // the dense MLP's width is its matrix's: a file may give it once a layer
+     const TensorInfo* gate = tensor(0, "ffn_gate.weight");
+     need(gate && gate->shape.size() == 2, "no blk.0.ffn_gate.weight");
+@@ -198,6 +211,7 @@ void Gemma4::load_layer(int il) {
+     auto has = [&](const char* n) { return tensor(il, n) != nullptr; };
+ 
+     B.swa = swa_[(size_t) il] != 0;
++    B.memory_layer = B.swa ? -1 : int(std::count(swa_.begin(), swa_.begin() + il, uint8_t(0)));
+     B.dim = B.swa ? dim_swa_ : dim_full_;
+     B.n_kv = kv_[(size_t) il];
+     B.n_rot = B.swa ? rot_swa_ : rot_full_;
+@@ -256,6 +270,11 @@ int Gemma4::widest() const {
+ // are one aligned load - which is also why the rings, one block for the whole model as the fp16 ones are, take two.
+ void Gemma4::alloc_caches() {
+     ring_ = std::min(opt_.max_context, window_ + rows_);
++#ifdef STRATA_KVMEM
++    // Provisional target rows may exceed a tiny prompt batch. Keep the whole
++    // accepted local window alive until keep() chooses the accepted prefix.
++    if (opt_.memory.budget) ring_=std::min(opt_.max_context,window_+std::max(rows_,opt_.window));
++#endif
+     keep_ = std::min(window_, ring_);
+     max_dim_ = std::max(dim_full_, dim_swa_);
+     if (int8()) {
+@@ -313,7 +332,7 @@ void Gemma4::alloc_caches() {
+         // fp16 cache the quantization replaced), as wide as the widest layer's rows and as long as that layer's
+         // rows.  --kv int8k needs only the keys' side: the values are the fp16 cache itself.
+         for (const Block& B : blocks_) {
+-            const size_t rows = B.swa ? (size_t) ring_ : (size_t) opt_.max_context;
++            const size_t rows = B.swa ? (size_t) ring_ : (size_t) cache_capacity();
+             twin_halves_ = std::max(twin_halves_, rows * (size_t) B.n_kv * B.dim);
+         }
+         if (vmm_) {
+@@ -356,7 +375,7 @@ void Gemma4::alloc_caches() {
+             B.k_f16 = sh_k_f16_;
+             B.v_f16 = sh_v_f16_;
+         }
+-        chunk_ = (int) std::clamp<size_t>(kScoreFloats / ((size_t) n_head_ * opt_.max_context), 1, (size_t) rows_);
++        chunk_ = (int) std::clamp<size_t>(kScoreFloats / ((size_t) n_head_ * std::max(cache_capacity(), ring_)), 1, (size_t) rows_);
+         return;
+     }
+     size_t rings = 0;   // a window layer's rows are a ring, whatever the sequence's length
+@@ -377,7 +396,7 @@ void Gemma4::alloc_caches() {
+             B.vals = (uint16_t*) kv_alloc(row * sizeof(uint16_t), 1);
+         }
+     }
+-    chunk_ = (int) std::clamp<size_t>(kScoreFloats / ((size_t) n_head_ * opt_.max_context), 1, (size_t) rows_);
++    chunk_ = (int) std::clamp<size_t>(kScoreFloats / ((size_t) n_head_ * std::max(cache_capacity(), ring_)), 1, (size_t) rows_);
+ }
+ 
+ Gemma4::~Gemma4() {
+@@ -416,7 +435,7 @@ void Gemma4::assign_scratch() {
+     vraw_ = fbuf(kv);
+     v_ = fbuf(kv);
+     att_ = fbuf(heads);
+-    score_ = fbuf((size_t) chunk_ * n_head_ * opt_.max_context);
++    score_ = fbuf((size_t) chunk_ * n_head_ * std::max(cache_capacity(), ring_));
+     mlp_ = fbuf(n * n_embd_);
+     rin_ = fbuf(n * n_embd_);
+     if (!guess_.empty()) {   // one token at a time
+@@ -425,6 +444,27 @@ void Gemma4::assign_scratch() {
+         dg_up_ = fbuf((size_t) d_ff_);
+         dg_h_ = fbuf((size_t) d_ff_);
+     }
++#ifdef STRATA_KVMEM
++    if (opt_.memory.budget) {
++        memory_groups_ = size_t(cache_capacity()) / opt_.memory.block_tokens + 1;
++        // Normalized Q is consumed (including its ordered D2H copy) before
++        // attn_store(), and normalized K before attention uses score_. Reuse
++        // that scratch rather than displacing routed experts from VRAM. Tiny
++        // physical contexts can have less score scratch than a full Q batch.
++        const size_t score_floats=size_t(chunk_)*n_head_*cache_capacity();
++        memory_kpre_ = score_floats >= n * n_kv_ * head_dim_ ? score_ : fbuf(n * n_kv_ * head_dim_);
++        memory_qpre_ = score_floats >= n * n_head_ * head_dim_ ? score_ : fbuf(n * n_head_ * head_dim_);
++        const size_t key_count = memory_groups_ * n_attn_ * n_kv_ * head_dim_;
++        memory_stats_stride_=key_count+size_t(n_attn_)*n_head_*head_dim_;
++        memory_stats_all_ = fbuf(memory_stats_stride_*size_t(opt_.batch+1));
++        memory_ksums_=memory_stats_all_;
++        memory_qsums_ = memory_ksums_ ? memory_ksums_ + key_count : nullptr;
++        if (opt_.memory.mtp) {
++            memory_window_keys_ = fbuf(size_t(opt_.window) * n_attn_ * n_kv_ * head_dim_);
++        }
++    }
++#endif
++
+     // assign_scratch() runs twice (the first pass only counts), so this is guarded: without it the counting
+     // pass's pair is allocated and dropped.
+     if (int8() && !q8c_) {   // this call's queries in the cache's own form, for attend_int8's dp4a
+@@ -436,6 +476,150 @@ void Gemma4::assign_scratch() {
+     if (rows_ >= kStageRows) awork_ = fbuf(heads + heads / 2 + 1 + 3 * n * n_head_);   // a prompt batch's attention
+ }
+ 
++#ifdef STRATA_KVMEM
++void Gemma4::init_memory() {
++    std::vector<KvmemPlane> planes;
++    for (size_t il = 0; il < blocks_.size(); ++il)
++        if (!blocks_[il].swa) {
++            const auto& b=blocks_[il];
++            planes.push_back({uint32_t(il),b.keys,b.vals,b.k_code,b.k_delta,b.v_code,b.v_delta});
++        }
++    if(memory_) memory_->rebind(std::move(planes));
++    else memory_ = std::make_shared<KvmemMemory>(*this,std::move(planes),n_head_,n_kv_,head_dim_,1.f);
++    const size_t total = memory_groups_ * n_attn_ * n_kv_ * head_dim_ + size_t(n_attn_) * n_head_ * head_dim_;
++    if(!h_memory_stats_all_) {
++        h_memory_stats_all_=static_cast<float*>(hmalloc(total*size_t(opt_.batch+1)*sizeof(float),"KVMem statistics staging"));
++        if(opt_.memory.mtp)
++            h_memory_window_keys_=static_cast<float*>(hmalloc(size_t(n_attn_)*opt_.window*n_kv_*head_dim_*sizeof(float),
++                                                             "KVMem accepted window staging"));
++    }
++    memory_ksums_=memory_stats_all_+size_t(bound_)*memory_stats_stride_;
++    memory_qsums_=memory_ksums_+memory_groups_*n_attn_*n_kv_*head_dim_;
++    h_memory_stats_=h_memory_stats_all_+size_t(bound_)*memory_stats_stride_;
++    if(memory_feedback_.empty()) {
++        memory_page_stride_=uint32_t((cache_capacity()+opt_.memory.block_tokens-1)/opt_.memory.block_tokens);
++        const size_t samples=size_t((cache_capacity()+31)/32+8);
++        memory_feedback_.resize(size_t(opt_.batch+1));
++        for(auto& capture:memory_feedback_) {
++            capture.config=static_cast<int64_t*>(dmalloc(7*sizeof(int64_t),"KVMem attention capture coordinates"));
++            capture.rows=static_cast<int32_t*>(dmalloc(samples*sizeof(int32_t),"KVMem attention sample rows"));
++            capture.mass=static_cast<float*>(dmalloc(samples*memory_page_stride_*sizeof(float),"KVMem sampled attention mass"));
++            capture.host=static_cast<float*>(hmalloc(samples*memory_page_stride_*sizeof(float),"KVMem attention feedback staging"));
++        }
++    }
++}
++void Gemma4::prepare_memory_capture(const int32_t* tokens,int n) {
++    // Full resident requests never consume captured Query rows. Avoid locking
++    // their maximum host workspace until an actual bounded Query needs it.
++    if(memory_->capture_query() && !h_memory_queries_)
++        h_memory_queries_=static_cast<float*>(hmalloc(size_t(n_attn_)*opt_.memory.query_max_tokens*n_head_*head_dim_*sizeof(float),
++                                                    "KVMem bounded Query staging"));
++    memory_->prepare_capture(tokens,n);
++    auto& capture=memory_feedback_.at(size_t(bound_));
++    const auto& rows=memory_->capture_samples();
++    if(!rows.empty()) {
++        ck(cudaMemcpyAsync(capture.rows,rows.data(),rows.size()*sizeof(uint32_t),cudaMemcpyHostToDevice,cs(st_)),
++            "KVMem attention sample rows");
++        ck(cudaMemsetAsync(capture.mass,0,rows.size()*memory_page_stride_*sizeof(float),cs(st_)),
++            "KVMem attention feedback clear");
++    }
++    feedback_call(*memory_,bound_,pos_,n);
++}
++void Gemma4::feedback_call(KvmemMemory& memory,int seq,int64_t first,int n) {
++    auto& capture=memory_feedback_.at(size_t(seq));
++    const auto& samples=memory.capture_samples();
++    const int64_t relative=first-memory.capture_begin();
++    const auto lo=std::lower_bound(samples.begin(),samples.end(),uint32_t(std::max<int64_t>(0,relative)));
++    const auto hi=std::lower_bound(lo,samples.end(),uint32_t(std::max<int64_t>(0,relative+n)));
++    const std::array<int64_t,7> config={first,memory.compact_position(first),memory.capture_begin(),
++        int64_t(memory.capture_map().size()),int64_t(memory.capture_pages().size()),lo-samples.begin(),memory_reaccept_?0:hi-lo};
++    // An empty sample range does not read any coordinates. Keep the device's
++    // zero-count sentinel across unsampled halves instead of launching a
++    // setter at every layer. The first call still initializes that sentinel.
++    if(config[6]==0 && capture.last[6]==0)return;
++    if(config!=capture.last) {
++        capture.last=config;
++        kvmem_capture_config(capture.config,config.data(),st_);
++    }
++}
++void Gemma4::memory_capture_call(int64_t first,int n) {
++    if(memory_ && !memory_drafting_)feedback_call(*memory_,bound_,first,n);
++}
++void Gemma4::clear_memory_capture() {
++    memory_capture_staged_ = false;
++    const size_t total = memory_groups_ * n_attn_ * n_kv_ * head_dim_ + size_t(n_attn_) * n_head_ * head_dim_;
++    ck(cudaMemsetAsync(memory_ksums_, 0, total * sizeof(float), cs(st_)), "KVMem statistics clear");
++}
++void Gemma4::stage_memory_capture(int n) {
++    const size_t groups = (size_t(memory_batch_start_ % opt_.memory.block_tokens) + n + opt_.memory.block_tokens-1) / opt_.memory.block_tokens;
++    const size_t width = groups * n_kv_ * head_dim_;
++    // A pitched D2H copy submits a separate transfer for each attention layer.
++    // At this boundary score_ is dead; pack there and submit one small transfer.
++    const size_t count=width*n_attn_;
++    if(count<=size_t(chunk_)*n_head_*cache_capacity()) {
++        kvmem_pack_key_sums(memory_ksums_,score_,n_kv_*head_dim_,int(groups),n_attn_,int(memory_groups_),st_);
++        ck(cudaMemcpyAsync(h_memory_stats_,score_,count*sizeof(float),cudaMemcpyDeviceToHost,cs(st_)),
++           "KVMem packed key statistics");
++    } else
++        ck(cudaMemcpy2DAsync(h_memory_stats_, width * sizeof(float), memory_ksums_,
++            memory_groups_ * n_kv_ * head_dim_ * sizeof(float), width * sizeof(float), n_attn_,
++            cudaMemcpyDeviceToHost, cs(st_)), "KVMem key statistics");
++    float* query = h_memory_stats_ + width * n_attn_;
++    const bool capture = memory_->capture_query();
++    if (capture)
++        ck(cudaMemcpyAsync(query, memory_qsums_, size_t(n_attn_) * n_head_ * head_dim_ * sizeof(float),
++            cudaMemcpyDeviceToHost, cs(st_)), "KVMem query statistics");
++    const auto& attention=memory_feedback_.at(size_t(bound_));
++    const size_t samples=memory_->capture_samples().size(),pages=memory_->capture_pages().size();
++    if(samples)ck(cudaMemcpy2DAsync(attention.host,pages*sizeof(float),attention.mass,
++        memory_page_stride_*sizeof(float),pages*sizeof(float),samples,cudaMemcpyDeviceToHost,cs(st_)),
++        "KVMem native attention feedback");
++    memory_capture_staged_ = true;
++}
++void Gemma4::commit_memory_capture(int n) {
++    if (!memory_capture_staged_) {
++        stage_memory_capture(n);
++        ck(cudaStreamSynchronize(cs(st_)), "KVMem accepted capture");
++    }
++    // eval() staged these copies before its existing logits synchronization;
++    // read() reaches here without that synchronization and takes the branch
++    // above. Never publish CPU statistics from an incomplete device pass.
++    const size_t groups = (size_t(memory_batch_start_ % opt_.memory.block_tokens) + n + opt_.memory.block_tokens-1) / opt_.memory.block_tokens;
++    const size_t width = groups * n_kv_ * head_dim_;
++    float* query = h_memory_stats_ + width * n_attn_;
++    const bool capture = memory_->capture_query();
++    memory_->accept_capture(n,memory_feedback_.at(size_t(bound_)).host,uint32_t(memory_->capture_pages().size()));
++    memory_->commit(n,h_memory_stats_,width,capture?query:nullptr,capture?h_memory_queries_:nullptr,
++        capture?size_t(opt_.memory.query_max_tokens)*n_head_*head_dim_:0);
++}
++void Gemma4::commit_memory_window(int n) {
++    // Provisional rows are kept individually, including separate halves of a
++    // recorded window. Transfer the tiny window once and reduce its accepted
++    // prefix on the CPU, avoiding a kernel per layer followed by a pitched copy.
++    // Rejected rows are transferred but never enter authoritative statistics.
++    const size_t width = size_t(n_kv_) * head_dim_;
++    ck(cudaMemcpyAsync(h_memory_window_keys_,memory_window_keys_,size_t(n_attn_)*opt_.window*width*sizeof(float),
++                       cudaMemcpyDeviceToHost,cs(st_)),"KVMem accepted window keys");
++    const auto& attention=memory_feedback_.at(size_t(bound_));
++    const size_t samples=memory_->capture_samples().size(),pages=memory_->capture_pages().size();
++    if(samples)ck(cudaMemcpy2DAsync(attention.host,pages*sizeof(float),attention.mass,
++        memory_page_stride_*sizeof(float),pages*sizeof(float),samples,cudaMemcpyDeviceToHost,cs(st_)),
++        "KVMem accepted window attention");
++    ck(cudaStreamSynchronize(cs(st_)),"KVMem accepted window");
++    const size_t groups=(size_t(memory_batch_start_%opt_.memory.block_tokens)+n+opt_.memory.block_tokens-1)/opt_.memory.block_tokens;
++    std::fill_n(h_memory_stats_,size_t(n_attn_)*groups*width,0.f);
++    for(int il=0;il<n_attn_;++il)for(int row=0;row<n;++row) {
++        const size_t group=(size_t(memory_batch_start_%opt_.memory.block_tokens)+row)/opt_.memory.block_tokens;
++        float* sum=h_memory_stats_+(size_t(il)*groups+group)*width;
++        const float* key=h_memory_window_keys_+(size_t(il)*opt_.window+row)*width;
++        for(size_t d=0;d<width;++d)sum[d]+=key[d];
++    }
++    memory_capture_staged_=true;
++    commit_memory_capture(n);
++}
++#endif
++
++
+ // A sequence's rows are the full layers': a window layer's are part of its state (save_layer()).  Under --kv int8
+ // a row is its codes and, in a second array, a delta every kQ8_0Values of them; the two are saved one after the
+ // other, as the layer's other side is.
+@@ -621,7 +805,16 @@ void Gemma4::load_extra(const uint8_t* src, int64_t pos) {
+ 
+ // The recordings of a full layer's head are numbered by the rows they are sized for; a window layer's never
+ // reads more than its window.
+-int Gemma4::head_key(int il, int n) const { return swa_[(size_t) il] ? 0 : room_key(n); }
++int Gemma4::head_key(int il, int n) const {
++#ifdef STRATA_KVMEM
++    if (memory_ && !swa_[size_t(il)]) {
++        const bool query=memory_->capture_query() && memory_->query_last(pos_,n)>memory_->query_first(pos_,n);
++        const bool feedback=memory_feedback_.at(size_t(bound_)).last[6]>0;
++        return 4*room_key(n)+2*int(query)+int(feedback);
++    }
++#endif
++    return swa_[size_t(il)] ? 0 : room_key(n);
++}
+ 
+ // One side of a layer's cache as the pair attend_int8 reads.  The fp16 pointers are null under --kv int8, so the
+ // attention asks for the side it wants rather than naming keys or vals itself.
+@@ -634,11 +827,17 @@ KvInt8 Gemma4::cache_int8(const Block& B, bool value) const {
+ // same shape, and under --kv int8 the codes and the deltas are two arrays either way.
+ void Gemma4::store(const float* x, const Block& B, int64_t pos, int n, bool value) {
+     const int width = B.n_kv * B.dim;
++#ifdef STRATA_KVMEM
++    if (memory_ && !B.swa) pos=memory_->compact_position(pos);
++    const long long* store_at=memory_ && B.swa ? at_+1 : at_;
++#else
++    const long long* store_at=at_;
++#endif
+     const bool q = int8() && (value ? !int8k() : true);   // this side's own format
+     if (q) {
+         int8_t* code = value ? B.v_code : B.k_code;
+         uint16_t* delta = value ? B.v_delta : B.k_delta;
+-        if (recording_) return store_int8_at(x, code, delta, B.n_kv, B.dim, n, at_, B.swa ? ring_ : 0, st_);
++        if (recording_) return store_int8_at(x, code, delta, B.n_kv, B.dim, n, store_at, B.swa ? ring_ : 0, st_);
+         if (!B.swa) return store_int8(x, code, delta, B.n_kv, B.dim, pos, n, st_);
+         const int at = (int) (pos % ring_), head = std::min(n, ring_ - at);
+         store_int8(x, code, delta, B.n_kv, B.dim, at, head, st_);
+@@ -646,7 +845,7 @@ void Gemma4::store(const float* x, const Block& B, int64_t pos, int n, bool valu
+         return;
+     }
+     uint16_t* cache = value ? B.vals : B.keys;
+-    if (recording_) return store_f16_at(x, cache, width, at_, n, B.swa ? ring_ : 0, st_);
++    if (recording_) return store_f16_at(x, cache, width, store_at, n, B.swa ? ring_ : 0, st_);
+     if (!B.swa) return store_f16(x, cache, width, pos, n, st_);
+     const int at = (int) (pos % ring_), head = std::min(n, ring_ - at);
+     store_f16(x, cache, width, at, head, st_);
+@@ -672,6 +871,11 @@ int64_t Gemma4::whole(int64_t at, int64_t m) const {
+ // are not scaled: the norms set their size.
+ void Gemma4::attn(Block& B, int64_t pos, int n) {
+     if (rows_of_) return attn_rows(B, n);
++#ifdef STRATA_KVMEM
++    // read() also visits heads layer-major, in several row-sized subcalls.
++    // Its frame spans the full read; each head must bind its own sample range.
++    if(memory_ && !B.swa && !recording_ && !memory_drafting_) memory_capture_call(pos,n);
++#endif
+     // a call is a picture or has no row of one (whole())
+     const Image* im = image_at(pos);
+     for (const Image& o : images_)
+@@ -679,13 +883,39 @@ void Gemma4::attn(Block& B, int64_t pos, int n) {
+             throw std::logic_error("a picture's rows in a call with other rows");
+     const bool sees_all = B.swa && im != nullptr;
+     const float* freq = B.swa ? nullptr : fp(freq_);
+-    const long long* at = recording_ ? at_ : nullptr;   // a recorded launch: the tokens from what at_ holds
++    const long long* at = recording_ ? at_ : nullptr;
++    const long long* rotary_at = at;
++#ifdef STRATA_KVMEM
++    if (memory_ && at) rotary_at = at + 1;
++#endif
+     lin(B.wq, xn_, qraw_, n, xq_);
++#ifdef STRATA_KVMEM
++    if (memory_ && !B.swa && memory_->capture_query() && memory_->query_last(pos,n)>memory_->query_first(pos,n)) {
++        head_norm_rope_capture(qraw_,B.dim,fp(B.q_norm),q_,memory_qpre_,B.dim,n_head_,B.n_rot,
++            B.theta_scale,pos,n,rms_eps_,st_,freq,nullptr,1,rotary_at);
++        const int from=memory_->query_first(pos,n), to=memory_->query_last(pos,n);
++        const size_t width=size_t(n_head_)*B.dim;
++        kvmem_query_sum(memory_qpre_,memory_qsums_+size_t(B.memory_layer)*width,int(width),from,to,st_);
++        ck(cudaMemcpyAsync(h_memory_queries_+(size_t(B.memory_layer)*opt_.memory.query_max_tokens+
++            size_t(memory_->query_offset(pos+from)))*width,memory_qpre_+size_t(from)*width,
++            size_t(to-from)*width*sizeof(float),cudaMemcpyDeviceToHost,cs(st_)),"Gemma Query capture");
++    } else
++#endif
+     head_norm_rope(qraw_, B.dim, fp(B.q_norm), q_, B.dim, n_head_, B.n_rot, B.theta_scale, pos, n, rms_eps_, st_,
+-                   freq, nullptr, 1, at);
++                   freq, nullptr, 1, rotary_at);
+     lin(B.wk, xn_, kraw_, n, xq_);
++#ifdef STRATA_KVMEM
++    if (memory_ && !B.swa) {
++        float* normalized=memory_window_ ? memory_window_keys_+
++            (size_t(B.memory_layer)*opt_.window+size_t(pos-memory_batch_start_))*n_kv_*head_dim_ : memory_kpre_;
++        head_norm_rope_capture(kraw_,B.dim,fp(B.k_norm),k_,normalized,B.dim,B.n_kv,B.n_rot,
++            B.theta_scale,pos,n,rms_eps_,st_,freq,nullptr,1,rotary_at);
++        if (!memory_window_) kvmem_key_sums(normalized,memory_ksums_+size_t(B.memory_layer)*memory_groups_*n_kv_*head_dim_,
++            n_kv_*head_dim_,n,pos,memory_batch_start_,int(memory_groups_),int(opt_.memory.block_tokens),st_,rotary_at);
++    } else
++#endif
+     head_norm_rope(kraw_, B.dim, fp(B.k_norm), k_, B.dim, B.n_kv, B.n_rot, B.theta_scale, pos, n, rms_eps_, st_,
+-                   freq, nullptr, 1, at);
++                   freq, nullptr, 1, rotary_at);
+     const float* values = kraw_;   // a layer without a value projection takes the keys'
+     if (B.wv.p) {
+         lin(B.wv, xn_, vraw_, n, xq_);
+@@ -694,6 +924,12 @@ void Gemma4::attn(Block& B, int64_t pos, int n) {
+     head_norm_rope(values, B.dim, nullptr, v_, B.dim, B.n_kv, 0, 1.f, pos, n, rms_eps_, st_);
+     store(k_, B, pos, n, false);
+     store(v_, B, pos, n, true);
++#ifdef STRATA_KVMEM
++    if (memory_) {
++        if (B.swa && at) at=rotary_at;
++        if (!B.swa) pos=memory_->compact_position(pos);
++    }
++#endif
+     const int window = B.swa ? window_ : 0, ring = B.swa ? ring_ : 0;
+     // a prompt batch through cuBLAS; a few tokens with the kernels that give a token the same bits in any company.
+     // Under --kv int8 a batch goes the other way round: the codes are converted to halves once per token - O(rows)
+@@ -710,7 +946,7 @@ void Gemma4::attn(Block& B, int64_t pos, int n) {
+             uint16_t* v = B.v_f16;
+             if (int8k()) v = B.vals;   // --kv int8k: the values are the fp16 cache itself
+             else dequant_int8_to_f16(B.v_code, B.v_delta, B.v_f16, blocks, st_);
+-            attend_batch(blas_, q_, B.k_f16, v, pos, n, score_, (size_t) chunk_ * n_head_ * opt_.max_context,
++            attend_batch(blas_, q_, B.k_f16, v, pos, n, score_, (size_t) chunk_ * n_head_ * std::max(cache_capacity(), ring_),
+                          awork_, att_, B.dim, n_head_, B.n_kv, 1.f, st_, window, ring, sees_all);
+         } else if (int8k()) {
+             attend_int8_mixed(q_, KvInt8{q8c_, q8d_}, cache_int8(B, false), B.vals, pos, n, score_, chunk_, att_,
+@@ -722,11 +958,19 @@ void Gemma4::attn(Block& B, int64_t pos, int n) {
+                       !at ? 0 : B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n));
+         }
+     } else if (n >= kStageRows)
+-        attend_batch(blas_, q_, B.keys, B.vals, pos, n, score_, (size_t) chunk_ * n_head_ * opt_.max_context, awork_,
++        attend_batch(blas_, q_, B.keys, B.vals, pos, n, score_, (size_t) chunk_ * n_head_ * std::max(cache_capacity(), ring_), awork_,
+                      att_, B.dim, n_head_, B.n_kv, 1.f, st_, window, ring, sees_all);
+     else
+         attend(q_, B.keys, B.vals, pos, n, score_, chunk_, att_, B.dim, n_head_, B.n_kv, 1.f, st_, window, ring,
+                sees_all, at, !at ? 0 : B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n));
++#ifdef STRATA_KVMEM
++    if (memory_ && !B.swa) {
++        const auto& capture=memory_feedback_.at(size_t(bound_));
++        if(capture.last[6]>0) kvmem_page_mass(q_,B.keys,int8()?Kvq8{B.k_code,B.k_delta}:Kvq8{},B.dim,n_head_,B.n_kv,
++            int(capture.last[6]),capture.config,capture.rows,capture.mass,int(memory_page_stride_),
++            n_attn_,int(opt_.memory.block_tokens),st_,score_,size_t(chunk_)*n_head_*cache_capacity(),1.f);
++    }
++#endif
+     lin(B.wo, att_, ao_, n);
+ }
+ 
+@@ -748,14 +992,36 @@ void Gemma4::attn_rows(Block& B, int n) {
+     for (int i = 0; i < n; ++i) {
+         const Row& r = rows_of_[i];
+         const long long* ai = at_ + 2 * i;
++        const long long* rotary_at=ai;
++        const long long* store_at=ai;
++        int64_t physical=r.pos;
++#ifdef STRATA_KVMEM
++        auto* managed=sequence_memory(r.seq);
++        if (managed) {
++            rotary_at=ai+1;
++            if (B.swa) store_at=ai+1;
++            else physical=managed->compact_position(r.pos);
++        }
++#endif
+         head_norm_rope(qraw_ + i * hq, B.dim, fp(B.q_norm), q_ + i * hq, B.dim, n_head_, B.n_rot, B.theta_scale, 0, 1,
+-                       rms_eps_, st_, freq, nullptr, 1, ai);
++                       rms_eps_, st_, freq, nullptr, 1, rotary_at);
++#ifdef STRATA_KVMEM
++        if (managed && !B.swa) {
++            head_norm_rope_capture(kraw_+i*kv,B.dim,fp(B.k_norm),k_+i*kv,memory_kpre_+i*kv,
++                B.dim,B.n_kv,B.n_rot,B.theta_scale,0,1,rms_eps_,st_,freq,nullptr,1,rotary_at);
++            kvmem_key_sums(memory_kpre_+i*kv,memory_stats_all_+size_t(r.seq)*memory_stats_stride_+
++                size_t(B.memory_layer)*memory_groups_*kv,int(kv),1,r.pos,r.pos,int(memory_groups_),
++                int(opt_.memory.block_tokens),st_);
++        } else
++#endif
+         head_norm_rope(kraw_ + i * kv, B.dim, fp(B.k_norm), k_ + i * kv, B.dim, B.n_kv, B.n_rot, B.theta_scale, 0, 1,
+-                       rms_eps_, st_, freq, nullptr, 1, ai);
++                       rms_eps_, st_, freq, nullptr, 1, rotary_at);
+         const int64_t keep = pos_;
+         pos_ = r.pos;
+-        const int sized = B.swa ? std::min(window_, opt_.max_context) : room(1);
++        int64_t padded=1024;while(padded<physical+1)padded*=2;
++        const int sized = B.swa ? std::min(window_, opt_.max_context) : int(std::min<int64_t>(padded,cache_capacity()));
+         pos_ = keep;
++        {
+         if (int8()) {
+             // A row reads and writes the codes of the sequence it belongs to, not the bound one's (seq_buf is how
+             // the fp16 path reaches them), and the values' side of a row is the codes the mode asks for: both
+@@ -764,29 +1030,42 @@ void Gemma4::attn_rows(Block& B, int n) {
+             uint16_t* kd8 = (uint16_t*) seq_buf(r.seq, B.k_delta);
+             // The row's own key goes to the cache at its own position (the ring's row included), as the fp16
+             // path's store_f16_at does: the position is the one the card holds for this row.
+-            store_int8_at(k_ + i * kv, kc8, kd8, B.n_kv, B.dim, 1, ai, ring, st_);
++            store_int8_at(k_ + i * kv, kc8, kd8, B.n_kv, B.dim, 1, store_at, ring, st_);
+             if (int8k()) {
+                 // The values are the fp16 cache: the row's own, at its own position.
+                 uint16_t* vc8 = (uint16_t*) seq_buf(r.seq, B.vals);
+-                store_f16_at(v_ + i * kv, vc8, (int) kv, ai, 1, ring, st_);
++                store_f16_at(v_ + i * kv, vc8, (int) kv, store_at, 1, ring, st_);
+                 // The queries' codes are the row's own (a row at a time, so the scratch's first row's worth).
+-                attend_int8_mixed(q_ + i * hq, KvInt8{q8c_, q8d_}, KvInt8{kc8, kd8}, vc8, r.pos, 1, score_, chunk_,
+-                                  att_ + i * hq, B.dim, n_head_, B.n_kv, 1.f, st_, window, ring, false, ai, sized);
+-                continue;
++                attend_int8_mixed(q_ + i * hq, KvInt8{q8c_, q8d_}, KvInt8{kc8, kd8}, vc8, physical, 1, score_, chunk_,
++                                  att_ + i * hq, B.dim, n_head_, B.n_kv, 1.f, st_, window, ring, false, store_at, sized);
++                goto feedback;
+             }
+             int8_t* vc8 = (int8_t*) seq_buf(r.seq, B.v_code);
+             uint16_t* vd8 = (uint16_t*) seq_buf(r.seq, B.v_delta);
+-            store_int8_at(v_ + i * kv, vc8, vd8, B.n_kv, B.dim, 1, ai, ring, st_);
+-            attend_int8(q_ + i * hq, KvInt8{q8c_, q8d_}, KvInt8{kc8, kd8}, KvInt8{vc8, vd8}, r.pos, 1, score_, chunk_,
+-                        att_ + i * hq, B.dim, n_head_, B.n_kv, 1.f, st_, window, ring, false, ai, sized);
+-            continue;
++            store_int8_at(v_ + i * kv, vc8, vd8, B.n_kv, B.dim, 1, store_at, ring, st_);
++            attend_int8(q_ + i * hq, KvInt8{q8c_, q8d_}, KvInt8{kc8, kd8}, KvInt8{vc8, vd8}, physical, 1, score_, chunk_,
++                        att_ + i * hq, B.dim, n_head_, B.n_kv, 1.f, st_, window, ring, false, store_at, sized);
++            goto feedback;
+         }
+         uint16_t* kc = (uint16_t*) seq_buf(r.seq, B.keys);
+         uint16_t* vc = (uint16_t*) seq_buf(r.seq, B.vals);
+-        store_f16_at(k_ + i * kv, kc, (int) kv, ai, 1, ring, st_);
+-        store_f16_at(v_ + i * kv, vc, (int) kv, ai, 1, ring, st_);
+-        attend(q_ + i * hq, kc, vc, r.pos, 1, score_, chunk_, att_ + i * hq, B.dim, n_head_, B.n_kv, 1.f, st_, window,
+-               ring, false, ai, sized);
++        store_f16_at(k_ + i * kv, kc, (int) kv, store_at, 1, ring, st_);
++        store_f16_at(v_ + i * kv, vc, (int) kv, store_at, 1, ring, st_);
++        attend(q_ + i * hq, kc, vc, physical, 1, score_, chunk_, att_ + i * hq, B.dim, n_head_, B.n_kv, 1.f, st_, window,
++               ring, false, store_at, sized);
++        }
++        feedback: ;
++#ifdef STRATA_KVMEM
++        if (managed && !B.swa) {
++            feedback_call(*managed,r.seq,r.pos,1);
++            const auto& capture=memory_feedback_.at(size_t(r.seq));
++            if(capture.last[6]>0) kvmem_page_mass(q_+i*hq,
++                int8()?nullptr:static_cast<uint16_t*>(seq_buf(r.seq,B.keys)),
++                int8()?Kvq8{static_cast<int8_t*>(seq_buf(r.seq,B.k_code)),static_cast<uint16_t*>(seq_buf(r.seq,B.k_delta))}:Kvq8{},
++                B.dim,n_head_,B.n_kv,1,capture.config,capture.rows,capture.mass,int(memory_page_stride_),
++                n_attn_,int(opt_.memory.block_tokens),st_,score_,size_t(chunk_)*n_head_*cache_capacity(),1.f);
++        }
++#endif
+     }
+     lin(B.wo, att_, ao_, n);
+ }
+@@ -886,19 +1165,23 @@ void Gemma4::draft_step(int32_t token, int i) {
+     lin(d_pre_, dxh_, x, 1);
+     for (const Guess& G : guess_) {
+         const Block& B = blocks_[(size_t) G.of];
++        int64_t cache_end=pos_-1;
++#ifdef STRATA_KVMEM
++        if (memory_ && !G.swa) cache_end=memory_->compact_position(pos_)-1;
++#endif
+         rms_norm(x, fp(G.attn_norm), xn_, a, 1, d_eps_, st_);
+         lin(G.wq, xn_, qraw_, 1);
+         head_norm_rope(qraw_, G.dim, fp(G.q_norm), q_, G.dim, n_head_, G.n_rot, G.theta_scale, pos_, 1, d_eps_, st_,
+                        G.swa ? nullptr : fp(d_freq_));
+         // a window layer's token attends itself and the window_ - 1 before it; the asking token has no row
+         if (int8k())
+-            attend_int8_mixed(q_, KvInt8{q8c_, q8d_}, cache_int8(B, false), B.vals, pos_ - 1, 1, score_, chunk_,
++            attend_int8_mixed(q_, KvInt8{q8c_, q8d_}, cache_int8(B, false), B.vals, cache_end, 1, score_, chunk_,
+                             att_, G.dim, n_head_, B.n_kv, 1.f, st_, G.swa ? window_ - 1 : 0, G.swa ? ring_ : 0);
+         else if (int8())
+-            attend_int8(q_, KvInt8{q8c_, q8d_}, cache_int8(B, false), cache_int8(B, true), pos_ - 1, 1, score_, chunk_,
++            attend_int8(q_, KvInt8{q8c_, q8d_}, cache_int8(B, false), cache_int8(B, true), cache_end, 1, score_, chunk_,
+                       att_, G.dim, n_head_, B.n_kv, 1.f, st_, G.swa ? window_ - 1 : 0, G.swa ? ring_ : 0);
+         else
+-            attend(q_, B.keys, B.vals, pos_ - 1, 1, score_, chunk_, att_, G.dim, n_head_, B.n_kv, 1.f, st_,
++            attend(q_, B.keys, B.vals, cache_end, 1, score_, chunk_, att_, G.dim, n_head_, B.n_kv, 1.f, st_,
+                    G.swa ? window_ - 1 : 0, G.swa ? ring_ : 0);
+         lin(G.wo, att_, ao_, 1);
+         rms_norm(ao_, fp(G.post_attn), cur_, a, 1, d_eps_, st_);
+diff --git a/src/poly/gemma4.hpp b/src/poly/gemma4.hpp
+index 0d56ff188a0931d655b0310a0afec409468cecd2..a3fa0b7172ecb2b09d9dd9eacb1a7b79e80d7ae6 100644
+--- a/src/poly/gemma4.hpp
++++ b/src/poly/gemma4.hpp
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include "engine.hpp"
++#include <array>
+ #include "strata/poly/kernels.hpp"   // KvInt8: what cache_int8() hands the attention under --kv int8
+ 
+ namespace strata::poly {
+@@ -26,6 +27,15 @@ public:
+     int64_t whole(int64_t at, int64_t m) const override;
+ 
+ protected:
++#ifdef STRATA_KVMEM
++    void init_memory() override;
++    void clear_memory_capture() override;
++    void prepare_memory_capture(const int32_t*,int) override;
++    void memory_capture_call(int64_t,int) override;
++    void stage_memory_capture(int n) override;
++    void commit_memory_capture(int n) override;
++    void commit_memory_window(int n) override;
++#endif
+     void load_geometry() override;
+     void load_layer(int il) override;
+     void begin_pass() override;
+@@ -57,6 +67,7 @@ private:
+ 
+     /// A layer's weights beside the ones every architecture has (Layer), and its caches.
+     struct Block {
++        int memory_layer = -1;
+         bool swa = false;   ///< attends a sliding window; its caches are rings
+         int dim = 0, n_kv = 0, n_rot = 0;   ///< a head's width, the heads that have keys of their own
+         float theta_scale = 0;
+@@ -113,6 +124,28 @@ private:
+     Dev freq_;         ///< the full layers' rotary frequency factors
+     int chunk_ = 1;    ///< tokens the attention takes at a time
+ 
++    int n_attn_ = 0, n_kv_ = 0, head_dim_ = 0;
++#ifdef STRATA_KVMEM
++    float *memory_kpre_ = nullptr, *memory_qpre_ = nullptr;
++    float *memory_ksums_ = nullptr, *memory_qsums_ = nullptr, *h_memory_stats_ = nullptr;
++    size_t memory_groups_ = 0;
++    bool memory_capture_staged_ = false;
++    float* memory_window_keys_ = nullptr;
++    float* h_memory_window_keys_ = nullptr;
++    float* h_memory_queries_ = nullptr;
++    float *memory_stats_all_ = nullptr, *h_memory_stats_all_ = nullptr;
++    size_t memory_stats_stride_ = 0;
++    struct FeedbackBuffers {
++        int64_t* config=nullptr;
++        int32_t* rows=nullptr;
++        float *mass=nullptr,*host=nullptr;
++        std::array<int64_t,7> last={-1,-1,-1,-1,-1,-1,-1};
++    };
++    std::vector<FeedbackBuffers> memory_feedback_;
++    uint32_t memory_page_stride_=0;
++    void feedback_call(KvmemMemory&,int,int64_t,int);
++#endif
++
+     // device scratch
+     float *qraw_ = nullptr, *q_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *vraw_ = nullptr, *v_ = nullptr,
+           *att_ = nullptr, *score_ = nullptr, *mlp_ = nullptr, *rin_ = nullptr;
+diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
+index 5919ed52dcbf0e54e009306084977bd2f2239532..72a92f2eb31f0ca6d9d8eb891206ebd980c4100a 100644
+--- a/src/poly/kvmem.cpp
++++ b/src/poly/kvmem.cpp
+@@ -68,17 +68,21 @@ void KvmemOptions::validate(int context, int batch, int window, bool draft) cons
+ }
+ 
+ KvmemMemory::KvmemMemory(Engine& engine, std::vector<KvmemPlane> planes,
+-                         uint32_t heads, uint32_t kv_heads, uint32_t dim)
+-    : block_tokens(engine.opt_.memory.block_tokens), engine_(engine), options_(engine.opt_.memory), planes_(std::move(planes)),
++                         uint32_t heads, uint32_t kv_heads, uint32_t dim, float scale)
++    : block_tokens(engine.opt_.memory.block_tokens), attention_scale(scale), engine_(engine), options_(engine.opt_.memory), planes_(std::move(planes)),
+       heads_(heads), kv_heads_(kv_heads), dim_(dim), key_width_(kv_heads * dim), query_width_(heads * dim),
+       storage_(engine.shared_storage_ ? engine.shared_storage_ : (engine.shared_storage_=storage(options_))) {
+     require(!planes_.empty(), "KVMem requires at least one full-attention layer");
++    const bool gemma = engine.gg_->get("general.architecture")->s == "gemma4";
+     descriptor_.identity = {"polystrata", "974552f+kvmem-v2",
+         std::filesystem::absolute(engine.opt_.model).string(),
+-        "qwen35-gdn-f32-v1"};
++        gemma ? "gemma4-swa-v1" : "qwen35-gdn-f32-v1"};
+     auto& layout = descriptor_.layout;
+-    const bool q8 = engine.opt_.kv_format == KvFmt::kQ8_0;
+-    layout.format = q8 ? "polystrata-qwen35-native-q8_0-v1" : "polystrata-qwen35-native-f16-v1";
++    const bool q8 = engine.opt_.kv_format == KvFmt::kQ8_0 || engine.opt_.kv_format == KvFmt::kInt8 || engine.opt_.kv_format == KvFmt::kInt8K;
++    const bool mixed = engine.opt_.kv_format == KvFmt::kInt8K;
++    layout.format = gemma ? (mixed ? "polystrata-gemma4-native-int8k-v1" :
++        q8 ? "polystrata-gemma4-native-int8-v1" : "polystrata-gemma4-native-f16-v1") :
++        q8 ? "polystrata-qwen35-native-q8_0-v1" : "polystrata-qwen35-native-f16-v1";
+     layout.version = 1;
+     layout.block_tokens = block_tokens;
+     layout.alignment = alignof(uint16_t);
+@@ -92,8 +96,11 @@ KvmemMemory::KvmemMemory(Engine& engine, std::vector<KvmemPlane> planes,
+         if (q8) {
+             add(plane.layer,kvmem::PayloadPlaneKind::Key,plane.key_codes,key_width_,1);
+             add(plane.layer,kvmem::PayloadPlaneKind::KeyScale,plane.key_scales,key_width_/32*2,2);
+-            add(plane.layer,kvmem::PayloadPlaneKind::Value,plane.value_codes,key_width_,1);
+-            add(plane.layer,kvmem::PayloadPlaneKind::ValueScale,plane.value_scales,key_width_/32*2,2);
++            if (mixed) add(plane.layer,kvmem::PayloadPlaneKind::Value,plane.values,uint64_t(key_width_)*2,2);
++            else {
++                add(plane.layer,kvmem::PayloadPlaneKind::Value,plane.value_codes,key_width_,1);
++                add(plane.layer,kvmem::PayloadPlaneKind::ValueScale,plane.value_scales,key_width_/32*2,2);
++            }
+         } else {
+             add(plane.layer,kvmem::PayloadPlaneKind::Key,plane.keys,uint64_t(key_width_)*2,2);
+             add(plane.layer,kvmem::PayloadPlaneKind::Value,plane.values,uint64_t(key_width_)*2,2);
+@@ -164,13 +171,17 @@ void KvmemMemory::ensure_staging(uint64_t out_rows,uint64_t in_rows) {
+ void KvmemMemory::rebind(std::vector<KvmemPlane> planes) {
+     require(!transaction_ && planes.size()==planes_.size(),"cannot rebind incompatible or busy KVMem planes");
+     planes_=std::move(planes);payload_.clear();
+-    const bool q8=descriptor_.layout.format.find("q8_0")!=std::string::npos;
++    const bool q8=engine_.opt_.kv_format!=KvFmt::kFp16;
++    const bool mixed=engine_.opt_.kv_format==KvFmt::kInt8K;
+     for(const auto& p:planes_) {
+         if(q8) {
+             payload_.push_back(reinterpret_cast<uint8_t*>(p.key_codes));
+             payload_.push_back(reinterpret_cast<uint8_t*>(p.key_scales));
+-            payload_.push_back(reinterpret_cast<uint8_t*>(p.value_codes));
+-            payload_.push_back(reinterpret_cast<uint8_t*>(p.value_scales));
++            if (mixed) payload_.push_back(reinterpret_cast<uint8_t*>(p.values));
++            else {
++                payload_.push_back(reinterpret_cast<uint8_t*>(p.value_codes));
++                payload_.push_back(reinterpret_cast<uint8_t*>(p.value_scales));
++            }
+         } else {
+             payload_.push_back(reinterpret_cast<uint8_t*>(p.keys));
+             payload_.push_back(reinterpret_cast<uint8_t*>(p.values));
+@@ -245,6 +256,7 @@ std::vector<uint64_t> KvmemMemory::select(bool retrieval) const {
+         std::vector<uint32_t> rows(planes_.size(),uint32_t(query_tokens_));
+         for(size_t il=0;il<planes_.size();++il) if(planes_[il].layer>=uint32_t(engine_.n_layer_)) rows[il]=0;
+         kvmem::PageQueryView query{query_rows_.data(),rows.data(),uint32_t(planes_.size()),uint32_t(query_tokens_),heads_,kv_heads_,dim_};
++        query.attention_scale=attention_scale;
+         auto scores=options_.scorer==kvmem::QueryScorer::PageSoftmax
+             ? cuda_recall_->score(*statistics_,query,query_frame_,options_.aggregation)
+             : kvmem::mean_query_cosine_scores(*statistics_,query,count,options_.aggregation);
+@@ -282,12 +294,23 @@ void KvmemMemory::before(int n) {
+     }
+     require(visible_ + uint64_t(n) <= uint64_t(capacity()), "KVMem selected view leaves insufficient append space");
+ }
++uint64_t KvmemMemory::checkpoint_charge() const {
++    return descriptor_.identity.state_schema == "gemma4-swa-v1" ? engine_.state_bytes() : 0;
++}
++uint64_t KvmemMemory::request_payload(uint64_t tokens) const {
++    // A required Query rollback image must coexist with the entire admitted
++    // KV archive and its atomic tail replacement. Optional history marks may
++    // use only the remaining quota.
++    return (uint64_t(pages(tokens)) + 1) * descriptor_.layout.record_bytes + checkpoint_charge();
++}
+ void KvmemMemory::admit(uint64_t tokens) const {
+     require(tokens <= descriptor_.capabilities.max_position, "KVMem request exceeds its logical context");
+     // One extra tail record covers atomic replacement of a versioned Host copy.
+-    if ((uint64_t(pages(tokens)) + 1) * descriptor_.layout.record_bytes > payload_limit())
++    const auto state = checkpoint_charge();
++    const auto resident = disk_limit() ? (uint64_t(pages(capacity())) + 1) * descriptor_.layout.record_bytes : 0;
++    if (state > host_limit() || resident > host_limit() - state || request_payload(tokens) > payload_limit())
+         throw kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded,
+-                                 "KVMem request exceeds Host payload capacity including replacement margin");
++                                 "KVMem request exceeds Host payload capacity including state and replacement margin");
+ }
+ void KvmemMemory::commit(int n, const float* keys, size_t stride, const float* query, const float* query_rows, size_t query_stride) {
+     if (engine_.memory_window_) check_fault("accept");
+@@ -652,11 +675,18 @@ KvmemCheckpoint KvmemMemory::checkpoint() {
+     cp.identity = {descriptor_.identity, descriptor_.layout, stamp_};
+     if (options_.verify) std::fprintf(stderr, "KVMEM_POLY checkpoint frontier=%llu state_bytes=%llu\n",
+         (unsigned long long)stamp_.frontier, (unsigned long long)engine_.state_bytes());
++    if (descriptor_.identity.state_schema == "gemma4-swa-v1")
++        cp.state_reservation=std::make_shared<kvmem::HostKvReservation>(storage_->reserve(engine_.state_bytes()));
+     cp.state.resize(engine_.state_bytes());
+-    require(cp.state.size() == engine_.state_n_ * sizeof(float), "KVMem M1 checkpoint has unsupported extra state");
+-    ck(cudaMemcpyAsync(cp.state.data(), engine_.state_, cp.state.size(), cudaMemcpyDeviceToHost, cs(engine_.st_)),
+-       "KVMem recurrent checkpoint");
+-    ck(cudaStreamSynchronize(cs(engine_.st_)), "KVMem recurrent checkpoint");
++    if (cp.state.size() == engine_.state_n_ * sizeof(float)) {
++        ck(cudaMemcpyAsync(cp.state.data(), engine_.state_, cp.state.size(), cudaMemcpyDeviceToHost, cs(engine_.st_)),
++           "KVMem recurrent checkpoint");
++        ck(cudaStreamSynchronize(cs(engine_.st_)), "KVMem recurrent checkpoint");
++    } else {
++        // Window rings are native state too. save_state() fences the stream
++        // and serializes them in chronological order at the accepted frontier.
++        engine_.save_state(cp.state.data());
++    }
+     if (options_.verify) {
+         std::vector<uint8_t> reference(cp.state.size());
+         engine_.save_state(reference.data());
+diff --git a/src/poly/kvmem.hpp b/src/poly/kvmem.hpp
+index e1a4f12f1344c604af9237b60c8b01d3cb98f0be..9904aeb63d039d19d89afc3f32508c3d427e5caf 100644
+--- a/src/poly/kvmem.hpp
++++ b/src/poly/kvmem.hpp
+@@ -52,7 +52,15 @@ struct KvmemPlane {
+ };
+ 
+ struct KvmemCheckpoint {
++    KvmemCheckpoint() = default;
++    KvmemCheckpoint(const KvmemCheckpoint&) = delete;
++    KvmemCheckpoint& operator=(const KvmemCheckpoint&) = delete;
++    KvmemCheckpoint(KvmemCheckpoint&&) = default;
++    KvmemCheckpoint& operator=(KvmemCheckpoint&&) = default;
+     kvmem::CheckpointIdentity identity;
++    // Gemma's large window image uses the same hard RAM quota as native KV.
++    // A shared reservation charges its vector once without duplicating bytes.
++    std::shared_ptr<kvmem::HostKvReservation> state_reservation;
+     std::vector<uint8_t> state;
+     std::vector<float> mean_tail;
+     kvmem::LrfuState retrieval;
+@@ -85,7 +93,8 @@ class KvmemMemory final : public kvmem::MemoryBackend,
+                           public std::enable_shared_from_this<KvmemMemory> {
+ public:
+     const uint32_t block_tokens;
+-    KvmemMemory(Engine&, std::vector<KvmemPlane>, uint32_t heads, uint32_t kv_heads, uint32_t head_dim);
++    const float attention_scale;
++    KvmemMemory(Engine&, std::vector<KvmemPlane>, uint32_t heads, uint32_t kv_heads, uint32_t head_dim, float attention_scale = 0);
+     ~KvmemMemory() override;
+     void rebind(std::vector<KvmemPlane>);
+     kvmem::MemoryDescriptor descriptor() const override;
+@@ -97,6 +106,8 @@ public:
+     void reset();
+     void before(int n);
+     void admit(uint64_t tokens) const;
++    uint64_t checkpoint_charge() const;
++    uint64_t request_payload(uint64_t tokens) const;
+     void commit(int n, const float* keys, size_t key_layer_stride, const float* query, const float* query_rows = nullptr, size_t query_stride = 0);
+     int64_t compact_position(int64_t logical) const;
+     int64_t visible_tokens() const noexcept { return visible_; }
+diff --git a/src/poly/kvmem_capture.cu b/src/poly/kvmem_capture.cu
+index e91c2effefdfc7ae1b800d89def474b841099a0f..a041c67fff45006a4ded467e55ab9283aad2e947 100644
+--- a/src/poly/kvmem_capture.cu
++++ b/src/poly/kvmem_capture.cu
+@@ -28,7 +28,7 @@ __device__ float max_warp(float value) {
+ }
+ template<int BlockTokens>
+ __global__ void page_mass(const float* q,const uint16_t* keys,Kvq8 quant,int dim,int heads,int kv_heads,
+-    const int64_t* cfg,const int32_t* map,float* mass,int stride,int layers) {
++    const int64_t* cfg,const int32_t* map,float* mass,int stride,int layers,float scale) {
+     const int head=int(blockIdx.x),lane=int(threadIdx.x)&31,warp=int(threadIdx.x)>>5;
+     if(int64_t(blockIdx.y)>=cfg[6])return;
+     const int sample=int(cfg[5])+int(blockIdx.y);
+@@ -44,7 +44,6 @@ __global__ void page_mass(const float* q,const uint16_t* keys,Kvq8 quant,int dim
+     for(int d=int(threadIdx.x);d<dim;d+=256)query[d]=q[(size_t(row)*heads+head)*dim+d];
+     for(int p=int(threadIdx.x);p<pages;p+=256)page[p]=0;
+     __syncthreads();
+-    const float scale=rsqrtf(float(dim));
+     float biggest=-CUDART_INF_F;
+     for(int key=warp;key<end;key+=8) {
+         float dot=0;
+@@ -95,7 +94,7 @@ __global__ void page_mass(const float* q,const uint16_t* keys,Kvq8 quant,int dim
+ // second reduction normalizes over the complete causal window, not per page.
+ template<int BlockTokens,int Dim, bool Quantized, int Group=1>
+ __global__ void page_mass_parts(const float* q,const uint16_t* keys,Kvq8 quant,int heads,int kv_heads,
+-    const int64_t* cfg,const int32_t* map,float2* parts,int stride) {
++    const int64_t* cfg,const int32_t* map,float2* parts,int stride,float scale) {
+     const int t=int(threadIdx.x),lane=t&31,warp=t>>5,pages=int(cfg[4]);
+     __shared__ float logits[Group][BlockTokens],reduce[Group][4],maximum[Group];
+     // A bounded persistent grid also makes an unsampled CUDA-graph replay
+@@ -137,7 +136,7 @@ __global__ void page_mass_parts(const float* q,const uint16_t* keys,Kvq8 quant,i
+         }
+         #pragma unroll
+         for(int g=0;g<Group;++g) {
+-            const float score=sum_warp(dot[g])*rsqrtf(float(Dim));
++            const float score=sum_warp(dot[g])*scale;
+             if(lane==0)logits[g][i]=key<end?score:-CUDART_INF_F;
+         }
+     }
+@@ -172,7 +171,7 @@ __device__ float sum_lane0(float value) {
+ }
+ template<int BlockTokens,int Dim,bool Quantized,int Group>
+ __global__ void page_mass_warp_parts(const float* q,const uint16_t* keys,Kvq8 quant,int heads,int kv_heads,
+-    const int64_t* cfg,const int32_t* map,float2* parts,int stride) {
++    const int64_t* cfg,const int32_t* map,float2* parts,int stride,float scale) {
+     const int lane=int(threadIdx.x)&31,warp=int(threadIdx.x)>>5,pages=int(cfg[4]);
+     __shared__ float logits[4][Group][BlockTokens];
+     for(int part=int(blockIdx.x)*4+warp;part<int(cfg[6])*(heads/Group)*pages;part+=int(gridDim.x)*4) {
+@@ -210,7 +209,7 @@ __global__ void page_mass_warp_parts(const float* q,const uint16_t* keys,Kvq8 qu
+             }
+             #pragma unroll
+             for(int g=0;g<Group;++g) {
+-                const float score=sum_lane0(dot[g])*rsqrtf(float(Dim));
++                const float score=sum_lane0(dot[g])*scale;
+                 if(lane==0)logits[warp][g][i]=key<end?score:-CUDART_INF_F;
+             }
+         }
+@@ -272,37 +271,50 @@ void kvmem_pack_key_sums(const float* source,float* packed,int width,int groups,
+ template<int BlockTokens>
+ void dispatch_page_mass(const float* query,const uint16_t* keys,Kvq8 q8,int dim,int heads,int kv_heads,
+     int rows,const int64_t* cfg,const int32_t* map,float* mass,int stride,int layers,void* stream,
+-    float* scratch,size_t scratch_floats) {
++    float* scratch,size_t scratch_floats,float scale) {
+     // score_ is dead after attention. Reusing it avoids a persistent allocation
+     // that would displace experts. Keep the small-context / unsupported fallback.
+-    if(scratch && scratch_floats>=size_t(rows)*heads*stride*2 && (dim==256 || dim==32)) {
++    if(scratch && scratch_floats>=size_t(rows)*heads*stride*2 && (dim==512 || dim==256 || dim==32)) {
+         auto* parts=reinterpret_cast<float2*>(scratch);
+         const unsigned grid=unsigned(std::min(size_t(256),size_t(stride)*heads*rows));
+         const auto st=static_cast<cudaStream_t>(stream);
+-        if(dim==256 && (heads/kv_heads)%8==0) {
+-            if(q8.codes)page_mass_warp_parts<BlockTokens,256,true,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
+-            else page_mass_warp_parts<BlockTokens,256,false,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
++        if(dim==512 && (heads/kv_heads)%8==0) {
++            // Gemma global attention shares one K head across eight Q heads.
++            // Read each page once for that group rather than scanning all K
++            // twice per Q head. Normalize across pages in the existing merge.
++            if(q8.codes)page_mass_warp_parts<BlockTokens,512,true,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_warp_parts<BlockTokens,512,false,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++        } else if(dim==512 && (heads/kv_heads)%4==0) {
++            if(q8.codes)page_mass_parts<BlockTokens,512,true,4><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_parts<BlockTokens,512,false,4><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++        } else if(dim==512) {
++            if(q8.codes)page_mass_parts<BlockTokens,512,true><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_parts<BlockTokens,512,false><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++        } else if(dim==256 && (heads/kv_heads)%8==0) {
++            if(q8.codes)page_mass_warp_parts<BlockTokens,256,true,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_warp_parts<BlockTokens,256,false,8><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
+         } else if(dim==256 && (heads/kv_heads)%4==0) {
+-            if(q8.codes)page_mass_parts<BlockTokens,256,true,4><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
+-            else page_mass_parts<BlockTokens,256,false,4><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
++            if(q8.codes)page_mass_parts<BlockTokens,256,true,4><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_parts<BlockTokens,256,false,4><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
+         } else if(dim==256) {
+-            if(q8.codes)page_mass_parts<BlockTokens,256,true><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
+-            else page_mass_parts<BlockTokens,256,false><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
++            if(q8.codes)page_mass_parts<BlockTokens,256,true><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_parts<BlockTokens,256,false><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
+         } else {
+-            if(q8.codes)page_mass_parts<BlockTokens,32,true><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
+-            else page_mass_parts<BlockTokens,32,false><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride);
++            if(q8.codes)page_mass_parts<BlockTokens,32,true><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
++            else page_mass_parts<BlockTokens,32,false><<<grid,128,0,st>>>(query,keys,q8,heads,kv_heads,cfg,map,parts,stride,scale);
+         }
+         page_mass_merge<<<dim3(heads,rows),256,0,st>>>(parts,cfg,map,mass,stride,heads,layers);
+         return;
+     }
+     page_mass<BlockTokens><<<dim3(heads,rows),256,size_t(dim+stride)*sizeof(float),static_cast<cudaStream_t>(stream)>>>(
+-        query,keys,q8,dim,heads,kv_heads,cfg,map,mass,stride,layers);
++        query,keys,q8,dim,heads,kv_heads,cfg,map,mass,stride,layers,scale);
+ }
+ void kvmem_page_mass(const float* query,const uint16_t* keys,Kvq8 q8,int dim,int heads,int kv_heads,
+     int rows,const int64_t* cfg,const int32_t* map,float* mass,int stride,int layers,int block_tokens,void* stream,
+-    float* scratch,size_t scratch_floats) {
+-    if(block_tokens==32)dispatch_page_mass<32>(query,keys,q8,dim,heads,kv_heads,rows,cfg,map,mass,stride,layers,stream,scratch,scratch_floats);
+-    else if(block_tokens==64)dispatch_page_mass<64>(query,keys,q8,dim,heads,kv_heads,rows,cfg,map,mass,stride,layers,stream,scratch,scratch_floats);
++    float* scratch,size_t scratch_floats,float attention_scale) {
++    const float scale=attention_scale>0 ? attention_scale : 1.f/std::sqrt(float(dim));
++    if(block_tokens==32)dispatch_page_mass<32>(query,keys,q8,dim,heads,kv_heads,rows,cfg,map,mass,stride,layers,stream,scratch,scratch_floats,scale);
++    else if(block_tokens==64)dispatch_page_mass<64>(query,keys,q8,dim,heads,kv_heads,rows,cfg,map,mass,stride,layers,stream,scratch,scratch_floats,scale);
+     else throw std::invalid_argument("KVMem block tokens must be 32 or 64");
+ }
+ 
+diff --git a/src/poly/kvmem_capture.hpp b/src/poly/kvmem_capture.hpp
+index 2a9225e473f1f9453e81579832714f376361ae1a..fef74f744a1bdc4669ae076e6eb004d1113db86f 100644
+--- a/src/poly/kvmem_capture.hpp
++++ b/src/poly/kvmem_capture.hpp
+@@ -9,5 +9,5 @@ void kvmem_pack_key_sums(const float* source,float* packed,int width,int groups,
+ // first sample and sample count for this call. Indices are frame-relative rows.
+ void kvmem_page_mass(const float* query,const uint16_t* keys,Kvq8 q8,int dim,int heads,int kv_heads,
+     int rows,const int64_t* cfg,const int32_t* map,float* mass,int stride,int layers,int block_tokens,void* stream,
+-    float* scratch=nullptr,size_t scratch_floats=0);
++    float* scratch=nullptr,size_t scratch_floats=0,float attention_scale=0);
+ }
+diff --git a/src/poly/kvmem_history.hpp b/src/poly/kvmem_history.hpp
+index d804cff1754d46abc9a199701e4649ec97259a95..d14422b5d2327beb636fcd65b11e0208ae0f4da5 100644
+--- a/src/poly/kvmem_history.hpp
++++ b/src/poly/kvmem_history.hpp
+@@ -27,6 +27,34 @@ public:
+         std::shared_ptr<const KvmemCheckpoint> checkpoint;
+     };
+     void clear() { tokens_.clear(); marks_.clear(); session_ = {}; }
++    // Reclaim oldest unshared images only when that can satisfy the allocation.
++    // Removing a mark held by an in-flight Query would free no RAM and would
++    // unnecessarily discard the next request's prefix restore point.
++    bool reclaim_state(uint64_t bytes, kvmem::CheckpointPurpose purpose = kvmem::CheckpointPurpose::None) {
++        const auto eligible = [&](const Mark& mark) {
++            if (mark.data.use_count() != 1 || !mark.data->state_reservation) return false;
++            if (purpose == kvmem::CheckpointPurpose::None) return true;
++            // Use the shared retention policy: an optional Endpoint must not
++            // displace the more useful assistant/image reuse anchor.
++            const auto keep = kvmem::retain_checkpoints({mark.checkpoint_info(),
++                {uint64_t(tokens_.size()), purpose, this, 0}}, kvmem::CheckpointLimits{1});
++            return !keep.empty() && keep.front() == 1;
++        };
++        uint64_t available = 0;
++        for (const auto& mark : marks_)
++            if (eligible(mark))
++                available += mark.data->state.size();
++        if (available < bytes) return false;
++        kvmem::CheckpointCatalog<Mark> keep{kvmem::CheckpointLimits{3}};
++        for (auto& mark : marks_) {
++            if (bytes && eligible(mark)) {
++                bytes -= std::min<uint64_t>(bytes, mark.data->state.size());
++                mark.data.reset();
++            } else keep.remember(std::move(mark));
++        }
++        marks_.swap(keep);
++        return true;
++    }
+     void bind(const kvmem::MemoryStamp& stamp) { session_ = stamp.session; }
+     size_t size() const noexcept { return tokens_.size(); }
+     const std::vector<int32_t>& tokens() const noexcept { return tokens_; }
+diff --git a/src/poly/kvmem_sessions.cpp b/src/poly/kvmem_sessions.cpp
+index b3bd52c13bf48e84e55c1d13b5548bcac6871ae3..b8ac1002b542d051eea9d0fbfbdf28e61881f012 100644
+--- a/src/poly/kvmem_sessions.cpp
++++ b/src/poly/kvmem_sessions.cpp
+@@ -4,6 +4,44 @@
+ #include <cstdlib>
+ 
+ namespace strata::poly {
++bool KvmemSessions::make_state_room(const KvmemMemory& memory, KvmemHistory& history, uint64_t total_tokens,
++                                   kvmem::CheckpointPurpose purpose) {
++    if (!memory.checkpoint_charge()) return true;
++    memory.admit(total_tokens);
++    const auto required = memory.request_payload(total_tokens);
++    const auto own = memory.active_host_bytes();
++    const auto extra = required > own ? required - own : memory.checkpoint_charge();
++    const auto fits = [&] { return extra <= memory.payload_limit() &&
++        memory.payload_bytes() <= memory.payload_limit() - extra; };
++    while (!fits() && evict_one()) {}
++    if (!fits() && extra <= memory.payload_limit())
++        history.reclaim_state(memory.payload_bytes() - (memory.payload_limit() - extra), purpose);
++    return fits();
++}
++std::shared_ptr<KvmemCheckpoint> KvmemSessions::checkpoint(KvmemMemory& memory, KvmemHistory& history,
++                                                          uint64_t total_tokens, bool required, kvmem::CheckpointPurpose purpose) {
++    if (!memory.checkpoint_charge()) return std::make_shared<KvmemCheckpoint>(memory.checkpoint());
++    const auto exhausted = [] { return kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded,
++        "KVMem required checkpoint exceeds remaining Host state capacity"); };
++    if (required) purpose = kvmem::CheckpointPurpose::None;
++    if (make_state_room(memory, history, total_tokens, purpose)) {
++        // With SSD enabled, aggregate space alone does not guarantee RAM for
++        // the non-spillable state. Reclaim optional marks on reserve failure.
++        for (int attempt = 0; attempt != 2; ++attempt) {
++            try { return std::make_shared<KvmemCheckpoint>(memory.checkpoint()); }
++            catch (const kvmem::MemoryError& error) {
++                if (error.code() != kvmem::MemoryErrorCode::BudgetExceeded) throw;
++                if (attempt) break;
++                while (evict_one()) {}
++                const auto free = memory.host_limit() - memory.host_bytes();
++                if (free < memory.checkpoint_charge()) history.reclaim_state(memory.checkpoint_charge() - free, purpose);
++            }
++        }
++    }
++    if (required) throw exhausted();
++    std::fprintf(stderr, "KVMEM_CHECKPOINT optional capture skipped: Host state capacity\n");
++    return {};
++}
+ bool KvmemSessions::make_archive_room(const KvmemMemory& memory) {
+     const auto needed = memory.archive_pending_bytes();
+     if (needed > memory.host_limit()) return false;
+diff --git a/src/poly/kvmem_sessions.hpp b/src/poly/kvmem_sessions.hpp
+index 898128e3fd4aedea388f49aad7df0985a5cc82cc..09b0041733a98d2090023cff968c709e03809e3a 100644
+--- a/src/poly/kvmem_sessions.hpp
++++ b/src/poly/kvmem_sessions.hpp
+@@ -73,6 +73,10 @@ public:
+     int64_t resume(Engine&, KvmemHistory&, const std::vector<int32_t>&, int64_t query_begin, uint64_t total_tokens);
+     void metrics(const KvmemMemory&) const;
+     bool make_archive_room(const KvmemMemory&);
++    bool make_state_room(const KvmemMemory&, KvmemHistory&, uint64_t total_tokens,
++                         kvmem::CheckpointPurpose purpose = kvmem::CheckpointPurpose::None);
++    std::shared_ptr<KvmemCheckpoint> checkpoint(KvmemMemory&, KvmemHistory&, uint64_t total_tokens, bool required,
++                         kvmem::CheckpointPurpose purpose = kvmem::CheckpointPurpose::Endpoint);
+ private:
+     void admit_active(const KvmemMemory&, uint64_t total_tokens);
+     size_t slots_ = 0, evictions_ = 0, restores_ = 0, skipped_ = 0;
+diff --git a/src/poly/main.cpp b/src/poly/main.cpp
+index 1ed8dc1fc794459f8a5dfec57881957a61f063ea..13ae5d67a360f05c75ab617c701c01d8a547398b 100644
+--- a/src/poly/main.cpp
++++ b/src/poly/main.cpp
+@@ -402,6 +402,11 @@ struct Session {
+ #ifdef STRATA_KVMEM
+         const bool managed = engine.kvmem_enabled();
+         const bool history_reuse = managed && engine.memory_options().history_reuse;
++        const bool gemma_window = managed && engine.memory().descriptor().identity.state_schema == "gemma4-swa-v1";
++        const bool generation_anchor_valid = gemma_window && turn_at>0 && turn_at<n &&
++            std::none_of(pictures.at.begin(),pictures.at.end(),[turn_at](const auto& image){return turn_at>image.at && turn_at<image.at+image.n;});
++        int64_t media_checkpoint = -1;
++        bool generation_anchor_saved = false;
+         const bool memory_profile = managed && std::getenv("KVMEM_POLY_PROFILE");
+         std::shared_ptr<strata::poly::KvmemCheckpoint> query_checkpoint;
+         bool query_replayed = false;
+@@ -487,6 +492,9 @@ struct Session {
+             if (!has_query) std::fprintf(stderr,"KVMEM_QUERY source=tool_or_continuation recall=0\n");
+             else if (full_prefix) std::fprintf(stderr,"KVMEM_QUERY source=resident recall=0 query_begin=%lld query_end=%lld\n",
+                 (long long)query_begin,(long long)query_end);
++            if (gemma_window && !managed_sessions.make_state_room(engine.memory(), managed_history, uint64_t(n)+uint64_t(max_new)))
++                throw kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded,
++                    "KVMem request has no room for required state after reclaiming optional histories");
+         }
+ #endif
+         if (!managed) kept.turn_at(turn_at);
+@@ -519,9 +527,28 @@ struct Session {
+                 break;
+             }
+ #ifdef STRATA_KVMEM
++            if (history_reuse && generation_anchor_valid && !generation_anchor_saved && i==turn_at) {
++                if (auto cp = managed_sessions.checkpoint(engine.memory(), managed_history, uint64_t(n)+uint64_t(max_new), false, kvmem::CheckpointPurpose::ReuseAnchor)) {
++                    managed_history.remember(std::move(cp), kvmem::CheckpointPurpose::ReuseAnchor);
++                    std::fprintf(stderr,"KVMEM_GEMMA_ANCHOR frontier=%lld purpose=assistant_turn\n",(long long)i);
++                }
++                generation_anchor_saved=true;
++            }
++            if (history_reuse && gemma_window && i != media_checkpoint &&
++                std::any_of(pictures.at.begin(),pictures.at.end(),[i](const auto& image){return i==image.at+image.n;})) {
++                // Gemma's reconstructed assistant may differ from its generation
++                // opener. Keep a proved prefix after the indivisible image,
++                // before those template tokens, together with the local ring.
++                if (auto cp = managed_sessions.checkpoint(engine.memory(), managed_history, uint64_t(n)+uint64_t(max_new), false, kvmem::CheckpointPurpose::MediaBoundary))
++                    managed_history.remember(std::move(cp), kvmem::CheckpointPurpose::MediaBoundary);
++                media_checkpoint=i;
++            }
+             if (managed && !full_prefix && !query_replayed && i == query_end) {
+                 const auto memory_timing = Clock::now();
+                 const bool replay = engine.memory().freeze_and_rewind(*query_checkpoint,uint64_t(n));
++                // Rewind is complete; the optional history catalog can now
++                // replace this image with a later, more useful reuse anchor.
++                if (gemma_window) query_checkpoint.reset();
+                 if (memory_profile) std::fprintf(stderr, "KVMEM_PROFILE rewind_ms=%.3f\n", ms_since(memory_timing));
+                 query_replayed = true;
+                 if (replay) {
+@@ -533,22 +560,23 @@ struct Session {
+             if (managed && (!full_prefix || history_reuse) && !query_replayed && i == query_begin && !query_checkpoint) {
+                 if (!full_prefix) engine.memory().begin_query(query_begin, query_end);
+                 const auto memory_timing = Clock::now();
+-                query_checkpoint = std::make_shared<strata::poly::KvmemCheckpoint>(engine.memory().checkpoint());
++                query_checkpoint = managed_sessions.checkpoint(engine.memory(), managed_history, uint64_t(n)+uint64_t(max_new), true);
+                 if (history_reuse) managed_history.remember(query_checkpoint, kvmem::CheckpointPurpose::QueryReplay);
+                 if (memory_profile) std::fprintf(stderr, "KVMEM_PROFILE checkpoint_ms=%.3f\n", ms_since(memory_timing));
+             }
+             if (history_reuse && !query_replayed && reuse_anchor > 0 && i == reuse_anchor && !anchor_saved) {
+                 try {
+                     auto cp = i == query_begin && query_checkpoint ? query_checkpoint
+-                        : std::make_shared<strata::poly::KvmemCheckpoint>(engine.memory().checkpoint());
+-                    managed_history.remember(std::move(cp), kvmem::CheckpointPurpose::ReuseAnchor);
++                        : managed_sessions.checkpoint(engine.memory(), managed_history, uint64_t(n)+uint64_t(max_new), false, kvmem::CheckpointPurpose::ReuseAnchor);
++                    if (cp) managed_history.remember(std::move(cp), kvmem::CheckpointPurpose::ReuseAnchor);
+                 } catch (const std::exception& error) {
+                     std::fprintf(stderr, "KVMEM_REUSE_ANCHOR capture skipped: %s\n", error.what());
+                 }
+                 anchor_saved = true;
+             }
+             if (history_reuse && i == n - 1 && i != query_begin)
+-                managed_history.remember(std::make_shared<strata::poly::KvmemCheckpoint>(engine.memory().checkpoint()));
++                if (auto cp = managed_sessions.checkpoint(engine.memory(), managed_history, uint64_t(n)+uint64_t(max_new), false))
++                    managed_history.remember(std::move(cp));
+ #endif
+             const bool last = i == n - 1;
+             const int64_t most = between ? (int64_t) piece_calls * engine.max_rows() : INT64_MAX;
+@@ -558,6 +586,8 @@ struct Session {
+ #endif
+             int64_t m = last ? 1 : text ? room : engine.whole(i, kept.until_checkpoint(i, room));
+ #ifdef STRATA_KVMEM
++            if (history_reuse && generation_anchor_valid && turn_at>i)
++                m=std::min(m,turn_at-i);
+             if (managed && (!full_prefix || history_reuse) && !query_replayed) {
+                 if (history_reuse && i < reuse_anchor) m = std::min(m, reuse_anchor - i);
+                 if (i < query_begin) m = std::min(m, query_begin - i);
+@@ -824,7 +854,9 @@ int serve(Session& ss) {
+         std::fprintf(stderr,"KVMEM_BLOCKS block_tokens=%u\n",m.block_tokens);
+         std::printf("INFO backend=polystrata kvmem=1 kvmem_budget=%u kvmem_reserve=%u kvmem_host_mib=%llu "
+                     "kvmem_block_tokens=%u kv_type=%s history_reuse=%d history_scope=%s kvmem_sessions=%u mtp=%d mtp_drafts=%d vision=%d ssd=%d kvmem_disk_mib=%llu query_scorer=%s graph_alpha=%.6g query_max_tokens=%u query_replay_max_tokens=%u batch_mtp=0 slot_cache=1 storage_scope=process gpu_scope=single\n",
+-                    m.budget, m.reserve, (unsigned long long)m.host_mib,m.block_tokens, engine.memory().descriptor().layout.format.find("q8_0")!=std::string::npos?"q8_0":"f16", int(m.history_reuse),
++                    m.budget, m.reserve, (unsigned long long)m.host_mib,m.block_tokens,
++                    engine.int8k() ? "int8k" : engine.int8() ? "int8" :
++                    engine.memory().descriptor().layout.format.find("q8_0")!=std::string::npos ? "q8_0" : "f16", int(m.history_reuse),
+                     m.sessions > 1 ? "prefix_pool" : "current", m.sessions, int(m.mtp && engine.drafts()), m.mtp ? engine.max_window()-1 : 0,
+                     int(engine.sees()), int(m.disk_mib>0),(unsigned long long)m.disk_mib,
+                     kvmem::query_scorer_name(m.scorer),m.graph_alpha,m.query_max_tokens,m.replay_max_tokens);
+@@ -897,12 +929,14 @@ int serve(Session& ss) {
+                 if(engine.kvmem_enabled() && engine.memory_options().history_reuse) {
+                     engine.bind(int(which[i])+1);
+                     try {
+-                        auto checkpoint=std::make_shared<strata::poly::KvmemCheckpoint>(engine.memory().checkpoint());
+-                        sl.managed_history.remember(checkpoint);
+-                        auto entry=std::make_unique<strata::poly::KvmemSessions::Entry>();
+-                        entry->history=std::move(sl.managed_history);
+-                        entry->memory=engine.memory().park(*checkpoint);
+-                        ss.managed_sessions.save(std::move(entry));
++                        auto checkpoint=ss.managed_sessions.checkpoint(engine.memory(), sl.managed_history, sl.held.size(), false);
++                        if (checkpoint) {
++                            sl.managed_history.remember(checkpoint);
++                            auto entry=std::make_unique<strata::poly::KvmemSessions::Entry>();
++                            entry->history=std::move(sl.managed_history);
++                            entry->memory=engine.memory().park(*checkpoint);
++                            ss.managed_sessions.save(std::move(entry));
++                        } else sl.managed_history.clear();
+                     } catch(const std::exception& e) {
+                         engine.memory().invalidate();sl.managed_history.clear();
+                         std::fprintf(stderr,"KVMEM_BATCH retain failed slot=%zu: %s\n",which[i],e.what());
+@@ -1382,7 +1416,7 @@ void usage() {
+         "  --kvmem-lrfu-lambda X --kvmem-lrfu-top-frac X\n"
+         "  --kvmem-verify-transfers (native byte checks and diagnostics)\n"
+         "  --kvmem-history-reuse (opt-in current conversation prefix and state reuse)\n"
+-        "  --kvmem-mtp (opt-in embedded MTP; requires --window 2..4 for one to three drafts, no --no-draft)\n"
++        "  --kvmem-mtp (opt-in MTP; Gemma requires --draft-model; --window 2..4, no --no-draft)\n"
+         "  --batch N (single-GPU native slots; batch uses ordinary decode, solo execution can resume MTP)\n"
+         "  --kvmem-disk-path DIR --kvmem-disk-mib N (optional process-local SSD backing)\n"
+         "  --kvmem-sessions N (1..16 retained histories including the GPU owner; requires reuse for N>1)\n"
+diff --git a/tools/poly_gemma_kvmem_test.cpp b/tools/poly_gemma_kvmem_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..341c806ce2acd216d232e0931da4e2d136422a1f
+--- /dev/null
++++ b/tools/poly_gemma_kvmem_test.cpp
+@@ -0,0 +1,182 @@
++#include "../src/poly/engine.hpp"
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <stdexcept>
++#include <vector>
++
++using namespace strata::poly;
++namespace strata::poly {
++struct KvmemTestAccess {
++    static void cold(KvmemMemory& m) {m.storage_->trim(0);}
++    static std::vector<uint8_t> kv(KvmemMemory& m) {
++        std::vector<uint8_t> bytes(m.visible_*m.descriptor_.layout.record_bytes/m.block_tokens);
++        m.save_view(bytes.data()); return bytes;
++    }
++};
++}
++void check(bool ok,const char* message) { if(!ok)throw std::runtime_error(message); }
++void logits_close(const std::vector<float>& expected,const float* actual) {
++    float worst=0;
++    for(size_t i=0;i<expected.size();++i) {
++        const float error=std::abs(expected[i]-actual[i])/std::max({1.f,std::abs(expected[i]),std::abs(actual[i])});
++        if(!std::isfinite(error) || error>2e-5f)throw std::runtime_error("checkpoint continuation logits mismatch");
++        worst=std::max(worst,error);
++    }
++    std::cout<<"logits max_relative="<<worst<<'\n';
++}
++void scorer_reference() {
++    kvmem::RawKvStore keys({1,1024,0,32});
++    std::vector<float> sums(1024,0),query(8192,0);
++    sums[0]=32;sums[512]=32;
++    keys.write_layer_mean_sum(0,32,0,sums.data());
++    std::fill(sums.begin(),sums.end(),0);
++    keys.write_layer_mean_sum(32,32,0,sums.data());
++    for(int head=0;head<16;++head)query[size_t(head)*512]=2;
++    const uint32_t rows[]{1};
++    kvmem::PageQueryView view{query.data(),rows,1,1,16,2,512};
++    const auto frame=kvmem::query_score_frame(64,32,1,0,0,{});
++    kvmem::PageSoftmaxCuda gpu(0);
++    for(float scale:{0.f,1.f}) {
++        view.attention_scale=scale;
++        const double temperature=scale>0 ? 1. : 1/std::sqrt(512.);
++        const double expected=1/(1+std::exp(-2*temperature));
++        const auto cpu=kvmem::page_softmax_scores(keys,view,frame);
++        const auto actual=gpu.score(keys,view,frame);
++        check(std::abs(cpu[0]-expected)<1e-12,"CPU scorer has incorrect model scale");
++        check(std::abs(actual[0]-expected)<2e-6,"CUDA scorer has incorrect model scale");
++    }
++    std::cout<<"Gemma 512-dim scorer independent reference PASS\n";
++}
++int main(int argc,char** argv) {
++    try {
++        scorer_reference();
++        if(argc==2 && std::string(argv[1])=="--scorer-only")return 0;
++        check(argc>=2,"usage: poly_gemma_kvmem_test MODEL [--graphs] [--block64]");
++        Options opt;
++        opt.model=argv[1];opt.max_context=4096;opt.prompt_batch=64;opt.threads=8;
++        opt.stage_mib=256;opt.stage_ahead=0;opt.cpu_share=0;opt.expert_swaps=0;
++        opt.window=1;opt.draft=false;opt.graphs=false;opt.vram_reserve_mib=512;
++        opt.memory.budget=256;opt.memory.reserve=128;opt.memory.host_mib=2048;
++        opt.memory.sink=32;opt.memory.recent=64;opt.memory.verify=true;
++        for(int i=2;i<argc;++i) {
++            if(std::string(argv[i])=="--graphs")opt.graphs=true;
++            else if(std::string(argv[i])=="--wide")opt.memory.budget=512;
++            else if(std::string(argv[i])=="--block64") {opt.memory.block_tokens=64;opt.memory.sink=64;}
++            else if(std::string(argv[i])=="--int8")opt.kv_format=KvFmt::kInt8;
++            else if(std::string(argv[i])=="--int8k")opt.kv_format=KvFmt::kInt8K;
++            else if(std::string(argv[i])=="--batch")opt.batch=1;
++            else if(std::string(argv[i])=="--elastic")opt.elastic_experts=true;
++            else if(std::string(argv[i])=="--draft" && i+1<argc) {
++                opt.draft_model=argv[++i];opt.draft=true;opt.window=4;opt.memory.mtp=true;
++            }
++            else if(std::string(argv[i])=="--disk" && i+1<argc) {opt.memory.disk_path=argv[++i];opt.memory.disk_mib=256;}
++            else throw std::runtime_error("unknown test option");
++        }
++        auto engine=Engine::open(opt);
++        std::vector<int32_t> tokens(1280);
++        for(size_t i=0;i<tokens.size();++i)tokens[i]=100+int(i%37);
++        for(size_t i=0;i<1152;) {
++            const int n=std::min({engine->max_read(),int(opt.memory.reserve),int(1152-i)});
++            check(engine->read(tokens.data()+i,n),"layer-major Gemma prefill was cancelled");i+=n;
++        }
++        auto& memory=engine->memory();
++        check(memory.visible_tokens()<=int64_t(opt.memory.budget+opt.memory.reserve),"physical KV exceeds B+R");
++        check(!memory.complete_prefix(),"fixture never evicted a global page");
++        auto cp=memory.checkpoint();
++        const auto native=KvmemTestAccess::kv(memory);
++        const size_t window_state=opt.kv_format==KvFmt::kInt8 ? 111411200 : opt.kv_format==KvFmt::kInt8K ? 160563200 : 209715200;
++        check(cp.state.size()==window_state+(opt.draft?2816*4:0),"Gemma sliding-window state was not captured completely");
++        check(bool(cp.state_reservation),"Gemma window state was not charged to the shared RAM budget");
++        engine->eval(tokens.data()+1152,32,true);
++        const std::vector<float> expected(engine->logits(),engine->logits()+engine->n_vocab());
++        const auto accepted=memory.checkpoint();
++        if(opt.memory.disk_mib) {
++            KvmemTestAccess::cold(memory);
++            check(memory.disk_bytes()>0,"SSD fixture did not spill native records");
++        }
++        memory.restore_prefix(cp);
++        check(engine->pos()==1152,"restore lost logical position");
++        check(KvmemTestAccess::kv(memory)==native,"restore changed accepted native global KV bytes");
++        if(opt.memory.disk_mib)check(memory.io_stats().read_bytes>0,"SSD restore never read spilled native records");
++        check(memory.checkpoint().state==cp.state,"restore changed sliding-window bytes");
++        engine->eval(tokens.data()+1152,32,true);
++        logits_close(expected,engine->logits());
++        check(memory.checkpoint().state==accepted.state,"restored continuation left different sliding-window state");
++        cp=memory.checkpoint();
++        const auto begin=engine->pos();
++        memory.begin_query(begin,begin+16);
++        engine->eval(tokens.data()+1184,16,true);
++        check(memory.freeze_and_rewind(cp,begin+16),"bounded Query replay was not admitted");
++        check(engine->pos()==begin,"Query probe did not rewind logical position");
++        check(memory.checkpoint().state==cp.state,"Query rewind lost the exact sliding window");
++        engine->eval(tokens.data()+1184,16,true);
++        memory.finish_query();
++        check(engine->pos()==begin+16,"Query replay has wrong accepted frontier");
++        {
++            auto saved=memory.checkpoint();
++            auto parked=memory.park(saved);
++            engine->reset();
++            engine->eval(tokens.data()+7,64,false);
++            engine->reset();
++            memory.enter(std::move(parked),saved);
++            check(memory.checkpoint().state==saved.state,"park/enter lost sliding-window state");
++            check(engine->pos()==begin+16,"park/enter lost logical position");
++        }
++        if(opt.batch) {
++            const auto home=memory.checkpoint();
++            engine->bind(1);
++            for(int i=0;i<1088;i+=64)engine->eval(tokens.data()+i,64,false);
++            auto other=engine->memory().checkpoint();
++            engine->bind(0);
++            const int seqs[]{0,1};const int32_t next[]{137,151};
++            engine->step(seqs,next,2);
++            const std::vector<float> expected0(engine->logits_of(0),engine->logits_of(0)+engine->n_vocab());
++            const std::vector<float> expected1(engine->logits_of(1),engine->logits_of(1)+engine->n_vocab());
++            engine->memory().restore_prefix(home);
++            engine->eval(next,1,true);
++            logits_close(expected0,engine->logits());
++            engine->bind(1);
++            engine->memory().restore_prefix(other);
++            engine->eval(next+1,1,true);
++            logits_close(expected1,engine->logits());
++            engine->bind(0);
++        }
++        if(opt.memory.mtp) {
++            check(engine->drafts(),"external Gemma assistant was not enabled");
++            for(int accepted=1;accepted<=4;++accepted) {
++                auto before=engine->memory().checkpoint();
++                int32_t window[4]={131,139,149,157};
++                float probability=0;
++                const auto native_before=KvmemTestAccess::kv(engine->memory());
++                window[1]=engine->draft(window[0],0,&probability);
++                window[2]=engine->draft(window[1],1,&probability);
++                window[3]=engine->draft(window[2],2,&probability);
++                check(KvmemTestAccess::kv(engine->memory())==native_before,"assistant changed authoritative target KV");
++                engine->window(window,4);
++                engine->keep(accepted);
++                auto kept=engine->memory().checkpoint();
++                const auto kept_kv=KvmemTestAccess::kv(engine->memory());
++                engine->memory().restore_prefix(before);
++                engine->eval(window,accepted,true);
++                check(engine->memory().checkpoint().state==kept.state,"MTP accepted prefix left different target/sliding state");
++                check(KvmemTestAccess::kv(engine->memory())==kept_kv,"MTP rejected suffix contaminated target KV");
++            }
++        }
++        // A cancelled layer-major read must not leave any local-ring or draft
++        // bytes visible to the next conversation after reset.
++        engine->reset();engine->eval(tokens.data(),64,false);
++        const auto clean=engine->memory().checkpoint();
++        const auto clean_kv=KvmemTestAccess::kv(engine->memory());
++        engine->reset();
++        const std::function<bool(int,int)> cancel=[](int,int){return false;};
++        check(!engine->read(tokens.data(),128,nullptr,0,&cancel),"cancelled read was accepted");
++        engine->reset();engine->eval(tokens.data(),64,false);
++        check(engine->memory().checkpoint().state==clean.state,"cancel/reset retained local or assistant state");
++        check(KvmemTestAccess::kv(engine->memory())==clean_kv,"cancel/reset retained provisional global KV");
++        check(engine->memory().host_bytes()<=engine->memory().host_limit(),"native checkpoint RAM quota exceeded");
++        std::cout<<"Gemma pressure/checkpoint/Query replay PASS graphs="<<opt.graphs
++                 <<" block="<<opt.memory.block_tokens<<" kv="<<int(opt.kv_format)<<" mtp="<<opt.memory.mtp<<'\n';
++    } catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
++}
+diff --git a/tools/poly_kvmem_kernel_test.cpp b/tools/poly_kvmem_kernel_test.cpp
+index 40b0404a6d14427e484a678f033d5306738ef31a..3c0b50f7e9e50c3019d0d19e16a621fc8f398a4a 100644
+--- a/tools/poly_kvmem_kernel_test.cpp
++++ b/tools/poly_kvmem_kernel_test.cpp
+@@ -17,7 +17,7 @@ void close(float a, float b, float tolerance, const char* label) {
+         throw std::runtime_error(label);
+ }
+ }
+-void feedback_reference_test(int dim=32,int count=128,int heads=8,int block_tokens=64) {
++void feedback_reference_test(int dim=32,int count=128,int heads=8,int block_tokens=64,float scale=0) {
+     const int kvheads=2,rows=3,kw=dim*kvheads,qw=dim*heads,pages=(count+block_tokens-1)/block_tokens;
+     std::vector<float> queries(rows*qw),keys(count*kw);
+     for(size_t i=0;i<queries.size();++i)queries[i]=float(int(i%29)-14)/20;
+@@ -52,7 +52,7 @@ void feedback_reference_test(int dim=32,int count=128,int heads=8,int block_toke
+             check(cudaMemset(mass,0,2*pages*sizeof(float)));
+             strata::poly::kvmem_page_mass(dq,quantized?nullptr:hk,
+                 quantized?strata::poly::Kvq8{codes,scales}:strata::poly::Kvq8{},
+-                dim,heads,kvheads,2,config,samples,mass,pages,1,block_tokens,nullptr,fast?scratch:nullptr,scratch_count);
++                dim,heads,kvheads,2,config,samples,mass,pages,1,block_tokens,nullptr,fast?scratch:nullptr,scratch_count,scale);
+             std::vector<float> got(2*pages);check(cudaMemcpy(got.data(),mass,got.size()*4,cudaMemcpyDeviceToHost));
+             for(int sample=0;sample<2;++sample) {
+                 std::vector<double> expected(pages,0.);const int row=sample_rows[sample],end=compact+row+1;
+@@ -61,7 +61,7 @@ void feedback_reference_test(int dim=32,int count=128,int heads=8,int block_toke
+                     for(int key=0;key<end;++key) {
+                         double dot=0;for(int d=0;d<dim;++d)
+                             dot+=double(queries[(row*heads+head)*dim+d])*actual_keys[(key*kvheads+head/(heads/kvheads))*dim+d];
+-                        weights[key]=dot/std::sqrt(double(dim));top=std::max(top,weights[key]);
++                        weights[key]=dot*(scale>0 ? double(scale) : 1/std::sqrt(double(dim)));top=std::max(top,weights[key]);
+                     }
+                     for(auto& value:weights){value=std::exp(value-top);total+=value;}
+                     for(int key=0;key<end;++key)expected[key/block_tokens]+=weights[key]/total/heads;
+@@ -74,8 +74,8 @@ void feedback_reference_test(int dim=32,int count=128,int heads=8,int block_toke
+     cudaFree(dq);cudaFree(dk);cudaFree(hk);cudaFree(codes);cudaFree(scales);cudaFree(config);cudaFree(samples);cudaFree(mass);cudaFree(scratch);
+ }
+ 
+-void feedback_benchmark(int block_tokens) {
+-    const int dim=256,heads=16,kvheads=2,rows=16,count=34816,pages=count/block_tokens;
++void feedback_benchmark(int block_tokens,int dim=256) {
++    const int heads=16,kvheads=2,rows=16,count=34816,pages=count/block_tokens;
+     auto* q=allocate<float>(rows*heads*dim);auto* k=allocate<int8_t>(count*kvheads*dim);
+     auto* scales=allocate<uint16_t>(count*kvheads*dim/32);auto* cfg=allocate<int64_t>(7);
+     auto* map=allocate<int32_t>(rows);auto* mass=allocate<float>(rows*pages);
+@@ -93,14 +93,14 @@ void feedback_benchmark(int block_tokens) {
+         for(int i=0;i<3;++i)run();check(cudaEventRecord(start));
+         for(int i=0;i<20;++i)run();check(cudaEventRecord(stop));check(cudaEventSynchronize(stop));
+         float ms=0;check(cudaEventElapsedTime(&ms,start,stop));
+-        std::printf("feedback block_tokens=%d context=%d samples=%d fast=%d ms=%.5f\n",block_tokens,context,samples,int(fast),ms/20);
++        std::printf("feedback dim=%d block_tokens=%d context=%d samples=%d fast=%d ms=%.5f\n",dim,block_tokens,context,samples,int(fast),ms/20);
+     }
+     cudaEventDestroy(start);cudaEventDestroy(stop);cudaFree(q);cudaFree(k);cudaFree(scales);cudaFree(cfg);
+     cudaFree(map);cudaFree(mass);cudaFree(scratch);
+ }
+ 
+-void feedback_graph_test(int block_tokens) {
+-    constexpr int dim=256,heads=4,kvheads=2,pages=4,rows=3;
++void feedback_graph_test(int block_tokens,int dim=256,int heads=4) {
++    constexpr int kvheads=2,pages=4,rows=3;
+     auto* q=allocate<float>(rows*heads*dim);auto* k=allocate<uint16_t>(pages*block_tokens*kvheads*dim);
+     auto* config=allocate<int64_t>(7);auto* samples=allocate<int32_t>(4);
+     auto* mass=allocate<float>(4*pages);auto* scratch=allocate<float>(2*heads*pages*2);
+@@ -131,16 +131,25 @@ void feedback_graph_test(int block_tokens) {
+     cudaFree(q);cudaFree(k);cudaFree(config);cudaFree(samples);cudaFree(mass);cudaFree(scratch);
+ }
+ 
+-int main() {
++int main(int argc,char** argv) {
+     try {
++        const bool benchmark=argc==1;
++        if(argc>2 || (argc==2 && std::strcmp(argv[1],"--no-benchmark")!=0))
++            throw std::runtime_error("usage: poly_kvmem_kernel_test [--no-benchmark]");
++        feedback_reference_test(512,128,16,32,1.f);
++        feedback_reference_test(512,128,16,64,1.f);
+         for(int block_tokens:{32,64}) {
++            for(int heads:{4,8,16})feedback_reference_test(512,2*block_tokens+1,heads,block_tokens,1.f);
++            feedback_reference_test(512,8192,16,block_tokens,1.f);
++            feedback_graph_test(block_tokens,512,16);
++            if(benchmark)feedback_benchmark(block_tokens,512);
+             for(int count:{block_tokens-1,block_tokens,block_tokens+1,2*block_tokens-1,2*block_tokens,2*block_tokens+1}) {
+                 feedback_reference_test(32,count,8,block_tokens);
+                 for(int heads:{4,8,16}) feedback_reference_test(256,count,heads,block_tokens);
+             }
+             feedback_reference_test(256,32768,16,block_tokens);
+             feedback_graph_test(block_tokens);
+-            feedback_benchmark(block_tokens);
++            if(benchmark)feedback_benchmark(block_tokens);
+         }
+         constexpr int dim = 256, heads = 2, width = dim * heads, max_rows = 129, groups = 6;
+         std::vector<float> input(width * max_rows), weight(dim), native(input.size()), rotated(input.size()), raw(input.size());
+diff --git a/tools/poly_kvmem_mtp_test.cpp b/tools/poly_kvmem_mtp_test.cpp
+index 45437906da56ca8a40ede3173bff0d3e371fba63..567bcd8ab89b4fc6241c3a3deb9ae2741ec8e9f5 100644
+--- a/tools/poly_kvmem_mtp_test.cpp
++++ b/tools/poly_kvmem_mtp_test.cpp
+@@ -207,7 +207,9 @@ int main(int argc,char** argv) {
+             engine->memory().before(opt.window); // same view as MTP's maximum-window reservation
+             for (int i=0;i<accepted;++i) engine->eval(w+i,1,true);
+             const auto serial=engine->memory().checkpoint();
+-            auto wrong_layout=serial;
++            // Native state images have one quota owner; checkpoint handles
++            // are shared by const reference rather than copying their bytes.
++            auto wrong_layout=engine->memory().checkpoint();
+             wrong_layout.identity.layout.block_tokens=opt.memory.block_tokens==32?64:32;
+             bool wrong_layout_rejected=false;
+             try { engine->memory().restore_prefix(wrong_layout); }
