@@ -71,3 +71,9 @@ SSD 组使用 H=384 MiB / D=4096 MiB，通过几份短文档触发真实文件�
 最终版本通过 `spill_io_test`、`radiance_storage_recovery_test`、`checkpoint_image_test`、`tiered_kv_storage_test` 和 `radiance_tiered_archive_test`。受控 CPU 测试覆盖队列取消竞争、队列析构期间的取消、慢 I/O 后的槽位释放，以及已经开始的前缀读取收尾。
 
 RX 9060 XT 实模型短测分两个独立阶段：队列修复中间版本通过 14 个请求、85 项检查；加入前缀读取修复后的最终版本通过 3 个请求、18 项检查，跨会话和原会话回访均复用 1067 个 token。这不是性能对照。最终版本源码清单 SHA256 `c7ad49304f1cd4b6667cee27ce33de6a29b56f6b267f4748b950669dc1eeb70a`，服务 SHA256 `ee1ef31c3ff9359e7dd0690ef58d069580c472137262453f2f1c223423151021`。故障并发由 CPU 受控 I/O 验证，未进行双 GPU 测试。原始记录见本任务 `remote-ms10dk-20261102/queue-cancel-fix-report.txt` 及 `queue-fix-short-results.json`。
+
+## 提交前对齐 master
+
+后续对齐 master `a84443bc11406c60400031e987d6b75db4a8fae1`，保留其 NInfer 低精度 prefill、ngram 仲裁、DFlash2 conditioning 与 PolyStrata poly.7 升级。共享缓存补丁分别追加在这些最新补丁之后；NInfer 37 项、PolyStrata 17 项补丁从固定基础提交逐项重建，所有中间树及最终树哈希通过。
+
+三方合并的两处源码冲突均保留两边功能：NInfer 同时引入 DFlash conditioning 与 cache owner 头文件，PolyStrata 同时保留 poly.7 的 `disk_sessions` 属性与共享缓存的 `cache_reuse` 属性。此步骤未重新编译原生引擎；此前 RX 9060 XT 数据仍对应上文记录的 Radiance 二进制，不扩展为新 NInfer/PolyStrata 组合的实机验收。
