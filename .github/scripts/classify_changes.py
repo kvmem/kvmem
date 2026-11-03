@@ -92,6 +92,10 @@ def ninfer_only_backend_change(paths, before, after, cwd=None):
     for path in paths:
         if is_documentation(path) or path in NON_CUDA_PATHS or is_console_path(path):
             continue
+        # Published NInfer measurements accompany its patch manifest, but are
+        # not inputs to the llama.cpp/PolyStrata CUDA or HIP builds.
+        if re.fullmatch(r'docs/benchmarks/ninfer-[A-Za-z0-9_-]+\.json', path):
+            continue
         if path in {'backends/versions.json', 'backends/ninfer'}:
             continue
         if re.fullmatch(r'backends/patches/ninfer-[^/]+\.patch', path):

@@ -1,0 +1,519 @@
+diff --git a/src/models/qwen3_5/program/planning/attention_feedback_readback.h b/src/models/qwen3_5/program/planning/attention_feedback_readback.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd33536aca587ca5dde20cfa496385160a8bf338
+--- /dev/null
++++ b/src/models/qwen3_5/program/planning/attention_feedback_readback.h
+@@ -0,0 +1,69 @@
++#pragma once
++
++#include "models/qwen3_5/execution/memory_statistics.h"
++
++#include <array>
++#include <limits>
++
++namespace ninfer::models::qwen3_5::detail {
++
++struct AttentionFeedbackCopy {
++    std::size_t rank;
++    std::int32_t slot;
++    std::int32_t layer;
++    std::uint32_t local_heads;
++    std::size_t native_pages;
++    std::size_t elements;
++    std::size_t host_offset;
++};
++
++struct AttentionFeedbackReadback {
++    std::vector<AttentionFeedbackCopy> copies;
++    std::size_t bytes = 0;
++};
++
++// Preserve the existing layer-then-rank summation order. Separate pinned host
++// destinations let all three products reuse each rank's device scratch/output
++// in stream order, with one completion wait per participating rank.
++inline AttentionFeedbackReadback attention_feedback_readback(
++    const execution::MemoryStatistics& statistics, std::uint32_t head_dim,
++    std::uint32_t rows) {
++    if (!statistics.layers || !head_dim || !rows || rows > 64 ||
++        statistics.query_width % head_dim)
++        throw std::logic_error("KVMem attention readback has invalid geometry");
++    AttentionFeedbackReadback plan;
++    const std::array<std::int32_t, 3> layers{0,
++        static_cast<std::int32_t>(statistics.layers / 2),
++        static_cast<std::int32_t>(statistics.layers - 1)};
++    for (std::int32_t slot = 0; slot < 3; ++slot) {
++        if (slot && layers[slot] == layers[slot - 1]) continue;
++        std::uint64_t heads = 0;
++        for (std::size_t rank = 0; rank < statistics.ranks.size(); ++rank) {
++            const auto& shard = statistics.ranks[rank];
++            if (!shard.attention_queries.data || std::uint64_t(layers[slot]) < shard.first_layer ||
++                std::uint64_t(layers[slot]) >=
++                    std::uint64_t(shard.first_layer) + shard.key_sums.ne[2]) continue;
++            const auto& mass = shard.attention_output;
++            if (shard.attention_queries.ne[0] <= 0 ||
++                shard.attention_queries.ne[0] % head_dim ||
++                shard.attention_queries.ne[2] != 3 || !mass.data ||
++                mass.dtype != DType::FP32 || !mass.is_contiguous() ||
++                mass.ne[0] <= 0 || mass.ne[1] < rows || mass.ne[2] != 1 || mass.ne[3] != 1)
++                throw std::logic_error("KVMem attention readback shard is invalid");
++            const auto local_heads =
++                static_cast<std::uint32_t>(shard.attention_queries.ne[0] / head_dim);
++            const auto elements = std::size_t(mass.ne[0]) * rows;
++            if (elements > (std::numeric_limits<std::size_t>::max() - plan.bytes) / sizeof(float))
++                throw std::overflow_error("KVMem attention readback exceeds host size");
++            plan.copies.push_back({rank, slot, layers[slot], local_heads,
++                static_cast<std::size_t>(mass.ne[0]), elements, plan.bytes});
++            plan.bytes += elements * sizeof(float);
++            heads += local_heads;
++        }
++        if (heads != statistics.query_width / head_dim)
++            throw std::logic_error("KVMem attention feedback does not cover every query head");
++    }
++    return plan;
++}
++
++} // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/models/qwen3_5/program/planning/memory_statistics_copy_plan.h b/src/models/qwen3_5/program/planning/memory_statistics_copy_plan.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..77eaac5c1d1bfd11aa626da9a9fcef038867455a
+--- /dev/null
++++ b/src/models/qwen3_5/program/planning/memory_statistics_copy_plan.h
+@@ -0,0 +1,37 @@
++#pragma once
++#include "models/qwen3_5/execution/memory_statistics.h"
++#include <optional>
++
++namespace ninfer::models::qwen3_5::detail {
++// Adjacent layers of one rank have the same row pitches. Flatten them into one
++// 2D transfer, preserving each copied byte and every untouched Query tail/head.
++// Key and Query buffers are independent; collect their runs separately so that
++// an interleaved Query descriptor does not split a contiguous Key run.
++template<class Visit>
++void for_each_coalesced_statistics_copy(const execution::MemoryStatistics& statistics,
++                                        bool include_query, std::uint32_t query_count,
++                                        Visit&& visit) {
++    using Copy = execution::MemoryStatisticsCopy;
++    std::optional<Copy> key, query;
++    auto flush = [&](std::optional<Copy>& pending) {
++        if (pending) { visit(*pending); pending.reset(); }
++    };
++    statistics.for_each_host_copy(include_query, query_count, [&](const Copy& copy) {
++        auto& pending = copy.destination_offset < statistics.key_bytes() ? key : query;
++        if (pending && pending->rank == copy.rank &&
++            pending->width_bytes == copy.width_bytes &&
++            pending->destination_pitch == copy.destination_pitch &&
++            static_cast<const std::byte*>(pending->source) +
++                pending->width_bytes * pending->rows == copy.source &&
++            pending->destination_offset + pending->destination_pitch * pending->rows ==
++                copy.destination_offset) {
++            pending->rows += copy.rows;
++        } else {
++            flush(pending);
++            pending = copy;
++        }
++    });
++    flush(key);
++    flush(query);
++}
++} // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index f57e5ed2a4b4c1061637f5c9c3a46ea8435c6ffd..bd35a153a83586f6832447b6afbe5d0c434457c5 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -1,6 +1,7 @@
+ #include "kvmem/spill_io.hpp"
+ #include "models/qwen3_5/program/structured_round.h"
+ #include "models/qwen3_5/program/program_impl.h"
++#include "models/qwen3_5/program/planning/attention_feedback_readback.h"
+ #include "models/qwen3_5/load/vision_cpu_cache.h"
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/context.h"
+@@ -691,8 +692,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+         memory_statistics->ranks.resize(device.size());
+         memory_candidate_statistics = *memory_statistics;
+         memory_candidate_statistics->columns = (detail::widest_verify_window(plan) + 1U) * plan.max_concurrency;
+-        memory_statistics_host = std::make_unique<PinnedHostBuffer>(
+-            memory_statistics->key_bytes() + memory_statistics->query_bytes());
+         memory_candidate_host = std::make_unique<PinnedHostBuffer>(
+             memory_candidate_statistics->key_bytes());
+         memory_statistics_ranges = {0, static_cast<std::int32_t>(capacity), 0, 0};
+@@ -738,6 +737,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+             plan.persistent.memory_statistics.front().prefill_origin.bind(backing);
+         memory_statistics->validate_layout();
+         memory_candidate_statistics->validate_layout();
++        // Mean-K/Query consumers copy into owned sequence stores before feedback
++        // runs. Reuse that pinned readback space then; the candidate readback
++        // remains separate because another lane may still need its accepted rows.
++        memory_statistics_host = std::make_unique<PinnedHostBuffer>(std::max(
++            memory_statistics->key_bytes() + memory_statistics->query_bytes(),
++            detail::attention_feedback_readback(*memory_statistics,
++                config.attention->head_dim, 64).bytes));
+     }
+     if (plan.persistent.score_hidden) {
+         score_hidden = plan.persistent.score_hidden->bind(backing);
+diff --git a/src/models/qwen3_5/program/storage/memory_statistics.cpp b/src/models/qwen3_5/program/storage/memory_statistics.cpp
+index 8a4a1299fb399b87cf8aee7b8a384babe5648095..00adddff52cb12f49be737f00693120672738bc3 100644
+--- a/src/models/qwen3_5/program/storage/memory_statistics.cpp
++++ b/src/models/qwen3_5/program/storage/memory_statistics.cpp
+@@ -1,4 +1,6 @@
+ #include "models/qwen3_5/program/program_impl.h"
++#include "models/qwen3_5/program/planning/memory_statistics_copy_plan.h"
++#include "models/qwen3_5/program/planning/attention_feedback_readback.h"
+ #include "models/qwen3_5/program/storage/attention_feedback_mass.h"
+ #ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+ #include "models/qwen3_5/program/query_test_support.h"
+@@ -6,10 +8,20 @@
+ #include <bit>
+ #include <cmath>
+ #include <cstdio>
++#include <cstring>
+ #include "ninfer/ops/attention_page_mass.h"
++#include "core/nvtx.h"
+ 
+ namespace ninfer::models::qwen3_5::detail {
+ namespace {
++// Keep post-processing phases visible without changing shared CUDA headers.
++class StatisticsRange {
++public:
++    explicit StatisticsRange(const char* name) noexcept { nvtxRangePushA(name); }
++    ~StatisticsRange() noexcept { nvtxRangePop(); }
++    StatisticsRange(const StatisticsRange&)=delete;
++    StatisticsRange& operator=(const StatisticsRange&)=delete;
++};
+ #ifdef NINFER_KVMEM_QUERY_TEST_HOOKS
+ std::uint64_t query_test_fingerprint(const KvmemWindowState& state, bool mean) {
+     std::uint64_t hash=14695981039346656037ULL;
+@@ -24,8 +36,9 @@ std::uint64_t query_test_fingerprint(const KvmemWindowState& state, bool mean) {
+ #endif
+ void read_statistics(DeviceContext& device, const execution::MemoryStatistics& statistics,
+                      void* destination, bool include_query, std::uint32_t query_count=0) {
++    const StatisticsRange range("kvmem.statistics.readback");
+     auto* host = static_cast<std::byte*>(destination);
+-    statistics.for_each_host_copy(include_query, query_count,
++    for_each_coalesced_statistics_copy(statistics, include_query, query_count,
+         [&](const execution::MemoryStatisticsCopy& copy) {
+             DeviceBinding binding(device.rank(copy.rank).device);
+             CUDA_CHECK(cudaMemcpy2DAsync(host + copy.destination_offset, copy.destination_pitch,
+@@ -102,6 +115,7 @@ void ProgramImpl::prepare_memory_statistics(SequenceState& sequence, std::uint32
+ void ProgramImpl::commit_memory_statistics(SequenceState& sequence, std::uint32_t begin,
+                                            std::uint32_t end) {
+     if (!memory_statistics) { return; }
++    const StatisticsRange range("kvmem.statistics.commit");
+     auto& state = sequence.window;
+     if (!state.statistics || begin != state.statistics_frontier || end <= begin ||
+         end - begin > prefill_chunk) {
+@@ -283,6 +297,7 @@ void ProgramImpl::commit_memory_candidates(SequenceState& sequence, std::uint32_
+ 
+ void ProgramImpl::observe_memory_attention(SequenceState& sequence,std::uint32_t begin,std::uint32_t end,
+     std::uint32_t first_column,std::uint32_t row_width,bool prefill) {
++    const StatisticsRange range("kvmem.attention.feedback");
+     auto& state=sequence.window;
+     if(!memory_statistics || end<=begin || end<=state.graph.accepted_through) return;
+     const auto& config=parameters.model.config().text;
+@@ -316,11 +331,10 @@ void ProgramImpl::observe_memory_attention(SequenceState& sequence,std::uint32_t
+     auto logical_pages=state.pages;
+     for(auto id=begin/64;id<(end+63)/64;++id)
+         if(std::find(logical_pages.begin(),logical_pages.end(),id)==logical_pages.end()) logical_pages.push_back(id);
+-    const std::int32_t selected[]{0,static_cast<std::int32_t>(config.full_attention_layers/2),
+-        static_cast<std::int32_t>(config.full_attention_layers-1)};
+     const auto selected_count=std::min<std::uint32_t>(3,config.full_attention_layers);
+     for(std::size_t i=0;i<rows.size();++i) observations[i].source_position=begin+rows[i];
+     for(std::size_t first=0;first<rows.size();first+=64) {
++        const StatisticsRange mass_range("kvmem.attention.mass-and-readback");
+         const auto count=std::min<std::size_t>(64,rows.size()-first);
+         AttentionPageMassAccumulator page_mass(
+             std::span(observations).subspan(first,count),logical_pages,
+@@ -330,42 +344,90 @@ void ProgramImpl::observe_memory_attention(SequenceState& sequence,std::uint32_t
+             columns[i]=static_cast<std::int32_t>(first_column+rows[first+i]);
+             positions[i]=static_cast<std::int32_t>(compact_position(sequence,begin+rows[first+i]));
+         }
+-        for(std::int32_t slot=0;slot<3;++slot) {
+-            if(slot && selected[slot]==selected[slot-1]) continue;
+-            const auto layer=selected[slot];
+-            std::uint32_t covered_heads=0;
+-            for(std::size_t rank=0;rank<memory_statistics->ranks.size();++rank) {
+-            auto& shard=memory_statistics->ranks[rank];
+-            if(!shard.attention_queries.data || layer<static_cast<std::int32_t>(shard.first_layer) ||
+-                layer>=static_cast<std::int32_t>(shard.first_layer+shard.key_sums.ne[2])) continue;
+-            const auto local_heads=shard.attention_queries.ne[0]/config.attention->head_dim;
+-            covered_heads+=local_heads;
+-            DeviceBinding binding(device.rank(rank).device);
+-            const auto stream=device.stream_for_rank(rank);
++        const auto readback=attention_feedback_readback(*memory_statistics,
++            config.attention->head_dim,static_cast<std::uint32_t>(count));
++        if(!memory_statistics_host || readback.bytes>memory_statistics_host->size())
++            throw std::logic_error("KVMem attention readback exceeds its planned host storage");
++        // Main Mean-K/Query data has already been consumed into owned sequence
++        // stores. Candidate data uses a different buffer, which other lanes can
++        // still need. No pending transfer may outlive the reused pinned storage.
++        auto* host=static_cast<std::byte*>(memory_statistics_host->data());
++        std::vector<bool> submitted(memory_statistics->ranks.size(),false);
++        const auto product=[&](const AttentionFeedbackCopy& copy) {
++            auto& shard=memory_statistics->ranks[copy.rank];
++            const auto stream=device.stream_for_rank(copy.rank);
+             auto row_tensor=shard.attention_rows.slice(0,0,static_cast<std::int32_t>(count));
+             auto position_tensor=shard.attention_positions.slice(0,0,static_cast<std::int32_t>(count));
+-            CUDA_CHECK(cudaMemcpyAsync(row_tensor.data,columns.data(),count*sizeof(columns[0]),cudaMemcpyHostToDevice,stream));
+-            CUDA_CHECK(cudaMemcpyAsync(position_tensor.data,positions.data(),count*sizeof(positions[0]),cudaMemcpyHostToDevice,stream));
+             const auto capacity=shard.attention_queries.ne[1];
+-            auto query=shard.attention_queries.slice(2,slot,1).view({static_cast<std::int32_t>(config.attention->head_dim),
+-                static_cast<std::int32_t>(local_heads),capacity});
++            auto query=shard.attention_queries.slice(2,copy.slot,1).view({
++                static_cast<std::int32_t>(config.attention->head_dim),
++                static_cast<std::int32_t>(copy.local_heads),capacity});
+             auto scratch=shard.attention_scratch.slice(2,0,static_cast<std::int32_t>(count));
+             auto norms=shard.attention_norms.slice(2,0,static_cast<std::int32_t>(count));
+             auto mass=shard.attention_output.slice(1,0,static_cast<std::int32_t>(count));
+-            auto cache=decoder->text_kv.batch_layer_view(static_cast<std::size_t>(layer),
+-                parameters.text.tensor_parallel() ? rank : 0);
++            auto cache=decoder->text_kv.batch_layer_view(static_cast<std::size_t>(copy.layer),
++                parameters.text.tensor_parallel() ? copy.rank : 0);
+             const auto table_row=text_kv_addresses->bound_row(sequence.kv->text);
+             ops::attention_page_mass(query,row_tensor,position_tensor,table_row,cache,scratch,norms,mass,stream);
+-            std::vector<float> host(std::size_t(mass.ne[0])*count);
+-            CUDA_CHECK(cudaMemcpyAsync(host.data(),mass.data,host.size()*sizeof(float),cudaMemcpyDeviceToHost,stream));
+-            CUDA_CHECK(cudaStreamSynchronize(stream));
+-            page_mass.add(host,static_cast<std::size_t>(mass.ne[0]),local_heads);
++            return mass;
++        };
++        try {
++            for(const auto& copy:readback.copies) {
++                auto& shard=memory_statistics->ranks[copy.rank];
++                DeviceBinding binding(device.rank(copy.rank).device);
++                const auto stream=device.stream_for_rank(copy.rank);
++                if(!submitted[copy.rank]) {
++                    submitted[copy.rank]=true;
++                    // These indices are read-only inputs shared by sampled layers.
++                    auto row_tensor=shard.attention_rows.slice(0,0,static_cast<std::int32_t>(count));
++                    auto position_tensor=shard.attention_positions.slice(0,0,static_cast<std::int32_t>(count));
++                    CUDA_CHECK(cudaMemcpyAsync(row_tensor.data,columns.data(),count*sizeof(columns[0]),cudaMemcpyHostToDevice,stream));
++                    CUDA_CHECK(cudaMemcpyAsync(position_tensor.data,positions.data(),count*sizeof(positions[0]),cudaMemcpyHostToDevice,stream));
++                }
++                const auto mass=product(copy);
++                CUDA_CHECK(cudaMemcpyAsync(host+copy.host_offset,mass.data,
++                    copy.elements*sizeof(float),cudaMemcpyDeviceToHost,stream));
++            }
++            for(std::size_t rank=0;rank<submitted.size();++rank) if(submitted[rank]) {
++                DeviceBinding binding(device.rank(rank).device);
++                CUDA_CHECK(cudaStreamSynchronize(device.stream_for_rank(rank)));
++            }
++        } catch (...) {
++            // Drain every submitted rank before index vectors can be released or
++            // the Program can reuse the host buffer after a failed operation.
++            for(std::size_t rank=0;rank<submitted.size();++rank) if(submitted[rank]) {
++                try {
++                    DeviceBinding binding(device.rank(rank).device);
++                    (void)cudaStreamSynchronize(device.stream_for_rank(rank));
++                } catch (...) {}
++            }
++            throw;
++        }
++        if(kvmem_options.verify_transfers) {
++            // Independent transfer schedule: the previous pageable, per-layer
++            // path reruns each identical Op and waits before inspecting it.
++            for(const auto& copy:readback.copies) {
++                DeviceBinding binding(device.rank(copy.rank).device);
++                const auto stream=device.stream_for_rank(copy.rank);
++                const auto mass=product(copy);
++                std::vector<float> reference(copy.elements);
++                CUDA_CHECK(cudaMemcpyAsync(reference.data(),mass.data,
++                    reference.size()*sizeof(float),cudaMemcpyDeviceToHost,stream));
++                CUDA_CHECK(cudaStreamSynchronize(stream));
++                if(std::memcmp(reference.data(),host+copy.host_offset,reference.size()*sizeof(float)))
++                    throw std::logic_error("KVMem batched attention readback changed native bytes");
+             }
+-            if(covered_heads!=config.attention->num_attention_heads)
+-                throw std::logic_error("KVMem attention feedback does not cover every query head");
++            std::fprintf(stderr,"KVMEM_ATTENTION_READBACK copies=%zu bytes=%zu ranks=%zu bytes_exact=1\n",
++                readback.copies.size(),readback.bytes,
++                static_cast<std::size_t>(std::count(submitted.begin(),submitted.end(),true)));
+         }
++        // Keep the original layer-then-rank floating-point addition order.
++        for(const auto& copy:readback.copies)
++            page_mass.add({reinterpret_cast<const float*>(host+copy.host_offset),copy.elements},
++                copy.native_pages,copy.local_heads);
+         page_mass.finish();
+     }
++    const StatisticsRange graph_range("kvmem.attention.graph-publication");
+     if(observations.empty()) {
+         state.graph=kvmem::prepare_graph_accept(state.graph,state.graph.accepted_through,end,{},32u<<20);
+         state.attention_scope=next_scope;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 3cb1d6dc55fed9e4ffd8bf06a2aed112e9cd561a..81c734f25c42fe6406d4f1c2111e8686ff6a4a3a 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -111,7 +111,7 @@ set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_heads_tests_PROGRAMS
+ ninfer_finalize_bundle(ninfer_heads_tests)
+ ninfer_stage_runtime_dlls(ninfer_heads_tests)
+ ninfer_add_test(ninfer_memory_statistics_layout STANDALONE
+-  SOURCES models/qwen3_5/test_memory_statistics_layout.cpp LIBRARIES ninfer_core)
++  SOURCES models/qwen3_5/test_memory_statistics_layout.cpp LIBRARIES ninfer_core kvmem)
+ ninfer_stage_runtime_dlls(ninfer_memory_statistics_layout)
+ ninfer_add_test(ninfer_memory_statistics_budget_test STANDALONE
+   SOURCES models/qwen3_5/test_memory_statistics_budget.cpp LIBRARIES ninfer_core kvmem)
+diff --git a/tests/models/qwen3_5/test_memory_statistics_layout.cpp b/tests/models/qwen3_5/test_memory_statistics_layout.cpp
+index 166e991545b0fa5ecb4e311f05425d68445c8cca..ec83667d86ec4635e01980d82a20d8424982aabb 100644
+--- a/tests/models/qwen3_5/test_memory_statistics_layout.cpp
++++ b/tests/models/qwen3_5/test_memory_statistics_layout.cpp
+@@ -1,4 +1,7 @@
+ #include "models/qwen3_5/execution/memory_statistics.h"
++#include "models/qwen3_5/program/planning/memory_statistics_copy_plan.h"
++#include "models/qwen3_5/program/planning/attention_feedback_readback.h"
++#include "models/qwen3_5/program/storage/attention_feedback_mass.h"
+ #include <array>
+ #include <cstring>
+ #include <iostream>
+@@ -9,7 +12,7 @@ using namespace ninfer;
+ using namespace ninfer::models::qwen3_5::execution;
+ 
+ template<class Query>
+-void check_values(bool pipeline, bool include_query, std::uint32_t accepted) {
++void check_values(bool pipeline, bool include_query, std::uint32_t accepted, bool coalesced) {
+     MemoryStatistics stats;
+     stats.layers=2; stats.key_width=8; stats.query_width=16;
+     stats.columns=3; stats.mean_query=std::is_same_v<Query,float>;
+@@ -59,7 +62,9 @@ void check_values(bool pipeline, bool include_query, std::uint32_t accepted) {
+                 std::memcpy(expected.data()+at,&value,sizeof(value));
+             }
+     }
+-    stats.for_each_host_copy(include_query,accepted,[&](const MemoryStatisticsCopy& copy) {
++    std::size_t copies=0;
++    auto visit=[&](const MemoryStatisticsCopy& copy) {
++        ++copies;
+         if(copy.rank>=2) throw std::runtime_error("empty rank scheduled a copy");
+         if(copy.destination_offset+(copy.rows-1)*copy.destination_pitch+copy.width_bytes>
+            stats.key_bytes()+stats.query_bytes())
+@@ -68,17 +73,109 @@ void check_values(bool pipeline, bool include_query, std::uint32_t accepted) {
+         for(size_t row=0;row<copy.rows;++row)
+             std::memcpy(actual.data()+guard+copy.destination_offset+row*copy.destination_pitch,
+                         source+row*copy.width_bytes,copy.width_bytes);
+-    });
++    };
++    if(coalesced) ninfer::models::qwen3_5::detail::for_each_coalesced_statistics_copy(
++        stats,include_query,accepted,visit);
++    else stats.for_each_host_copy(include_query,accepted,visit);
+     if(actual!=expected)
+         throw std::runtime_error("global layer/head order or accepted Query prefix differs from oracle");
++    const auto layers=pipeline ? 1U : 2U;
++    const auto key_copies=coalesced ? 2U : 2U*layers;
++    const auto query_copies=!include_query ? 0U : coalesced &&
++        (stats.mean_query || accepted==stats.query_columns) ? 2U : 2U*layers;
++    if(copies!=key_copies+query_copies)
++        throw std::runtime_error("contiguous layers were not coalesced, or a Query tail was copied");
+     if(!stats.mean_query) for(const auto invalid:{0U,stats.query_columns+1}) {
+         bool rejected=false, copied=false;
+-        try { stats.for_each_host_copy(true,invalid,[&](const auto&) {copied=true;}); }
++        try {
++            if(coalesced) ninfer::models::qwen3_5::detail::for_each_coalesced_statistics_copy(
++                stats,true,invalid,[&](const auto&) {copied=true;});
++            else stats.for_each_host_copy(true,invalid,[&](const auto&) {copied=true;});
++        }
+         catch(const std::logic_error&) {rejected=true;}
+         if(!rejected || copied) throw std::runtime_error("invalid Query prefix started a copy");
+     }
+ }
+ 
++void check_feedback_readback(std::uint32_t layers, bool pipeline, std::uint32_t count) {
++    using namespace ninfer::models::qwen3_5::detail;
++    MemoryStatistics stats;
++    stats.layers=layers; stats.query_width=8; stats.ranks.resize(3);
++    float sentinel=0;
++    const auto split=(layers+1)/2;
++    std::array<std::array<std::vector<float>,3>,2> source;
++    const std::array<std::uint32_t,3> sampled{0,layers/2,layers-1};
++    for(std::uint32_t rank=0;rank<2;++rank) {
++        auto& shard=stats.ranks[rank];
++        const auto local_layers=pipeline ? (rank ? layers-split : split) : layers;
++        if(!local_layers) continue;
++        shard.first_layer=pipeline && rank ? split : 0;
++        shard.key_sums=Tensor(&sentinel,DType::FP32,{1,1,static_cast<int>(local_layers)});
++        const int heads=pipeline ? 4 : rank ? 1 : 3;
++        shard.attention_queries=Tensor(&sentinel,DType::BF16,{heads*2,64,3});
++        shard.attention_output=Tensor(&sentinel,DType::FP32,{static_cast<int>(5+rank),64});
++        for(std::uint32_t slot=0;slot<3;++slot) {
++            source[rank][slot].resize((5+rank)*count);
++            for(std::uint32_t row=0;row<count;++row) for(std::uint32_t p=0;p<5+rank;++p)
++                source[rank][slot][row*(5+rank)+p]=p<3 ?
++                    float((sampled[slot]+1)*1000+rank*100+row*3+p+1)/16384.0F : 0.0F;
++        }
++    }
++    const auto plan=attention_feedback_readback(stats,2,count);
++    const auto capacity=attention_feedback_readback(stats,2,64).bytes;
++    if(plan.bytes>capacity) throw std::runtime_error("attention readback exceeds startup capacity");
++    constexpr std::size_t guard=32;
++    std::vector<std::byte> staging(guard+plan.bytes+guard,std::byte{0xcd});
++    for(const auto& copy:plan.copies) {
++        const auto& input=source[copy.rank][copy.slot];
++        if(input.size()!=copy.elements || copy.host_offset+input.size()*sizeof(float)>plan.bytes)
++            throw std::runtime_error("attention readback has wrong source shape or host bounds");
++        std::memcpy(staging.data()+guard+copy.host_offset,input.data(),input.size()*sizeof(float));
++    }
++    const std::array<std::uint32_t,3> pages{2,7,19};
++    std::vector<kvmem::AcceptedAttentionRow> actual(count);
++    AttentionPageMassAccumulator accumulator(actual,pages,std::min(3U,layers),4);
++    for(const auto& copy:plan.copies)
++        accumulator.add({reinterpret_cast<const float*>(staging.data()+guard+copy.host_offset),copy.elements},
++            copy.native_pages,copy.local_heads);
++    accumulator.finish();
++    std::vector<std::array<double,3>> expected(count);
++    std::size_t cursor=0,descriptors=0;
++    for(std::uint32_t slot=0;slot<3;++slot) {
++        if(slot && sampled[slot]==sampled[slot-1]) continue;
++        for(std::uint32_t rank=0;rank<2;++rank) {
++            const bool included=!pipeline || (rank==0 ? sampled[slot]<split : sampled[slot]>=split);
++            if(!included) continue;
++            const auto heads=pipeline ? 4U : rank ? 1U : 3U;
++            const auto& copy=plan.copies.at(descriptors++);
++            if(copy.slot!=slot || copy.rank!=rank || copy.layer!=sampled[slot] || copy.host_offset!=cursor)
++                throw std::runtime_error("attention readback changed represented layer/rank order");
++            cursor+=source[rank][slot].size()*sizeof(float);
++            for(std::uint32_t row=0;row<count;++row) for(std::uint32_t p=0;p<3;++p)
++                expected[row][p]+=double(source[rank][slot][row*(5+rank)+p])*heads/(std::min(3U,layers)*4);
++        }
++    }
++    if(descriptors!=plan.copies.size() || cursor!=plan.bytes)
++        throw std::runtime_error("attention readback omitted or duplicated a sampled operand");
++    for(std::uint32_t row=0;row<count;++row) for(std::uint32_t p=0;p<3;++p)
++        if(actual[row].mass[p].target!=std::uint64_t(pages[p])*64 || actual[row].mass[p].mass!=expected[row][p])
++            throw std::runtime_error("attention readback differs from independently represented mass");
++    for(std::size_t i=0;i<guard;++i)
++        if(staging[i]!=std::byte{0xcd} || staging[guard+plan.bytes+i]!=std::byte{0xcd})
++            throw std::runtime_error("attention readback changed a host canary");
++    for(const auto invalid:{0U,65U}) {
++        bool rejected=false;
++        try { (void)attention_feedback_readback(stats,2,invalid); }
++        catch(const std::logic_error&) {rejected=true;}
++        if(!rejected) throw std::runtime_error("attention readback accepted an invalid row count");
++    }
++    auto missing=stats; missing.query_width+=2;
++    bool rejected=false;
++    try { (void)attention_feedback_readback(missing,2,count); }
++    catch(const std::logic_error&) {rejected=true;}
++    if(!rejected) throw std::runtime_error("attention readback accepted incomplete head coverage");
++}
++
+ int main() {
+     // Shapes stand for 4 KV heads / 16 Query heads at head dimension 256.
+     // The two ranks hold 3:1 heads; rank 2 deliberately has no attention.
+@@ -118,13 +215,15 @@ int main() {
+         shard.query_values = Tensor(&sentinel, DType::BF16, {4096, 7, 1});
+     }
+     stats.validate_layout();
+-    for(const bool pipeline:{false,true}) {
+-        check_values<std::uint16_t>(pipeline,true,3); // One unaccepted tail column stays untouched.
+-        check_values<std::uint16_t>(pipeline,true,4);
+-        check_values<std::uint16_t>(pipeline,false,0); // Mean-K capture without Query consumers.
+-        check_values<float>(pipeline,true,0);
+-        check_values<float>(pipeline,false,0);
++    for(const bool pipeline:{false,true}) for(const bool coalesced:{false,true}) {
++        check_values<std::uint16_t>(pipeline,true,3,coalesced); // Unaccepted tail untouched.
++        check_values<std::uint16_t>(pipeline,true,4,coalesced);
++        check_values<std::uint16_t>(pipeline,false,0,coalesced); // Mean-K without Query consumers.
++        check_values<float>(pipeline,true,0,coalesced);
++        check_values<float>(pipeline,false,0,coalesced);
+     }
++    for(const auto layers:{1U,2U,5U}) for(const bool pipeline:{false,true})
++        for(const auto rows:{1U,3U,64U}) check_feedback_readback(layers,pipeline,rows);
+     std::cout << "OK: unequal heads, empty attention rank, layer pipeline, Query/MeanQ values, "
+                  "accepted prefixes and invalid coverage\n";
+ }

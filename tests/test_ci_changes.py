@@ -39,6 +39,9 @@ class DocumentationChangesTest(unittest.TestCase):
             patch = root / 'backends/patches/ninfer-feature.patch'
             patch.parent.mkdir()
             patch.write_text('native patch\n', encoding='utf-8')
+            evidence = root / 'docs/benchmarks/ninfer-fp8-image-stores-20261103.json'
+            evidence.parent.mkdir(parents=True)
+            evidence.write_text('{"measurement": 1}\n', encoding='utf-8')
             after = commit(new_data)
             event = {'pull_request': {'base': {'sha': before}, 'head': {'sha': after}}}
             full, cuda, _, paths = changes.classify('pull_request', event, root)
@@ -50,6 +53,8 @@ class DocumentationChangesTest(unittest.TestCase):
                                                   before, after, root))
             for extra in ('kvmem/src/host/memory_contract.cpp', 'CMakeLists.txt',
                           'backends/patches/llamacpp-kvmem.patch', 'backends/polystrata',
+                          'docs/config.json', 'docs/benchmarks/polystrata-speed.json',
+                          'docs/benchmarks/../ninfer-feature.json',
                           'backends/patches/../ninfer-feature.patch'):
                 self.assertTrue(changes.requires_cuda(paths + [extra], before, after, root))
             self.assertTrue(changes.requires_cuda(paths, 'f' * 40, after, root))
