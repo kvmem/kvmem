@@ -28,6 +28,8 @@ module.exports=async({browser,base,info})=>{
  assert.equal(await page.locator('[data-param=Vision]').isDisabled(),false);
  await page.getByRole('tab',{name:'Templates & vision',exact:true}).click();
  await page.locator('[data-param=Vision]').check();
+ assert.equal(await page.locator('[data-param=CpuThreads]').inputValue(),'2');
+ assert.equal(await page.locator('[data-param=VisionCacheMiB]').inputValue(),'256');
  assert.equal(await page.locator('[data-param=VisionTokens]').isDisabled(),false);
  assert.equal(await page.locator('[data-param=VisionResidency]').inputValue(),'resident');
  assert.equal(await page.locator('[data-param=VisionResidency]').isDisabled(),false);

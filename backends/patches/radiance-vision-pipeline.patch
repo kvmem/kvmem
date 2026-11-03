@@ -1,0 +1,508 @@
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -57,6 +57,7 @@
+ }
+ 
+ Engine::~Engine() {
++    stop_vision(); // worker uses mapped weights and kernel plugins: join before unloading either
+     /* WHERE --profile-ops LEAVES ITS FINAL TABLE. Here, because this is the last moment the
+      * program still holds the op table the rows name -- and it has to be printed somewhere: a
+      * flag that pays for the synchronisations, warns that the run is not comparable, and then
+@@ -458,7 +459,7 @@
+         /* MEDIA A WAITING REQUEST NEEDS, encoded while nothing is in flight: the last step has been
+          * collected and none was issued ahead of it -- the scheduler issues none while a request
+          * is waiting, and one whose media is not encoded waits. */
+-        if (!ahead && sched_.encodes_pending()) {
++        if (!ahead && (cfg_.vision_cpu || sched_.encodes_pending())) {
+             if (const int es = run_encodes(); es < 0) return fail_loop(es);
+         }
+         const bool issued = ahead != nullptr;
+--- a/core/engine.h
++++ b/core/engine.h
+@@ -44,6 +44,7 @@
+ class SSDTier;
+ class Kld;
+ struct TierPump;
++struct VisionPipeline;
+ struct TierJob;
+ struct StepSlot;
+ 
+@@ -325,6 +326,9 @@
+     /* THE ENCODER DRIVER (spec §11): every media item the scheduler is waiting on, encoded in
+      * passes of whole segments and read back into the item, between steps and never inside one.
+      * core/engine_mm.cpp. */
++    std::shared_ptr<VisionPipeline> vision_;
++    int run_cpu_encodes(std::vector<std::shared_ptr<mm::Item>> items);
++    void stop_vision();
+     int  run_encodes();
+     int32_t enc_step_ = 0;
+     void drain_completed();
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -8,6 +8,7 @@
+  * path and shares nothing with this but the Engine's fields. See engine_priv.h.
+  */
+ #include "engine_priv.h"
++#include "mm/vision_cache.h"
+ 
+ #include "build/startup.h"
+ #include "build/rad_build.h"
+@@ -3416,6 +3417,7 @@
+ 
+ /* ================================================================== start */
+ int Engine::start() {
++    try { (void)mm::vision_cache_bytes(); } catch(const std::exception& e) { RAD_ERR("%s",e.what());return RAD_E_INVAL; }
+     std::vector<int> devs;
+     std::string inventory;
+     std::string devnote;
+--- a/core/engine_mm.cpp
++++ b/core/engine_mm.cpp
+@@ -21,16 +21,138 @@
+ #include "engine_priv.h"
+ 
+ #include "mm/processor.h"
++#include "mm/vision_cache.h"
++#include "mm/cpu_cancel.h"
++#include <future>
++#include <deque>
++#include <stdexcept>
+ 
+ #include <cstdio>
+ #include <cstdlib>
+ 
+ namespace rad {
++
++
++struct VisionPipeline {
++    mm::VisionCache cache;
++    Program program;
++    Ctx ctx;
++    bool ready=false;
++    std::deque<std::shared_ptr<mm::Item>> waiting;
++    std::shared_ptr<mm::Item> source, result;
++    std::future<int> work;
++    std::atomic<bool> cancel{false};
++    int device=0;
++    ArchStepFn step=nullptr;
++    explicit VisionPipeline(size_t bytes):cache(bytes) {}
++    ~VisionPipeline(){cancel=true;if(work.valid())work.wait();ctx.shutdown();}
++};
++
++// Retain handle numbering for the architecture's immutable vision declaration, but remove all
++// language-model ops/buffer allocations. Weight pointers refer to the engine-owned mapped file.
++static Program cpu_vision_program(const Program& source) {
++    Program p=source;
++    p.kv_groups.clear();p.meta.n_expert=0;
++    p.arena_bytes=0;p.arena_fixed_bytes=0;p.arena_stage_off=-1;p.arena_stage_bytes=0;
++    p.scratch_bytes=0;p.scratch_regions=1;
++    for(size_t i=1;i<p.buffers.size();++i) {
++        auto& b=p.buffers[i];
++        if(b.name.rfind("v.",0)!=0) {
++            b.decl={};b.decl.dtype=RAD_F32;b.decl.rank=1;b.decl.shape[0]=1;
++            b.arena_offset=0;b.bytes=sizeof(float);
++        }
++        b.decl.domain=RAD_DOMAIN_HOST;
++    }
++    for(size_t i=1;i<p.ops.size();++i) {
++        auto& o=p.ops[i];
++        if(!o.host_forced){o=OpInfo{};o.host_forced=true;continue;}
++        for(auto& b:o.bands) {
++            b.dom[RAD_DOMAIN_DEVICE]={};
++            const auto& host=b.dom[RAD_DOMAIN_HOST];
++            if(!host.row || host.scratch_bytes)throw std::runtime_error("CPU encoder needs a scratch-free host kernel");
++        }
++    }
++    return p;
++}
++
++static int encode_cpu_item(VisionPipeline& v) {
++    try {
++        RAD_TRY(rad_dev_set(v.device));
++        if(!v.ready) {
++            CtxDesc d{};d.program=&v.program;d.device=v.device;d.arch_step=v.step;d.record_passes=false;
++            RAD_TRY(v.ctx.init(d));v.ready=true;
++        }
++        if(v.cancel)return RAD_OK;
++        auto& item=*v.result;
++        if(item.kind!=mm::Kind::Image || item.n_seg!=1)return RAD_E_UNSUPPORTED;
++        const auto start=mm::vision_now_ns();
++        item.stats->encode_start_ns=start;item.stats->phase=2;
++        item.stats->queued_ns=start-item.queued_at_ns;
++        std::vector<int32_t> coords(4*item.n_patch);item.coords(0,item.n_patch,coords.data());
++        int32_t cu[2]={0,int32_t(item.n_patch)};
++        RadBatch b{};b.enc=RAD_MM_IMAGE;b.phase=RAD_PHASE_PREFILL;
++        b.enc_n_patch=item.n_patch;b.enc_pixels=item.pixels.data();b.enc_coord=coords.data();
++        b.enc_n_seg=1;b.enc_cu=cu;b.enc_max_seg=int32_t(item.n_patch);
++        cpu_encoder_cancel_token(&v.cancel);
++        const int rc=v.ctx.run_step(&b);
++        cpu_encoder_cancel_token(nullptr);
++        item.stats->encode_ns=mm::vision_now_ns()-start;
++        if(rc<0 || v.cancel)return rc;
++        auto* data=static_cast<const uint16_t*>(v.ctx.buf_ptr(v.program.encoder.out));
++        if(!data)return RAD_E_STATE;
++        item.embd.assign(data,data+item.n_rows()*v.program.encoder.n_embd);item.encoded=true;
++        if(const char* dir=std::getenv("RADIANCE_DEBUG_MM_DUMP");dir && *dir) {
++            const auto dump=[&](const char* ext,const std::vector<uint16_t>& values) {
++                char path[512];std::snprintf(path,sizeof path,"%s/mm_%016llx%016llx_%dx%dx%d%s",dir,
++                    (unsigned long long)item.key_hi,(unsigned long long)item.key_lo,item.grid_t,item.grid_h,item.grid_w,ext);
++                if(FILE* file=std::fopen(path,"wb")){std::fwrite(values.data(),sizeof(uint16_t),values.size(),file);std::fclose(file);}
++            };
++            dump(".pix.bf16",item.pixels);dump(".bf16",item.embd);
++        }
++        return RAD_OK;
++    } catch(const std::exception& e){cpu_encoder_cancel_token(nullptr);RAD_ERR("CPU encoder: %s",e.what());return RAD_E_STATE;}
++}
++
++void Engine::stop_vision(){if(vision_)rad_dev_set(vision_->device);vision_.reset();}
++int Engine::run_cpu_encodes(std::vector<std::shared_ptr<mm::Item>> items) {
++    if(!vision_) {
++        vision_=std::make_shared<VisionPipeline>(mm::vision_cache_bytes());
++        vision_->program=cpu_vision_program(ranks_[0]->program);
++        vision_->device=ranks_[0]->device;vision_->step=arch_step_;
++    }
++    auto& v=*vision_;
++    for(auto& item:items)if(!item->encoded)v.waiting.push_back(std::move(item));
++    if(v.work.valid()) {
++        if(!sched_.media_needed(v.source.get()))v.cancel=true;
++        if(v.work.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return RAD_OK;
++        const int rc=v.work.get();
++        if(!v.cancel && sched_.media_needed(v.source.get())) {
++            if(rc<0)v.source->stats->status=rc;
++            else {v.source->stats->phase=3;v.cache.put(*v.result);v.source->embd=std::move(v.result->embd);v.source->encoded=true;std::vector<uint16_t>().swap(v.source->pixels);}
++        }
++        v.source.reset();v.result.reset();
++    }
++    while(!v.waiting.empty()) {
++        auto item=std::move(v.waiting.front());v.waiting.pop_front();
++        if(item->encoded || !sched_.media_needed(item.get()))continue;
++        if(v.cache.get(*item)) {item->stats->queued_ns=mm::vision_now_ns()-item->queued_at_ns;std::vector<uint16_t>().swap(item->pixels);continue;}
++        item->stats->cache_misses=1;
++        v.source=item;v.result=std::make_shared<mm::Item>(*item);v.cancel=false;
++        v.work=std::async(std::launch::async,[&v]{return encode_cpu_item(v);});break;
++    }
++    return RAD_OK;
++}
+ 
+ int Engine::run_encodes() {
+     std::vector<std::shared_ptr<mm::Item>> items;
+     sched_.take_encodes(&items);
++    if(cfg_.vision_cpu)return run_cpu_encodes(std::move(items));
+     if (items.empty()) return RAD_OK;
++    if(!vision_)vision_=std::make_shared<VisionPipeline>(mm::vision_cache_bytes());
++    for(auto& item:items) if(!item->encoded) {
++        if(vision_->cache.get(*item))std::vector<uint16_t>().swap(item->pixels);
++        else item->stats->cache_misses=1;
++    }
+ 
+     /* A DIAGNOSTIC: RADIANCE_DEBUG_MM_DUMP=<dir> writes each item's patches (`.pix.bf16`, the
+      * processor's output in merge-block order) and its rows (`.bf16`) there as raw bf16, named by
+@@ -99,6 +221,7 @@
+             }
+             if (parts.empty()) break;
+ 
++            const auto pass_start=mm::vision_now_ns();
+             const RadBatch* b = sched_.build_encoder(parts, enc_step_++, enc);
+             if (!b) return RAD_E_STATE;
+             RAD_TRY(prepare_release(b));
+@@ -138,6 +261,13 @@
+             /* Every rank's stream, not only rank 0's: the next pass rewrites the staging every
+              * rank's copy reads, and the arena every rank's tower wrote. */
+             for (auto& rk : ranks_) RAD_TRY(rad_stream_sync(rk->ctx.stream()));
++            const auto pass_ns=mm::vision_now_ns()-pass_start;
++            for(const auto& part:parts) {
++                auto& item=*const_cast<mm::Item*>(part.item);
++                if(!item.stats->queued_ns.load())item.stats->queued_ns=pass_start-item.queued_at_ns;
++                const auto patches=int64_t(part.n_seg)*item.grid_h*item.grid_w;
++                item.stats->encode_ns.fetch_add(int64_t(double(pass_ns)*patches/np));
++            }
+         }
+     }
+ 
+@@ -145,6 +275,7 @@
+         mm::Item& it = *ip;
+         if (it.encoded) continue;
+         it.encoded = true;
++        vision_->cache.put(it);
+         it.pixels.clear();
+         it.pixels.shrink_to_fit();
+         if (dump_dir && *dump_dir) dump(it, ".bf16", it.embd.data(), it.embd.size());
+--- a/core/mm/processor.cpp
++++ b/core/mm/processor.cpp
+@@ -761,10 +761,17 @@
+         }
+     }
+     Frame f;
++    const auto start = vision_now_ns();
+     RAD_TRY(decode_image(bytes, n, cfg_.max_source_pixels, &f, why));
+-    if (cfg_.family == Family::Gemma4)
+-        return image_gemma4(f, image_tokens ? image_tokens : cfg_.image_soft_tokens, out, why);
+-    return image_from(f, out, why);
++    const auto decoded = vision_now_ns();
++    const int rc = cfg_.family == Family::Gemma4
++        ? image_gemma4(f, image_tokens ? image_tokens : cfg_.image_soft_tokens, out, why)
++        : image_from(f, out, why);
++    if (rc >= 0) {
++        (*out)->stats->decode_ns = decoded-start;
++        (*out)->stats->preprocess_ns = vision_now_ns()-decoded;
++    }
++    return rc;
+ }
+ 
+ namespace {
+--- a/core/mm/processor.h
++++ b/core/mm/processor.h
+@@ -25,6 +25,7 @@
+  */
+ #pragma once
+ #include "mm/media.h"
++#include "mm/vision_stats.h"
+ 
+ #include <cstdint>
+ #include <functional>
+@@ -127,6 +128,8 @@
+  * once the encoder has run -- its rows. Shared between the request that owns it and the engine
+  * thread that encodes it; the engine writes `embd` once and nothing reads it before then. */
+ struct Item {
++    std::shared_ptr<VisionStats> stats = std::make_shared<VisionStats>();
++    int64_t queued_at_ns = 0;
+     Kind    kind = Kind::Image;
+     int32_t grid_t = 0, grid_h = 0, grid_w = 0;   /* in patches; grid_t temporal groups */
+     int64_t n_patch = 0;
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -23,6 +23,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include "ctx.h"
++#include "mm/cpu_cancel.h"
+ #include "device/device.h"
+ #include "wtab.h"
+ 
+@@ -34,6 +35,8 @@
+ #endif
+ 
+ namespace rad {
++static thread_local const std::atomic<bool>* cpu_cancel_token=nullptr;
++void cpu_encoder_cancel_token(const std::atomic<bool>* token) { cpu_cancel_token=token; }
+ #if defined(RAD_USE_HIP_RUNTIME)
+ int hip_op_clock_issue(bool,unsigned,const char*,const char*,const RadArgs*,RadStream);
+ #endif
+@@ -526,6 +529,8 @@
+  * pass otherwise does once, at its start. After the op, on the stream the op went to, because that
+  * is where "every reader of this weight is behind us" can be recorded. */
+ int Ctx::issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
++    if(cpu_cancel_token && cpu_cancel_token->load(std::memory_order_relaxed))
++        return abort_step_msg(h,RAD_E_STATE,"CPU image encoding cancelled");
+     if (!staging_) return issue_body(h, opd, n_opd, n);
+     if (step_status_ < 0) return step_status_;
+     bool resync = false;
+--- a/core/sched/scheduler.cpp
++++ b/core/sched/scheduler.cpp
+@@ -1407,6 +1407,11 @@
+             /* ITS MEDIA FIRST. A request whose items are not encoded keeps its place and the one
+              * behind it is asked, exactly as for a context still being read off disk; the engine
+              * runs the encoder before the next step (encodes_pending). */
++            if(s.req->media) {
++                int error=0;
++                for(const auto& p:s.req->media->items)if(p.item->stats->status.load()<0)error=p.item->stats->status.load();
++                if(error<0){close_request(s,ReqState::Failed,"image_encode",false,true,error,"image encoder failed");continue;}
++            }
+             if (s.req->media && !media_ready(s)) { ++at; continue; }
+             /* One share left for the next request in the queue, when there is one and a slot
+              * for it (busy_cap). The embed path takes a whole input or nothing, so it is not
+@@ -1649,12 +1654,19 @@
+         ready = false;
+         if (!it.queued) {
+             it.queued = true;
++            it.queued_at_ns = mm::vision_now_ns();it.stats->phase=1;
+             enc_want_.push_back(p.item);
+         }
+     }
+     return ready;
+ }
+ 
++bool Scheduler::media_needed(const mm::Item* item) const {
++    std::lock_guard<std::mutex> lk(mu_);
++    for(const auto& s:reqs_) if(s && s->req && (s->req->state==ReqState::Waiting || s->req->state==ReqState::Running || s->req->state==ReqState::Preempted) && s->req->media)
++        for(const auto& p:s->req->media->items) if(p.item.get()==item)return true;
++    return false;
++}
+ bool Scheduler::encodes_pending() const {
+     std::lock_guard<std::mutex> lk(mu_);
+     return !enc_want_.empty();
+@@ -2723,6 +2735,8 @@
+     if (idle && now - pub_at_us_ < 20000) return;
+     {
+         std::lock_guard<std::mutex> lk(mu_);
++        for(const auto& request:reqs_)if(request && request->req &&
++            (request->req->state==ReqState::Waiting || request->req->state==ReqState::Running || request->req->state==ReqState::Preempted))observe_request(*request);
+         scratch_m_ = metrics_locked();
+         scratch_reqs_.resize(reqs_.size());
+         scratch_reqs_.resize((size_t)requests_locked(scratch_reqs_.data(), (int)scratch_reqs_.size()));
+--- a/core/sched/scheduler.h
++++ b/core/sched/scheduler.h
+@@ -320,6 +320,7 @@
+      * here for the engine, which runs the encoder between steps and marks them done (take_encodes).
+      * Encoding before admission rather than chunk by chunk keeps the encoder off the step path:
+      * a step never waits for a tower, and the batch builder only ever copies rows that exist. */
++    bool media_needed(const mm::Item* item) const;
+     bool     encodes_pending() const;
+     void     take_encodes(std::vector<std::shared_ptr<mm::Item>>* out);
+     /* An encoder pass over whole segments; see BatchBuilder::build_encoder. */
+--- a/core/server/oai.cpp
++++ b/core/server/oai.cpp
+@@ -2650,6 +2650,10 @@
+     };
+     const json pms = t.prompt_ms >= 0.0 ? json(t.prompt_ms) : json(nullptr);
+     json o;
++    if(t.image_tokens) o["image"] = {{"decode_ms",t.image_decode_ns/1e6},
++        {"preprocess_ms",t.image_preprocess_ns/1e6},{"queue_ms",t.image_queue_ns/1e6},
++        {"encode_ms",t.image_encode_ns/1e6},{"cache_hits",t.image_cache_hits},
++        {"cache_misses",t.image_cache_misses},{"tokens",t.image_tokens}};
+     o["cache_n"]                = t.cache_n;
+     o["prompt_n"]               = t.prompt_n;
+     o["prompt_ms"]              = pms;
+--- a/core/server/oai.h
++++ b/core/server/oai.h
+@@ -370,6 +370,8 @@
+  * earliest choice's start to the latest choice's end. */
+ struct TimingsOut {
+     bool    valid = false;       /* some choice produced a token; nothing is reported otherwise */
++    int64_t image_decode_ns=0,image_preprocess_ns=0,image_queue_ns=0,image_encode_ns=0;
++    int64_t image_cache_hits=0,image_cache_misses=0,image_tokens=0;
+     int64_t prompt_n = 0, cache_n = 0;
+     double  prompt_ms = -1.0;    /* < 0: the engine did not report the admission */
+     int64_t predicted_n = 0;
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -1,4 +1,5 @@
+ #include "server.h"
++#include "mm/processor.h"
+ 
+ #include <cstdio>
+ #include "json_partial.h"
+@@ -8,6 +9,7 @@
+ #include <nlohmann/json.hpp>
+ 
+ #include <algorithm>
++#include <unordered_set>
+ #include <cmath>
+ #include <chrono>
+ #include <thread>
+@@ -449,6 +451,7 @@
+             rq.priority = r.priority;
+             rq.stream = r.stream;
+             rq.media = r.prompts[p].media;
++            g.sink->media = rq.media;
+             rq.session_label = r.session_label;
+             rq.cache_owner = r.cache_owner;
+             rq.sink = g.sink.get();
+@@ -660,8 +663,17 @@
+     TimingsOut t;
+     int64_t admit = INT64_MAX, first_lo = INT64_MAX, first_hi = INT64_MIN, last = INT64_MIN;
+     bool admitted = true;
++    std::unordered_set<const mm::Item*> measured_media;
+     for (size_t i = 0; i < n; ++i) {
+         const Sink& s = *sinks[i];
++        if(s.media) for(const auto& placed:s.media->items) {
++            if(!measured_media.insert(placed.item.get()).second)continue;
++            const auto& item=*placed.item;const auto& v=*item.stats;
++            t.image_decode_ns+=v.decode_ns.load();t.image_preprocess_ns+=v.preprocess_ns.load();
++            t.image_queue_ns+=v.queued_ns.load();t.image_encode_ns+=v.encode_ns.load();
++            t.image_cache_hits+=v.cache_hits.load();t.image_cache_misses+=v.cache_misses.load();
++            t.image_tokens+=item.n_rows();
++        }
+         const int64_t produced = s.n_produced();
+         t.predicted_n      += produced;
+         t.draft_n          += s.n_drafted();
+--- a/core/server/sink.h
++++ b/core/server/sink.h
+@@ -61,6 +61,7 @@
+ 
+ class Sink {
+ public:
++    std::shared_ptr<mm::PromptMedia> media;
+     /* `capacity` is rounded up to a power of two. 8192 tokens is ~64 KiB and is far more than any
+      * HTTP consumer can fall behind by without being dead: at 100 tok/s that is 80 seconds of
+      * slack. Overflow is not silently dropped -- it fails the request, because a stream missing
+--- /dev/null
++++ b/core/mm/vision_stats.h
+@@ -0,0 +1,14 @@
++#pragma once
++#include <atomic>
++#include <chrono>
++namespace rad::mm {
++inline int64_t vision_now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(
++    std::chrono::steady_clock::now().time_since_epoch()).count(); }
++struct VisionStats {
++    std::atomic<int64_t> decode_ns{0}, preprocess_ns{0}, queued_ns{0}, encode_ns{0};
++    std::atomic<int64_t> cache_hits{0}, cache_misses{0};
++    std::atomic<int64_t> encode_start_ns{0};
++    std::atomic<int> phase{0}; // 0 prepared, 1 queued, 2 encoding, 3 ready, 4 cache hit
++    std::atomic<int> status{0}; // negative: failed; publication stays on the scheduler thread
++};
++}
+--- /dev/null
++++ b/core/mm/vision_cache.h
+@@ -0,0 +1,55 @@
++#pragma once
++#include "mm/processor.h"
++#include <list>
++#include <charconv>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++namespace rad::mm {
++inline size_t vision_cache_bytes() {
++    const char* value=std::getenv("KVMEM_RAD_VISION_CACHE_MIB");
++    if(!value)return size_t(256)*1024*1024;
++    unsigned mib=0;const char* end=value+std::strlen(value);
++    const auto result=std::from_chars(value,end,mib);
++    if(result.ec!=std::errc{} || result.ptr!=end || value==end || mib>65536)
++        throw std::invalid_argument("KVMEM_RAD_VISION_CACHE_MIB must be 0..65536");
++    return size_t(mib)*1024*1024;
++}
++
++// Engine-local: model, encoder implementation and weights cannot change during its lifetime.
++// Exact patches guard even a content-key collision; their bytes count against the LRU quota.
++class VisionCache {
++    struct Entry { Item identity; std::vector<uint16_t> output; size_t bytes; };
++    std::list<Entry> entries_;
++    size_t limit_, bytes_=0;
++    static bool same(const Item& a,const Item& b) {
++        return a.kind==b.kind && a.key_hi==b.key_hi && a.key_lo==b.key_lo &&
++            a.grid_t==b.grid_t && a.grid_h==b.grid_h && a.grid_w==b.grid_w &&
++            a.patch_dim==b.patch_dim && a.n_seg==b.n_seg && a.seg_rows==b.seg_rows &&
++            a.rows_h==b.rows_h && a.rows_w==b.rows_w && a.pixels==b.pixels;
++    }
++public:
++    explicit VisionCache(size_t limit):limit_(limit) {}
++    size_t bytes() const { return bytes_; }
++    bool get(Item& item) {
++        if (!limit_) return false;
++        for(auto it=entries_.begin();it!=entries_.end();++it) if(same(it->identity,item)) {
++            item.embd=it->output;item.encoded=true;item.stats->cache_hits=1;item.stats->phase=4;
++            entries_.splice(entries_.begin(),entries_,it);return true;
++        }
++        return false;
++    }
++    void put(const Item& item) {
++        if(!limit_ || !item.encoded || item.kind!=Kind::Image || item.embd.empty())return;
++        const size_t bytes=(item.pixels.size()+item.embd.size())*sizeof(uint16_t);
++        if(bytes>limit_)return;
++        // Replace a duplicate rather than charging the same image twice.
++        for(auto it=entries_.begin();it!=entries_.end();) {
++            if(same(it->identity,item)){bytes_-=it->bytes;it=entries_.erase(it);}else ++it;
++        }
++        while(bytes_>limit_-bytes){bytes_-=entries_.back().bytes;entries_.pop_back();}
++        Entry e; e.identity=item; std::vector<uint16_t>().swap(e.identity.embd);std::vector<int32_t>().swap(e.identity.expand);std::vector<int32_t>().swap(e.identity.seg_at);
++        e.output=item.embd;e.bytes=bytes;entries_.push_front(std::move(e));bytes_+=bytes;
++    }
++};
++}
+--- /dev/null
++++ b/core/mm/cpu_cancel.h
+@@ -0,0 +1,3 @@
++#pragma once
++#include <atomic>
++namespace rad { void cpu_encoder_cancel_token(const std::atomic<bool>* token); }

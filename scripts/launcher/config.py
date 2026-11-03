@@ -112,12 +112,12 @@ ENGINE_DEFAULTS['radiance'] = dict(Backend='radiance', Context=65536, Budget=409
     QueryMaxTokens=512, QueryReplayMaxTokens=2048, KvType='fp8', StateCacheType='f32', Prefill=512,
     SpeculativeMode='none', DraftTokens=0, DraftPolicy='fixed', Vision=False, MaxTokens=0,
     ThinkingMode='default', ThinkingBudget=0, VramReserveMiB=1024,
-    VisionTokens=1024, VisionResidency='resident', EmbeddingPlacement='vram')
+    VisionTokens=1024, VisionResidency='resident', EmbeddingPlacement='vram', CpuThreads=2, VisionCacheMiB=256)
 STRINGS = {'StateCacheType', 'EmbeddingPlacement', 'RadianceHome', 'RocmPath', 'Tokenizer','PolystrataSource','Python','VisionWorker','Mmproj','QueryScorer','Backend', 'Model', 'Worker', 'Gpu', 'ListenHost', 'KvType', 'KvTypeK', 'KvTypeV', 'DiskPath',
            'VisionResidency',
            'DeviceProfile', 'ScoreAggregation', 'QueryScorer', 'ApiKey', 'ModelAlias', 'LogLevel',
            'ChatTemplateFile', 'ThinkingMode', 'ReasoningEffort', 'SpeculativeMode', 'DraftPolicy', 'DraftModel'}
-INTEGERS = {'BlockTokens', 'VramReserveMiB', 'Context', 'Budget', 'Reserve', 'HostMiB', 'Prefill', 'MaxTokens', 'Port',
+INTEGERS = {'CpuThreads', 'VisionCacheMiB', 'BlockTokens', 'VramReserveMiB', 'Context', 'Budget', 'Reserve', 'HostMiB', 'Prefill', 'MaxTokens', 'Port',
             'MtpDrafts', 'NgramDrafts', 'NgramMinMatch', 'Concurrency', 'RetainedSessions',
             'VisionTokens', 'ThinkingBudget', 'SinkTokens', 'RecentTokens', 'DiskMiB', 'DraftTokens',
             'QueryMaxTokens', 'QueryReplayMaxTokens', 'ReplayMaxTokens', 'CheckpointExtraRecomputeTokens'}
@@ -185,6 +185,8 @@ def normalize(data, backends):
     for key in ('QueryMaxTokens', 'QueryReplayMaxTokens'):
         if key in p and p[key] <= 0:
             raise ValueError(f'{key} must be positive')
+    if p['Backend'] != 'radiance' and {'CpuThreads','VisionCacheMiB'} & p.keys():
+        raise ValueError('CpuThreads and VisionCacheMiB currently configure Radiance only')
     if 'CheckpointExtraRecomputeTokens' in p and p['Backend'] != 'ninfer':
         raise ValueError('CheckpointExtraRecomputeTokens configures NInfer only')
     history = p.get('Lrfu', p.get('QueryScorer') == 'meanq-cosine')

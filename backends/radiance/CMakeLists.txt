@@ -194,3 +194,8 @@ if(TARGET rad_core)
     add_test(NAME radiance_page_transfer_gpu_test COMMAND radiance_page_transfer_gpu_test)
     set_tests_properties(radiance_page_transfer_gpu_test PROPERTIES LABELS gpu TIMEOUT 60)
 endif()
+
+add_executable(radiance_vision_cache_test tests/vision_cache_test.cpp)
+target_compile_features(radiance_vision_cache_test PRIVATE cxx_std_17)
+target_include_directories(radiance_vision_cache_test PRIVATE ${RADIANCE_SOURCE_DIR}/core ${RADIANCE_SOURCE_DIR}/abi)
+add_test(NAME radiance_vision_cache_test COMMAND radiance_vision_cache_test)

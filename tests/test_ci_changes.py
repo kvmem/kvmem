@@ -21,8 +21,44 @@ class DocumentationChangesTest(unittest.TestCase):
         for path in ('backends/radiance/adapter/native_memory.cpp', 'CMakeLists.txt',
                      'backends/radiance/tools/new_tool.py', 'backends/radiance/upstream.json',
                      'docs/benchmarks/unreviewed.json', '../backends/radiance/README.md'):
-            self.assertTrue(changes.requires_native(paths + [path]))
-            self.assertTrue(changes.requires_cuda(paths + [path], 'a', 'b'))
+            scoped = path.startswith('backends/radiance/')
+            self.assertEqual(changes.requires_native(paths + [path]), not scoped)
+            self.assertEqual(changes.requires_cuda(paths + [path], 'a', 'b'), not scoped)
+            self.assertEqual(changes.radiance_only_change(paths + [path]), scoped)
+
+    def test_radiance_workflow_routing_keeps_other_engine_recipes_fixed(self):
+        from unittest.mock import patch
+        old = b'name: CI\njobs:\n  changes:\n    outputs:\n      run_native: ${{ steps.classify.outputs.run_native }}\n  host-linux:\n    run: cmake --build build --parallel 2\n  radiance-host-contracts:\n    if: old\n  host-and-server-units-linux:\n    env:\n          RUN_NATIVE: ${{ needs.changes.outputs.run_native }}\n    run: |\n            test "$RADIANCE_RESULT" = success\n            test "$RADIANCE_RESULT" = skipped\n          if [ "$RUN_CUDA" = true ]; then\n'
+        cuda_jobs = b''.join(('  '+name+':\n    run: native-build\n').encode() for name in changes.CUDA_JOBS)
+        old = old.replace(b'  host-and-server-units-linux:',cuda_jobs+b'  host-and-server-units-linux:')
+        new = old.replace(b'      run_native: ${{ steps.classify.outputs.run_native }}\n',
+            b'      run_native: ${{ steps.classify.outputs.run_native }}\n      run_radiance: ${{ steps.classify.outputs.run_radiance }}\n')
+        new = new.replace(b'          RUN_NATIVE: ${{ needs.changes.outputs.run_native }}\n',
+            b'          RUN_NATIVE: ${{ needs.changes.outputs.run_native }}\n          RUN_RADIANCE: ${{ needs.changes.outputs.run_radiance }}\n')
+        new = new.replace(b'            test "$RADIANCE_RESULT" = success\n',b'').replace(b'            test "$RADIANCE_RESULT" = skipped\n',b'')
+        new = new.replace(b'          if [ "$RUN_CUDA" = true ]; then',
+            b'          if [ "$RUN_RADIANCE" = true ]; then\n            test "$RADIANCE_RESULT" = success\n          else\n            test "$RUN_RADIANCE" = false\n            test "$RADIANCE_RESULT" = skipped\n          fi\n          if [ "$RUN_CUDA" = true ]; then')
+        attrs = b'*.md text\n'
+        current_attrs = attrs + b'\n# These files retain their existing CRLF byte layout.\nbackends/radiance/upstream.json whitespace=cr-at-eol\nui/test-monitor.cjs whitespace=cr-at-eol\n.github/workflows/server-compat.yml whitespace=cr-at-eol\n'
+        paths = ['backends/patches/radiance-vision-pipeline.patch', changes.WORKFLOW,
+                 '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py', '.gitattributes',
+                 'docs/benchmarks/radiance-vision-pipeline-20261104.json']
+        def data(command, ref, **kwargs):
+            self.assertEqual(command,'show')
+            return {'old:'+changes.WORKFLOW:old,'new:'+changes.WORKFLOW:new,
+                    'old:.gitattributes':attrs,'new:.gitattributes':current_attrs}[ref]
+        with patch.object(changes,'git',side_effect=data):
+            self.assertTrue(changes.radiance_only_change(paths,'old','new'))
+            self.assertFalse(changes.requires_native(paths,'old','new'))
+            self.assertFalse(changes.requires_cuda(paths,'old','new'))
+            for extra in ['CMakeLists.txt','kvmem/src/host/kvmem_store.cpp',
+                          'backends/patches/ninfer-new.patch','../backends/radiance/file.cpp']:
+                self.assertTrue(changes.requires_native(paths+[extra],'old','new'))
+                self.assertTrue(changes.requires_cuda(paths+[extra],'old','new'))
+            changed = new.replace(b'cmake --build build --parallel 2',b'cmake --build other --parallel 2')
+            self.assertNotEqual(new,changed)
+            new = changed
+            self.assertFalse(changes.radiance_only_change(paths,'old','new'))
 
     def test_only_exact_evidence_workflow_step_avoids_native_builds(self):
         from unittest.mock import patch

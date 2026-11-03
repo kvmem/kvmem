@@ -41,8 +41,18 @@ Windows AMD 和其他模型/设备仍需独立资格验证。
 ## 原生图片接入
 
 统一启动器的 `Vision=true` 开启 Radiance 原生图片处理器和视觉编码器；模型必须是
-包含视觉权重及 patch/merge 元数据的 `qwen35` `.rad`。当前要求
-`VisionResidency=resident`，不支持 CPU 视觉编码器、视频或音频。
+包含视觉权重及 patch/merge 元数据的 `qwen35` `.rad`。当前支持
+`VisionResidency=resident|cpu`，支持原生 GPU 或完整 CPU 视觉编码器；不支持视频或音频。
+CPU 图片已在 RX 9060 XT 上完成短任务验证，范围和资源指标见
+[CPU 图片验收](radiance-cpu-image-validation-20261103.md)；
+本轮线程配置、embedding 缓存和异步编码见[管线验收](radiance-vision-pipeline-validation-20261104.md)。
+CPU 编码使用独立执行上下文在后台运行，编码结果由调度线程发布；语言模型可以继续处理其他请求。
+统一启动器提供 `CpuThreads`（1–256，默认 2）和 `VisionCacheMiB`（0–65536，默认 256）。
+`CpuThreads` 设置进程的 `OMP_NUM_THREADS`，也会影响其他使用 OpenMP 的 CPU 算子。
+直接启动 worker 时使用 `OMP_NUM_THREADS` 和 `KVMEM_RAD_VISION_CACHE_MIB`。
+缓存为进程内 LRU，0 关闭；预算计入 BF16 embedding 和用于精确核对身份的图片 patch 数据，
+独立于 KVMem Host/SSD 预算。活动请求和后台编码器的工作内存另计。
+重启或更换模型后不保留图片编码缓存。
 `VisionTokens` 默认 1024、范围 64–16384，按模型几何换算为原生 patch 和像素上限；
 这是单图压缩目标，图片数量还受上下文及 KVMem 工作集预算限制。
 
@@ -50,7 +60,8 @@ Windows AMD 和其他模型/设备仍需独立资格验证。
 `data:image/jpeg;base64,...`。原生服务不替客户端下载远程图片 URL。
 图片和文字共用普通消息协议；跨轮发送完整对话历史即可复用 KV/state。
 缓存身份同时检查图片内容的 128 位 key、完整展开区间和原生 MRoPE 布局，
-因此相同占位 token 和尺寸不能使不同图片误命中。视觉预处理/编码本身尚无跨请求缓存。
+因此相同占位 token 和尺寸不能使不同图片误命中。图片解码和预处理仍逐请求执行；视觉 embedding 可跨请求复用，
+缓存同时核对内容 key、几何和完整 patch 数据，避免不同图片误命中。
 
 图片完整页在 Query、Prefill Pressure 和 Decode Pressure 中始终保留；预算不足时
 拒绝请求并提示减少图片或增加 Budget。Query 边界在图片展开后的真实 token 序列上证明，
@@ -61,6 +72,13 @@ Windows AMD 和其他模型/设备仍需独立资格验证。
 `--ffmpeg-static`。`--ffmpeg OFF` 构建的 worker 会报告不支持图片，启动器会拒绝视觉配置。
 本次 Linux 验证使用单独固定的 FFmpeg 8.1 最小图片解码依赖包，未改变原有 ROCm 依赖包。
 分发时保留原生来源、FFmpeg 许可和对应构建信息；本次没有发布二进制包。
+
+API 响应的 `timings.image` 和监控请求的 `image` 对象提供 `decode_ms`、
+`preprocess_ms`、`queue_ms`、`encode_ms`、`cache_hits`、`cache_misses` 和 `tokens`。
+`queue_ms` 从图片进入编码队列开始计时；CPU 首次执行上下文初始化计入此阶段。
+CPU `encode_ms` 是视觉算子执行的 wall time，包含执行中的权重触页等等待；GPU 多图批次按 patch 数分摊批次耗时。
+监控另提供正在编码/排队的图片数及当前编码耗时。跨请求缓存命中时编码耗时为零，
+解码和预处理仍有开销。并行阶段存在重叠，不能将这些时间简单相加当作端到端耗时。
 
 ## 本次改动
 

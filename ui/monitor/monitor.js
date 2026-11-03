@@ -306,6 +306,12 @@
       t("入口：{0}\n输入 {1} tokens · 复用 {2} · 输出 {3}\n预填充 {4} tok/s · 输入复用率 {5}%\n输出上限 {6} · 耗时 {7} 秒", row.endpoint, fmt(row.prompt_tokens), fmt(row.cached_tokens), fmt(row.generated_tokens), fmt(prefill.rate, 1), fmt(ratio(row.cached_tokens, row.prompt_tokens), 1), fmt(row.limit), fmt(row.elapsed_ms / 1000, 2)) + "\n" +
       prefillTimes(prefill, row);
     const lines = [];
+    if(row.image) {
+      const v=row.image;
+      lines.push((i18n.language==='en'?'Image decode / preprocess / queue / encode ms: ':'图片解码 / 预处理 / 排队 / 编码 ms：')+
+        [v.decode_ms,v.preprocess_ms,v.queue_ms,v.encode_ms].map(x=>fmt(x,1)).join(' / '));
+      lines.push((i18n.language==='en'?'Image cache hits / misses: ':'图片缓存命中 / 未命中：')+`${fmt(v.cache_hits)} / ${fmt(v.cache_misses)}`);
+    }
     if (typeof row.cache_source === 'string' && row.cache_source) lines.push((i18n.language === 'en' ? 'Cache source' : '缓存来源') + `: ${row.cache_source}`);
     if (number(row.planned_cached_tokens)) lines.push((i18n.language === 'en' ? 'Planned reuse' : '计划复用') + `: ${fmt(row.planned_cached_tokens)} tokens`);
     if (number(row.actual_cached_tokens)) lines.push((i18n.language === 'en' ? 'Actual reuse' : '实际复用') + `: ${fmt(row.actual_cached_tokens)} tokens`);

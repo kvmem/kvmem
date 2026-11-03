@@ -1035,6 +1035,8 @@
       detected?.available?['留空使用已检测到的程序：'+detected.path,'Leave empty to use the detected executable: '+detected.path]:['未检测到后端程序，请填写已安装程序的完整路径。','No backend executable detected. Enter the full path to an installed executable.']);
     worker.placeholder=tr('自动检测','Auto-detect');worker.closest('label').classList.add('l-wide');
     if(rad){
+      field(panels[3],{CpuThreads:2,...p},'CpuThreads','CPU 编码线程数','CPU encoder threads','number');
+      field(panels[3],{VisionCacheMiB:256,...p},'VisionCacheMiB','图片编码缓存 MiB','Image embedding cache MiB','number',null,['0 关闭；包含图片身份数据，独立于 KV 缓存预算。','0 disables; includes image identity data and has a separate budget from KV.']);
       field(panels[0],{EmbeddingPlacement:'vram',...p},'EmbeddingPlacement','文本嵌入表位置','Text embedding placement','text',[['vram','GPU'],['ram','RAM']],['RAM 可为视觉和 KV 释放显存。','RAM frees GPU memory for vision and KV.']);
       for(const [key,zh,en] of [['RadianceHome','Radiance 资源目录','Radiance resource directory'],['RocmPath','ROCm 运行库目录','ROCm runtime directory']])field(ng,p,key,zh,en);
     }
