@@ -12,6 +12,32 @@ spec.loader.exec_module(changes)
 
 
 class DocumentationChangesTest(unittest.TestCase):
+    def test_offline_evidence_changes_keep_python_checks_without_native_builds(self):
+        paths = [*changes.EVIDENCE_PATHS, 'docs/radiance-cpu-image-validation-20261103.md',
+                 '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py']
+        self.assertTrue(changes.requires_ci(paths))
+        self.assertFalse(changes.requires_native(paths))
+        self.assertFalse(changes.requires_cuda(paths, 'a', 'b'))
+        for path in ('backends/radiance/adapter/native_memory.cpp', 'CMakeLists.txt',
+                     'backends/radiance/tools/new_tool.py', 'backends/radiance/upstream.json',
+                     'docs/benchmarks/unreviewed.json', '../backends/radiance/README.md'):
+            self.assertTrue(changes.requires_native(paths + [path]))
+            self.assertTrue(changes.requires_cuda(paths + [path], 'a', 'b'))
+
+    def test_only_exact_evidence_workflow_step_avoids_native_builds(self):
+        from unittest.mock import patch
+        old = 'name: Test\non: pull_request\njobs:\n  changes:\n    steps:\n'
+        new = old + changes.EVIDENCE_TEST_STEP
+        paths = [changes.WORKFLOW, *changes.EVIDENCE_PATHS]
+        with patch.object(changes, 'git', side_effect=[old.encode(), new.encode()]):
+            self.assertFalse(changes.requires_native(paths, 'a' * 40, 'b' * 40))
+        for unsafe in (new + '      - run: cmake --build everything\n',
+                       new.replace('python3 backends/', 'python3 other/'),
+                       new + 'env:\n  CXXFLAGS: changed\n'):
+            with patch.object(changes, 'git', side_effect=[old.encode(), unsafe.encode()]):
+                self.assertTrue(changes.requires_native(paths, 'a' * 40, 'b' * 40))
+        self.assertTrue(changes.requires_native(paths))
+
     def test_ninfer_manifest_changes_do_not_build_other_backends_cuda(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -29,6 +29,19 @@ CONSOLE_PATHS = {
     'ui/package.json', 'ui/package-lock.json', 'ui/README.md',
 }
 
+# These files audit archived results; none is an input to a native target.
+EVIDENCE_PATHS = {
+    'backends/radiance/README.md',
+    'backends/radiance/tools/check_cpu_image_evidence.py',
+    'backends/radiance/tests/cpu_image_evidence_test.py',
+    'docs/benchmarks/radiance-cpu-image-20261103.json',
+}
+EVIDENCE_TEST_STEP = (
+    '      - name: Test offline CPU image evidence checks\n'
+    "        if: steps.classify.outputs.run_ci == 'true'\n"
+    '        run: python3 backends/radiance/tests/cpu_image_evidence_test.py\n'
+)
+
 
 def is_console_path(path):
     if '..' in PurePosixPath(path).parts or path.startswith('/'):
@@ -38,10 +51,13 @@ def is_console_path(path):
             or bool(re.fullmatch(r'ui/test-[^/]+\.cjs', path)))
 
 
-def requires_native(paths):
+def requires_native(paths, before=None, after=None, cwd=None):
     # Unknown paths and CI recipe changes stay conservative. Pure UI changes
     # still run Python/browser checks, without configuring or building engines.
-    return not paths or any(not is_documentation(path) and not is_console_path(path) for path in paths)
+    return not paths or any(
+        not is_documentation(path) and not is_console_path(path) and path not in EVIDENCE_PATHS
+        and not (path == WORKFLOW and only_evidence_test_step_changed(before, after, cwd))
+        for path in paths)
 
 
 def is_documentation(path):
@@ -63,6 +79,19 @@ def requires_ci(paths):
 
 def git(*args, cwd=None):
     return subprocess.check_output(['git', *args], cwd=cwd, stderr=subprocess.PIPE)
+
+
+def only_evidence_test_step_changed(before, after, cwd=None):
+    # Allow only the exact standalone Python check added by this change.
+    # Every other workflow edit retains the conservative native-build policy.
+    if not all(isinstance(ref, str) and re.fullmatch(r'[0-9a-f]{40}', ref) for ref in (before, after)):
+        return False
+    try:
+        old, new = (git('show', ref + ':' + WORKFLOW, cwd=cwd).decode('utf-8').replace('\r\n', '\n')
+                    for ref in (before, after))
+        return new.count(EVIDENCE_TEST_STEP) == 1 and new.replace(EVIDENCE_TEST_STEP, '', 1) == old
+    except (OSError, UnicodeError, subprocess.CalledProcessError):
+        return False
 
 
 def cuda_build_definition(text):
@@ -115,7 +144,7 @@ def ninfer_only_backend_change(paths, before, after, cwd=None):
 
 
 def requires_cuda(paths, before, after, cwd=None):
-    if not paths or any(not is_documentation(path) and path not in NON_CUDA_PATHS and not is_console_path(path) for path in paths):
+    if not paths or any(not is_documentation(path) and path not in NON_CUDA_PATHS and not is_console_path(path) and path not in EVIDENCE_PATHS for path in paths):
         if not ninfer_only_backend_change(paths, before, after, cwd):
             return True
     if WORKFLOW in paths:
@@ -158,11 +187,17 @@ def classify(event_name, event, cwd=None):
 def main():
     event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
     full, cuda, reason, paths = classify(os.environ['GITHUB_EVENT_NAME'], event)
+    if os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
+        request = event.get('pull_request', {})
+        before, after = request.get('base', {}).get('sha'), request.get('head', {}).get('sha')
+    else:
+        before, after = event.get('before'), event.get('after')
+    native = full and requires_native(paths, before, after)
     with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
         output.write('run_ci=' + str(full).lower() + '\n')
         output.write('run_cuda=' + str(cuda).lower() + '\n')
-        output.write('run_native=' + str(full and requires_native(paths)).lower() + '\n')
-    print(json.dumps({'run_ci': full, 'run_cuda': cuda, 'run_native': full and requires_native(paths), 'reason': reason, 'paths': paths}, ensure_ascii=True))
+        output.write('run_native=' + str(native).lower() + '\n')
+    print(json.dumps({'run_ci': full, 'run_cuda': cuda, 'run_native': native, 'reason': reason, 'paths': paths}, ensure_ascii=True))
 
 
 if __name__ == '__main__':
