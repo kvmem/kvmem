@@ -42,6 +42,7 @@ class DocumentationChangesTest(unittest.TestCase):
         current_attrs = attrs + b'\n# These files retain their existing CRLF byte layout.\nbackends/radiance/upstream.json whitespace=cr-at-eol\nui/test-monitor.cjs whitespace=cr-at-eol\n.github/workflows/server-compat.yml whitespace=cr-at-eol\n'
         paths = ['backends/patches/radiance-vision-pipeline.patch', changes.WORKFLOW,
                  '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py', '.gitattributes',
+                 'tests/test_radiance_launcher.py',
                  'docs/benchmarks/radiance-vision-pipeline-20261104.json']
         def data(command, ref, **kwargs):
             self.assertEqual(command,'show')

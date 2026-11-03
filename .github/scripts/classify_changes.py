@@ -17,6 +17,7 @@ NON_CUDA_PATHS = {
 }
 CONSOLE_PATHS = {
     '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
+    'tests/test_radiance_launcher.py',
     'START-HERE-CN.sh', 'START-HERE-EN.sh', 'START-HERE-CN.bat', 'START-HERE-EN.bat',
     'scripts/local-console.py', 'scripts/launcher-cli.py', 'scripts/launcher-capabilities.json',
     'scripts/console_chat.py', 'scripts/console_hardware.py', 'scripts/model_health.py',
