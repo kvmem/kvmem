@@ -84,9 +84,35 @@ def cuda_build_definition(text):
     return text[:jobs.start()], tuple(recipes[name] for name in CUDA_JOBS)
 
 
+def ninfer_only_backend_change(paths, before, after, cwd=None):
+    # The CUDA jobs build llama.cpp and PolyStrata, not NInfer. A manifest
+    # update may skip those jobs only when every other backend record is equal.
+    if 'backends/versions.json' not in paths:
+        return False
+    for path in paths:
+        if is_documentation(path) or path in NON_CUDA_PATHS or is_console_path(path):
+            continue
+        if path in {'backends/versions.json', 'backends/ninfer'}:
+            continue
+        if re.fullmatch(r'backends/patches/ninfer-[^/]+\.patch', path):
+            continue
+        return False
+    try:
+        old, new = (json.loads(git('show', ref + ':backends/versions.json', cwd=cwd))
+                    for ref in (before, after))
+        if not all(isinstance(value, dict) and isinstance(value.get('ninfer'), dict)
+                   for value in (old, new)):
+            return False
+        return ({key: value for key, value in old.items() if key != 'ninfer'} ==
+                {key: value for key, value in new.items() if key != 'ninfer'})
+    except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError):
+        return False
+
+
 def requires_cuda(paths, before, after, cwd=None):
     if not paths or any(not is_documentation(path) and path not in NON_CUDA_PATHS and not is_console_path(path) for path in paths):
-        return True
+        if not ninfer_only_backend_change(paths, before, after, cwd):
+            return True
     if WORKFLOW in paths:
         try:
             old = cuda_build_definition(git('show', before + ':' + WORKFLOW, cwd=cwd).decode('utf-8'))

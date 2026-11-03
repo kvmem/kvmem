@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,6 +12,55 @@ spec.loader.exec_module(changes)
 
 
 class DocumentationChangesTest(unittest.TestCase):
+    def test_ninfer_manifest_changes_do_not_build_other_backends_cuda(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = root / 'backends/versions.json'
+            manifest.parent.mkdir()
+            base_data = {'layout': 'patched', 'ninfer': {'base_commit': 'old'},
+                         'llamacpp': {'base_commit': 'llama'},
+                         'polystrata': {'base_commit': 'poly'}}
+
+            def git(*args):
+                return subprocess.check_output(['git', *args], cwd=root,
+                                               stderr=subprocess.PIPE).decode().strip()
+
+            def commit(data):
+                manifest.write_text(json.dumps(data) if isinstance(data, dict) else data,
+                                    encoding='utf-8')
+                git('add', '.')
+                git('-c', 'user.name=CI test', '-c', 'user.email=ci-test@example.invalid',
+                    'commit', '-qm', 'manifest')
+                return git('rev-parse', 'HEAD')
+
+            git('init', '-q')
+            before = commit(base_data)
+            new_data = dict(base_data, ninfer={'base_commit': 'new'})
+            patch = root / 'backends/patches/ninfer-feature.patch'
+            patch.parent.mkdir()
+            patch.write_text('native patch\n', encoding='utf-8')
+            after = commit(new_data)
+            event = {'pull_request': {'base': {'sha': before}, 'head': {'sha': after}}}
+            full, cuda, _, paths = changes.classify('pull_request', event, root)
+            self.assertTrue(full)
+            self.assertTrue(changes.requires_native(paths))
+            self.assertFalse(cuda)
+            self.assertFalse(changes.classify('push', {'before': before, 'after': after}, root)[1])
+            self.assertFalse(changes.requires_cuda(paths + ['docs/guide.md', 'tests/test_ci_changes.py'],
+                                                  before, after, root))
+            for extra in ('kvmem/src/host/memory_contract.cpp', 'CMakeLists.txt',
+                          'backends/patches/llamacpp-kvmem.patch', 'backends/polystrata',
+                          'backends/patches/../ninfer-feature.patch'):
+                self.assertTrue(changes.requires_cuda(paths + [extra], before, after, root))
+            self.assertTrue(changes.requires_cuda(paths, 'f' * 40, after, root))
+            for key in ('llamacpp', 'polystrata', 'layout'):
+                mixed = dict(new_data, **{key: 'changed'})
+                changed = commit(mixed)
+                self.assertTrue(changes.requires_cuda(paths, before, changed, root))
+            for malformed in ('not json', '[]', '{}'):
+                changed = commit(malformed)
+                self.assertTrue(changes.requires_cuda(paths, before, changed, root))
+
     def test_documentation_and_images_skip_builds(self):
         self.assertFalse(changes.requires_ci(['README.md', 'docs/guide.md', 'docs/assets/flow.svg',
                                              'scripts/windows/README-quantizer.md', 'LICENSE']))
