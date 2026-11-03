@@ -1,0 +1,164 @@
+diff --git a/src/ops/linear/gguf/gguf_linear.cpp b/src/ops/linear/gguf/gguf_linear.cpp
+index 2a9b05eb7949ef0fdb449138c6255f5ccbbd38d9..8d64007a8b3e86a5364c5faf39b14f3290f362d1 100644
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -311,6 +311,66 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
+         }
+         rows = std::max<std::size_t>(rows, shape.rows);
+     }
++    if (gguf::mxfp8::enabled() && !gguf::nvfp4_enabled() &&
++        !detail::sm70::takes(max_tokens)) {
++        std::size_t widest = 0;
++        for (int t = min_tokens; t <= max_tokens; ++t) {
++            WorkspaceLayoutBuilder layout;
++            if (t <= gguf::kMaxVectorColumns) {
++                for (const auto& shape : shapes) {
++                    (void)shape;
++                    (void)layout.alloc_bytes(gguf::vector_activation_bytes(k,t));
++                }
++            } else {
++                struct Routes { bool q8=false, tile=false, lt=false; };
++                std::vector<Routes> choices;
++                std::size_t plane_rows=0, mx_bytes=0;
++                bool fixup=false, decode=false;
++                for (const auto& shape : shapes) {
++                    Routes r;
++                    // Shapes do not describe the output. Bound every supported
++                    // epilogue, including generic FP32/GELU products (Other).
++                    for (auto epi : {gguf::mxfp8::PrefillEpilogue::F32,
++                                     gguf::mxfp8::PrefillEpilogue::BF16,
++                                     gguf::mxfp8::PrefillEpilogue::Add,
++                                     gguf::mxfp8::PrefillEpilogue::Silu,
++                                     gguf::mxfp8::PrefillEpilogue::Other}) {
++                        const auto route=gguf::mxfp8::prefill_route(
++                            gguf_type(shape.qtype),shape.rows,k,t,epi);
++                        r.q8 |= route==gguf::mxfp8::PrefillRoute::Q8;
++                        r.tile |= route==gguf::mxfp8::PrefillRoute::Tile;
++                        r.lt |= route==gguf::mxfp8::PrefillRoute::Lt;
++                    }
++                    choices.push_back(r);
++                    if (r.q8 || r.lt) plane_rows=std::max(plane_rows,std::size_t(shape.rows));
++                    if (r.q8) {
++                        fixup |= gguf::has_matrix_kernel(gguf_type(shape.qtype));
++                        decode |= !gguf::has_matrix_kernel(gguf_type(shape.qtype));
++                    }
++                    if (r.lt) mx_bytes=std::max(mx_bytes,gguf::mxfp8::scratch_bytes(k,shape.rows,t));
++                }
++                if (plane_rows) (void)layout.alloc_bytes(plane_rows*t*sizeof(float));
++                if (fixup) (void)layout.alloc_bytes(fixup_bound());
++                if (mx_bytes) (void)layout.alloc_bytes(mx_bytes);
++                if (decode) {
++                    (void)layout.alloc_bytes(gguf::vector_activation_bytes(k,gguf::kMaxVectorColumns));
++                    (void)layout.alloc_bytes(kDequantizedScratchBytes);
++                }
++                for (std::size_t i=0;i<shapes.size();++i) {
++                    const auto type=gguf_type(shapes[i].qtype);
++                    const auto r=choices[i];
++                    if (r.tile) (void)layout.alloc_bytes(gguf::mxfp8::tile_activation_bytes(k,t));
++                    if (r.lt) (void)layout.alloc_bytes(gguf::mxfp8::activation_bytes(k,t));
++                    if (r.q8 && gguf::has_matrix_kernel(type))
++                        (void)layout.alloc_bytes(gguf::matrix_activation_bytes(gguf::matrix_padded_k(k),t));
++                    if (r.q8 && !gguf::has_matrix_kernel(type) && t>kDequantizedVectorColumns)
++                        (void)layout.alloc_bytes(std::size_t(k)*t*2);
++                }
++            }
++            widest=std::max(widest,layout.peak_bytes(1));
++        }
++        return widest;
++    }
+     // Every product may carry its own input gather, so each may quantize its own activation.
+     const std::size_t activations = shapes.size();
+     std::size_t widest            = 0;
+@@ -418,15 +478,6 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+         void* data;
+     };
+     std::vector<Activation> activations;
+-    std::int32_t plane_rows = 0;
+-    bool dequantized        = false;
+-    for (const auto& p : products) {
+-        plane_rows = std::max(plane_rows, p.weight->n);
+-        dequantized |= !matrix_kernel(*p.weight);
+-    }
+-    auto* plane = static_cast<float*>(
+-        workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
+-    void* fixup = workspace.alloc_bytes(fixup_bound()).data;
+     // Compute a product's route once, and use the same decision for workspace
+     // planning and execution. Q8 is a complete fallback, not a request for Lt.
+     std::vector<gguf::mxfp8::PrefillRoute> mx_routes;
+@@ -447,6 +498,24 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+         }
+       }
+     }
++    std::int32_t plane_rows=0;
++    bool needs_fixup=false, dequantized=false;
++    for (std::size_t i=0;i<products.size();++i) {
++        const auto& p=products[i];
++        const auto route=mx_routes.empty()?gguf::mxfp8::PrefillRoute::Q8:mx_routes[i];
++        if (route==gguf::mxfp8::PrefillRoute::Tile) continue;
++        const bool direct=p.f32!=nullptr && p.epilogue==GgufEpilogue::Store;
++        if (!direct) plane_rows=std::max(plane_rows,p.weight->n);
++        if (route==gguf::mxfp8::PrefillRoute::Q8) {
++            needs_fixup |= matrix_kernel(*p.weight);
++            dequantized |= !matrix_kernel(*p.weight);
++            // matrix_product_bf16 uses plane as its stream-k output scratch.
++            if (p.f32==nullptr && matrix_kernel(*p.weight))
++                plane_rows=std::max(plane_rows,p.weight->n);
++        }
++    }
++    auto* plane=plane_rows?static_cast<float*>(workspace.alloc_bytes(std::size_t(plane_rows)*t*sizeof(float)).data):nullptr;
++    void* fixup=needs_fixup?workspace.alloc_bytes(fixup_bound()).data:nullptr;
+     void* mx_scratch=mx_bytes?workspace.alloc_bytes(mx_bytes).data:nullptr;
+     constexpr auto fp4_form = gguf::LtForm::Nvfp4;
+     std::size_t fp4_bytes = 0;
+diff --git a/tests/ops/linear/test_gguf_mxfp8.cpp b/tests/ops/linear/test_gguf_mxfp8.cpp
+index 16bca2a04635a2b508d874dfb3e3758ddc953eb9..86b3f4c529a645d94b7815726a09bf1506a2a7ed 100644
+--- a/tests/ops/linear/test_gguf_mxfp8.cpp
++++ b/tests/ops/linear/test_gguf_mxfp8.cpp
+@@ -153,7 +153,10 @@ void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
+     Weight w;w.qtype=f.q;w.layout=QuantLayout::GgufBlocks;w.scale_dtype=DType::FP16;w.n=n;w.k=k;w.qdata=dw.p;
+     Weight parent=w;parent.n=2*n;
+     const auto capacity=std::max(ops::linear_workspace_capacity_bytes(f.q,n,k,ops::LinearPolicy::A16Only,1,t),ops::linear_swiglu_workspace_capacity_bytes(f.q,2*n,k,ops::LinearPolicy::A16Only,1,t));
+-    WorkspaceArena workspace(capacity);
++    WorkspaceArena gated_workspace(capacity);
++    const auto product_capacity=ops::linear_workspace_capacity_bytes(
++        f.q,n,k,ops::LinearPolicy::A16Only,t,t);
++    WorkspaceArena workspace(product_capacity);
+     DeviceBuffer out(std::size_t(n)*t*4+32);out.fill(0x42);
+     auto* fp=static_cast<float*>(out.p)+4;Tensor ty(fp,DType::FP32,{n,t});
+     std::vector<float> got(std::size_t(n)*t);
+@@ -205,7 +208,7 @@ void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
+         for(std::size_t i=0;i<got.size();++i)got[i]=__bfloat162float(bh[i]);error(got,add,.004,.003,"MXFP8 residual");
+         if(fusion){
+             parent.input_columns=w.input_columns;
+-            ops::linear_swiglu(tx,parent,by,ops::LinearPolicy::A16Only,workspace,nullptr);bf.copy_to_host(bh.data(),bh.size()*2);
++            ops::linear_swiglu(tx,parent,by,ops::LinearPolicy::A16Only,gated_workspace,nullptr);bf.copy_to_host(bh.data(),bh.size()*2);
+             auto fused=ref;for(std::size_t i=0;i<fused.size();++i){fused[i]=ref[i]/(1+std::exp(-ref[i]))*upper[i];got[i]=__bfloat162float(bh[i]);}
+             error(got,fused,.005,.003,"MXFP8 SwiGLU");
+         }
+@@ -218,7 +221,7 @@ void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
+         checked(cudaMemcpy(got.data(),fp,got.size()*4,cudaMemcpyDeviceToHost));error(got,ref,1e-4,3e-5,"MXFP8 graph");
+         checked(cudaGraphExecDestroy(exe));checked(cudaGraphDestroy(graph));checked(cudaStreamDestroy(stream));
+     }
+-    if(workspace.peak_used()>capacity)throw std::runtime_error("workspace exceeds capacity query");
++    if(workspace.peak_used()>product_capacity || gated_workspace.peak_used()>capacity)throw std::runtime_error("workspace exceeds capacity query");
+ }
+ void route_boundaries() {
+     using R=mx::PrefillRoute;using E=mx::PrefillEpilogue;
+@@ -414,6 +417,17 @@ int main(int argc,char** argv){try{
+         weight_codec(format,128,5120);
+         weight_codec(format,128,17408);
+     }
++    for (const auto& format:formats) for (const auto shape:mx::kPrefillShapes) {
++        const ops::detail::GgufShape problem{format.q,shape.n,shape.k};
++        const auto bound=ops::detail::gguf_project_workspace_bytes({&problem,1},1,1024);
++        for (int t=1;t<=1024;++t) {
++            const auto exact=ops::detail::gguf_project_workspace_bytes({&problem,1},t,t);
++            if (exact>bound) throw std::runtime_error("workspace interval misses an interior width");
++        }
++        if (format.q==QType::GGUF_IQ3_S && shape.n==17408 && shape.k==5120)
++            for (int t:{256,512,1024}) std::cout<<"WORKSPACE IQ3_S 17408x5120 T="<<t<<" bytes="
++                <<ops::detail::gguf_project_workspace_bytes({&problem,1},1,t)<<"\n";
++    }
+     route_boundaries();
+     if(argc==2 && std::string_view(argv[1])=="--lt512") {
+         const auto saved=ops::installed_device_route_profile();

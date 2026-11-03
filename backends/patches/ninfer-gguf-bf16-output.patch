@@ -1,0 +1,325 @@
+diff --git a/docs/gguf-mxfp8-prefill.md b/docs/gguf-mxfp8-prefill.md
+index 832b87425ee1b25b45490a95e92946f6d1afba01..6ed25aec54d8fe46ed3f71c9cbfc5302ef021972 100644
+--- a/docs/gguf-mxfp8-prefill.md
++++ b/docs/gguf-mxfp8-prefill.md
+@@ -18,7 +18,7 @@ on q8_1. Prefill errors can still affect later KV/GDN state and generated output
+   warps with cp.async staging and native block-scaled E4M3 MMA consumer warps.
+   Results pass directly through the existing store, residual or gate epilogue.
+ - At 1024 columns and above, a bounded weight image feeds cuBLASLt. GEMM
+-  accumulation and output are FP32, followed by the existing epilogue/BF16 cast.
++  accumulation is FP32. Aligned BF16 Store/Add destinations receive BF16 directly; FP32 and gated outputs retain the existing FP32 epilogue path.
+   Each 32-byte image slice is written as two aligned 128-bit stores. This keeps
+   the scalar decoder's exact FP8 bytes/scales and the existing 64 MiB slab limit;
+   it adds no model copy, codebook allocation or workspace. Independent weight
+@@ -132,3 +132,23 @@ The pipeline is adapted from `2-com-org/ninfer-5060-qwen` at
+ interpretation and output boundaries differ from that repository's optimized
+ scale-bound and some FP16/BF16 paths. Its numerical and performance results
+ cannot substitute for qualification of this implementation.
++
++## Route-owned workspace and BF16 output
++
++Workspace planning covers every token width in the requested interval, including
++profile-specific Lt512 and tail fallbacks. Tile-only calls need no generic FP32
++plane or Q8 stream-k fixup. Mixed routes and distinct gathers retain their live
++buffers. NVFP4 keeps its existing conservative capacity contract.
++
++The BF16 Lt Store/Add route follows ninfer-5060-qwen@08c4fb70: FP32 accumulation,
++16-byte aligned BF16 output, column stride divisible by eight, and no GateProduct.
++FP32 destinations and unaligned BF16 calls retain the prior path. Weight decoding,
++actual per-group amax and E4M3/E8M0 coding are unchanged. Residual addition within
++GEMM may round differently; the numerical state/cost signature is profile-v3.
++The LinearAdd capacity query uses its known whole BF16 output; generic projection
++queries remain conservative for outputs whose type/layout is unknown.
++
++Validation is staged: public independent CPU/FP64 operations, exact capacities,
++BF16 Add Graph replay, sanitizer, same-GPU inference and fixed-corpus incremental
++PPL. These changes do not establish lossless FP8 or generalize 5060 Ti timings to
++other hardware. The 64 MiB weight image limit is still used at this stage.
+diff --git a/src/ops/linear/gguf/gguf_linear.cpp b/src/ops/linear/gguf/gguf_linear.cpp
+index 8d64007a8b3e86a5364c5faf39b14f3290f362d1..d2b8c22b6315b2f61945d892d17fcfd92122472b 100644
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -68,7 +68,7 @@ PrefillRoute prefill_route(GgmlType type, std::int32_t n, std::int32_t k,
+ 
+ std::string prefill_profile_signature(std::span<const int> devices) {
+     if (!enabled()) { return {}; }
+-    std::string result = "mxfp8-e4m3-e8m0-f32-profile-v2\n";
++    std::string result = "mxfp8-e4m3-e8m0-bf16-store-add-profile-v3\n";
+     for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+         const DeviceBinding binding(devices[rank]);
+         result += "rank=" + std::to_string(rank) + '\n';
+@@ -285,8 +285,9 @@ void require_gguf(const Weight& w, const char* label) {
+     }
+ }
+ 
+-std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
+-                                         std::int32_t min_tokens, std::int32_t max_tokens) {
++static std::size_t gguf_project_workspace_impl(std::span<const GgufShape> shapes,
++                                         std::int32_t min_tokens, std::int32_t max_tokens,
++                                         bool bf16_add) {
+     if (shapes.empty() || min_tokens <= 0 || max_tokens < min_tokens) {
+         throw std::invalid_argument("gguf workspace: invalid products or token interval");
+     }
+@@ -335,6 +336,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
+                                      gguf::mxfp8::PrefillEpilogue::Add,
+                                      gguf::mxfp8::PrefillEpilogue::Silu,
+                                      gguf::mxfp8::PrefillEpilogue::Other}) {
++                        if (bf16_add && epi!=gguf::mxfp8::PrefillEpilogue::Add) continue;
+                         const auto route=gguf::mxfp8::prefill_route(
+                             gguf_type(shape.qtype),shape.rows,k,t,epi);
+                         r.q8 |= route==gguf::mxfp8::PrefillRoute::Q8;
+@@ -342,12 +344,14 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
+                         r.lt |= route==gguf::mxfp8::PrefillRoute::Lt;
+                     }
+                     choices.push_back(r);
+-                    if (r.q8 || r.lt) plane_rows=std::max(plane_rows,std::size_t(shape.rows));
++                    if (r.q8 || (r.lt && !bf16_add)) plane_rows=std::max(plane_rows,std::size_t(shape.rows));
+                     if (r.q8) {
+                         fixup |= gguf::has_matrix_kernel(gguf_type(shape.qtype));
+                         decode |= !gguf::has_matrix_kernel(gguf_type(shape.qtype));
+                     }
+-                    if (r.lt) mx_bytes=std::max(mx_bytes,gguf::mxfp8::scratch_bytes(k,shape.rows,t));
++                    if (r.lt) mx_bytes=std::max(mx_bytes,bf16_add
++                        ?gguf::mxfp8::bf16_scratch_bytes(k,shape.rows)
++                        :gguf::mxfp8::scratch_bytes(k,shape.rows,t));
+                 }
+                 if (plane_rows) (void)layout.alloc_bytes(plane_rows*t*sizeof(float));
+                 if (fixup) (void)layout.alloc_bytes(fixup_bound());
+@@ -435,6 +439,16 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
+     return widest;
+ }
+ 
++std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
++                                         std::int32_t min_tokens,std::int32_t max_tokens) {
++    return gguf_project_workspace_impl(shapes,min_tokens,max_tokens,false);
++}
++std::size_t gguf_linear_add_workspace_bytes(const GgufShape& shape,
++                                           std::int32_t first,std::int32_t last) {
++    // Public LinearAdd is a whole, aligned BF16 residual with no row offset.
++    return gguf_project_workspace_impl({&shape,1},first,last,shape.rows%8==0);
++}
++
+ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+                   WorkspaceArena& workspace, cudaStream_t stream, LinearPolicy policy) {
+     require_activation(x, "gguf product");
+@@ -494,7 +508,9 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+         const auto route = gguf::mxfp8::prefill_route(gguf_type(p.weight->qtype),p.weight->n,k,t,epilogue);
+         mx_routes.push_back(route);
+         if (route == gguf::mxfp8::PrefillRoute::Lt) {
+-            mx_bytes=std::max(mx_bytes,gguf::mxfp8::scratch_bytes(k,p.weight->n,t));
++            mx_bytes=std::max(mx_bytes,gguf::mxfp8::takes_bf16_output(output(p,0))
++                ?gguf::mxfp8::bf16_scratch_bytes(k,p.weight->n)
++                :gguf::mxfp8::scratch_bytes(k,p.weight->n,t));
+         }
+       }
+     }
+@@ -503,7 +519,8 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+     for (std::size_t i=0;i<products.size();++i) {
+         const auto& p=products[i];
+         const auto route=mx_routes.empty()?gguf::mxfp8::PrefillRoute::Q8:mx_routes[i];
+-        if (route==gguf::mxfp8::PrefillRoute::Tile) continue;
++        if (route==gguf::mxfp8::PrefillRoute::Tile ||
++            (route==gguf::mxfp8::PrefillRoute::Lt && gguf::mxfp8::takes_bf16_output(output(p,0)))) continue;
+         const bool direct=p.f32!=nullptr && p.epilogue==GgufEpilogue::Store;
+         if (!direct) plane_rows=std::max(plane_rows,p.weight->n);
+         if (route==gguf::mxfp8::PrefillRoute::Q8) {
+@@ -575,6 +592,11 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+                 gguf::mxfp8::quantize(xb,k,t,w.input_columns,data,stream);
+                 activations.push_back({mx_layout,w.input_columns,data});found=activations.end()-1;
+             }
++            if (gguf::mxfp8::takes_bf16_output(output(p,0))) {
++                gguf::mxfp8::bf16_product(type,w.qdata,row_bytes(w),w.n,k,found->data,t,
++                                         output(p,0),mx_scratch,mx_bytes,stream);
++                continue;
++            }
+             gguf::mxfp8::product(type,w.qdata,row_bytes(w),w.n,k,found->data,t,out,stride,mx_scratch,mx_bytes,stream);
+             if(!direct)gguf::store_plane(plane,w.n,w.n,t,output(p,0),stream);
+             continue;
+diff --git a/src/ops/linear/gguf/gguf_linear.h b/src/ops/linear/gguf/gguf_linear.h
+index 13930983a34e58741f460fc62167bb5147e9a1a0..644bcf70b550ccc8a0a22b533e3215df7f79f8f6 100644
+--- a/src/ops/linear/gguf/gguf_linear.h
++++ b/src/ops/linear/gguf/gguf_linear.h
+@@ -61,6 +61,10 @@ struct GgufShape {
+                                                        std::int32_t min_tokens,
+                                                        std::int32_t max_tokens);
+ 
++[[nodiscard]] std::size_t gguf_linear_add_workspace_bytes(const GgufShape& shape,
++                                                           std::int32_t first,
++                                                           std::int32_t last);
++
+ // Runs every product against one BF16 activation x [K,T], quantizing x once per activation layout
+ // (and once more per distinct input gather).
+ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+diff --git a/src/ops/linear/gguf/gguf_mxfp8.cu b/src/ops/linear/gguf/gguf_mxfp8.cu
+index 66ed790782ca82724891cceb5a56883ceb28231d..8a290ecaf6d9ecf05098bbefac7b695c5452d264 100644
+--- a/src/ops/linear/gguf/gguf_mxfp8.cu
++++ b/src/ops/linear/gguf/gguf_mxfp8.cu
+@@ -276,6 +276,7 @@ struct LtKey {
+     int k;
+     std::int64_t ld;
+     bool accumulate;
++    bool bf16;
+     auto operator<=>(const LtKey&) const = default;
+ };
+ 
+@@ -288,8 +289,8 @@ struct LtPlan {
+ };
+ 
+ void lt_gemm(int m, int n, int k, const std::uint8_t* image, const std::uint8_t* image_scales,
+-             const std::uint8_t* x, const std::uint8_t* x_scales, float* out,
+-             std::int64_t ld, bool accumulate, cudaStream_t stream) {
++             const std::uint8_t* x, const std::uint8_t* x_scales, void* out,
++             std::int64_t ld, bool accumulate, bool bf16, cudaStream_t stream) {
+     static std::mutex mutex;
+     static std::map<LtKey, LtPlan> plans;
+     int device = 0;
+@@ -304,7 +305,7 @@ void lt_gemm(int m, int n, int k, const std::uint8_t* image, const std::uint8_t*
+                                                 &x_scales, sizeof x_scales),
+                  "activation scales");
+     };
+-    auto [found, inserted] = plans.try_emplace(LtKey{device, m, n, k, ld, accumulate});
++    auto [found, inserted] = plans.try_emplace(LtKey{device, m, n, k, ld, accumulate, bf16});
+     LtPlan& plan           = found->second;
+     if (inserted) {
+         try {
+@@ -328,7 +329,7 @@ void lt_gemm(int m, int n, int k, const std::uint8_t* image, const std::uint8_t*
+             const cudaDataType_t in_type = CUDA_R_8F_E4M3;
+             check_lt(cublasLtMatrixLayoutCreate(&plan.a, in_type, k, m, k), "image layout");
+             check_lt(cublasLtMatrixLayoutCreate(&plan.b, in_type, k, n, k), "x layout");
+-            check_lt(cublasLtMatrixLayoutCreate(&plan.d, CUDA_R_32F, m, n, ld), "out layout");
++            check_lt(cublasLtMatrixLayoutCreate(&plan.d, bf16?CUDA_R_16BF:CUDA_R_32F, m, n, ld), "out layout");
+             cublasLtMatmulPreference_t preference = nullptr;
+             check_lt(cublasLtMatmulPreferenceCreate(&preference), "preference");
+             const std::size_t workspace = 0;
+@@ -449,8 +450,36 @@ void product(GgmlType type,const void* weight,std::int64_t rb,int rows,int k,con
+         const int count=std::min(pass,rows-first),mp=pad128(count);
+         image(type,{static_cast<const std::uint8_t*>(weight)+std::int64_t(first)*rb,rb,count,k,codes,scales,mp},s);
+         const bool direct=count==mp&&columns==np&&stride%4==0&&reinterpret_cast<std::uintptr_t>(out+first)%16==0;
+-        lt_gemm(mp,np,k,codes,scales,x,xs,direct?out+first:plane,direct?stride:mp,false,s);
++        lt_gemm(mp,np,k,codes,scales,x,xs,direct?out+first:plane,direct?stride:mp,false,false,s);
+         if(!direct){const auto total=std::int64_t(count)*columns;crop<<<unsigned((total+255)/256),256,0,s>>>(plane,mp,count,columns,out+first,stride);check(cudaGetLastError(),"MXFP8 output crop");}
+     }
+ }
++bool takes_bf16_output(const VectorOutput& out) {
++    return out.bf16!=nullptr && out.f32==nullptr &&
++           (out.epilogue==Epilogue::Store || out.epilogue==Epilogue::Accumulate) &&
++           reinterpret_cast<std::uintptr_t>(out.bf16)%16==0 && out.column_stride%8==0;
++}
++std::size_t bf16_scratch_bytes(int k,int rows) {
++    const int p=max_pass(k,rows);
++    return round256(std::size_t(k)*p)+round256(scale_bytes(p,k));
++}
++void bf16_product(GgmlType type,const void* weight,std::int64_t rb,int rows,int k,
++                  const void* activation,int columns,const VectorOutput& out,
++                  void* scratch,std::size_t bytes,cudaStream_t stream) {
++    if (!supported(type,k) || rows<=0 || columns<=0 || !takes_bf16_output(out) ||
++        out.column_stride<rows || bytes<bf16_scratch_bytes(k,rows))
++        throw std::invalid_argument("invalid MXFP8 BF16 product/workspace");
++    const int pass=lt_wave_pass(rows,columns,k,max_pass(k,rows),false);
++    auto* codes=static_cast<std::uint8_t*>(scratch);
++    auto* scales=codes+round256(std::size_t(pass)*k);
++    const auto* x=static_cast<const std::uint8_t*>(activation);
++    const auto* xs=x+round256(std::size_t(k)*pad128(columns));
++    for(int first=0;first<rows;first+=pass) {
++        const int count=std::min(pass,rows-first),mp=pad128(count);
++        image(type,{static_cast<const std::uint8_t*>(weight)+std::int64_t(first)*rb,
++                    rb,count,k,codes,scales,mp},stream);
++        lt_gemm(count,columns,k,codes,scales,x,xs,out.bf16+first,out.column_stride,
++                out.epilogue==Epilogue::Accumulate,true,stream);
++    }
++}
+ } // namespace ninfer::ops::gguf::mxfp8
+diff --git a/src/ops/linear/gguf/gguf_mxfp8.h b/src/ops/linear/gguf/gguf_mxfp8.h
+index 98ac9250c566996c02f89c465712d9af7d6f47d2..f5569e03d32ff33ebf61f56eed1881aff4cfeffb 100644
+--- a/src/ops/linear/gguf/gguf_mxfp8.h
++++ b/src/ops/linear/gguf/gguf_mxfp8.h
+@@ -23,4 +23,10 @@ void quantize(const __nv_bfloat16* x, int k, int columns,
+ void product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
+              const void* activation, int columns, float* out, std::int64_t stride,
+              void* scratch, std::size_t scratch_size, cudaStream_t stream);
++// FP32 accumulation written directly at the public BF16 Store/Add boundary.
++[[nodiscard]] bool takes_bf16_output(const VectorOutput& out);
++[[nodiscard]] std::size_t bf16_scratch_bytes(int k,int rows);
++void bf16_product(GgmlType type,const void* weight,std::int64_t row_bytes,int rows,int k,
++                  const void* activation,int columns,const VectorOutput& out,
++                  void* scratch,std::size_t bytes,cudaStream_t stream);
+ } // namespace ninfer::ops::gguf::mxfp8
+diff --git a/src/ops/wrapper/linear_add.cpp b/src/ops/wrapper/linear_add.cpp
+index d7653114a6ace5a72030c73cd421f3818a956242..23a0d98c56d2aa30b272bd4de5d02949ae325c36 100644
+--- a/src/ops/wrapper/linear_add.cpp
++++ b/src/ops/wrapper/linear_add.cpp
+@@ -149,7 +149,7 @@ std::size_t linear_add_route_workspace_bytes(QType qtype, std::int32_t output_ro
+     }
+     if (is_gguf(qtype)) {
+         const detail::GgufShape shape{qtype, output_rows, input_rows};
+-        return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
++        return detail::gguf_linear_add_workspace_bytes(shape, min_tokens, max_tokens);
+     }
+     if (qtype == QType::T5_G128_FP16) {
+         if (output_rows <= 0) { throw std::invalid_argument("linear_add workspace: T5 rows must be positive"); }
+diff --git a/tests/ops/linear/test_gguf_mxfp8.cpp b/tests/ops/linear/test_gguf_mxfp8.cpp
+index 86b3f4c529a645d94b7815726a09bf1506a2a7ed..c8ecdd97422b25a570f1f3811e3b3f6afca4f23c 100644
+--- a/tests/ops/linear/test_gguf_mxfp8.cpp
++++ b/tests/ops/linear/test_gguf_mxfp8.cpp
+@@ -157,6 +157,7 @@ void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
+     const auto product_capacity=ops::linear_workspace_capacity_bytes(
+         f.q,n,k,ops::LinearPolicy::A16Only,t,t);
+     WorkspaceArena workspace(product_capacity);
++    WorkspaceArena add_workspace(ops::linear_add_workspace_capacity_bytes(f.q,n,k,ops::LinearPolicy::A16Only,t,t));
+     DeviceBuffer out(std::size_t(n)*t*4+32);out.fill(0x42);
+     auto* fp=static_cast<float*>(out.p)+4;Tensor ty(fp,DType::FP32,{n,t});
+     std::vector<float> got(std::size_t(n)*t);
+@@ -203,9 +204,21 @@ void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
+         for(std::size_t i=0;i<got.size();++i)got[i]=__bfloat162float(bh[i]);
+         error(got,ref,.004,.003,"MXFP8 BF16 store");
+         std::fill(bh.begin(),bh.end(),__float2bfloat16(.25f));bf.copy_from_host(bh.data(),bh.size()*2);
+-        ops::linear_add(tx,w,by,ops::LinearPolicy::A16Only,workspace,nullptr);
++        ops::linear_add(tx,w,by,ops::LinearPolicy::A16Only,add_workspace,nullptr);
+         bf.copy_to_host(bh.data(),bh.size()*2);auto add=ref;for(auto&v:add)v+=.25;
+         for(std::size_t i=0;i<got.size();++i)got[i]=__bfloat162float(bh[i]);error(got,add,.004,.003,"MXFP8 residual");
++        {
++            std::fill(bh.begin(),bh.end(),__float2bfloat16(.25f));bf.copy_from_host(bh.data(),bh.size()*2);
++            cudaStream_t cs;checked(cudaStreamCreateWithFlags(&cs,cudaStreamNonBlocking));
++            checked(cudaStreamBeginCapture(cs,cudaStreamCaptureModeGlobal));
++            ops::linear_add(tx,w,by,ops::LinearPolicy::A16Only,add_workspace,cs);
++            cudaGraph_t cg;checked(cudaStreamEndCapture(cs,&cg));cudaGraphExec_t ce;
++            checked(cudaGraphInstantiate(&ce,cg,nullptr,nullptr,0));checked(cudaGraphLaunch(ce,cs));checked(cudaStreamSynchronize(cs));
++            bf.copy_to_host(bh.data(),bh.size()*2);
++            for(std::size_t i=0;i<got.size();++i)got[i]=__bfloat162float(bh[i]);
++            error(got,add,.004,.003,"MXFP8 BF16 Add graph");
++            checked(cudaGraphExecDestroy(ce));checked(cudaGraphDestroy(cg));checked(cudaStreamDestroy(cs));
++        }
+         if(fusion){
+             parent.input_columns=w.input_columns;
+             ops::linear_swiglu(tx,parent,by,ops::LinearPolicy::A16Only,gated_workspace,nullptr);bf.copy_to_host(bh.data(),bh.size()*2);
+@@ -221,7 +234,7 @@ void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
+         checked(cudaMemcpy(got.data(),fp,got.size()*4,cudaMemcpyDeviceToHost));error(got,ref,1e-4,3e-5,"MXFP8 graph");
+         checked(cudaGraphExecDestroy(exe));checked(cudaGraphDestroy(graph));checked(cudaStreamDestroy(stream));
+     }
+-    if(workspace.peak_used()>product_capacity || gated_workspace.peak_used()>capacity)throw std::runtime_error("workspace exceeds capacity query");
++    if(workspace.peak_used()>product_capacity || gated_workspace.peak_used()>capacity || add_workspace.peak_used()>add_workspace.capacity())throw std::runtime_error("workspace exceeds capacity query");
+ }
+ void route_boundaries() {
+     using R=mx::PrefillRoute;using E=mx::PrefillEpilogue;
+@@ -428,11 +441,12 @@ int main(int argc,char** argv){try{
+             for (int t:{256,512,1024}) std::cout<<"WORKSPACE IQ3_S 17408x5120 T="<<t<<" bytes="
+                 <<ops::detail::gguf_project_workspace_bytes({&problem,1},1,t)<<"\n";
+     }
++    for (const auto& format:formats) for(int t:{512,1024}) run(format,128,256,t,true);
+     route_boundaries();
+     if(argc==2 && std::string_view(argv[1])=="--lt512") {
+         const auto saved=ops::installed_device_route_profile();
+         auto measured=std::make_shared<ops::DeviceRouteProfile>();
+-        for(const auto& format:formats)for(const auto shape:std::array<mx::PrefillShape,3>{{{17,256},{17,5120},{3,17408}}})
++        for(const auto& format:formats)for(const auto shape:std::array<mx::PrefillShape,4>{{{17,256},{17,5120},{3,17408},{128,256}}})
+             for(auto epi:mx::kPrefillEpilogues)
+                 measured->routes[mx::prefill_route_key(ops::detail::gguf_type(format.q),shape.n,shape.k,epi)]={{511,"tile"},{512,"lt"}};
+         ops::install_device_route_profile(measured);
+@@ -443,6 +457,7 @@ int main(int argc,char** argv){try{
+                mx::prefill_route(type,17,256,513,mx::PrefillEpilogue::F32)!=mx::PrefillRoute::Tile)
+                 throw std::runtime_error("Lt512 exact-width profile route");
+             for(int t:{511,512,513})run(format,17,256,t,true);
++            run(format,128,256,512,true);
+         }
+         for(int i:{1,5}){run(formats[i],17,5120,512,true);run(formats[i],3,17408,512,true);}
+         ops::install_device_route_profile(saved);

@@ -1,0 +1,119 @@
+diff --git a/docs/gguf-mxfp8-prefill.md b/docs/gguf-mxfp8-prefill.md
+index 6ed25aec54d8fe46ed3f71c9cbfc5302ef021972..fae02d3bb817414e88d238bc2c2b531cbc73874f 100644
+--- a/docs/gguf-mxfp8-prefill.md
++++ b/docs/gguf-mxfp8-prefill.md
+@@ -152,3 +152,17 @@ Validation is staged: public independent CPU/FP64 operations, exact capacities,
+ BF16 Add Graph replay, sanitizer, same-GPU inference and fixed-corpus incremental
+ PPL. These changes do not establish lossless FP8 or generalize 5060 Ti timings to
+ other hardware. The 64 MiB weight image limit is still used at this stage.
++
++## Measured weight-image capacity
++
++The `gguf_prefill_mxfp8/weight-image` device-profile key selects `10.5mib`,
++`16mib`, `32mib` or `64mib`; absent or unknown schedules retain 64 MiB.
++The 36-SM RTX 5060 Ti builtin selects 32 MiB after same-device 256/512/1024
++ordinary/KVMem comparisons and independent CPU/FP64/Graph/memory qualification.
++Other hardware keeps 64 MiB. No automatic image-budget calibration is added.
++The key is part of the serialized numerical/cost profile signature.
++
++The reference's 10.5 MiB candidate reduced sampled card use by 98 MiB at
++chunk1024 but regressed ordinary/KVMem throughput by 3.70%/3.50%; it was rejected.
++The selected budget preserves actual-amax encoding and FP32 gate/up intermediates.
++No BF16 gated intermediate or new weight quantizer is adopted.
+diff --git a/src/ops/linear/gguf/gguf_linear.cpp b/src/ops/linear/gguf/gguf_linear.cpp
+index d2b8c22b6315b2f61945d892d17fcfd92122472b..1f55ecf0e1d52b2e6e32af06ac2efd614bd84583 100644
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -26,6 +26,14 @@ bool enabled() {
+     return value;
+ }
+ 
++std::size_t weight_image_bytes() {
++    const auto schedule=device_route_schedule("gguf_prefill_mxfp8/weight-image",1);
++    if (schedule=="10.5mib") return 21ULL<<19;
++    if (schedule=="16mib") return 16ULL<<20;
++    if (schedule=="32mib") return 32ULL<<20;
++    return 64ULL<<20;
++}
++
+ std::string prefill_route_key(GgmlType type, std::int32_t n, std::int32_t k,
+                               PrefillEpilogue epilogue) {
+     std::string_view format;
+diff --git a/src/ops/linear/gguf/gguf_mxfp8.cu b/src/ops/linear/gguf/gguf_mxfp8.cu
+index 8a290ecaf6d9ecf05098bbefac7b695c5452d264..39584a632be6c47ad776fccfd89dcf65882688fc 100644
+--- a/src/ops/linear/gguf/gguf_mxfp8.cu
++++ b/src/ops/linear/gguf/gguf_mxfp8.cu
+@@ -21,7 +21,7 @@ using ninfer::ops::gguf::detail::device_facts;
+ constexpr int kImageThreads = 256;
+ constexpr int kTileQuantizeThreads = 128;
+ // A bounded 64 MiB image amortizes cuBLASLt dispatch on the dense prefill shapes.
+-constexpr std::size_t kImageBytes = 64ULL << 20;
++// The backend profile bounds the caller-owned image; unknown devices retain 64 MiB.
+ std::size_t round256(std::size_t n) { return (n + 255) / 256 * 256; }
+ int pad128(int n) { return (n + 127) / 128 * 128; }
+ __host__ __device__ constexpr std::size_t lt_scale_offset(int row,int group,int groups) {
+@@ -29,7 +29,7 @@ __host__ __device__ constexpr std::size_t lt_scale_offset(int row,int group,int
+            std::size_t(row%32)*16 + std::size_t(row%128/32)*4 + std::size_t(group%4);
+ }
+ std::size_t scale_bytes(int rows,int k) { return std::size_t(pad128(rows)) * ((k/32+3)/4)*4; }
+-int max_pass(int k,int rows) { return std::min(pad128(rows),std::max(128,int(kImageBytes/k)/128*128)); }
++int max_pass(int k,int rows) { return std::min(pad128(rows),std::max(128,int(weight_image_bytes()/k)/128*128)); }
+ // ceil(log2(amax/448)), clamped to E8M0's finite scale range. frexp avoids underflow
+ // of amax/448 for tiny finite BF16 values. All-zero blocks use scale one.
+ __device__ __forceinline__ unsigned exponent(float amax) {
+diff --git a/src/ops/linear/gguf/gguf_mxfp8.h b/src/ops/linear/gguf/gguf_mxfp8.h
+index f5569e03d32ff33ebf61f56eed1881aff4cfeffb..352d77e8ec81cb75ef2aad218d15edf4db6f5c54 100644
+--- a/src/ops/linear/gguf/gguf_mxfp8.h
++++ b/src/ops/linear/gguf/gguf_mxfp8.h
+@@ -16,6 +16,7 @@ void quantize_tile(const __nv_bfloat16* x, int k, int columns,
+ void tile_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
+                   const void* activation, int columns, const VectorOutput& out,
+                   cudaStream_t stream);
++[[nodiscard]] std::size_t weight_image_bytes();
+ [[nodiscard]] std::size_t activation_bytes(int k, int columns);
+ [[nodiscard]] std::size_t scratch_bytes(int k, int rows, int columns);
+ void quantize(const __nv_bfloat16* x, int k, int columns,
+diff --git a/src/runtime/engine/device_profiles.json b/src/runtime/engine/device_profiles.json
+index 859abf8df8ced37ecaac51ba1efd731aa1b576ee..12b61f63c1d246112c8dc26f48dfa39b3c0b6a60 100644
+--- a/src/runtime/engine/device_profiles.json
++++ b/src/runtime/engine/device_profiles.json
+@@ -431,6 +431,7 @@
+       "multiprocessors": 36,
+       "origin": "built in: RTX 5060 Ti at 180 W, 2026-10-16; GGUF Q4_K/Q6_K dense loads, CUDA 13.2, 2026-11-01; MXFP8 T256 shape/epilogue routes, two calibrated runs, 2026-11-02; Lt512 78 measured shape/epilogue routes, 2026-11-03",
+       "routes": {
++        "gguf_prefill_mxfp8/weight-image": [[2147483647, "32mib"]],
+         "gguf_prefill_mxfp8/iq2_xxs/1024x5120/bf16-silu": [
+           [
+             256,
+diff --git a/tests/ops/linear/test_gguf_mxfp8.cpp b/tests/ops/linear/test_gguf_mxfp8.cpp
+index c8ecdd97422b25a570f1f3811e3b3f6afca4f23c..d387a0db9627a1e8dd682629714c2941d6b4698a 100644
+--- a/tests/ops/linear/test_gguf_mxfp8.cpp
++++ b/tests/ops/linear/test_gguf_mxfp8.cpp
+@@ -388,7 +388,7 @@ void large_slab(const Format& f) {
+     // Cross the former 1536-row / 8 MiB boundary at K=5120. Independently decode
+     // every packed value, then evaluate FP64 dots at both sides of that boundary
+     // and the actual/padded row and column tile tails.
+-    constexpr int n=1665,k=5120,t=1024;
++    constexpr int n=2177,k=5120,t=1024;
+     const auto b=gguf_block_shape(f.q);const auto rb=std::int64_t(k/b.elements)*b.bytes;
+     std::mt19937 rng(8826);std::vector<unsigned char> raw(n*rb+256);
+     for(std::size_t i=0;i<std::size_t(n)*rb;++i)raw[i]=static_cast<unsigned char>(rng()%256);
+@@ -409,7 +409,7 @@ void large_slab(const Format& f) {
+     cudaGraph_t graph;checked(cudaStreamEndCapture(stream,&graph));cudaGraphExec_t exe;checked(cudaGraphInstantiate(&exe,graph,nullptr,nullptr,0));checked(cudaGraphLaunch(exe,stream));checked(cudaStreamSynchronize(stream));
+     std::vector<float> all(n*t);checked(cudaMemcpy(all.data(),result,all.size()*4,cudaMemcpyDeviceToHost));
+     std::vector<float> got;std::vector<double> ref;
+-    for(int c:{0,1,127,128,1023})for(int r:{0,127,128,1535,1536,1664}) {
++    for(int c:{0,1,127,128,1023})for(int r:{0,127,128,1535,1536,2047,2048,2176}) {
+         double sum=0;for(int j=0;j<k;++j)sum+=double(qw[r*k+j])*qx[c*k+j];
+         ref.push_back(sum);got.push_back(all[c*n+r]);
+     }
+@@ -423,6 +423,9 @@ void large_slab(const Format& f) {
+ int main(int argc,char** argv){try{
+     if(!mx::enabled())throw std::runtime_error("test requires NINFER_GGUF_PREFILL_MXFP8=1");
+     if(!mx::supported(ops::gguf::GgmlType::IQ3_S,256)){std::cout<<"SKIP MXFP8 requires sm120\n";return 77;}
++    std::unique_ptr<ops::DeviceRouteForce> image_force;
++    if (argc==2 && (std::string_view(argv[1])=="--compact" || std::string_view(argv[1])=="--image32"))
++        image_force=std::make_unique<ops::DeviceRouteForce>("gguf_prefill_mxfp8/weight-image",std::string_view(argv[1])=="--image32"?"32mib":"10.5mib");
+     activation_codec();
+     std::vector<Format> formats={{QType::GGUF_IQ3_XXS,"iq3_xxs",{0}},{QType::GGUF_IQ3_S,"iq3_s",{0}},{QType::GGUF_IQ2_XXS,"iq2_xxs",{0}},{QType::GGUF_IQ2_XS,"iq2_xs",{0}},{QType::GGUF_IQ2_S,"iq2_s",{0}},{QType::GGUF_IQ4_XS,"iq4_xs",{0}},{QType::GGUF_Q2_K,"q2_k",{80,82}},{QType::GGUF_Q4_K,"q4_k",{0,2}}};
+     for(const auto& format:formats) {

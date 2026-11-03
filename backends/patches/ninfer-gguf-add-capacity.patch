@@ -1,0 +1,141 @@
+diff --git a/docs/gguf-mxfp8-prefill.md b/docs/gguf-mxfp8-prefill.md
+index fae02d3bb817414e88d238bc2c2b531cbc73874f..65c29c4498c12ada84e3d3e8d94da061a2595938 100644
+--- a/docs/gguf-mxfp8-prefill.md
++++ b/docs/gguf-mxfp8-prefill.md
+@@ -145,8 +145,9 @@ The BF16 Lt Store/Add route follows ninfer-5060-qwen@08c4fb70: FP32 accumulation
+ FP32 destinations and unaligned BF16 calls retain the prior path. Weight decoding,
+ actual per-group amax and E4M3/E8M0 coding are unchanged. Residual addition within
+ GEMM may round differently; the numerical state/cost signature is profile-v3.
+-The LinearAdd capacity query uses its known whole BF16 output; generic projection
+-queries remain conservative for outputs whose type/layout is unknown.
++The LinearAdd capacity query knows the Add epilogue but not the residual base
++alignment. It therefore reserves the FP32 fallback as well; aligned execution
++still writes BF16 directly. Generic queries bound every supported output route.
+ 
+ Validation is staged: public independent CPU/FP64 operations, exact capacities,
+ BF16 Add Graph replay, sanitizer, same-GPU inference and fixed-corpus incremental
+diff --git a/src/ops/linear/gguf/gguf_linear.cpp b/src/ops/linear/gguf/gguf_linear.cpp
+index 1f55ecf0e1d52b2e6e32af06ac2efd614bd84583..780a936f10a6025e619ee87adbe9cd1dfdf621aa 100644
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -295,7 +295,7 @@ void require_gguf(const Weight& w, const char* label) {
+ 
+ static std::size_t gguf_project_workspace_impl(std::span<const GgufShape> shapes,
+                                          std::int32_t min_tokens, std::int32_t max_tokens,
+-                                         bool bf16_add) {
++                                         bool add_only) {
+     if (shapes.empty() || min_tokens <= 0 || max_tokens < min_tokens) {
+         throw std::invalid_argument("gguf workspace: invalid products or token interval");
+     }
+@@ -344,7 +344,7 @@ static std::size_t gguf_project_workspace_impl(std::span<const GgufShape> shapes
+                                      gguf::mxfp8::PrefillEpilogue::Add,
+                                      gguf::mxfp8::PrefillEpilogue::Silu,
+                                      gguf::mxfp8::PrefillEpilogue::Other}) {
+-                        if (bf16_add && epi!=gguf::mxfp8::PrefillEpilogue::Add) continue;
++                        if (add_only && epi!=gguf::mxfp8::PrefillEpilogue::Add) continue;
+                         const auto route=gguf::mxfp8::prefill_route(
+                             gguf_type(shape.qtype),shape.rows,k,t,epi);
+                         r.q8 |= route==gguf::mxfp8::PrefillRoute::Q8;
+@@ -352,14 +352,16 @@ static std::size_t gguf_project_workspace_impl(std::span<const GgufShape> shapes
+                         r.lt |= route==gguf::mxfp8::PrefillRoute::Lt;
+                     }
+                     choices.push_back(r);
+-                    if (r.q8 || (r.lt && !bf16_add)) plane_rows=std::max(plane_rows,std::size_t(shape.rows));
++                    if (r.q8 || r.lt) plane_rows=std::max(plane_rows,std::size_t(shape.rows));
+                     if (r.q8) {
+                         fixup |= gguf::has_matrix_kernel(gguf_type(shape.qtype));
+                         decode |= !gguf::has_matrix_kernel(gguf_type(shape.qtype));
+                     }
+-                    if (r.lt) mx_bytes=std::max(mx_bytes,bf16_add
+-                        ?gguf::mxfp8::bf16_scratch_bytes(k,shape.rows)
+-                        :gguf::mxfp8::scratch_bytes(k,shape.rows,t));
++                    // The public capacity query has no output pointer. Even a
++                    // whole-BF16 shape needs the FP32 fallback when its base
++                    // address is not 16-byte aligned.
++                    if (r.lt) mx_bytes=std::max(mx_bytes,
++                        gguf::mxfp8::scratch_bytes(k,shape.rows,t));
+                 }
+                 if (plane_rows) (void)layout.alloc_bytes(plane_rows*t*sizeof(float));
+                 if (fixup) (void)layout.alloc_bytes(fixup_bound());
+@@ -453,8 +455,8 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
+ }
+ std::size_t gguf_linear_add_workspace_bytes(const GgufShape& shape,
+                                            std::int32_t first,std::int32_t last) {
+-    // Public LinearAdd is a whole, aligned BF16 residual with no row offset.
+-    return gguf_project_workspace_impl({&shape,1},first,last,shape.rows%8==0);
++    // LinearAdd fixes the epilogue, but not the residual's base alignment.
++    return gguf_project_workspace_impl({&shape,1},first,last,true);
+ }
+ 
+ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+diff --git a/tests/ops/linear/test_gguf_mxfp8.cpp b/tests/ops/linear/test_gguf_mxfp8.cpp
+index d387a0db9627a1e8dd682629714c2941d6b4698a..77532b47cf9313dc5a369d62233551d05f02a8cb 100644
+--- a/tests/ops/linear/test_gguf_mxfp8.cpp
++++ b/tests/ops/linear/test_gguf_mxfp8.cpp
+@@ -25,6 +25,7 @@ extern "C" void gguf_cpu_decode(int, const void*, float*, int);
+ namespace {
+ using namespace ninfer;
+ namespace mx=ops::gguf::mxfp8;
++bool check_unaligned=false;
+ void checked(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
+ double fp8_value(unsigned c){
+     const int e=(c>>3)&15,m=c&7;
+@@ -219,6 +220,23 @@ void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
+             error(got,add,.004,.003,"MXFP8 BF16 Add graph");
+             checked(cudaGraphExecDestroy(ce));checked(cudaGraphDestroy(cg));checked(cudaStreamDestroy(cs));
+         }
++        if (check_unaligned) {
++            // The public GGUF LinearAdd contract accepts contiguous BF16
++            // residuals without requiring a 16-byte base address.
++            DeviceBuffer shifted(std::size_t(n)*t*2+32);shifted.fill(0x42);
++            auto* destination=static_cast<__nv_bfloat16*>(shifted.p)+1;
++            Tensor unaligned(destination,DType::BF16,{n,t});
++            std::fill(bh.begin(),bh.end(),__float2bfloat16(.25f));
++            checked(cudaMemcpy(destination,bh.data(),bh.size()*2,cudaMemcpyHostToDevice));
++            ops::linear_add(tx,w,unaligned,ops::LinearPolicy::A16Only,add_workspace,nullptr);
++            checked(cudaMemcpy(bh.data(),destination,bh.size()*2,cudaMemcpyDeviceToHost));
++            for(std::size_t i=0;i<got.size();++i)got[i]=__bfloat162float(bh[i]);
++            error(got,add,.004,.003,"MXFP8 unaligned BF16 Add exact-capacity oracle");
++            std::vector<unsigned char> guard(shifted.bytes);shifted.copy_to_host(guard.data(),guard.size());
++            for(std::size_t i=0;i<guard.size();++i)
++                if ((i<2 || i>=2+std::size_t(n)*t*2) && guard[i]!=0x42)
++                    throw std::runtime_error("unaligned BF16 output guard");
++        }
+         if(fusion){
+             parent.input_columns=w.input_columns;
+             ops::linear_swiglu(tx,parent,by,ops::LinearPolicy::A16Only,gated_workspace,nullptr);bf.copy_to_host(bh.data(),bh.size()*2);
+@@ -428,6 +446,18 @@ int main(int argc,char** argv){try{
+         image_force=std::make_unique<ops::DeviceRouteForce>("gguf_prefill_mxfp8/weight-image",std::string_view(argv[1])=="--image32"?"32mib":"10.5mib");
+     activation_codec();
+     std::vector<Format> formats={{QType::GGUF_IQ3_XXS,"iq3_xxs",{0}},{QType::GGUF_IQ3_S,"iq3_s",{0}},{QType::GGUF_IQ2_XXS,"iq2_xxs",{0}},{QType::GGUF_IQ2_XS,"iq2_xs",{0}},{QType::GGUF_IQ2_S,"iq2_s",{0}},{QType::GGUF_IQ4_XS,"iq4_xs",{0}},{QType::GGUF_Q2_K,"q2_k",{80,82}},{QType::GGUF_Q4_K,"q4_k",{0,2}}};
++    if (argc==2 && std::string_view(argv[1])=="--unaligned") {
++        check_unaligned=true;
++        const auto saved=ops::installed_device_route_profile();
++        auto profile=std::make_shared<ops::DeviceRouteProfile>();
++        const auto type=ops::detail::gguf_type(formats[1].q);
++        profile->routes[mx::prefill_route_key(type,128,256,mx::PrefillEpilogue::Add)]={{511,"tile"},{512,"lt"}};
++        ops::install_device_route_profile(profile);
++        for (int t:{512,1024}) run(formats[1],128,256,t,false);
++        ops::install_device_route_profile(saved);
++        std::cout<<"Unaligned BF16 Add public exact-capacity regression passed\n";
++        return 0;
++    }
+     for(const auto& format:formats) {
+         weight_codec(format,17,256);
+         weight_codec(format,128,5120);
+diff --git a/tests/ops/linear/tests.cmake b/tests/ops/linear/tests.cmake
+index 866b332336584d3d1d13352d8a9efe894c78c138..e0b6133da59d08539ca36f7dfb4341b20757b9ef 100644
+--- a/tests/ops/linear/tests.cmake
++++ b/tests/ops/linear/tests.cmake
+@@ -120,6 +120,11 @@ target_include_directories(ninfer_linear_gguf_mxfp8_test PRIVATE
+ ninfer_stage_runtime_dlls(ninfer_linear_gguf_mxfp8_test)
+ set_tests_properties(ninfer_linear_gguf_mxfp8_test PROPERTIES
+   ENVIRONMENT "NINFER_GGUF_PREFILL_MXFP8=1;NINFER_GGUF_PREFILL_NVFP4=0")
++add_test(NAME ninfer_linear_gguf_mxfp8_unaligned_test
++  COMMAND ninfer_linear_gguf_mxfp8_test --unaligned)
++set_tests_properties(ninfer_linear_gguf_mxfp8_unaligned_test PROPERTIES
++  SKIP_RETURN_CODE 77
++  ENVIRONMENT "NINFER_GGUF_PREFILL_MXFP8=1;NINFER_GGUF_PREFILL_NVFP4=0")
+ 
+ ninfer_add_op_test(ninfer_linear_gguf_mmq_store_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mmq_store.cu"

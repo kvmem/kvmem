@@ -1,0 +1,347 @@
+diff --git a/src/ops/linear/gguf/ggml_bridge.cu b/src/ops/linear/gguf/ggml_bridge.cu
+index 0aa62279baee143e99c4147414aec1d6d74ea595..bb3468d0b3180d188fae95640f6b0ed5423eecda 100644
+--- a/src/ops/linear/gguf/ggml_bridge.cu
++++ b/src/ops/linear/gguf/ggml_bridge.cu
+@@ -366,6 +366,44 @@ __global__ void store_plane_kernel(const float* __restrict__ in, std::int64_t in
+     vec_store(out, row, column, in[column * in_column_stride + row]);
+ }
+ 
++// The same scalar FP32 arithmetic, eight independent rows per thread. Only the
++// aligned loads/stores are widened; BF16 is rounded once at the existing final
++// store boundary. Activation-bearing outputs keep the original scalar route.
++template <Epilogue epi>
++__global__ void store_plane_vector_kernel(const float* __restrict__ in,
++                                          std::int64_t in_column_stride, int rows, VecStore out) {
++    static_assert(epi == Epilogue::Store || epi == Epilogue::Accumulate);
++    const int first = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
++    const int column = blockIdx.y;
++    if (first >= rows) { return; }
++    if (rows - first < 8) {
++        for (int row = first; row < rows; ++row) {
++            vec_store(out, row, column, in[std::int64_t(column) * in_column_stride + row]);
++        }
++        return;
++    }
++    const float* source = in + std::int64_t(column) * in_column_stride + first;
++    const float4 values[2] = {*reinterpret_cast<const float4*>(source),
++                              *reinterpret_cast<const float4*>(source + 4)};
++    uint4 prior;
++    auto* destination = out.bf16 + std::int64_t(column) * out.column_stride + first;
++    if constexpr (epi == Epilogue::Accumulate) {
++        prior = *reinterpret_cast<const uint4*>(destination);
++    }
++    uint4 packed;
++    auto* result = reinterpret_cast<__nv_bfloat16*>(&packed);
++    const auto* previous = reinterpret_cast<const __nv_bfloat16*>(&prior);
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        float value = reinterpret_cast<const float*>(values)[i];
++        if constexpr (epi == Epilogue::Accumulate) {
++            value += __bfloat162float(previous[i]);
++        }
++        result[i] = __float2bfloat16(value);
++    }
++    *reinterpret_cast<uint4*>(destination) = packed;
++}
++
+ __global__ void gather_columns_kernel(const __nv_bfloat16* __restrict__ x, int k,
+                                       const std::int32_t* __restrict__ input_columns,
+                                       __nv_bfloat16* __restrict__ out) {
+@@ -1218,6 +1256,27 @@ void store_plane(const float* in, std::int64_t in_column_stride, int rows, int c
+     const detail::VecStore store{out.bf16,     out.f32,  out.column_stride,
+                                  out.epilogue, out.gate, out.gate_column_stride,
+                                  static_cast<int>(out.activation)};
++    const auto aligned = [](const void* pointer) {
++        return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0;
++    };
++    // Keep narrow calls and every unaligned/FP32 view on the existing route.
++    // The last partial group is handled scalarly without reading its padding.
++    if (out.bf16 != nullptr &&
++        (out.epilogue == Epilogue::Store || out.epilogue == Epilogue::Accumulate) &&
++        rows >= 256 && columns >= 256 &&
++        in_column_stride % 4 == 0 && out.column_stride % 8 == 0 &&
++        aligned(in) && aligned(out.bf16)) {
++        const dim3 grid(unsigned((std::uint64_t(rows) + 1023) / 1024), columns, 1);
++        if (out.epilogue == Epilogue::Store) {
++            detail::store_plane_vector_kernel<Epilogue::Store><<<grid, 128, 0, stream>>>(
++                in, in_column_stride, rows, store);
++        } else {
++            detail::store_plane_vector_kernel<Epilogue::Accumulate><<<grid, 128, 0, stream>>>(
++                in, in_column_stride, rows, store);
++        }
++        detail::check(cudaGetLastError(), "vector store plane launch");
++        return;
++    }
+     detail::store_plane_kernel<<<dim3((rows + 255) / 256, columns, 1), 256, 0, stream>>>(
+         in, in_column_stride, rows, store);
+     detail::check(cudaGetLastError(), "store plane launch");
+diff --git a/tests/ops/linear/test_gguf_epilogue.cu b/tests/ops/linear/test_gguf_epilogue.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f524eaba51ba74da186388d27f6fb50aa53d93b
+--- /dev/null
++++ b/tests/ops/linear/test_gguf_epilogue.cu
+@@ -0,0 +1,246 @@
++// Preserve the FP32 -> epilogue -> BF16 boundary against a frozen scalar GPU
++// route, and independently check the represented mathematics on the CPU. The
++// scalar comparison alone is not the mathematical correctness oracle.
++#include "ops/linear/gguf/ggml_bridge.h"
++#include "ops/common/silu.h"
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <iostream>
++#include <stdexcept>
++#include <string_view>
++#include <vector>
++
++namespace {
++namespace gg = ninfer::ops::gguf;
++void check(cudaError_t status) {
++    if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
++}
++struct Buffer {
++    void* data = nullptr;
++    explicit Buffer(std::size_t bytes) { check(cudaMalloc(&data, bytes)); }
++    ~Buffer() { if (data) { cudaFree(data); } }
++    Buffer(const Buffer&) = delete;
++    Buffer& operator=(const Buffer&) = delete;
++};
++__global__ void scalar_reference(const float* in, std::int64_t stride, int rows,
++                                  gg::VectorOutput out) {
++    const int row = blockIdx.x * blockDim.x + threadIdx.x;
++    const int column = blockIdx.y;
++    if (row >= rows) { return; }
++    float value = in[std::int64_t(column) * stride + row];
++    const auto at = std::int64_t(column) * out.column_stride + row;
++    if (out.epilogue == gg::Epilogue::GateProduct) {
++        const float gate = out.gate[std::int64_t(column) * out.gate_column_stride + row];
++        value *= out.activation == gg::GateActivation::Silu
++                     ? ninfer::ops::portable_silu(gate) : ninfer::ops::gelu_tanh(gate);
++    }
++    if (out.f32 != nullptr) {
++        out.f32[at] = out.epilogue == gg::Epilogue::Accumulate ? out.f32[at] + value : value;
++    } else {
++        if (out.epilogue == gg::Epilogue::Accumulate) { value += __bfloat162float(out.bf16[at]); }
++        out.bf16[at] = __float2bfloat16(value);
++    }
++}
++std::uint16_t bf16_bits(float value) {
++    std::uint32_t bits;
++    std::memcpy(&bits, &value, 4);
++    // The fixtures contain finite values only. Round to nearest, ties to even.
++    return std::uint16_t((bits + 0x7FFFU + ((bits >> 16) & 1U)) >> 16);
++}
++float bf16_value(std::uint16_t bits) {
++    const std::uint32_t word = std::uint32_t(bits) << 16;
++    float value;
++    std::memcpy(&value, &word, 4);
++    return value;
++}
++struct Shape {
++    int rows, columns, in_stride, out_stride, gate_stride;
++    int input_shift = 0, output_shift = 0, gate_shift = 0;
++};
++void qualify(const Shape& s, gg::Epilogue epi, bool fp32, gg::GateActivation activation,
++             bool graph) {
++    const std::size_t input_offset = 8 + s.input_shift;
++    const std::size_t gate_offset = 8 + s.gate_shift;
++    const std::size_t output_offset = 32 + s.output_shift * (fp32 ? 4 : 2);
++    const std::size_t input_count = input_offset + std::size_t(s.columns - 1) * s.in_stride + s.rows;
++    const std::size_t gate_count = gate_offset + std::size_t(s.columns - 1) * s.gate_stride + s.rows;
++    const std::size_t output_count = std::size_t(s.columns) * s.out_stride;
++    const std::size_t bytes = output_offset + output_count * (fp32 ? 4 : 2) + 32;
++    std::vector<float> input(input_count), gate(gate_count);
++    for (std::size_t i = 0; i < input.size(); ++i) {
++        input[i] = float(int(i % 257) - 128) * 0.0625F;
++        if (i % 13 == 0) { input[i] = -0.0F; }
++        if (i % 17 == 0) { input[i] = 1.00390625F; } // BF16 midpoint, even lower value.
++        if (i % 19 == 0) { input[i] = 1.01171875F; } // BF16 midpoint, odd lower value.
++    }
++    for (std::size_t i = 0; i < gate.size(); ++i) {
++        gate[i] = float(int(i % 509) - 254) * 0.0625F;
++    }
++    std::vector<unsigned char> seed(bytes, 0x42), actual(bytes), reference(bytes);
++    if (epi == gg::Epilogue::Accumulate) {
++        for (int c = 0; c < s.columns; ++c) for (int row = 0; row < s.rows; ++row) {
++            const auto at = std::size_t(c) * s.out_stride + row;
++            const float value = float(int(at % 31) - 15) * 0.03125F;
++            if (fp32) { std::memcpy(seed.data() + output_offset + 4 * at, &value, 4); }
++            else {
++                const auto bits = bf16_bits(value);
++                std::memcpy(seed.data() + output_offset + 2 * at, &bits, 2);
++            }
++        }
++    }
++    Buffer di(input.size() * 4), dg(gate.size() * 4), da(bytes), dr(bytes), ds(bytes);
++    check(cudaMemcpy(di.data, input.data(), input.size() * 4, cudaMemcpyHostToDevice));
++    check(cudaMemcpy(dg.data, gate.data(), gate.size() * 4, cudaMemcpyHostToDevice));
++    check(cudaMemcpy(ds.data, seed.data(), bytes, cudaMemcpyHostToDevice));
++    check(cudaMemcpy(dr.data, seed.data(), bytes, cudaMemcpyHostToDevice));
++    gg::VectorOutput output;
++    output.column_stride = s.out_stride;
++    output.epilogue = epi;
++    output.gate = static_cast<const float*>(dg.data) + gate_offset;
++    output.gate_column_stride = s.gate_stride;
++    output.activation = activation;
++    const auto bind = [&](void* memory) {
++        auto view = output;
++        auto* at = static_cast<unsigned char*>(memory) + output_offset;
++        if (fp32) { view.f32 = reinterpret_cast<float*>(at); }
++        else { view.bf16 = reinterpret_cast<__nv_bfloat16*>(at); }
++        return view;
++    };
++    const auto* source = static_cast<const float*>(di.data) + input_offset;
++    scalar_reference<<<dim3((s.rows + 255) / 256, s.columns), 256>>>(source, s.in_stride, s.rows, bind(dr.data));
++    check(cudaGetLastError());
++    cudaStream_t stream;
++    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++    if (graph) {
++        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
++        check(cudaMemcpyAsync(da.data, ds.data, bytes, cudaMemcpyDeviceToDevice, stream));
++        gg::store_plane(source, s.in_stride, s.rows, s.columns, bind(da.data), stream);
++        cudaGraph_t captured;
++        check(cudaStreamEndCapture(stream, &captured));
++        cudaGraphExec_t executable;
++        check(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
++        for (int repeat = 0; repeat < 3; ++repeat) { check(cudaGraphLaunch(executable, stream)); }
++        check(cudaStreamSynchronize(stream));
++        check(cudaGraphExecDestroy(executable));
++        check(cudaGraphDestroy(captured));
++    } else {
++        check(cudaMemcpyAsync(da.data, ds.data, bytes, cudaMemcpyDeviceToDevice, stream));
++        gg::store_plane(source, s.in_stride, s.rows, s.columns, bind(da.data), stream);
++        check(cudaStreamSynchronize(stream));
++    }
++    check(cudaDeviceSynchronize());
++    check(cudaStreamDestroy(stream));
++    check(cudaMemcpy(actual.data(), da.data, bytes, cudaMemcpyDeviceToHost));
++    check(cudaMemcpy(reference.data(), dr.data, bytes, cudaMemcpyDeviceToHost));
++    if (actual != reference) { throw std::runtime_error("epilogue scalar preservation / canary mismatch"); }
++    const auto probes = std::min<std::size_t>(4096, std::size_t(s.rows) * s.columns);
++    for (std::size_t i = 0; i < probes; ++i) {
++        const auto logical = i * std::size_t(s.rows) * s.columns / probes;
++        const auto c = logical / s.rows, row = logical % s.rows;
++        const auto at = c * s.out_stride + row;
++        const float x = input[input_offset + c * s.in_stride + row];
++        double expected = x;
++        if (epi == gg::Epilogue::GateProduct) {
++            const double g = gate[gate_offset + c * s.gate_stride + row];
++            const double activated = activation == gg::GateActivation::Silu
++                ? g / (1.0 + std::exp(-g))
++                : 0.5 * g * (1.0 + std::tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)));
++            expected *= activated;
++        } else if (epi == gg::Epilogue::Accumulate) {
++            const float prior = float(int(at % 31) - 15) * 0.03125F;
++            volatile float rounded = x + prior;
++            expected = rounded;
++        }
++        float got;
++        if (fp32) { std::memcpy(&got, actual.data() + output_offset + 4 * at, 4); }
++        else {
++            std::uint16_t bits;
++            std::memcpy(&bits, actual.data() + output_offset + 2 * at, 2);
++            got = bf16_value(bits);
++            if (epi != gg::Epilogue::GateProduct && bits != bf16_bits(float(expected))) {
++                throw std::runtime_error("independent BF16 nearest-even oracle mismatch");
++            }
++        }
++        const double tolerance = (fp32 ? 2e-5 : 0.0041) * std::abs(expected) + 2e-6;
++        if (!std::isfinite(got) || std::abs(double(got) - expected) > tolerance) {
++            throw std::runtime_error("independent FP64 epilogue oracle mismatch");
++        }
++    }
++    std::uint64_t hash = 14695981039346656037ULL;
++    for (unsigned char byte : actual) { hash = (hash ^ byte) * 1099511628211ULL; }
++    std::cout << "EPILOGUE_CASE rows=" << s.rows << " t=" << s.columns << " epi=" << int(epi)
++              << " fp32=" << fp32 << " activation=" << int(activation) << " graph=" << graph
++              << " shifts=" << s.input_shift << ',' << s.output_shift << ',' << s.gate_shift
++              << " scalar_exact=1 cpu_probes=" << probes << " hash=" << hash << '\n';
++}
++void bench(int rows, int columns, gg::Epilogue epi) {
++    const auto count = std::size_t(rows) * columns;
++    Buffer input(count * 4), gate(count * 4), output(count * 2);
++    std::vector<float> x(count, 0.125F), g(count, 1.25F);
++    check(cudaMemcpy(input.data, x.data(), count * 4, cudaMemcpyHostToDevice));
++    check(cudaMemcpy(gate.data, g.data(), count * 4, cudaMemcpyHostToDevice));
++    check(cudaMemset(output.data, 0, count * 2));
++    gg::VectorOutput view;
++    view.bf16 = static_cast<__nv_bfloat16*>(output.data);
++    view.column_stride = rows;
++    view.epilogue = epi;
++    view.gate = static_cast<const float*>(gate.data);
++    view.gate_column_stride = rows;
++    for (int warm = 0; warm < 8; ++warm) {
++        gg::store_plane(static_cast<const float*>(input.data), rows, rows, columns, view, nullptr);
++    }
++    check(cudaDeviceSynchronize());
++    cudaEvent_t start, end;
++    check(cudaEventCreate(&start)); check(cudaEventCreate(&end));
++    for (int trial = 0; trial < 5; ++trial) {
++        check(cudaEventRecord(start));
++        for (int iteration = 0; iteration < 32; ++iteration) {
++            gg::store_plane(static_cast<const float*>(input.data), rows, rows, columns, view, nullptr);
++        }
++        check(cudaEventRecord(end)); check(cudaEventSynchronize(end));
++        float milliseconds;
++        check(cudaEventElapsedTime(&milliseconds, start, end));
++        std::cout << "EPILOGUE_BENCH rows=" << rows << " t=" << columns << " epi=" << int(epi)
++                  << " trial=" << trial << " milliseconds=" << milliseconds / 32 << '\n';
++    }
++    check(cudaEventDestroy(start)); check(cudaEventDestroy(end));
++}
++} // namespace
++int main(int argc, char** argv) { try {
++    const bool benchmark = argc == 2 && std::string_view(argv[1]) == "--bench";
++    const bool tails = argc == 2 && std::string_view(argv[1]) == "--tails";
++    if (benchmark) {
++        for (int rows : {5120, 17408}) for (int columns : {256, 1024}) {
++            for (auto epi : {gg::Epilogue::Store, gg::Epilogue::Accumulate, gg::Epilogue::GateProduct}) {
++                bench(rows, columns, epi);
++            }
++        }
++        return 0;
++    }
++    const Shape shapes[] = {{1, 1, 1, 1, 1}, {255, 256, 256, 256, 256},
++        {257, 256, 260, 264, 260}, {258, 256, 260, 264, 260},
++        {263, 256, 264, 264, 264}, {513, 257, 516, 520, 516},
++        {512, 255, 512, 512, 512}, {512, 256, 513, 513, 513},
++        {512, 256, 512, 512, 512, 1, 0, 0},
++        {512, 256, 512, 512, 512, 0, 1, 0},
++        {512, 256, 512, 512, 512, 0, 0, 1}};
++    for (const auto& shape : shapes) for (bool fp32 : {false, true}) {
++        qualify(shape, gg::Epilogue::Store, fp32, gg::GateActivation::Silu, true);
++        qualify(shape, gg::Epilogue::Accumulate, fp32, gg::GateActivation::Silu, false);
++        for (auto act : {gg::GateActivation::Silu, gg::GateActivation::GeluTanh}) {
++            qualify(shape, gg::Epilogue::GateProduct, fp32, act, true);
++        }
++    }
++    if (!tails) for (int rows : {5120, 17408}) {
++        const Shape shape{rows, 1024, rows, rows, rows};
++        for (auto epi : {gg::Epilogue::Store, gg::Epilogue::Accumulate, gg::Epilogue::GateProduct}) {
++            qualify(shape, epi, false, gg::GateActivation::Silu, true);
++        }
++    }
++    std::cout << "GGUF epilogue exact scalar / independent CPU / tails / strides / Graph passed\n";
++    return 0;
++} catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }
+diff --git a/tests/ops/linear/tests.cmake b/tests/ops/linear/tests.cmake
+index 9dd11885709da5c1252a0cc2458ac0dfddd2e953..866b332336584d3d1d13352d8a9efe894c78c138 100644
+--- a/tests/ops/linear/tests.cmake
++++ b/tests/ops/linear/tests.cmake
+@@ -94,6 +94,13 @@ ninfer_add_op_test(ninfer_linear_gguf_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf.cpp"
+   LIBRARIES ninfer_ops)
+ 
++# Exact preservation of FP32-input GGUF output epilogues, with independent
++# CPU mathematics, alignment/tail canaries, CUDA Graph replay and optional timing.
++ninfer_add_op_test(ninfer_gguf_epilogue_test STANDALONE
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_epilogue.cu"
++  LIBRARIES ninfer_ops)
++ninfer_stage_runtime_dlls(ninfer_gguf_epilogue_test)
++
+ ninfer_add_op_test(ninfer_linear_gguf_nvfp4_test STANDALONE
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_nvfp4.cpp"
+           "${CMAKE_CURRENT_LIST_DIR}/gguf_cpu_oracle.c"
