@@ -1,14 +1,14 @@
 # PolyStrata integration
 
-The opt-in `polystrata` backend pins upstream `v0.1.45-poly.6` at
-`20d839dbbaf34f28413e84d6e99301725f4f624b`. It supports qwen35moe GGUF models
+The opt-in `polystrata` backend pins upstream `v0.1.45-poly.7` at
+`fabae0d6445e524a1dc68b2c2fa99b53880f98e6`. It supports qwen35moe GGUF models
 with F16/Q8_0 KV and Gemma 4 26B-A4B with F16/int8/int8k KV on one CUDA GPU.
 This revision also carries the opt-in HIP
 integration, marked experimental and disabled by default. Its compile/link CI
 is a merge gate; AMD inference qualification is required before promoting it
 to validated hardware support, rather than blocking the validated CUDA update.
 The source submodule stays at the upstream commit; `backends/versions.json`
-identifies all fifteen ordered patches and their resulting trees.
+identifies all sixteen ordered patches and their resulting trees.
 
 ## Gemma 4 26B-A4B
 
@@ -118,11 +118,17 @@ separate state/replay validation before claiming a speed or quality benefit.
 The web chat's send and regenerate paths share the same explicit request
 overrides, client-owned reasoning, native timing and incomplete-stream detection.
 The poly.5 qualification below is historical; the current pin is in
-`backends/versions.json`. The poly.5 update
-rebases the existing integration layers, adds HIP KVMem integration, links
-Kolibri sources into model test targets, and preserves the `(0, 0)` no-Query
-sentinel when image tokens are expanded. A continuation must not reinterpret
-that sentinel as a request to recall old history.
+`backends/versions.json`. The current pin excludes commits after the poly.7
+release. The poly.7 update adds `--ram-experts-mib` expert staging/spill, an
+optional streaming CPU store (`STRATA_POLY_STREAM_STAGE`) and a RAM expert
+pool; the rebase keeps the KVMem memory validation beside the new
+streaming-stage setup instead of replacing it. It also retains upstream's
+`gemma4-kvmem` layer, rebased onto poly.7, so Gemma 4 26B-A4B support is not
+dropped by the version bump.
+The poly.5 layer had rebased the integration, added HIP KVMem integration,
+linked Kolibri sources into model test targets, and preserved the `(0, 0)`
+no-Query sentinel when image tokens are expanded. A continuation must not
+reinterpret that sentinel as a request to recall old history.
 
 ### Direct HIP launch
 
@@ -143,6 +149,23 @@ and a projector matching the language model; the filename alone does not prove
 that their embedding widths match. HIP startup prints an experimental-status
 notice. Deployments still require inference checks on the intended AMD
 architecture; build success alone is not a correctness or performance claim.
+
+### Poly.7 HIP validation (2026-11-02)
+
+On Linux x64 with ROCm 10.1 / hipcc clang 24 and one gfx1100 RX 7900 XT, the
+worker was built with `-DSTRATA_ENABLE_HIP=ON` against the KVMem core, and the
+encoder with the local `STRATA_VISION_HIP=ON` layer (`gfx1100`). The native
+history, sessions and KVMem kernel targets passed; upstream's `poly_fattn_test`
+does not compile under HIP because it still uses `CUBLAS_TENSOR_OP_MATH`, so
+the build only targets the worker and the KVMem tests. With
+Ornith-1.5-35B-A3B Q6_K, q8_0 KV, a 65,536-token budget and a 512 MiB reserve,
+a 128,924-token prompt prefilled in 3m30.7s (612.4 tok/s) and answered
+correctly while parking 1.31 GiB of history. The follow-up reused 128,403
+tokens, moved 521 prompt tokens and answered in 3.74s, capturing Query
+`[128403, 128915)` with the page-softmax scorer and one bounded replay. Vision
+ran on the GPU (1.38 GiB); the worker and encoder together used 19.53 GiB of
+20.0 GiB usable VRAM. These are functional checks on one machine, not a
+performance claim.
 
 ### Poly.5 candidate validation (2026-10-28)
 

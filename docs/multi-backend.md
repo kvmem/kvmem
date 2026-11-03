@@ -193,7 +193,7 @@ H 必须容纳所有并发 lane 的基本工作区，H+D 还需为换页预留�
 
 ## PolyStrata qwen35moe 接入（2026-10-22 源码）
 
-当前源码固定 PolyStrata `v0.1.45-poly.6` / `20d839dbbaf34`，支持 CUDA 单卡的 `qwen35moe` GGUF（F16/Q8_0 KV）及 Gemma 4 26B-A4B（F16/int8/int8k KV）。Gemma 的独立 assistant、原生状态配额和验收边界见 [Gemma 接入说明](polystrata-integration.md#gemma-4-26b-a4b)。使用同一个 GGUF 导出的 tokenizer/template；图像输入还需要匹配的 mmproj 和 `strata-vision`。Python 运行环境需具备固定上游 requirements 中的 frontend 依赖。
+当前源码固定 PolyStrata `v0.1.45-poly.7` / `fabae0d6445e`，支持 CUDA 单卡的 `qwen35moe` GGUF（F16/Q8_0 KV）及 Gemma 4 26B-A4B（F16/int8/int8k KV）；HIP 为实验性路径，需用 `-DSTRATA_ENABLE_HIP=ON` 自行构建 worker 和图像编码器。Gemma 的独立 assistant、原生状态配额和验收边界见 [Gemma 接入说明](polystrata-integration.md#gemma-4-26b-a4b)。使用同一个 GGUF 导出的 tokenizer/template；图像输入还需要匹配的 mmproj 和 `strata-vision`。Python 运行环境需具备固定上游 requirements 中的 frontend 依赖。
 
 统一启动器和直接 Python 入口均可省略 Tokenizer：第一次启动从所选 GGUF 本地导出完整 tokenizer 与 chat template，缓存在用户本地 KVMem 目录中，不下载模型或修改模型目录。缓存按模型绝对路径、大小、修改时间、头部摘要及导出器版本隔离，并校验导出文件；显式 Tokenizer 仍要求完整的同模型导出。DryRun 只展示计划，不创建缓存。控制台的 Python、frontend、图像 worker 等可选路径留空时使用运行包内默认位置。
 
