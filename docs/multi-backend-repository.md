@@ -31,6 +31,12 @@ The 2026-11-02 low-precision work uses these independently reviewable layers:
 | `gguf-mxfp8-prefill` | Generic FP8 arithmetic, fused tile/Lt paths, numerical signatures and independent CPU/FP64 qualification |
 | `gguf-mxfp8-device-routes` | Backend device/shape calibration, 25 measured T=256 overrides, profile signatures |
 | `gguf-mxfp8-image-stores` | Equivalent vectorized image writes, byte-exact qualification and bounded memory |
+| `gguf-vector-epilogues` | Equivalent aligned FP32-input BF16 Store/Add loads and writes; scalar gated routes retained |
+| `gguf-lt512-routes` | Exact-width, backend-profile Lt512 selection and conditional workspace; 78 measured 5060 Ti rules |
+| `gguf-route-workspace` | Route-owned FP8/Q8 buffers and full token-interval capacity; unchanged arithmetic |
+| `gguf-bf16-output` | Aligned BF16 Store/Add Lt output, Add-specific capacity and numerical profile-v3 |
+| `gguf-image-budget` | Backend image budgets; measured 32 MiB on 36-SM 5060 Ti, 64 MiB elsewhere |
+| `gguf-add-capacity` | Public BF16 Add capacity includes unaligned FP32 fallback; exact-capacity regression |
 | `gguf-nvfp4-prefill` | Generic NVFP4 arithmetic, explicit A4 permissions, FFN integration and tests |
 | `kvmem-statistics-readback` | Precision-independent native KVMem Mean-K/Query copy coalescing and sampled-attention readback |
 
@@ -38,8 +44,12 @@ FP8/NVFP4 remain usable without KVMem. The common CPU packed-GGUF oracle is
 introduced with FP8 and reused by NVFP4. Native device routing now includes 25
 measured Q8 overrides for T=256 on the 36-SM RTX 5060 Ti; unmatched devices/shapes
 retain the generic path. Equivalent 128-bit image stores preserve encoding and
-the existing 64 MiB image bound. FP8 remains default-off and lossy; further FP4
+the image bound selected by the backend profile (32 MiB on the measured 36-SM 5060 Ti, 64 MiB elsewhere). FP8 remains default-off and lossy; further FP4
 experiments are paused.
+At T=512 the 36-SM RTX 5060 Ti has 78 measured IQ3_S/IQ4_XS Lt entries;
+other devices and unmatched shapes retain tile/Q8. Lt512 needs additional
+caller-owned workspace. The automatic calibrator still measures this namespace
+at T=256 and does not yet generate Lt512 entries.
 Further FP4 experiments remain paused, and unfinished artifact-tool variants
 are not included in the prepared backend.
 

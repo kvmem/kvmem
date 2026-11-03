@@ -441,3 +441,88 @@ GPU 为 RTX 5060 Ti，UUID `GPU-A`。每次启动前检查无计算进程、利�
 最终服务程序是本实验 build/ninfer-serve.exe；数值测试 qualification.exe、原回归 oracle.exe、质量程序 ninfer-perplexity.exe。使用方式见 backend/docs/gguf-mxfp8-prefill.md。运行参数、每臂输出和原生日志在 performance，质量明细在 quality-baseline/quality-mxfp8，汇总在 analysis.json，产物哈希与 GPU 释放状态在 final-checks.json。所有自建服务已退出，两张 GPU 检查时均为 0 MiB、无计算进程。
 
 未验证 Linux / 非 sm120 编译、Windows kernel-DLL 的完整发布构建、其他模型/MoE、多 GPU、多并发、未预热的首次 graph capture、完整长上下文质量和峰值显存。现有包脚本已包含 cublasLt DLL，但未生成发布包。当前完成的是 5060 Ti dense 模型的可复现默认关闭实验路径及上述范围的比较；更广的默认启用需要后续收益门槛和质量判断。
+
+## 2026-11-03：512 chunk 的后端 Lt profile 优化
+
+新增 `gguf-lt512-routes` 补丁，在 `gguf-vector-epilogues` 后应用。512 的可选路径使用现有有界 MXFP8 image/cuBLASLt，保留 FP32 解码、实际 group amax、E4M3/E8M0 和 FP32 累加；规约顺序可与 tile 不同。仅在设备 profile 明确选择且查询区间包含 512 时增加 Lt workspace。
+
+5060 Ti、36 SM 的 IQ3_S/IQ4_XS、十个登记形状和四个 epilogue 共 80 组做了两轮交错 public-Op 测速，每轮取五次中位数，保留两轮均超过 3% 的 78 组。IQ3_S 1024x5120 BF16 Store/Add 的最差测速变化分别约 −8.58%/−6.02%，已排除。256 的旧选择保留；511 以前和 513 以后不外推 Lt512。其他设备、未测格式和形状继续原路线。现有自动校准仍只测此 namespace 的 T=256，尚不自动生成 Lt512 条目。
+
+同一 5060 Ti、27B IQ3_S 模型、INT8 KV、MTP4、ngram0、单路、chunk512、capacity/context25600，KVMem B24576/R1024。每组独立进程两次镜像运行，先普通文档 turn（14806 token、cache0），后同一会话独立问题 turn；保存请求/响应并核对原生复用和计算 span，KVMem 未进入 pressure。冷启动不计入 prefill。
+
+| 路径 | 上一版 FP8 tok/s | 最终版 FP8 tok/s | 变化 |
+|---|---:|---:|---:|
+| 普通模式 | 1001.24（996.84–1005.63） | 1131.87（1128.23–1135.51） | +13.05% |
+| KVMem budget 内 | 962.34（953.42–971.27） | 1088.87（1088.74–1089.00） | +13.15% |
+| 原仓库普通 FP8 | 1156.10（1154.75–1157.46） | 对照 | 本地差距 13.40%→2.10% |
+
+本轮基线存在约 1%–2% 波动，不把均值小数视为稳定精度。采样整卡显存普通模式 13574→13654 MiB，KVMem 13402→13482 MiB，均增加 80 MiB；每秒 NVML 采样不是分配器精确峰值。单 Op 的额外 workspace 因形状而异。文档确认和相关后续问题输出相同，仅作行为探针，不是新的独立质量评分。
+
+八格式公开算子经实际 Lt512 profile 路由对独立 CPU GGUF/E4M3/FP64 oracle 通过；包括 511/512/513、真实 K5120/17408、gather、FP32/BF16、残差、SwiGLU/GeGLU、Graph 和 workspace 边界。本轮未重跑大语料 PPL；FP8 本身仍有损且默认关闭，不能将通过 oracle/同一短问题输出解释为模型质量无损。
+
+保留的拒绝方案：IQ4_XS 精确查表解码通过 507904 group 的逐字节/独立参考，但整模型普通/KVMem 测得 −0.29%/−0.93%，已撤回；粗粒度 IQ4_XS Q8 路由约 −0.87%，原仓库 wave-fill 路由接近持平，均未采用。全格式强制 Lt512 探针达到普通 1217.85、KVMem 1166.84 tok/s，但会外推未测格式/形状并包含上述不利组合，因此最终采用范围更窄的 78 条规则，正式收益以上表为准。探针 FP8 关闭 Q8 对照变化约 −0.016%。
+
+所有构建均先审计 dry-run、8 jobs、保留既有库和 Ninja 元数据。拒绝的 CUDA 候选只编译一个生产 CUDA 文件和必要测试；最终选路只编译两个 C++ 对象并聚焦重链，零 CUDA 编译。测试构建的 include 路径、局部名称冲突和链接记录重名曾失败，已修正；不是最终推理验证失败。此为同工具链/ABI 的聚焦验证构建，未生成或安装完整发布包；新内置表与 GPU 验证所用用户 profile 已验证等价，完整 37 补丁源码重放及精确树检查通过。没有提交或推送。
+
+机器可读结果见 [Lt512 验证](benchmarks/ninfer-lt512-20261103.json)。尚未验证其他 GPU、模型、多并发、长生成与完整包构建，进一步扩展应先测其对应形状和质量。
+
+## 2026-11-03：三项后端显存优化
+
+在 Lt512 补丁后追加三层：`gguf-route-workspace` 按实际路线规划输出、fixup 和激活，
+覆盖整个 token 区间；`gguf-bf16-output` 使用 FP32 累加直接写 BF16 Store/Add，
+保留 FP32 gate/up 和实际 amax；`gguf-image-budget` 只给实测 36-SM 5060 Ti
+选择 32 MiB image，其余设备仍 64 MiB。profile-v3 与 image key 隔离数值状态和成本。
+未新增自动 image-budget 校准，也未移植参考版的尺度上界、FP16 权重解码或 BF16 gate/up。
+
+同一 27B、5060 Ti、INT8 KV、MTP4、ngram0、单路、capacity25600，KVMem B24576/R1024。
+每臂两个镜像进程；14806-token 文档后另发问题，核对实际复用和 native no_pressure。
+下表是第三项最终受控组，不把不同轮次的吞吐收益相加；显存为每秒采样整卡 MiB。
+
+| chunk | 本地普通 tok/s | KVMem budget 内 tok/s | 参考普通 tok/s | 本地普通 / KVMem MiB |
+|---|---:|---:|---:|---:|
+| 256 | 933.77 | 904.86 | 970.23 | 13518 / 13288 |
+| 512 | 1151.58 | 1110.55 | 1156.08 | 13600 / 13428 |
+| 1024 | 1452.68 | 1373.37 | 1459.64 | 13734 / 13580 |
+
+第一项512/1024分别减少8/14MiB，吞吐基本持平。第二项512普通/KVMem约+1.07%/+1.02%，
+1024约+2.48%/+2.11%，整卡峰值未继续下降。第三项32MiB在512/1024再减少46/58MiB；
+1024普通约+0.52%。一轮KVMem1024基线1307.958，另一轮1366.711，保留全部样本，
+不能把该组均值约+2.69%解释为稳定收益。参考10.5MiB减98MiB但普通/KVMem退化
+3.70%/3.50%，已拒绝。与三项前记录比较，512/1024整卡峰值合计下降约54/72MiB；
+普通缓存本地hybrid、参考legacy，仍不能把全部资源差额归因于FP8。
+
+八格式独立CPU GGUF/E4M3/FP64、精确容量、区间与混合路线、gather、行列尾部、
+BF16 Add Graph及Compute Sanitizer通过（0错误）。六域固定未改语料、context513/2048，
+以第二项前FP8与第二项、第二项与32MiB分别检查新增舍入/分块误差，原始报告与阈值见JSON。
+FP8本身仍有损且默认关闭；相关续问相同不作为独立质量分数。
+
+一次评分被其他DFlash验证进入GPU而中止，目录和冲突证据保留，成功重跑后才采用评分。
+沙箱内Sanitizer未能附加，后续获准在外执行并通过。构建只编必要C++/CUDA对象，8jobs，
+每轮先审核dry-run，保留原Ninja元数据与库；测试源依赖遗漏在dry-run时发现并修复。
+完整40层补丁准备/树检查、编译项目输入与交付源码比较、验证用profile与新builtin等价检查通过。
+这是同ABI/工具链聚焦验证，未安装、提交、推送或验证完整组合发布包、其他GPU/模型、多并发和256K压力质量。
+
+机器可读数据：[三项显存优化](benchmarks/ninfer-fp8-memory-20261103.json)。
+
+## 2026-11-04：提交前审计
+
+在当前 master 的 DFlash conditioning、shared-cache 补丁后追加五项 FP8 优化，
+保留其余后端及已有补丁原文；另追加 `gguf-add-capacity` 审计修复，总计 43 层。
+
+发现并复现本次 `gguf-bf16-output` 新引入的容量缺口：public LinearAdd 只要求残差
+连续 BF16，没有 16-byte 基址保证。基址偏移 2 字节会选择 FP32 回退，而旧查询遗漏
+该路线所需的输出 plane/scratch，在精确容量下 `bad allocation`。修复后保留 Add
+路线筛选，但 Lt 可选时覆盖 FP32 回退空间；对齐时执行仍用 BF16 直出。代价是即使
+实际残差对齐，查询也保守预留回退空间。本轮没有重测该修复后的整机峰值/吞吐，
+上节 native40 数字不能当作最终 native43 组合发布包的测量。
+
+5060 Ti 上修复前失败、修复后512/1024、gather与非gather、独立FP64参考及边界canary
+通过；Compute Sanitizer为0错误。新增专门CTest用例。编译只替换一项host实现、复用
+本轮已核对的库并重链；相关工程源码及传递头依赖按LF比较与交付代码一致，完整43层
+补丁重放和prepared tree检查通过。补丁脚本10项、证据导出10项、CI分类12项测试通过。
+沙箱内Sanitizer无法附加及host测试的TEMP/Git/本地HTTP权限失败均保留，正常权限重跑通过。
+这次没有编译/安装完整合并后发布包，也没有新增其他GPU/模型或多并发性能结论。
+
+32MiB选择及先前固定语料质量验证仍只支持原测量范围；FP8仍默认关闭且有损，
+自动校准Lt512/image预算未增加。拒绝10.5MiB的退化结果及KVMem1024方差说明继续保留。
+审计记录见[机器可读报告](benchmarks/ninfer-fp8-memory-audit-20261104.json)。

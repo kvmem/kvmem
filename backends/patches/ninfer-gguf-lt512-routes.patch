@@ -1,0 +1,1866 @@
+diff --git a/docs/gguf-mxfp8-prefill.md b/docs/gguf-mxfp8-prefill.md
+index 953b9f0ff3cd132e9bb4414862893d594f2fed92..832b87425ee1b25b45490a95e92946f6d1afba01 100644
+--- a/docs/gguf-mxfp8-prefill.md
++++ b/docs/gguf-mxfp8-prefill.md
+@@ -32,6 +32,22 @@ require whole 128-row tiles; unsupported formats, partial row tiles and other
+ epilogues keep their existing route. A Q8 choice bypasses both FP8 kernels and
+ the two-stage Lt path. T >= 1024 retains Lt irrespective of these profile keys.
+ 
++At exactly T=512 a measured `lt` entry may select the same bounded cuBLASLt
++implementation used at T>=1024. Workspace queries include its slab only when a
++matching entry can be reached in the requested extent interval. The FP32 weight
++decode, actual group amax, E4M3/E8M0 representation and FP32 accumulation are
++retained; GEMM reduction order may differ from the tile implementation.
++
++The 36-SM RTX 5060 Ti table has 78 T=512 entries for IQ3_S/IQ4_XS across ten
++registered shapes and four epilogues. Two mirrored five-trial median public-Op
++sweeps confirmed each retained improvement above 3%. IQ3_S 1024x5120 BF16 Store
++and Add retain tile because Lt regressed. Existing T=256 choices are preserved;
++the entries stop at 512, with tile retained through 511. Other cards and
++unmeasured shapes retain their current routing and workspace requirements.
++The automatic calibration tool currently measures this namespace at T=256;
++it does not yet generate the Lt512 entries. These built-ins came from the
++separately qualified native public-Op sweep.
++
+ The first built-in set has 25 entries for the 36-SM RTX 5060 Ti, at exactly
+ T=256. Two independent native calibrations measured 8 formats, 10 actual-model
+ shapes and 4 epilogues; only Q8 winners confirmed in both runs were retained.
+diff --git a/src/ops/linear/gguf/gguf_linear.cpp b/src/ops/linear/gguf/gguf_linear.cpp
+index 681e649122705ded9b8441f5280a06178de1a1ed..2a9b05eb7949ef0fdb449138c6255f5ccbbd38d9 100644
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -47,6 +47,14 @@ PrefillRoute prefill_route(GgmlType type, std::int32_t n, std::int32_t k,
+                            std::int32_t tokens, PrefillEpilogue epilogue) {
+     if (!enabled() || tokens < kMinColumns || !supported(type, k)) { return PrefillRoute::Q8; }
+     if (!takes_tile(type, k, tokens)) { return PrefillRoute::Lt; }
++    // Lt entries are measured exact-width choices; other devices and widths
++    // retain their existing tile/Q8 routes.
++    if (tokens == 512 && n > 0) {
++        const auto key = prefill_route_key(type, n, k, epilogue);
++        if (!key.empty() && device_route_schedule(key, tokens) == "lt") {
++            return PrefillRoute::Lt;
++        }
++    }
+     // The alternate integer matrix route requires whole output-row tiles. Never
+     // let a profile extend a candidate's mathematical or implementation domain.
+     if (n > 0 && n % 128 == 0 && has_matrix_kernel(type)) {
+@@ -339,7 +347,14 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
+         for(const auto& shape:shapes) {
+             if(gguf::mxfp8::supported(gguf_type(shape.qtype),shape.k)) {
+                 ++count;
+-                if(max_tokens>=1024)scratch=std::max(scratch,gguf::mxfp8::scratch_bytes(k,shape.rows,max_tokens));
++                bool lt512 = false;
++                if (min_tokens <= 512 && max_tokens >= 512) {
++                    for (auto epi : gguf::mxfp8::kPrefillEpilogues) {
++                        lt512 |= gguf::mxfp8::prefill_route(gguf_type(shape.qtype),
++                            shape.rows, shape.k, 512, epi) == gguf::mxfp8::PrefillRoute::Lt;
++                    }
++                }
++                if(max_tokens>=1024 || lt512)scratch=std::max(scratch,gguf::mxfp8::scratch_bytes(k,shape.rows,max_tokens));
+             }
+         }
+         std::size_t activation=gguf::mxfp8::activation_bytes(k,max_tokens);
+diff --git a/src/runtime/engine/device_profiles.json b/src/runtime/engine/device_profiles.json
+index f611d140b97b8322db2d4c8bbb99ce0a6fbb0933..859abf8df8ced37ecaac51ba1efd731aa1b576ee 100644
+--- a/src/runtime/engine/device_profiles.json
++++ b/src/runtime/engine/device_profiles.json
+@@ -426,114 +426,1661 @@
+         "t2_i8_small/5120x6144": [[8, "r32c8k4"], [16, "r32c16"], [32, ""]],
+         "t2_i8_small/7168+7168x5120": [[3, "r32c8k4"], [14, ""], [16, "r32c16"], [32, ""]]
+      }},
+-    {"hardware_class": "nvidia-geforce-rtx-5060-ti-sm120", "multiprocessors": 36, "origin": "built in: RTX 5060 Ti at 180 W, 2026-10-16; GGUF Q4_K/Q6_K dense loads, CUDA 13.2, 2026-11-01; MXFP8 T256 shape/epilogue routes, two calibrated runs, 2026-11-02",
+-     "routes": {
+-        "gguf_prefill_mxfp8/iq2_xxs/1024x5120/bf16-silu": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq3_s/1024x5120/f32": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq3_xxs/1024x5120/bf16": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq3_xxs/1024x5120/bf16-silu": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq3_xxs/1024x5120/f32": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/1024x5120/bf16": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/1024x5120/bf16-add": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/1024x5120/bf16-silu": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/1024x5120/f32": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x17408/bf16": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x17408/bf16-add": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x17408/bf16-silu": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x17408/f32": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x5120/bf16": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x5120/bf16-add": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x5120/bf16-silu": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x5120/f32": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x6144/bf16": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x6144/bf16-add": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x6144/bf16-silu": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/iq4_xs/5120x6144/f32": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/q4_k/1024x5120/bf16": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/q4_k/1024x5120/bf16-add": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/q4_k/1024x5120/bf16-silu": [[256, "q8"]],
+-        "gguf_prefill_mxfp8/q4_k/1024x5120/f32": [[256, "q8"]],
+-        "gguf_vector/q4_k": [[8, ""]],
+-        "gguf_vector/q6_k": [[1, ""], [8, "cooperative"]],
+-        "attn_i8_small/h24/int8/w1": [[1048576, ""]],
+-        "attn_i8_small/h24/int8/w2": [[1048576, ""]],
+-        "attn_i8_small/h24/int8/w3": [[8192, ""], [65536, "8x2x32q"], [1048576, ""]],
+-        "attn_i8_small/h24/int8/w4": [[1048576, ""]],
+-        "attn_i8_small/h24/int8/w5": [[8192, "8x2x32q"], [65536, "8x2x32qe"], [1048576, ""]],
+-        "attn_i8_small/h24/int8/w6": [[8192, "12x1x32q"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/int8/w7": [[8192, "12x1x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/int8/w8": [[8192, ""], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk2v4-e8/w1": [[1048576, "8x2x32e"]],
+-        "attn_i8_small/h24/rk2v4-e8/w2": [[1048576, ""]],
+-        "attn_i8_small/h24/rk2v4-e8/w3": [[1048576, ""]],
+-        "attn_i8_small/h24/rk2v4-e8/w4": [[1048576, ""]],
+-        "attn_i8_small/h24/rk2v4-e8/w5": [[1048576, ""]],
+-        "attn_i8_small/h24/rk2v4-e8/w6": [[1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk2v4-e8/w7": [[8192, "12x1x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk2v4-e8/w8": [[8192, "12x1x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk4v4-e8/w1": [[1048576, "8x2x32e"]],
+-        "attn_i8_small/h24/rk4v4-e8/w2": [[1048576, "8x2x32e"]],
+-        "attn_i8_small/h24/rk4v4-e8/w3": [[1048576, "4x2x32qe"]],
+-        "attn_i8_small/h24/rk4v4-e8/w4": [[8192, ""], [1048576, "4x2x32qe"]],
+-        "attn_i8_small/h24/rk4v4-e8/w5": [[8192, ""], [65536, "4x2x32qe"], [1048576, ""]],
+-        "attn_i8_small/h24/rk4v4-e8/w6": [[8192, "12x1x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk4v4-e8/w7": [[8192, "12x1x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk4v4-e8/w8": [[8192, "12x1x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk4v4/w1": [[1048576, "8x2x32e"]],
+-        "attn_i8_small/h24/rk4v4/w2": [[1048576, "8x2x32e"]],
+-        "attn_i8_small/h24/rk4v4/w3": [[8192, ""], [1048576, "4x2x32qe"]],
+-        "attn_i8_small/h24/rk4v4/w4": [[8192, ""], [1048576, "4x2x32qe"]],
+-        "attn_i8_small/h24/rk4v4/w5": [[8192, ""], [1048576, "4x2x32qe"]],
+-        "attn_i8_small/h24/rk4v4/w6": [[8192, "12x1x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk4v4/w7": [[8192, "12x1x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk4v4/w8": [[8192, "12x1x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk8v4/w1": [[1048576, ""]],
+-        "attn_i8_small/h24/rk8v4/w2": [[1048576, ""]],
+-        "attn_i8_small/h24/rk8v4/w3": [[8192, ""], [65536, "8x2x32q"], [1048576, ""]],
+-        "attn_i8_small/h24/rk8v4/w4": [[1048576, ""]],
+-        "attn_i8_small/h24/rk8v4/w5": [[1048576, "8x2x32q"]],
+-        "attn_i8_small/h24/rk8v4/w6": [[1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk8v4/w7": [[8192, "6x2x32q"], [65536, "6x2x32qe"], [1048576, "6x2x32q"]],
+-        "attn_i8_small/h24/rk8v4/w8": [[8192, ""], [1048576, "6x2x32q"]],
+-        "attn_pack_gqa": [[1, ""]],
+-        "attn_parallel_tiles": [[1, ""]],
+-        "attn_prompt_fast": [[1, "on"]],
+-        "attn_pv_f16": [[1, "on"]],
+-        "gdn_two_stage/h32": [[2147483647, "on"]],
+-        "gdn_two_stage/h48": [[2147483647, "on"]],
+-        "q4_linear_add/5120x17408": [[6, ""], [8, "small_t_c8"], [24, ""], [32, "small_t_c32"]],
+-        "q4_linear_add/5120x6144": [[7, ""], [8, "small_t_c8"], [24, ""], [32, "small_t_c32"]],
+-        "q4_linear_swiglu/34816x17408x5120": [[64, ""]],
+-        "q4_q5_attn_input/5120x6144x1024": [[64, ""]],
+-        "q4_q5_gdn_input/5120x4096x12288": [[56, ""], [64, "grouped_r32_c64_s4"]],
+-        "q5_linear_add/5120x17408": [[2, "small_t_mma"], [32, ""], [64, "mma_r64_c64"]],
+-        "q5_linear_add/5120x6144": [[1, ""], [2, "small_t_mma"], [32, ""], [64, "mma_r64_c64"]],
+-        "q6_head/248320x5120": [[2, "gemv"], [16, "small_t"], [32, ""]],
+-        "q8_ksplit/14336x5120": [[8, ""]],
+-        "q8_ksplit/17408x5120": [[8, ""]],
+-        "q8_ksplit/2048x16384": [[8, ""]],
+-        "q8_ksplit/2048x4096": [[3, ""], [4, "kw4"], [8, ""]],
+-        "q8_ksplit/248320x5120": [[8, ""]],
+-        "q8_ksplit/34816x5120": [[8, ""]],
+-        "q8_ksplit/5120x10240": [[8, ""]],
+-        "q8_ksplit/5120x17408": [[8, ""]],
+-        "q8_ksplit/5120x25600": [[8, ""]],
+-        "q8_ksplit/5120x6144": [[8, ""]],
+-        "q8_ksplit/6144x5120": [[8, ""]],
+-        "t2_i8_route": [[48, ""], [64, "tile"], [192, ""]],
+-        "t2_i8_small/248320x5120": [[8, ""], [16, "r32c16k8"]],
+-        "t2_i8_small/34816x5120": [[1, "r32c8k4"], [2, ""], [8, "r32c8k4"], [16, "r32c16"], [32, ""]],
+-        "t2_i8_small/4096+12288x5120": [[6, "r16c8w1"], [8, "r32c8k4"], [16, "r32c16"], [32, ""]],
+-        "t2_i8_small/5120x17408": [[8, "r16c8w1"], [10, ""], [12, "r32c16k8"], [16, "r32c16"], [32, ""]],
+-        "t2_i8_small/5120x6144": [[8, "r16c8w1"], [16, "r32c16"], [32, ""]],
+-        "t2_i8_small/7168+7168x5120": [[7, "r16c8w1"], [12, ""], [16, "r32c16"], [32, ""]],
+-        "unified/q4_linear_add": [[64, ""]],
+-        "unified/q4_linear_swiglu": [[32, ""]],
+-        "unified/q4_q5_attn_input": [[12, ""]],
+-        "unified/q4_q5_gdn_input": [[14, ""]],
+-        "unified/q5_linear_add/5120x17408": [[16, ""], [20, "unified"], [32, ""], [64, "unified"]],
+-        "unified/q5_linear_add/5120x6144": [[16, ""], [20, "unified"], [32, ""], [64, "unified"]]
+-     }},
++    {
++      "hardware_class": "nvidia-geforce-rtx-5060-ti-sm120",
++      "multiprocessors": 36,
++      "origin": "built in: RTX 5060 Ti at 180 W, 2026-10-16; GGUF Q4_K/Q6_K dense loads, CUDA 13.2, 2026-11-01; MXFP8 T256 shape/epilogue routes, two calibrated runs, 2026-11-02; Lt512 78 measured shape/epilogue routes, 2026-11-03",
++      "routes": {
++        "gguf_prefill_mxfp8/iq2_xxs/1024x5120/bf16-silu": [
++          [
++            256,
++            "q8"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/1024x5120/f32": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_xxs/1024x5120/bf16": [
++          [
++            256,
++            "q8"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_xxs/1024x5120/bf16-silu": [
++          [
++            256,
++            "q8"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_xxs/1024x5120/f32": [
++          [
++            256,
++            "q8"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/1024x5120/bf16": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/1024x5120/bf16-add": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/1024x5120/bf16-silu": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/1024x5120/f32": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x17408/bf16": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x17408/bf16-add": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x17408/bf16-silu": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x17408/f32": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x5120/bf16": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x5120/bf16-add": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x5120/bf16-silu": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x5120/f32": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x6144/bf16": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x6144/bf16-add": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x6144/bf16-silu": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/5120x6144/f32": [
++          [
++            256,
++            "q8"
++          ],
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/q4_k/1024x5120/bf16": [
++          [
++            256,
++            "q8"
++          ]
++        ],
++        "gguf_prefill_mxfp8/q4_k/1024x5120/bf16-add": [
++          [
++            256,
++            "q8"
++          ]
++        ],
++        "gguf_prefill_mxfp8/q4_k/1024x5120/bf16-silu": [
++          [
++            256,
++            "q8"
++          ]
++        ],
++        "gguf_prefill_mxfp8/q4_k/1024x5120/f32": [
++          [
++            256,
++            "q8"
++          ]
++        ],
++        "gguf_vector/q4_k": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "gguf_vector/q6_k": [
++          [
++            1,
++            ""
++          ],
++          [
++            8,
++            "cooperative"
++          ]
++        ],
++        "attn_i8_small/h24/int8/w1": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/int8/w2": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/int8/w3": [
++          [
++            8192,
++            ""
++          ],
++          [
++            65536,
++            "8x2x32q"
++          ],
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/int8/w4": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/int8/w5": [
++          [
++            8192,
++            "8x2x32q"
++          ],
++          [
++            65536,
++            "8x2x32qe"
++          ],
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/int8/w6": [
++          [
++            8192,
++            "12x1x32q"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/int8/w7": [
++          [
++            8192,
++            "12x1x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/int8/w8": [
++          [
++            8192,
++            ""
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk2v4-e8/w1": [
++          [
++            1048576,
++            "8x2x32e"
++          ]
++        ],
++        "attn_i8_small/h24/rk2v4-e8/w2": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/rk2v4-e8/w3": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/rk2v4-e8/w4": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/rk2v4-e8/w5": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/rk2v4-e8/w6": [
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk2v4-e8/w7": [
++          [
++            8192,
++            "12x1x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk2v4-e8/w8": [
++          [
++            8192,
++            "12x1x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4-e8/w1": [
++          [
++            1048576,
++            "8x2x32e"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4-e8/w2": [
++          [
++            1048576,
++            "8x2x32e"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4-e8/w3": [
++          [
++            1048576,
++            "4x2x32qe"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4-e8/w4": [
++          [
++            8192,
++            ""
++          ],
++          [
++            1048576,
++            "4x2x32qe"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4-e8/w5": [
++          [
++            8192,
++            ""
++          ],
++          [
++            65536,
++            "4x2x32qe"
++          ],
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4-e8/w6": [
++          [
++            8192,
++            "12x1x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4-e8/w7": [
++          [
++            8192,
++            "12x1x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4-e8/w8": [
++          [
++            8192,
++            "12x1x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4/w1": [
++          [
++            1048576,
++            "8x2x32e"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4/w2": [
++          [
++            1048576,
++            "8x2x32e"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4/w3": [
++          [
++            8192,
++            ""
++          ],
++          [
++            1048576,
++            "4x2x32qe"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4/w4": [
++          [
++            8192,
++            ""
++          ],
++          [
++            1048576,
++            "4x2x32qe"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4/w5": [
++          [
++            8192,
++            ""
++          ],
++          [
++            1048576,
++            "4x2x32qe"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4/w6": [
++          [
++            8192,
++            "12x1x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4/w7": [
++          [
++            8192,
++            "12x1x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk4v4/w8": [
++          [
++            8192,
++            "12x1x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk8v4/w1": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/rk8v4/w2": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/rk8v4/w3": [
++          [
++            8192,
++            ""
++          ],
++          [
++            65536,
++            "8x2x32q"
++          ],
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/rk8v4/w4": [
++          [
++            1048576,
++            ""
++          ]
++        ],
++        "attn_i8_small/h24/rk8v4/w5": [
++          [
++            1048576,
++            "8x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk8v4/w6": [
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk8v4/w7": [
++          [
++            8192,
++            "6x2x32q"
++          ],
++          [
++            65536,
++            "6x2x32qe"
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_i8_small/h24/rk8v4/w8": [
++          [
++            8192,
++            ""
++          ],
++          [
++            1048576,
++            "6x2x32q"
++          ]
++        ],
++        "attn_pack_gqa": [
++          [
++            1,
++            ""
++          ]
++        ],
++        "attn_parallel_tiles": [
++          [
++            1,
++            ""
++          ]
++        ],
++        "attn_prompt_fast": [
++          [
++            1,
++            "on"
++          ]
++        ],
++        "attn_pv_f16": [
++          [
++            1,
++            "on"
++          ]
++        ],
++        "gdn_two_stage/h32": [
++          [
++            2147483647,
++            "on"
++          ]
++        ],
++        "gdn_two_stage/h48": [
++          [
++            2147483647,
++            "on"
++          ]
++        ],
++        "q4_linear_add/5120x17408": [
++          [
++            6,
++            ""
++          ],
++          [
++            8,
++            "small_t_c8"
++          ],
++          [
++            24,
++            ""
++          ],
++          [
++            32,
++            "small_t_c32"
++          ]
++        ],
++        "q4_linear_add/5120x6144": [
++          [
++            7,
++            ""
++          ],
++          [
++            8,
++            "small_t_c8"
++          ],
++          [
++            24,
++            ""
++          ],
++          [
++            32,
++            "small_t_c32"
++          ]
++        ],
++        "q4_linear_swiglu/34816x17408x5120": [
++          [
++            64,
++            ""
++          ]
++        ],
++        "q4_q5_attn_input/5120x6144x1024": [
++          [
++            64,
++            ""
++          ]
++        ],
++        "q4_q5_gdn_input/5120x4096x12288": [
++          [
++            56,
++            ""
++          ],
++          [
++            64,
++            "grouped_r32_c64_s4"
++          ]
++        ],
++        "q5_linear_add/5120x17408": [
++          [
++            2,
++            "small_t_mma"
++          ],
++          [
++            32,
++            ""
++          ],
++          [
++            64,
++            "mma_r64_c64"
++          ]
++        ],
++        "q5_linear_add/5120x6144": [
++          [
++            1,
++            ""
++          ],
++          [
++            2,
++            "small_t_mma"
++          ],
++          [
++            32,
++            ""
++          ],
++          [
++            64,
++            "mma_r64_c64"
++          ]
++        ],
++        "q6_head/248320x5120": [
++          [
++            2,
++            "gemv"
++          ],
++          [
++            16,
++            "small_t"
++          ],
++          [
++            32,
++            ""
++          ]
++        ],
++        "q8_ksplit/14336x5120": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/17408x5120": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/2048x16384": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/2048x4096": [
++          [
++            3,
++            ""
++          ],
++          [
++            4,
++            "kw4"
++          ],
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/248320x5120": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/34816x5120": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/5120x10240": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/5120x17408": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/5120x25600": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/5120x6144": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "q8_ksplit/6144x5120": [
++          [
++            8,
++            ""
++          ]
++        ],
++        "t2_i8_route": [
++          [
++            48,
++            ""
++          ],
++          [
++            64,
++            "tile"
++          ],
++          [
++            192,
++            ""
++          ]
++        ],
++        "t2_i8_small/248320x5120": [
++          [
++            8,
++            ""
++          ],
++          [
++            16,
++            "r32c16k8"
++          ]
++        ],
++        "t2_i8_small/34816x5120": [
++          [
++            1,
++            "r32c8k4"
++          ],
++          [
++            2,
++            ""
++          ],
++          [
++            8,
++            "r32c8k4"
++          ],
++          [
++            16,
++            "r32c16"
++          ],
++          [
++            32,
++            ""
++          ]
++        ],
++        "t2_i8_small/4096+12288x5120": [
++          [
++            6,
++            "r16c8w1"
++          ],
++          [
++            8,
++            "r32c8k4"
++          ],
++          [
++            16,
++            "r32c16"
++          ],
++          [
++            32,
++            ""
++          ]
++        ],
++        "t2_i8_small/5120x17408": [
++          [
++            8,
++            "r16c8w1"
++          ],
++          [
++            10,
++            ""
++          ],
++          [
++            12,
++            "r32c16k8"
++          ],
++          [
++            16,
++            "r32c16"
++          ],
++          [
++            32,
++            ""
++          ]
++        ],
++        "t2_i8_small/5120x6144": [
++          [
++            8,
++            "r16c8w1"
++          ],
++          [
++            16,
++            "r32c16"
++          ],
++          [
++            32,
++            ""
++          ]
++        ],
++        "t2_i8_small/7168+7168x5120": [
++          [
++            7,
++            "r16c8w1"
++          ],
++          [
++            12,
++            ""
++          ],
++          [
++            16,
++            "r32c16"
++          ],
++          [
++            32,
++            ""
++          ]
++        ],
++        "unified/q4_linear_add": [
++          [
++            64,
++            ""
++          ]
++        ],
++        "unified/q4_linear_swiglu": [
++          [
++            32,
++            ""
++          ]
++        ],
++        "unified/q4_q5_attn_input": [
++          [
++            12,
++            ""
++          ]
++        ],
++        "unified/q4_q5_gdn_input": [
++          [
++            14,
++            ""
++          ]
++        ],
++        "unified/q5_linear_add/5120x17408": [
++          [
++            16,
++            ""
++          ],
++          [
++            20,
++            "unified"
++          ],
++          [
++            32,
++            ""
++          ],
++          [
++            64,
++            "unified"
++          ]
++        ],
++        "unified/q5_linear_add/5120x6144": [
++          [
++            16,
++            ""
++          ],
++          [
++            20,
++            "unified"
++          ],
++          [
++            32,
++            ""
++          ],
++          [
++            64,
++            "unified"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/1024x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/4096x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/4096x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/4096x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/4096x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x6144/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x6144/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x6144/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x6144/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x17408/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x17408/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x17408/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/5120x17408/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/6144x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/6144x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/6144x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/6144x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/8192x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/8192x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/8192x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/8192x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/10240x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/10240x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/10240x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/10240x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/17408x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/17408x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/17408x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/17408x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/34816x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/34816x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/34816x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq3_s/34816x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/4096x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/4096x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/4096x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/4096x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/6144x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/6144x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/6144x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/6144x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/8192x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/8192x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/8192x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/8192x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/10240x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/10240x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/10240x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/10240x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/17408x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/17408x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/17408x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/17408x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/34816x5120/f32": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/34816x5120/bf16": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/34816x5120/bf16-add": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ],
++        "gguf_prefill_mxfp8/iq4_xs/34816x5120/bf16-silu": [
++          [
++            511,
++            "tile"
++          ],
++          [
++            512,
++            "lt"
++          ]
++        ]
++      }
++    },
+     {"hardware_class": "nvidia-geforce-rtx-5070-sm120", "multiprocessors": 48, "origin": "built in: RTX 5070 at 250 W, 2026-10-16",
+      "routes": {
+         "attn_i8_small/h24/int8/w1": [[1048576, ""]],
+diff --git a/tests/ops/linear/test_gguf_mxfp8.cpp b/tests/ops/linear/test_gguf_mxfp8.cpp
+index 6484b8d1661290efed8dd60f9523bf38aff20e5d..16bca2a04635a2b508d874dfb3e3758ddc953eb9 100644
+--- a/tests/ops/linear/test_gguf_mxfp8.cpp
++++ b/tests/ops/linear/test_gguf_mxfp8.cpp
+@@ -415,6 +415,25 @@ int main(int argc,char** argv){try{
+         weight_codec(format,128,17408);
+     }
+     route_boundaries();
++    if(argc==2 && std::string_view(argv[1])=="--lt512") {
++        const auto saved=ops::installed_device_route_profile();
++        auto measured=std::make_shared<ops::DeviceRouteProfile>();
++        for(const auto& format:formats)for(const auto shape:std::array<mx::PrefillShape,3>{{{17,256},{17,5120},{3,17408}}})
++            for(auto epi:mx::kPrefillEpilogues)
++                measured->routes[mx::prefill_route_key(ops::detail::gguf_type(format.q),shape.n,shape.k,epi)]={{511,"tile"},{512,"lt"}};
++        ops::install_device_route_profile(measured);
++        for(const auto& format:formats) {
++            const auto type=ops::detail::gguf_type(format.q);
++            if(mx::prefill_route(type,17,256,511,mx::PrefillEpilogue::F32)!=mx::PrefillRoute::Tile ||
++               mx::prefill_route(type,17,256,512,mx::PrefillEpilogue::F32)!=mx::PrefillRoute::Lt ||
++               mx::prefill_route(type,17,256,513,mx::PrefillEpilogue::F32)!=mx::PrefillRoute::Tile)
++                throw std::runtime_error("Lt512 exact-width profile route");
++            for(int t:{511,512,513})run(format,17,256,t,true);
++        }
++        for(int i:{1,5}){run(formats[i],17,5120,512,true);run(formats[i],3,17408,512,true);}
++        ops::install_device_route_profile(saved);
++        std::cout<<"Lt512 measured-route, workspace, fusion, Graph and FP64 qualification passed\n";return 0;
++    }
+     if(argc==2 && std::string_view(argv[1])=="--image-bench") {
+         for(int index:{0,1,5}) {
+             bench(formats[index],5120,5120,1024);
