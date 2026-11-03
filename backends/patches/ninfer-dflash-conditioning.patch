@@ -1,0 +1,352 @@
+diff --git a/src/runtime/contract/dflash_conditioning.h b/src/runtime/contract/dflash_conditioning.h
+new file mode 100644
+--- /dev/null
++++ b/src/runtime/contract/dflash_conditioning.h
+@@ -0,0 +1,54 @@
++#pragma once
++
++#include "ninfer/engine_options.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::runtime {
++
++// Resolve once, before publishing Engine options or planning the working set. The existing
++// recent policy then owns both Query and resident-only Pressure; no second pinning policy.
++// Budget searches may start with a smaller seed B: their minimum candidate uses this resolved
++// recent span, whereas an executing Engine must already have enough selected pages.
++inline std::uint32_t dflash2_kvmem_recent_tokens(const KvmemOptions& memory,
++                                                SpeculativeBackend backend,
++                                                std::uint32_t ring_tokens,
++                                                bool require_selected_budget = true) {
++    if (!memory.selected_tokens || backend != SpeculativeBackend::DFlash2) {
++        return memory.recent_tokens;
++    }
++    if (!ring_tokens) {
++        throw std::invalid_argument("DFlash2 requires a positive draft sliding window");
++    }
++    constexpr std::uint64_t page_tokens = 64;
++    const auto ring_pages = (static_cast<std::uint64_t>(ring_tokens) + page_tokens - 1) / page_tokens;
++    const auto recent_pages = std::max<std::uint64_t>(memory.recent_blocks(), ring_pages);
++    const auto effective = recent_pages * page_tokens;
++    if (effective > std::numeric_limits<std::uint32_t>::max()) {
++        throw std::invalid_argument("DFlash2 draft recent span exceeds uint32 token capacity");
++    }
++    const auto required_pages = static_cast<std::uint64_t>(memory.sink_blocks()) + recent_pages;
++    if (required_pages > std::numeric_limits<std::uint32_t>::max() / page_tokens) {
++        throw std::invalid_argument("DFlash2 sink-plus-recent span exceeds uint32 token capacity");
++    }
++    if (require_selected_budget && required_pages > memory.selected_tokens / page_tokens) {
++        throw std::invalid_argument(
++            "DFlash2 KVMem selected_tokens must hold sink plus the draft-ring recent span; "
++            "increase the KVMem budget");
++    }
++    // Preserve the caller's existing downward page rounding when its span is already larger.
++    return memory.recent_blocks() >= ring_pages ? memory.recent_tokens
++                                               : static_cast<std::uint32_t>(effective);
++}
++
++// Truncating reuse can restore an earlier frontier while retaining a later floor. Hiding all
++// history is safe, but the lower bound itself must not remain beyond the restored frontier.
++constexpr void clamp_dflash_context_floor(std::uint32_t& floor,
++                                           std::uint32_t frontier) noexcept {
++    floor = std::min(floor, frontier);
++}
++
++} // namespace ninfer::runtime
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -25,6 +25,7 @@
+ #include "runtime/engine/graph_probe.h"
+ #include "runtime/engine/memory_recovery.h"
+ #include "runtime/contract/rope_scaling.h"
++#include "runtime/contract/dflash_conditioning.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -933,6 +934,16 @@
+         throw std::invalid_argument(
+             "strict requires all selected weights resident on the device; "
+             "the artifact materialized pinned Host weights");
++    }
++    const auto& draft_config = model->config().draft;
++    const auto draft_ring = draft_config ? draft_config->sliding_window.value_or(0U) : 0U;
++    const auto recent = dflash2_kvmem_recent_tokens(
++        options.kvmem, options.speculative.backend, draft_ring, budget_plan == nullptr);
++    if (recent != options.kvmem.recent_tokens) {
++        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
++            "KVMEM_DFLASH_RECENT requested=%u effective=%u ring=%u",
++            options.kvmem.recent_tokens, recent, draft_ring);
++        options.kvmem.recent_tokens = recent;
+     }
+     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
+     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+diff --git a/src/models/qwen3_5/program/decode.cpp b/src/models/qwen3_5/program/decode.cpp
+--- a/src/models/qwen3_5/program/decode.cpp
++++ b/src/models/qwen3_5/program/decode.cpp
+@@ -1,5 +1,6 @@
+ #include "models/qwen3_5/program/structured_round.h"
+ #include "models/qwen3_5/program/program_impl.h"
++#include "runtime/contract/dflash_conditioning.h"
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/context.h"
+ #include "models/qwen3_5/program/graph_execution.h"
+@@ -1115,6 +1116,10 @@
+         if (kvmem_window_tokens) {
+             prepare_window(sequence, sequence.execution_frontier,
+                            std::min(capacity, sequence.execution_frontier + width),false,false,kvmem::SelectionReason::DecodePressure);
++        }
++        if (speculative_backend == SpeculativeBackend::DFlash2) {
++            runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
++                                                sequence.dflash_context_frontier);
+         }
+         // Graph selection follows compact target KV; the draft ring keeps logical positions.
+         maximum_frontier =
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -3,6 +3,7 @@
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/storage/kvmem_transfer_trace.h"
+ #include "models/qwen3_5/program/storage/checkpoint_recompute_policy.h"
++#include "runtime/contract/dflash_conditioning.h"
+ 
+ #include <atomic>
+ #include <cstdio>
+@@ -696,6 +697,10 @@
+             static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
+         sequence.dflash_context_floor =
+             end > recent_tokens ? static_cast<std::uint32_t>(end - recent_tokens) : 0U;
++        if (speculative_backend == SpeculativeBackend::DFlash2) {
++            runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
++                                                sequence.dflash_context_frontier);
++        }
+         auto backend = std::make_shared<WindowMemoryBackend>(*this, sequence, end);
+         const auto count = kv_pages_for_tokens(begin);
+         const auto keep = std::min(count, kvmem_options.selected_tokens / page_tokens);
+@@ -1561,6 +1566,8 @@
+         const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
+         sequence.dflash_context_floor = frontier > recent
+             ? static_cast<std::uint32_t>(frontier - recent) : 0U;
++        runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
++                                            sequence.dflash_context_frontier);
+     }
+     if (backend_kv_pages) { sequence.mtp_kv_valid = frontier; sequence.mtp_draft_count = 0; }
+     ++window.stamp.execution_history;
+diff --git a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
+--- a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
++++ b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
+@@ -1,6 +1,7 @@
+ #include "models/qwen3_5/program/program_impl.h"
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/planning/pressure_planner.h"
++#include "runtime/contract/dflash_conditioning.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -768,6 +769,10 @@
+         const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * 64ULL;
+         sequence.dflash_context_floor = kvmem_window_tokens && retained->main_frontier > recent
+             ? static_cast<std::uint32_t>(retained->main_frontier - recent) : 0U;
++        if (speculative_backend == SpeculativeBackend::DFlash2) {
++            runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
++                                                sequence.dflash_context_frontier);
++        }
+     }
+     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+     refresh_state_views(sequence);
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -135,6 +135,8 @@
+            "                                page; positive values round down, minimum one page\n"
+            "  --kvmem-recent-tokens N       always-kept newest suffix; default 64 (one page);\n"
+            "                                minimum 64; values round down to whole pages\n"
++           "                                DFlash2 raises this to its draft ring (usually 2048);\n"
++           "                                B must hold sink plus the effective recent span\n"
+            "  --kvmem-sessions N            inactive histories, 1..16 (default 4); active requests excluded\n"
+            "  --kvmem-disk-path PATH        Ephemeral active/idle KV spill directory\n"
+            "  --kvmem-disk-mib N            Shared SSD payload quota D, MiB; 0 = off (default)\n"
+diff --git a/tests/models/qwen3_5/test_dflash_conditioning.cpp b/tests/models/qwen3_5/test_dflash_conditioning.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/models/qwen3_5/test_dflash_conditioning.cpp
+@@ -0,0 +1,109 @@
++#include "runtime/contract/dflash_conditioning.h"
++#include "runtime/engine/memory_recovery.h"
++
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <stdexcept>
++
++namespace {
++using ninfer::SpeculativeBackend;
++using ninfer::runtime::dflash2_kvmem_recent_tokens;
++void require(bool condition, const char* message) {
++    if (!condition) throw std::runtime_error(message);
++}
++template<class Work> void rejects(Work work, const char* message) {
++    bool rejected = false;
++    try { work(); } catch (const std::invalid_argument&) { rejected = true; }
++    require(rejected, message);
++}
++void recent_respects_backend_and_page_budget() {
++    ninfer::KvmemOptions memory;
++    memory.selected_tokens = 8192;
++    memory.recent_tokens = 64;
++    require(dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 2048) == 2048,
++            "DFlash2 preserves a full model ring");
++    for (auto backend : {SpeculativeBackend::None, SpeculativeBackend::Mtp, SpeculativeBackend::DFlash}) {
++        require(dflash2_kvmem_recent_tokens(memory, backend, 2048) == 64,
++                "other backends keep their requested recent span");
++    }
++    memory.selected_tokens = 0;
++    require(dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 0) == 64,
++            "disabled KVMem has no recent-ring requirement");
++    memory.selected_tokens = 8192;
++    memory.recent_tokens = 2000;
++    require(dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 2048) == 2048,
++            "downward page rounding must not shorten the ring");
++    memory.recent_tokens = 4095;
++    require(dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 2048) == 4095,
++            "larger caller settings retain their existing rounding semantics");
++    memory.recent_tokens = 4096;
++    memory.selected_tokens = 4096;
++    rejects([&] { (void)dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 2048); },
++            "a larger explicit recent span must also leave room for the sink");
++    memory.selected_tokens = 8192;
++    memory.recent_tokens = 64;
++    require(dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 4096) == 4096,
++            "capacity comes from the model rather than a hardcoded 2K");
++    memory.selected_tokens = 2048;
++    rejects([&] { (void)dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 2048); },
++            "the ring must not consume the mandatory sink budget");
++    memory.selected_tokens = 2112;
++    require(dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 2048) == 2048,
++            "the exact sink-plus-ring budget is admitted");
++    memory.sink_tokens = 512;
++    rejects([&] { (void)dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 2048); },
++            "the actual sink size counts against the same selected budget");
++    memory.selected_tokens = 8192;
++    rejects([&] { (void)dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 0); },
++            "an active DFlash2 ring must have positive capacity");
++    rejects([&] { (void)dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, UINT32_MAX); },
++            "rounding a huge ring must not wrap uint32");
++    rejects([&] { (void)dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2,
++                                                  UINT32_MAX - 63U, false); },
++            "the budget-search minimum must include sink without overflowing uint32");
++    memory.recent_tokens = 2048;
++    require(dflash2_kvmem_recent_tokens(memory, SpeculativeBackend::DFlash2, 2048) == 2048,
++            "normalization is idempotent and does not double-pin recent pages");
++}
++void budget_search_uses_the_resolved_recent_minimum() {
++    ninfer::EngineOptions options;
++    options.speculative.backend = SpeculativeBackend::DFlash2;
++    options.kvmem.selected_tokens = 1024;
++    options.kvmem.reserve_tokens = 256;
++    options.max_context = 16384;
++    options.kvmem.recent_tokens = dflash2_kvmem_recent_tokens(
++        options.kvmem, options.speculative.backend, 2048, false);
++    unsigned quotes = 0;
++    const auto plan = ninfer::runtime::maximum_memory_budget(options, 1ULL << 30, 16384,
++        [&](const ninfer::EngineOptions& candidate) {
++            ++quotes;
++            require(candidate.kvmem.selected_tokens >= 2112,
++                    "budget planning never quotes an inadmissible sink-plus-ring window");
++            return static_cast<std::size_t>(candidate.kvmem.selected_tokens) * 1024;
++        });
++    require(plan.available && quotes && plan.minimum_budget == 2112,
++            "a small planning seed may discover a larger valid DFlash2 budget");
++}
++void truncation_does_not_leave_a_future_floor() {
++    struct Case { std::uint32_t floor, frontier, expected; };
++    for (auto row : std::array{Case{4032, 2048, 2048}, Case{4096, 0, 0},
++                               Case{0, 4096, 0}, Case{2048, 4096, 2048},
++                               Case{UINT32_MAX, 17, 17}, Case{17, 17, 17}}) {
++        ninfer::runtime::clamp_dflash_context_floor(row.floor, row.frontier);
++        require(row.floor == row.expected && row.floor <= row.frontier,
++                "restore keeps existing history bounds or safely hides all truncated history");
++    }
++}
++}
++int main() {
++    try {
++        recent_respects_backend_and_page_budget();
++        budget_search_uses_the_resolved_recent_minimum();
++        truncation_does_not_leave_a_future_floor();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "%s\n", error.what());
++        return 1;
++    }
++    std::puts("DFlash conditioning policy passed");
++}
+diff --git a/tests/models/qwen3_5/tests.cmake b/tests/models/qwen3_5/tests.cmake
+--- a/tests/models/qwen3_5/tests.cmake
++++ b/tests/models/qwen3_5/tests.cmake
+@@ -239,6 +239,10 @@
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_adaptive.cpp"
+   LIBRARIES ninfer_core)
+ 
++ninfer_add_test(ninfer_qwen3_5_dflash_conditioning_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_conditioning.cpp"
++  LIBRARIES ninfer_runtime_support)
++
+ ninfer_add_test(ninfer_qwen3_5_structured_round_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_structured_round.cpp"
+   LIBRARIES ninfer_model_runtime ninfer_core)
+diff --git a/docs/dflash-conditioning.md b/docs/dflash-conditioning.md
+new file mode 100644
+--- /dev/null
++++ b/docs/dflash-conditioning.md
+@@ -0,0 +1,32 @@
++# DFlash2 recent context with KVMem
++
++When KVMem is enabled with DFlash2, Engine startup resolves the effective recent span
++to at least the model's draft sliding-window capacity, rounded up to 64-token pages.
++For a 2048-token ring, requested recent64 or2000 becomes2048. A larger existing
++recent setting keeps its normal downward page rounding. Other speculative backends
++and runs without KVMem retain their requested setting.
++
++This uses the existing recent policy for both Query-required pages and resident-only
++Pressure. It adds no second page-pinning policy or cold recall to tool continuation.
++`KVMEM_DFLASH_RECENT requested=... effective=... ring=...` reports any increase, and
++the resolved Engine options carry the effective value.
++
++The selected budget B is unchanged. Keeping more recent pages leaves less room for
++other retrieved history. B must hold sink plus the effective recent span; with the
++default one-page sink and a2048-token ring, B must be at least2112. An executing
++Engine rejects a smaller budget explicitly. Budget planning uses the same resolved
++span as its minimum even if its seed B is smaller.
++
++The restored draft floor is bounded by its committed frontier, including immediately
++before DFlash2 decode. A truncating restore can therefore hide unavailable history
++without leaving a future lower bound. This guard does not expand the valid interval.
++
++Draft KV remains BF16. There is no INT8 draft storage, shadow buffer, new request
++protocol or ingestion state in this change. Recent=2048 already covers a2048-token
++ring: the minimum is idempotent, not an additional2048-token allocation.
++
++The ring-retention and restored-floor ideas originate in
++melis2023/ninfer-kvmem-actkv commits
++`f9cfb15dfa7251707d8f114c29ecb0f52eea62e6` and
++`e7996f7c3894bcfcef4b1a3c2d3ad832646f20d5`. This integration normalizes recent once
++instead of maintaining independent floor and page-pinning overrides.
+diff --git a/docs/cli.md b/docs/cli.md
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -425,6 +425,10 @@
+ 
+ All weight, sequence, workspace, and graph allocations are released when the Engine is destroyed.
+ 
++With DFlash2 and KVMem, the effective recent span is at least the model's draft ring
++(usually2048 tokens). Larger settings keep their existing page rounding. The selected
++budget must hold sink plus that span; see [DFlash2 conditioning](dflash-conditioning.md).
++
+ ## JSON and JSON Schema output
+ 
+ `--json` constrains output to a JSON object. `--json-schema FILE` constrains it to the supported

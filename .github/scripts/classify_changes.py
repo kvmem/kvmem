@@ -10,6 +10,7 @@ WORKFLOW = '.github/workflows/server-compat.yml'
 CUDA_JOBS = ('cuda-build-linux', 'polystrata-cuda-build-linux', 'polystrata-hip-build-linux')
 NON_CUDA_PATHS = {
     WORKFLOW, '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
+    'tests/test_ninfer_dflash_conditioning.py',
     'scripts/windows/start-backend.ps1', 'scripts/windows/start-ninfer.ps1',
     'scripts/windows/start-server.ps1', 'scripts/windows/test-backend-launcher.ps1',
     'scripts/windows/test-launcher.ps1',
