@@ -8,7 +8,7 @@ Windows 入口 `scripts/windows/start-backend.ps1` 在当前源码可选择 `lla
 
 当前源码统一了 MTP/DFlash2 的启动配置、能力描述及 `/props` 统计，控制台按后端、并发和显卡数量启用选项。llama.cpp 的 DFlash2 使用上游原生草稿实现和独立 GGUF，NInfer 使用模型内置组件；详见 [公共推测解码接口](speculative-interface.md) 和 [本轮功能验证](speculative-validation-20261019.md)。已有发布包需更新 worker 后才能使用新增方式。
 
-切换后端时的参数、默认值和执行行为区别见 [两后端实现差异](multi-backend-differences.md)，包括 ninfer 固定 64-token block、recent 默认且至少保留一页（参数至少 64 tokens）、R 与输出上限，以及 Host 和磁盘预算的不同含义。
+切换后端时的参数、默认值和执行行为区别见 [两后端实现差异](multi-backend-differences.md)，包括 ninfer 固定 64-token block、recent 默认保留一页（DFlash2 会按草稿环自动提高下限）、R 与输出上限，以及 Host 和磁盘预算的不同含义。
 
 Qwen3.5 dense 的 0.8B/2B/4B/9B/27B 规格与原生 MTP 适配范围、4B 两后端验收及模型复用方法见 [家族适配记录](qwen35-dense-family.md)。
 
@@ -129,6 +129,8 @@ ngram 默认关闭。
 `-MtpDrafts` 默认 0，可选固定 1–15；`-AdaptiveMtp` 要求 MTP，允许文本/图片 C1–8；`-FastPrefill` 允许 INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 的文本及 resident/CPU 图片 C1–8，可组合公共 SSD 分层；`-VisionResidency cpu` 要求 `-Vision`；`-NgramDrafts` 默认 0，可选 1–63，非零时要求 MTP：宽度 1–15 允许 C1–8；启动并发 C2–8 时，配置的 16–63 自动降至15并提示，C1 保留原宽度。文本及 resident/CPU 图片均允许 BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 九种 KV。多路上限 15 来自原生 GDN 验证工作区的 16 列容量；本次移除了 KVMem 额外的单路门禁。`-NgramMinMatch` 默认 12，可选 4–64。例如八路文本用 `-Concurrency 8 -MtpDrafts 3 -NgramDrafts 15 -KvType int8`，图片再加 `-Vision`。ngram 使用完整已提交 token 历史提出复制草稿，仍由目标模型验证；重复文本或代码更容易获益，不能承诺所有输入都加速。直接运行 server 开启 MTP 时，默认 ngram15 可用于多路；统一脚本默认仍显式传入 ngram0。快捷脚本默认单路/ngram31，改成多路时会自动使用 ngram15；以启动并发上限为准，当时只有一条活动请求也不改变宽度。MTP 独立 attention window、视频、overlay Vision、并行 prefill 仍被拒绝。`-DeviceProfile auto` 可选原生设备配置；公共 SSD 分层不提供重启恢复。`-RetainedSessions` 控制非活动 Host 历史数量，默认 4，上限 16。
 
 直接运行 NInfer worker 时，`--ngram-arbitration on|off` 控制 Qwen3.5 系列 MTP／DFlash／DFlash2 的复制收益仲裁，默认 on：先用两轮复制测量收益，后续仅在预计收益超过神经草稿的 1.3 倍时采用复制，每跳过八次候选再探测一次。拒绝复制时清除归档续拷游标；统计按请求隔离。off 可用于直接复制对照。此改动不引入 INT8 draft KV；生成文本及速度可能因提案选择而变化。
+
+启用 KVMem 和 DFlash2 时，recent 自动提高到至少模型草稿环的容量，通常是 2048 token；已配置更大 recent 时保持原值。近期页仍占用原有 B 预算，可能减少其他历史的保留空间；B 必须容纳 sink 和有效 recent，否则启动明确报错。日志 `KVMEM_DFLASH_RECENT` 显示自动提高前后的数值。其他推测后端不受影响，草稿 KV 仍为 BF16。
 
 本次 ninfer 实测制品是 Qwen3.8-27B-GSQ-RCO-IQ3_S，设备为 RTX 5060 Ti 16GB、CUDA 13.2、`sm_120a`。8K/64K/128K/256K 档的早期口令检索和后续追问通过；这组人工构造用例不代表通用长文问答质量，也不表示其他 GPU 架构已验收。示例的 B=2048、R=512、H=12 GiB 是实际通过的配置。
 
