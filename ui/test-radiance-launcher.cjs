@@ -8,7 +8,7 @@ module.exports=async({browser,base,info})=>{
  const fixture={...info,backends:[...new Set([...info.backends,'radiance'])],gpus:[uuid,second,third,nvidia].map(id=>({uuid:id,name:id===nvidia?'NVIDIA test GPU':'AMD Radeon AI PRO R9700',vendor:id===nvidia?'nvidia':'amd',memory_mib:'32624'})),
    status:{state:'stopped'},draft:{schema_version:1,parameters:{Backend:'radiance',Model:'C:/models/target.rad',Gpu:uuid,
     Context:65536,Budget:4096,Reserve:1024,HostMiB:8192,Prefill:512,SinkTokens:128,RecentTokens:512,
-    KvType:'fp8',MaxTokens:0,Concurrency:2,RetainedSessions:8,SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',
+    KvType:'k6_v4',StateCacheType:'f16',MaxTokens:0,Concurrency:2,RetainedSessions:8,SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',
     ThinkingMode:'default',RadianceHome:'C:/radiance/home',RocmPath:'C:/ROCm'}}};
  await page.route('**/api/launcher/info',route=>route.fulfill({json:fixture}));
  await page.route('**/api/launcher/status',route=>route.fulfill({json:{state:'stopped'}}));
@@ -16,8 +16,13 @@ module.exports=async({browser,base,info})=>{
  await page.goto(base+'/monitor/?lang=en#config');
  await page.locator('[data-param=Backend]').waitFor();
  assert.equal(await page.locator('[data-param=Backend]').inputValue(),'radiance');
+ assert.equal(await page.locator('[data-param=EmbeddingPlacement]').inputValue(),'vram');
+ assert.deepEqual(await page.locator('[data-param=EmbeddingPlacement] option').evaluateAll(items=>items.map(x=>x.value)),['vram','ram']);
  assert.equal(await page.locator('[data-param=Model]').inputValue(),'C:/models/target.rad');
- assert.deepEqual(await page.locator('[data-param=KvType] option').evaluateAll(items=>items.map(x=>x.value)),['fp8','bf16']);
+ assert.deepEqual(await page.locator('[data-param=KvType] option').evaluateAll(items=>items.map(x=>x.value)),['fp8','bf16','fp8_v4','k6_v4']);
+ assert.equal(await page.locator('[data-param=KvType]').inputValue(),'k6_v4');
+ assert.equal(await page.locator('[data-param=StateCacheType]').inputValue(),'f16');
+ assert.deepEqual(await page.locator('[data-param=StateCacheType] option').evaluateAll(items=>items.map(x=>x.value)),['f32','f16']);
  for(const key of ['VisionTokens','VisionResidency','DiskPath','DiskMiB','StageLayers','DraftModel'])
    assert.equal(await page.locator(`[data-param=${key}]`).isDisabled(),true,key);
  assert.equal(await page.locator('[data-param=Vision]').isDisabled(),false);
@@ -25,7 +30,13 @@ module.exports=async({browser,base,info})=>{
  await page.locator('[data-param=Vision]').check();
  assert.equal(await page.locator('[data-param=VisionTokens]').isDisabled(),false);
  assert.equal(await page.locator('[data-param=VisionResidency]').inputValue(),'resident');
+ assert.equal(await page.locator('[data-param=VisionResidency]').isDisabled(),false);
+ await page.locator('[data-param=VisionResidency]').selectOption('cpu');
+ assert.equal(await page.locator('[data-param=VisionResidency]').inputValue(),'cpu');
+ await page.locator('[data-param=Vision]').uncheck();
  assert.equal(await page.locator('[data-param=VisionResidency]').isDisabled(),true);
+ await page.locator('[data-param=Vision]').check();
+ assert.equal(await page.locator('[data-param=VisionResidency]').inputValue(),'cpu');
  await page.locator('[data-param=Vision]').uncheck();
  await page.getByRole('tab',{name:'Cache & history',exact:true}).click();
  assert.equal(await page.locator('[data-param=DiskEnabled]').isDisabled(),false);

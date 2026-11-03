@@ -22,8 +22,9 @@ class kvmem_lane_conversations {
     };
 public:
     struct operation {
-        int lane = -1, id = -1, outgoing = -1;
-        bool fresh = false, added = false, attached = false, ready = false, finished = false;
+        int lane = -1, id = -1, outgoing = -1, source = -1;
+        bool fresh = false, added = false, attached = false, ready = false, finished = false, source_reserved = false;
+        bool reuse_observed = false;
         size_t prepare_begin = 0;
         int observed_lcp = 0;
     };
@@ -62,7 +63,7 @@ public:
                     disk_path_ = std::filesystem::u8path(lanes[lane]->kparams.payload_disk_dir);
                 }
             }
-            if (disk_) held.native_bytes = llama_kvmem_store_payload_bytes(llama_kvmem_store_current(), false);
+            held.native_bytes = llama_kvmem_store_payload_bytes(llama_kvmem_store_current(), false);
             resident_[lane] = id;
         }
         for(auto* lane:lanes_) lane->mm_checkpoint_reclaim = [this](const auto& account,size_t bytes) {
@@ -80,9 +81,9 @@ public:
         return result;
     }
     size_t preview(const kvmem_prompt & prompt, const std::string & key, bool reset,
-                   const std::shared_ptr<reference> & ref) {
+                   const std::shared_ptr<reference> & ref, bool discover = true) {
         std::lock_guard<std::mutex> lock(mu_);
-        const auto plan = plan_locked(prompt, key);
+        const auto plan = plan_locked(prompt, key, discover);
         if (!reset && ref && ref->id_ < 0 && plan.id >= 0) {
             ref->id_ = plan.id;
             ++entries_.at(plan.id).refs;
@@ -90,35 +91,59 @@ public:
         return reset ? 0 : (size_t) std::max(0, plan.keep);
     }
     int select(const kvmem_prompt & prompt, const std::string & key, bool reset,
-               const std::vector<bool> & busy, bool reserve, operation & op) {
+               const std::vector<bool> & busy, bool reserve, operation & op, bool discover = true) {
         std::lock_guard<std::mutex> lock(mu_);
-        const auto plan = plan_locked(prompt, key);
-        int id = reset ? -1 : plan.id;
+        const auto plan = plan_locked(prompt, key, discover);
+        bool fork = !reset && plan.action == kvmem_store_action::fork;
+        if (fork && !eligible(entries_.at(plan.source), busy)) return -1;
+        int id = reset || fork ? -1 : plan.id;
         bool fresh = reset || plan.action == kvmem_store_action::fresh;
-        if (id < 0 && !key.empty()) {
+        if (id < 0 && !fork && !key.empty()) {
             for (const auto & item : entries_) if (item.second.client_id == key) { id = item.first; break; }
         }
         if (id < 0) {
             for (const auto & item : entries_) {
                 const auto & held = item.second;
                 if (held.client_id.empty() && held.committed.match.rows == 0 && eligible(held, busy)) {
+                    // A resident target cannot be rebound on the source lane.
+                    // When capacity permits, allocate a detached branch instead.
+                    if (fork && held.lane >= 0 &&
+                            (inactive_limit_ || entries_.size() < (size_t)max_)) continue;
                     id = item.first; break;
                 }
             }
         }
         if (id < 0 && !inactive_limit_ && entries_.size() >= (size_t)max_) {
-            for (const auto & item : entries_) {
-                if (!eligible(item.second, busy) || protected_entry(item.second)) continue;
+            // Queued previews are hints, not capacity reservations. select()
+            // replans and media_ready() rechecks any evicted prefix. Prefer the
+            // request's old slot, including when it is also the proposed source.
+            if (!key.empty()) {
+                for (const auto& item : entries_) {
+                    if (item.second.client_id == key && eligible(item.second, busy)) {
+                        id = item.first;
+                        break;
+                    }
+                }
+            }
+            if (id < 0) for (const auto& item : entries_) {
+                if (!eligible(item.second, busy) || (fork && item.first == plan.source)) continue;
                 if (id < 0 || item.second.used < entries_.at(id).used) id = item.first;
             }
+            // No other idle slot exists: recompute on the source's own slot
+            // rather than wait forever for a queued request to release a hint.
+            if (id < 0 && fork) id = plan.source;
             if (id < 0) return -1;
         }
         if (id >= 0 && !eligible(entries_.at(id), busy)) return -1;
-        const size_t begin = fresh ? 0 : (size_t) std::max(0, plan.keep);
+        if (fork && id >= 0 && (id == plan.source || entries_.at(id).lane >= 0)) {
+            fork = false;
+            fresh = true;
+        }
+        const size_t begin = fresh && !fork ? 0 : (size_t) std::max(0, plan.keep);
         op.prepare_begin = begin;
         op.observed_lcp = reset ? 0 : plan.observed_lcp;
         if (!prompt.media_ready(begin)) return -2;
-        int lane = id >= 0 ? entries_.at(id).lane : -1;
+        int lane = fork ? entries_.at(plan.source).lane : id >= 0 ? entries_.at(id).lane : -1;
         if (lane < 0) {
             for (size_t candidate = 0; candidate < busy.size(); ++candidate) {
                 const auto & outgoing = entries_.at(resident_[candidate]);
@@ -126,6 +151,8 @@ public:
             }
         }
         if (lane < 0) return -1;
+        if (id >= 0 && entries_.at(id).lane >= 0 && entries_.at(id).lane != lane)
+            throw std::logic_error("cache target is resident on another lane");
         if (!reserve) return lane;
         op.added = id < 0;
         if (op.added) {
@@ -137,6 +164,8 @@ public:
         op.id = id;
         op.outgoing = resident_[lane];
         op.fresh = fresh;
+        op.source = fork ? plan.source : -1;
+        if (fork) { entries_.at(op.source).switching = true; op.source_reserved = true; }
         entries_.at(id).busy = true;
         if (id != op.outgoing) entries_.at(op.outgoing).switching = true;
         return lane;
@@ -145,10 +174,23 @@ public:
         std::string client_id = key; // Allocate before changing either owner.
         entry * incoming;
         entry * outgoing;
+        entry * fork_source = nullptr;
         {
             std::lock_guard<std::mutex> lock(mu_);
             incoming = &entries_.at(op.id);
             outgoing = &entries_.at(op.outgoing);
+            if (op.source >= 0) fork_source = &entries_.at(op.source);
+        }
+        // source_reserved prevents erasure while fork/I/O runs without mu_.
+        // All map lookups above must remain under mu_, including the source.
+        if (fork_source) {
+            auto& source = *fork_source;
+            if (source.lane < 0) restore_attachments(source);
+            auto payload = source.lane < 0 ? llama_driver_fork_conversation(source.payload, int(op.prepare_begin))
+                                          : llama_driver_fork_conversation(st, int(op.prepare_begin));
+            bundle_ptr branch {llama_kvmem_store_bundle_fork(source.lane < 0 ? source.parked.get() : nullptr), llama_kvmem_store_bundle_free};
+            incoming->payload = std::move(payload); incoming->parked = std::move(branch);
+            op.fresh = false;
         }
         bool restaged = true;
         if (op.id == op.outgoing) {
@@ -189,7 +231,7 @@ public:
         }
         st.mm_reset_requested = false;
         st.mm_observed_lcp = op.fresh ? op.observed_lcp : 0;
-        const auto incoming_native = disk_ ? llama_kvmem_store_payload_bytes(llama_kvmem_store_current(), false) : 0;
+        const auto incoming_native = llama_kvmem_store_payload_bytes(llama_kvmem_store_current(), false);
         std::unique_lock<std::mutex> lock(mu_);
         // Publish the actual owners before any accounting allocation can fail.
         incoming->lane = op.lane;
@@ -203,7 +245,7 @@ public:
             outgoing->lane = -1;
             outgoing->committed = describe(outgoing->payload, llama_kvmem_store_bundle_rows(outgoing->parked.get()));
             outgoing->bytes = payload_bytes(outgoing->payload) + llama_kvmem_store_bundle_bytes(outgoing->parked.get());
-            if (disk_) outgoing->native_bytes = llama_kvmem_store_bundle_payload_bytes(outgoing->parked.get());
+            outgoing->native_bytes = llama_kvmem_store_bundle_payload_bytes(outgoing->parked.get());
             if (disk_ && bytes_max_ && bytes_locked() > bytes_max_) {
                 // switching protects this owner while its lane thread performs
                 // I/O outside the catalog lock and outside other GPU lanes.
@@ -215,7 +257,9 @@ public:
             outgoing->switching = false;
             ++switches_;
         }
-        if (op.fresh) ++forks_; else ++extends_;
+        if (op.fresh || op.source >= 0) ++forks_; else ++extends_;
+        if(op.source>=0)++shared_forks_;
+        if (op.source_reserved) { entries_.at(op.source).switching = false; op.source_reserved = false; }
         op.ready = true;
         kvmem_diag("KVMEM_LANE_STORE lane=%d out=%d in=%d fresh=%d restaged=%d stores=%zu\n",
                 op.lane, op.outgoing, op.id, (int)op.fresh, (int)restaged, entries_.size());
@@ -228,7 +272,7 @@ public:
         const auto required = llama_kvmem_store_payload_capacity(uint32_t(rows));
         std::lock_guard<std::mutex> lock(mu_);
         auto& owner = entries_.at(op.id);
-        const auto reservation = std::max(required, owner.native_bytes);
+        const auto reservation = required > owner.native_bytes ? required-owner.native_bytes : 0;
         const auto fits = [&] {
             const auto used = retained_bytes_locked(op.id);
             return used <= payload_budget_ && reservation <= payload_budget_ - used;
@@ -261,6 +305,10 @@ public:
     void finish(operation & op, ServerState & st) noexcept {
         if (op.finished) return;
         op.finished = true;
+        struct source_guard {
+            kvmem_lane_conversations& owner; operation& op;
+            ~source_guard() { if(op.source_reserved) { std::lock_guard<std::mutex> lock(owner.mu_); auto it=owner.entries_.find(op.source); if(it!=owner.entries_.end())it->second.switching=false; op.source_reserved=false; } }
+        } release_source{*this,op};
         try {
             kvmem_execution_scope execution(st.execution.get());
             llama_driver_finish(st);
@@ -272,7 +320,7 @@ public:
             }
             auto committed = op.attached && !op.ready ? snapshot{} : describe(st, llama_kvmem_store_n_tokens());
             const uint64_t bytes = payload_bytes(st) + llama_kvmem_store_active_bytes();
-            const uint64_t native = disk_ ? llama_kvmem_store_payload_bytes(llama_kvmem_store_current(), false) : 0;
+            const uint64_t native = llama_kvmem_store_payload_bytes(llama_kvmem_store_current(), false);
             st.active_prompt.reset();
             std::lock_guard<std::mutex> lock(mu_);
             const int active = op.attached ? op.id : op.outgoing;
@@ -288,7 +336,7 @@ public:
             if (!op.ready) {
                 auto target = entries_.find(op.id);
                 if (target != entries_.end()) target->second.committed = snapshot{};
-                if (op.attached && op.outgoing != op.id) entries_.at(op.outgoing).committed = snapshot{};
+                if (op.attached && op.outgoing != op.id && op.source != op.outgoing) entries_.at(op.outgoing).committed = snapshot{};
                 entries_.at(op.outgoing).switching = false;
             }
             // Successful attach released outgoing. Another lane may already
@@ -304,9 +352,19 @@ public:
             auto target = entries_.find(op.id);
             if (target != entries_.end()) target->second.busy = false;
             auto out = entries_.find(op.outgoing);
-            if (!op.ready && out != entries_.end()) { out->second.switching = false; out->second.committed = snapshot{}; }
+            if (!op.ready && out != entries_.end()) { out->second.switching = false; if(op.source!=op.outgoing)out->second.committed = snapshot{}; }
         }
         st.active_prompt.reset();
+    }
+    void observe_reuse(operation & op, size_t actual_tokens) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (op.reuse_observed) return;
+        op.reuse_observed = true;
+        planned_reuse_tokens_ += op.prepare_begin;
+        actual_reuse_tokens_ += actual_tokens;
+        if (!actual_tokens) ++actual_misses_;
+        else if (op.source >= 0) ++actual_shared_hits_;
+        else ++actual_own_hits_;
     }
     json status(int lane = -1) const {
         std::lock_guard<std::mutex> lock(mu_);
@@ -321,6 +379,22 @@ public:
             {"session_limit_kind", inactive_limit_ ? "inactive" : "legacy_total"},
             {"bytes_max", bytes_max_}, {"switches", switches_}, {"evictions", evictions_},
             {"extends", extends_}, {"forks", forks_}};
+        uint64_t logical = 0;
+        for (const auto& item : entries_) logical += item.second.native_bytes;
+        const auto physical = llama_kvmem_execution_storage_stats(lanes_[0]->execution.get());
+        result["native_logical_bytes"] = logical;
+        result["host_payload_bytes"] = physical.host_bytes;
+        result["disk_payload_bytes"] = physical.disk_bytes;
+        result["physical_payload_bytes"] = physical.host_bytes + physical.disk_bytes;
+        result["sharing_credit_lower_bound_bytes"] = logical > physical.host_bytes + physical.disk_bytes ? logical-physical.host_bytes-physical.disk_bytes : 0;
+        result["shared_forks"] = shared_forks_;
+        result["history_hits"] = actual_shared_hits_ + actual_own_hits_;
+        result["own_history_hits"] = actual_own_hits_;
+        result["shared_history_hits"] = actual_shared_hits_;
+        result["history_misses"] = actual_misses_;
+        result["planned_reuse_tokens"] = planned_reuse_tokens_;
+        result["actual_reuse_tokens"] = actual_reuse_tokens_;
+        result["shared_prefix_fork_supported"] = lanes_[0]->kparams.cpu_bytes == 0;
         if (lane >= 0) {
             const int id = resident_.at((size_t)lane);
             result["resident"] = id;
@@ -340,16 +414,17 @@ private:
     int max_, next_id_ = 0;
     bool inactive_limit_ = false;
     bool warned_bytes_ = false;
-    uint64_t bytes_max_, clock_ = 0, switches_ = 0, evictions_ = 0, extends_ = 0, forks_ = 0;
+    uint64_t bytes_max_, clock_ = 0, switches_ = 0, evictions_ = 0, extends_ = 0, forks_ = 0, shared_forks_ = 0;
+    uint64_t actual_own_hits_ = 0, actual_shared_hits_ = 0, actual_misses_ = 0;
+    uint64_t planned_reuse_tokens_ = 0, actual_reuse_tokens_ = 0;
     uint64_t retained_bytes_locked(int exclude = -1) const {
-        uint64_t bytes = 0;
+        const auto physical = llama_kvmem_execution_storage_stats(lanes_[0]->execution.get());
+        uint64_t bytes = physical.host_bytes + physical.disk_bytes;
         for (const auto& item : entries_) {
             if (item.first == exclude) continue;
-            const auto& held = item.second;
-            const auto native = std::max(held.native_bytes, held.reserved_bytes);
-            if (native > UINT64_MAX - bytes || held.attachment_bytes > UINT64_MAX - bytes - native)
-                throw std::overflow_error("retained KV capacity overflow");
-            bytes += native + held.attachment_bytes;
+            const auto extra = item.second.reserved_bytes;
+            if (extra > UINT64_MAX-bytes) throw std::overflow_error("retained KV capacity overflow");
+            bytes += extra;
         }
         return bytes;
     }
@@ -400,7 +475,7 @@ private:
             LOG_WRN("srv    KVMEM parked attachment spill retained valid source: %s\n", e.what());
         }
     }
-    kvmem_store_plan plan_locked(const kvmem_prompt & prompt, const std::string & key) const {
+    kvmem_store_plan plan_locked(const kvmem_prompt & prompt, const std::string & key, bool discover) const {
         std::vector<kvmem_store_match> matches;
         for (const auto & item : entries_) {
             auto match = item.second.committed.match;
@@ -413,8 +488,8 @@ private:
         }
         kvmem_store_limits limits;
         limits.max_stores = std::numeric_limits<int>::max();
-        return kvmem_store_select(matches, (int)prompt.tokens.size() - (lanes_[0]->spec.ok ? 1 : 0),
-                                    lanes_[0]->spec.ok, key, limits);
+        return kvmem_store_select_shared(matches, (int)prompt.tokens.size() - (lanes_[0]->spec.ok ? 1 : 0),
+                                    lanes_[0]->spec.ok, key, limits, discover && !lanes_[0]->kparams.cpu_bytes);
     }
     bool eligible(const entry & held, const std::vector<bool> & busy) const {
         return !held.busy && !held.switching && (held.lane < 0 || !busy[(size_t)held.lane]);
@@ -494,7 +569,7 @@ private:
                 held.committed = snapshot{};
                 held.client_id.clear();
                 held.bytes = payload_bytes(state) + llama_kvmem_store_active_bytes();
-                held.native_bytes = disk_ ? llama_kvmem_store_payload_bytes(llama_kvmem_store_current(), false) : 0;
+                held.native_bytes = llama_kvmem_store_payload_bytes(llama_kvmem_store_current(), false);
             } else {
                 entries_.erase(victim);
             }

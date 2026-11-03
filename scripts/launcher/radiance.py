@@ -44,9 +44,11 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         raise ValueError('Radiance requires one or two distinct AMD GPUs by ROCr UUID')
     if p.get('StageLayers') or p.get('FastPrefill') or p.get('DeviceProfile','off')!='off':
         raise ValueError('Radiance does not implement NInfer layer splitting or CUDA fast-prefill/device profiles')
+    if p['EmbeddingPlacement'] not in ('ram','vram'):
+        raise ValueError('Radiance EmbeddingPlacement must be ram or vram')
     if p.get('Vision'):
-        if p.get('VisionResidency')!='resident':
-            raise ValueError('Radiance native vision currently requires GPU-resident encoder weights')
+        if p.get('VisionResidency') not in ('resident','cpu'):
+            raise ValueError('Radiance VisionResidency must be resident or cpu')
         if not 64<=p['VisionTokens']<=16384:raise ValueError('VisionTokens must be in [64,16384]')
     p.setdefault('DiskMiB',4096)
     if not 0<=p['DiskMiB']<=1048576:
@@ -61,8 +63,10 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         ('HostMiB',1,1048576),('Prefill',1,2147483647),('Concurrency',1,8),('RetainedSessions',0,1024),
         ('VramReserveMiB',256,65536)]:
         if not low<=p[key]<=high:raise ValueError(f'{key} must be in [{low},{high}]')
-    if p.get('KvType') not in ('fp8','bf16'):
-        raise ValueError('Radiance KV format must be fp8 or bf16')
+    if p.get('KvType') not in ('fp8','bf16','fp8_v4','k6_v4'):
+        raise ValueError('Radiance KV format must be fp8, bf16, fp8_v4 or k6_v4')
+    if p.get('StateCacheType','f32') not in ('f32','f16'):
+        raise ValueError('Radiance recurrent state format must be f32 or f16')
     tokens=token_settings('radiance',p);p.update(tokens['effective'])
     _speculative(p,supplied)
     suffix='.exe' if platform=='windows' else ''
@@ -82,12 +86,13 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         ('--max-model-len','Context'),('--max-num-seqs','Concurrency'),('--max-num-batched-tokens','Prefill'),
         ('--kvmem-budget','Budget'),('--kvmem-gen-reserve','Reserve'),('--kvmem-host-mib','HostMiB'),
         ('--kvmem-sink-tokens','SinkTokens'),('--kvmem-recent-tokens','RecentTokens'),('--kvmem-sessions','RetainedSessions'),
-        ('--kv-cache-dtype','KvType'),('--gpu-headroom-mib','VramReserveMiB'),('--num-speculative-tokens','MtpDrafts')]:pair(flag,p[key])
+        ('--kv-cache-dtype','KvType'),('--state-cache-dtype','StateCacheType'),('--gpu-headroom-mib','VramReserveMiB'),('--num-speculative-tokens','MtpDrafts')]:pair(flag,p[key])
     argv+=['--tp',str(len(gpu_ids)),'--tp-wire','exact','--no-prefix-cache','--host-pool-mib','0','--prefix-cache-host-mib','0',
-           '--placement','all_vram','--embedding-placement','vram',
+           '--placement','all_vram','--embedding-placement',p['EmbeddingPlacement'],
            '--draft-window',p['DraftPolicy'],'--kvmem','--kvmem-block-tokens','128']
     if p.get('Vision'):
         patch,merge=vision_geometry(p['Model'])
+        pair('--vision-residency',p['VisionResidency'])
         pair('--mm-max-patches',p['VisionTokens']*merge*merge)
         pair('--image-max-pixels',p['VisionTokens']*(patch*merge)**2)
     else:pair('--mm-max-patches',0)

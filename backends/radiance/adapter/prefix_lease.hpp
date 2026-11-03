@@ -55,6 +55,9 @@ class PrefixLease {
         refs_.clear();
     }
 public:
+    void account(SharedPayloadAccounting& out) const {
+        if(parked_host_)parked_host_->account(out);state_.account(out);
+    }
     class Payload {
         friend class PrefixLease;
         std::shared_ptr<const int> identity_;

@@ -215,6 +215,8 @@ public:
     bool conv_swap_supported(std::string & reason) const;
     bool conv_compatible(const llama_memory_kvmem & other) const;
     std::unique_ptr<ConvStore> make_conv();
+    std::unique_ptr<ConvStore> fork_conv(ConvStore & source);
+    std::unique_ptr<ConvStore> fork_active_conv();
     // Exchange the per-conversation host state. Call only between requests,
     // under the server's request lock. `conv` must come from make_conv() or an
     // earlier swap_conv() on a compatible memory object; on return it holds the outgoing

@@ -92,7 +92,35 @@ static void failed_write(const std::filesystem::path& directory) {
     rejects(MemoryErrorCode::Stale,[&]{a.source(block(d,1));});
 #endif
 }
+static void checkpoint_alias_accounting() {
+    const auto d=descriptor(0);const auto n=d.layout.record_bytes;
+    auto storage=std::make_shared<HostKvStorage>(8*n);
+    TieredArchive active(d.identity,{42,3},d.layout,8*n,storage);
+    MemorySnapshot view;
+    for(uint64_t i=0;i<3;++i) {
+        auto item=block(d,i);active.put(payload(d,item));
+        view.blocks.push_back({item,item.content_version});
+    }
+    auto input=active.fork({42,4},view);
+    CHECK(input.bytes()==3*n && active.shared_bytes(input)==3*n && storage->charged_bytes()==3*n);
+    // A newer payload at the same logical ID no longer shares that allocation.
+    auto changed=block(d,1);++changed.content_version;active.put(payload(d,changed));
+    CHECK(active.shared_bytes(input)==2*n && storage->charged_bytes()==4*n);
+    CHECK(active.bytes()+input.bytes()-active.shared_bytes(input)==4*n);
+    auto sibling=input.fork({43,1},[&]{
+        auto next=view;for(auto& b:next.blocks)b.block.session={42,4};return next;
+    }());
+    SharedPayloadAccounting account;
+    active.account(account);input.account(account);sibling.account(account);
+    CHECK(account.credit()==5*n);
+    CHECK(active.bytes()+input.bytes()+sibling.bytes()-account.credit()==storage->charged_bytes());
+    // Even identical bytes in an independent allocation must be charged.
+    TieredArchive independent(d.identity,{42,3},d.layout,8*n,storage);
+    independent.put(payload(d,block(d,0)));
+    CHECK(active.shared_bytes(independent)==0);
+}
 int main() {
+    checkpoint_alias_accounting();
     const auto directory=std::filesystem::temp_directory_path()/
         ("kvmem-radiance-archive-"+std::to_string(std::random_device{}()));
     CHECK(std::filesystem::create_directory(directory));
@@ -109,6 +137,13 @@ int main() {
         CHECK(bytes.empty() && parked->size()==expected.size());
         CHECK(storage->charged_bytes()<=1024 && storage->disk_bytes()>0);
         CHECK(read_buffer(*parked,io)==expected);
+        auto branch=parked->fork();
+        SharedPayloadAccounting shared;
+        parked->account(shared);branch->account(shared);
+        CHECK(shared.credit()==expected.size());
+        CHECK(storage->charged_bytes()+storage->disk_bytes()==expected.size());
+        parked.reset();CHECK(branch->read()==expected);
+        branch.reset();
         parked.reset();CHECK(storage->charged_bytes()==0 && storage->disk_bytes()==0);
         auto small=std::make_shared<HostKvStorage>(1024,std::make_shared<SpillFile>(directory,1024));
         bytes=expected;

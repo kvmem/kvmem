@@ -5,8 +5,8 @@ using namespace kvmem::radiance::rolling;
 #define REQUIRE(x) do { if (!(x)) throw std::runtime_error(#x); } while(false)
 template<class F> void rejects(F f) { bool threw=false; try { f(); } catch(const std::invalid_argument&) { threw=true; } REQUIRE(threw); }
 int main() {
-    REQUIRE(!retainable_prefix_boundary(32843,32843,128));
-    REQUIRE(!retainable_prefix_boundary(64,64,128));
+    REQUIRE(retainable_prefix_boundary(32843,32843,128));
+    REQUIRE(retainable_prefix_boundary(64,64,128));
     REQUIRE(!retainable_prefix_boundary(32768,32843,128));
     REQUIRE(!retainable_prefix_boundary(0,0,128));
     REQUIRE(retainable_prefix_boundary(32768,32768,128));

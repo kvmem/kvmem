@@ -335,6 +335,7 @@
       row(tr('显卡顺序','GPU order'),gpuSummary+(gpuIssue?'\n'+gpuIssue:''),'Gpu',ids.length>0&&!missing.length&&!gpuIssue);
       row(tr('上下文 / GPU 历史 / RAM 缓存','Context / GPU history / RAM cache'),`${p.Context??'—'} tokens / ${p.Budget??'—'} tokens / ${p.HostMiB??'—'} MiB`,'Context');
       row(tr('KV 缓存格式','KV cache format'),p.Backend==='llamacpp'?`K: ${p.KvTypeK||'—'} / V: ${p.KvTypeV||'—'}`:p.KvType||'—',p.Backend==='llamacpp'?'KvTypeK':'KvType');
+      if(p.Backend==='radiance')row(tr('循环状态缓存格式','Recurrent state cache format'),p.StateCacheType||'f32','StateCacheType');
       for(const input of root.querySelectorAll('form [data-param]'))if(input.dataset.param!=='Gpu'&&input.willValidate&&!input.checkValidity())row(input.getAttribute('aria-label')||input.dataset.param,input.validationMessage,input.dataset.param,false);
       if(errors.length){summary.textContent=tr('需要补全或修改配置','Some settings need attention');return;}
       const result=await api('preview',data);if(!el.isConnected)return;
@@ -908,9 +909,10 @@
       help(kvTitle,tr('KV 格式','KV format'),tr('K 和 V 可分别选择：q8_0、q5_0、q4_0 可互配；f16、f32 可互配。浮点与量化不能混搭。','Choose K and V independently: q8_0, q5_0 and q4_0 can be combined; f16 and f32 can be combined. Floating-point and quantized types cannot be mixed.'));
       kvField.append(kvTitle,pair,make('p',{class:'l-muted l-error l-kv-status','data-kv-pair-status':'','aria-live':'polite',hidden:''}));panels[0].append(kvField);
     }else{
-      const kv=rad?['fp8','bf16']:poly?['f16','q8_0','int8','int8k']:['int8','bf16','fp8','nvfp4','k8v4','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'];
+      const kv=rad?['fp8','bf16','fp8_v4','k6_v4']:poly?['f16','q8_0','int8','int8k']:['int8','bf16','fp8','nvfp4','k8v4','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'];
       field(panels[0],{...p,KvType:p.KvType||kv[0]},'KvType','KV 格式','KV format','text',kv.map(v=>[v,v]));
     }
+    if(rad)field(panels[0],{...p,StateCacheType:p.StateCacheType||'f32'},'StateCacheType','循环状态缓存格式','Recurrent state cache format','text',[['f32','FP32'],['f16','FP16']],['FP16 可减少循环状态缓存显存，可能改变模型输出。','FP16 reduces recurrent-state memory and may change model output.']);
     // UI state only: the worker still receives the existing path/budget pair.
     const diskEnabled=field(panels[0],{DiskEnabled:typeof p.DiskEnabled==='boolean'?p.DiskEnabled:!!p.DiskPath?.trim()&&p.DiskMiB!==0},'DiskEnabled','启用 SSD 缓存','Enable SSD cache','checkbox',null,['关闭后不传 SSD 参数；目录与预算仍保存在草稿和模板中，重新开启时可继续使用。','When off, no SSD arguments are passed. The directory and budget stay in drafts and templates for later reuse.']);
     diskEnabled.dataset.uiOnly='true';diskEnabled.closest('label').classList.add('l-wide');
@@ -1032,7 +1034,10 @@
     const worker=field(ng,p,'Worker','后端程序','Backend executable','text',null,
       detected?.available?['留空使用已检测到的程序：'+detected.path,'Leave empty to use the detected executable: '+detected.path]:['未检测到后端程序，请填写已安装程序的完整路径。','No backend executable detected. Enter the full path to an installed executable.']);
     worker.placeholder=tr('自动检测','Auto-detect');worker.closest('label').classList.add('l-wide');
-    if(rad){for(const [key,zh,en] of [['RadianceHome','Radiance 资源目录','Radiance resource directory'],['RocmPath','ROCm 运行库目录','ROCm runtime directory']])field(ng,p,key,zh,en);}
+    if(rad){
+      field(panels[0],{EmbeddingPlacement:'vram',...p},'EmbeddingPlacement','文本嵌入表位置','Text embedding placement','text',[['vram','GPU'],['ram','RAM']],['RAM 可为视觉和 KV 释放显存。','RAM frees GPU memory for vision and KV.']);
+      for(const [key,zh,en] of [['RadianceHome','Radiance 资源目录','Radiance resource directory'],['RocmPath','ROCm 运行库目录','ROCm runtime directory']])field(ng,p,key,zh,en);
+    }
     if(poly){
       for(const [key,zh,en,placeholderZh,placeholderEn] of [
         ['Python','Python 程序','Python executable','使用内置环境','Use bundled runtime'],
@@ -1105,8 +1110,6 @@
     [save,preview,start,stop].forEach(button=>button.onclick=()=>act(button.dataset.action));
     if(info.script_export_version){start.textContent=tr('生成并启动','Generate and start');root.querySelectorAll('[data-browse-template],[data-browse-model],[data-scan-folder]').forEach(button=>button.hidden=true);}
     if(rad){
-      const residency=root.querySelector('[data-param=VisionResidency]');
-      if(residency){residency.value='resident';residency.disabled=true;residency.dataset.backendSupported='false';}
       for(const option of root.querySelector('[data-param=LogLevel]').options)option.disabled=!['info','debug','trace'].includes(option.value);
     }
     if(poly){

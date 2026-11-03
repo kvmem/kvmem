@@ -223,13 +223,58 @@ static void queue_tests(const std::filesystem::path & directory) {
     auto cancelled = queue.submit(8, [lease = record.lease(), &called] { called = true; });
     record.reset();
     CHECK(ram.charged_bytes() == 8 && queue.pinned_bytes() == 16);
-    CHECK(cancelled.cancel() && !cancelled.ready());
-    rejects(MemoryErrorCode::Pending, [&] { queue.submit(1, [] {}); });
+    const auto cancelled_epoch = queue.completion_epoch();
+    CHECK(cancelled.cancel() && cancelled.ready() && !cancelled.cancel());
+    CHECK(cancelled.status() == StorageTaskStatus::Cancelled && !called);
+    CHECK(ram.charged_bytes() == 0 && queue.pending_jobs() == 1 && queue.pinned_bytes() == 8);
+    CHECK(queue.completion_epoch() != cancelled_epoch);
+    auto replacement = queue.submit(8, [] {}); // cancellation immediately returned quota
     release.set_value();
     first.wait();
+    replacement.wait();
     fails([&] { cancelled.wait(); });
     CHECK(cancelled.status() == StorageTaskStatus::Cancelled && !called);
     CHECK(ram.charged_bytes() == 0 && queue.pending_jobs() == 0 && queue.pinned_bytes() == 0);
+
+    // Race a worker taking a job against cancellation. A successful cancel
+    // must never run the work; a lost race must drain the running work.
+    for (int i = 0; i < 256; ++i) {
+        std::atomic<bool> ran{false};
+        auto raced = queue.submit(1, [&] { ran = true; });
+        const bool won = raced.cancel();
+        if (won) fails([&] { raced.wait(); });
+        else raced.wait();
+        CHECK(ran.load() != won);
+        CHECK(queue.pending_jobs() == 0 && queue.pinned_bytes() == 0);
+    }
+
+    // Queue destruction must also wait for a cancellation that detached work
+    // but has not yet finished releasing its captured lease.
+    struct BlockingLease {
+        std::promise<void> & entered;
+        std::shared_future<void> released;
+        BlockingLease(std::promise<void> & e, std::shared_future<void> r) : entered(e), released(std::move(r)) {}
+        ~BlockingLease() { entered.set_value(); released.wait(); }
+    };
+    std::promise<void> worker_release, worker_entered, lease_release, lease_entered;
+    auto worker_gate = worker_release.get_future().share();
+    auto lease_gate = lease_release.get_future().share();
+    auto owned_queue = std::make_unique<StorageIoQueue>(2, 16);
+    auto running = owned_queue->submit(1, [&] { worker_entered.set_value(); worker_gate.wait(); });
+    worker_entered.get_future().wait();
+    auto blocking_lease = std::make_shared<BlockingLease>(lease_entered, lease_gate);
+    auto detached = owned_queue->submit(1, [blocking_lease] {});
+    blocking_lease.reset();
+    auto cancellation = std::async(std::launch::async, [&] { return detached.cancel(); });
+    lease_entered.get_future().wait();
+    worker_release.set_value(); running.wait();
+    auto destruction = std::async(std::launch::async, [&] { owned_queue.reset(); });
+    const bool waited_for_lease = destruction.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout;
+    const bool not_complete_early = !detached.ready();
+    lease_release.set_value();
+    const bool cancelled_during_destruction = cancellation.get();
+    destruction.get();
+    CHECK(waited_for_lease && not_complete_early && cancelled_during_destruction && detached.ready());
 
     auto failure = queue.submit(16, [] { throw std::runtime_error("injected I/O failure"); });
     fails([&] { failure.wait(); });

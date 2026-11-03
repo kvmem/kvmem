@@ -1,0 +1,1101 @@
+diff --git a/docs/BACKENDS.md b/docs/BACKENDS.md
+index c569a42b2e5a652759e5400a94f3d33ddf988305..b7996afa96796ee57f3bdbe7ff9d9de516ad7f54 100644
+--- a/docs/BACKENDS.md
++++ b/docs/BACKENDS.md
+@@ -150,6 +150,48 @@ and 31.4 with Ornith's and 22.6, 24.6 and 28.6 with Gemma 4's, of its 31.8. Tiel
+ with the engine of 1212621baadf, took it to 21.8, 24.9 and 29.9 GiB. Setup does not stop a PC below the 32 GB that
+ Qwen3.8 needs when one of these families is named.
+ 
++## KVMem retained owners
++
++This fork's opt-in KVMem integration can retain an exact native prefix for a
++different conversation without consuming its source. `kvmem.conversation_id`
++selects a mutable lineage; `prompt_cache_key` and `promptCacheKey` are aliases.
++Full UTF-8 keys are bounded at 256 bytes and conflicting aliases are rejected.
++No key is required for a new user Query to discover a compatible prefix. Tool
++continuation uses append and resident-only Pressure, without foreign discovery.
++
++Only sealed host/SSD KV and immutable recurrent checkpoint bytes share physical
++allocations. Each branch has its own accepted identity, checkpoint catalog,
++MeanK, selector, Query, graph feedback and mutable engine state. A failed child
++restore preserves the source. Admission uses the global physical payload
++account plus new growth, not the sum of logical bytes across all owners.
++The native `KVMEM_SHARED` counters expose those scopes separately from RSS.
++Request completion diagnostics report planned/actual cached tokens and the
++native source (`own`, `shared`, `miss`); older engines leave these fields absent.
++Solo MTP and ordinary batch decode retain their existing execution modes.
++Owners also survive solo/batch admission, yielded prefill and MTP continuation;
++continuation after decode has an empty Query span without dropping the owner.
++Prefill yielded before its new Query keeps that still-pending bounded span.
++Foreign discovery requires `--kvmem-sessions` greater than one. With one retained
++history, a different named owner starts fresh instead of taking the active
++owner's mutable lineage. Anonymous single-history behavior stays native.
++
++`CACHE_REUSE` reports the first successful native prefix-restore boundary of an
++HTTP request. Subsequent internal legs cannot inflate this value with input
++already computed by that request. It is not a measure of net compute avoided
++across all later replay. Legacy `DONE` timing fields keep their original scope.
++`KVMEM_SHARED scope_version=2` includes all native sequence archives and slot
++checkpoint references, in addition to parked histories, at request boundaries.
++Logical state references deduplicate their immutable root when reporting
++physical state bytes. The RAM/SSD payload charge includes reservations and can
++overlap cold checkpoint bytes; do not sum these counters into RSS or VRAM.
++`KVMEM_REUSE` traces the effective bounded Query, separately from the requested
++span; a long requested user span is not the amount captured for retrieval.
++Monitor own/shared/miss counters count first native observations once per HTTP
++request and reset with the worker generation. Batch-mode parked/eviction counts
++come from the global native catalog when scope version 2 is available; older
++batch workers keep unsupported fields absent.
++CUDA execution and portable CPU tests are qualified separately from HIP.
++
+ ## Elastic experts (opt-in, CUDA)
+ 
+ `strata-poly --elastic-experts` lends audited prompt scratch and expert staging pages to the expert cache
+diff --git a/serve/kvmem.py b/serve/kvmem.py
+index 8b4ecca252ff1f2b83215f21caf1cd57df7f0adc..881b543c85cb21f4a412c7a70d6c574700e87ff4 100644
+--- a/serve/kvmem.py
++++ b/serve/kvmem.py
+@@ -15,14 +15,34 @@ def enabled(engine) -> bool:
+         return False
+ 
+ 
++def cache_owner(req):
++    req = req or {}
++    k = req.get("kvmem", {})
++    if not isinstance(k, dict):
++        raise ValueError("kvmem must be an object")
++    conversation = k.get("conversation_id")
++    if conversation is not None and (not isinstance(conversation, str) or not conversation or len(conversation.encode()) > 256):
++        raise ValueError("kvmem.conversation_id must be a nonempty string of at most 256 UTF-8 bytes")
++    aliases = []
++    for name in ("prompt_cache_key", "promptCacheKey"):
++        value = req.get(name)
++        if value is not None and (not isinstance(value, str) or len(value.encode()) > 256):
++            raise ValueError(name + " must be a string of at most 256 UTF-8 bytes")
++        if value: aliases.append(value)
++    if len(set(aliases)) > 1:
++        raise ValueError("conflicting prompt cache keys")
++    return conversation or (aliases[0] if aliases else "")
++
++
+ class Prompt(list):
+     """Request-local metadata survives appended generation-control tokens."""
+-    def __init__(self, ids, query):
++    def __init__(self, ids, query, owner=""):
+         super().__init__(ids)
+         self.kvmem_query = tuple(query)
++        self.kvmem_owner = owner
+ 
+     def __add__(self, tail):
+-        return Prompt(super().__add__(tail), self.kvmem_query)
++        return Prompt(super().__add__(tail), self.kvmem_query, self.kvmem_owner)
+ 
+     def __getitem__(self, key):
+         result = super().__getitem__(key)
+@@ -30,9 +50,9 @@ class Prompt(list):
+             first, last, step = key.indices(len(self))
+             begin, end = self.kvmem_query
+             if step==1 and begin==end==0:
+-                return Prompt(result,(0,0))
++                return Prompt(result,(0,0),self.kvmem_owner)
+             if step == 1 and first <= begin < end <= last:
+-                return Prompt(result, (begin - first, end - first))
++                return Prompt(result, (begin - first, end - first), self.kvmem_owner)
+         return result
+ 
+ 
+diff --git a/serve/kvmem_monitor.py b/serve/kvmem_monitor.py
+index 792376bad0382483f8ea6c64381bc9dd7f2dfb8a..a6ab15e7c340560f5552ccbf80e885632bc7076b 100644
+--- a/serve/kvmem_monitor.py
++++ b/serve/kvmem_monitor.py
+@@ -71,7 +71,7 @@ class StorageLog:
+             self.pos += end
+             lines = data[:end].decode('utf-8', 'replace').splitlines()
+             for line in lines[1:] if skipped else lines:
+-                if line.startswith(('KVMEM_STORAGE ', 'KVMEM_SESSIONS ')):
++                if line.startswith(('KVMEM_STORAGE ', 'KVMEM_SESSIONS ', 'KVMEM_SHARED ')):
+                     self.values.update({k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', line)})
+                     self.sampled_at_ms = time.time() * 1000
+             return dict(self.values)
+@@ -87,6 +87,8 @@ def snapshot(service):
+         history = list(service.history)
+         totals = dict(service.totals)
+         queued = service.status.get('queued', 0)
++        reuse=(dict(service.kvmem_reuse_totals)
++               if getattr(service,'kvmem_reuse_generation',None)==(id(service.engine),getattr(service.engine,'gen',0)) else {})
+     active = []
+     solo = not getattr(service.engine, 'batch', 0)
+     for st, rate in live:
+@@ -100,7 +102,10 @@ def snapshot(service):
+                        'has_media': bool(st.get('has_media')),
+                        'endpoint': 'generation', 'prompt_tokens': st.get('prompt_tokens'),
+                        'generated_tokens': count,
+-                       'cached_tokens': getattr(service.engine, 'reused', None) if solo and generating else None,
++                       'cached_tokens': st.get('actual_cached_tokens', getattr(service.engine, 'reused', None) if solo and generating else None),
++                       'planned_cached_tokens': st.get('planned_cached_tokens'),
++                       'actual_cached_tokens': st.get('actual_cached_tokens'),
++                       'cache_source': st.get('cache_source'),
+                        'limit': st.get('max_tokens'),
+                        'ttft_ms': (st['first_token']-started)*1000 if generating else None,
+                        'ttft_scope': 'execution',
+@@ -124,7 +129,11 @@ def snapshot(service):
+                        'drafts_offered': row.get('drafts_offered'), 'drafts_accepted': row.get('drafts_accepted'),
+                        'expert_hit_rate': row.get('hit_rate'),
+                        'endpoint': 'generation', 'limit': row.get('kvmem_monitor_limit'),
+-                       'prompt_tokens': row.get('prompt_tokens'), 'cached_tokens': row.get('reused'),
++                       'prompt_tokens': row.get('prompt_tokens'),
++                       'cached_tokens': row.get('actual_cached_tokens') if number(row.get('actual_cached_tokens')) else row.get('reused'),
++                       'planned_cached_tokens': row.get('planned_cached_tokens'),
++                       'actual_cached_tokens': row.get('actual_cached_tokens'),
++                       'cache_source': row.get('cache_source'),
+                        'generated_tokens': generated,
+                        'decode_tps': 0 if number(generated) and generated <= 1 else row.get('decode_tok_s'),
+                        'decode_tps_mean': 0 if number(generated) and generated <= 1 else row.get('decode_tok_s'),
+@@ -149,14 +158,19 @@ def snapshot(service):
+     info = getattr(service.engine, 'info', {}) or {}
+     usage = {target: counters.get(source) for target, source in {
+         'host_payload_bytes':'host_bytes', 'disk_payload_bytes':'disk_bytes',
+-        'disk_read_bytes':'read_bytes', 'disk_written_bytes':'written_bytes'}.items()}
++        'disk_read_bytes':'read_bytes', 'disk_written_bytes':'written_bytes',
++        'logical_payload_bytes':'logical_payload_bytes', 'physical_payload_bytes':'physical_payload_bytes',
++        'sharing_credit_bytes':'sharing_credit_bytes', 'shared_forks':'shared_forks',
++        'logical_state_bytes':'logical_state_bytes', 'physical_state_bytes':'physical_state_bytes',
++        'state_sharing_credit_bytes':'state_sharing_credit_bytes', 'state_references':'state_references'}.items()}
+     usage.update(sampled_at_ms=service.kvmem_monitor_log.sampled_at_ms,
+-                 sampling_scope='request_end',
++                 sampling_scope='request_end_all_native_sequences' if counters.get('scope_version')==2 else 'request_end',
+                  host_payload_budget_bytes=int(info.get('kvmem_host_mib', 0))*1048576,
+                  disk_payload_budget_bytes=int(info.get('kvmem_disk_mib', 0))*1048576,
+-                 retained_sessions=counters.get('parked') if solo else None,
+-                 history_evictions=counters.get('evictions') if solo else None,
+-                 history_hits=counters.get('restores') if solo else None)
++                 retained_sessions=counters.get('parked') if solo or counters.get('scope_version')==2 else None,
++                 history_evictions=counters.get('evictions') if solo or counters.get('scope_version')==2 else None,
++                 history_hits=reuse['own']+reuse['shared'] if reuse else counters.get('restores') if solo else None,
++                 own_history_hits=reuse.get('own'),shared_history_hits=reuse.get('shared'),history_misses=reuse.get('miss'))
+     if info.get('ssd') in (0, '0'):
+         usage.update(disk_payload_bytes=0, disk_read_bytes=0, disk_written_bytes=0)
+     return {'schema_version': 1, 'backend': 'polystrata', 'server_instance': str(service.started_at),
+diff --git a/serve/server.py b/serve/server.py
+index 87e45b051f96ab980da413f8e78b19cf12362add..70644c15ee6543ef337412d1dc632f22e69c81ae 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -827,6 +827,32 @@ class StrataEngine:
+         """SAVE / RESTORE: the Strata project's engine has them, strata-poly does not (issue 114)."""
+         return Path(str(self.spawn[0])).stem.lower() not in ("strata-poly", "strata-glm")
+ 
++    @property
++    def cache_reuse(self):
++        if self.batch:
++            tl = self.__dict__.setdefault('_tl', threading.local())
++            if not hasattr(tl, 'cache_reuse'): tl.cache_reuse = {}
++            return tl.cache_reuse
++        return self.__dict__.get('_cache_reuse', {})
++
++    @cache_reuse.setter
++    def cache_reuse(self, value):
++        if self.batch:
++            self.__dict__.setdefault('_tl', threading.local()).cache_reuse = value
++        else:
++            self.__dict__['_cache_reuse'] = value
++
++    def _parse_cache_reuse(self, line):
++        observation = {}
++        for token in line.split()[1:]:
++            key, separator, value = token.partition('=')
++            if separator and key in ('planned_cached_tokens', 'actual_cached_tokens') and value.isdigit():
++                observation[key] = int(value)
++            elif separator and key == 'cache_source' and value in ('own', 'shared', 'miss'):
++                observation[key] = value
++        if len(observation) == 3 and not self.cache_reuse:
++            self.cache_reuse = observation
++
+     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
+                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
+         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
+@@ -1177,11 +1203,15 @@ class StrataEngine:
+             self.last.update(offloaded=int(f[15]))
+         for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
+             key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
+-            if eq and key in ("chunk", "experts_streamed"):
++            if eq and key in ("chunk", "experts_streamed", "planned_cached_tokens", "actual_cached_tokens"):
+                 try:
+                     self.last[key] = int(value)
+                 except ValueError:
+                     pass
++            elif eq and key == "cache_source" and value in ("own", "shared", "miss"):
++                self.last[key] = value
++        if not self.cache_reuse and all(key in self.last for key in ('planned_cached_tokens', 'actual_cached_tokens', 'cache_source')):
++            self.cache_reuse = {key:self.last[key] for key in ('planned_cached_tokens', 'actual_cached_tokens', 'cache_source')}
+ 
+     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
+         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
+@@ -1297,17 +1327,19 @@ class StrataEngine:
+         on = sampling.get("experimental_speed_projection")
+         return f" cvec={int(on)}" if isinstance(on, bool) else ""
+ 
+-    def turn_key(self, ids) -> str:
++    def turn_key(self, ids, continuation=False) -> str:
+         """`turn_at=POS`: where the prompt's last turn begins (its last token of turn_ids).  strata-poly keeps a
+         checkpoint there, which the chat's next request goes on from; the Qwen3.8 engine skips the key and finds the
+         place itself."""
+         from serve import kvmem
+         if kvmem.enabled(self):
+-            span = getattr(ids, "kvmem_query", None)
++            span = (0,0) if continuation else getattr(ids, "kvmem_query", None)
+             if span is None or not (span==(0,0) or 0<=span[0]<span[1]<=len(ids)):
+                 raise ValueError("KVMem requires the frontend's exact user-query span")
+             at = next((i for i in range(len(ids)-1,0,-1) if ids[i] in self.turn_ids),None)
+-            return f" query_begin={span[0]} query_end={span[1]}" + (f" turn_at={at}" if at is not None else "")
++            owner = getattr(ids, "kvmem_owner", "")
++            key = " cache_owner=" + owner.encode().hex() if owner else ""
++            return f" query_begin={span[0]} query_end={span[1]}" + (f" turn_at={at}" if at is not None else "") + key
+         at = next((i for i in range(len(ids) - 1, 0, -1) if ids[i] in self.turn_ids), None)
+         return f" turn_at={at}" if at is not None else ""
+ 
+@@ -1365,6 +1397,8 @@ class StrataEngine:
+                     self._send("STOP")
+                     stopped = True
+                 yield None
++            elif line.startswith("CACHE_REUSE "):
++                self._parse_cache_reuse(line)
+             elif line.startswith("DONE"):
+                 self._parse_done(line)
+                 self._last_done = line
+@@ -1404,6 +1438,8 @@ class StrataEngine:
+                 continue
+             if line is None:
+                 return None
++            if line.startswith("CACHE_REUSE "):
++                self._parse_cache_reuse(line)
+             if line.startswith("DONE"):
+                 self._parse_done(line)
+             if line.startswith(until) or line.startswith("ERR"):
+@@ -1626,6 +1662,8 @@ class StrataEngine:
+         pending: list[int] = []
+         prompt, left = list(ids), int(max_new)
+         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
++        reuse_metadata0 = {}
++        self.cache_reuse = {}
+         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
+         ok = yield from self._take_control(cancel, len(prompt), new=True)
+         if not ok:
+@@ -1698,10 +1736,11 @@ class StrataEngine:
+                             return
+                         if reused0 is None:
+                             reused0 = (self.last or {}).get("reused")
++                            reuse_metadata0 = {k:self.last[k] for k in ("planned_cached_tokens", "actual_cached_tokens", "cache_source") if k in self.last}
+                         carry_leg(carry, self.last)         # #1869: the solo leg's figures; the slot's admission (a copy of
+                                                             # the held prefix: prompt_read 1) and BDONE replace them
+                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
+-                        if managed:keys=self.sampling_keys(sampling or {})+" query_begin=0 query_end=0"
++                        if managed:keys=self.sampling_keys(sampling or {})+self.turn_key(ids,continuation=True)
+                 while True:
+                     if slot is None:
+                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
+@@ -1873,8 +1912,9 @@ class StrataEngine:
+                             slot, gen0 = None, None
+                             if reused0 is None:
+                                 reused0 = (self.last or {}).get("reused")
++                                reuse_metadata0 = {k:self.last[k] for k in ("planned_cached_tokens", "actual_cached_tokens", "cache_source") if k in self.last}
+                             prompt, left = list(ids) + out, int(max_new) - len(out)
+-                            if managed:keys=self.sampling_keys(sampling or {})+" query_begin=0 query_end=0"
++                            if managed:keys=self.sampling_keys(sampling or {})+self.turn_key(ids,continuation=True)
+                             solo_again += 1
+                             btrace("back to the solo path")
+                             break
+@@ -1906,6 +1946,8 @@ class StrataEngine:
+                 self.last = {**self.last, "reused": reused0}
+             if carry and isinstance(self.last, dict):
+                 self.last = add_carry(carry, self.last)
++            if reuse_metadata0 and isinstance(self.last, dict):
++                self.last = {**self.last, **reuse_metadata0}
+             if holding:
+                 self.ctl.release()
+             if admit_wait:
+@@ -2011,6 +2053,7 @@ class StrataEngine:
+             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
+             return
+         self.progress, self.progress_ms, self.reused = None, 0, 0
++        self.cache_reuse = {}
+         self.prefill_tok_s_mean = None
+         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
+         keys = self.sampling_keys(sampling or {}) + self.turn_key(ids)
+@@ -2085,6 +2128,8 @@ class StrataEngine:
+                         read_to = self.reused = int(line.split()[1])
+                     except (IndexError, ValueError):
+                         pass
++                elif line.startswith("CACHE_REUSE "):
++                    self._parse_cache_reuse(line)
+                 elif line.startswith("DONE"):
+                     self._parse_done(line)
+                     done = True
+@@ -2117,6 +2162,8 @@ class StrataEngine:
+                                            f"within {allow:.0f} s") from None
+                     if line is None or line.startswith("ERR"):
+                         break
++                    if line.startswith("CACHE_REUSE "):
++                        self._parse_cache_reuse(line)
+                     if line.startswith("DONE"):
+                         self._parse_done(line)
+                         break
+@@ -3223,6 +3270,35 @@ def budget_tokens(value) -> int | None:
+ 
+ 
+ class Service:
++    def _begin_native_cache_observation(self, status):
++        # C1 reuses self.status. Reset only when this HTTP request owns the
++        # execution turn; clearing it while queued would erase the active turn.
++        for key in ('planned_cached_tokens','actual_cached_tokens','cache_source','_kvmem_reuse_observed'):
++            status.pop(key,None)
++
++    def _observe_native_cache(self, status, previous):
++        # last is request-thread-local for batching. Never borrow a previous
++        # request/leg's figures or replace this HTTP request's first observation.
++        if status.get('_kvmem_reuse_observed'):
++            return
++        current = getattr(self.engine, 'cache_reuse', None)
++        if not current:
++            current = getattr(self.engine, 'last', None)
++            if current is previous:
++                return
++        if not isinstance(current, dict) or 'actual_cached_tokens' not in current: return
++        values = {key:current[key] for key in ('planned_cached_tokens', 'actual_cached_tokens', 'cache_source') if key in current}
++        values['_kvmem_reuse_observed'] = True
++        with self.status_lock:
++            status.update(values)
++            generation=(id(self.engine),getattr(self.engine,'gen',0))
++            if getattr(self,'kvmem_reuse_generation',None)!=generation:
++                self.kvmem_reuse_generation=generation
++                self.kvmem_reuse_totals={'own':0,'shared':0,'miss':0}
++            source=values.get('cache_source')
++            if source in self.kvmem_reuse_totals:
++                self.kvmem_reuse_totals[source]+=1
++
+     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+                  vision: Vision | None = None, sampling_defaults: dict | None = None,
+                  fit_max_tokens: bool = False):
+@@ -4599,6 +4675,8 @@ class Service:
+                 ids = kvmem.Prompt(out, (0, 0))     # the engine's turn key still needs the sentinel
+             else:
+                 ids = out
++        if kvmem.enabled(self.engine):
++            ids = kvmem.Prompt(ids, getattr(ids, "kvmem_query", (0, 0)), kvmem.cache_owner(req))
+         ctx = self.engine.max_context
+         if ctx <= 0:
+             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
+@@ -4956,6 +5034,7 @@ class Service:
+                     with self.status_lock:
+                         if par:
+                             self.status["queued"] -= 1
++                        self._begin_native_cache_observation(st)
+                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
+                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
+                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
+@@ -4989,6 +5068,7 @@ class Service:
+                             # the engine's heartbeat sends when nothing has gone out for KEEPALIVE_S.
+                             last_out = time.perf_counter()
+                             for t in gen:
++                                self._observe_native_cache(st, segment_before)
+                                 if t is None:               # heartbeat while the engine is quiet
+                                     last_print = self._progress(last_print, st=st)
+                                     last_out = time.perf_counter()
+@@ -5082,6 +5162,7 @@ class Service:
+                                     raise
+                             segment_done = getattr(self.engine, "last", None)
+                             if segment_done is not None and segment_done is not segment_before:
++                                self._observe_native_cache(st, segment_before)
+                                 segments.append(dict(segment_done))
+                         if nonfinite and not cancel.is_set():
+                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
+@@ -5218,6 +5299,9 @@ class Service:
+                                 if loaded else None,
+                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
++                                "planned_cached_tokens": st.get("planned_cached_tokens"),
++                                "actual_cached_tokens": st.get("actual_cached_tokens"),
++                                "cache_source": st.get("cache_source"),
+                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
+                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                 "reasoning_recoveries": recovery_count,
+diff --git a/src/poly/engine.cpp b/src/poly/engine.cpp
+index cde7072934a85eda109786e6b9263830844e9b69..10ebd3c2015d6116ff2b896f46e0333d82552763 100644
+--- a/src/poly/engine.cpp
++++ b/src/poly/engine.cpp
+@@ -893,6 +893,18 @@ void Engine::copy_seq(int from, int to) {
+ }
+ 
+ #ifdef STRATA_KVMEM
++uint64_t Engine::logical_memory_payload_bytes() const {
++    std::vector<const KvmemMemory*> seen;
++    uint64_t total=0;
++    const auto add=[&](const KvmemMemory* memory) {
++        if(memory && std::find(seen.begin(),seen.end(),memory)==seen.end()) {
++            seen.push_back(memory);total+=memory->active_host_bytes();
++        }
++    };
++    add(memory_.get());
++    for(const auto& sequence:seqs_)add(sequence.memory.get());
++    return total;
++}
+ void Engine::move_memory_seq(int from,int to) {
+     if(!memory_ready_) {copy_seq(from,to);return;}
+     if(from<0 || from>=sequences() || to<0 || to>=sequences() || win_ || memory_window_ || memory_drafting_)
+diff --git a/src/poly/engine.hpp b/src/poly/engine.hpp
+index fe8015e921995e3fec9aea3e6cb2cf5b4da0035c..5bc37dedfa0e25405ca249f0184e802c7e755d58 100644
+--- a/src/poly/engine.hpp
++++ b/src/poly/engine.hpp
+@@ -198,6 +198,7 @@ public:
+ #ifdef STRATA_KVMEM
+     bool kvmem_enabled() const noexcept { return bool(memory_); }
+     KvmemMemory& memory() { return *memory_; }
++    uint64_t logical_memory_payload_bytes() const;
+     const KvmemOptions& memory_options() const { return opt_.memory; }
+     int64_t cache_position() const { return memory_ ? memory_->compact_position(pos_) : pos_; }
+     int cache_capacity() const { return opt_.memory.budget ? int(opt_.memory.budget + opt_.memory.reserve) : opt_.max_context; }
+diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
+index 72a92f2eb31f0ca6d9d8eb891206ebd980c4100a..02567f58deb6bce95b7d8e86bd5dae131feba255 100644
+--- a/src/poly/kvmem.cpp
++++ b/src/poly/kvmem.cpp
+@@ -688,7 +688,7 @@ KvmemCheckpoint KvmemMemory::checkpoint() {
+         engine_.save_state(cp.state.data());
+     }
+     if (options_.verify) {
+-        std::vector<uint8_t> reference(cp.state.size());
++        std::vector<uint8_t> reference(cp.native_state().size());
+         engine_.save_state(reference.data());
+         require(reference == cp.state, "KVMem contiguous checkpoint differs from native layer checkpoints");
+     }
+@@ -703,7 +703,7 @@ bool KvmemMemory::freeze_and_rewind(const KvmemCheckpoint& cp,uint64_t prompt_en
+             "KVMem Query probe is incomplete");
+     require(cp.identity.stamp==query_base_stamp_ && cp.identity.backend==descriptor_.identity &&
+             cp.identity.layout==descriptor_.layout && cp.identity.stamp.session==stamp_.session &&
+-            cp.identity.stamp.frontier==uint64_t(query_begin_) && cp.state.size()==engine_.state_bytes(),
++            cp.identity.stamp.frontier==uint64_t(query_begin_) && cp.native_state().size()==engine_.state_bytes(),
+             "KVMem Query checkpoint identity mismatch");
+     query_capture_=false;
+     if (!prompt_end) prompt_end=uint64_t(query_end_);
+@@ -732,7 +732,7 @@ void KvmemMemory::restore_prefix(const KvmemCheckpoint& cp) {
+     require(stamp_.valid && !transaction_ && cp.identity.stamp.valid &&
+             cp.identity.backend == descriptor_.identity && cp.identity.layout == descriptor_.layout &&
+             cp.identity.stamp.session == stamp_.session && cp.identity.stamp.frontier <= stamp_.frontier &&
+-            cp.state.size() == engine_.state_bytes(), "KVMem history checkpoint identity mismatch");
++            cp.native_state().size() == engine_.state_bytes(), "KVMem history checkpoint identity mismatch");
+     // The caller proved an identical token prefix and discarded checkpoints
+     // after a fork. Later appends never change the KV bytes before this point.
+     start_request();
+@@ -757,11 +757,11 @@ void KvmemMemory::restore_prefix(const KvmemCheckpoint& cp) {
+ void KvmemMemory::rewind_state(const KvmemCheckpoint& cp) {
+     archive_resident();
+     truncate_catalog(cp);
+-    engine_.load_state(cp.state.data(), int64_t(stamp_.frontier));
++    engine_.load_state(cp.native_state().data(), int64_t(stamp_.frontier));
+     if (options_.verify) {
+         std::vector<uint8_t> restored(engine_.state_bytes());
+         engine_.save_state(restored.data());
+-        require(restored == cp.state, "KVMem recurrent checkpoint bytes differ after restore");
++        require(restored == cp.native_state(), "KVMem recurrent checkpoint bytes differ after restore");
+     }
+ }
+ void KvmemMemory::truncate_catalog(const KvmemCheckpoint& cp) {
+@@ -786,7 +786,7 @@ void KvmemMemory::truncate_catalog(const KvmemCheckpoint& cp) {
+ KvmemParked KvmemMemory::park(const KvmemCheckpoint& cp) {
+     require(stamp_.valid && !transaction_ && !engine_.memory_window_ && !engine_.memory_drafting_ && cp.identity.backend == descriptor_.identity &&
+             cp.identity.layout == descriptor_.layout && cp.identity.stamp.session == stamp_.session &&
+-            cp.identity.stamp.frontier <= stamp_.frontier && cp.state.size() == engine_.state_bytes(),
++            cp.identity.stamp.frontier <= stamp_.frontier && cp.native_state().size() == engine_.state_bytes(),
+             "KVMem parked checkpoint identity mismatch");
+     // Allocate the empty next catalog before detaching any authoritative data.
+     auto fresh_statistics = std::make_unique<kvmem::RawKvStore>(statistics_->config());
+@@ -815,6 +815,26 @@ KvmemParked KvmemMemory::park(const KvmemCheckpoint& cp) {
+     invalidate(); // Engine state belongs to the detached history until reset/enter.
+     return parked;
+ }
++KvmemParked KvmemMemory::fork(KvmemParked& source) {
++    require(source.identity.backend == descriptor_.identity && source.identity.layout == descriptor_.layout &&
++            source.identity.stamp.valid && source.statistics && source.selector &&
++            source.versions.size() == source.archive.size() && source.host_versions == source.versions,
++            "KVMem fork source is incomplete or incompatible");
++    KvmemParked result;
++    result.identity = source.identity;
++    result.identity.stamp.session = {next_session.fetch_add(1), 1};
++    result.statistics = source.statistics->fork_mean_prefix(uint32_t(source.identity.stamp.frontier));
++    result.selector = std::make_unique<kvmem::KvMemStore>(*source.selector);
++    result.selector->restore_retrieval(source.selector->retrieval_checkpoint());
++    result.versions = source.versions; result.host_versions = source.host_versions;
++    result.graph = source.graph; result.feedback = source.feedback; result.output_samples = source.output_samples;
++    result.archive.reserve(source.archive.size());
++    for (const auto& record : source.archive) {
++        require(bool(record), "KVMem fork source has a missing accepted record");
++        result.archive.push_back(record.fork());
++    }
++    return result;
++}
+ void KvmemMemory::enter(KvmemParked&& parked, const KvmemCheckpoint& cp) {
+     require(!transaction_ && archive_.empty() && versions_.empty() && resident_.empty() &&
+             parked.identity.backend == descriptor_.identity && parked.identity.layout == descriptor_.layout &&
+diff --git a/src/poly/kvmem.hpp b/src/poly/kvmem.hpp
+index 9904aeb63d039d19d89afc3f32508c3d427e5caf..58da4e9d7b4a0f0b0bcb0e32f927733ce5bdca53 100644
+--- a/src/poly/kvmem.hpp
++++ b/src/poly/kvmem.hpp
+@@ -62,6 +62,8 @@ struct KvmemCheckpoint {
+     // A shared reservation charges its vector once without duplicating bytes.
+     std::shared_ptr<kvmem::HostKvReservation> state_reservation;
+     std::vector<uint8_t> state;
++    std::shared_ptr<const KvmemCheckpoint> shared_state;
++    const std::vector<uint8_t>& native_state() const { return shared_state ? shared_state->state : state; }
+     std::vector<float> mean_tail;
+     kvmem::LrfuState retrieval;
+     uint64_t transfers = 0;
+@@ -123,6 +125,7 @@ public:
+     void restore_prefix(const KvmemCheckpoint&);
+     KvmemParked park(const KvmemCheckpoint&);
+     void enter(KvmemParked&&, const KvmemCheckpoint&);
++    KvmemParked fork(KvmemParked&);
+     uint64_t archive_pending_bytes() const;
+     uint64_t active_host_bytes() const;
+     uint64_t host_limit() const { return storage_->capacity_bytes(); }
+diff --git a/src/poly/kvmem_history.hpp b/src/poly/kvmem_history.hpp
+index d14422b5d2327beb636fcd65b11e0208ae0f4da5..156e0de518abd84684fd8922055a0f88a4fa28b2 100644
+--- a/src/poly/kvmem_history.hpp
++++ b/src/poly/kvmem_history.hpp
+@@ -17,7 +17,7 @@ class KvmemHistory {
+         std::shared_ptr<const KvmemCheckpoint> data;
+         kvmem::CheckpointInfo checkpoint_info() const {
+             return {data->identity.stamp.frontier, purposes, data.get(),
+-                    data->state.size() + data->mean_tail.size() * sizeof(float) +
++                    data->native_state().size() + data->mean_tail.size() * sizeof(float) +
+                     data->resident.capacity()*sizeof(uint64_t) + data->graph.bytes() + data->feedback.bytes()};
+         }
+     };
+@@ -26,7 +26,7 @@ public:
+         int64_t at = 0;
+         std::shared_ptr<const KvmemCheckpoint> checkpoint;
+     };
+-    void clear() { tokens_.clear(); marks_.clear(); session_ = {}; }
++    void clear() { tokens_.clear(); marks_.clear(); session_ = {}; owner.clear(); }
+     // Reclaim oldest unshared images only when that can satisfy the allocation.
+     // Removing a mark held by an in-flight Query would free no RAM and would
+     // unnecessarily discard the next request's prefix restore point.
+@@ -55,10 +55,34 @@ public:
+         marks_.swap(keep);
+         return true;
+     }
++    std::string owner;
++    KvmemHistory fork(const kvmem::MemoryStamp& stamp) const {
++        if (!stamp.valid || stamp.frontier != tokens_.size()) throw std::logic_error("invalid history fork frontier");
++        KvmemHistory result;
++        result.session_ = stamp.session;
++        result.tokens_ = tokens_;
++        for (const auto& mark : marks_) {
++            const auto& old = *mark.data;
++            auto cp = std::make_shared<KvmemCheckpoint>();
++            cp->identity = old.identity;
++            cp->shared_state = old.shared_state ? old.shared_state : mark.data;
++            cp->mean_tail = old.mean_tail; cp->retrieval = old.retrieval; cp->resident = old.resident;
++            cp->transfers = old.transfers; cp->graph = old.graph; cp->feedback = old.feedback; cp->output_samples = old.output_samples;
++            cp->identity.stamp.session = stamp.session;
++            result.marks_.remember({mark.purposes, std::move(cp)});
++        }
++        return result;
++    }
+     void bind(const kvmem::MemoryStamp& stamp) { session_ = stamp.session; }
+     size_t size() const noexcept { return tokens_.size(); }
+     const std::vector<int32_t>& tokens() const noexcept { return tokens_; }
+     size_t marks() const noexcept { return marks_.size(); }
++    void state_records(std::vector<std::pair<const void*, uint64_t>>& records) const {
++        for (const auto& mark : marks_) {
++            const auto root = mark.data->shared_state ? mark.data->shared_state.get() : mark.data.get();
++            if (!root->state.empty()) records.emplace_back(root,root->state.size());
++        }
++    }
+     std::shared_ptr<const KvmemCheckpoint> latest() const { return marks_.empty() ? nullptr : marks_.back().data; }
+     size_t observed_prefix(const std::vector<int32_t>& ids) const {
+         size_t common = 0;
+diff --git a/src/poly/kvmem_sessions.cpp b/src/poly/kvmem_sessions.cpp
+index b8ac1002b542d051eea9d0fbfbdf28e61881f012..0e08a2c122cb6c2c712b2fbcb32ac1c988855fed 100644
+--- a/src/poly/kvmem_sessions.cpp
++++ b/src/poly/kvmem_sessions.cpp
+@@ -2,6 +2,7 @@
+ #include "engine.hpp"
+ #include <cstdio>
+ #include <cstdlib>
++#include <set>
+ 
+ namespace strata::poly {
+ bool KvmemSessions::make_state_room(const KvmemMemory& memory, KvmemHistory& history, uint64_t total_tokens,
+@@ -53,33 +54,41 @@ void KvmemSessions::admit_active(const KvmemMemory& memory, uint64_t total_token
+     memory.admit(total_tokens); // rejects impossible requests before eviction
+     const auto records = (total_tokens+memory.block_tokens-1)/memory.block_tokens+1;
+     const auto required = records*memory.descriptor().layout.record_bytes;
+-    while (payload_bytes() > memory.payload_limit()-required)
++    const auto own = memory.active_host_bytes();
++    const auto extra = required > own ? required-own : 0;
++    while (memory.payload_bytes() > memory.payload_limit()-extra)
+         if (!evict_one()) throw std::logic_error("KVMem active admission did not fit after clearing idle histories");
+ }
+ int64_t KvmemSessions::resume(Engine& engine, KvmemHistory& current, const std::vector<int32_t>& ids,
+-                              int64_t query_begin, uint64_t total_tokens) {
++                              int64_t query_begin, uint64_t total_tokens, const std::string& owner, bool shared) {
+     auto& memory = engine.memory();
++    last_reuse = {};
+     configure(engine.memory_options().sessions-1);
+     memory.admit(total_tokens);
+-    const auto live = current.choose(ids, query_begin, memory.stamp());
+-    const auto idle = choose(ids, query_begin);
+-    if (live.at > 0 && live.at >= idle.resume.at) {
++    auto live = current.choose(ids, query_begin, memory.stamp());
++    if (!live.checkpoint && live.at > 0 && current.owner != owner) {
++        const auto cp = current.latest();
++        live = cp && cp->identity.stamp.frontier <= uint64_t(live.at)
++             ? KvmemHistory::Resume{int64_t(cp->identity.stamp.frontier), cp} : KvmemHistory::Resume{};
++    }
++    const bool live_owner = current.owner == owner && (!owner.empty() || current.observed_prefix(ids) == current.size());
++    const auto idle = choose(ids, query_begin, owner, shared);
++    const bool selected_live = prefer_live(live, live_owner, idle, shared);
++    if (live_owner && selected_live) {
++        last_reuse.planned = live.at;
+         admit_active(memory, total_tokens);
+         if (!live.checkpoint || make_archive_room(memory)) {
+             if (live.checkpoint) memory.restore_prefix(*live.checkpoint);
+             current.truncate(live.at);
++            last_reuse.actual = live.at; last_reuse.source = "own";
+             return live.at;
+         }
+-        // Cache pressure need not fail a request that fits by itself.
+         ++skipped_;
+-        current.clear();
+-        engine.reset();
+-        current.bind(memory.stamp());
+-        return 0;
+     }
+-
+-    // Protect the selected source while LRU pressure frees other idle records.
+-    auto target = idle.slot != SIZE_MAX ? take(idle.slot) : nullptr;
++    // A selected source is held outside the LRU until the branch is published.
++    const bool from_live = !live_owner && selected_live;
++    last_reuse.planned = from_live ? live.at : idle.resume.at;
++    auto source = !from_live && idle.slot != SIZE_MAX ? take(idle.slot) : nullptr;
+     try {
+         const auto cp = current.latest();
+         if (cp && memory.stamp().valid && cp->identity.stamp.session == memory.stamp().session && make_archive_room(memory)) {
+@@ -87,36 +96,71 @@ int64_t KvmemSessions::resume(Engine& engine, KvmemHistory& current, const std::
+             leaving->memory = memory.park(*cp);
+             current.truncate(int64_t(cp->identity.stamp.frontier));
+             leaving->history = std::move(current);
+-            save(std::move(leaving));
++            if (from_live) source = std::move(leaving);
++            else save(std::move(leaving));
+         } else {
+             if (cp) ++skipped_;
+-            current.clear();
+-            engine.reset();
++            current.clear(); engine.reset();
++        }
++        if (source) {
++            const auto at = from_live ? live.at : idle.resume.at;
++            const bool branch = from_live || idle.fork;
++            if (branch) {
++                auto forked = memory.fork(source->memory);
++                auto history = source->history.fork(forked.identity.stamp);
++                auto checkpoint = history.choose(ids, query_begin, forked.identity.stamp);
++                if (!checkpoint.checkpoint) checkpoint.checkpoint = history.latest();
++                if (!checkpoint.checkpoint || checkpoint.at != at ||
++                    checkpoint.checkpoint->identity.stamp.frontier != uint64_t(at))
++                    throw std::logic_error("KVMem fork lost its native checkpoint");
++                memory.enter(std::move(forked), *checkpoint.checkpoint);
++                current = std::move(history);
++                save(std::move(source));
++                ++forks_;
++            } else {
++                memory.enter(std::move(source->memory), *idle.resume.checkpoint);
++                current = std::move(source->history);
++            }
++            current.truncate(at); current.owner = owner;
++            admit_active(memory, total_tokens);
++            ++restores_;
++            last_reuse.actual = at; last_reuse.source = branch ? "shared" : "own";
++            std::fprintf(stderr,"KVMEM_HISTORY source=%s restored_tokens=%lld forks=%llu physical_bytes=%llu logical_idle_bytes=%llu\n",
++                branch?"shared":"own", (long long)at, (unsigned long long)forks_,
++                (unsigned long long)memory.payload_bytes(), (unsigned long long)payload_bytes());
++            return at;
+         }
+     } catch (...) {
+-        // A failed park has not consumed the protected source. Other idle
+-        // catalogs remain valid; the caller drops/resets only the GPU owner.
+-        if (target) save(std::move(target));
++        if (source && source->memory.statistics) save(std::move(source));
+         throw;
+     }
++    engine.reset(); current.clear(); current.bind(memory.stamp()); current.owner = owner;
+     admit_active(memory, total_tokens);
+-    if (target) {
+-        current = std::move(target->history);
+-        memory.enter(std::move(target->memory), *idle.resume.checkpoint);
+-        current.truncate(idle.resume.at);
+-        ++restores_;
+-        return idle.resume.at;
+-    }
+-    engine.reset();
+-    current.clear();
+-    current.bind(memory.stamp());
+     return 0;
+ }
+-void KvmemSessions::metrics(const KvmemMemory& memory) const {
++void KvmemSessions::metrics(const KvmemMemory& memory, const KvmemHistory* active,
++                          const std::vector<const KvmemHistory*>& others, uint64_t logical_active) const {
+     if (!std::getenv("KVMEM_POLY_SESSION_METRICS")) return;
+     std::fprintf(stderr, "KVMEM_SESSIONS parked=%zu evictions=%zu restores=%zu skipped=%zu host_bytes=%llu host_limit=%llu session=%llu incarnation=%llu\n",
+         parked(), evictions(), restores(), skipped(), (unsigned long long)memory.host_bytes(),
+         (unsigned long long)memory.host_limit(), (unsigned long long)memory.stamp().session.id,
+         (unsigned long long)memory.stamp().session.incarnation);
++    std::vector<std::pair<const void*,uint64_t>> states;
++    for (const auto& entry : entries_) entry->history.state_records(states);
++    if (active) active->state_records(states);
++    for(const auto* history:others)if(history)history->state_records(states);
++    std::set<const void*> unique;
++    uint64_t logical_state=0, physical_state=0;
++    for (const auto& state : states) {
++        logical_state+=state.second;
++        if(unique.insert(state.first).second)physical_state+=state.second;
++    }
++    std::fprintf(stderr,"KVMEM_SHARED scope_version=2 logical_state_bytes=%llu physical_state_bytes=%llu state_sharing_credit_bytes=%llu state_references=%zu\n",
++        (unsigned long long)logical_state,(unsigned long long)physical_state,
++        (unsigned long long)(logical_state-physical_state),states.size());
++    const auto logical = payload_bytes()+(logical_active==UINT64_MAX ? memory.active_host_bytes() : logical_active), physical = memory.payload_bytes();
++    std::fprintf(stderr,"KVMEM_SHARED logical_payload_bytes=%llu physical_payload_bytes=%llu sharing_credit_bytes=%llu shared_forks=%llu\n",
++        (unsigned long long)logical, (unsigned long long)physical,
++        (unsigned long long)(logical>physical?logical-physical:0), (unsigned long long)forks_);
+ }
+ } // namespace strata::poly
+diff --git a/src/poly/kvmem_sessions.hpp b/src/poly/kvmem_sessions.hpp
+index 09b0041733a98d2090023cff968c709e03809e3a..253d53b17e44f332b58f22b15af24f04567a891d 100644
+--- a/src/poly/kvmem_sessions.hpp
++++ b/src/poly/kvmem_sessions.hpp
+@@ -15,22 +15,40 @@ public:
+     struct Choice {
+         size_t slot = SIZE_MAX;
+         KvmemHistory::Resume resume;
++        bool fork = false;
+     };
++    struct ReuseObservation {
++        int64_t planned = 0, actual = 0;
++        const char* source = "miss";
++    };
++    static bool prefer_live(const KvmemHistory::Resume& live, bool live_owner,
++                            const Choice& idle, bool shared) {
++        if (live.at <= 0) return false;
++        if (live_owner) return idle.fork || live.at >= idle.resume.at;
++        // An own parked history wins even when a foreign live prefix is longer.
++        if (!shared || (idle.resume.at > 0 && !idle.fork)) return false;
++        return live.at >= idle.resume.at;
++    }
++    ReuseObservation last_reuse;
+     void configure(size_t idle_slots) {
+         if (idle_slots > 15) throw std::logic_error("KVMem supports at most 16 retained histories");
+         slots_ = idle_slots;
+         entries_.reserve(slots_);
+         while (entries_.size() > slots_) evict_one();
+     }
+-    Choice choose(const std::vector<int32_t>& ids, int64_t query_begin) const {
++    Choice choose(const std::vector<int32_t>& ids, int64_t query_begin, const std::string& owner = {}, bool shared = true) const {
+         Choice best;
+         for (size_t i = 0; i < entries_.size(); ++i) {
+-            auto candidate = entries_[i]->history.choose(ids, query_begin, entries_[i]->memory.identity.stamp);
+-            if (candidate.at > best.resume.at) {
++            const auto& source = entries_[i]->history;
++            const bool own = !owner.empty() && owner == source.owner;
++            if (!own && !shared) continue;
++            if (best.resume.at && !best.fork && !own) continue;
++            auto candidate = source.choose(ids, query_begin, entries_[i]->memory.identity.stamp);
++            if (candidate.at > 0 && (candidate.at > best.resume.at || (own && best.fork))) {
+                 // An idle frontier is not live GPU state. Even an exact
+                 // continuation needs its saved recurrent checkpoint.
+                 if (!candidate.checkpoint) candidate.checkpoint = entries_[i]->history.latest();
+-                if (candidate.checkpoint) best = {i, std::move(candidate)};
++                if (candidate.checkpoint) best = {i, std::move(candidate), !own};
+             }
+         }
+         return best;
+@@ -70,8 +88,9 @@ public:
+     size_t evictions() const noexcept { return evictions_; }
+     size_t restores() const noexcept { return restores_; }
+     size_t skipped() const noexcept { return skipped_; }
+-    int64_t resume(Engine&, KvmemHistory&, const std::vector<int32_t>&, int64_t query_begin, uint64_t total_tokens);
+-    void metrics(const KvmemMemory&) const;
++    int64_t resume(Engine&, KvmemHistory&, const std::vector<int32_t>&, int64_t query_begin, uint64_t total_tokens, const std::string& owner = {}, bool shared = true);
++    void metrics(const KvmemMemory&, const KvmemHistory* active = nullptr,
++                 const std::vector<const KvmemHistory*>& others = {}, uint64_t logical_active = UINT64_MAX) const;
+     bool make_archive_room(const KvmemMemory&);
+     bool make_state_room(const KvmemMemory&, KvmemHistory&, uint64_t total_tokens,
+                          kvmem::CheckpointPurpose purpose = kvmem::CheckpointPurpose::None);
+@@ -80,7 +99,7 @@ public:
+ private:
+     void admit_active(const KvmemMemory&, uint64_t total_tokens);
+     size_t slots_ = 0, evictions_ = 0, restores_ = 0, skipped_ = 0;
+-    uint64_t clock_ = 0;
++    uint64_t clock_ = 0, forks_ = 0;
+     std::vector<std::unique_ptr<Entry>> entries_;
+ };
+ } // namespace strata::poly
+diff --git a/src/poly/main.cpp b/src/poly/main.cpp
+index 13ae5d67a360f05c75ab617c701c01d8a547398b..52027d45ae9fdc1cd83dc2924daee7ecd831505b 100644
+--- a/src/poly/main.cpp
++++ b/src/poly/main.cpp
+@@ -382,11 +382,18 @@ struct Session {
+ 
+     struct Result {
+         int64_t produced = 0, resume = 0, read = 0;
++        int64_t planned_cache = 0;
++        const char* cache_source = "miss";
+         int64_t gave_way = -1;   // where `between` stopped the read
+         int64_t guessed = 0, guessed_right = 0;
+         double prompt_ms = 0, decode_ms = 0;
+         const char* finish = "length";
+     };
++    struct CacheObservation {
++        int64_t planned=0, actual=0;
++        const char* source="miss";
++        int64_t query_begin=0, query_end=0;
++    } cache_observation;
+ 
+     // Reads the prompt and generates.  on_token gets every token, the end-of-sequence one included.  The rows of
+     // the prompt's pictures have ids below zero (take_pictures()); `pad` is the token they stand in for.
+@@ -396,7 +403,7 @@ struct Session {
+     Result generate(const std::vector<int32_t>& ids, const Pictures& pictures, int32_t pad, int64_t turn_at,
+                     int64_t max_new, const Sampling& s, const std::atomic<bool>& stop, OnToken on_token,
+                     OnProgress on_progress, const std::function<bool(int64_t)>* between = nullptr,
+-                    int64_t query_begin = -1, int64_t query_end = -1) {
++                    int64_t query_begin = -1, int64_t query_end = -1, const std::string& cache_owner = {}) {
+         Result r;
+         const int64_t n = (int64_t) ids.size();
+ #ifdef STRATA_KVMEM
+@@ -460,10 +467,16 @@ struct Session {
+                 const auto observed = std::max(managed_history.observed_prefix(ids),
+                     managed_sessions.observed_prefix(ids));
+                 if (engine.memory_options().sessions > 1) {
+-                    r.resume = managed_sessions.resume(engine, managed_history, ids, history_bound, uint64_t(n)+uint64_t(max_new));
++                    r.resume = managed_sessions.resume(engine, managed_history, ids, history_bound, uint64_t(n)+uint64_t(max_new), cache_owner, has_query && !follow_up);
++                    r.planned_cache = managed_sessions.last_reuse.planned;
++                    r.cache_source = managed_sessions.last_reuse.source;
+                 } else {
+-                    const auto candidate = managed_history.choose(ids, history_bound, engine.memory().stamp());
++                    const auto candidate = managed_history.owner == cache_owner
++                        ? managed_history.choose(ids, history_bound, engine.memory().stamp())
++                        : strata::poly::KvmemHistory::Resume{};
+                     r.resume = candidate.at;
++                    r.planned_cache = candidate.at;
++                    r.cache_source = candidate.at ? "own" : "miss";
+                     if (!r.resume) {
+                         managed_history.clear();
+                         engine.reset();
+@@ -472,6 +485,7 @@ struct Session {
+                         if (candidate.checkpoint) engine.memory().restore_prefix(*candidate.checkpoint);
+                         managed_history.truncate(r.resume);
+                     }
++                    managed_history.owner = cache_owner;
+                 }
+                 std::vector<kvmem::PrefixRange> groups;
+                 for (const auto& image : pictures.at)
+@@ -507,6 +521,7 @@ struct Session {
+         }
+         asked += n;
+         reused += r.resume;
++        cache_observation = {r.planned_cache,r.resume,r.cache_source,query_begin,query_end};
+         on_progress(r.resume, n, 0.0, true);
+         if (s.seed != 0) rng.seed(s.seed);
+ 
+@@ -777,7 +792,7 @@ struct Session {
+ // the key image_pad, the token whose runs in the ids are the pictures' places.  turn_at is the place in the ids
+ // where the prompt's last turn begins (the server knows the template's turn tokens): a checkpoint goes there.
+ bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t& pad, int64_t& turn_at,
+-               std::string& pictures, std::vector<int32_t>& ids, int64_t& query_begin, int64_t& query_end) {
++               std::string& pictures, std::vector<int32_t>& ids, int64_t& query_begin, int64_t& query_end, std::string& cache_owner) {
+     const bool geni = line.rfind("GENI ", 0) == 0;
+     char* p = nullptr;
+     max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &p, 10);
+@@ -785,6 +800,7 @@ bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t
+     pad = -1;
+     turn_at = -1;
+     query_begin = query_end = -1;
++    cache_owner.clear();
+     for (;;) {   // key=value tokens, then the file and the ids
+         while (*p == ' ') ++p;
+         const char* start = p;
+@@ -810,6 +826,16 @@ bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t
+         else if (key == "turn_at") turn_at = std::strtoll(v, nullptr, 10);
+         else if (key == "query_begin") query_begin = std::strtoll(v, nullptr, 10);
+         else if (key == "query_end") query_end = std::strtoll(v, nullptr, 10);
++        else if (key == "cache_owner") {
++            const std::string hex(v);
++            if (hex.empty() || hex.size() > 512 || hex.size()%2) return false;
++            auto digit = [](char c) { return c>='0' && c<='9'?c-'0':c>='a' && c<='f'?c-'a'+10:-1; };
++            for (size_t i=0;i<hex.size();i+=2) {
++                const auto a=digit(hex[i]), b=digit(hex[i+1]);
++                if(a<0 || b<0) return false;
++                cache_owner.push_back(char(a*16+b));
++            }
++        }
+         // other keys belong to the other engine and are skipped
+     }
+     pictures.clear();
+@@ -954,7 +980,7 @@ int serve(Session& ss) {
+     // A prompt that goes on from what a slot's sequence holds, further than from what sequence 0 holds, starts
+     // from a copy of that: a request that left its slot to write alone again (with guesses), or the next turn of
+     // a conversation a slot answered.
+-    const auto from_slot = [&](const std::vector<int32_t>& ids) {
++    const auto from_slot = [&](const std::vector<int32_t>& ids, const std::string& owner) {
+ #ifdef STRATA_KVMEM
+         if(engine.kvmem_enabled()) {
+             // Completed histories are parked globally. A yielded prompt still
+@@ -962,6 +988,9 @@ int serve(Session& ss) {
+             // before the ordinary prefix planner decides where to resume.
+             size_t best=slots.size(),most=ss.managed_history.observed_prefix(ids);
+             for(size_t b=0;b<slots.size();++b)if(!slots[b].active && !slots[b].held.empty()) {
++                // A yielded prefix is still private to its named lineage.
++                // Foreign discovery uses the sealed catalog, never this move.
++                if(slots[b].managed_history.owner!=owner)continue;
+                 const auto common=slots[b].managed_history.observed_prefix(ids);
+                 if(common>most) {best=b;most=common;}
+             }
+@@ -1078,6 +1107,7 @@ int serve(Session& ss) {
+         int32_t pad = -1;
+         int64_t turn_at = -1;
+         int64_t query_begin = -1, query_end = -1;
++        std::string cache_owner;
+         std::string file;
+         // VRAM [reserve_mib], the server's POST /v1/vram: the expert cache sized again between requests, to leave
+         // that much VRAM to other programs; alone, back to what the engine started with
+@@ -1131,7 +1161,7 @@ int serve(Session& ss) {
+             std::fflush(stdout);
+             continue;
+         }
+-        if (!parse_gen(line, max_new, s, pad, turn_at, file, ids, query_begin, query_end)) {
++        if (!parse_gen(line, max_new, s, pad, turn_at, file, ids, query_begin, query_end, cache_owner)) {
+             std::printf("ERR bad request\n");
+             std::fflush(stdout);
+             continue;
+@@ -1164,7 +1194,7 @@ int serve(Session& ss) {
+         int32_t first = -1;   // the token BGEN's read picks
+         try {
+             engine.bind(0);
+-            from_slot(ids);
++            from_slot(ids,cache_owner);
+             ids_n = n;
+             text = pictures.at.empty();
+             ss.piece_calls = writing() ? 1 : kPiece;
+@@ -1188,6 +1218,17 @@ int serve(Session& ss) {
+                 [&](int64_t at, int64_t total, double ms, bool first) {
+                     if (first) {
+                         resume = at;
++#ifdef STRATA_KVMEM
++                        if(engine.kvmem_enabled()) {
++                            const auto& cache=ss.cache_observation;
++                            std::printf("CACHE_REUSE planned_cached_tokens=%lld actual_cached_tokens=%lld cache_source=%s\n",
++                                (long long)cache.planned,(long long)cache.actual,cache.source);
++                            if(std::getenv("KVMEM_POLY_SESSION_METRICS"))
++                                std::fprintf(stderr,"KVMEM_REUSE planned_tokens=%lld actual_tokens=%lld source=%s owner_bytes=%zu mode=%s query_begin=%lld query_end=%lld requested_query_begin=%lld requested_query_end=%lld\n",
++                                    (long long)cache.planned,(long long)cache.actual,cache.source,cache_owner.size(),admit>=0?"admit":"solo",
++                                    (long long)cache.query_begin,(long long)cache.query_end,(long long)query_begin,(long long)query_end);
++                        }
++#endif
+                         std::printf("RESUME %lld\n", (long long) at);
+                     } else {
+                         std::printf("PP %lld %lld %.0f %.1f\n", (long long) at, (long long) total, ms,
+@@ -1195,7 +1236,7 @@ int serve(Session& ss) {
+                     }
+                     std::fflush(stdout);
+                 },
+-                slots.empty() ? nullptr : &between, query_begin, query_end);
++                slots.empty() ? nullptr : &between, query_begin, query_end, cache_owner);
+             if (r.gave_way >= 0) {
+ #ifdef STRATA_KVMEM
+                 if(engine.kvmem_enabled())engine.move_memory_seq(0,gives_to+1);
+@@ -1241,16 +1282,24 @@ int serve(Session& ss) {
+         engine.elastic_info();
+         const strata::poly::Stats& now = engine.stats();
+ #ifdef STRATA_KVMEM
+-        if (engine.kvmem_enabled() && engine.memory_options().sessions > 1)
+-            ss.managed_sessions.metrics(engine.memory());
++        if (engine.kvmem_enabled() && engine.memory_options().sessions > 1) {
++            std::vector<const strata::poly::KvmemHistory*> other_histories;
++            for(const auto& slot:slots)other_histories.push_back(&slot.managed_history);
++            ss.managed_sessions.metrics(engine.memory(), &ss.managed_history,other_histories,engine.logical_memory_payload_bytes());
++        }
+         if (engine.kvmem_enabled()) engine.memory().storage_metrics();
+ #endif
+         // the cache's share of the experts looked up while answering: a prompt batch's go through VRAM either way
+         const long long hits = now.gpu_experts - before.gpu_experts;
+         const long long misses = now.cpu_experts - before.cpu_experts;
+-        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld 0\n", (long long) r.produced, n,
++        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld 0", (long long) r.produced, n,
+                     r.prompt_ms, r.decode_ms, r.finish, (long long) r.guessed_right, (long long) r.guessed,
+                     (long long) r.resume, hits, hits + misses, (long long) r.read);
++#ifdef STRATA_KVMEM
++        if (engine.kvmem_enabled()) std::printf(" planned_cached_tokens=%lld actual_cached_tokens=%lld cache_source=%s",
++                    (long long) r.planned_cache, (long long) r.resume, r.cache_source);
++#endif
++        std::putchar('\n');
+         std::fflush(stdout);
+         engine.trim();
+         ss.kept.release();
+diff --git a/tools/poly_kvmem_sessions_test.cpp b/tools/poly_kvmem_sessions_test.cpp
+index 75aa083fec959737c02bd415ebdd6d7fa66fefac..64d8d8699ae74133a27c1864b23f957a9a81878a 100644
+--- a/tools/poly_kvmem_sessions_test.cpp
++++ b/tools/poly_kvmem_sessions_test.cpp
+@@ -18,6 +18,7 @@ std::unique_ptr<KvmemSessions::Entry> entry(kvmem::HostKvStorage& storage, uint6
+     auto ids = prompt(base);
+     saved->history.append(ids.data(),128);
+     auto cp = std::make_shared<KvmemCheckpoint>();
++    cp->state.assign(16, 7);
+     cp->identity.stamp = stamp;
+     saved->history.remember(cp);
+     saved->memory.identity.stamp = stamp;
+@@ -29,6 +30,25 @@ int main() {
+     try {
+         kvmem::HostKvStorage shared(192);
+         KvmemSessions cache;
++        {
++            KvmemSessions owners;
++            owners.configure(2);
++            auto own=entry(shared,90,1000);own->history.owner="A";
++            owners.save(std::move(own));
++            const auto idle=owners.choose(prompt(1000),128,"A",true);
++            check(idle.resume.at==128 && !idle.fork,"own idle fixture not selected");
++            for(int64_t at : {64,128,256}) {
++                const KvmemHistory::Resume live{at,nullptr};
++                check(!KvmemSessions::prefer_live(live,false,idle,true),"foreign live displaced own idle history");
++                check(!KvmemSessions::prefer_live(live,false,idle,false),"tool continuation chose foreign live history");
++            }
++            const auto foreign=owners.choose(prompt(1000),128,"B",true);
++            check(foreign.fork,"foreign idle fixture not selected");
++            check(KvmemSessions::prefer_live({64,nullptr},true,foreign,true),"own live lost priority to longer foreign idle");
++            check(KvmemSessions::prefer_live({256,nullptr},false,foreign,true),"longer foreign live was not discoverable");
++            check(!KvmemSessions::prefer_live({256,nullptr},false,foreign,false),"tool continuation discovered foreign prefix");
++            check(!KvmemSessions::prefer_live({64,nullptr},false,foreign,true),"shorter foreign live won over longer idle");
++        }
+         cache.configure(2);
+         cache.save(entry(shared,1,1000));
+         cache.save(entry(shared,2,2000));
+@@ -66,6 +86,21 @@ int main() {
+         ++invalid->memory.identity.stamp.session.incarnation;
+         cache.save(std::move(invalid));
+         check(cache.choose(prompt(5000),128).resume.at == 0, "incompatible idle incarnation was selected");
++        auto owned = entry(shared,9,9000);
++        owned->history.owner = "parent";
++        owned->history.latest();
++        auto stamp = owned->memory.identity.stamp; stamp.session.id = 19;
++        auto forked = owned->history.fork(stamp);
++        check(forked.latest()->native_state().data()==owned->history.latest()->native_state().data(), "fork duplicated sealed recurrent state");
++        check(forked.choose(prompt(9000),128,stamp).at == 128, "fork lost its rebound native checkpoint");
++        owned->history.truncate(0);
++        check(forked.size()==128 && forked.latest()->identity.stamp.session.id==19, "parent edit changed child history");
++        check(forked.latest()->native_state().size()==16 && forked.latest()->native_state()[0]==7, "parent edit released child state");
++        owned->history = forked.fork(owned->memory.identity.stamp);
++        cache.save(std::move(owned));
++        auto foreign=cache.choose(prompt(9000),128,"different",true);
++        check(foreign.resume.at>0 && foreign.fork, "foreign lookup transferred the source owner");
++        check(cache.choose(prompt(9000),128,"different",false).resume.at==0, "tool continuation discovered foreign history");
+         cache.configure(0);
+         check(shared.charged_bytes() == 0 && cache.parked() == 0, "clearing idle sessions leaked RAM records");
+         std::cout << "KVMem retained-session planner and shared quota PASS\n";

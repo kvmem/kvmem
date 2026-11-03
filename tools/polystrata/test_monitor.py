@@ -44,16 +44,27 @@ class MonitorTest(unittest.TestCase):
         row=snapshot(s)['active'][0]
         self.assertEqual(row['cached_tokens'],80)
         self.assertEqual(row['prefill_tps'],250)
+        a.update(planned_cached_tokens=90,actual_cached_tokens=80,cache_source='shared')
+        s.engine.batch=2;s.live_reqs={1:(a,[(now,8)])}
+        live=snapshot(s)['active'][0]
+        self.assertEqual(live['cached_tokens'],80)
+        self.assertEqual(live['planned_cached_tokens'],90)
+        self.assertEqual(live['cache_source'],'shared')
+        s.engine.batch=0
         s.status={'busy':False}
         s.live_reqs={};s.history=[{'time':now-1,'duration_s':1,'finish':'disconnect',
             'output_tokens':1,'decode_tok_s':1000000,'kvmem_monitor_id':'a',
-            'prompt_tokens':100,'reused':90,'prompt_read':10,'prompt_ms':20}]
+            'prompt_tokens':100,'reused':90,'prompt_read':10,'prompt_ms':20,
+            'planned_cached_tokens':90,'actual_cached_tokens':90,'cache_source':'shared'}]
         x=snapshot(s)
         self.assertFalse(x['active']);self.assertEqual(x['recent'][0]['id'],'a')
         self.assertEqual(x['recent'][0]['decode_tps'],0)
         self.assertEqual(x['recent'][0]['decode_tps_mean'],0)
         self.assertEqual(x['recent'][0]['status'],'disconnected')
         self.assertEqual(x['recent'][0]['prefill_tps'],500)
+        self.assertEqual(x['recent'][0]['planned_cached_tokens'],90)
+        self.assertEqual(x['recent'][0]['actual_cached_tokens'],90)
+        self.assertEqual(x['recent'][0]['cache_source'],'shared')
 
     def test_log_partial_line_and_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -66,6 +77,35 @@ class MonitorTest(unittest.TestCase):
             self.assertEqual(log.poll(engine),{})
             path.write_bytes(b'KVMEM_STORAGE host_bytes=1\n')
             self.assertEqual(log.poll(engine),{'host_bytes':1})
+
+    def test_shared_bytes_are_native_counters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'native.log'
+            path.write_text('KVMEM_SHARED logical_payload_bytes=120 physical_payload_bytes=80 sharing_credit_bytes=40 shared_forks=2\n'
+                            'KVMEM_SHARED logical_state_bytes=200 physical_state_bytes=100 state_sharing_credit_bytes=100 state_references=2\n')
+            engine=NS(log_path=str(path),log_start=0)
+            counters=StorageLog().poll(engine)
+            self.assertEqual(counters['sharing_credit_bytes'],40)
+            self.assertEqual(counters['physical_state_bytes'],100)
+            self.assertEqual(counters['state_references'],2)
+
+    def test_global_batch_catalog_and_native_request_observations(self):
+        s=self.service();s.engine.batch=2;s.engine.gen=4
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'native.log'
+            path.write_text('KVMEM_SESSIONS parked=3 evictions=2 restores=7\nKVMEM_SHARED scope_version=2 logical_payload_bytes=120 physical_payload_bytes=80\n')
+            s.engine.log_path=str(path);s.engine.log_start=0
+            s.kvmem_reuse_generation=(id(s.engine),4)
+            s.kvmem_reuse_totals={'own':5,'shared':3,'miss':2}
+            usage=snapshot(s)['kvmem']
+            self.assertEqual(usage['retained_sessions'],3)
+            self.assertEqual(usage['history_evictions'],2)
+            self.assertEqual(usage['history_hits'],8)
+            self.assertEqual(usage['shared_history_hits'],3)
+            self.assertEqual(usage['history_misses'],2)
+            self.assertEqual(usage['sampling_scope'],'request_end_all_native_sequences')
+            s.engine.gen+=1
+            self.assertIsNone(snapshot(s)['kvmem']['history_hits'])
 
 
 if __name__ == '__main__':unittest.main()

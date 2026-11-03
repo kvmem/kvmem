@@ -6,6 +6,7 @@
 #include "rank_native_memory.hpp"
 #include "state_checkpoint.hpp"
 #include "rank_prefix.hpp"
+#include "prefix_directory.hpp"
 #include "query_identity.hpp"
 #include "image_contract.hpp"
 #include "attention_capture.hpp"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <deque>
 #include <chrono>
+#include <set>
 
 namespace kvmem::radiance {
 class BatchedStatisticsObserver;
@@ -43,7 +45,8 @@ struct SelectionOptions : RecallOptions {
 // the engine-owned prefix cache is disabled in favor of the shared KVMem cache.
 class StatisticsObserver final : public rad::StepObserver {
 public:
-    explicit StatisticsObserver(SelectionOptions options = {}) : options_(options) {}
+    explicit StatisticsObserver(SelectionOptions options = {}) : options_(options) {cache_->observers.insert(this);}
+    ~StatisticsObserver() override {cache_->observers.erase(this);}
     bool retain_history_boundary() const noexcept override { return options_.budget_tokens > 0; }
     int pool_token_limit(const rad::Config&, const rad::Program&, int64_t*) noexcept override;
     int configure(const rad::Config&, rad::CtxDesc&) noexcept override;
@@ -93,14 +96,15 @@ private:
         std::vector<int32_t> tokens;
         ImageIdentities images;
         std::string scope;
+        bool fallback = false;
         std::vector<int32_t> query_tokens;
         int32_t query_begin = -1, query_end = -1;
-        bool matches(const rad::Request& r) const {
-            return scope == r.session_label &&
-                r.prompt.size() > tokens.size() &&
+        bool prefix_matches(const rad::Request& r) const {
+            return r.prompt.size() > tokens.size() &&
                 std::equal(tokens.begin(), tokens.end(), r.prompt.begin()) &&
                 image_prefix_matches(images,r.media.get(),r.prompt.size(),tokens.size());
         }
+        bool matches(const rad::Request& r) const {return scope==r.cache_owner && prefix_matches(r);}
     };
     ImageIdentities images_; // immutable layout of the active native request
     std::shared_ptr<const CachedIdentity> cached_identity_; // atomic immutable HTTP snapshot
@@ -117,7 +121,11 @@ private:
         std::shared_ptr<RankNativeMemory> memory;
         std::unique_ptr<RecallPolicy> recall;
         std::unique_ptr<RecallSnapshot> recall_snapshot;
+        // One LRU conversation, two native restore points. Immutable archive
+        // records are shared; mutable catalogs and statistics are independent.
+        std::unique_ptr<RetainedSession> input, fallback;
     };
+    std::unique_ptr<RetainedSession> input_, fallback_;
     struct ParkWork {
         std::unique_ptr<RankPrefix> prefix;
         std::shared_ptr<HostKvStorage> storage;
@@ -133,10 +141,11 @@ private:
     struct CacheState {
         std::shared_ptr<HostKvStorage> payload;
         std::shared_ptr<StorageIoQueue> io;
-        uint64_t hits=0,evictions=0,forks=0;
+        uint64_t hits=0,evictions=0,forks=0,cross_owner_forks=0;
+        uint64_t actual_own_hits=0,actual_shared_hits=0,actual_misses=0;
         std::deque<RetainedSession> sessions; // LRU, owns no live native sequence
         std::vector<std::unique_ptr<PendingPark>> parking;
-        struct Finishing {uint64_t id;std::shared_ptr<const CachedIdentity> identity;};
+        struct Finishing {uint64_t id;std::shared_ptr<const CachedIdentity> identity, input_identity, fallback_identity;};
         std::vector<Finishing> finishing; // bounded by active native sequence count
         uint64_t next_park=1,park_errors=0;
         size_t count() const noexcept {return sessions.size()+parking.size();}
@@ -144,10 +153,14 @@ private:
             return std::any_of(parking.begin(),parking.end(),[&](const auto& x){return x->id==id;}) ||
                 std::any_of(finishing.begin(),finishing.end(),[&](const auto& x){return x.id==id;});
         }
-        uint64_t bytes = 0, active_archive_bytes = 0;
+        uint64_t bytes = 0, active_archive_bytes = 0, active_checkpoint_bytes = 0;
+        std::set<const StatisticsObserver*> observers; // scheduler-thread ownership only
+        uint64_t sharing_credit(const RetainedSession* extra=nullptr) const;
     };
     std::shared_ptr<CacheState> cache_ = std::make_shared<CacheState>();
     uint64_t archive_charge_ = 0;
+    uint64_t input_charge_ = 0;
+    uint64_t history_allowance(const RetainedSession* extra=nullptr) const;
     uint64_t next_incarnation_ = 1, steps_ = 0;
     uint32_t frontier_ = 0, max_position_ = 0;
     std::vector<double> query_total_;
@@ -177,8 +190,12 @@ private:
         SelectionReason reason;
         size_t spill,restore;
         std::chrono::steady_clock::time_point deadline;
+        std::shared_ptr<RankMemory> storage;
     };
     std::optional<PendingSelection> pending_selection_;
+    bool draining_selection_failure_=false;
+    bool draining_storage_failure() const noexcept {return draining_prefix_failure_ || draining_selection_failure_;}
+    void cancel_selection() noexcept;
     bool asynchronous_=false; // enabled only by a wrapper implementing scheduler holds
     struct PrefixReadWork {
         std::unique_ptr<RankPrefix> source;
@@ -201,10 +218,22 @@ private:
         size_t output_tokens=0;
     };
     std::unique_ptr<TerminalSnapshot> pending_finish_;
+    std::shared_ptr<const CachedIdentity> pending_input_;
+    std::unique_ptr<PendingPark> input_parking_;
     uint64_t finishing_id_=0;
     void capture_terminal(const TerminalSnapshot&);
+    void retain_input(const rad::StepEntry&);
+    void capture_input(std::shared_ptr<const CachedIdentity>);
+    bool poll_input();
+    void update_input_charge(uint64_t);
+    uint64_t input_extra_bytes() const;
+    void promote_input();
+    std::unique_ptr<RetainedSession> carry_input(const RetainedSession&, const RetainedSession&, const rad::Request&,bool fallback=false);
+    void admit_carried_input(std::unique_ptr<RetainedSession>);
+    static uint64_t retained_bytes(const RetainedSession&);
+    static RetainedSession* select_checkpoint(RetainedSession&, const rad::Request&, bool shared=false);
     uint64_t pending_cache_=0;
-    bool pending_io() const noexcept {return pending_cache_ || bool(pending_prefix_) || bool(pending_selection_) || bool(pending_finish_);}
+    bool pending_io() const noexcept {return pending_cache_ || bool(pending_prefix_) || bool(pending_selection_) || bool(pending_finish_) || bool(pending_input_) || bool(input_parking_);}
     bool poll_prefix();
     bool poll_selection(bool wait=false);
     int poll_pending_selection() noexcept;

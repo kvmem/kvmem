@@ -91,7 +91,8 @@ def main():
                         help="reuse native drafter; MTP requires MTP weights, never silently falls back to DFlash")
     parser.add_argument("--speculative-tokens", type=int, default=None,
                         help="native Radiance draft depth; 0 is the historical non-speculative baseline")
-    parser.add_argument("--kv-cache-dtype", choices=("bf16", "fp8"), default="bf16",
+    parser.add_argument("--state-cache-dtype", choices=("f32", "f16"), default="f32")
+    parser.add_argument("--kv-cache-dtype", choices=("bf16", "fp8", "fp8_v4", "k6_v4"), default="bf16",
                         help="native Radiance KV encoding; explicit in every recorded command")
     parser.add_argument("--prompt-file", type=Path)
     parser.add_argument("--rounds", type=int, default=1, choices=range(1, 6),
@@ -165,7 +166,7 @@ def main():
                "--host", "127.0.0.1", "--port", str(port), "--served-model-name", "bringup",
                "--tp", "1", "--max-model-len", str(args.context), "--max-num-seqs", "1",
                "--max-num-batched-tokens", str(args.batch), "--num-speculative-tokens", str(args.speculative_tokens),
-               "--gpu-headroom-mib", str(args.gpu_headroom_mib), "--kv-cache-dtype", args.kv_cache_dtype,
+               "--gpu-headroom-mib", str(args.gpu_headroom_mib), "--kv-cache-dtype", args.kv_cache_dtype, "--state-cache-dtype", args.state_cache_dtype,
                "--placement", "all_vram", "--embedding-placement", args.embedding_placement,
                "--host-pool-mib", "0", "--prefix-cache-host-mib", "0",
                "--mm-max-patches", "0",
@@ -481,22 +482,14 @@ def main():
                        if "KVMEM_PREFIX_RESUME " in line]
             report["prefix_resumes"] = resumed
             retained = [dict(re.findall(r"(\w+)=([^ ]+)", line)) for line in log_lines
-                        if "KVMEM_PREFIX_RETAIN " in line]
+                        if "KVMEM_INPUT_RETAIN " in line]
             report["prefix_retained"] = retained
             if args.require_prefix_resume:
-                resume_ok = len(resumed) == expected_rounds - 1 and expected_rounds > 1
-                resume_ok = resume_ok and len(retained) == expected_rounds
-                for index, (item, row) in enumerate(zip(resumed, report.get("rounds", [])[1:]), 1):
-                    cached = (row.get("usage", {}).get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-                    previous_prompt = report["rounds"][index - 1]["usage"]["prompt_tokens"]
-                    # Only the proven history prefix is reusable: generation-only
-                    # chat template suffixes are recomputed, never falsely cached.
-                    resume_ok = resume_ok and 0 < int(item["frontier"]) == cached <= previous_prompt and \
-                        item["exact_prefix"] == item["same_query"] == "1"
-                    resume_ok = resume_ok and index <= len(retained) and \
-                        int(retained[index - 1]["frontier"]) == cached
-                report["prefix_resume_pass"] = resume_ok
-                report["pass"] = report["pass"] and resume_ok
+                from prefix_checks import input_prefix_continuations
+                prefix_check = input_prefix_continuations(log_lines, report.get("rounds", []))
+                report["prefix_resume_evidence"] = prefix_check
+                report["prefix_resume_pass"] = prefix_check["pass"]
+                report["pass"] = report["pass"] and prefix_check["pass"]
             frozen = []
             for line in log_lines:
                 if "KVMEM_QUERY_FROZEN session=" in line:

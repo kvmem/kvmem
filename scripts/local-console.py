@@ -10,6 +10,7 @@ import getpass
 import hashlib
 import ipaddress
 from ctypes import wintypes
+import http.client
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,7 @@ from urllib.parse import parse_qs, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from console_chat import ChatBridge, MAX_BODY
 from console_hardware import SystemDiskSampler
+from console_radiance import enrich_props, enrich_status
 from console_memory import diagnose as diagnose_memory, validate_budget_plan
 from model_health import request_parameters, unchecked
 
@@ -1304,6 +1306,19 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(403, {'error': 'Invalid console token'}); return False
         return True
 
+    def runtime_status(self):
+        state=self.control.status()
+        if state.get('state')=='ready' and state.get('active_config',{}).get('parameters',{}).get('Backend')=='radiance':
+            try:
+                snapshot=self.control.chat.get_json(state,'/api/monitor/snapshot')
+                if state.get('instance')!=self.control.status().get('instance'):
+                    raise ValueError('Service changed while reading runtime status')
+                state=enrich_status(state,snapshot)
+            except (OSError,ValueError,http.client.HTTPException):
+                # Missing telemetry must not turn a healthy worker into a stopped service.
+                pass
+        return state
+
     def do_GET(self):
         if not self.trusted():
             return
@@ -1335,13 +1350,13 @@ class Handler(BaseHTTPRequestHandler):
                                 'backend_capabilities': launcher_capabilities(self.control.backend_root)['backends'],
                                 'state_dir': str(self.control.state_dir),
                                 'backend_root': str(self.control.backend_root), 'gpus': self.server.gpus,
-                                'draft': self.control.draft(), 'status': self.control.status(),
+                                'draft': self.control.draft(), 'status': self.runtime_status(),
                                 'workers': self.control.worker_defaults(),
                                 'native_options': {k: sorted(v | NATIVE_SWITCHES.get(k, set())) for k, v in NATIVE.items()}})
             elif path == '/api/launcher/model-directories':
                 self.reply(200, self.control.model_directories())
             elif path == '/api/launcher/status':
-                self.reply(200, self.control.status())
+                self.reply(200, self.runtime_status())
             elif path == '/api/launcher/services':
                 self.reply(200, self.control.service_list())
             elif path == '/api/launcher/hardware':
@@ -1351,7 +1366,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/launcher/logs':
                 revision = parse_qs(urlsplit(self.path).query).get('revision', [''])[0]
                 self.reply(200, self.control.log_snapshot(revision))
-            elif path in ('/api/monitor/snapshot', '/props', '/slots', '/stats'):
+            elif path in ('/api/monitor/snapshot', '/props', '/slots', '/stats', '/server_info'):
                 state = self.control.status()
                 if not state['url']:
                     self.reply(503, {'error': 'No managed service is running'}); return
@@ -1365,6 +1380,12 @@ class Handler(BaseHTTPRequestHandler):
                         body = response.read(4 * 1024 * 1024 + 1)
                         if len(body) > 4 * 1024 * 1024:
                             raise ValueError('Monitor response too large')
+                        if path=='/props' and state.get('active_config',{}).get('parameters',{}).get('Backend')=='radiance':
+                            info=self.control.chat.get_json(state,'/server_info')
+                            snapshot=self.control.chat.get_json(state,'/api/monitor/snapshot')
+                            if state.get('instance')!=self.control.status().get('instance'):
+                                raise ValueError('Service changed while reading runtime data')
+                            body=enrich_props(json.loads(body),info,snapshot)
                         self.reply(response.status, body)
                 except urllib.error.HTTPError as error:
                     self.reply(error.code, {'error': 'Inference endpoint unavailable'})

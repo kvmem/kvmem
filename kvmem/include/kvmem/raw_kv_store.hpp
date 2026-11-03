@@ -101,6 +101,9 @@ public:
     // payload lives in its separately shared page archive. The caller restores
     // the checkpoint's partial-tail sum after truncation.
     std::unique_ptr<RawKvStore> fork_mean_prefix(uint32_t token_pos) const;
+    // Caller has drained native writers. Packed records become sealed shared
+    // sources; raw rows and mutable statistics remain private to the branch.
+    std::unique_ptr<RawKvStore> fork_prefix(uint32_t token_pos);
 
 private:
     struct LayerBlk {

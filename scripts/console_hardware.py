@@ -44,9 +44,23 @@ def amd_gpu_inventory():
     except (OSError,subprocess.TimeoutExpired):return []
 
 
+def linux_disk_counters():
+    # Whole physical devices only: exclude partitions, loop devices and stacked
+    # dm/md devices so one transfer is not counted at several layers. System scope.
+    from types import SimpleNamespace
+    devices=[p.name for p in Path('/sys/block').iterdir() if (p/'device').exists()]
+    if not devices:return None
+    read=write=0
+    for device in devices:
+        fields=(Path('/sys/block')/device/'stat').read_text().split()
+        read+=int(fields[2])*512;write+=int(fields[6])*512
+    return SimpleNamespace(read_bytes=read,write_bytes=write)
+
+
 class SystemDiskSampler:
     def __init__(self, reader=None, clock=time.monotonic, wall=time.time):
-        self.reader = reader or (psutil.disk_io_counters if psutil else None)
+        self.reader = reader or (psutil.disk_io_counters if psutil else linux_disk_counters if Path('/sys/block').is_dir() else None)
+        self.source='linux-sysfs-physical-devices' if self.reader is linux_disk_counters else 'psutil'
         self.clock, self.wall = clock, wall
         self.previous = None
         self.lock = threading.Lock()
@@ -55,7 +69,7 @@ class SystemDiskSampler:
         self.value = self._empty('warming_up')
 
     def _empty(self, status):
-        return dict(schema_version=1, scope='system', source='psutil', status=status,
+        return dict(schema_version=1, scope='system', source=self.source, status=status,
                     sampled_at_ms=None, interval_ms=None,
                     system_disk_read_bytes_per_second=None,
                     system_disk_write_bytes_per_second=None)

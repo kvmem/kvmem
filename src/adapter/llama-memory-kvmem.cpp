@@ -1297,6 +1297,62 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::make_conv() {
     return conv;
 }
 
+std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_conv(ConvStore & source) {
+    if (rt_cfg_.cpu_bytes) throw std::runtime_error("shared forks do not clone legacy pinned CPU tiers");
+    if (source.cold || source.model != &model_ || source.type_k != kv_->type_k() || source.type_v != kv_->type_v() ||
+        source.slots != n_slots_ || source.has_mtp != bool(mtp_) || !source.content || !source.content->stamp().valid)
+        throw std::invalid_argument("incompatible native conversation fork");
+    auto result = make_conv();
+    const auto rows = source.runtime->store().total_tokens();
+    if (source.content->stamp().frontier != rows) throw std::runtime_error("native fork has unaccepted rows");
+    result->content = source.content->fork();
+    result->raw = source.raw->fork_prefix(rows);
+    if (source.mtp_raw) result->mtp_raw = source.mtp_raw->fork_prefix(rows);
+    result->runtime->store() = source.runtime->store();
+    result->runtime->store().restore_retrieval(source.runtime->store().retrieval_checkpoint());
+    result->row_positions = source.row_positions; result->resident = source.resident;
+    result->q_rows = source.q_rows; result->q_count = source.q_count;
+    result->graph = source.graph; result->feedback.restore(source.feedback.snapshot());
+    result->scope = source.scope; result->output_begin = source.output_begin;
+    result->think_open = source.think_open; result->think_close = source.think_close;
+    return result;
+}
+
+std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_conv() {
+    if (rt_cfg_.cpu_bytes) throw std::runtime_error("shared forks do not clone legacy pinned CPU tiers");
+    kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
+    decode_mean_reset(); harvest_flush(); harvest_gpu_v_commit();
+    const auto rows = runtime_->store().total_tokens();
+    if (!content_->stamp().valid || content_->stamp().frontier != rows)
+        throw std::runtime_error("active fork has unaccepted content");
+    auto result = make_conv();
+    for (const auto& block : runtime_->store().blocks()) if (block.gpu_slot >= 0) {
+        harvest_gpu_v(block.block_id);
+        if (mtp_) mtp_->on_stage_out(block.block_id);
+        result->resident.push_back(block.block_id);
+    }
+    harvest_gpu_v_commit();
+    if (mtp_) mtp_->harvest_flush();
+    for (auto id : result->resident) {
+        const auto& block = runtime_->store().blocks()[id];
+        for (uint32_t layer = 0; layer < n_layer_; ++layer) if (kvmem_cache_has_layer(kv_,int32_t(layer))) {
+            if (!raw_->has_k_gpu(id,layer,block.n_tokens) || (!v_trans_ && !raw_->has_v_gpu(id,layer,block.n_tokens)))
+                throw std::runtime_error("active fork has incomplete packed KV");
+        }
+    }
+    result->content = content_->fork();
+    result->raw = raw_->fork_prefix(rows);
+    if (mtp_) result->mtp_raw = mtp_->fork_raw(rows);
+    result->runtime->store() = runtime_->store();
+    result->runtime->store().restore_retrieval(runtime_->store().retrieval_checkpoint());
+    for (auto id : result->resident) result->runtime->store().set_block_tier(id,kvmem::KvTier::CPU,int32_t(id));
+    result->row_positions = row_positions_; result->q_rows = q_rows_; result->q_count = q_count_;
+    result->graph = graph_; result->feedback.restore(feedback_.snapshot());
+    result->scope = attention_scope_; result->output_begin = attention_output_begin_;
+    result->think_open = attention_think_open_; result->think_close = attention_think_close_;
+    return result;
+}
+
 uint32_t llama_memory_kvmem::conv_n_tokens(const ConvStore & conv) const {
     return conv.runtime ? conv.runtime->store().total_tokens() : 0;
 }
@@ -5456,6 +5512,19 @@ llama_kvmem_store_bundle * llama_kvmem_store_bundle_create() {
     }
     auto result = std::make_unique<llama_kvmem_store_bundle>();
     result->store = mem->make_conv();
+    return result.release();
+}
+
+llama_kvmem_store_bundle * llama_kvmem_store_bundle_fork(llama_kvmem_store_bundle * source) {
+    auto * mem = kvmem_capture_active();
+    if (!mem) throw std::runtime_error("missing native fork execution");
+    auto result = std::make_unique<llama_kvmem_store_bundle>();
+    if (source) {
+        if (!source->store) throw std::invalid_argument("missing native fork source");
+        result->store = mem->fork_conv(*source->store);
+    } else {
+        result->store = mem->fork_active_conv();
+    }
     return result.release();
 }
 

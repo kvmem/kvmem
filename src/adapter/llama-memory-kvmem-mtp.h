@@ -130,6 +130,10 @@ public:
     std::unique_ptr<kvmem::RawKvStore> make_raw() const {
         return std::make_unique<kvmem::RawKvStore>(raw_cfg_);
     }
+    std::unique_ptr<kvmem::RawKvStore> fork_raw(uint32_t rows) {
+        harvest_flush();
+        return raw_ ? raw_->fork_prefix(rows) : make_raw();
+    }
     uint64_t host_bytes() const { return raw_ ? raw_->allocated_bytes() : 0; }
     uint64_t payload_bytes(bool disk_only = false) const { return raw_ ? raw_->payload_bytes(disk_only) : 0; }
     uint64_t payload_capacity_bytes(uint32_t tokens) const { return raw_ ? raw_->payload_capacity_bytes(tokens) : 0; }

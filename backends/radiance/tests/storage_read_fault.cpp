@@ -42,7 +42,12 @@ void delay_write(int fd) {
     if(!claim(fd,"KVMEM_TEST_WRITE_DELAY_MARKER"))return;
     const char begin[]="KVMEM_TEST_WRITE_DELAY begin\n",end[]="KVMEM_TEST_WRITE_DELAY end\n";
     (void)::write(STDERR_FILENO,begin,sizeof(begin)-1);
-    timespec remaining{5,0};while(::nanosleep(&remaining,&remaining) && errno==EINTR){}
+    long seconds=5;
+    if(const char* value=std::getenv("KVMEM_TEST_WRITE_DELAY_SECONDS")) {
+        char* tail=nullptr;const long parsed=std::strtol(value,&tail,10);
+        if(tail && !*tail && parsed>=1 && parsed<=60)seconds=parsed;
+    }
+    timespec remaining{seconds,0};while(::nanosleep(&remaining,&remaining) && errno==EINTR){}
     (void)::write(STDERR_FILENO,end,sizeof(end)-1);
 }
 void delay_read(int fd) {

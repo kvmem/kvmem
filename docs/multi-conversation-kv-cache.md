@@ -2,11 +2,10 @@
 
 For the optional RAM/NVMe extension, capacity admission and disk restore, see
 [Session disk cache](session-disk-cache.md). For dynamic scheduling across multiple lanes, see [Multi-lane conversations](multi-lane-conversations.md).
-The policy below describes the original single-lane RAM-only mode unless stated otherwise.
-The experimental [spread checkpoint policy](checkpoint-policy.md) also permits
-middle-history edits of an explicitly bound conversation to restore a valid
-prefix and replace its suffix. Inferred IDs and legacy mode keep the continuation
-gate described below.
+The current owner and shared-prefix rules are in the
+[checkpoint contract](checkpoint-policy.md#shared-owners-across-backends).
+The native recurrent checkpoint remains the restore authority in both `legacy`
+and `spread`; a token prefix alone is insufficient.
 
 `--kvmem-conversations N` lets the server hold N conversations' KV in host RAM
 at the same time and switch between them. With the flag absent, or set to `1`,
@@ -16,14 +15,14 @@ stored conversation discards it. This section describes `--parallel 1`; with
 is the scarce one, so the design is one `llama_context`, one GPU working set,
 N host stores, time-multiplexed. Requests are still served one at a time.
 
-There is no client API change. A conversation is identified by the token
-sequence the client sends, so clients that send nothing extra work unchanged.
-`{"kvmem": {"conversation_id": "..."}}` in the request body is honored as an
-optimization when a client does send it, and is ignored when `N` is 1. It can
-never fail a request: the key was unrecognized before this feature existed, so
-a value the server cannot use as a key (not a string, empty, over 128 bytes, or
-carrying a byte outside printable ASCII) is dropped and the request is matched
-by its token prefix instead.
+Clients can omit owner keys. `kvmem.conversation_id` selects the mutable lineage,
+with `prompt_cache_key` and `promptCacheKey` as lower-priority aliases. The full
+UTF-8 key is preserved up to 256 bytes; invalid types, an empty explicit owner
+and conflicting aliases return 400. This replaces the historical silently
+dropped 128-byte ASCII hint. Owner priority still requires valid native token,
+media, state and accepted-frontier proof. The catalog prefers a proven own
+continuation and can fork a different owner's exact prefix without consuming
+that source. Ordinary tool continuation does not discover foreign histories.
 
 ## Decision table
 
@@ -35,19 +34,16 @@ the reason it reports appears in a `KVMEM_TRACE store_select` line.
 |---|---|---|
 | `extend` | The prompt continues a stored conversation, and a recurrent checkpoint exists at or before the match point | Attach that store and resume from the checkpoint |
 | `client_id` | Same as `extend`, reached through a `kvmem.conversation_id` the client supplied | Attach that store; the id only skips the prefix comparisons |
+| `shared_prefix` | A different owner or deep anonymous branch has an exact native checkpoint | Fork sealed KV/checkpoint references and keep mutable state independent; preserve the source |
 | `new_conversation` | No store is live | Fresh store |
 | `no_recurrent_checkpoint` | The prefix matches, but no recurrent checkpoint sits at or before the match point | Fresh store. This is a hard constraint of the hybrid model, not a policy choice |
 | `fork_zero_keep` | A checkpoint exists but only at row 0, so there is nothing to resume | Fresh store, leaving the matched store intact |
-| `fork_shared_prefix` | The match covers only a small part of the matched store, for example a shared system prompt or chat template | Fresh store, so the matched store's longer tail is not truncated |
+| `fork_shared_prefix` | Historical policy helper, or foreign forks disabled by an old pinned CPU arena | Fresh store; source remains intact |
 
-With `N` = 1 none of this runs. `conversation_begin_request` returns before the
-policy, so the request reaches the same prefill path, with the same checkpoint
-selection, that it reached at v0.16.0-rc3: default behavior is identical by
-construction rather than because two expressions agree. In particular the
-continuation rule is a multi-store rule. The single-store prefill path has no
-such gate, and applying it there would change default behavior in exactly the
-`fork_shared_prefix` configuration, where today's server attaches at a low
-checkpoint and truncates the stored tail.
+The historical single-store path remains distinct from the multi-owner catalog.
+The modern host/SSD tier uses its own retained-session limit. Old pinned CPU
+arenas can resume their own lineage but do not support foreign shared forks.
+An owner key does not by itself enable additional retained stores.
 
 ## The three formulas
 
@@ -302,8 +298,8 @@ emitted. The same test pins the eviction planner's refusal to ever name the
 attached conversation, which would otherwise leave a host store alive with
 nothing able to reach or release it.
 
-`scripts/test_server_conversations.py` runs four servers. The baseline case
-asserts today's behavior, that an interleaved conversation comes back as a full
+`scripts/test_server_conversations.py` runs four servers. The historical single-store baseline case
+asserts its configured behavior, that an interleaved conversation comes back as a full
 miss. The second case, with `--kvmem-conversations 4`, asserts that the
 returning conversation resumes its own prefix and that each conversation's
 answer carries its own needle and not the other's. The third case, with
@@ -327,29 +323,26 @@ with no thinking markers, and the MTP sampler probe needs a grammar the draft
 model cannot take. So the case pins the ordering with the last rejection it
 can reach rather than with the image-sized request that originally broke it.
 
-`scripts/test_server_compat.py` covers the default path: with `--model` it
-asserts that a request carrying an unusable `kvmem.conversation_id` is still
-served on a server with no `--kvmem-conversations` flag. Without a model it
-asserts both new startup cross-checks, that `--kvmem-conversations-gb` without
-`N > 1` and `--no-kvmem --kvmem-conversations 2` are rejected the same way
-every other bad argument is.
+`scripts/test_server_compat.py` checks strict owner validation even without an
+extra conversation catalog: non-string, empty explicit and over-256-byte keys
+are rejected; long valid UTF-8 keys, spaces and null-as-absent are accepted.
+Its model-free cases retain the startup checks for incompatible capacity flags.
 
 ## 中文摘要
 
-`--kvmem-conversations N` 允许服务器同时在主机内存中保留 N 个会话的 KV 并在它们之间
-切换；不带该参数或设为 `1` 时行为与此前完全一致，即换一个会话就会丢弃上一个。设计是
-一个 `llama_context`、一个 GPU 工作集、N 个主机存储，按时间复用，请求仍然串行处理。
+`--kvmem-conversations N` 是旧版主机存储目录；现代 host/SSD tier 使用自己的
+retained-session 上限。`--parallel 1` 按时间切换一个 GPU 工作集，多 lane 调度另见
+[多 lane 会话](multi-lane-conversations.md)。owner key 本身不会增加保留容量。
 
-不需要客户端改动：会话身份就是客户端发送的 token 序列。请求体里的
-`kvmem.conversation_id` 只作为可选优化，参数为 1 时被忽略；取值不可用（非字符串、
-为空、超过 128 字节或含非可打印 ASCII 字节）时直接丢弃该字段，绝不会让请求失败。
-请求继续某个已存会话时
-延用该存储；只共享系统提示词或聊天模板时新建存储，避免截断原会话更长的尾部。匹配点
-之前必须存在 recurrent 检查点，否则按 cache miss 处理，这是混合模型的硬约束。
+`kvmem.conversation_id` 优先选择可变会话归属，`prompt_cache_key` 与
+`promptCacheKey` 是较低优先级别名；完整 UTF-8 key 最长 256 字节。类型错误、显式空
+owner、超长或冲突别名返回 400。无 key 的新用户 Query 也可以搜索兼容前缀；工具续接
+不做 foreign discovery，只走 append + resident-only Pressure。
 
-`--kvmem-conversations-gb` 统计的是各存储 `bytes_k() + bytes_v()` 与服务端检查点、
-token 历史之和，按最近最少使用淘汰**非当前**会话，因此它约束的是非活动存储之和，不是
-显存或内存的硬上限；`--kvmem-cpu-gb` 与 `--kvmem-nvme-gb` 则是按存储计的，N 个会话会
-各分配一份，启动时会警告一次。切换会把 GPU 工作集整体落盘再重建，复用会话内已有的换出/换入
-流程；两个会话交替对话时每轮要付两次这个代价。本特性不引入并发解码，不改变
-`n_seq_max` 或 `llama_seq_id`，不在存储之间共享块，也不支持跨进程持久化。
+前缀必须通过原生 token、媒体、位置、accepted frontier 与 recurrent checkpoint 证明。
+满足条件后，子会话共享 sealed RAM/SSD KV 和只读 checkpoint 字节，保留独立的 MeanK、
+检索、Query、反馈和回滚状态，父会话保持可用。旧 pinned CPU arena 不支持 foreign fork。
+
+物理存储引用只计费一次，逻辑引用与物理计费分开。会话目录仍可按正常 LRU 淘汰，最后一个
+owner/reader 释放后才归还物理额度。H/D 计费、checkpoint 元数据、RSS 和 GPU 显存不是同一
+口径；本次没有引入公共 GPU 页池、跨后端 KV 字节格式或跨进程持久化。

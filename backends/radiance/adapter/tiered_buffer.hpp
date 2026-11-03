@@ -1,5 +1,6 @@
 #pragma once
 #include "kvmem/host_kv_storage.hpp"
+#include "shared_payload_accounting.hpp"
 #include "storage_work.hpp"
 #include <algorithm>
 #include <vector>
@@ -22,6 +23,9 @@ public:
         }
     }
     size_t size() const noexcept { return bytes_; }
+    void account(SharedPayloadAccounting& out) const {
+        for(const auto& record:records_)out.add(record.storage_identity(),record.size());
+    }
     std::unique_ptr<TieredBuffer> fork() const {
         auto next=std::unique_ptr<TieredBuffer>(new TieredBuffer);
         next->bytes_=bytes_;next->records_.reserve(records_.size());

@@ -5,6 +5,7 @@
 #include "llama-kvmem-execution.h"
 #include "kvmem/retrieval_options.hpp"
 #include "kvmem/launch_contract.hpp"
+#include "kvmem/cache_owner.hpp"
 #include "kvmem/token_options.hpp"
 #include "kvmem-spec.h"
 #include "kvmem-chat-sampling.h"
@@ -801,15 +802,21 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
                 out.force_substr = k["pin"][0].get<std::string>();
             }
         }
-        // Optional, never required, and never a reason to fail a request: this
-        // key was unrecognized at v0.16.0-rc3, so a client that sends one must
-        // still be served, and kvmem_store_client_id drops a value the policy
-        // cannot use instead of rejecting it. Ignored entirely with one host
-        // store, where conversation identity is the token prefix itself.
-        if (k.contains("conversation_id") && k["conversation_id"].is_string()) {
-            out.conversation_id = kvmem_store_client_id(k["conversation_id"].get<std::string>());
-        }
     }
+    try {
+        kvmem::CacheOwnerHints hints;
+        auto read = [&](const json& object, const char* field, std::optional<std::string>& target) {
+            if (!object.contains(field) || object[field].is_null()) return;
+            if (!object[field].is_string()) throw std::invalid_argument(std::string(field) + " must be a string");
+            target = object[field].get<std::string>();
+        };
+        read(body, "prompt_cache_key", hints.prompt); read(body, "promptCacheKey", hints.sdk_prompt);
+        if (body.contains("kvmem")) {
+            if (!body["kvmem"].is_object()) throw std::invalid_argument("kvmem must be an object");
+            read(body["kvmem"], "conversation_id", hints.conversation);
+        }
+        out.conversation_id = kvmem::resolve_cache_owner(hints).value_or("");
+    } catch (const std::exception& e) { err = e.what(); return false; }
     if (!kvmem_chat_template_override(body, out.enable_thinking, out.template_kwargs, err)) {
         return false;
     }
@@ -1485,7 +1492,7 @@ int main(int argc, char ** argv) {
     }
 
     std::unique_ptr<kvmem_lane_conversations> lane_conversations;
-    if (options.parallel > 1 || (options.enabled && !options.legacy_conversations)) {
+    if (options.parallel > 1 || (options.enabled && (!options.legacy_conversations || options.conversations > 1))) {
         for (auto * lane : lanes) {
             kvmem_execution_scope execution(lane->execution.get());
             if (!llama_kvmem_store_swap_supported()) {
@@ -1529,6 +1536,25 @@ int main(int argc, char ** argv) {
         auto data = monitor.snapshot();
         data["hardware"] = hardware.snapshot();
         data["backend"] = "llamacpp";
+        if (lane_conversations) {
+            auto usage = lane_conversations->status();
+            const auto storage = llama_kvmem_execution_storage_stats(lanes[0]->execution.get());
+            usage["logical_payload_bytes"] = usage["native_logical_bytes"];
+            usage["sharing_credit_bytes"] = usage["sharing_credit_lower_bound_bytes"];
+            usage["host_payload_budget_bytes"] = storage.host_capacity;
+            usage["disk_payload_budget_bytes"] = storage.disk_capacity;
+            usage["disk_read_bytes"] = storage.read_bytes; usage["disk_written_bytes"] = storage.written_bytes;
+            usage["disk_reads"] = storage.reads; usage["disk_writes"] = storage.writes; usage["disk_errors"] = storage.errors;
+            usage["history_evictions"] = usage["evictions"];
+            usage["sampling_scope"] = "committed_owner_metadata_with_live_physical_account";
+            uint64_t state_bytes = 0;
+            std::set<const MultimodalCheckpointAccounting*> accounts;
+            for (const auto* lane : lanes) if (accounts.insert(lane->mm_checkpoint_accounting.get()).second)
+                state_bytes += lane->mm_checkpoint_accounting->live_bytes.load();
+            usage["physical_checkpoint_bytes"] = state_bytes;
+            usage["checkpoint_bytes_scope"] = "native_state_and_private_retrieval_metadata";
+            data["kvmem"] = std::move(usage);
+        }
         res.set_header("Cache-Control", "no-store");
         res.set_content(data.dump(), "application/json");
     });
@@ -1952,7 +1978,7 @@ int main(int argc, char ** argv) {
         }
         auto operation = std::make_shared<kvmem_lane_conversations::operation>();
         size_t prepare_begin = lane_conversations
-            ? lane_conversations->preview(*parsed_prompt, cr.conversation_id, body.value("cache_reset", false), cache_reference) : 0;
+            ? lane_conversations->preview(*parsed_prompt, cr.conversation_id, body.value("cache_reset", false), cache_reference, !cr.msgs.empty() && cr.msgs.back().role == "user") : 0;
         std::shared_ptr<kvmem_lane_pool::lease> lease;
         try {
             for (;;) {
@@ -1960,7 +1986,7 @@ int main(int argc, char ** argv) {
                 monitor.update(monitor_id, {{"status", "queued"}});
                 lease = lane_pool.acquire(ticket, cancelled, [&](const std::vector<bool> & busy, bool reserve) {
                     if (lane_conversations) return lane_conversations->select(*parsed_prompt, cr.conversation_id,
-                            body.value("cache_reset", false), busy, reserve, *operation);
+                            body.value("cache_reset", false), busy, reserve, *operation, !cr.msgs.empty() && cr.msgs.back().role == "user");
                     for (size_t lane = 0; lane < busy.size(); ++lane) if (!busy[lane]) return (int)lane;
                     return -1;
                 });
@@ -2107,24 +2133,28 @@ int main(int argc, char ** argv) {
         request_params["n_predict"] = cr.max_tokens;
         request_params["max_tokens"] = cr.max_tokens;
         request_params["temperature"] = sparams.temp;
-        monitor.update(monitor_id, {{"status", "reading"}, {"prompt_tokens", toks.size()}, {"generated_tokens", 0}});
+        const char * planned_source = !operation->prepare_begin ? "miss" : operation->source >= 0 ? "shared" : "own";
+        monitor.update(monitor_id, {{"status", "reading"}, {"prompt_tokens", toks.size()}, {"generated_tokens", 0},
+            {"planned_cached_tokens", operation->prepare_begin}, {"planned_cache_source", planned_source}});
         st.progress.prompt((int) toks.size(), cr.max_tokens, std::move(request_params));
         st.log.start();
         LOG_INF("slot   processing task, n_prompt = %d, n_predict = %d\n", (int) toks.size(), cr.max_tokens);
         auto timings = std::make_shared<json>(json::object());
         // 1:1 upstream timings block (server-context.cpp): prompt/predicted counts, ms, per-token and per-second rates.
         // 中文：对齐上游的 timings 统计块——prompt/predicted 的计数、耗时、每 token 与每秒速率，供 /v1 响应回传
-        auto make_emit_gen_wall = [timings, request_metrics, &st, &monitor, monitor_id, n_prompt = (int) toks.size()](
+        auto make_emit_gen_wall = [timings, request_metrics, operation, &lane_conversations, &st, &monitor, monitor_id, n_prompt = (int) toks.size()](
                 std::chrono::steady_clock::time_point t_turn0,
                 std::chrono::steady_clock::time_point t_pf1,
                 double prefill_ms, int n_cache_hit) {
             const int cache_n = std::clamp(n_cache_hit, 0, n_prompt);
+            if (lane_conversations) lane_conversations->observe_reuse(*operation, size_t(cache_n));
+            const char * actual_source = !cache_n ? "miss" : operation->source >= 0 ? "shared" : "own";
             const int64_t prefilled_us = ggml_time_us();
             request_metrics->stats.start(prefilled_us - (int64_t)(prefill_ms * 1000.0));
             request_metrics->stats.prefilled(n_prompt, cache_n, prefilled_us);
             const int prompt_n = n_prompt - cache_n;
             st.progress.prefilled(cache_n);
-            monitor.update(monitor_id, {{"status", "generating"}, {"cached_tokens", cache_n},
+            monitor.update(monitor_id, {{"status", "generating"}, {"cached_tokens", cache_n}, {"actual_cached_tokens", cache_n}, {"cache_source", actual_source},
                 {"prefill_ms", prefill_ms}, {"prompt_new_tokens", prompt_n},
                 {"prefill_tps", prefill_ms > 0 ? json(1000.0 * prompt_n / prefill_ms) : json(nullptr)}});
             st.log.start_generation();

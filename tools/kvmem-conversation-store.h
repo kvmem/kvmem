@@ -57,6 +57,7 @@ struct kvmem_store_match {
 };
 
 enum class kvmem_store_action {
+    fork,
     extend, // run on plan.id and resume at plan.keep without clearing it
     fresh,  // the request gets an empty store; plan.id is always -1, asking
             // the caller to allocate one, or to reuse and clear its least
@@ -68,6 +69,7 @@ struct kvmem_store_plan {
     // reconstruction. It never authorizes restoring an old state or KV row.
     int observed_lcp = 0;
     kvmem_store_action action = kvmem_store_action::fresh;
+    int  source = -1;
     int  id    = -1;
     int  lcp   = 0;
     int  keep  = 0;
@@ -135,7 +137,7 @@ inline void kvmem_store_plan_evictions(const std::vector<kvmem_store_match> & st
                                        bool allocating, kvmem_store_plan & plan) {
     std::vector<const kvmem_store_match *> victims;
     for (const auto & store : stores) {
-        if (store.id != plan.id && store.id != limits.attached) {
+        if (store.id != plan.id && store.id != plan.source && store.id != limits.attached) {
             victims.push_back(&store);
         }
     }
@@ -232,8 +234,35 @@ inline kvmem_store_plan kvmem_store_select(const std::vector<kvmem_store_match> 
     return plan;
 }
 
+// Owner lookup has priority. A foreign match always gets a new mutable owner.
+inline kvmem_store_plan kvmem_store_select_shared(const std::vector<kvmem_store_match>& stores,
+        int eval_end, bool spec_ok, const std::string& key, const kvmem_store_limits& limits, bool discover) {
+    std::vector<kvmem_store_match> own;
+    for (const auto& store : stores)
+        if (store.client_id == key && (!key.empty() || kvmem_store_continuation(store))) own.push_back(store);
+    auto result = kvmem_store_select(own, eval_end, spec_ok, key, limits);
+    if (result.action == kvmem_store_action::extend) {
+        result.evict.clear(); kvmem_store_plan_evictions(stores, limits, false, result);
+        return result;
+    }
+    if (discover) {
+        uint64_t used = 0;
+        for (const auto& store : stores) {
+            result.observed_lcp = std::max(result.observed_lcp, store.lcp);
+            int keep = 0;
+            if (kvmem_store_checkpoint(store, kvmem_store_keep_cap(store, eval_end, spec_ok), keep) && keep > 0 &&
+                (keep > result.keep || (keep == result.keep && store.used > used))) {
+                result.action = kvmem_store_action::fork; result.source = store.id;
+                result.keep = keep; result.lcp = store.lcp; used = store.used; result.reason = "shared_prefix";
+            }
+        }
+    }
+    result.evict.clear(); kvmem_store_plan_evictions(stores, limits, true, result);
+    return result;
+}
+
 inline const char * kvmem_store_action_name(kvmem_store_action action) {
-    return action == kvmem_store_action::extend ? "extend" : "fresh";
+    return action == kvmem_store_action::extend ? "extend" : action == kvmem_store_action::fork ? "fork" : "fresh";
 }
 
 // Bookkeeping for the live host stores: the adapter handle, the accounted host

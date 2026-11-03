@@ -38,10 +38,20 @@ or lane is busy. A request still preparing media is not ready. With an explicit
 `kvmem.conversation_id`, requests serialize in arrival order before preparation,
 so a second turn never reads a half-written first turn. Different IDs can use
 other lanes while that turn waits. Queued references protect host caches from
-LRU eviction without pinning their GPU residency. Without IDs, the existing
+soft byte-cap eviction, but cannot reserve the last count-limited slots or pin
+their GPU residency. Without IDs, the existing
 media-aware prefix and recurrent-checkpoint policy infers cache identity;
 explicit IDs are recommended when overlapping requests belong to one conversation.
 An ID never bypasses prefix/checkpoint validation.
+
+The modern host/SSD tier and multi-conversation path also allow a different
+owner to fork an exact native prefix. Full owner keys and their aliases follow
+the [shared-owner contract](checkpoint-policy.md#shared-owners-across-backends).
+The source catalog entry and sealed allocations remain valid when the child
+rewinds, generates, fails or is released. A live source is captured read-only;
+only the subsequent normal handover moves the lane working set. Old pinned CPU
+arenas do not support these foreign forks; the monitor reports
+`shared_prefix_fork_supported=false` for that configuration.
 
 | Event (P=2, N=3) | Lane 0 | Lane 1 | Parked in RAM |
 |---|---|---|---|
@@ -51,7 +61,8 @@ An ID never bypasses prefix/checkpoint validation.
 | A finishes; queued A2 is ready | C running | A2 running, warm | B |
 
 At N=P, a new conversation recycles an eligible idle store instead of allocating
-an N+1 arena. If all stores are busy or protected by queued requests, it waits.
+an N+1 arena. If all stores are busy or switching, it waits. Queued cache hints
+alone cannot prevent admission; their prefix and media needs are rechecked.
 An invalid request is rejected before any reservation, eviction or KV switch.
 Disconnected waiters release queue/cache references. Completion, disconnect and
 errors release lane reservations and commit a usable prefix or clear a failed
@@ -67,7 +78,8 @@ reserved. Inference and GPU copies execute outside the scheduler mutex.
 2. Invalidate all outgoing target/MTP cell mappings and positions, reset the
    lane's slot allocator and invalidate attention-view epochs. The buffers stay.
 3. Park raw KV, runtime arena, row positions and query accumulators as one
-   uniquely owned bundle. A parked runtime has no lane backend pointer.
+   independently mutable bundle. Its sealed KV and read-only checkpoints may
+   retain references shared with another bundle. A parked runtime has no lane backend pointer.
 4. Bind the incoming bundle to this lane, stage its valid working set and
    restore recurrent/MTP checkpoints through the existing prefill path.
 5. Publish matching metadata only after quiescence. Scheduling reads committed
@@ -96,6 +108,17 @@ cancellation support when live references occupy the ceiling. Native video/audio
 concurrency is outside this multi-lane implementation.
 
 ## Status and validation
+
+Shared-prefix admission keeps the catalog-to-lane mapping one-to-one. A new
+or detached branch can run on the source lane; a slot resident on another lane
+cannot be rebound there. When the legacy total-store limit leaves no room for
+a detached branch, a resident target runs fresh on its own lane. This preserves
+the source when a separate target exists, at the cost of recomputing that request.
+If the only usable target is the request's own source, fresh execution replaces
+that old history. Queued preview pins are hints, not hard count reservations:
+selection replans and rechecks media preparation after reuse is lost. Active or
+switching entries remain protected. Inactive-limit mode can still allocate a
+detached shared branch while another lane is empty.
 
 `/props` reports physical P, effective/requested N, per-store CPU budget, soft
 host byte cap and projector placement. `/slots` always has P entries. Each

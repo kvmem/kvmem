@@ -21,6 +21,9 @@ void KvContent::reset() noexcept {
     versions_.clear();
 }
 void KvContent::revoke_prefixes(uint64_t keep, bool all) noexcept {
+    inherited_.erase(std::remove_if(inherited_.begin(), inherited_.end(), [&](const auto & p) {
+        return all || p->frontier_ > keep;
+    }), inherited_.end());
     prefixes_.erase(std::remove_if(prefixes_.begin(), prefixes_.end(), [&](const auto & weak) {
         auto p = weak.lock();
         if (!p) return true;
@@ -43,7 +46,26 @@ std::shared_ptr<const ContentPrefix> KvContent::prefix(uint64_t end) {
     return p;
 }
 bool KvContent::contains(const std::shared_ptr<const ContentPrefix> & p) const noexcept {
-    return stamp_.valid && p && p->valid_ && p->session_ == stamp_.session && p->frontier_ <= stamp_.frontier;
+    if (!stamp_.valid || !p || p->frontier_ > stamp_.frontier) return false;
+    // Only the owning session reads its mutable revocation flag. A parent may
+    // revoke concurrently with a child validating this inherited proof.
+    if (p->session_ == stamp_.session) return p->valid_;
+    return std::find(inherited_.begin(), inherited_.end(), p) != inherited_.end();
+}
+std::unique_ptr<KvContent> KvContent::fork() const {
+    if (!stamp_.valid || evaluated_ != stamp_.frontier)
+        throw MemoryError(MemoryErrorCode::Pending, "cannot fork unaccepted content");
+    auto result = std::make_unique<KvContent>(block_tokens_);
+    const auto session = result->stamp_.session;
+    result->stamp_ = stamp_; result->stamp_.session = session;
+    result->reserved_ = reserved_; result->evaluated_ = evaluated_;
+    result->versions_ = versions_;
+    result->inherited_ = inherited_;
+    for (const auto & weak : prefixes_) {
+        auto p = weak.lock();
+        if (contains(p)) result->inherited_.push_back(std::move(p));
+    }
+    return result;
 }
 void KvContent::reserve(uint64_t end) {
     if (!stamp_.valid) throw MemoryError(MemoryErrorCode::InvalidSession, "content session invalid");

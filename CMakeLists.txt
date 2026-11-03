@@ -65,6 +65,11 @@ add_executable(kvmem-conversation-store-test tests/conversation-store-test.cpp)
 target_include_directories(kvmem-conversation-store-test PRIVATE tools)
 add_test(NAME kvmem-conversation-store-test COMMAND kvmem-conversation-store-test)
 
+add_executable(kvmem-shared-cache-test tests/shared-cache-test.cpp)
+target_include_directories(kvmem-shared-cache-test PRIVATE tools)
+target_link_libraries(kvmem-shared-cache-test PRIVATE kvmem)
+add_test(NAME kvmem-shared-cache-test COMMAND kvmem-shared-cache-test)
+
 add_executable(kvmem-session-snapshot-test tests/session-snapshot-test.cpp)
 target_include_directories(kvmem-session-snapshot-test PRIVATE tools)
 target_link_libraries(kvmem-session-snapshot-test PRIVATE kvmem)

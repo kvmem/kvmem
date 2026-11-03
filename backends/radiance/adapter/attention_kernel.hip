@@ -1,5 +1,5 @@
-#include "attention_kernel.hpp"
 #include <hip/hip_runtime.h>
+#include "attention_kernel.hpp"
 #include <hip/hip_fp16.h>
 #include <cmath>
 namespace kvmem::radiance {
@@ -14,6 +14,12 @@ __device__ float read_float(const void* data, uint32_t dtype, uint64_t i) {
     const int exponent = (v >> 3) & 15, mantissa = v & 7;
     const float x = exponent ? ldexpf(float(8 + mantissa), exponent - 10) : ldexpf(float(mantissa), -9);
     return v & 128 ? -x : x;
+}
+__device__ float read_key(const AttentionKernelArgs& a, uint64_t base, unsigned channel) {
+    if (a.packing != KvPacking::K6V4) return read_float(a.cache.data, a.cache.dtype, base + channel);
+    const auto* row = static_cast<const uint8_t*>(a.cache.data) + base;
+    const auto* scale = reinterpret_cast<const __half*>(row + a.head_dim * 5 / 4);
+    return float(packed_k6_code(row, a.head_dim, channel)) * __half2float(scale[channel / 32]);
 }
 __global__ void page_lse(AttentionKernelArgs a) {
     const unsigned page = blockIdx.x, head = blockIdx.y, sample = blockIdx.z;
@@ -33,7 +39,7 @@ __global__ void page_lse(AttentionKernelArgs a) {
                 uint64_t(kv_head) * a.cache.stride[1] + (compact % native_block) * a.cache.stride[2];
             for (unsigned channel = lane; channel < a.head_dim; channel += 32)
                 dot += read_float(a.query.data, a.query.dtype, qbase + channel) *
-                       read_float(a.cache.data, a.cache.dtype, kbase + channel);
+                       read_key(a, kbase, channel);
         }
         for (int delta = 16; delta; delta /= 2) dot += __shfl_down(dot, delta, 32);
         if (!lane) {
@@ -88,13 +94,16 @@ __global__ void average_heads(AttentionKernelArgs a) {
 }
 }
 int attention_page_masses(const AttentionKernelArgs& a, RadStream stream) {
+    if (a.packing != KvPacking::Plain && a.packing != KvPacking::Fp8V4 && a.packing != KvPacking::K6V4) return RAD_E_INVAL;
+    if (a.packing != KvPacking::Plain && (a.head_dim % 32 || a.cache.dtype != RAD_F8E4M3)) return RAD_E_INVAL;
+    const auto row_elements = kv_row_elements(a.head_dim, a.packing);
     const auto floating = [](uint32_t t) { return t == RAD_F32 || t == RAD_F16 || t == RAD_BF16; };
     if (!stream || !a.samples || !a.page_count || !a.rows || !a.pages || !a.table || !a.logits || !a.masses ||
         !a.query.data || !a.cache.data || !floating(a.query.dtype) ||
         (!floating(a.cache.dtype) && a.cache.dtype != RAD_F8E4M3) || a.cache.rank != 4 ||
         !a.head_dim || a.cache.shape[1] <= 0 || a.query_heads % a.cache.shape[1] ||
-        a.cache.shape[2] <= 0 || a.cache.shape[3] != 2 * a.head_dim || a.cache.stride[3] != 1 ||
-        a.cache.stride[2] != 2 * a.head_dim || a.query.stride[0] < int64_t(a.query_heads) * a.head_dim)
+        a.cache.shape[2] <= 0 || a.cache.shape[3] != row_elements || a.cache.stride[3] != 1 ||
+        a.cache.stride[2] != row_elements || a.query.stride[0] < int64_t(a.query_heads) * a.head_dim)
         return RAD_E_INVAL;
     const auto s = reinterpret_cast<hipStream_t>(stream);
     hipLaunchKernelGGL(page_lse, dim3(a.page_count, a.query_heads, a.samples), dim3(256), 0, s, a);

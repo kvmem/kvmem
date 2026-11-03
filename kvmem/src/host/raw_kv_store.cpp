@@ -756,6 +756,33 @@ std::unique_ptr<RawKvStore> RawKvStore::fork_mean_prefix(uint32_t token_pos) con
     return fork;
 }
 
+std::unique_ptr<RawKvStore> RawKvStore::fork_prefix(uint32_t token_pos) {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto count = (uint64_t(token_pos) + cfg_.block_tokens - 1) / cfg_.block_tokens;
+    if (count > blocks_.size()) throw std::logic_error("native KV fork exceeds the retained prefix");
+    auto branch = std::make_unique<RawKvStore>(cfg_);
+    branch->blocks_.resize(size_t(count));
+    for (size_t b = 0; b < count; ++b) {
+        auto & target = branch->blocks_[b].layers;
+        target.resize(cfg_.n_layer);
+        for (size_t i = 0; i < target.size(); ++i) {
+            auto & source = blocks_[b].layers.at(i);
+            auto & dest = target[i];
+            source.k_gpu.seal(); source.v_gpu.seal();
+            dest.n_tokens = source.n_tokens;
+            dest.k_gpu_tokens = source.k_gpu_tokens; dest.v_gpu_tokens = source.v_gpu_tokens;
+            dest.mean_tokens = source.mean_tokens;
+            dest.k = source.k; dest.v = source.v; dest.k_sum = source.k_sum;
+            dest.k_gpu_fmt = source.k_gpu_fmt; dest.v_gpu_fmt = source.v_gpu_fmt;
+            dest.k_gpu = source.k_gpu.fork(); dest.v_gpu = source.v_gpu.fork();
+        }
+    }
+    // Counts and partial-tail means must come from the selected checkpoint.
+    // Truncation only changes the branch; its first packed write detaches.
+    branch->truncate_to(token_pos);
+    return branch;
+}
+
 void RawKvStore::snapshot_write(SnapshotWriter & out) {
     std::lock_guard<std::mutex> lk(mu_);
     out.scalar(uint32_t(0x31564b52));

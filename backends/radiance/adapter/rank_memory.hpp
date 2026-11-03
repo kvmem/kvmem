@@ -1,5 +1,7 @@
 #pragma once
 #include "kvmem/memory_contract.hpp"
+#include "storage_work.hpp"
+#include "storage_wait.hpp"
 #include <algorithm>
 #include <limits>
 
@@ -13,6 +15,7 @@ class RankMemory : public MemoryBackend {
         std::vector<std::shared_ptr<MemoryBackend>> ranks;
         MemoryDescriptor descriptor;
         bool pending=false;
+        StorageWaiter* storage=nullptr;
     };
     std::shared_ptr<Shared> state_;
     static void check(bool ok,const char* why) {
@@ -27,7 +30,7 @@ class RankMemory : public MemoryBackend {
             if(!(a.blocks[i].block==b.blocks[i].block) || a.blocks[i].compact_start!=b.blocks[i].compact_start)return false;
         return true;
     }
-    class Transfer final : public MemoryTransfer {
+    class Transfer final : public MemoryTransfer, public StorageWaiter {
         std::shared_ptr<Shared> owner_;
         std::vector<std::unique_ptr<MemoryTransfer>> children_;
         WorkingSetPlan plan_;
@@ -36,10 +39,16 @@ class RankMemory : public MemoryBackend {
         size_t published_=0;
         bool publishing_started_=false;
         std::vector<bool> complete_;
+        std::vector<StorageWaiter*> storage_;
+        std::exception_ptr storage_error_;
     public:
         Transfer(std::shared_ptr<Shared> state,WorkingSetPlan plan,
                  std::vector<std::unique_ptr<MemoryTransfer>> children)
-            :owner_(std::move(state)),children_(std::move(children)),plan_(std::move(plan)),complete_(children_.size(),false) {owner_->pending=true;}
+            :owner_(std::move(state)),children_(std::move(children)),plan_(std::move(plan)),complete_(children_.size(),false) {
+            storage_.reserve(children_.size());
+            for(const auto& child:children_)storage_.push_back(dynamic_cast<StorageWaiter*>(child.get()));
+            owner_->pending=true;owner_->storage=this;
+        }
         ~Transfer() override {(void)abort();}
         void start_spill() override {
             check(phase_==Phase::Prepared,"rank spill phase order");phase_=Phase::Spilling;
@@ -49,10 +58,25 @@ class RankMemory : public MemoryBackend {
             check(phase_==Phase::Spilling || phase_==Phase::Spilled || phase_==Phase::Restoring || phase_==Phase::Ready,
                   "rank poll phase order");
             if(phase_==Phase::Spilled || phase_==Phase::Ready)return {TransferStatus::Complete,{}};
+            if(storage_error_) {
+                if(!storage_quiescent())return {TransferStatus::Pending,{}};
+                std::rethrow_exception(storage_error_);
+            }
             bool complete=true;
             for(size_t i=0;i<children_.size();++i) {
                 if(complete_[i])continue;
-                const auto result=children_[i]->poll();
+                TransferPoll result;
+                try { result=children_[i]->poll(); }
+                catch(const StorageFailure&) { storage_error_=std::current_exception(); }
+                catch(const MemoryError& error) {
+                    if(error.code()!=MemoryErrorCode::BudgetExceeded)throw;
+                    storage_error_=std::current_exception();
+                }
+                if(storage_error_) {
+                    cancel_queued_storage();
+                    if(!storage_quiescent())return {TransferStatus::Pending,{}};
+                    std::rethrow_exception(storage_error_);
+                }
                 if(result.status==TransferStatus::Failed)return result;
                 complete_[i]=result.status==TransferStatus::Complete;
                 complete=complete && result.status==TransferStatus::Complete;
@@ -75,8 +99,25 @@ class RankMemory : public MemoryBackend {
             // a mixture of old and new views is never eligible for execution.
             publishing_started_=true;
             for(auto& child:children_){child->publish(view);++published_;}
-            phase_=Phase::Published;owner_->pending=false;
+            phase_=Phase::Published;owner_->pending=false;owner_->storage=nullptr;
         }
+        bool awaiting_storage() const noexcept override {
+            for(const auto* child:storage_)if(child && child->awaiting_storage())return true;
+            return false;
+        }
+        bool cpu_io_pending() const noexcept override {
+            for(const auto* child:storage_)if(child && child->cpu_io_pending())return true;
+            return false;
+        }
+        bool storage_quiescent() override {
+            bool ready=true;
+            for(auto* child:storage_)if(child && !child->storage_quiescent())ready=false;
+            return ready;
+        }
+        void cancel_queued_storage() noexcept override {
+            for(auto* child:storage_)if(child)child->cancel_queued_storage();
+        }
+        std::exception_ptr storage_error() const noexcept override {return storage_error_;}
         AbortResult abort() noexcept override {
             if(phase_==Phase::Published || phase_==Phase::Aborted) {
                 for(const auto& child:owner_->ranks)if(!child->stamp().valid)return AbortResult::SessionInvalidated;
@@ -85,7 +126,7 @@ class RankMemory : public MemoryBackend {
             bool valid=!publishing_started_;
             for(auto& child:children_)if(child->abort()!=AbortResult::PreviousViewPreserved)valid=false;
             if(!valid)for(auto& child:owner_->ranks)child->invalidate();
-            phase_=Phase::Aborted;owner_->pending=false;
+            phase_=Phase::Aborted;owner_->pending=false;owner_->storage=nullptr;
             return valid ? AbortResult::PreviousViewPreserved : AbortResult::SessionInvalidated;
         }
     };
@@ -129,6 +170,11 @@ public:
         // validates actual ownership when the caller rebinds/executes it.
         d.validate();check(stamp().valid,"rank memory stamps differ or are invalid");
     }
+    bool awaiting_storage() const noexcept {return state_->storage && state_->storage->awaiting_storage();}
+    bool cpu_io_pending() const noexcept {return state_->storage && state_->storage->cpu_io_pending();}
+    bool storage_quiescent() const {return !state_->storage || state_->storage->storage_quiescent();}
+    void cancel_queued_storage() noexcept {if(state_->storage)state_->storage->cancel_queued_storage();}
+    std::exception_ptr storage_error() const noexcept {return state_->storage ? state_->storage->storage_error() : std::exception_ptr{};}
     MemoryDescriptor descriptor() const override {return state_->descriptor;}
     MemoryStamp stamp() const noexcept override {
         auto out=state_->ranks[0]->stamp();

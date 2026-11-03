@@ -235,9 +235,11 @@ void llama_driver_clear(LlamaEngineState & st);
 void llama_driver_conversation_buffers(kvmem_conversation & conv, std::vector<kvmem::SnapshotBuffer> & buffers) {
     std::set<const MultimodalCheckpointData *> unique;
     auto checkpoint = [&](const std::shared_ptr<const MultimodalCheckpointData> & p) {
-        if (!p || !unique.insert(p.get()).second) return;
+        if (!p || !unique.insert(p.get()).second || p->shared.load()) return;
         // Created mutable by multimodal_checkpoint(). Live/rollback aliases
-        // were cleared after parking. Only this conversation owns references.
+        // were cleared after parking. Shared checkpoints stay charged in RAM
+        // (or retain their existing cold extent) until their last owner drops
+        // them; a per-session manifest cannot clear another owner's vectors.
         auto & data = *const_cast<MultimodalCheckpointData *>(p.get());
         auto add = [&](auto & vector) {
             if (!vector.capacity()) return;
@@ -844,10 +846,11 @@ static void checkpoint_tier(LlamaEngineState & st, bool drain, bool force) {
         for (const auto & e : st.mm_archive) owned |= e.info.identity == job.source.get() &&
             llama_kvmem_tail_mean_valid(e.record.row, e.record.data->tail_mean);
         if (job.ticket.status() == kvmem::StorageTaskStatus::Complete && owned &&
-                !checkpoint_execution_held(st, job.source.get())) {
+                !checkpoint_execution_held(st, job.source.get()) && !job.source->shared.load()) {
             auto & data = *const_cast<MultimodalCheckpointData *>(job.source.get());
             data.cold_recurrent = data.recurrent.size(); data.cold_carry = data.draft_carry.size();
             data.cold = std::move(job.destination);
+            data.cold_identity = 0;
             if (data.accounting) data.accounting->live_bytes -= data.cold_recurrent + data.cold_carry;
             std::vector<uint8_t>().swap(data.recurrent); std::vector<uint8_t>().swap(data.draft_carry);
             kvmem_diag("KVMEM_CHECKPOINT_TIER write_bytes=%zu cold=1\n", data.cold_recurrent + data.cold_carry);
@@ -862,7 +865,7 @@ static void checkpoint_tier(LlamaEngineState & st, bool drain, bool force) {
     const kvmem::CheckpointArchive<MultimodalCheckpoint>::Entry * victim = nullptr;
     for (const auto & e : st.mm_archive) if (e.info.identity && !e.record.data->cold) {
         hot.insert(e.record.data.get());
-        if (!checkpoint_execution_held(st, e.record.data.get()) && (!victim || e.info.used < victim->info.used)) victim = &e;
+        if (!e.record.data->shared.load() && !checkpoint_execution_held(st, e.record.data.get()) && (!victim || e.info.used < victim->info.used)) victim = &e;
     }
     if (!victim || (!force && hot.size() <= st.mm_archive.policy().hot_count)) return;
     const auto source = victim->record.data;
@@ -924,18 +927,48 @@ struct CheckpointHostReservation {
     }
 };
 
-static void checkpoint_materialize(LlamaEngineState & st, const std::shared_ptr<const MultimodalCheckpointData> & saved) {
-    if (!saved->cold) return;
-    auto & data = *const_cast<MultimodalCheckpointData *>(saved.get());
-    const auto bytes = data.cold_recurrent + data.cold_carry;
-    checkpoint_make_room(st, bytes, false, data.accounting);
-    CheckpointHostReservation reservation(data.accounting,bytes,st.mm_archive.policy().host_bytes);
-    std::vector<uint8_t> recurrent(data.cold_recurrent), carry(data.cold_carry);
-    kvmem::read_checkpoint_image(data.cold, uint64_t(reinterpret_cast<uintptr_t>(saved.get())),
+template<class Source> static kvmem_conversation fork_conversation(const Source& source, int keep) {
+    const MultimodalCheckpoint * selected = nullptr;
+    for (const auto& cp : source.mm_checkpoints) if (cp.row == keep) selected = &cp;
+    for (const auto& entry : source.mm_archive) if (entry.info.identity && entry.record.row == keep) selected = &entry.record;
+    if (!selected || !selected->data) throw std::runtime_error("native fork checkpoint disappeared");
+    selected->data->shared.store(true);
+    kvmem_conversation result;
+    result.cached_tokens = source.cached_tokens; result.cached_prompt = source.cached_prompt;
+    result.history_input_prompt = source.history_input_prompt; result.history_points = source.history_points;
+    auto cp = *selected;
+    result.mm_checkpoints.remember(cp);
+    result.mm_archive.remember(cp, kvmem::CoveragePurpose::Input);
+    result.mm_live_row = keep; result.last_n_gen = source.last_n_gen;
+    return result;
+}
+kvmem_conversation llama_driver_fork_conversation(const kvmem_conversation& source, int keep) { return fork_conversation(source, keep); }
+kvmem_conversation llama_driver_fork_conversation(const LlamaEngineState& source, int keep) { return fork_conversation(source, keep); }
+
+std::shared_ptr<const MultimodalCheckpointData> llama_driver_materialize_checkpoint(
+        LlamaEngineState & st, const std::shared_ptr<const MultimodalCheckpointData> & saved) {
+    if (!saved->cold) return saved;
+    const auto bytes = saved->cold_recurrent + saved->cold_carry;
+    const bool shared = saved->shared.load();
+    const auto charge = bytes + (shared ? saved->resident_bytes() : 0);
+    checkpoint_make_room(st, charge, false, saved->accounting);
+    CheckpointHostReservation reservation(saved->accounting,charge,st.mm_archive.policy().host_bytes);
+    std::shared_ptr<MultimodalCheckpointData> copy;
+    if (shared) {
+        copy = std::make_shared<MultimodalCheckpointData>();
+        copy->tail_mean = saved->tail_mean;
+        // Assign accounting only after successful publication. On any failed
+        // allocation/read the reservation alone releases the temporary charge.
+    }
+    std::vector<uint8_t> recurrent(saved->cold_recurrent), carry(saved->cold_carry);
+    kvmem::read_checkpoint_image(saved->cold, saved->cold_identity ? saved->cold_identity : uint64_t(reinterpret_cast<uintptr_t>(saved.get())),
         {{recurrent.data(), recurrent.size()}, {carry.data(), carry.size()}});
+    auto & data = shared ? *copy : *const_cast<MultimodalCheckpointData *>(saved.get());
     data.recurrent.swap(recurrent); data.draft_carry.swap(carry); data.cold.reset();
-    reservation.publish(bytes);
+    reservation.publish(shared ? copy->resident_bytes() : bytes);
+    if (shared) copy->accounting = saved->accounting;
     kvmem_diag("KVMEM_CHECKPOINT_TIER read_bytes=%zu cold=0\n", bytes);
+    return shared ? std::shared_ptr<const MultimodalCheckpointData>(std::move(copy)) : saved;
 }
 
 static MultimodalCheckpoint multimodal_checkpoint(LlamaEngineState & st, int row, bool optional = false) {
@@ -1006,7 +1039,7 @@ static void multimodal_restore(LlamaEngineState & st, const MultimodalCheckpoint
     if (!checkpoint.data) throw std::runtime_error("missing multimodal checkpoint data");
     if (!llama_kvmem_tail_mean_valid(checkpoint.row, checkpoint.data->tail_mean))
         throw std::runtime_error("stale or foreign mean-K/recurrent checkpoint");
-    checkpoint_materialize(st, checkpoint.data);
+    const auto restore_data = live ? checkpoint.data : llama_driver_materialize_checkpoint(st, checkpoint.data);
     if (live) ++st.mm_perf.restore_skips;
     else ++st.mm_perf.restores;
     llama_synchronize(st.ctx);
@@ -1014,7 +1047,7 @@ static void multimodal_restore(LlamaEngineState & st, const MultimodalCheckpoint
     llama_kvmem_decode_mean_flush();
     llama_kvmem_decode_mean_discard();
     const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    const auto & data = checkpoint.data->recurrent;
+    const auto & data = restore_data->recurrent;
     if (!live && llama_state_seq_set_data_ext(st.ctx, data.data(), data.size(), 0, flags) != data.size()) {
         throw std::runtime_error("multimodal recurrent restore failed");
     }
@@ -1026,7 +1059,7 @@ static void multimodal_restore(LlamaEngineState & st, const MultimodalCheckpoint
     }
     if (st.spec.ok && !live) {
         kvmem_scoped_ms carry_timer(st.mm_perf.carry_ms);
-        common_speculative_set_state(st.spec.spec, 0, checkpoint.data->draft_carry);
+        common_speculative_set_state(st.spec.spec, 0, restore_data->draft_carry);
     }
     if (truncate) {
         llama_kvmem_truncate_cached(checkpoint.row);
@@ -1038,7 +1071,7 @@ static void multimodal_restore(LlamaEngineState & st, const MultimodalCheckpoint
     st.mm_archive.truncate(checkpoint.row);
     st.mm_archive.touch(checkpoint.data.get());
     st.mm_live_row = checkpoint.row;
-    st.mm_live_checkpoint = checkpoint.data;
+    st.mm_live_checkpoint = restore_data;
     if (restore_history) llama_kvmem_restore_history(checkpoint.data->tail_mean.history);
 }
 
@@ -1218,7 +1251,7 @@ static bool run_prefill_multimodal(LlamaEngineState & st, kvmem::RequestControl 
             if (archived && (!checkpoint || archived->row > checkpoint->row)) checkpoint = archived;
             while (checkpoint) {
                 base = *checkpoint;
-                try { checkpoint_materialize(st, base.data); found = true; break; }
+                try { base.data = llama_driver_materialize_checkpoint(st, base.data); found = true; break; }
                 catch (const std::exception & error) {
                     kvmem_diag("KVMEM_CHECKPOINT_READ_FALLBACK row=%d reason=%s\n", base.row, error.what());
                     const int earlier = base.row-1;

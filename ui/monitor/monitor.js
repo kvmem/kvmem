@@ -59,7 +59,7 @@
   }
   function meanSpeed(row) { return row?.decode_tps_mean ?? row?.decode_tps; }
   function prefillMetrics(snapshot, row, active) {
-    const live = snapshot?.backend === 'ninfer' && active && row?.status === 'reading';
+    const live = ['ninfer','radiance'].includes(snapshot?.backend) && active && row?.status === 'reading';
     if (!live) return {live: false, rate: row?.prefill_tps, ms: row?.prefill_ms,
       tokens: row?.prompt_new_tokens ?? (number(row?.prompt_tokens) && number(row?.cached_tokens)
         ? Math.max(0, row.prompt_tokens - row.cached_tokens) : null)};
@@ -306,6 +306,9 @@
       t("入口：{0}\n输入 {1} tokens · 复用 {2} · 输出 {3}\n预填充 {4} tok/s · 输入复用率 {5}%\n输出上限 {6} · 耗时 {7} 秒", row.endpoint, fmt(row.prompt_tokens), fmt(row.cached_tokens), fmt(row.generated_tokens), fmt(prefill.rate, 1), fmt(ratio(row.cached_tokens, row.prompt_tokens), 1), fmt(row.limit), fmt(row.elapsed_ms / 1000, 2)) + "\n" +
       prefillTimes(prefill, row);
     const lines = [];
+    if (typeof row.cache_source === 'string' && row.cache_source) lines.push((i18n.language === 'en' ? 'Cache source' : '缓存来源') + `: ${row.cache_source}`);
+    if (number(row.planned_cached_tokens)) lines.push((i18n.language === 'en' ? 'Planned reuse' : '计划复用') + `: ${fmt(row.planned_cached_tokens)} tokens`);
+    if (number(row.actual_cached_tokens)) lines.push((i18n.language === 'en' ? 'Actual reuse' : '实际复用') + `: ${fmt(row.actual_cached_tokens)} tokens`);
     if (number(row.decode_ms)) lines.push(t("解码耗时 {0}s", fmt(row.decode_ms / 1000, 2)));
     if (number(row.drafts_offered) && number(row.drafts_accepted))
       lines.push(t("推测解码：提议 {0} / 接受 {1} · 接受率 {2}%", fmt(row.drafts_offered), fmt(row.drafts_accepted), fmt(ratio(row.drafts_accepted, row.drafts_offered), 1)));
@@ -438,7 +441,8 @@
       ? list.reduce((n, x) => n + x[field], 0)
       : null;
   function cacheData() {
-    if (state.backend === "polystrata" || state.backend === "radiance") return state.kvmem || {};
+    if (state.backend === "polystrata" || state.backend === "radiance" ||
+        (state.backend === "llamacpp" && Object.hasOwn(state.kvmem || {}, "physical_payload_bytes"))) return state.kvmem || {};
     if (state.backend === "ninfer")
       return stats?.kvmem || props.kvmem?.usage || {};
     const storage = slots.map((s) => s.kvmem?.storage).filter(Boolean),
@@ -479,6 +483,17 @@
     }
   }
   const metricLabels = {
+    logical_payload_bytes:['KV 逻辑引用大小','Logical KV references'],
+    physical_payload_bytes:['RAM/SSD 物理计费','Physical RAM/SSD charge'],
+    sharing_credit_bytes:['KV 共享节省下界','KV sharing savings lower bound'],
+    shared_forks:['跨会话缓存分叉','Shared prefix forks'],
+    logical_state_bytes:['循环状态逻辑引用','Logical recurrent-state references'],
+    physical_state_bytes:['循环状态物理占用','Physical recurrent state'],
+    physical_checkpoint_bytes:['检查点及检索元数据物理占用','Physical checkpoint and retrieval metadata'],
+    state_sharing_credit_bytes:['循环状态共享节省','Recurrent-state sharing savings'],
+    state_references:['循环状态引用数','Recurrent-state references'],
+    payload_references:['KV 引用数','KV references'],
+    unique_payload_records:['KV 唯一记录数','Unique KV records'],
     active_sessions:['活动会话','Active sessions'], retained_sessions_limit:['保留会话上限','Retained session limit'],
     history_misses:['历史未命中','History misses'], history_swaps:['历史交换','History swaps'],
     history_restored_bytes:['历史恢复量','History restored'], history_spilled_bytes:['历史转存量','History spilled'],
@@ -492,8 +507,13 @@
     retained_payload_budget_bytes:['保留数据预算','Retained payload budget'], evaluated_tokens:['已计算 tokens','Evaluated tokens'],
     selected_tokens:['驻留 token 预算','Resident token budget'], reserve_tokens:['生成预留 tokens','Generation reserve tokens'],
     host_payload_bytes:['RAM 数据占用','RAM payload'], host_payload_budget_bytes:['RAM 数据预算','RAM payload budget'],
+    retained_logical_bytes:['保留缓存逻辑大小','Retained logical bytes'],
+    shared_payload_credit_bytes:['共享记录去重节省','Shared payload credit'],
+    accounted_cache_bytes:['缓存去重计费大小','Accounted cache bytes'],
     disk_payload_bytes:['SSD 数据占用','SSD payload'], disk_payload_budget_bytes:['SSD 数据预算','SSD payload budget'],
     retained_sessions:['保留会话','Retained sessions'], history_hits:['历史命中','History hits'], history_evictions:['历史淘汰','History evictions'],
+    own_history_hits:['自身历史命中','Own history hits'],shared_history_hits:['共享历史命中','Shared history hits'],
+    planned_history_hits:['计划历史命中','Planned history hits'],planned_reuse_tokens:['计划复用 tokens','Planned reused tokens'],actual_reuse_tokens:['实际复用 tokens','Actual reused tokens'],
     max_context:['逻辑上下文上限','Context limit'], max_concurrency:['并发上限','Concurrency limit'],
     max_pending_requests:['排队上限','Pending request limit'], max_admitted_requests:['接纳上限','Admission limit'],
     kv_capacity_pages:['KV 容量页数','KV capacity pages'], kv_capacity_tokens:['KV 容量 tokens','KV capacity tokens'], kv_page_tokens:['每页 tokens','Tokens per page'],
@@ -541,10 +561,27 @@
   }
   // Render only the selected native metric groups, never prompts or responses.
   // Keep the details elements stable so polling does not collapse open sections.
+  function radianceMetricGroups(stats, engine) {
+    const groups = [];
+    const pick = keys => Object.fromEntries(keys.filter(k => stats?.[k] !== undefined).map(k => [k,stats[k]]));
+    if (stats) {
+      groups.push({id:'scheduler',label:'Radiance · 调度器',value:pick(['running','waiting','preempted','in_flight','queue_cap','total_requests','steps','steps_prefill','steps_decode','steps_mixed','preemptions'])});
+      groups.push({id:'memory',label:'Radiance · KV 池',value:{
+        kv_used_bytes:stats.kv_bytes_used,kv_capacity_bytes:stats.kv_bytes_total,kv_carved_bytes:stats.kv_bytes_carved,
+        kv_tokens_used:stats.kv_tokens_used,kv_tokens_total:stats.kv_tokens_total,kv_util:stats.kv_util}});
+      groups.push({id:'speculation',label:'Radiance · 草稿验证',value:pick(['draft_accept','draft_positions'])});
+      // Native prefix-cache counters are intentionally excluded: KVMem owns reuse.
+      // /stats throughput is global and never substitutes for a request's speed.
+      groups.push({id:'throughput_tokens_per_second',label:'Radiance · 引擎区间吞吐',value:pick(['prefill_tps','decode_tps'])});
+    }
+    if (engine) groups.push({id:'kv_allocation',label:'Radiance · KV 分配与放置',value:{kv_groups:engine.kv_groups,
+      embedding_placement:engine.embedding_placement,placement:engine.placement,speculation:engine.speculation}});
+    return groups;
+  }
   function renderNativeMetrics() {
     const root = $('[data-backend-sections]');
     if (!root) return;
-    const groups = [];
+    const groups = state.backend === 'radiance' ? radianceMetricGroups(stats,props.radiance_engine) : [];
     if (state.backend === 'ninfer' && stats) {
       for (const [key, label] of [
         ['requests','请求状态'], ['queue','等待队列'], ['capacity','引擎容量'], ['occupancy','引擎驻留'],
@@ -599,6 +636,11 @@
     const fragment=document.createDocumentFragment();
     for (const name of [
       'disk_read_bytes','disk_written_bytes','disk_reads','disk_hits','disk_writes','disk_errors',
+      'logical_payload_bytes','physical_payload_bytes','sharing_credit_bytes','shared_forks',
+      'retained_logical_bytes','shared_payload_credit_bytes','accounted_cache_bytes',
+      'own_history_hits','shared_history_hits','planned_history_hits','planned_reuse_tokens','actual_reuse_tokens',
+      'logical_state_bytes','physical_state_bytes','physical_checkpoint_bytes','state_sharing_credit_bytes','state_references',
+      'payload_references','unique_payload_records',
       'history_misses','history_swaps','history_restored_bytes','history_spilled_bytes',
       'active_sessions','retained_sessions_limit','active_payload_reservation_bytes','retained_payload_budget_bytes',
       'checkpoint_bytes','checkpoint_tokens','resident_pages','mtp_resident_pages','evaluated_tokens',
@@ -622,7 +664,7 @@
     const service = !consoleRuntime || (consoleRuntime.state === 'ready' &&
       runtimePropsInstance === consoleRuntime.instance && state?.backend === backend) ? props || {} : {};
     const plan = running ? consoleRuntime.token_settings || {} : {};
-    const scoring = running ? consoleRuntime.effective_scoring || {} : {};
+    const scoring = service.kvmem?.scoring || (running ? consoleRuntime.effective_scoring || {} : {});
     const k = service.kvmem || {}, caps = k.capabilities || {}, spec = service.speculative || {};
     const generation = service.default_generation_settings || {}, defaults = service.effective_settings?.effective || {};
     const present = value => value !== undefined && value !== null && value !== '' &&
@@ -669,7 +711,8 @@
     token('primary','Reserve',['生成预留 R','Generation reserve R'],k.reserve_tokens);
     row('primary','KvType',['KV 缓存格式','KV cache format'],kvPair(k.kv_type,k.kv_type),
       kvPair(first(config.KvTypeK,config.KvType),first(config.KvTypeV,config.KvType)),{format:kvFormat});
-    token('primary','Prefill',['预填充块大小','Prefill chunk'],undefined);
+    token('primary','Prefill',['预填充块大小','Prefill chunk'],k.prefill_tokens);
+    row('primary','StateCacheType',['递归状态格式','Recurrent state format'],k.state_cache_type,config.StateCacheType,{optional:true});
     const reportedAlgorithm = first(spec.algorithm,typeof k.mtp === 'boolean' ? k.mtp ? 'mtp' : 'none' : undefined);
     const requestedAlgorithm = first(config.SpeculativeMode,typeof config.MtpEnabled === 'boolean' ? config.MtpEnabled ? 'mtp' : 'none' : undefined);
     row('primary','SpeculativeMode',['推测解码','Speculative decoding'],reportedAlgorithm,requestedAlgorithm,{format:algorithm});
@@ -749,6 +792,7 @@
       row('generation',key,labels,first(defaults[key],generation.params?.[key]),undefined,{optional:true});
 
     const compactLabels = {
+      StateCacheType:['状态格式','State format'],
       Context:['上下文','Context'],Budget:['历史 KV','History KV'],Reserve:['预留','Reserve'],KvType:['KV','KV'],
       Prefill:['Prefill','Prefill'],SpeculativeMode:['推测','Speculation'],Concurrency:['并发','Concurrency'],MaxTokens:['输出','Output'],
     };
@@ -767,7 +811,8 @@
       for (const item of items) {
         const cell = document.createElement('div');cell.className='s-runtime-item';cell.dataset.runtimeKey=item.id;cell.dataset.source=item.source;
         if (item.differs) cell.dataset.differs='true';
-        const dt = document.createElement('dt');dt.textContent=compact?tr(...compactLabels[item.id]):item.label;
+        const dt = document.createElement('dt');
+        dt.textContent=compact && compactLabels[item.id] ? tr(...compactLabels[item.id]) : item.label;
         const dd = document.createElement('dd'), value = document.createElement('span');
         value.className='s-runtime-value';value.textContent=compact
           ? item.source==='unknown'?'—':item.value.replace(/ tokens$/,'') : item.value;
@@ -863,14 +908,14 @@
     const requestSpeed = requestLiveSpeed(state, r, liveRequest);
     const realtimeSpeed = state.backend === "ninfer"
       ? requestSpeed ?? ninferLiveSpeed(state, r, liveRequest, nativeThroughput)
-      : state.backend === "llamacpp" ? requestLiveSpeed(state, r, liveRequest)
+      : ["llamacpp","radiance"].includes(state.backend) ? requestLiveSpeed(state, r, liveRequest)
       : liveRequest && state.backend === "polystrata" ? r?.decode_tps : null;
     text("decode", fmt(realtimeSpeed, 1));
     text("decode-label", state.backend === "ninfer" && requestSpeed !== null
       ? t("实时 · {0}s", fmt(r.decode_tps_window_ms / 1000, 0))
       : state.backend === "ninfer" && nativeThroughput
       ? t("实时 · {0}s", fmt(nativeThroughput.seconds, nativeThroughput.seconds < 1 ? 2 : 0))
-      : state.backend === "llamacpp" && number(r?.decode_tps_window_ms)
+      : ["llamacpp","radiance"].includes(state.backend) && number(r?.decode_tps_window_ms)
         ? t("实时 · {0}s", fmt(r.decode_tps_window_ms / 1000, 1)) : t("实时速度"));
     $("[data-live-speed]").title = state.backend === "ninfer" && requestSpeed === null
       ? t("引擎区间吞吐，包含同期所有请求；本轮平均仅统计所选请求。") : "";
@@ -1045,7 +1090,7 @@
       )
         throw new Error(t("不兼容的监控数据"));
       const runtime =
-        snapshot.backend === "ninfer"
+        ["ninfer","radiance"].includes(snapshot.backend)
           ? await get("../stats", controller.signal)
           : null;
       if (snapshot.backend === "ninfer") {
@@ -1074,6 +1119,10 @@
       currentInstance = snapshot.server_instance;
       snapshot.system_hardware = systemHardware?.schema_version === 1 && systemHardware.scope === "system"
         ? systemHardware : systemHardware === null ? null : {sampled_at_ms:null};
+      for (const row of [...snapshot.active, ...snapshot.recent]) {
+        if (number(row.actual_cached_tokens)) row.cached_tokens = row.actual_cached_tokens;
+        else if (String(row.reuse_accounting_scope || '').startsWith('admission_quote')) row.cached_tokens = null;
+      }
       state = snapshot;
       props = configuration;
       slots = lanes || [];

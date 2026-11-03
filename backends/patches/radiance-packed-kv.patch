@@ -1,0 +1,3555 @@
+diff --git a/abi/rad_abi.h b/abi/rad_abi.h
+--- a/abi/rad_abi.h
++++ b/abi/rad_abi.h
+@@ -19,7 +19,7 @@
+  * name, with both versions printed. An OPTIONAL export added beside the existing ones
+  * (rad_plugin_reference, say) is not a change of shape: a plugin without it is read as answering
+  * the default. */
+-#define RAD_ABI_VERSION 15u
++#define RAD_ABI_VERSION 1263927297u /* KVMem packed-KV extension v1, based on ABI15 */
+ 
+ /* ================================================================== plugin identity */
+ /* RAD_PLUGIN_QUANT is a quantiser plugin: rad_quant.h is its whole contract. */
+diff --git a/abi/rad_builder.h b/abi/rad_builder.h
+--- a/abi/rad_builder.h
++++ b/abi/rad_builder.h
+@@ -58,6 +58,11 @@
+ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* dflt);
+ 
+ /* ================================================================== build context */
++/* Packed row layouts match upstream 203064b, groups of 32 with f16 scales.
++ * V4: K[HD] E4M3, V[HD/2] int4, V scales[HD/16].
++ * K6V4: K low[HD/2], K high[HD/4], V[HD/2], K scales[HD/16], V scales[HD/16]. */
++enum { RAD_KVQ_NONE = 0, RAD_KVQ_V4 = 1, RAD_KVQ_K6V4 = 2 };
++
+ typedef struct RadBuildCtx {
+     int      rank;            /* declare runs once per rank; the plugin declares dimensions */
+     int      world_size;      /* ALREADY DIVIDED -- the core inserts no collectives (spec §9) */
+@@ -144,6 +149,8 @@
+      *
+      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+     int64_t  max_audio_frames;
++    int kv_quant;          /* RAD_KVQ_*, zero retains the original cache */
++    uint32_t state_dtype;  /* zero/F32 retain f32; F16 is opt-in */
+ } RadBuildCtx;
+ 
+ /* ================================================================== weights */
+@@ -666,6 +673,8 @@
+      * number of its merge), when it declares one: the engine sizes the audio pass with it
+      * (RadBuildCtx::max_audio_frames). 0 is no audio. */
+     int64_t audio_frames;
++    int32_t kv_quant_ok; /* bit 1 << RAD_KVQ_* */
++    int32_t state_f16_ok;
+ } RadArchProbe;
+ 
+ int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
+diff --git a/arch/qwen35_fp8/qwen35_fp8.cpp b/arch/qwen35_fp8/qwen35_fp8.cpp
+--- a/arch/qwen35_fp8/qwen35_fp8.cpp
++++ b/arch/qwen35_fp8/qwen35_fp8.cpp
+@@ -718,11 +718,13 @@
+     fd.kind      = RAD_KV_FULL;
+     fd.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
+     fd.n_head_kv = g.n_head_kv;
+-    fd.head_dim  = g.head_dim;
++    const int row16 = ctx->kv_quant == RAD_KVQ_V4 ? 25 : ctx->kv_quant == RAD_KVQ_K6V4 ? 22 : 32;
++    fd.head_dim  = g.head_dim * row16 / 32;
+     m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
+     /* The op parameter has to be the SAME SPELLING the rows band on, and the rows band on
+      * rad_dtype_name's, so it is taken from there rather than written out twice. */
+-    g.kv_dtype = rad_dtype_name(fd.dtype);
++    g.kv_dtype = ctx->kv_quant == RAD_KVQ_V4 ? "fp8_v4" :
++                 ctx->kv_quant == RAD_KVQ_K6V4 ? "k6_v4" : rad_dtype_name(fd.dtype);
+ 
+     /* THE SSM STATE CACHE IS f32.
+      *
+@@ -741,7 +743,7 @@
+      * does that without being asked to. */
+     RadKVGroupDecl sd{};
+     sd.kind         = RAD_KV_LINEAR;
+-    sd.dtype        = RAD_F32;
++    sd.dtype        = ctx->state_dtype == RAD_F16 ? RAD_F16 : RAD_F32;
+     sd.n_head_kv    = gc.n_head_v;
+     sd.state_dim[0] = gc.head_v;
+     sd.state_dim[1] = gc.head_k;
+@@ -1465,6 +1467,18 @@
+  * this model can" on a model that cannot. */
+ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+     if (!meta || !out) return RAD_E_INVAL;
++    /* --kv-cache-dtype fp8_v4 / k6_v4: libr4d's rows for them are the h256/gqa6 attention
++     * family's (Qwen3.8-27B), so other geometries are refused at startup rather than in declare. */
++    {
++        const long long hd  = meta->head_dim ? meta->head_dim
++                                             : (meta->n_head ? meta->n_embd / meta->n_head : 0);
++        const long long nkv = meta->n_head_kv ? meta->n_head_kv : meta->n_head;
++        if (hd == 256 && nkv > 0 && meta->n_head == 6 * nkv)
++            out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
++    }
++    /* The delta-net state cache is declared at RadBuildCtx::state_dtype. */
++    out->state_f16_ok = 1;
++
+     const char* da = rad_meta_gets(meta, "draft.architectures", "");
+     if (da && std::strstr(da, "DFlash2")) {
+         const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 8);
+diff --git a/core/config.cpp b/core/config.cpp
+--- a/core/config.cpp
++++ b/core/config.cpp
+@@ -451,11 +451,20 @@
+                                                { if (!(v = need(i))) return RAD_E_INVAL; c->gpu_headroom_mib = atoll(v); }
+         else if (S("--kv-cache-dtype")) {
+             if (!(v = need(i))) return RAD_E_INVAL;
+-            if (std::strcmp(v, "bf16") && std::strcmp(v, "fp8")) {
+-                RAD_ERR("--kv-cache-dtype takes bf16 or fp8, not '%s'", v);
++            if (std::strcmp(v, "bf16") && std::strcmp(v, "fp8") &&
++                std::strcmp(v, "fp8_v4") && std::strcmp(v, "k6_v4")) {
++                RAD_ERR("--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not '%s'", v);
+                 return RAD_E_INVAL;
+             }
+             c->kv_cache_dtype = v;
++        }
++        else if (S("--state-cache-dtype")) {
++            if (!(v = need(i))) return RAD_E_INVAL;
++            if (std::strcmp(v, "f32") && std::strcmp(v, "f16")) {
++                RAD_ERR("--state-cache-dtype takes f32 or f16, not '%s'", v);
++                return RAD_E_INVAL;
++            }
++            c->state_cache_dtype = v;
+         }
+         else if (S("--host-pool-mib"))         { if (!(v = need(i))) return RAD_E_INVAL; c->host_pool_mib = atoll(v); }
+         else if (S("--embedding-placement") || S("--ngram-placement")) {
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -890,7 +890,10 @@
+     /* One answer to "is the cache fp8", for every architecture. The engine always states it;
+      * RAD_DT_INVALID stays meaningful in the ABI for an out-of-tree caller that leaves the field
+      * zero, and means the plugin's own default. */
+-    bc.kv_dtype = cfg_.kv_cache_dtype == "fp8" ? RAD_F8E4M3 : RAD_BF16;
++    bc.kv_dtype = cfg_.kv_cache_dtype == "bf16" ? RAD_BF16 : RAD_F8E4M3;
++    bc.kv_quant = cfg_.kv_cache_dtype == "fp8_v4" ? RAD_KVQ_V4 :
++                  cfg_.kv_cache_dtype == "k6_v4" ? RAD_KVQ_K6V4 : RAD_KVQ_NONE;
++    bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : RAD_F32;
+     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
+     bc.scope      = "";
+     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
+@@ -937,6 +940,18 @@
+         cfg_.n_spec = 0;
+         cfg_.prefix_cache = false;
+         if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
++    }
++    {
++        RadArchProbe pb{};
++        (void)rad_tools_probe(plugins_, meta_, &pb);
++        const auto bc = build_ctx(0, cfg_.max_tok);
++        if ((bc.kv_quant && !(pb.kv_quant_ok & (1 << bc.kv_quant))) ||
++            (bc.state_dtype == RAD_F16 && !pb.state_f16_ok)) {
++            RAD_ERR("plugin %s does not serve KV=%s / state=%s for this model",
++                    plugins_.arch_plugin.c_str(), cfg_.kv_cache_dtype.c_str(), cfg_.state_cache_dtype.c_str());
++            return RAD_E_UNSUPPORTED;
++        }
++        RAD_INFO("cache formats: KV=%s, recurrent state=%s", cfg_.kv_cache_dtype.c_str(), cfg_.state_cache_dtype.c_str());
+     }
+     if (cfg_.n_spec < 0) {
+         RadArchProbe pb{};
+@@ -3159,7 +3174,7 @@
+                             std::to_string(meta_.n_layers) + "|" +
+                             std::to_string(ranks_[0]->prefix.block_size()) + "|" +
+                             std::to_string(slot_bytes) + "|" + std::to_string(ck_slot_bytes) + "|" +
+-                            cfg_.kv_cache_dtype + "|" +
++                            cfg_.kv_cache_dtype + "|" + cfg_.state_cache_dtype + "|" +
+                             std::to_string((long long)ranks_.size()) + "|" + RAD_VERSION +
+                             "|theta=" + theta + "|" + rope_identity(meta_kv_k_, meta_kv_v_);
+                         uint64_t h = 1469598103934665603ull;
+diff --git a/core/rad_core.h b/core/rad_core.h
+--- a/core/rad_core.h
++++ b/core/rad_core.h
+@@ -746,6 +746,7 @@
+      * a third name for the second one, and a flag whose values are not all distinct is a flag
+      * whose log line cannot be read back. */
+     std::string kv_cache_dtype = "bf16";
++    std::string state_cache_dtype = "f32";
+     int64_t host_pool_mib = 0;
+     /* THE FILE TIER FOR WEIGHTS: what fits neither the VRAM slab nor the pinned host pool is read
+      * from the container itself, with O_DIRECT, ahead of the ops that read it -- a scheduled unit by
+diff --git a/libr4d/CMakeLists.txt b/libr4d/CMakeLists.txt
+--- a/libr4d/CMakeLists.txt
++++ b/libr4d/CMakeLists.txt
+@@ -55,6 +55,9 @@
+ set(RAD_W4_GROUP 128 CACHE STRING "libr4d quantised-weight group size (must match R4D_W4_GROUP in r4d_args.h)")
+ 
+ set(R4D_UNITS
++  "r4d_packed_kv_attn|"
++  "r4d_packed_kv_store|"
++  "r4d_packed_kv_qk|"
+   "r4d_attn_paged_h256_gqa6|"
+   "r4d_attn_paged_h128_gqa4|"
+   # Eight queries per KV head, at both head widths: the routed 35B-A3B is 16 over 2 at 256
+diff --git a/libr4d/packed_kv/r4d.h b/libr4d/packed_kv/r4d.h
+new file mode 100644
+--- /dev/null
++++ b/libr4d/packed_kv/r4d.h
+@@ -0,0 +1,66 @@
++#pragma once
++struct R4DArgs {
++    const void*  q;             // (num_seqs*q_len, q_heads, head_dim)  bf16
++    const void*  kv;            // (num_blocks, kv_heads, block_size, 2*head_dim)  fp8 e4m3 or bf16
++                                //   strides below are in elements of that dtype; K then V per slot
++    const int*   block_table;   // (num_seqs, max_blocks)            int32
++    const int*   seqused_k;     // (num_seqs,)                       int32
++    void*        out;           // (total_q, q_heads, head_dim)      bf16
++    const float* k_descale;     // (num_seqs, kv_heads)
++    const float* v_descale;     // (num_seqs, kv_heads)
++    const float* q_descale;     // unused: the query is bf16
++    void*        scratch;       // split-KV partials (decode only), or null
++    int num_seqs, q_len, q_heads, kv_heads, head_dim, block_size, max_blocks;
++    long kv_block_stride;       // elements between consecutive blocks
++    long kv_head_stride;        // elements between kv heads inside a block
++    float scale;
++    int  splits;                // decode only; 0 = let the split law choose
++    int  max_ctx;               // host-visible context bound (seqused_k is device-side)
++    int  window;                // sliding window, 0 = none (a full-attention layer)
++    int  causal;                // 1 = key <= query; 0 = key < seq_len, window two-sided
++    const void* causal_seq;     // (num_seqs,) uint8 per-sequence flag, or null for `causal`
++
++    // ---- Ragged batches --------------------------------------------------------------------
++    // A serving step mixes one sequence's prefill chunk with other sequences' single decode rows,
++    // so query lengths differ per sequence.
++    //
++    // `cu_q` is cu_seqlens: [num_seqs + 1] int32 on the device, cu_q[0] == 0, cu_q[num_seqs] ==
++    // total_q; sequence s owns query rows [cu_q[s], cu_q[s+1]) of q and out. Null means uniform:
++    // row r of sequence `seq` is row `seq * q_len + r`.
++    //
++    // With cu_q set, `q_len` is the maximum query length in the batch (it sizes the grid and picks
++    // the decode kernel's wave count) and `total_q` is the row count of q and out, host-side so the
++    // split-KV scratch can be sized without reading device memory. Both are ignored when cu_q is
++    // null.
++    const int* cu_q;            // (num_seqs+1,) int32 device, or null for a uniform q_len
++    int  total_q;               // rows of q/out; ignored unless cu_q is set
++
++    // ---- Views the split-KV decode kernel reads (r4d_attn_decode_h256_gqa6.hip); every other
++    // kernel leaves them at zero and reads q dense with one cache head per query group.
++    //
++    // `q_ld` is the element distance between q rows, 0 for dense (q_heads * head_dim): the q part
++    // of a fused [q|k|v] projection read where it lies (attn_paged_qrow). A multiple of 4.
++    //
++    // `kv_rep` maps query groups onto cache heads: group g (q heads g*GQA .. g*GQA+GQA-1) reads
++    // cache head g / kv_rep, and the descales are per cache head. kv_heads then counts the groups
++    // (q_heads / GQA) and the cache holds kv_heads / kv_rep heads. 0 or 1 is one head a group. It
++    // runs a gqa of GQA * kv_rep on the kernel compiled for GQA, whose workgroup holds at most 64
++    // rows of q_len * GQA: the 31B's DFlash drafter, gqa 8 at a block of 16, on the gqa-4 kernel.
++    long q_ld;
++    int  kv_rep;
++    // The engine's chained launch (RadKernelChainFn, r4d_chain.h): the decode path launches its
++    // chained forms. fill_paged sets it from the resolved `chain` parameter.
++    int  chain;
++    // A tree verify (attn_paged_qrow_tree, docs/OPS.md): RadBatch::spec_parent, one int32 a query
++    // row, -2 for an ordinary causal row, else the row's parent's index within its sequence's rows
++    // (-1 for the block's first). Read only by the O_TREE instances; null elsewhere.
++    const int* spec_parent;
++};
++
++// Rows of q and out. The split-KV scratch is laid out by dense query row, so the host sizing hook
++// and the device kernels must agree on this count; hence total_q is carried rather than read off
++// the end of cu_q.
++__host__ __device__ __forceinline__ int r4d_q_total(const R4DArgs& a) {
++    return a.cu_q ? a.total_q : a.num_seqs * a.q_len;
++}
++
+diff --git a/libr4d/packed_kv/r4d_attn_args.h b/libr4d/packed_kv/r4d_attn_args.h
+new file mode 100644
+--- /dev/null
++++ b/libr4d/packed_kv/r4d_attn_args.h
+@@ -0,0 +1,172 @@
++/* r4d_attn_args.h -- the paged-attention operand reader shared by every paged kernel geometry.
++ *
++ * The paged kernels (h256/gqa6, h128/gqa4, the gqa8/gqa12 instantiations; prefill and decode) take
++ * the same operands in the same order, so one reader serves them all.
++ *
++ * R4DArgs uses RadTensor's convention (strides in elements, spec 2.1), so this is field extraction
++ * plus the per-call validation a constraint cannot express: contiguity, alignment and buffer
++ * sizes, each refused with the code that names the class.
++ *
++ * Kernel return codes for an unserved shape (-1 head_dim or block_size, -2 gqa, -4 too many decode
++ * rows, -100-hipError for a launch failure) pass through unchanged. Getting one means a selection
++ * bug, and the value says which.
++ */
++#ifndef R4D_ATTN_ARGS_H
++#define R4D_ATTN_ARGS_H
++
++#include "r4d.h"
++#include "../r4d_args.h"
++
++#include <cmath>
++#include <cstring>
++
++/* Checks libr4d's compiled-in geometry against the row table, so a libr4d rebuilt for a
++ * different head size cannot silently change what the rows mean. */
++static inline int check_dims_once() {
++    return RAD_OK;
++}
++
++/* Operand indices, from oAttnPaged in r4d_rows.cpp. */
++enum { AP_Q = 0, AP_KV, AP_BT, AP_SEQ, AP_KDS, AP_VDS, AP_CU, AP_OUT };
++
++/* Fill R4DArgs from a RadArgs. Returns RAD_OK, or the negative code naming what is wrong.
++ *
++ * Ragged batches: the kernels take a scalar q_len and an optional cu_seqlens. Without cu_seqlens
++ * every sequence must have the same query length, which RAD_PHASE_MIXED steps (decode rows riding
++ * on another sequence's prefill chunk, core/sched/scheduler.cpp) do not satisfy; refusing them
++ * would abort the engine. So cu_seqlens is used whenever present, and the uniform arithmetic
++ * (q_len = total_q / num_seqs) only when it is not. In the ragged case q_len is the batch maximum,
++ * taken from the parameter the arch block issued the op with (batch->max_q_len).
++ *
++ * `q_pitched`: q may be a column slice of a wider row (attn_paged_qrow), its pitch in r->q_ld. Only
++ * the split-KV decode kernel reads q_ld; every other caller leaves this off.
++ */
++/* `row` is a token's bytes (elements for a 16-bit cache) in a (block, head) page: 2 * head_dim,
++ * or 25 * head_dim / 16 for the fp8_v4 cache (E4M3 K, int4 V, f16 group scales). */
++static inline int fill_paged_row(const RadArgs* a, R4DArgs* r, int expect_head_dim, long long row,
++                                 bool q_pitched = false) {
++    const RadTensor* q  = r4d_opt(a, AP_Q);
++    const RadTensor* kv = r4d_opt(a, AP_KV);
++    const RadTensor* bt = r4d_opt(a, AP_BT);
++    const RadTensor* su = r4d_opt(a, AP_SEQ);
++    const RadTensor* cu = r4d_opt(a, AP_CU);
++    const RadTensor* o  = r4d_opt(a, AP_OUT);
++    if (!q || !kv || !bt || !su || !o) return R4D_NO(RAD_E_INVAL);
++
++    if (q->rank < 2 || o->rank < 2 || bt->rank != 2 || su->rank < 1) return R4D_NO(RAD_E_SHAPE);
++    if (kv->rank != 4) return R4D_NO(RAD_E_SHAPE);
++
++    /* The query may be [tokens, n_head, head_dim] or flattened to [tokens, n_head*head_dim]
++     * (a gated attention block's de-interleaved query). Both are the same dense block, so any rank
++     * is accepted; head_dim comes from the op parameter, which makes the flattened form readable. */
++    const long long head_dim = expect_head_dim;
++    const long long total_q  = q->shape[0];
++    const long long num_seqs = bt->shape[0];
++    if (num_seqs <= 0 || total_q <= 0 || head_dim <= 0) return R4D_NO(RAD_E_SHAPE);
++    if (r4d_numel(q) % (total_q * head_dim)) return R4D_NO(RAD_E_SHAPE);
++    const long long q_heads = r4d_numel(q) / (total_q * head_dim);
++    if (q_heads <= 0) return R4D_NO(RAD_E_SHAPE);
++    /* Ragged exactly when cu_seqlens is present; see the note above fill_paged. */
++    const bool ragged = (cu != nullptr) && cu->data;
++    if (ragged) {
++        if (cu->rank != 1 || cu->shape[0] != num_seqs + 1) return R4D_NO(RAD_E_SHAPE);
++        if (!r4d_contig(cu)) return R4D_NO(RAD_E_STRIDE);
++    } else if (total_q % num_seqs) {
++        return R4D_NO(RAD_E_SHAPE);
++    }
++
++    /* q and out are indexed as one dense [total_q, q_heads, head_dim] block; the kernel has no
++     * pitch argument for either -- except q under q_pitched, whose rows may be apart: dense inside
++     * a row, a pitch in whole 8-byte loads (the kernel reads q four elements at a time). */
++    long long q_ld = 0;
++    if (q_pitched && !r4d_contig(q)) {
++        q_ld = r4d_row_pitch(q);
++        if (q_ld < q_heads * head_dim || q_ld % 4) return R4D_NO(RAD_E_STRIDE);
++    } else if (!r4d_contig(q)) {
++        return R4D_NO(RAD_E_STRIDE);
++    }
++    if (!r4d_contig(o)) return R4D_NO(RAD_E_STRIDE);
++    if (o->shape[0] != total_q || r4d_numel(o) != total_q * q_heads * head_dim)
++        return R4D_NO(RAD_E_SHAPE);
++    if (su->shape[0] != num_seqs) return R4D_NO(RAD_E_SHAPE);
++    if (!r4d_contig(bt) || !r4d_contig(su)) return R4D_NO(RAD_E_STRIDE);
++
++    /* The KV cache is pitched (kv_block_stride, kv_head_stride), so a padded cache is legal.
++     * Each (block, head) slot must be dense, because the kernel walks it with vector loads. */
++    const long long block_size = kv->shape[2];
++    if (kv->stride[3] != 1) return R4D_NO(RAD_E_STRIDE);
++    if (kv->stride[2] != row) return R4D_NO(RAD_E_STRIDE);
++    if (kv->shape[3] != row) return R4D_NO(RAD_E_SHAPE);
++
++    /* 16-byte alignment for 128-bit loads. */
++    if (!r4d_aligned(q->data, 16) || !r4d_aligned(o->data, 16) || !r4d_aligned(kv->data, 16))
++        return R4D_NO(RAD_E_ALIGN);
++
++    const RadTensor* kds = r4d_opt(a, AP_KDS);
++    const RadTensor* vds = r4d_opt(a, AP_VDS);
++
++    std::memset(r, 0, sizeof(*r));
++    r->q           = q->data;
++    r->kv          = kv->data;
++    r->block_table = (const int*)bt->data;
++    r->seqused_k   = (const int*)su->data;
++    r->out         = o->data;
++    r->k_descale   = kds ? (const float*)kds->data : nullptr;
++    r->v_descale   = vds ? (const float*)vds->data : nullptr;
++    r->q_descale   = nullptr;                 /* the query is bf16 in every variant */
++    r->q_ld        = (long)q_ld;              /* 0: dense */
++    r->scratch     = a->scratch;
++    r->num_seqs    = (int)num_seqs;
++    r->cu_q        = ragged ? (const int*)cu->data : nullptr;
++    r->total_q     = (int)total_q;
++    /* q_len is exact for a uniform batch and an upper bound for a ragged one; it sizes the
++     * prefill grid and the decode wave count, and the kernels read exact lengths from cu_seqlens.
++     * The bound is min(band, total_q): the `q_len` parameter is the resolved band selected by
++     * max_q_len, and total_q is a sum of lengths, so both are >= the true maximum. The min keeps
++     * decode legal (band bound 10 * gqa 6 = 60 rows fits a 64-row workgroup; total_q alone would
++     * be refused with -4). A loose bound only costs workgroups that exit on their first compare. */
++    r->q_len       = (int)(total_q / num_seqs);
++    if (ragged) {
++        const long long band = r4d_geti_or(a, "q_len", total_q);
++        r->q_len = (int)(band > 0 && band < total_q ? band : total_q);
++    }
++    r->q_heads     = (int)q_heads;
++    r->kv_heads    = (int)kv->shape[1];
++    r->head_dim    = (int)head_dim;
++    r->block_size  = (int)block_size;
++    r->max_blocks  = (int)bt->shape[1];
++    r->kv_block_stride = (long)kv->stride[0];
++    r->kv_head_stride  = (long)kv->stride[1];
++    r->window      = (int)r4d_geti_or(a, "window", 0);
++    r->causal      = (int)r4d_geti_or(a, "causal", 1);
++    r->causal_seq  = nullptr;
++
++    /* Softmax scale; defaults to 1/sqrt(head_dim). */
++    r->scale = (float)r4d_getf(a, "scale", 1.0 / std::sqrt((double)head_dim));
++
++    /* max_ctx is the host-visible context bound for the split law (seqused_k is device-side).
++     * Block-table width times block size is a safe upper bound. */
++    long long mc = r4d_geti_or(a, "max_ctx", 0);
++    if (mc <= 0) mc = (long long)r->max_blocks * block_size;
++    r->max_ctx = (int)mc;
++
++    /* Set by the caller from the tuned `splits`; 0 means libr4d's own split law. */
++    r->splits = 0;
++    r->chain = r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0;
++    return RAD_OK;
++}
++
++/* The decode rows declare a `splits` axis; its default is 0, which is that same law. */
++static inline int split_of(const RadArgs* a) {
++    R4dSplitCfg c;
++    r4d_cfg_split(a, &c);
++    return c.splits;
++}
++
++
++static inline int fill_paged(const RadArgs* a, R4DArgs* r, int expect_head_dim,
++                             bool q_pitched = false) {
++    return fill_paged_row(a, r, expect_head_dim, 2LL * expect_head_dim, q_pitched);
++}
++
++#endif  /* R4D_ATTN_ARGS_H */
+diff --git a/libr4d/packed_kv/r4d_attn_decode_h256_gqa6.hip b/libr4d/packed_kv/r4d_attn_decode_h256_gqa6.hip
+new file mode 100644
+--- /dev/null
++++ b/libr4d/packed_kv/r4d_attn_decode_h256_gqa6.hip
+@@ -0,0 +1,1097 @@
++// R4D split-KV decode (also the MTP-verify shape). Same core as the prefill kernel (lazy
++// reference-max softmax, f16 operands, folded query scale, contiguous-k fragments, prefetch +
++// scheduling barrier, dot2 row sum), plus two decode-only options:
++//
++//   KLDS0  reads K straight from the paged cache (bf16 or fp8), widening once per warp instead of
++//          once per workgroup. Costs VALU on a bandwidth-bound leg and frees sK, which at TILE 16
++//          is 8.3 KB of the 14.5 KB that limits resident workgroups. Best at every depth.
++//   PF16   split-KV partials stored as f16. At 16K context the partial round trip is ~14 MB
++//          against ~17 MB of KV. Storing O/l instead of O bounds values by max|v|, so f16 cannot
++//          overflow; the 11-bit mantissa costs ~5e-4 relative.
++//
++// No fp8-P leg and no non-CONTIG alternative here; r4d_attn_prefill_h256_gqa6.hip documents the
++// full option set.
++#include "r4d.h"
++#include "r4d_common.h"
++#include "r4d_dt16.h"
++#include "r4d_q8.h"     // the gate quantiser's 8-bit codes: E4M3, or int8 (GQ == 2)
++
++#include <algorithm>
++#include <type_traits>
++
++#define O_F16    1
++#define O_MSKIP  2
++#define O_FOLDQ  8
++#define O_KLDS0 16
++#define O_PF16  32
++#define O_CONTIG 512
++#define O_PF2   1024
++#define O_PF4   2048
++#define O_PF8   3072
++#define O_SGB   4096
++#define O_DOT2 16384
++// Tile-staging options, shared with r4d_attn_prefill_h256_gqa6.hip:
++//   BTS   the tile's block-table entries in SGPRs, loaded a tile ahead. With KLDS0 this also takes
++//         the dependent bt[kk/BS] load out of the m-tile loop.
++//   GPREV tile ti+1's V fetched into registers before the m-tile loop.
++//   LDSB  an LDS-scoped barrier, so the barrier does not invalidate the vector cache.
++#define O_BTS   262144
++#define O_GPREV 1048576
++#define O_LDSB  2097152
++// Bit 4194304 is free: a non-temporal hint on the K load gained nothing on the target GPU (the KV
++// stream does not evict the neighbouring GEMMs' activations).
++// O_V8: an fp8 cache's V tile staged in LDS as codes (6 KiB instead of 12 KiB of f16), converted
++// when a fragment is read. For a one-wave workgroup the f16 tile is what caps residency (ten
++// workgroups per WGP). At one wave the conversion count is unchanged and the conversion is exact,
++// so results are identical; with more waves each would convert the whole tile, so the launcher
++// uses it only at one wave.
++#define O_V8    8388608
++// O_KRAW: with K read from the paged cache (KLDS0, CONTIG), issue all HEAD_DIM/16 fragment loads
++// of an m-tile in one round and convert each fragment just before its WMMA. LLVM 24 honours the PF
++// groups and scheduling barriers literally, so with PF 2 K arrives in HEAD_DIM/32 serial round
++// trips (16-19% on the head_dim-128 drafter leg, bf16 cache). Raw cache bytes are held (8 per
++// fragment for fp8, 16 for bf16), costing 2 or 4 x HEAD_DIM/16 VGPRs; PF = HEAD_DIM/16 would hold
++// converted fragments and cost occupancy. Results are unchanged.
++#define O_KRAW  16777216
++// O_V4: the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale), and with O_K6 the
++// k6_v4 cache (int6 K, int4 V); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
++#define O_V4    33554432
++#define O_K6    67108864
++// The two views of R4DArgs (r4d.h), compiled in only where a row asks for them, since the h256
++// instances sit at the 256-VGPR bound and a runtime pitch and head map spill there:
++//   QLD    q rows at R4DArgs::q_ld (attn_paged_qrow), not dense.
++//   KVREP  query group g reads cache head g / R4DArgs::kv_rep, descales per cache head.
++// Neither changes the arithmetic.
++#define O_QLD   134217728
++#define O_KVREP 268435456
++// TREE: a tree verify (attn_paged_qrow_tree; R4DArgs::spec_parent). A row whose entry is not -2
++// sees, inside its sequence's query block, only itself and its ancestors, and its window is
++// measured from the block's first position plus its depth. Compiled in only where a row asks.
++#define O_TREE  536870912
++__host__ __device__ __forceinline__ int r4d_attn_tiles(int ctx, int tile) { return (ctx + tile - 1) / tile; }
++__host__ __device__ __forceinline__ int r4d_attn_tps(int ctx, int tile, int splits) {
++    int t = r4d_attn_tiles(ctx, tile); return (t + splits - 1) / splits;
++}
++// First KV position query row `qrow` may attend to under a sliding window: the row's
++// causal limit, less the window, floored at zero. window <= 0 means no window.
++__host__ __device__ __forceinline__ int r4d_attn_wlo(int ctx, int q_len, int qrow, int window) {
++    if (window <= 0) return 0;
++    const int lo = ctx - q_len + qrow - window + 1;
++    return lo > 0 ? lo : 0;
++}
++
++// WIN enables a sliding window (a.window positions ending at each row's causal limit). As a
++// template parameter defaulting to 0, full attention compiles with no window code.
++// The body: its blocks return early (empty slots, tiles past the window), so the chained form
++// (r4d_chain.h) wraps it below rather than bracketing it in place.
++template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
++         int WIN = 0>
++__device__ __forceinline__
++void r4d_attn_decode_body(const R4DArgs& a, int splits)
++{
++    constexpr int F16   = (OPT & O_F16)   ? 1 : 0;
++    constexpr int MSKIP = (OPT & O_MSKIP) ? 1 : 0;
++    constexpr int FOLDQ = (OPT & O_FOLDQ) ? 1 : 0;
++    constexpr int KLDS  = (OPT & O_KLDS0) ? 0 : 1;
++    constexpr int PF16  = (OPT & O_PF16)  ? 1 : 0;
++    constexpr int CTG   = (OPT & O_CONTIG) ? 1 : 0;
++    constexpr int PF    = 1 << ((OPT >> 10) & 3);
++    constexpr int SGB   = (OPT & O_SGB) ? 1 : 0;
++    constexpr int DOT2  = ((OPT & O_DOT2) && (OPT & O_F16)) ? 1 : 0;
++    constexpr int BTS   = (OPT & O_BTS)  ? 1 : 0;
++    constexpr int LDSB  = (OPT & O_LDSB) ? 1 : 0;
++    constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
++    constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
++    // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
++    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
++    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
++    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
++    constexpr int KSOFF = HEAD_DIM * 5 / 4;
++    constexpr int V8    = ((OPT & O_V8) && !KVP && !V4) ? 1 : 0;
++    static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
++    constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
++    static_assert(!KRAW || (OPT & O_CONTIG), "the raw K round reads the contiguous layout");
++    static_assert(!K6 || (!KLDS && (OPT & O_CONTIG) && !KRAW),
++                  "k6_v4 K is widened from the paged cache, a lane's eight dims contiguous");
++    static_assert(!V4 || (OPT & O_F16), "fp8_v4 widens to f16");
++    constexpr int QLD   = (OPT & O_QLD)   ? 1 : 0;
++    constexpr int KVREP = (OPT & O_KVREP) ? 1 : 0;
++    constexpr int TREE  = (OPT & O_TREE)  ? 1 : 0;
++    typedef DT16<F16> D;
++    typedef typename D::frag frag16;
++
++    constexpr int NKS   = HEAD_DIM / 16;
++    constexpr int MT    = TILE / 16;
++    constexpr int KSTR  = HEAD_DIM + (CTG ? 8 : 4);
++    constexpr int VSTR  = TILE + (CTG ? 8 : 4);
++    constexpr int NTHR  = NWARPS * 32;
++    constexpr int NB    = TILE / BS;
++    constexpr int NTR   = (TILE / 8) * (HEAD_DIM / (KVP ? 32 : 64));
++    constexpr int VREGS = (NTR + NWARPS - 1) / NWARPS;
++    // A V prefetch costs VREGS x 4 VGPRs on top of a 128-VGPR accumulator and a 64-VGPR query.
++    // Up to three uint4 it fits in 255 VGPRs without spilling (two: +6-8% at depth; three, the
++    // 48-row shape q_len 8 x gqa 6 at NWARPS 3: a further 2-15%). At four or more (NWARPS 1-2, or a
++    // bf16 cache) it spills and loses ~10%, so the geometry gates it, not just the flag.
++    constexpr int GPREV = ((OPT & O_GPREV) && VREGS <= 3 && !V4) ? 1 : 0;
++    constexpr float PSHIFT = D::SHIFT;
++    constexpr float PGROW  = D::GROW;
++
++    __shared__ uint16_t sK[KLDS ? TILE * KSTR : 1];
++    // V4 at TILE 16: dim octet o's 8 rows start S(o) = 16 (o & 3) + 8 ((o >> 2) & 1) + 128 (o >> 2)
++    // halfwords later, so the 4 (8) octets of a storeV4 store land on distinct banks (unskewed they
++    // share them: 8 rows = 96 dwords = 0 mod 32). The 128 (o >> 2) term (64 dwords, unseen by the
++    // banks) keeps octet o's last row clear of octet o + 1's first; multiples of 8 halfwords keep the
++    // b128 PV read aligned. NWARPS 1 keeps the plain tile: its 10 workgroups a WGP would not fit.
++    constexpr int VSK  = (V4 && TILE == 16 && CTG && NWARPS >= 2) ? 1 : 0;
++    constexpr int VSKN = HEAD_DIM / 8 - 1;
++    constexpr int VSKX = VSK ? 16 * (VSKN & 3) + 8 * ((VSKN >> 2) & 1) + 128 * (VSKN >> 2) : 0;
++    __shared__ uint16_t sV16[V8 ? 1 : HEAD_DIM * VSTR + VSKX];
++    /* A code-tile row is 16 keys + 8 padding = 24 bytes (six dwords): the sixteen lanes of a
++     * fragment read hit distinct banks, and a lane's eight codes are one aligned 8-byte load. */
++    constexpr int VSTR8 = TILE + 8;
++    __shared__ uint8_t sV8[V8 ? HEAD_DIM * VSTR8 : 1];
++
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    // The launch is NTHR threads. Stated (k6_v4), so the V4 rounds wholly below NP4 lose their range
++    // test: as exec-masked blocks, each round's loads issued only after the previous round's returned.
++    // fp8_v4 keeps the tested rounds: batched there, its 4-row steps ran 6 % slower.
++    if constexpr (K6) __builtin_assume(tid < NTHR);
++    const int c = lane & 15, h = lane >> 4;
++
++    const int sp = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
++    // kvh is the query group; under KVREP the cache head it reads is kvh / kv_rep
++    const int kvc = KVREP ? kvh / a.kv_rep : kvh;
++    const int ctx = a.seqused_k[seq];
++    if (ctx <= 0) return;
++
++    // Ragged batches (r4d.h, R4DArgs::cu_q): this sequence's q/out rows and query length. With
++    // cu_q, a.q_len is the batch maximum that sized the wave count; rows past qlen are not live.
++    const int qoff = r4d_q_off(a.cu_q, seq, a.q_len);
++    const int qlen = r4d_q_len(a.cu_q, seq, a.q_len);
++    if (qlen <= 0) return;                 // a slot carrying no query rows this step
++
++    const int ntl  = r4d_attn_tiles(ctx, TILE);
++    // A sliding-window layer must not read below the window: those blocks may already be freed
++    // and reassigned to another sequence. The walk starts at the tile holding row 0's first
++    // window token (row 0 reaches furthest back), and the splits divide that range.
++    const int wlo0 = WIN ? r4d_attn_wlo(ctx, qlen, 0, a.window) : 0;
++    const int tb   = WIN ? wlo0 / TILE : 0;
++    const int neff = ntl - tb;
++    const int tps  = (neff + splits - 1) / splits;
++    const int t_lo = tb + sp * tps;
++    if (t_lo >= ntl) return;
++    const int t_hi = min(t_lo + tps, ntl);
++
++    // TREE: the block's parents staged once, so each row's walk below reads LDS rather than a
++    // chain of dependent global loads. Every early return above is uniform across the block.
++    __shared__ int s_tpar[TREE ? 64 : 1];
++    if constexpr (TREE) {
++        if (a.spec_parent) {
++            for (int r = tid; r < qlen && r < 64; r += NTHR) s_tpar[r] = a.spec_parent[qoff + r];
++            __syncthreads();
++        }
++    }
++
++    const int row = warp * 16 + c;
++    const int qi = row / GQA, hi = row - qi * GQA;
++    const bool live = (qi < qlen);
++    const int qrow = live ? qi : (qlen - 1);
++    const int qhead = kvh * GQA + hi;
++
++    const int* __restrict__ bt = a.block_table + (size_t)seq * a.max_blocks;
++    const float kdesc = a.k_descale
++                      ? a.k_descale[seq * (KVREP ? a.kv_heads / a.kv_rep : a.kv_heads) + kvc]
++                      : 1.0f;
++    const float mul   = a.scale * kdesc * 1.44269504089f;
++
++    frag16 qf[NKS];
++    {
++        const uint16_t* qp = QLD ? (const uint16_t*)a.q + (size_t)(qoff + qrow) * a.q_ld
++                                                        + (size_t)qhead * HEAD_DIM
++                                 : (const uint16_t*)a.q
++                                   + ((size_t)(qoff + qrow) * a.q_heads + qhead) * HEAD_DIM;
++        #pragma unroll
++        for (int t = 0; t < NKS; ++t) {
++            const uint2 l0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h : 4 * h));
++            const uint2 h0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h + 4 : 8 + 4 * h));
++            qf[t] = D::mk(make_uint2(r4d_qcvt<D, FOLDQ, F16>(l0.x, mul),
++                                     r4d_qcvt<D, FOLDQ, F16>(l0.y, mul)),
++                          make_uint2(r4d_qcvt<D, FOLDQ, F16>(h0.x, mul),
++                                     r4d_qcvt<D, FOLDQ, F16>(h0.y, mul)));
++        }
++    }
++
++    // The row's absolute position. Causal masking bounds the key by it; non-causal masking
++    // bounds it by the sequence, with the window applied on both sides (a block-diffusion
++    // drafter's own block).
++    const int pos = ctx - qlen + qrow;
++    const int cz  = a.causal_seq ? (int)((const unsigned char*)a.causal_seq)[seq] : a.causal;
++    const int klimit = cz ? pos
++                          : ((WIN && a.window > 0) ? min(ctx - 1, pos + a.window - 1)
++                                                   : ctx - 1);
++    // A tree verify's row (TREE): a bit per row of the block for itself and each ancestor, and
++    // its depth, from which its window is measured. Parents precede children, so the walk ends.
++    const int tbase = ctx - qlen;
++    uint64_t tmask = 0;
++    int tdep = 0;
++    bool trow = false;
++    if (TREE && a.spec_parent && qrow < 64) {
++        int pj = s_tpar[qrow];
++        if (pj != -2) {
++            trow  = true;
++            tmask = 1ull << qrow;
++            for (int at = qrow; pj >= 0 && pj < at; ) {
++                tmask |= 1ull << pj;
++                ++tdep;
++                at = pj;
++                pj = s_tpar[pj];
++            }
++        }
++    }
++    const int wpos   = (TREE && trow) ? tbase + tdep : pos;
++    const int wlo    = (WIN && a.window > 0) ? (wpos - a.window + 1 > 0
++                                               ? wpos - a.window + 1 : 0) : 0;
++    float m_ref = -3.0e38f;
++    float off   = PSHIFT + 3.0e38f;
++    float l_i   = 0.0f;
++    v8f acc[NKS];
++    #pragma unroll
++    for (int t = 0; t < NKS; ++t) acc[t] = (v8f){0,0,0,0,0,0,0,0};
++
++    const int vg = lane >> 3, vj = lane & 7;
++    uint4 vreg[VREGS];
++
++    // ---- fp8_v4 / k6_v4: V's int4 codes into sV16 ([dim][key]) as the prefill kernel stages them
++    // (r4d_attn_prefill_h256_gqa6.hip: a key pair's 8 dims a thread, two code words and the pair's
++    // scale, widened with packed f16 into one dword a dim), fetched in the tile: no prefetch.
++    constexpr int NP4 = (TILE / 2) * (HEAD_DIM / 8);
++    constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
++    // The pair's two scales stay apart until storeV4 packs them: packed here, the fetch is waited on
++    // right after it is issued. fp8_v4 packs here, as the prefill kernel does.
++    constexpr int OLDV4 = V4 && !K6;
++    uint32_t v4c[U4][2], v4s[U4][2];
++    auto fetchV4 = [&](int k0, const int* blks) {
++        #pragma unroll
++        for (int r = 0; r < U4; ++r) {
++            const int u = tid + r * NTHR;
++            // k6_v4, a partial round (NWARPS 3: the third, warps 0-1): u < NP4 <=> warp < (NP4 - r NTHR)
++            // / 32 when NP4 is a multiple of 32, tested on the wave-uniform warp: a scalar branch.
++            if (NP4 % NTHR == 0 || (K6 ? ((r + 1) * NTHR <= NP4
++                || (NP4 % 32 == 0 ? __builtin_amdgcn_readfirstlane(warp) * 32 < NP4 - r * NTHR
++                                  : u < NP4)) : u < NP4)) {
++                const int kp = u % (TILE / 2), o = u / (TILE / 2);
++                uint32_t sc[2];
++                #pragma unroll
++                for (int j = 0; j < 2; ++j) {
++                    int kk = min(k0 + 2 * kp + j, ctx - 1);
++                    if (WIN && kk < wlo0) kk = wlo0;
++                    const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
++                    const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
++                                        + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
++                    v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
++                    sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
++                }
++                if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
++                else                 { v4s[r][0] = sc[0]; v4s[r][1] = sc[1]; }
++            }
++        }
++    };
++    auto storeV4 = [&]() {
++        typedef _Float16 h2 __attribute__((ext_vector_type(2)));
++        #pragma unroll
++        for (int r = 0; r < U4; ++r) {
++            const int u = tid + r * NTHR;
++            // k6_v4, a partial round (NWARPS 3: the third, warps 0-1): u < NP4 <=> warp < (NP4 - r NTHR)
++            // / 32 when NP4 is a multiple of 32, tested on the wave-uniform warp: a scalar branch.
++            if (NP4 % NTHR == 0 || (K6 ? ((r + 1) * NTHR <= NP4
++                || (NP4 % 32 == 0 ? __builtin_amdgcn_readfirstlane(warp) * 32 < NP4 - r * NTHR
++                                  : u < NP4)) : u < NP4)) {
++                const int kp = u % (TILE / 2), o = u / (TILE / 2);
++                // Two's complement nibbles; ^ 8 makes them offset binary (value + 8).
++                const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
++                const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
++                const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
++                const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
++                const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
++                const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
++                uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp
++                                      + (VSK ? 16 * (o & 3) + 8 * ((o >> 2) & 1) + 128 * (o >> 2) : 0)];
++                #pragma unroll
++                for (int b = 0; b < 4; ++b) {
++                    const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
++                    const uint32_t lo = __builtin_amdgcn_perm(n1, n0, sel) | 0x64006400u;
++                    const uint32_t hi = __builtin_amdgcn_perm(m1, m0, sel) | 0x64006400u;
++                    const h2 vl = (__builtin_bit_cast(h2, lo) - bias) * s2;
++                    const h2 vh = (__builtin_bit_cast(h2, hi) - bias) * s2;
++                    *(uint32_t*)(dst + (2 * b) * VSTR)     = __builtin_bit_cast(uint32_t, vl);
++                    *(uint32_t*)(dst + (2 * b + 1) * VSTR) = __builtin_bit_cast(uint32_t, vh);
++                }
++            }
++        }
++    };
++
++    auto fetchV = [&](int k0, const int* blks) {
++        #pragma unroll
++        for (int r = 0; r < VREGS; ++r) {
++            const int idx = warp + r * NWARPS;
++            if (NTR % NWARPS == 0 || idx < NTR) {
++                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
++                const int kg = idx / DG, dg = idx - kg * DG;
++                int kk = min(k0 + kg * 8 + vj, ctx - 1);
++                if (WIN && kk < wlo0) kk = wlo0;
++                const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
++                const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
++                const size_t o = (size_t)blk * a.kv_block_stride
++                               + (size_t)kvc * a.kv_head_stride
++                               + (size_t)(kk % BS) * ROWB + HEAD_DIM + d0;
++                const void* p = KVP ? (const void*)((const uint16_t*)a.kv + o)
++                                    : (const void*)((const uint8_t*)a.kv + o);
++                vreg[r] = __builtin_bit_cast(uint4, load_tr_b128(p));
++            }
++        }
++    };
++
++    auto storeV = [&]() {
++        #pragma unroll
++        for (int r = 0; r < VREGS; ++r) {
++            const int idx = warp + r * NWARPS;
++            if (NTR % NWARPS == 0 || idx < NTR) {
++                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
++                const int kg = idx / DG, dg = idx - kg * DG;
++                const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
++                const uint4 v = vreg[r];
++                if (KVP) {
++                    uint16_t* dst = &sV16[(d0 + vj) * VSTR + kg * 8];
++                    *(uint2*)(dst)     = make_uint2(D::from_bf16w(v.x), D::from_bf16w(v.y));
++                    *(uint2*)(dst + 4) = make_uint2(D::from_bf16w(v.z), D::from_bf16w(v.w));
++                } else if (V8) {
++                    const uint32_t lo0 = byte_gather(v.x, v.y, 0), lo1 = byte_gather(v.z, v.w, 0);
++                    const uint32_t hi0 = byte_gather(v.x, v.y, 1), hi1 = byte_gather(v.z, v.w, 1);
++                    *(uint2*)&sV8[(d0 + 2 * vj)     * VSTR8 + kg * 8] = make_uint2(lo0, lo1);
++                    *(uint2*)&sV8[(d0 + 2 * vj + 1) * VSTR8 + kg * 8] = make_uint2(hi0, hi1);
++                } else {
++                    const uint32_t lo0 = byte_gather(v.x, v.y, 0), lo1 = byte_gather(v.z, v.w, 0);
++                    const uint32_t hi0 = byte_gather(v.x, v.y, 1), hi1 = byte_gather(v.z, v.w, 1);
++                    uint32_t wl[4], wh[4];
++                    fp8x8_to_16x4w<D>(make_uint2(lo0, lo1), wl);
++                    fp8x8_to_16x4w<D>(make_uint2(hi0, hi1), wh);
++                    uint16_t* a0 = &sV16[(d0 + 2 * vj)     * VSTR + kg * 8];
++                    uint16_t* a1 = &sV16[(d0 + 2 * vj + 1) * VSTR + kg * 8];
++                    *(uint2*)(a0)     = make_uint2(wl[0], wl[1]);
++                    *(uint2*)(a0 + 4) = make_uint2(wl[2], wl[3]);
++                    *(uint2*)(a1)     = make_uint2(wh[0], wh[1]);
++                    *(uint2*)(a1 + 4) = make_uint2(wh[2], wh[3]);
++                }
++            }
++        }
++    };
++
++    // A tile's NB entries are read whole, and a multi-block tile can run past the sequence's last
++    // block (on the last row, past the end of the table). Keys are clamped to ctx - 1, so entries
++    // past lastb are never used; only tiles reaching past lastb take the clamped load, and the
++    // rest keep one wide scalar load. With NB == 1 the test folds away.
++    const int lastb = (ctx - 1) / BS;
++    auto load_bt = [&](int t0, int* out) {
++        if (NB > 1 && t0 + NB - 1 > lastb) {
++            #pragma unroll
++            for (int i = 0; i < NB; ++i) out[i] = bt[min(t0 + i, lastb)];
++        } else {
++            #pragma unroll
++            for (int i = 0; i < NB; ++i) out[i] = bt[t0 + i];
++        }
++    };
++    int blk[NB];
++    if (BTS) load_bt(t_lo * NB, blk);
++    if (GPREV) fetchV(t_lo * TILE, blk);
++
++    for (int ti = t_lo; ti < t_hi; ++ti) {
++        const int k0 = ti * TILE;
++        int blkn[NB];
++        if (BTS && ti + 1 < t_hi) {
++            load_bt((ti + 1) * NB, blkn);
++        }
++        if (LDSB) lds_barrier(); else __syncthreads();
++
++        if (KLDS) {
++            #pragma unroll 1
++            for (int i = tid; i < TILE * (HEAD_DIM / 8); i += NTHR) {
++                const int key = i / (HEAD_DIM / 8), ch = i - key * (HEAD_DIM / 8);
++                int kk = min(k0 + key, ctx - 1);
++                if (WIN && kk < wlo0) kk = wlo0;
++                const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
++                const size_t o = (size_t)kb * a.kv_block_stride
++                               + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
++                uint16_t* kd = &sK[key * KSTR];
++                uint32_t w4[4];
++                if (KVP) {
++                    const uint4 r = *(const uint4*)((const uint16_t*)a.kv + o + ch * 8);
++                    w4[0] = D::from_bf16w(r.x); w4[1] = D::from_bf16w(r.y);
++                    w4[2] = D::from_bf16w(r.z); w4[3] = D::from_bf16w(r.w);
++                } else {
++                    fp8x8_to_16x4w<D>(*(const uint2*)((const uint8_t*)a.kv + o + ch * 8), w4);
++                }
++                *(uint2*)(kd + ch * 8)     = make_uint2(w4[0], w4[1]);
++                *(uint2*)(kd + ch * 8 + 4) = make_uint2(w4[2], w4[3]);
++            }
++        }
++        if constexpr (V4) { fetchV4(k0, blk); storeV4(); }
++        else { if (!GPREV) fetchV(k0, blk); storeV(); }
++        if (LDSB) lds_barrier(); else __syncthreads();
++        if (GPREV && ti + 1 < t_hi) fetchV(k0 + TILE, blkn);
++
++        #pragma unroll 1
++        for (int mt = 0; mt < MT; ++mt) {
++            const uint8_t* grow = nullptr;
++            if (!KLDS) {
++                int kk = min(k0 + mt * 16 + c, ctx - 1);
++                if (WIN && kk < wlo0) kk = wlo0;
++                const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
++                grow = (const uint8_t*)a.kv + ((size_t)kb * a.kv_block_stride
++                     + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB)
++                     * (KVP ? 2 : 1);
++            }
++            // A fragment's raw K: 8 elements of 1 byte (fp8) or 2 (bf16).
++            typedef typename std::conditional<KVP != 0, uint4, uint2>::type kraw_t;
++            kraw_t kraw[KRAW ? NKS : 1];
++            if constexpr (KRAW) {
++                #pragma unroll
++                for (int t = 0; t < NKS; ++t)
++                    kraw[t] = *(const kraw_t*)(grow + (16 * t + 8 * h) * (KVP ? 2 : 1));
++            }
++            v8f s = (v8f){0,0,0,0,0,0,0,0};
++            #pragma unroll
++            for (int g = 0; g < NKS; g += PF) {
++                frag16 kb[PF];
++                #pragma unroll
++                for (int j = 0; j < PF; ++j) {
++                    const int t = g + j;
++                    if (KLDS) {
++                        const uint16_t* kp = &sK[(mt * 16 + c) * KSTR + 16 * t];
++                        if (CTG) {
++                            const uint4 u = *(const uint4*)(kp + 8 * h);
++                            kb[j] = D::mk(make_uint2(u.x, u.y), make_uint2(u.z, u.w));
++                        } else {
++                            kb[j] = D::mk(*(const uint2*)(kp + 4 * h), *(const uint2*)(kp + 8 + 4 * h));
++                        }
++                    } else if (KVP) {
++                        const uint16_t* kp = (const uint16_t*)grow + 16 * t;
++                        uint2 l0, h0;
++                        if constexpr (KRAW && KVP != 0) {
++                            const uint4 u = kraw[t];
++                            l0 = make_uint2(u.x, u.y);
++                            h0 = make_uint2(u.z, u.w);
++                        } else {
++                            l0 = *(const uint2*)(kp + (CTG ? 8 * h : 4 * h));
++                            h0 = *(const uint2*)(kp + (CTG ? 8 * h + 4 : 8 + 4 * h));
++                        }
++                        kb[j] = D::mk(make_uint2(D::from_bf16w(l0.x), D::from_bf16w(l0.y)),
++                                      make_uint2(D::from_bf16w(h0.x), D::from_bf16w(h0.y)));
++                    } else if constexpr (K6) {
++                        // k6_v4: this lane's eight dims (16t + 8h ..) from their low nibbles, the
++                        // chunk's high-bit word and the group's scale.
++                        uint32_t w4[4];
++                        const uint32_t sb = *(const uint16_t*)(grow + KSOFF + (t >> 1) * 2);
++                        k6x8_to_f16x4w(*(const uint32_t*)(grow + 8 * t + 4 * h),
++                                       *(const uint32_t*)(grow + HEAD_DIM / 2 + 4 * t), h,
++                                       sb | (sb << 16), w4);
++                        kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
++                    } else {
++                        const uint8_t* kp = grow + 16 * t;
++                        uint32_t w4[4];
++                        // CONTIG: one 8-byte load; the split map needs two 4-byte loads.
++                        uint2 raw;
++                        if constexpr (KRAW && KVP == 0) raw = kraw[t];
++                        else raw = CTG ? *(const uint2*)(kp + 8 * h)
++                                       : make_uint2(*(const uint32_t*)(kp + 4 * h),
++                                                    *(const uint32_t*)(kp + 8 + 4 * h));
++                        fp8x8_to_16x4w<D>(raw, w4);
++                        kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
++                    }
++                }
++                if (SGB) sched_barrier();
++                #pragma unroll
++                for (int j = 0; j < PF; ++j) s = D::wmma(kb[j], qf[g + j], s);
++            }
++            float sc[8];
++            #pragma unroll
++            for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
++
++            const int kbase = k0 + mt * 16 + 8 * h;
++            if (!MSKIP || wave_any(kbase + 7 > klimit) || (WIN && wave_any(kbase < wlo)) ||
++                (TREE && wave_any(trow && kbase + 7 >= tbase))) {
++                #pragma unroll
++                for (int e = 0; e < 8; ++e)
++                    sc[e] = ((kbase + e <= klimit) && (!WIN || kbase + e >= wlo) &&
++                             (!TREE || !trow || kbase + e < tbase ||
++                              ((tmask >> (kbase + e - tbase)) & 1ull)))
++                          ? sc[e] : -INFINITY;
++            }
++            float smax = sc[0];
++            #pragma unroll
++            for (int e = 1; e < 8; ++e) smax = fmaxf(smax, sc[e]);
++
++            if (wave_any(smax > m_ref + PGROW)) {
++                const float rmax  = fmaxf(smax, swap16(smax));
++                const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
++                const float alpha = ex2(m_ref - mnew);
++                #pragma unroll
++                for (int dt = 0; dt < NKS; ++dt)
++                    #pragma unroll
++                    for (int e = 0; e < 8; ++e) acc[dt][e] *= alpha;
++                l_i *= alpha;
++                m_ref = mnew;
++                off   = PSHIFT - mnew;
++            }
++
++            float pf[8], lsum = 0.0f;
++            #pragma unroll
++            for (int e = 0; e < 8; ++e) {
++                const float p = ex2(sc[e] + off); pf[e] = p;
++                if (!DOT2) lsum += p;
++            }
++            if (!DOT2) l_i += lsum;
++
++            {
++                uint32_t pw[4];
++                #pragma unroll
++                for (int e = 0; e < 8; e += 2) pw[e >> 1] = D::pk(pf[e], pf[e + 1]);
++                if (DOT2) {
++                    const v2hf one = {(__fp16)1.0f, (__fp16)1.0f};
++                    #pragma unroll
++                    for (int e = 0; e < 4; ++e)
++                        l_i = __builtin_amdgcn_fdot2(__builtin_bit_cast(v2hf, pw[e]), one, l_i, false);
++                }
++                const uint2 lo  = make_uint2(pw[0], pw[1]);
++                const uint2 hi2 = make_uint2(pw[2], pw[3]);
++                frag16 p16;
++                if (CTG) {
++                    p16 = D::mk(lo, hi2);          // QK already left the keys lane-local
++                } else {
++                    const uint2 y = swap16_u2p((h == 0) ? hi2 : lo);
++                    p16 = (h == 0) ? D::mk(lo, y) : D::mk(y, hi2);
++                }
++                // Skewed tile: row 16 G + c is in octet 2 G + (c >> 3), so its S is 16 (c >> 3) here
++                // plus 32 (G & 1) + 8 ((G >> 1) & 1) + 128 (G >> 1), a compile-time offset below.
++                const uint16_t* vbase = &sV16[c * VSTR + mt * 16] + (CTG ? 8 * h : 0)
++                                      + (VSK ? 16 * (c >> 3) : 0);
++                #pragma unroll
++                for (int g = 0; g < NKS; g += PF) {
++                    frag16 vb[PF];
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j) {
++                        const uint16_t* vp = vbase + (g + j) * 16 * VSTR
++                            + (VSK ? 32 * ((g + j) & 1) + 8 * (((g + j) >> 1) & 1) + 128 * ((g + j) >> 1)
++                                   : 0);
++                        if (V8) {
++                            uint32_t w4[4];
++                            fp8x8_to_16x4w<D>(*(const uint2*)&sV8[(c + (g + j) * 16) * VSTR8 +
++                                                                 mt * 16 + 8 * h], w4);
++                            vb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
++                        } else if (CTG) {
++                            const uint4 u = *(const uint4*)vp;
++                            vb[j] = D::mk(make_uint2(u.x, u.y), make_uint2(u.z, u.w));
++                        } else {
++                            vb[j] = D::mk(*(const uint2*)(vp + 4 * h),
++                                          *(const uint2*)(vp + 8 + 4 * h));
++                        }
++                    }
++                    if (SGB) sched_barrier();
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j) acc[g + j] = D::wmma(vb[j], p16, acc[g + j]);
++                }
++            }
++        }
++        if (BTS) {
++            #pragma unroll
++            for (int i = 0; i < NB; ++i) blk[i] = blkn[i];
++        }
++    }
++
++    if (!live) return;
++    // fetch-inactive: the f32 partials read lrow under `if (h == 0)` only (see the prefill kernel's
++    // epilogue).
++    const float lrow = l_i + swap16_fi(l_i);
++    const int tok = qoff + qrow;
++    const size_t idx = (size_t)(tok * a.q_heads + qhead) * splits + sp;
++    const size_t nrow = (size_t)r4d_q_total(a) * a.q_heads * splits;
++    if (PF16) {
++        // O/l in f16: bounded by max|v|, so no overflow, and the merge weight becomes w*l.
++        uint16_t* so = (uint16_t*)a.scratch;
++        float* sm = (float*)(so + nrow * HEAD_DIM);
++        float* sl = sm + nrow;
++        uint16_t* op = so + idx * HEAD_DIM;
++        const float inv = (lrow > 0.0f) ? (1.0f / lrow) : 0.0f;
++        #pragma unroll
++        for (int dt = 0; dt < NKS; ++dt) {
++            uint32_t tw[4];
++            #pragma unroll
++            for (int e = 0; e < 8; e += 2) tw[e >> 1] = DT16<1>::pk(acc[dt][e] * inv,
++                                                                    acc[dt][e + 1] * inv);
++            *(uint4*)(op + dt * 16 + 8 * h) = make_uint4(tw[0], tw[1], tw[2], tw[3]);
++        }
++        if (h == 0) { sm[idx] = m_ref; sl[idx] = lrow; }
++    } else {
++        float* so = (float*)a.scratch;
++        float* sm = so + nrow * HEAD_DIM;
++        float* sl = sm + nrow;
++        float* op = so + idx * HEAD_DIM;
++        #pragma unroll
++        for (int dt = 0; dt < NKS; ++dt) *(v8f*)(op + dt * 16 + 8 * h) = acc[dt];
++        if (h == 0) { sm[idx] = m_ref; sl[idx] = lrow; }
++    }
++}
++
++// ---- Output gate and fp8 quantiser as the merge's epilogue (attn_paged_gate_quant) ----
++//
++// A gated attention's merged row feeds gate_quant_fp8: bf16(sigmoid(gate)) times the row, rounded
++// to bf16, then E4M3 codes with one scale per 128 columns. A merge row is one (token, head) pair
++// and a scale group is 128 columns, so the `_gq` forms finish the row in registers instead of in a
++// second dispatch.
++//
++// Byte-identical to gate_quant_fp8 (r4d_fused_quant_fp8.hip): gate rounded to bf16 before the
++// multiply, product rounded, scale = group absmax / 448 (1 at zero), codes clamped to +-448, and
++// the bf16 product stored to `out`. A padded slot merges to zeros and takes the same epilogue.
++// GQ == 2 is the int8 form (scale amax / 127, round to nearest-even, r4d_q8.h).
++struct R4DGateQuant {
++    const uint16_t* g;          // gate, row `job` at g + job * g_ld
++    uint8_t*        q;          // E4M3 (or int8, `i8`) codes, row `job` at q + job * q_ld
++    float*          s;          // one scale per 128 columns, row `job` at s + job * s_ld
++    unsigned        g_ld, q_ld, s_ld;
++    int             i8;         // read by the launcher only: which combine to instantiate
++};
++constexpr int kGqGroup = 128;
++
++__device__ __forceinline__ uint16_t r4d_gq_gate(uint16_t gb, uint16_t xb) {
++    const float    gv = bf16_to_f32(gb);
++    const uint16_t ab = f32_to_bf16(1.0f / (1.0f + expf(-gv)));
++    return f32_to_bf16(bf16_to_f32(ab) * bf16_to_f32(xb));
++}
++__device__ __forceinline__ float r4d_gq_clamp(float v) { return fminf(fmaxf(v, -448.0f), 448.0f); }
++
++// The plain decode kernel, and the chained one (r4dchain*, r4d_chain.h) over the same body.
++template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
++         int WIN = 0>
++__global__ __launch_bounds__(NWARPS * 32)
++void r4d_attn_decode_kernel(const R4DArgs a, int splits)
++{
++    r4d_attn_decode_body<NWARPS, TILE, HEAD_DIM, GQA, BS, KVP, OPT, WIN>(a, splits);
++}
++
++
++// Vectorised merge, used by the h256 launcher whenever the split count fits a wave. Bit-identical
++// to splitkv_combine_body below; only the thread map differs. One wave owns one output row and
++// each lane HEAD_DIM/32 dims, so a segment is one 16-byte load per lane; a block carries JPB rows.
++// No barrier and no LDS, so rows in one block may have different contexts and segment counts.
++//
++// SPAN: merge only rows [cu_q[0], cu_q[num_seqs]). A launch over part of a step (ArPieces' pieces,
++// a mixed step's prefill half) gets q and out whole with cu_q at its own first row; r4d_q_seq
++// would map any other row onto this launch's first or last sequence and overwrite it. The decode
++// launchers never offset cu_q and do not instantiate it.
++template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN, int GQ, int SPAN = 0>
++__device__ __forceinline__
++void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
++{
++    constexpr int DPL = HEAD_DIM / 32;                 // dims a lane owns
++    const int lane = threadIdx.x & 31;
++    const int job  = blockIdx.x * JPB + (int)(threadIdx.x >> 5);
++    if (job >= r4d_q_total(a) * a.q_heads) return;
++    const int tok = job / a.q_heads;
++    if (SPAN && a.cu_q && (tok < a.cu_q[0] || tok >= a.cu_q[a.num_seqs])) return;
++    const int seq = r4d_q_seq(a.cu_q, a.num_seqs, a.q_len, tok);
++    const int ctx = a.seqused_k[seq];
++    uint16_t* outp = (uint16_t*)a.out + (size_t)job * HEAD_DIM + lane * DPL;
++
++    /* Plain store, or gated + quantised. A lane's DPL columns lie in one 128-column group of
++     * 128 / DPL lanes, so the group absmax is a butterfly over those lanes only. */
++    auto finish = [&](const uint16_t (&ob)[DPL]) {
++        if constexpr (!GQ) {
++            union { uint4 u4; uint2 u2; uint16_t w[DPL]; } o_;
++            #pragma unroll
++            for (int j = 0; j < DPL; ++j) o_.w[j] = ob[j];
++            if (DPL == 8) *(uint4*)outp = o_.u4; else *(uint2*)outp = o_.u2;
++        } else {
++            constexpr int LPG = kGqGroup / DPL;        // lanes a scale group
++            static_assert(DPL == 8 || DPL == 4, "a lane's columns are one or two dwords of codes");
++            const uint16_t* gp = gq.g + (size_t)job * gq.g_ld + lane * DPL;
++            union { uint4 u4; uint2 u2; uint16_t w[DPL]; } gi, o_;
++            if (DPL == 8) gi.u4 = *(const uint4*)gp; else gi.u2 = *(const uint2*)gp;
++            float v[DPL];
++            float m = 0.0f;
++            #pragma unroll
++            for (int j = 0; j < DPL; ++j) {
++                o_.w[j] = r4d_gq_gate(gi.w[j], ob[j]);
++                v[j] = bf16_to_f32(o_.w[j]);
++                m = fmaxf(m, fabsf(v[j]));
++            }
++            if (DPL == 8) *(uint4*)outp = o_.u4; else *(uint2*)outp = o_.u2;
++            if constexpr (LPG > 16) m = fmaxf(m, r4d_xor_lane<16>(m));
++            if constexpr (LPG > 8)  m = fmaxf(m, r4d_xor_lane<8>(m));
++            m = fmaxf(m, r4d_xor_lane<4>(m));
++            m = fmaxf(m, r4d_xor_lane<2>(m));
++            m = fmaxf(m, r4d_xor_lane<1>(m));
++            const float sc  = m > 0.0f ? m * (1.0f / q8_top<GQ == 2>()) : 1.0f;
++            const float inv = 1.0f / sc;
++            if ((lane % LPG) == 0) gq.s[(size_t)job * gq.s_ld + (lane * DPL) / kGqGroup] = sc;
++            uint32_t pk[DPL / 4];
++            #pragma unroll
++            for (int w = 0; w < DPL / 4; ++w)
++                pk[w] = q8_pack4<GQ == 2>(v[4 * w + 0], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3],
++                                          inv);
++            uint8_t* qp = gq.q + (size_t)job * gq.q_ld + lane * DPL;
++            if (DPL == 8) *(uint2*)qp = make_uint2(pk[0], pk[DPL / 4 - 1]);
++            else          *(uint32_t*)qp = pk[0];
++        }
++    };
++
++    if (ctx <= 0) {                                    // padded slot: zeros, read nothing
++        uint16_t ob[DPL];
++        #pragma unroll
++        for (int i = 0; i < DPL; ++i) ob[i] = 0;
++        finish(ob);
++        return;
++    }
++    const int nef = r4d_attn_tiles(ctx, tile)
++                  - (WIN ? r4d_attn_wlo(ctx, r4d_q_len(a.cu_q, seq, a.q_len), 0, a.window) / tile : 0);
++    const int tp_ = (nef + splits - 1) / splits;
++    const int u   = (nef + tp_ - 1) / tp_;
++    const size_t nrow = (size_t)r4d_q_total(a) * a.q_heads * splits;
++    const size_t base = (size_t)job * splits;
++
++    const float* sm; const float* sl;
++    if (PF16) { const uint16_t* so = (const uint16_t*)a.scratch;
++                sm = (const float*)(so + nrow * HEAD_DIM); sl = sm + nrow; }
++    else      { const float* so = (const float*)a.scratch;
++                sm = so + nrow * HEAD_DIM; sl = sm + nrow; }
++
++    // max is order-independent and wave-uniform, so it is a scalar walk. The sum reproduces the
++    // LDS tree's association (stride-32 pre-accumulation, then xor butterfly 16..1) so results
++    // match the non-vector merge bit for bit.
++    float gmax = -INFINITY;
++    for (int s = 0; s < u; ++s) gmax = fmaxf(gmax, sm[base + s]);
++    float tot = 0.0f;
++    for (int s = lane; s < u; s += 32) {
++        const float mm = sm[base + s];
++        const float w  = (mm <= -3.0e38f) ? 0.0f : ex2(mm - gmax);
++        tot += w * sl[base + s];
++    }
++    tot = r4d_wave_sum(tot);
++
++    float ch[CHAINS][DPL];
++    #pragma unroll
++    for (int i = 0; i < CHAINS; ++i)
++        #pragma unroll
++        for (int j = 0; j < DPL; ++j) ch[i][j] = 0.0f;
++
++    auto wgt = [&](int sx) {
++        const float mm = sm[base + sx];
++        const float w  = (mm <= -3.0e38f) ? 0.0f : ex2(mm - gmax);
++        return PF16 ? w * sl[base + sx] : w;
++    };
++
++    int s = 0;
++    if (PF16) {
++        const uint16_t* op = (const uint16_t*)a.scratch + base * HEAD_DIM + lane * DPL;
++        // One aligned access per lane per segment: 16 bytes at head_dim 256, 8 at 128.
++        union { uint4 u4; uint2 u2; __fp16 h[DPL]; } r;
++        auto rd = [&](int sx) {
++            if (DPL == 8) r.u4 = *(const uint4*)(op + (size_t)sx * HEAD_DIM);
++            else          r.u2 = *(const uint2*)(op + (size_t)sx * HEAD_DIM);
++        };
++        for (; s + CHAINS <= u; s += CHAINS) {
++            #pragma unroll
++            for (int i = 0; i < CHAINS; ++i) {
++                rd(s + i);
++                const float w = wgt(s + i);
++                #pragma unroll
++                for (int j = 0; j < DPL; ++j) ch[i][j] = fmaf(w, (float)r.h[j], ch[i][j]);
++            }
++        }
++        for (; s < u; ++s) {
++            rd(s);
++            const float w = wgt(s);
++            #pragma unroll
++            for (int j = 0; j < DPL; ++j) ch[0][j] = fmaf(w, (float)r.h[j], ch[0][j]);
++        }
++    } else {
++        const float* op = (const float*)a.scratch + base * HEAD_DIM + lane * DPL;
++        for (; s + CHAINS <= u; s += CHAINS) {
++            #pragma unroll
++            for (int i = 0; i < CHAINS; ++i) {
++                const float* p = op + (size_t)(s + i) * HEAD_DIM;
++                const float w = wgt(s + i);
++                #pragma unroll
++                for (int j = 0; j < DPL; ++j) ch[i][j] = fmaf(w, p[j], ch[i][j]);
++            }
++        }
++        for (; s < u; ++s) {
++            const float* p = op + (size_t)s * HEAD_DIM;
++            const float w = wgt(s);
++            #pragma unroll
++            for (int j = 0; j < DPL; ++j) ch[0][j] = fmaf(w, p[j], ch[0][j]);
++        }
++    }
++
++    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);   /* the query group */
++    const int krep = a.kv_rep > 1 ? a.kv_rep : 1;                    /* its cache head: kvh / krep */
++    const float vd = a.v_descale ? a.v_descale[seq * (a.kv_heads / krep) + kvh / krep] : 1.0f;
++    uint16_t ob[DPL];
++    #pragma unroll
++    for (int j = 0; j < DPL; ++j) {
++        float av = 0.0f;
++        #pragma unroll
++        for (int i = 0; i < CHAINS; ++i) av += ch[i][j];
++        // (av * vd) / tot in this order; folding vd/tot first rounds differently (one bf16 ULP).
++        ob[j] = f32_to_bf16(tot > 0.0f ? av * vd / tot : 0.0f);
++    }
++    finish(ob);
++}
++
++template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int SPAN = 0>
++__global__ __launch_bounds__(32 * JPB)
++void r4d_attn_splitkv_combine_vec_kernel(const R4DArgs a, int splits, int tile)
++{
++    splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0, SPAN>(a, splits, tile,
++                                                                         R4DGateQuant{});
++}
++
++template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int GQ = 1>
++__global__ __launch_bounds__(32 * JPB)
++void r4d_attn_splitkv_combine_vec_gq_kernel(const R4DArgs a, int splits, int tile,
++                                            const R4DGateQuant gq)
++{
++    splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, GQ>(a, splits, tile, gq);
++}
++
++// Merge. PF16=1 reads normalised f16 partials and folds l into the weight; PF16=0 reads
++// unnormalised f32 partials with l summed separately. Both walk segments in fixed index order so
++// rounding never depends on workgroup scheduling. SPAN as in the vectorised form (the return is
++// block-uniform, ahead of every barrier).
++template<int HEAD_DIM, int CHAINS, int PF16, int WIN, int GQ, int SPAN = 0>
++__device__ __forceinline__
++void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQuant& gq)
++{
++    extern __shared__ float sw[];
++    __shared__ float red[HEAD_DIM];
++    const int job = blockIdx.x, d = threadIdx.x;
++    const int tok = job / a.q_heads;
++    if (SPAN && a.cu_q && (tok < a.cu_q[0] || tok >= a.cu_q[a.num_seqs])) return;
++    const int seq = r4d_q_seq(a.cu_q, a.num_seqs, a.q_len, tok);
++    const int ctx = a.seqused_k[seq];
++
++    /* One thread per column, so a 128-column scale group is four waves, combined through `red`.
++     * Reusing `red` is safe: its last read (the total) is behind a barrier before the merge loop,
++     * and a padded slot never used it. */
++    auto finish = [&](uint16_t ob) {
++        uint16_t* op = (uint16_t*)a.out + (size_t)job * HEAD_DIM + d;
++        if constexpr (!GQ) {
++            *op = ob;
++        } else {
++            constexpr int WPG = kGqGroup / 32;         // waves a scale group
++            const uint16_t h = r4d_gq_gate(gq.g[(size_t)job * gq.g_ld + d], ob);
++            *op = h;
++            const float v = bf16_to_f32(h);
++            const float m = r4d_wave_max(fabsf(v));
++            if ((d & 31) == 0) red[d / 32] = m;
++            __syncthreads();
++            const int g0 = (d / kGqGroup) * WPG;
++            float gm = red[g0];
++            #pragma unroll
++            for (int w = 1; w < WPG; ++w) gm = fmaxf(gm, red[g0 + w]);
++            const float sc  = gm > 0.0f ? gm * (1.0f / q8_top<GQ == 2>()) : 1.0f;
++            const float inv = 1.0f / sc;
++            if ((d % kGqGroup) == 0) gq.s[(size_t)job * gq.s_ld + d / kGqGroup] = sc;
++            if constexpr (GQ == 2) {
++                gq.q[(size_t)job * gq.q_ld + d] =
++                    (uint8_t)(int)rintf(fminf(fmaxf(v * inv, -127.0f), 127.0f));
++            } else {
++                const int p = __builtin_amdgcn_cvt_pk_fp8_f32(r4d_gq_clamp(v * inv), 0.0f, 0, false);
++                gq.q[(size_t)job * gq.q_ld + d] = (uint8_t)(p & 0xff);
++            }
++        }
++    };
++
++    // A padded slot (ctx 0) would divide by zero below; write zeros and stop. ctx is
++    // block-uniform, so the barriers below stay matched.
++    if (ctx <= 0) { finish(0); return; }
++    // Segment count, derived exactly as in the decode kernel, including the window's tile floor;
++    // otherwise the merge would read partials no segment wrote.
++    const int nef = r4d_attn_tiles(ctx, tile)
++                  - (WIN ? r4d_attn_wlo(ctx, r4d_q_len(a.cu_q, seq, a.q_len), 0, a.window) / tile : 0);
++    const int tp_ = (nef + splits - 1) / splits;
++    const int u   = (nef + tp_ - 1) / tp_;
++    const size_t nrow = (size_t)r4d_q_total(a) * a.q_heads * splits;
++    const size_t base = (size_t)job * splits;
++
++    const float* sm; const float* sl;
++    if (PF16) { const uint16_t* so = (const uint16_t*)a.scratch;
++                sm = (const float*)(so + nrow * HEAD_DIM); sl = sm + nrow; }
++    else      { const float* so = (const float*)a.scratch;
++                sm = so + nrow * HEAD_DIM; sl = sm + nrow; }
++
++    float gmax = -INFINITY;
++    for (int s = d; s < u; s += HEAD_DIM) gmax = fmaxf(gmax, sm[base + s]);
++    red[d] = gmax; __syncthreads();
++    for (int off = HEAD_DIM / 2; off; off >>= 1) {
++        if (d < off) red[d] = fmaxf(red[d], red[d + off]);
++        __syncthreads();
++    }
++    gmax = red[0]; __syncthreads();
++
++    float tot = 0.0f;
++    for (int s = d; s < u; s += HEAD_DIM) {
++        const float mm = sm[base + s];
++        float w = (mm <= -3.0e38f) ? 0.0f : ex2(mm - gmax);
++        if (PF16) { w *= sl[base + s]; sw[s] = w; tot += w; }
++        else      { sw[s] = w;         tot += w * sl[base + s]; }
++    }
++    red[d] = tot; __syncthreads();
++    for (int off = HEAD_DIM / 2; off; off >>= 1) {
++        if (d < off) red[d] += red[d + off];
++        __syncthreads();
++    }
++    tot = red[0]; __syncthreads();
++
++    float ch[CHAINS];
++    #pragma unroll
++    for (int i = 0; i < CHAINS; ++i) ch[i] = 0.0f;
++    int s = 0;
++    if (PF16) {
++        const uint16_t* op = (const uint16_t*)a.scratch + base * HEAD_DIM + d;
++        for (; s + CHAINS <= u; s += CHAINS) {
++            #pragma unroll
++            for (int i = 0; i < CHAINS; ++i)
++                ch[i] = fmaf(sw[s + i], (float)__builtin_bit_cast(
++                    __fp16, op[(size_t)(s + i) * HEAD_DIM]), ch[i]);
++        }
++        for (; s < u; ++s)
++            ch[0] = fmaf(sw[s], (float)__builtin_bit_cast(__fp16, op[(size_t)s * HEAD_DIM]), ch[0]);
++    } else {
++        const float* op = (const float*)a.scratch + base * HEAD_DIM + d;
++        for (; s + CHAINS <= u; s += CHAINS) {
++            #pragma unroll
++            for (int i = 0; i < CHAINS; ++i)
++                ch[i] = fmaf(sw[s + i], op[(size_t)(s + i) * HEAD_DIM], ch[i]);
++        }
++        for (; s < u; ++s) ch[0] = fmaf(sw[s], op[(size_t)s * HEAD_DIM], ch[0]);
++    }
++    float av = 0.0f;
++    #pragma unroll
++    for (int i = 0; i < CHAINS; ++i) av += ch[i];
++
++    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);   /* the query group */
++    const int krep = a.kv_rep > 1 ? a.kv_rep : 1;                    /* its cache head: kvh / krep */
++    const float vd = a.v_descale ? a.v_descale[seq * (a.kv_heads / krep) + kvh / krep] : 1.0f;
++    finish(f32_to_bf16(tot > 0.0f ? av * vd / tot : 0.0f));
++}
++
++template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int SPAN = 0>
++__global__ __launch_bounds__(HEAD_DIM)
++void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
++{
++    splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0, SPAN>(a, splits, tile, R4DGateQuant{});
++}
++
++template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int GQ = 1>
++__global__ __launch_bounds__(HEAD_DIM)
++void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
++                                        const R4DGateQuant gq)
++{
++    splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, GQ>(a, splits, tile, gq);
++}
++
++// ---- host helpers shared by the paged decode dispatches -----------------------------------------
++
++// Split law of the full-attention legs (h256/gqa6 and the gqa8 family): as many workgroups as fit
++// under 128 (grid = splits * kv_heads * num_seqs), at least two tiles per segment. It does not
++// depend on gqa or head_dim.
++//
++// floor(128 / units), not a power of two: a power of two leaves 96-112 workgroups at 3, 5, 6 and
++// 7 requests, and floor is 2-20% faster there. Staying under a multiple of 64 matters (at five
++// requests, 13 splits = 130 workgroups is three rounds of 64 and slower than 12).
++//
++// Fewer splits mainly save partial-buffer traffic (seqs x q_len x q_heads x splits rows of
++// head_dim f16, written once and read once): at eight requests 12.8 MB at splits 32 vs 3.2 MB at
++// 8, 19% of a 16K step's KV but 1.2% at 128K. The effect fades with depth, never enough to need a
++// context term.
++//
++// The target is 256 workgroups where a workgroup has one or two waves (q_len * gqa <= 32: a plain
++// decode, or a 4-row verify of the DFlash2 short block), 128 otherwise: a one- or two-wave
++// workgroup keeps too few KV bytes in flight to load the card's DRAM at 128 (Qwen3.8-27B TP2,
++// k6_v4: one row over 100k 264 -> 175 us, a decode step at speculation 7 -4.5 %; 4x and 8x the
++// target were worse than 2x). At three waves (an 8-row verify) more workgroups only add
++// contention (+9 %). The split count already moves with the batch, so the merge sees no new
++// partition.
++//
++// Except that a three-wave workgroup reads the step's depth (r4d_decode_depth): past
++// kVerifyMinFrom it keeps at least kVerifySplitsMin segments, what 128 gives one sequence of two
++// KV heads, and past kVerifyDeepFrom it targets 512 workgroups (at most kVerifyDeepMax segments).
++// At depth the 128 target starves an 8-row verify, each segment walking 2-18k tokens. Qwen3.8-27B
++// at TP2 on the R9700, k6_v4, speculation 7, ms a decode step, forced segment counts
++// (RADIANCE_TUNE=attn_paged:splits), the 128 target (16-21 at x3-x4, 10 at x6) -> 64: x3 45k
++// 27.83 -> 27.56, 90k 32.61 -> 31.79, 180k 42.31 -> 40.47; x4 45k 29.96 -> 29.48, 90k 36.03 ->
++// 34.89, 180k 48.74 -> 46.26; x6 45k 37.39 -> 36.11, 90k 47.74 -> 44.70. Deeper still two
++// sequences want 128 (90k 26.73 -> 26.36, 180k 33.00 -> 32.01) and one 256 (180k 25.25 -> 24.93,
++// 90k level), while four stay at 64 (128: 180k 45.94 vs 46.32, 90k 35.06 vs 35.00) and six lose at
++// 128 (90k 44.91 vs 44.70): about 512 workgroups. Shallow the minimum costs up to half a percent
++// (1k: x2 20.98 -> 21.01, x4 24.01 -> 24.15, x6 28.71 -> 28.86; x4 16k 25.80 -> 25.85), hence
++// the floor. The kernel benchmark above (+9 % at x2) did not carry to the server. 64 is also the
++// vectorised merge's limit and the count one sequence already splits at.
++// Served against the 128 target, ms a decode step: x1 90k 22.07 -> 22.03, 180k 25.35 -> 24.88;
++// x2 90k 26.83 -> 26.36, 180k 33.18 -> 31.99; x3 180k 42.41 -> 40.33; x4 90k 36.20 -> 34.96. A
++// plain decode, the 4-row short block (16k x16 38.94 -> 38.90) and a verify up to 16k (1k x1-x8)
++// keep their segment count. Greedy output is unchanged.
++static constexpr int kVerifySplitsMin = 64;
++// The floor is also bounded by the batch: at most kVerifyFloorWorkgroups workgroups (segments x KV
++// heads x sequences). The scratch is sized at declare for the worst sequence count up to max_seqs,
++// and an unbounded floor reserves 64 segments for each sequence: 487.5 MiB a card for h256/gqa12 at
++// 256 sequences and max_ctx 200000, 7.62 MiB under the bound. Up to eight sequences of two KV
++// heads the floor stays 64; at 16 it is 32, at 256 two: the region stays at what eight need.
++static constexpr int kVerifyFloorWorkgroups = 1024;
++static constexpr int kVerifyMinFrom   = 16384;
++static constexpr int kVerifyDeepFrom  = 65536;
++static constexpr int kVerifyDeepMax   = 256;
++
++// The deepest context the step can reach. At issue the block table is the step's: its width moves
++// with the batch's longest sequence, rounded up (core/sched/batch.cpp, bound_bucket), while
++// `max_ctx` is the declared bound, the model's context. Declare passes no table (max_blocks 0), so
++// the scratch is sized at the declared bound, the deepest the law can be asked for; the law grows
++// with depth, so an issue never needs more.
++static inline int r4d_decode_depth(const R4DArgs* a) {
++    if (a->max_blocks > 0 && a->block_size > 0) {
++        const long long t = (long long)a->max_blocks * a->block_size;
++        if (t < a->max_ctx) return (int)t;
++    }
++    return a->max_ctx;
++}
++
++static inline int r4d_decode_splits(const R4DArgs* a, int tile) {
++    if (a->splits > 0) return a->splits;
++    const int tiles = (a->max_ctx + tile - 1) / tile;
++    const int units = std::max(1, a->kv_heads * a->num_seqs);
++    const int gqa = a->kv_heads > 0 ? std::max(1, a->q_heads / a->kv_heads) : 1;
++    int s = 256 / units;
++    if (a->q_len * gqa > 32) {
++        const int depth = r4d_decode_depth(a);
++        s = (depth > kVerifyDeepFrom ? 512 : 128) / units;
++        if (s > kVerifyDeepMax) s = kVerifyDeepMax;
++        if (depth > kVerifyMinFrom) {
++            const int floor = std::min(kVerifySplitsMin, kVerifyFloorWorkgroups / units);
++            if (s < floor) s = floor;
++        }
++    }
++    const int cap = tiles / 2;
++    if (s > cap) s = cap;
++    if (s > tiles) s = tiles;
++    if (s < 1) s = 1;
++    return s;
++}
++
++// Split law of the windowed legs (the DFlash2 drafter at h128/gqa4, Gemma 4 at h256/gqa2): target
++// 192 workgroups, round down to a power of two (min 16), keep at least two tiles per segment, then
++// step up off splits * units == 256, a slow spot for these geometries. The tile count comes from
++// the window when one is set, since that is the span the kernel walks.
++static inline long r4d_decode_scratch(const R4DArgs* a, int splits, int opt) {
++    const long rows = (long)r4d_q_total(*a) * a->q_heads;
++    return (opt & O_PF16) ? rows * splits * (long)(a->head_dim * 2 + 8)
++                          : rows * splits * (long)(a->head_dim + 2) * 4L;
++}
+diff --git a/libr4d/packed_kv/r4d_attn_prefill_h256_gqa6.hip b/libr4d/packed_kv/r4d_attn_prefill_h256_gqa6.hip
+new file mode 100644
+--- /dev/null
++++ b/libr4d/packed_kv/r4d_attn_prefill_h256_gqa6.hip
+@@ -0,0 +1,706 @@
++// R4D prefill. Transposed core: S^T = K.Q^T, one lane owns one query row, ROWS = 16*NWARPS,
++// 128-VGPR accumulator. The query is bf16 and the KV cache is fp8 or bf16; the 16-bit operand
++// format for both matmuls is f16 (see r4d_dt16.h for why).
++//
++// Two families: all-16-bit (bf16 KV) and 16/8 mixed (bf16 query, fp8, fp8_v4 or k6_v4 KV). The
++// mixed family also has lossy e4m3 legs (QK8, PV8), launched only by the rows a caller's
++// `prefill_fp8` selects.
++//
++// Each option below can be turned off on its own after a geometry change:
++//
++//   LAZY  (always on) Softmax against a reference max instead of a running one:
++//         p = 2^(s - m_ref + SHIFT), with m_ref updated and the 128-VGPR accumulator rescaled only
++//         when a row max exceeds m_ref by more than the P format absorbs (DT16::GROW octaves),
++//         instead of on every m-tile. Same relative weighting in an f32 accumulator.
++//   F16   f16 as the 16-bit operand format. gfx1201 has no bf16 convert (software RTNE is ~6 VALU);
++//         v_cvt_pkrtz_f16_f32 converts two values in one. Exact for these operands (fp8 has 3
++//         mantissa bits, bf16 7, f16 10).
++//   MSKIP Causal masking only on m-tiles that straddle the limit.
++//   FOLDQ scale * k_descale * log2(e) folded into the query once at load.
++//   CONTIG The WMMA k axis is only contracted, so relabelling it on both operands is free. Reading
++//         eight contiguous elements at 8*h gives one aligned ds_read_b128 per fragment, removes 16
++//         address adds and makes the P fragment lane-local.
++//   PF/SGB Load PF fragments before the matching PF WMMAs, with a scheduling barrier between the
++//         groups. Without the barrier PF has no effect.
++//   DOT2  v_dot2_f32_f16 row sum from the packed f16 P: 4 instructions instead of 8, and the
++//         denominator uses the p values the PV matmul used.
++//   BTS/KWIDE/GPREV/KLATE  tile staging; see each define.
++//   QK8   Lossy. Q rounded to e4m3 once at load, after the folded scale; K as e4m3 bytes in LDS
++//         (half the tile) and Q.K^T runs as fp8 WMMA at twice the f16 rate.
++//   PV8   Lossy. P rounded to e4m3 and V as e4m3 bytes in LDS, P.V as fp8 WMMA. GROW is 8
++//         octaves (e4m3's largest value is 448 = 2^8.8), and DOT2 is off: the denominator sums the
++//         p values before rounding.
++//         The LDS bytes are the cache's own for the fp8 cache and fp8_v4's K. k6_v4's K and the
++//         int4 V of fp8_v4/k6_v4 are widened to value * group scale, as for the f16 legs, and
++//         rounded once to e4m3 at staging. QK8 and PV8 need an 8-bit cache and CONTIG; a
++//         static_assert holds both.
++#include "r4d.h"
++#include "r4d_common.h"
++#include "r4d_dt16.h"
++
++#define O_F16     1
++#define O_MSKIP   2
++#define O_QK8    32
++#define O_PV8    64
++#define O_FOLDQ   8
++#define O_CONTIG  512
++#define O_PF2    1024
++#define O_PF4    2048
++#define O_PF8    3072
++#define O_SGB    4096
++#define O_DOT2  16384
++// BTS: a tile's TILE/BS block-table entries are at a wave-uniform index, so load them into SGPRs
++// once per tile. Otherwise each staging pass does two serialised memory round trips (block table,
++// then KV) inside a barrier-bounded phase with nothing else to run.
++#define O_BTS   262144
++// KWIDE: one 16-byte K fetch per thread instead of two 8-byte ones. 768 threads x 16 B is exactly
++// a 48-key fp8 tile, so staging is straight-line with half the loads and block-table lookups.
++// key = tid/16 would make a warp write one row at a 32-byte stride (4-way LDS bank conflict, since
++// 8*ch mod 32 takes four values). key = 2*warp + (lane&1), ch = (lane&31)>>1 interleaves two keys
++// so the writes cover all 32 banks, while global reads stay two contiguous 256-byte runs.
++#define O_KWIDE 524288
++// GPREV: fetch tile ti+1's V into registers right after the second barrier, so its latency is
++// hidden by tile ti's 96 WMMAs and only the LDS stores remain between barriers. V only: at
++// 240 VGPRs a K prefetch would be spilled, and a spilled prefetch is waited on immediately.
++#define O_GPREV 1048576
++// LDSB: an LDS-scoped barrier instead of __syncthreads() (lds_barrier() in r4d_common.h). The
++// default fence invalidates the vector cache twice per tile, though only LDS needs ordering.
++#define O_LDSB  2097152
++// KLATE: on the fp8 and k6_v4 caches (the wide K fetch), tile ti+1's K is fetched once tile ti's
++// last m-tile has its scores (its K fragments are dead there, so kreg adds no live range across the
++// WMMAs), and the staging between the barriers only widens and stores. Otherwise every wave of the
++// workgroup (the only one on its WGP) waits out a global round trip each tile. With the branch-free
++// K fetch and the V scales packed at the store, k6_v4 over 100k keys runs 25.96 -> 21.48 ms (2048
++// queries, r4d_selftest --perfpaged) and fp8 24.6 -> 22.7; the gain is largest once the KV no
++// longer fits the 64 MB Infinity Cache.
++#define O_KLATE 4194304
++// O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache (see r4d_attn_decode_h256_gqa6.hip).
++#define O_V4    33554432
++#define O_K6    67108864
++// O_PSPLIT: a KV split for launches with too few workgroups to fill the card (r4d_prefill_splits
++// in r4d_attn_prefill_split.h). blockIdx.x is qtile * a.splits + split, and the workgroup walks
++// only its segment of the sequence's tiles, cut as r4d_attn_tps cuts them (the partition the
++// split-KV merge recomputes from ctx), clipped at its causal end. Instead of bf16 out it stores the
++// unnormalised f32 O, m_ref and l in the decode kernel's partial layout (r4d_attn_decode_body,
++// !PF16); r4d_attn_splitkv_combine* finishes the rows, so only the summation order changes.
++#define O_PSPLIT 536870912
++
++typedef int v2i32_r4d __attribute__((ext_vector_type(2)));   // one fp8 WMMA operand (8 e4m3)
++// pack 4 floats -> 4 e4m3 bytes in element order (RNE, saturating), 2 instructions
++__device__ __forceinline__ uint32_t pk_fp8x4(float a, float b, float c, float d) {
++    const uint32_t w = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false);
++    return __builtin_amdgcn_cvt_pk_fp8_f32(c, d, w, true);
++}
++// two f16 dwords (four values in element order) -> four e4m3 bytes
++__device__ __forceinline__ uint32_t pk_fp8x4_h(uint32_t lo, uint32_t hi) {
++    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
++    const h2 a = __builtin_bit_cast(h2, lo), b = __builtin_bit_cast(h2, hi);
++    return pk_fp8x4((float)a[0], (float)a[1], (float)b[0], (float)b[1]);
++}
++// one f16 dword -> two e4m3 bytes in the low half
++__device__ __forceinline__ uint32_t pk_fp8x2_h(uint32_t w) {
++    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
++    const h2 a = __builtin_bit_cast(h2, w);
++    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)a[0], (float)a[1], 0u, false) & 0xffffu;
++}
++
++// bf16 dword -> 16-bit dword in the target format, optionally scaled. Used once per kernel on Q.
++template<class D, int FOLDQ, int F16>
++__device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
++    if (!FOLDQ) return F16 ? D::from_bf16w(w) : w;
++    return D::pk(__builtin_bit_cast(float, w << 16) * s,
++                 __builtin_bit_cast(float, w & 0xffff0000u) * s);
++}
++
++// O_PSPLIT's store: segment `sp` of row (tok, qhead) in the decode kernel's f32 partial layout,
++// O at [idx][HEAD_DIM] then m[nrow] and l[nrow], idx = (tok * q_heads + qhead) * splits + sp. Lane
++// (c, h) holds dims 16 dt + 8 h .. + 7 of its row, as at the bf16 store. An empty segment stores
++// O = 0, m = -3e38 (at the merge's zero-weight cut) and l = 0.
++template<int NKS, int HEAD_DIM>
++__device__ __forceinline__ void r4d_prefill_store_partial(const R4DArgs& a, int tok, int qhead,
++                                                          int sp, const v8f* acc, float m, float l,
++                                                          int h) {
++    const size_t idx  = (size_t)(tok * a.q_heads + qhead) * a.splits + sp;
++    const size_t nrow = (size_t)r4d_q_total(a) * a.q_heads * a.splits;
++    float* so = (float*)a.scratch;
++    float* op = so + idx * HEAD_DIM;
++    #pragma unroll
++    for (int dt = 0; dt < NKS; ++dt)
++        *(v8f*)(op + dt * 16 + 8 * h) = acc[dt];
++    if (h == 0) { so[nrow * HEAD_DIM + idx] = m; so[nrow * HEAD_DIM + nrow + idx] = l; }
++}
++
++// WIN enables a sliding window (a.window positions ending at each row's causal limit), as in the
++// decode kernel. Keys below the window are masked, and the KV walk starts at the tile holding the
++// workgroup's earliest window token. window <= 0 (or WIN off) is full attention.
++template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT, int WIN = 0>
++__global__ __launch_bounds__(NWARPS * 32)
++void r4d_attn_prefill_kernel(const R4DArgs a)
++{
++    constexpr int F16   = (OPT & O_F16)   ? 1 : 0;
++    constexpr int MSKIP = (OPT & O_MSKIP) ? 1 : 0;
++    constexpr int FOLDQ = (OPT & O_FOLDQ) ? 1 : 0;
++    constexpr int CTG   = (OPT & O_CONTIG) ? 1 : 0;
++    constexpr int PF    = 1 << ((OPT >> 10) & 3);
++    constexpr int SGB   = (OPT & O_SGB) ? 1 : 0;
++    constexpr int DOT2  = ((OPT & O_DOT2) && (OPT & O_F16) && !(OPT & O_PV8)) ? 1 : 0;
++    constexpr int BTS   = (OPT & O_BTS)   ? 1 : 0;
++    constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
++    constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
++    // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
++    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
++    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
++    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
++    constexpr int KSOFF = HEAD_DIM * 5 / 4;
++    constexpr int GPREV = ((OPT & O_GPREV) && !V4) ? 1 : 0;
++    constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
++    constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
++    // fp8_v4 takes none of the three (KLATE, the assume, the scale pack): they gain at 100k but lose
++    // 3-7 % at 25k and 50k.
++    constexpr int OLDV4 = V4 && !K6;
++    constexpr int KLATE = ((OPT & O_KLATE) && KWIDE && !KVP && !OLDV4) ? 1 : 0;
++    constexpr int QK8   = ((OPT & O_QK8) && !KVP) ? 1 : 0;
++    constexpr int PV8   = ((OPT & O_PV8) && !KVP) ? 1 : 0;
++    static_assert(!(OPT & (O_QK8 | O_PV8)) || !KVP,
++                  "the e4m3 legs need an 8-bit cache, or they compile to the exact form");
++    constexpr int SPLIT = (OPT & O_PSPLIT) ? 1 : 0;
++    static_assert(!SPLIT || !WIN, "the split partition has no window floor (the merge's WIN has)");
++    static_assert(!QK8 || KWIDE, "QK8 raw-byte staging is written for the wide K fetch");
++    typedef DT16<F16> D;
++    typedef typename D::frag frag16;
++
++    constexpr int ROWS    = NWARPS * 16;
++    constexpr int BLOCK_Q = ROWS / GQA;
++    constexpr int NKS     = HEAD_DIM / 16;
++    constexpr int MT      = TILE / 16;
++    constexpr int KSTR    = HEAD_DIM + (CTG ? 8 : 4);
++    constexpr int VSTR    = TILE + (CTG ? 8 : 4);
++    constexpr int NTHR    = NWARPS * 32;
++    constexpr int NB      = TILE / BS;                       // block-table entries per tile
++    constexpr int KEL     = KWIDE ? 16 : 8;                  // K elements fetched per thread-pass
++    constexpr int KITEMS  = TILE * (HEAD_DIM / KEL);          // K passes needed for one tile
++    constexpr int KPASS   = (KITEMS + NTHR - 1) / NTHR;        // passes per thread
++    constexpr int KREGS   = KPASS * (KVP ? 2 : 1);             // uint4 of raw K per thread
++    constexpr int NTR     = (TILE / 8) * (HEAD_DIM / (KVP ? 32 : 64));
++    constexpr int VREGS   = (NTR + NWARPS - 1) / NWARPS;        // uint4 of raw V per thread
++    constexpr float PSHIFT = D::SHIFT;
++    constexpr float PGROW  = PV8 ? 8.0f : D::GROW;   // e4m3 max is 448 = 2^8.8
++    static_assert(!KWIDE || KPASS == 1, "the wide K fetch is one straight-line pass");
++    static_assert(!K6 || KWIDE, "k6_v4 K is staged sixteen dims a thread");
++    static_assert((!QK8 && !PV8) || CTG, "the 8-bit fragment maps are written for CONTIG");
++
++    constexpr int KSTR8 = HEAD_DIM + 8, VSTR8 = TILE + 8;
++    __shared__ uint16_t sK[QK8 ? (TILE * KSTR8 + 1) / 2 : TILE * KSTR];
++    __shared__ uint16_t sV16[PV8 ? (HEAD_DIM * VSTR8 + 1) / 2 : HEAD_DIM * VSTR];
++    uint8_t* const sK8 = (uint8_t*)sK;
++    uint8_t* const sV8 = (uint8_t*)sV16;
++
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    // The launch is NTHR threads. Stated, so the wide K fetch's `key >= TILE` test (never true:
++    // KITEMS == NTHR) folds: as a branch its join made the compiler wait on every load in flight right
++    // after the K fetch, the V stores' cover included.
++    if constexpr (!OLDV4) __builtin_assume(tid < NTHR);
++    const int c = lane & 15, h = lane >> 4;
++
++    // SPLIT: blockIdx.x = qtile * splits + segment; wave-uniform, so the divide is scalar.
++    const int qb = SPLIT ? (int)blockIdx.x / a.splits : (int)blockIdx.x;
++    const int sp = SPLIT ? (int)blockIdx.x - qb * a.splits : 0;
++    const int kvh = blockIdx.y, seq = blockIdx.z;
++    const int ctx = a.seqused_k[seq];
++    if (ctx <= 0) return;
++
++    // Ragged batches: this sequence owns rows [qoff, qoff+qlen) of q and out. grid.x is sized from
++    // the batch maximum q_len, so blocks past a shorter sequence's end exit here.
++    const int qoff = r4d_q_off(a.cu_q, seq, a.q_len);
++    const int qlen = r4d_q_len(a.cu_q, seq, a.q_len);
++    if (qb * BLOCK_Q >= qlen) return;
++
++    const int row = warp * 16 + c;
++    const int qi = row / GQA, hi = row - qi * GQA;
++    const int qpos = qb * BLOCK_Q + qi;
++    const bool live = (qpos < qlen);
++    const int qrow = live ? qpos : (qlen - 1);
++    const int qhead = kvh * GQA + hi;
++
++    const int* __restrict__ bt = a.block_table + (size_t)seq * a.max_blocks;
++
++    // SPLIT: tps tiles a segment, as r4d_attn_tps cuts tiles(ctx). A segment at or past the merge's
++    // segment count u = ceil(tiles / tps) is never read: exit. One wholly past this workgroup's
++    // causal end must still be written, since the merge reads all u segments of every row: its walk
++    // is empty, so the epilogue stores the empty partial (O = 0, m_ref = -3e38, l = 0), and the
++    // prologue's prefetch of tile tstart stays inside the sequence. (A separate early store spills
++    // k6_v4's next-tile fetch addresses inside the tile loop.)
++    const int sp_tps = SPLIT ? ((ctx + TILE - 1) / TILE + a.splits - 1) / a.splits : 0;
++    if constexpr (SPLIT) {
++        if (sp * sp_tps >= (ctx + TILE - 1) / TILE) return;
++    }
++
++    const float kdesc = a.k_descale ? a.k_descale[seq * a.kv_heads + kvh] : 1.0f;
++    const float vdesc = a.v_descale ? a.v_descale[seq * a.kv_heads + kvh] : 1.0f;
++    const float mul   = a.scale * kdesc * 1.44269504089f;
++
++    frag16 qf[NKS];
++    v2i32_r4d qf8[QK8 ? NKS : 1];
++    {
++        const uint16_t* qp = (const uint16_t*)a.q
++                           + ((size_t)(qoff + qrow) * a.q_heads + qhead) * HEAD_DIM;
++        #pragma unroll
++        for (int t = 0; t < NKS; ++t) {
++            // CONTIG reads the 8 dims as one run; the split map takes them 4+4.
++            const uint2 l0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h : 4 * h));
++            const uint2 h0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h + 4 : 8 + 4 * h));
++            if constexpr (QK8) {
++                const float m_ = FOLDQ ? mul : 1.0f;
++                #define R4D_QB(w) __builtin_bit_cast(float, (w) << 16) * m_, \
++                                  __builtin_bit_cast(float, (w) & 0xffff0000u) * m_
++                qf8[t] = (v2i32_r4d){(int)pk_fp8x4(R4D_QB(l0.x), R4D_QB(l0.y)),
++                                     (int)pk_fp8x4(R4D_QB(h0.x), R4D_QB(h0.y))};
++                #undef R4D_QB
++            } else {
++                qf[t] = D::mk(make_uint2(r4d_qcvt<D, FOLDQ, F16>(l0.x, mul),
++                                         r4d_qcvt<D, FOLDQ, F16>(l0.y, mul)),
++                              make_uint2(r4d_qcvt<D, FOLDQ, F16>(h0.x, mul),
++                                         r4d_qcvt<D, FOLDQ, F16>(h0.y, mul)));
++            }
++        }
++    }
++
++    const int klimit = ctx - qlen + qpos;
++    // First key in this row's window, floored at zero. Same formula as r4d_attn_wlo, which is
++    // defined in the decode unit, included after this one.
++    int wlo = (WIN && a.window > 0) ? (ctx - qlen + qpos - a.window + 1) : 0;
++    if (WIN && a.window > 0 && wlo < 0) wlo = 0;
++
++    float m_ref = -3.0e38f;
++    float off   = PSHIFT + 3.0e38f;
++    float l_i   = 0.0f;
++    v8f acc[NKS];
++    #pragma unroll
++    for (int t = 0; t < NKS; ++t) acc[t] = (v8f){0,0,0,0,0,0,0,0};
++
++    const int qmax_cta   = min(qb * BLOCK_Q + BLOCK_Q - 1, qlen - 1);
++    const int klimit_cta = ctx - qlen + qmax_cta;
++    const int ctiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
++    // SPLIT: the segment's tiles, clipped at the causal end (empty when it starts past it).
++    const int ntiles = SPLIT ? min((sp + 1) * sp_tps, ctiles) : ctiles;
++    // First window tile, taken at this workgroup's first query row (the one reaching furthest
++    // back), not the chunk's row 0, so fully masked tiles are never walked. Starts at 0 without a
++    // window.
++    const int wlo0 = (WIN && a.window > 0) ? (ctx - qlen + qb * BLOCK_Q - a.window + 1) : 0;
++    const int tstart = SPLIT ? sp * sp_tps
++                     : (WIN && a.window > 0 && wlo0 > 0) ? (wlo0 / TILE) : 0;
++
++    // ---- staging, split into a global fetch (registers) and an LDS store ------------------------
++    // The split lets GPREV move the fetch out from between the barriers.
++    const int vg = lane >> 3, vj = lane & 7;
++    uint4 kreg[KREGS], vreg[VREGS];
++
++    // ---- fp8_v4 / k6_v4: V is int4 in groups of 32 with an f16 scale (absmax / 7): 16 bytes of
++    // codes a group at VOFF (dim d at bits 4*(d%8) of word d/8), the group scales at VSOFF. A thread stages one key pair's 8 dims: two code words and the pair's scale,
++    // fetched a tile ahead like GPREV's V, so the loads are in flight across the m-tile loop. They
++    // widen into sV16 ([dim][key]) as a dword per dim holding both keys: with u = code ^ 8 (offset
++    // binary), 0x6400 | u is the f16 1024 + u, so (x - 1032) * s is the value times s, rounded
++    // once. Key pairs run fastest across lanes,
++    // which keeps the dword stores of one dim row in distinct banks.
++    static_assert(!V4 || F16, "fp8_v4 widens V to f16");
++    constexpr int NP4 = (TILE / 2) * (HEAD_DIM / 8);
++    constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
++    // The pair's two scales stay apart until storeV4 packs them: packed here, the prefetch a tile
++    // ahead would be waited on right after it is issued (fp8_v4 packs here, see KLATE).
++    uint32_t v4c[U4][2], v4s[U4][2];
++    auto fetchV4 = [&](int k0, const int* blks) {
++        #pragma unroll
++        for (int r = 0; r < U4; ++r) {
++            const int u = tid + r * NTHR;
++            if (NP4 % NTHR == 0 || u < NP4) {
++                const int kp = u % (TILE / 2), o = u / (TILE / 2);
++                uint32_t sc[2];
++                #pragma unroll
++                for (int j = 0; j < 2; ++j) {
++                    const int kk = min(k0 + 2 * kp + j, ctx - 1);
++                    const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
++                    const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
++                                        + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
++                    v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
++                    sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
++                }
++                if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
++                else                 { v4s[r][0] = sc[0]; v4s[r][1] = sc[1]; }
++            }
++        }
++    };
++    auto storeV4 = [&]() {
++        typedef _Float16 h2 __attribute__((ext_vector_type(2)));
++        #pragma unroll
++        for (int r = 0; r < U4; ++r) {
++            const int u = tid + r * NTHR;
++            if (NP4 % NTHR == 0 || u < NP4) {
++                const int kp = u % (TILE / 2), o = u / (TILE / 2);
++                // Codes are two's complement nibbles; ^ 8 makes them offset binary (value + 8).
++                const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
++                const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
++                const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
++                const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
++                const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
++                const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
++                uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
++                uint8_t* dst8 = &sV8[(o * 8) * VSTR8 + 2 * kp];
++                #pragma unroll
++                for (int b = 0; b < 4; ++b) {
++                    // Byte b of the first key's word low, of the second key's word in the high half:
++                    // perm selects source bytes 0-3 from its second operand, 4-7 from its first,
++                    // and 0x0c is a zero byte.
++                    const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
++                    const uint32_t lo = __builtin_amdgcn_perm(n1, n0, sel) | 0x64006400u;   // dim 2b
++                    const uint32_t hi = __builtin_amdgcn_perm(m1, m0, sel) | 0x64006400u;   // dim 2b+1
++                    const h2 vl = (__builtin_bit_cast(h2, lo) - bias) * s2;
++                    const h2 vh = (__builtin_bit_cast(h2, hi) - bias) * s2;
++                    if constexpr (PV8) {
++                        // [dim][key] bytes: the pair's two keys as one 16-bit store a dim
++                        *(uint16_t*)(dst8 + (2 * b) * VSTR8)     = (uint16_t)pk_fp8x2_h(__builtin_bit_cast(uint32_t, vl));
++                        *(uint16_t*)(dst8 + (2 * b + 1) * VSTR8) = (uint16_t)pk_fp8x2_h(__builtin_bit_cast(uint32_t, vh));
++                        continue;
++                    }
++                    *(uint32_t*)(dst + (2 * b) * VSTR)     = __builtin_bit_cast(uint32_t, vl);
++                    *(uint32_t*)(dst + (2 * b + 1) * VSTR) = __builtin_bit_cast(uint32_t, vh);
++                }
++            }
++        }
++    };
++
++    auto fetchK = [&](int k0, const int* blks) {
++        #pragma unroll
++        for (int p = 0; p < KPASS; ++p) {
++            const int i = tid + p * NTHR;
++            if (KITEMS % NTHR == 0 || i < KITEMS) {
++                const int key = KWIDE ? (2 * (i >> 5) + (i & 1)) : (i / (HEAD_DIM / KEL));
++                const int ch  = KWIDE ? ((i & 31) >> 1) : (i - key * (HEAD_DIM / KEL));
++                if (KWIDE && key >= TILE) continue;
++                const int kk  = min(k0 + key, ctx - 1);
++                const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
++                const size_t o = (size_t)blk * a.kv_block_stride
++                               + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
++                if (KVP) {
++                    const uint16_t* g = (const uint16_t*)a.kv + o + ch * KEL;
++                    #pragma unroll
++                    for (int q = 0; q < (KVP ? (KEL / 8) : 1); ++q)
++                        kreg[p * (KEL / 8) + q] = *(const uint4*)(g + 8 * q);
++                } else if (K6) {
++                    // k6_v4: the chunk's sixteen low nibbles, its high-bit word, its group's scale.
++                    const uint8_t* rp = (const uint8_t*)a.kv + o;
++                    const uint2 lo = *(const uint2*)(rp + ch * 8);
++                    kreg[p] = make_uint4(lo.x, lo.y, *(const uint32_t*)(rp + HEAD_DIM / 2 + ch * 4),
++                                         *(const uint16_t*)(rp + KSOFF + (ch >> 1) * 2));
++                } else if (KWIDE) {
++                    kreg[p] = *(const uint4*)((const uint8_t*)a.kv + o + ch * 16);
++                } else {
++                    const uint2 r = *(const uint2*)((const uint8_t*)a.kv + o + ch * 8);
++                    kreg[p] = make_uint4(r.x, r.y, 0, 0);
++                }
++            }
++        }
++    };
++
++    auto fetchV = [&](int k0, const int* blks) {
++        #pragma unroll
++        for (int r = 0; r < VREGS; ++r) {
++            const int idx = warp + r * NWARPS;
++            if (NTR % NWARPS == 0 || idx < NTR) {
++                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
++                const int kg = idx / DG, dg = idx - kg * DG;
++                const int kk = min(k0 + kg * 8 + vj, ctx - 1);
++                const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
++                const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
++                const size_t o = (size_t)blk * a.kv_block_stride
++                               + (size_t)kvh * a.kv_head_stride
++                               + (size_t)(kk % BS) * ROWB + HEAD_DIM + d0;
++                const void* p = KVP ? (const void*)((const uint16_t*)a.kv + o)
++                                    : (const void*)((const uint8_t*)a.kv + o);
++                vreg[r] = __builtin_bit_cast(uint4, load_tr_b128(p));
++            }
++        }
++    };
++
++    auto storeK = [&]() {
++        #pragma unroll
++        for (int p = 0; p < KPASS; ++p) {
++            const int i = tid + p * NTHR;
++            if (KITEMS % NTHR == 0 || i < KITEMS) {
++                const int key = KWIDE ? (2 * (i >> 5) + (i & 1)) : (i / (HEAD_DIM / KEL));
++                const int ch  = KWIDE ? ((i & 31) >> 1) : (i - key * (HEAD_DIM / KEL));
++                if (KWIDE && key >= TILE) continue;
++                if constexpr (QK8 && K6) {
++                    // k6_v4: widen to f16 as below, then round each value once to e4m3
++                    const uint4 r = kreg[p];
++                    #pragma unroll
++                    for (int q = 0; q < 2; ++q) {
++                        uint32_t w4[4];
++                        k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
++                        *(uint2*)(&sK8[key * KSTR8 + ch * KEL + 8 * q]) =
++                            make_uint2(pk_fp8x4_h(w4[0], w4[1]), pk_fp8x4_h(w4[2], w4[3]));
++                    }
++                    continue;
++                } else if constexpr (QK8) {
++                    *(uint4*)(&sK8[key * KSTR8 + ch * KEL]) = kreg[p];
++                    continue;
++                }
++                uint16_t* kd = &sK[key * KSTR + ch * KEL];
++                #pragma unroll
++                for (int q = 0; q < KEL / 8; ++q) {
++                    uint32_t w4[4];
++                    if (KVP) {
++                        const uint4 r = kreg[p * (KEL / 8) + q];
++                        w4[0] = D::from_bf16w(r.x); w4[1] = D::from_bf16w(r.y);
++                        w4[2] = D::from_bf16w(r.z); w4[3] = D::from_bf16w(r.w);
++                    } else {
++                        const uint4 r = kreg[p];
++                        if constexpr (K6) k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
++                        else fp8x8_to_16x4w<D>(q ? make_uint2(r.z, r.w) : make_uint2(r.x, r.y), w4);
++                    }
++                    *(uint2*)(kd + 8 * q)     = make_uint2(w4[0], w4[1]);
++                    *(uint2*)(kd + 8 * q + 4) = make_uint2(w4[2], w4[3]);
++                }
++            }
++        }
++    };
++
++    auto storeV = [&]() {
++        #pragma unroll
++        for (int r = 0; r < VREGS; ++r) {
++            const int idx = warp + r * NWARPS;
++            if (NTR % NWARPS == 0 || idx < NTR) {
++                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
++                const int kg = idx / DG, dg = idx - kg * DG;
++                const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
++                const uint4 v = vreg[r];
++                if (KVP) {
++                    uint16_t* dst = &sV16[(d0 + vj) * VSTR + kg * 8];
++                    *(uint2*)(dst)     = make_uint2(D::from_bf16w(v.x), D::from_bf16w(v.y));
++                    *(uint2*)(dst + 4) = make_uint2(D::from_bf16w(v.z), D::from_bf16w(v.w));
++                } else {
++                    // tr_b128 transposes 16-bit lanes, so each short holds two fp8 from adjacent
++                    // dims; v_perm_b32 splits them into two dim rows.
++                    const uint32_t lo0 = byte_gather(v.x, v.y, 0), lo1 = byte_gather(v.z, v.w, 0);
++                    const uint32_t hi0 = byte_gather(v.x, v.y, 1), hi1 = byte_gather(v.z, v.w, 1);
++                    if constexpr (PV8) {
++                        *(uint2*)(&sV8[(d0 + 2 * vj)     * VSTR8 + kg * 8]) = make_uint2(lo0, lo1);
++                        *(uint2*)(&sV8[(d0 + 2 * vj + 1) * VSTR8 + kg * 8]) = make_uint2(hi0, hi1);
++                        continue;
++                    }
++                    uint32_t wl[4], wh[4];
++                    fp8x8_to_16x4w<D>(make_uint2(lo0, lo1), wl);
++                    fp8x8_to_16x4w<D>(make_uint2(hi0, hi1), wh);
++                    uint16_t* a0 = &sV16[(d0 + 2 * vj)     * VSTR + kg * 8];
++                    uint16_t* a1 = &sV16[(d0 + 2 * vj + 1) * VSTR + kg * 8];
++                    *(uint2*)(a0)     = make_uint2(wl[0], wl[1]);
++                    *(uint2*)(a0 + 4) = make_uint2(wl[2], wl[3]);
++                    *(uint2*)(a1)     = make_uint2(wh[0], wh[1]);
++                    *(uint2*)(a1 + 4) = make_uint2(wh[2], wh[3]);
++                }
++            }
++        }
++    };
++
++    // Tile ti's block-table entries are loaded during tile ti-1, off the KV address chain.
++    // A multi-block tile can run past the sequence's last block (on the last row, past the end of
++    // the table). Keys are clamped to ctx - 1, so entries past lastb are never used; only tiles
++    // reaching past lastb take the clamped load. With NB == 1 the test folds away.
++    const int lastb = (ctx - 1) / BS;
++    auto load_bt = [&](int t0, int* out) {
++        if (NB > 1 && t0 + NB - 1 > lastb) {
++            #pragma unroll
++            for (int i = 0; i < NB; ++i) out[i] = bt[min(t0 + i, lastb)];
++        } else {
++            #pragma unroll
++            for (int i = 0; i < NB; ++i) out[i] = bt[t0 + i];
++        }
++    };
++    int blk[NB];
++    if (BTS) load_bt(tstart * NB, blk);
++    if (GPREV) fetchV(tstart * TILE, blk);
++    if (V4) fetchV4(tstart * TILE, blk);
++    if (KLATE) fetchK(tstart * TILE, blk);
++
++    for (int ti = tstart; ti < ntiles; ++ti) {
++        const int k0 = ti * TILE;
++        int blkn[NB];
++        if (BTS && ti + 1 < ntiles) {
++            load_bt((ti + 1) * NB, blkn);
++        }
++        if (LDSB) lds_barrier(); else __syncthreads();
++        if (!KLATE) fetchK(k0, blk);
++        // V first: already in registers.
++        if constexpr (V4) { storeV4(); } else { if (!GPREV) fetchV(k0, blk); storeV(); }
++        storeK();
++        if (LDSB) lds_barrier(); else __syncthreads();
++        // Issue the next tile's V loads before the WMMAs below; they are consumed after the next
++        // barrier.
++        if (GPREV && ti + 1 < ntiles) fetchV(k0 + TILE, blkn);
++        if (V4 && ti + 1 < ntiles) fetchV4(k0 + TILE, blkn);
++
++        #pragma unroll 1
++        for (int mt = 0; mt < MT; ++mt) {
++            v8f s = (v8f){0,0,0,0,0,0,0,0};
++            if constexpr (QK8) {
++                const uint8_t* krow8 = &sK8[(mt * 16 + c) * KSTR8] + 8 * h;
++                #pragma unroll
++                for (int g = 0; g < NKS; g += PF) {
++                    v2i32_r4d kb8[PF];
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j)
++                        kb8[j] = *(const v2i32_r4d*)(krow8 + 16 * (g + j));
++                    if (SGB) sched_barrier();
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j)
++                        s = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(kb8[j], qf8[g + j], s);
++                }
++            } else {
++                const uint16_t* krow = &sK[(mt * 16 + c) * KSTR] + (CTG ? 8 * h : 0);
++                // Load PF fragments before issuing their WMMAs, so each WMMA waits on
++                // s_wait_dscnt PF-1 instead of a full drain.
++                #pragma unroll
++                for (int g = 0; g < NKS; g += PF) {
++                    frag16 kb[PF];
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j) {
++                        const uint16_t* kp = krow + 16 * (g + j);
++                        if (CTG) {
++                            const uint4 u = *(const uint4*)kp;
++                            kb[j] = D::mk(make_uint2(u.x, u.y), make_uint2(u.z, u.w));
++                        } else {
++                            kb[j] = D::mk(*(const uint2*)(kp + 4 * h),
++                                          *(const uint2*)(kp + 8 + 4 * h));
++                        }
++                    }
++                    if (SGB) sched_barrier();
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j) s = D::wmma(kb[j], qf[g + j], s);
++                }
++            }
++            if (KLATE && mt == MT - 1 && ti + 1 < ntiles) fetchK(k0 + TILE, blkn);
++            float sc[8];
++            #pragma unroll
++            for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
++
++            const int kbase = k0 + mt * 16 + 8 * h;
++            // Mask keys past klimit and, with WIN, before wlo. MSKIP skips tiles straddling neither.
++            if (!MSKIP || wave_any(kbase + 7 > klimit) || (WIN && wave_any(kbase < wlo))) {
++                #pragma unroll
++                for (int e = 0; e < 8; ++e) sc[e] = ((kbase + e <= klimit) && (!WIN || kbase + e >= wlo))
++                                                    ? sc[e] : -INFINITY;
++            }
++
++            float smax = sc[0];
++            #pragma unroll
++            for (int e = 1; e < 8; ++e) smax = fmaxf(smax, sc[e]);
++            // The rescale is the wave's, so a row's bits depend on the rows sharing its wave. Only
++            // live rows decide it: a row past qlen limits its keys at its own qpos, past ctx, so it
++            // scores whatever the cache's last block held before (another request's KV), and the
++            // last query rows of a sequence's final block would round by that.
++            if (wave_any(live && smax > m_ref + PGROW)) {
++                const float rmax  = fmaxf(smax, swap16(smax));
++                const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
++                const float alpha = ex2(m_ref - mnew);
++                #pragma unroll
++                for (int dt = 0; dt < NKS; ++dt)
++                    #pragma unroll
++                    for (int e = 0; e < 8; ++e) acc[dt][e] *= alpha;
++                l_i *= alpha;
++                m_ref = mnew;
++                off   = PSHIFT - mnew;
++            }
++
++            float pf[8], lsum = 0.0f;
++            #pragma unroll
++            for (int e = 0; e < 8; ++e) {
++                const float p = ex2(sc[e] + off);
++                pf[e] = p;
++                if (!DOT2) lsum += p;
++            }
++            if (!DOT2) l_i += lsum;
++
++            if constexpr (PV8) {
++                const v2i32_r4d p8 = (v2i32_r4d){(int)pk_fp8x4(pf[0], pf[1], pf[2], pf[3]),
++                                                 (int)pk_fp8x4(pf[4], pf[5], pf[6], pf[7])};
++                const uint8_t* vbase8 = &sV8[c * VSTR8 + mt * 16 + 8 * h];
++                #pragma unroll
++                for (int g = 0; g < NKS; g += PF) {
++                    v2i32_r4d vb8[PF];
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j)
++                        vb8[j] = *(const v2i32_r4d*)(vbase8 + (size_t)(g + j) * 16 * VSTR8);
++                    if (SGB) sched_barrier();
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j)
++                        acc[g + j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(vb8[j], p8, acc[g + j]);
++                }
++            } else {
++                uint32_t pw[4];
++                #pragma unroll
++                for (int e = 0; e < 8; e += 2) pw[e >> 1] = D::pk(pf[e], pf[e + 1]);
++                if (DOT2) {
++                    const v2hf one = {(__fp16)1.0f, (__fp16)1.0f};
++                    #pragma unroll
++                    for (int e = 0; e < 4; ++e)
++                        l_i = __builtin_amdgcn_fdot2(__builtin_bit_cast(v2hf, pw[e]), one, l_i, false);
++                }
++                const uint2 lo  = make_uint2(pw[0], pw[1]);
++                const uint2 hi2 = make_uint2(pw[2], pw[3]);
++                // QK leaves lane (c,h) holding keys 8h+e. Under CONTIG that is already the B
++                // fragment; the split map needs a cross-half exchange.
++                frag16 p16;
++                if (CTG) {
++                    p16 = D::mk(lo, hi2);
++                } else {
++                    const uint2 y = swap16_u2p((h == 0) ? hi2 : lo);
++                    p16 = (h == 0) ? D::mk(lo, y) : D::mk(y, hi2);
++                }
++                const uint16_t* vbase = &sV16[c * VSTR + mt * 16] + (CTG ? 8 * h : 0);
++                #pragma unroll
++                for (int g = 0; g < NKS; g += PF) {
++                    frag16 vb[PF];
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j) {
++                        const uint16_t* vp = vbase + (g + j) * 16 * VSTR;
++                        if (CTG) {
++                            const uint4 u = *(const uint4*)vp;
++                            vb[j] = D::mk(make_uint2(u.x, u.y), make_uint2(u.z, u.w));
++                        } else {
++                            vb[j] = D::mk(*(const uint2*)(vp + 4 * h),
++                                          *(const uint2*)(vp + 8 + 4 * h));
++                        }
++                    }
++                    if (SGB) sched_barrier();
++                    #pragma unroll
++                    for (int j = 0; j < PF; ++j) acc[g + j] = D::wmma(vb[j], p16, acc[g + j]);
++                }
++            }
++        }
++        if (BTS) {
++            #pragma unroll
++            for (int i = 0; i < NB; ++i) blk[i] = blkn[i];
++        }
++    }
++
++    if (!live) return;
++    // fetch-inactive: the split store reads l_i under `if (h == 0)` only, so the exchange may be sunk
++    // into that half; swap16_fi still reads the partner's half of the row sum.
++    l_i += swap16_fi(l_i);
++    if constexpr (SPLIT) {
++        // Unnormalised: the merge weighs segments by 2^(m - max m) and applies v_descale itself.
++        r4d_prefill_store_partial<NKS, HEAD_DIM>(a, qoff + qpos, qhead, sp, acc, m_ref, l_i, h);
++        return;
++    }
++    const float inv = (l_i > 0.0f) ? (vdesc / l_i) : 0.0f;
++    uint16_t* op = (uint16_t*)a.out
++                 + ((size_t)(qoff + qpos) * a.q_heads + qhead) * HEAD_DIM;
++    #pragma unroll
++    for (int dt = 0; dt < NKS; ++dt) {
++        uint32_t tw[4];
++        #pragma unroll
++        for (int e = 0; e < 8; e += 2)
++            tw[e >> 1] = (uint32_t)f32_to_bf16(acc[dt][e] * inv)
++                       | ((uint32_t)f32_to_bf16(acc[dt][e + 1] * inv) << 16);
++        *(uint4*)(op + dt * 16 + 8 * h) = make_uint4(tw[0], tw[1], tw[2], tw[3]);
++    }
++}
+diff --git a/libr4d/packed_kv/r4d_common.h b/libr4d/packed_kv/r4d_common.h
+new file mode 100644
+--- /dev/null
++++ b/libr4d/packed_kv/r4d_common.h
+@@ -0,0 +1,329 @@
++// Shared device-side machinery for R4D. The layout algebra here was verified on hardware with
++// targeted probes; do not "fix" it from a vendor doc.
++#pragma once
++#include <hip/hip_runtime.h>
++#include <cstdint>
++
++// The W4A8 scale group lives here, not in either GEMM, because both read the same packed weight and
++// a disagreement would be silently wrong, not a link error. r4d_gemm_args.h restates it and checks
++// it against the layout constant.
++#define R4D_GEMM_W4A8_GROUP 128      // K per scale
++
++// ---- ragged query batches ----------------------------------------------------------------------
++// A paged-attention batch may have a different query length per sequence (R4DArgs::cu_q in r4d.h).
++// These are the two lookups every kernel indexing the dense q or out block needs, plus the inverse
++// for the split-KV combine, which walks output rows rather than sequences. With cu_q null they
++// compile to one multiply and no load; the branch is wave-uniform (cu_q is a kernel argument).
++__device__ __forceinline__ int r4d_q_off(const int* cu_q, int seq, int q_len) {
++    return cu_q ? cu_q[seq] : seq * q_len;
++}
++__device__ __forceinline__ int r4d_q_len(const int* cu_q, int seq, int q_len) {
++    return cu_q ? (cu_q[seq + 1] - cu_q[seq]) : q_len;
++}
++// num_seqs is at most a few tens, so the search is a few scalar loads, once per block.
++__device__ __forceinline__ int r4d_q_seq(const int* cu_q, int num_seqs, int q_len, int tok) {
++    if (!cu_q) return tok / q_len;
++    int lo = 0, hi = num_seqs;                       // invariant: cu_q[lo] <= tok < cu_q[hi]
++    while (hi - lo > 1) {
++        const int mid = (lo + hi) >> 1;
++        if (cu_q[mid] <= tok) lo = mid; else hi = mid;
++    }
++    return lo;
++}
++
++// ---- the occupancy a kernel is built for ---------------------------------------------------------
++// R4D_WAVES(n) fixes the waves per SIMD the compiler schedules a kernel for. Otherwise the
++// scheduler picks that target itself and the choice moves between compiler releases (LLVM 24
++// serialises a GEMM's loads to win one more wave, paying a load round trip per WMMA). A kernel
++// whose speed rests on a register budget states it here. `n` may depend on template arguments.
++#define R4D_WAVES(n) __attribute__((amdgpu_waves_per_eu((n), (n))))
++
++typedef short    v8s __attribute__((ext_vector_type(8)));
++typedef float    v8f __attribute__((ext_vector_type(8)));
++typedef float    v2f __attribute__((ext_vector_type(2)));   // what cvt_pk_f32_fp8 actually returns
++
++/* A 16-byte staging register as a native vector. HIP's uint4 is a class template wrapping a
++ * union, and an array of them carried across a K loop (the next tile's chunks) is kept in scratch
++ * by LLVM 22 and 24, adding a scratch store and load per chunk; an ext_vector_type array is
++ * promoted to registers. Loaded and stored whole only. r4d_dflash_conv_body.h declares the same
++ * type for a source also compiled without this header. */
++typedef unsigned int r4d_u32x4 __attribute__((ext_vector_type(4)));
++
++// exp2 with the hardware transcendental.
++
++__device__ __forceinline__ float ex2(float x) {
++#if __has_builtin(__builtin_amdgcn_exp2f)
++    return __builtin_amdgcn_exp2f(x);
++#else
++    return exp2f(x);
++#endif
++}
++
++// f32 -> bf16, round-to-nearest-even, in software: gfx1201 has no v_cvt_pk_bf16_f32.
++__device__ __forceinline__ uint16_t f32_to_bf16(float f) {
++    uint32_t u = __builtin_bit_cast(uint32_t, f);
++    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
++}
++
++// And back: a shift, since every bf16 is exactly a float.
++__device__ __forceinline__ float bf16_to_f32(uint16_t h) {
++    return __builtin_bit_cast(float, (uint32_t)h << 16);
++}
++
++// ---- 16-bit values held in whole registers -------------------------------------------------------
++// LLVM 24 gives gfx12 real 16-bit registers: a 16-bit value lives in one half of a VGPR. Packing
++// two bf16 then costs a shift and a half move per pair instead of one v_perm_b32, widening costs a
++// half move and a shift, and a 16-bit load into a half (global_load_d16_b16) depends on the
++// register's earlier contents, so the waitcnt pass waits for them. The helpers below keep bf16 data
++// in whole 32-bit registers from load to store, which compiles the same under LLVM 22 and 24 and
++// gives the same bits as the 16-bit forms.
++
++// f32 -> bf16 rounded to nearest even, as the high half of a word whose low half is not zero
++// (f32_to_bf16 before its final shift). A NaN can round to infinity, as there.
++__device__ __forceinline__ uint32_t bf16_hi_rne(float f) {
++    const uint32_t u = __float_as_uint(f);
++    return u + 0x7fffu + ((u >> 16) & 1u);
++}
++// Rounds as (__hip_bfloat16)f does (LLVM's expansion): a NaN stays NaN, quieted; everything else
++// rounds to nearest even. Both results are formed before the select so it compiles to one
++// v_cndmask; `nan ? u | 0x400000 : u + ...` makes each element an exec-masked branch.
++__device__ __forceinline__ uint32_t bf16_hi_rne_nan(float f) {
++    const uint32_t u = __float_as_uint(f);
++    const uint32_t r = u + 0x7fffu + ((u >> 16) & 1u), q = u | 0x400000u;
++    return f != f ? q : r;
++}
++// Two such words as one bf16 pair, `lo`'s high half in the low half: one byte permute.
++__device__ __forceinline__ uint32_t bf16_pack_hi(uint32_t lo, uint32_t hi) {
++    return __builtin_amdgcn_perm(hi, lo, 0x07060302u);
++}
++// Two floats as a bf16 pair (`lo` in the low half), rounded as f32_to_bf16 rounds.
++__device__ __forceinline__ uint32_t bf16x2_rne(float lo, float hi) {
++    return bf16_pack_hi(bf16_hi_rne(lo), bf16_hi_rne(hi));
++}
++// Two floats as a bf16 pair, rounded as (__hip_bfloat16) rounds.
++__device__ __forceinline__ uint32_t bf16x2_rne_nan(float lo, float hi) {
++    return bf16_pack_hi(bf16_hi_rne_nan(lo), bf16_hi_rne_nan(hi));
++}
++// A bf16 pair word's two values as floats: a shift and a mask, no conversion.
++__device__ __forceinline__ float bf16w_lo(uint32_t w) { return __uint_as_float(w << 16); }
++__device__ __forceinline__ float bf16w_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
++
++// One 16-bit element of global memory, zero-extended into a whole register (global_load_u16).
++// Loaded as uint16_t it would go into a register half (global_load_d16_b16 or d16_hi_b16) and wait
++// for the other half; through a generic pointer it would also be a flat load. The pointer must
++// address global memory.
++typedef __attribute__((address_space(1))) const uint16_t* r4d_gu16;
++__device__ __forceinline__ uint32_t ldg_u16(const uint16_t* p) { return *(r4d_gu16)p; }
++
++// `lane ^ N` without the LDS pipe. `__shfl_xor` lowers to `ds_bpermute_b32` plus `s_wait_dscnt`,
++// an LDS round trip that dominates a dependency chain (e.g. a dot product closed in a token loop).
++// gfx10+ DPP16 has ROW_XMASK (0x160 | N), so for N < 16 the partner read is a modifier on the
++// consuming VALU op (`v_add_f32_dpp ... row_xmask:2`). N = 16 crosses the two 16-lane rows of a
++// wave32 and uses v_permlanex16, still one VALU op. Same lane mapping and value as the shuffle,
++// provided all lanes are active, which every caller's whole-wave butterfly guarantees.
++template <int N>
++__device__ __forceinline__ uint32_t r4d_xor_lane_u32(uint32_t v) {
++    static_assert(N >= 1 && N <= 16 && (N & (N - 1)) == 0, "a lane xor within the wave");
++    if constexpr (N < 16)
++        return (uint32_t)__builtin_amdgcn_update_dpp(0, (int)v, 0x160 | N, 0xf, 0xf, true);
++    else
++        return (uint32_t)__builtin_amdgcn_permlanex16((int)v, (int)v, 0x76543210u, 0xFEDCBA98u,
++                                                      false, false);
++}
++
++template <int N>
++__device__ __forceinline__ float r4d_xor_lane(float v) {
++    return __uint_as_float(r4d_xor_lane_u32<N>(__float_as_uint(v)));
++}
++
++// A 64-bit value's partner: the halves exchanged separately, as a 64-bit `__shfl_xor` does.
++template <int N>
++__device__ __forceinline__ unsigned long long r4d_xor_lane_u64(unsigned long long v) {
++    const uint32_t lo = r4d_xor_lane_u32<N>((uint32_t)v);
++    const uint32_t hi = r4d_xor_lane_u32<N>((uint32_t)(v >> 32));
++    return ((unsigned long long)hi << 32) | lo;
++}
++
++// Exchange between lane L and lane L^16 (the two halves a wave32 WMMA fragment splits a row
++// across). v_permlanex16_b32 swaps only with identity selectors (each 4-bit field names the source
++// lane in the other half; sel0 covers lanes 0-7, sel1 lanes 8-15); zero selectors would silently
++// broadcast lane 0.
++__device__ __forceinline__ float swap16(float x) { return r4d_xor_lane<16>(x); }
++
++// The same exchange with fetch-inactive set. swap16 assumes every lane is active; where only one half
++// consumes the result (a store under `if (h == 0)`), a compiler may sink the exchange into that half,
++// and with fi = 0 a lane then reads its own value for the inactive partner's. fi = 1 reads the
++// partner's register whatever exec says, so a pair sum stays a pair sum. Identical to swap16 with
++// every lane active.
++__device__ __forceinline__ float swap16_fi(float x) {
++    return __uint_as_float((uint32_t)__builtin_amdgcn_permlanex16(
++        (int)__float_as_uint(x), (int)__float_as_uint(x), 0x76543210u, 0xFEDCBA98u, true, false));
++}
++
++// A wave32 sum on DPP instead of the LDS crossbar. `__shfl_xor` is a `ds_bpermute_b32` on gfx1201
++// at any offset, queued behind other LDS traffic; where little arithmetic separates reductions, a
++// five-stage shuffle butterfly dominates the run. Offsets 8..1 use row_xmask (dpp_ctrl 0x160 | N)
++// as a modifier on the add; 16 uses v_permlanex16_b32 (see swap16).
++//
++// The lanes exchanged and the order of the adds match the shuffle loop, so this is bit-identical
++// and a kernel can move onto it without its output changing. Row and bank masks are all-ones since
++// every lane participates; `bound_ctrl` is moot because every lane has a partner.
++template <int CTRL>
++__device__ __forceinline__ float r4d_dpp_xor_add(float v) {
++    return v + __builtin_bit_cast(float,
++        __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), CTRL, 0xF, 0xF, true));
++}
++
++__device__ __forceinline__ float r4d_wave_sum(float v) {
++    v += swap16(v);                        /* xor 16 -- crosses the two rows of sixteen */
++    v = r4d_dpp_xor_add<0x168>(v);         /* xor  8 -- row_xmask from here down */
++    v = r4d_dpp_xor_add<0x164>(v);         /* xor  4 */
++    v = r4d_dpp_xor_add<0x162>(v);         /* xor  2 */
++    v = r4d_dpp_xor_add<0x161>(v);         /* xor  1 */
++    return v;
++}
++
++// The same butterfly over a group of W lanes (W a power of two up to the wave): the exchanges of
++// `for (o = W / 2; o; o >>= 1) v = op(v, __shfl_xor(v, o))`, in its order, so bit-identical to
++// that loop.
++template <int W>
++__device__ __forceinline__ float r4d_xor_sum(float v) {
++    static_assert(W >= 1 && W <= 32 && (W & (W - 1)) == 0, "a power-of-two group within the wave");
++    if constexpr (W >= 32) v += r4d_xor_lane<16>(v);
++    if constexpr (W >= 16) v += r4d_xor_lane<8>(v);
++    if constexpr (W >= 8)  v += r4d_xor_lane<4>(v);
++    if constexpr (W >= 4)  v += r4d_xor_lane<2>(v);
++    if constexpr (W >= 2)  v += r4d_xor_lane<1>(v);
++    return v;
++}
++
++template <int W>
++__device__ __forceinline__ float r4d_xor_max(float v) {
++    static_assert(W >= 1 && W <= 32 && (W & (W - 1)) == 0, "a power-of-two group within the wave");
++    if constexpr (W >= 32) v = fmaxf(v, r4d_xor_lane<16>(v));
++    if constexpr (W >= 16) v = fmaxf(v, r4d_xor_lane<8>(v));
++    if constexpr (W >= 8)  v = fmaxf(v, r4d_xor_lane<4>(v));
++    if constexpr (W >= 4)  v = fmaxf(v, r4d_xor_lane<2>(v));
++    if constexpr (W >= 2)  v = fmaxf(v, r4d_xor_lane<1>(v));
++    return v;
++}
++
++__device__ __forceinline__ float r4d_wave_max(float v) { return r4d_xor_max<32>(v); }
++
++/* A wave's inclusive prefix and suffix sums in registers: row_shr (or row_shl) 1, 2, 4 and 8
++ * within each row of sixteen, then the other row's total from one readlane. Lane L ends with the
++ * sum over lanes 0..L (prefix) or L..31 (suffix). Replaces LDS step-doubling scans (two barriers a
++ * round); integer sums, so combine order does not matter. Every lane must be active. */
++__device__ __forceinline__ uint32_t r4d_wave_prefix_u32(uint32_t x, int lane) {
++    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x111, 0xF, 0xF, true);   /* row_shr:1 */
++    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x112, 0xF, 0xF, true);   /* row_shr:2 */
++    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x114, 0xF, 0xF, true);   /* row_shr:4 */
++    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x118, 0xF, 0xF, true);   /* row_shr:8 */
++    const uint32_t lo = (uint32_t)__builtin_amdgcn_readlane((int)x, 15);
++    return lane >= 16 ? x + lo : x;
++}
++
++__device__ __forceinline__ uint32_t r4d_wave_suffix_u32(uint32_t x, int lane) {
++    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x101, 0xF, 0xF, true);   /* row_shl:1 */
++    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x102, 0xF, 0xF, true);   /* row_shl:2 */
++    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x104, 0xF, 0xF, true);   /* row_shl:4 */
++    x += (uint32_t)__builtin_amdgcn_update_dpp(0, (int)x, 0x108, 0xF, 0xF, true);   /* row_shl:8 */
++    const uint32_t hi = (uint32_t)__builtin_amdgcn_readlane((int)x, 16);
++    return lane < 16 ? x + hi : x;
++}
++
++// 8x8 transpose of 16-bit elements across each group of 8 lanes. Lane j receives element j from
++// each of the 8 lanes in its group; the 8 addresses may be arbitrarily strided.
++__device__ __forceinline__ v8s load_tr_b128(const void* p) {
++    // This builtin requires a global (address_space(1)) pointer from ROCm 7.2 / LLVM 22 on; a
++    // generic pointer does not convert implicitly. Every caller passes a global address.
++    return __builtin_amdgcn_global_load_tr_b128_v8i16(
++        (__attribute__((address_space(1))) v8s*)const_cast<void*>(p));
++}
++
++// Gather the low (sel=0) or high (sel=1) byte of each of four 16-bit lanes of {w0,w1} into one
++// dword. Written so the compiler can contract each to a single v_perm_b32.
++__device__ __forceinline__ uint32_t byte_gather(uint32_t w0, uint32_t w1, int sel) {
++    uint32_t s = (uint32_t)sel * 8u;
++    return ((w0 >> s) & 0xffu)
++         | (((w0 >> (16 + s)) & 0xffu) << 8)
++         | (((w1 >> s) & 0xffu) << 16)
++         | (((w1 >> (16 + s)) & 0xffu) << 24);
++}
++
++__device__ __forceinline__ void sched_barrier() { __builtin_amdgcn_sched_barrier(0); }
++
++// __syncthreads() is a workgroup-scope acquire-release fence over all address spaces, so on gfx12
++// it emits `global_inv scope:SCOPE_SE` on both sides, discarding the L0/L1 lines the next tile's
++// KV loads would hit. These barriers only order LDS traffic, so the fence is scoped to the local
++// address space and the invalidate disappears.
++__device__ __forceinline__ void lds_barrier() {
++    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
++    __builtin_amdgcn_s_barrier();
++    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
++}
++
++// Two-dword form of swap16.
++__device__ __forceinline__ uint2 swap16_u2p(uint2 v) {
++    return make_uint2(__builtin_bit_cast(uint32_t, swap16(__builtin_bit_cast(float, v.x))),
++                      __builtin_bit_cast(uint32_t, swap16(__builtin_bit_cast(float, v.y))));
++}
++
++// ---------------------------------------------------------------------------------------------
++// Workgroup width for the activation-path kernels
++//
++// had_quant_act_i8, rmsnorm_had_quant_i8, gated_had_quant_i8 and gdn_gated_norm_had_quant_i8 launch
++// one workgroup per row, so at decode batch sizes the grid is a few tens of workgroups on a 64-CU
++// part and they are latency bound. Widening the workgroup is the only knob that adds parallelism,
++// and it is the large win at small M.
++//
++// It reverses once the grid alone fills the machine. At 1024 threads there is a residency cliff
++// just past M=32 where the wider workgroup stops fitting and the cost roughly doubles, so 1024 is
++// used only with clearance below it.
++//
++// Where 512 stops paying depends on K, because the K floats of LDS a row needs cap how many
++// workgroups a CU holds. At K=8704 only one fits at either width, so wider wins out to large M; at
++// K=3072 five fit, the grid fills the part, and past M~72 the narrow width is even. The thresholds
++// below are those crossovers.
++__host__ __device__ __forceinline__ int r4d_act_threads(int M, int K) {
++    if (M <= 32) return 1024;
++    const int lim = K >= 8192 ? (1 << 24) : (K >= 4096 ? 120 : 72);
++    return M <= lim ? 512 : 256;
++}
++
++// The partition a row's sum is folded over, whatever the workgroup width: lane v < kR4dSumLanes
++// adds columns v, v + kR4dSumLanes, ... in order, the lanes past it add nothing, and block_sum adds
++// the wave sums from the first. Folding over the width instead would round a row's norm by how many
++// rows its launch carries, since r4d_act_threads widens the workgroup at small M: the same token in
++// a 64-token prefill chunk and in a 2048-token one would get different bits. 256 is the narrowest
++// width, so a launch at it keeps the order it always had.
++constexpr uint32_t kR4dSumLanes = 256;
++
++// The full-card cliff of the R9700 (gfx1201, 64 CUs). A launch whose wavefront count falls in
++// the last 32 before a multiple of 2048 runs about five times slower than the same work one
++// workgroup wider, whatever the kernel does: 256-thread workgroups take 27.6 us at 253 to 256 of
++// them and 5.2 us at 252 or 257, for a norm, an LDS-only kernel and a copy alike.
++//
++// 2048 is every wave slot of the R9700 (64 CUs x 2 SIMDs x 16). Both numbers are that card's and
++// apply on every target libr4d builds for. They are not derived from the device: no other card has
++// been measured, and HIP's multiProcessorCount counts WGPs, not CUs, on RDNA. On an RDNA4 part with
++// fewer CUs a launch padded here costs one idle row and gives the same bytes; a cliff at that
++// part's own full-card size, if it has one, is not stepped past.
++//
++// r4d_cliff_rows() is the row count to launch for a grid of `rows` x `per_row` workgroups of
++// `waves` wavefronts each: `rows` where that is clear of the window, else the first count past it.
++// A row of `per_row * waves` wavefronts that is a multiple of 2048 lands every count on the cliff,
++// so it is launched as it is. The kernel returns at once in a row at or past `rows`, so the result
++// is unchanged.
++constexpr uint32_t kR4dCliffWaves  = 2048;   // the R9700's wave slots: 64 CUs x 2 SIMDs x 16
++constexpr uint32_t kR4dCliffWindow = 32;     // the slow window, below each multiple of it
++__host__ __device__ __forceinline__ uint32_t r4d_cliff_rows(uint32_t rows, uint32_t per_row,
++                                                            uint32_t waves) {
++    if ((uint64_t)per_row * waves % kR4dCliffWaves == 0) return rows;
++    uint32_t r = rows;
++    for (int i = 0; i < 64; ++i, ++r) {
++        const uint64_t w = (uint64_t)r * per_row * waves % kR4dCliffWaves;
++        if (w != 0 && w <= kR4dCliffWaves - kR4dCliffWindow) return r;
++    }
++    return rows;
++}
+diff --git a/libr4d/packed_kv/r4d_dt16.h b/libr4d/packed_kv/r4d_dt16.h
+new file mode 100644
+--- /dev/null
++++ b/libr4d/packed_kv/r4d_dt16.h
+@@ -0,0 +1,107 @@
++// 16-bit operand traits. The QK and PV matmuls take a 16-bit A/B pair, and both sources are exact
++// in either format: an fp8 e4m3 K/V has 3 mantissa bits (bf16 has 7, f16 10), and a bf16 query's
++// 7 bits are exact in f16 for |q| in [6.1e-5, 65504].
++// The costs differ. gfx1201 has no bf16 convert, so each f32->bf16 is ~6 VALU of software RTNE,
++// while v_cvt_pkrtz_f16_f32 converts two f32 in one; on the softmax path that is 24 VALU per
++// 8-element P fragment against 4. f16 also has 3 more mantissa bits; it gives up exponent range,
++// which GROW below accounts for.
++#pragma once
++#include "r4d_common.h"
++
++typedef __bf16   v8bf __attribute__((ext_vector_type(8)));
++typedef __fp16   v8hf __attribute__((ext_vector_type(8)));  // what the f16 WMMA builtin takes
++typedef __fp16   v2hf __attribute__((ext_vector_type(2)));  // what cvt_pkrtz returns
++
++// GROW = how many octaves the running row max may exceed the reference max before the accumulator
++// must be rescaled. p = 2^(s - m_ref) must stay inside the format, so GROW is log2(format max) with
++// margin. Eager online softmax pays 128 multiplies every m-tile; with a reference max they are paid
++// only when the max moves by more than GROW, which at long context is rare.
++template<int F16> struct DT16;
++
++template<> struct DT16<0> {                       // bf16: exponent range of f32
++    typedef v8bf frag;
++    static constexpr float SHIFT = 0.0f;
++    static constexpr float GROW  = 60.0f;         // 2^60 * |v| * n stays far under f32 max
++    __device__ __forceinline__ static frag mk(uint2 lo, uint2 hi) {
++        union { uint32_t w[4]; frag f; } u;       // union, never a pointer cast
++        u.w[0] = lo.x; u.w[1] = lo.y; u.w[2] = hi.x; u.w[3] = hi.y; return u.f;
++    }
++    __device__ __forceinline__ static v8f wmma(frag a, frag b, v8f c) {
++        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
++    }
++    __device__ __forceinline__ static uint32_t pk(float x, float y) {
++        return (uint32_t)f32_to_bf16(x) | ((uint32_t)f32_to_bf16(y) << 16);
++    }
++    __device__ __forceinline__ static uint32_t pkv(v2f x) {   // what cvt_pk_f32_fp8 returns
++        union { v2f f; uint32_t u[2]; } q; q.f = x;
++        return __builtin_amdgcn_perm(q.u[1], q.u[0], 0x07060302u);
++    }
++    __device__ __forceinline__ static uint32_t from_bf16w(uint32_t w) { return w; }  // identity
++};
++
++template<> struct DT16<1> {                       // f16: 3 more mantissa bits, 1 convert instead of 6
++    typedef v8hf frag;
++    static constexpr float SHIFT = 0.0f;
++    static constexpr float GROW  = 14.0f;         // p <= 2^14 = 16384 < 65504
++    __device__ __forceinline__ static frag mk(uint2 lo, uint2 hi) {
++        union { uint32_t w[4]; frag f; } u;
++        u.w[0] = lo.x; u.w[1] = lo.y; u.w[2] = hi.x; u.w[3] = hi.y; return u.f;
++    }
++    __device__ __forceinline__ static v8f wmma(frag a, frag b, v8f c) {
++        return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
++    }
++    __device__ __forceinline__ static uint32_t pk(float x, float y) {
++        union { v2hf h; uint32_t u; } q; q.h = __builtin_amdgcn_cvt_pkrtz(x, y); return q.u;
++    }
++    __device__ __forceinline__ static uint32_t pkv(v2f x) {
++        union { v2f f; float e[2]; } s; s.f = x;
++        union { v2hf h; uint32_t u; } q; q.h = __builtin_amdgcn_cvt_pkrtz(s.e[0], s.e[1]); return q.u;
++    }
++    // two bf16 in a dword -> two f16 in a dword. bf16->f32 is a shift, so this is 3 VALU.
++    __device__ __forceinline__ static uint32_t from_bf16w(uint32_t w) {
++        union { v2hf h; uint32_t u; } q;
++        q.h = __builtin_amdgcn_cvt_pkrtz(__builtin_bit_cast(float, w << 16),
++                                         __builtin_bit_cast(float, w & 0xffff0000u));
++        return q.u;
++    }
++};
++
++// Widen 8 fp8 (2 dwords) to 8 16-bit values (4 dwords) in element order.
++// Eight K dims of the k6_v4 cache as four f16 dwords, dims (2i, 2i+1) in dword i. `lo` holds
++// their low nibbles (dim 2i in bits 8i..8i+3, 2i+1 in 8i+4..8i+7) and `hb` their 16-dim chunk's
++// high-bit word (byte j: bits 0-1 dim 2j, 2-3 dim 2j+1, 4-5 dim 8+2j, 6-7 dim 9+2j); `half` says
++// which eight of the sixteen these are. One mask and shift put the high bits beside the low
++// nibbles, a byte a dim. Codes are 6-bit two's complement: ^ 32 makes them offset binary u,
++// 0x6400 | u is the f16 1024 + u, and (x - 1056) * s is the value times the group scale `s2` (the
++// f16 in both halves), rounded once.
++__device__ __forceinline__ void k6x8_to_f16x4w(uint32_t lo, uint32_t hb, int half, uint32_t s2,
++                                               uint32_t* w4) {
++    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
++    const uint32_t ev = ((lo & 0x0F0F0F0Fu) | ((half ? hb : hb << 4) & 0x30303030u)) ^ 0x20202020u;
++    const uint32_t od = (((lo >> 4) & 0x0F0F0F0Fu) | ((half ? hb >> 2 : hb << 2) & 0x30303030u))
++                      ^ 0x20202020u;
++    const h2 s = __builtin_bit_cast(h2, s2);
++    const h2 bias = { (_Float16)1056.0f, (_Float16)1056.0f };
++#pragma unroll
++    for (int b = 0; b < 4; ++b) {
++        // Byte b of the even dims low, of the odd dims high; perm takes bytes 0-3 from its second
++        // operand, 4-7 from its first, and 0x0c is a zero byte.
++        const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
++        const uint32_t x = __builtin_amdgcn_perm(od, ev, sel) | 0x64006400u;
++        w4[b] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(h2, x) - bias) * s);
++    }
++}
++
++template<class D>
++__device__ __forceinline__ void fp8x8_to_16x4w(uint2 raw, uint32_t* w4) {
++    #pragma unroll
++    for (int q = 0; q < 2; ++q) {
++        const int wv = (q == 0) ? (int)raw.x : (int)raw.y;
++        w4[q * 2 + 0] = D::pkv(__builtin_amdgcn_cvt_pk_f32_fp8(wv, false));
++        w4[q * 2 + 1] = D::pkv(__builtin_amdgcn_cvt_pk_f32_fp8(wv, true));
++    }
++}
++
++__device__ __forceinline__ int wave_any(bool c) {
++    return (int)__builtin_amdgcn_ballot_w32(c);
++}
+diff --git a/libr4d/packed_kv/r4d_q8.h b/libr4d/packed_kv/r4d_q8.h
+new file mode 100644
+--- /dev/null
++++ b/libr4d/packed_kv/r4d_q8.h
+@@ -0,0 +1,39 @@
++// r4d_q8.h -- the 8-bit activation codes the trunk GEMMs read, written by every quantising producer:
++// E4M3 for the fp8a8 GEMMs, int8 for their int8 twins (gemm_i8a8_*). One scale per (row, 128
++// columns); only the largest code and the conversion differ.
++//
++// E4M3: scale `amax * (1 / 448)`, clamp to +-448, two packed conversions. The clamp is required:
++// v_cvt_pk_fp8_f32 returns NaN for out-of-range input instead of saturating, and
++// `amax * (1 / scale)` can land an ulp above 448.
++//
++// Int8: as quant_act_i8g (r4d_quant_act_fp8.hip), scale `amax * (1 / 127)` and round-to-nearest-
++// even into -127..127, so a fused producer writes the same codes as the standalone quantiser.
++#pragma once
++#include <hip/hip_runtime.h>
++#include <cstdint>
++
++template <bool I8>
++__device__ __forceinline__ constexpr float q8_top() {
++    return I8 ? 127.0f : 448.0f;
++}
++
++// Four values times `inv` (the reciprocal of the scale), as four codes in one dword, value 0 in
++// the low byte.
++template <bool I8>
++__device__ __forceinline__ uint32_t q8_pack4(float a, float b, float c, float d, float inv) {
++    if constexpr (I8) {
++        const int ia = (int)rintf(fminf(fmaxf(a * inv, -127.0f), 127.0f));
++        const int ib = (int)rintf(fminf(fmaxf(b * inv, -127.0f), 127.0f));
++        const int ic = (int)rintf(fminf(fmaxf(c * inv, -127.0f), 127.0f));
++        const int id = (int)rintf(fminf(fmaxf(d * inv, -127.0f), 127.0f));
++        return ((uint32_t)ia & 0xFFu) | (((uint32_t)ib & 0xFFu) << 8) |
++               (((uint32_t)ic & 0xFFu) << 16) | (((uint32_t)id & 0xFFu) << 24);
++    } else {
++        int pk = 0;
++        pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(a * inv, -448.0f), 448.0f),
++                                             fminf(fmaxf(b * inv, -448.0f), 448.0f), pk, false);
++        pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(c * inv, -448.0f), 448.0f),
++                                             fminf(fmaxf(d * inv, -448.0f), 448.0f), pk, true);
++        return (uint32_t)pk;
++    }
++}
+diff --git a/libr4d/r4d_packed_kv_attn.hip b/libr4d/r4d_packed_kv_attn.hip
+new file mode 100644
+--- /dev/null
++++ b/libr4d/r4d_packed_kv_attn.hip
+@@ -0,0 +1,110 @@
++// Selective packed-KV backport, upstream 203064b; old attention TUs stay unchanged.
++#include <hip/hip_runtime.h>
++#include <cmath>
++#include <algorithm>
++#include <type_traits>
++#include "r4d_args.h"
++namespace kvmem_packed {
++using std::max;
++#include "packed_kv/r4d.h"
++#include "packed_kv/r4d_attn_args.h"
++#include "packed_kv/r4d_common.h"
++#include "packed_kv/r4d_attn_prefill_h256_gqa6.hip"
++#include "packed_kv/r4d_attn_decode_h256_gqa6.hip"
++#define CHK() do { auto e=hipGetLastError(); if(e!=hipSuccess) return RAD_E_DEVICE; } while(0)
++#define A_HEAD_DIM 256
++#define A_GQA 6
++#define A_BLOCK_SIZE 16
++#define A_MAX_DECODE_ROWS 64
++#define P_NWARPS 24
++#define P_TILE 48
++#define P_OPT (3954187 | O_KLATE)
++#define D_TILE 16
++#define D_OPT 3429947
++#define D_JPB 2
++#define D_VECMIN 256
++template <int KVP, int XOPT>
++static int prefill_launch(const R4DArgs* a, hipStream_t s) {
++    if (a->head_dim != 256 || a->block_size != 16 || a->q_heads / a->kv_heads != 6) return RAD_E_SHAPE;
++    constexpr int BQ = (P_NWARPS * 16) / A_GQA;
++    hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, KVP, P_OPT | XOPT>),
++                      dim3((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs), dim3(P_NWARPS * 32), 0, s, *a);
++    CHK(); return RAD_OK;
++}
++
++template <int KVP, int XOPT>
++static int decode_launch(const R4DArgs* a, hipStream_t s) {
++    if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
++    if (a->q_heads / a->kv_heads != A_GQA) return -2;
++    const int rows = a->q_len * A_GQA;
++    if (rows > A_MAX_DECODE_ROWS) return -4;    // verify width <= 10 at gqa 6
++    const int nw = (rows + 15) / 16;            // gqa-aligned height; no dead m-tiles issued
++    const int splits = r4d_decode_splits(a, D_TILE);
++
++#define D_LAUNCH(NW)                                                                          \
++    hipLaunchKernelGGL((r4d_attn_decode_kernel<NW, D_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,    \
++                                               KVP, D_OPT | XOPT>),                           \
++                       dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits)
++    if      (nw == 1) D_LAUNCH(1);
++    else if (nw == 2) D_LAUNCH(2);
++    else if (nw == 3) D_LAUNCH(3);
++    else              D_LAUNCH(4);
++#undef D_LAUNCH
++    CHK();
++
++    // The vectorised merge's wave sum reproduces the general LDS tree only while splits <= 64.
++    // Above that (only when kv_heads * num_seqs is 1, giving 128 splits) use the general form.
++    // Both produce identical bytes; the choice is speed only.
++    const int jobs3 = r4d_q_total(*a) * a->q_heads;
++    if (splits <= 64 && jobs3 >= D_VECMIN) {
++        const int blocks = (jobs3 + D_JPB - 1) / D_JPB;
++        if (D_OPT & 32)
++            hipLaunchKernelGGL((r4d_attn_splitkv_combine_vec_kernel<A_HEAD_DIM, 4, 1, D_JPB>),
++                               dim3(blocks), dim3(32 * D_JPB), 0, s, *a, splits, D_TILE);
++        else
++            hipLaunchKernelGGL((r4d_attn_splitkv_combine_vec_kernel<A_HEAD_DIM, 4, 0, D_JPB>),
++                               dim3(blocks), dim3(32 * D_JPB), 0, s, *a, splits, D_TILE);
++    } else if (D_OPT & 32)
++        hipLaunchKernelGGL((r4d_attn_splitkv_combine_kernel<A_HEAD_DIM, 4, 1>), dim3(jobs3),
++                           dim3(256), splits * sizeof(float), s, *a, splits, D_TILE);
++    else
++        hipLaunchKernelGGL((r4d_attn_splitkv_combine_kernel<A_HEAD_DIM, 4, 0>), dim3(jobs3),
++                           dim3(256), splits * sizeof(float), s, *a, splits, D_TILE);
++    CHK();
++    return 0;
++}
++static int64_t scratch(const RadArgs* a, int row) {
++    R4DArgs r{};
++    const auto nh=r4d_geti_or(a,"n_head",0), ns=r4d_geti_or(a,"max_seqs",0);
++    if(nh>0 && ns>0) {
++        r.head_dim=256; r.q_heads=nh; r.kv_heads=nh/6; r.max_ctx=r4d_geti_or(a,"max_ctx",0);
++        r.block_size=16; r.splits=split_of(a);
++        if(r.max_ctx<=0 || r.splits<0) return RAD_E_INVAL;
++        int64_t worst=0;
++        for(int n=1;n<=ns;++n) for(int q=1;q<=r4d_geti_or(a,"q_len",1);++q) {
++            r.num_seqs=n;r.q_len=q;
++            worst=std::max(worst,(int64_t)r4d_decode_scratch(&r,r4d_decode_splits(&r,D_TILE),D_OPT));
++        }
++        return worst;
++    }
++    int rc=fill_paged_row(a,&r,256,row); if(rc!=RAD_OK)return rc;
++    r.splits=split_of(a); if(r.splits<0)return RAD_E_INVAL;
++    return r4d_decode_scratch(&r,r4d_decode_splits(&r,D_TILE),D_OPT);
++}
++template<int OPT, int ROW, bool DECODE>
++int launch(const RadArgs* a, RadStream s) {
++    R4DArgs r{};int rc=fill_paged_row(a,&r,256,ROW);if(rc!=RAD_OK)return rc;
++    if constexpr(DECODE) {
++        r.splits=split_of(a);if(r.splits<0)return RAD_E_INVAL;
++        auto need=r4d_decode_scratch(&r,r4d_decode_splits(&r,D_TILE),D_OPT);
++        if(!a->scratch || a->scratch_bytes<need)return RAD_E_SCRATCH;
++        return decode_launch<0,OPT>(&r,(hipStream_t)s);
++    } else return prefill_launch<0,OPT>(&r,(hipStream_t)s);
++}
++} // private types/templates cannot collide with the original attention TUs
++extern "C" int r4d_rad_attn_prefill_h256_fp8v4(const RadArgs* a, RadStream s) { return kvmem_packed::launch<O_V4, 400, false>(a,s); }
++extern "C" int r4d_rad_attn_decode_h256_fp8v4(const RadArgs* a, RadStream s) { return kvmem_packed::launch<O_V4, 400, true>(a,s); }
++extern "C" int64_t r4d_rad_attn_decode_h256_fp8v4_scratch(const RadArgs* a) { return kvmem_packed::scratch(a,400); }
++extern "C" int r4d_rad_attn_prefill_h256_k6v4(const RadArgs* a, RadStream s) { return kvmem_packed::launch<O_V4 | O_K6, 352, false>(a,s); }
++extern "C" int r4d_rad_attn_decode_h256_k6v4(const RadArgs* a, RadStream s) { return kvmem_packed::launch<O_V4 | O_K6, 352, true>(a,s); }
++extern "C" int64_t r4d_rad_attn_decode_h256_k6v4_scratch(const RadArgs* a) { return kvmem_packed::scratch(a,352); }
+diff --git a/libr4d/r4d_packed_kv_qk.hip b/libr4d/r4d_packed_kv_qk.hip
+new file mode 100644
+--- /dev/null
++++ b/libr4d/r4d_packed_kv_qk.hip
+@@ -0,0 +1,400 @@
++// Packed fused QK/RoPE/store from upstream 203064b, isolated from old kernels.
++#include <hip/hip_runtime.h>
++#include <hip/hip_bf16.h>
++#include <cstdint>
++#include <cmath>
++#include "r4d_args.h"
++#include "r4d_emit.h"
++#include "r4d_common.h"
++#include "rad_yarn.h"
++namespace kvmem_packed_qk {
++struct QkKvStore {
++  const __hip_bfloat16* v;
++  const int32_t*        slot;
++  void*                 cache;
++  int   v_pitch, block_size, n_blocks;
++  float k_inv, v_inv;
++  int   row;   /* fp8_v4 / k6_v4: a token's bytes in a page, 25 or 22 * HD / 16 */
++  /* QK_KV_STREAMED only: the group's host mirror and per-layer residency map, as
++   * kv_store_streamed takes them (libr4d/r4d_model_bf16.hip). `blocks` is the mirror's block
++   * count (the id space) while `n_blocks` stays the ring depth. */
++  const int32_t*        res;
++  void*                 host;
++  int                   blocks;
++};
++
++/* The cache forms KV selects. The two streamed forms are the same store into two planes, E4M3
++ * and bf16. */
++enum { QK_KV_NONE = 0, QK_KV_FP8 = 1, QK_KV_BF16 = 2, QK_KV_F8V4 = 3, QK_KV_K6V4 = 4,
++       QK_KV_STREAMED = 5, QK_KV_STREAMED_BF16 = 6 };
++
++/* KV folds kv_store in: a k head's block, holding the token's rotated k one element per lane, also
++ * writes that element and the head's v element into the cache at the token's slot, as E4M3 with
++ * kv_store_fp8's arithmetic or as bf16 like kv_store_bf16 (see the store at the end). */
++template <int HD, int KV = QK_KV_NONE>
++__global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
++    const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,
++    __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,
++    __hip_bfloat16* __restrict__ GO,
++    const void* __restrict__ WQ, const void* __restrict__ WK,
++    const void* __restrict__ CS, const void* __restrict__ POS, long cs_rows,
++    int nq, int nkv, int rot, float eps, float wadd,
++    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
++  constexpr int THR = 256;
++  __shared__ float lds[THR / 32];
++  const int tok = blockIdx.x, h = blockIdx.y;
++  const int t = threadIdx.x;
++  const long p = pos_i64 ? ((const long*)POS)[tok] : (long)((const int*)POS)[tok];
++  const int half = rot >> 1;
++  const bool isk = h >= nq;
++  const int lh = isk ? h - nq : h;
++  const __hip_bfloat16* in = isk ? (K + (size_t)tok * k_pitch + (size_t)lh * HD)
++                                 : (QG + (size_t)tok * qg_pitch + (size_t)lh * 2 * HD);
++  // The gain is f32 in this engine's plugins and bf16 in vLLM's; its width follows the operand.
++  const void* w = isk ? WK : WQ;
++  __hip_bfloat16* out = isk ? (KO + ((size_t)tok * nkv + lh) * HD)
++                            : (QO + ((size_t)tok * nq + lh) * HD);
++  const float* csf = (const float*)CS;
++  const __hip_bfloat16* csb = (const __hip_bfloat16*)CS;
++
++  // Spelled once so this lane's element and its rotary partner cannot use different widths.
++  auto gain = [&](int i) -> float {
++    return w_f32 ? ((const float*)w)[i] : __bfloat162float(((const __hip_bfloat16*)w)[i]);
++  };
++  // Rounded to bf16 before the rotation; see the bit-identity note at the top of this file.
++  auto normed = [&](float v, float g, float inv) -> float {
++    return __bfloat162float(__float2bfloat16(v * inv * (g + wadd)));
++  };
++
++  // Everything the rotation reads is loaded before the reduction, so it is in flight during the
++  // sum of squares: this lane's element and gain, its partner's, and its cos and sin. Indices are
++  // clamped instead of guarding the loads (a lane past the head reads its last element; a lane past
++  // the rotary range reads its own element and table column 0, which exists since rot >= 2), and
++  // the values are used only where the guards below allow.
++  const int tc = t < HD ? t : HD - 1;
++  const bool rl = t < rot, first = t < half;
++  const int pt = rl ? (first ? t + half : t - half) : tc;
++  const int ci = rl ? (first ? t : t - half) : 0;
++  // The table row is clamped: a padded row (negative) or a position past the table's height has no
++  // row rope_table wrote, and must not read outside the plane.
++  const size_t co = (size_t)(p < 0 ? 0 : (p < cs_rows ? p : cs_rows - 1)) * rot;
++  const float vt = __bfloat162float(in[tc]), gt = gain(tc);
++  const float vp = __bfloat162float(in[pt]), gp = gain(pt);
++  const float c = cs_f32 ? csf[co + ci] : __bfloat162float(csb[co + ci]);
++  const float s = cs_f32 ? csf[co + half + ci] : __bfloat162float(csb[co + half + ci]);
++
++  float ss = 0.0f;
++  if (t < HD) ss = vt * vt;
++  // rmsnorm_bf16's block_sum, transcribed: the wave butterfly, then the wave partials summed in
++  // ascending order. Any other order breaks the bit-equality above. The barrier orders only the LDS
++  // partials, so the loads above stay in flight across it.
++  ss = r4d_wave_sum(ss);
++  if ((t & 31) == 0) lds[t >> 5] = ss;
++  lds_barrier();
++  float sum = 0.0f;
++#pragma unroll
++  for (int wv = 0; wv < THR / 32; ++wv) sum += lds[wv];
++  const float inv = rsqrtf(sum / (float)HD + eps);
++
++  float res = 0.0f;
++  if (t < HD) {
++    res = normed(vt, gt, inv);
++    if (rl) {
++      const float xp = normed(vp, gp, inv);
++      res = first ? (res * c - xp * s) : (xp * s + res * c);
++    }
++  }
++  // Every lane must read its input before any lane writes back: the engine rotates `k` in place,
++  // and a lane's partner is a memory read, so without this barrier it may already be overwritten.
++  // The failure is a ~1% scatter of wrong elements that looks like rounding; r4d_selftest's
++  // byte-equality row catches it.
++  __syncthreads();
++  if (t < HD) {
++    out[t] = __float2bfloat16(res);
++    // `gate_out` is optional: a caller that reads the gate straight from the interleaved projection
++    // (the fp8 block, via gate_quant_fp8) passes none.
++    if (!isk && GO) GO[((size_t)tok * nq + lh) * HD + t] = in[HD + t];
++  }
++  // The cache write kv_store would make next, from the same bytes: the rotated k as just stored
++  // and the v row as the projection left it. The E4M3 form scales by the inverse descale, clamps
++  // (v_cvt_pk_fp8_f32 returns NaN out of range) and converts each element on its own, so one
++  // element a lane gives the same byte. The bf16 form stores the values as kv_store_bf16 does.
++  // Layout [n_blocks, kv_heads, block_size, 2*head_dim], k then v; a negative or out-of-range slot
++  // stores nothing.
++  if constexpr (KV != QK_KV_NONE) {
++    if (isk && t < HD) {
++      const int32_t sl = kvs.slot[tok];
++      /* A streamed group's cache is the ring and its truth is the host mirror: the token goes to
++       * the mirror's block row ALWAYS and to the ring slot only where the residency map says the
++       * block is resident, exactly as kv_store_streamed writes it (libref/ref_attn.cpp states why
++       * the test belongs in the writer). The block id bounds the mirror, the map bounds the ring,
++       * and a slot names a ring block only through `res`. */
++      if constexpr (KV == QK_KV_STREAMED || KV == QK_KV_STREAMED_BF16) {
++        if (sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < (uint32_t)kvs.blocks) {
++          const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
++          const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
++          /* One element of each plane. The mirror and the ring are byte planes of the same paged
++           * layout and `block_bytes` is their pitch, so a bf16 element is two bytes at twice the
++           * fp8 offset. */
++          const size_t EB = KV == QK_KV_STREAMED_BF16 ? 2 : 1;
++          const size_t rowb = (size_t)(2 * HD) * EB;
++          const size_t at = ((size_t)blk * nkv * kvs.block_size + off) * rowb +
++                            (size_t)lh * kvs.block_size * rowb;
++          const __hip_bfloat16 kb = __float2bfloat16(res);
++          const __hip_bfloat16 vb = kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t];
++          const int32_t rs = kvs.res[blk];
++          unsigned char* const m = (unsigned char*)kvs.host + at;
++          unsigned char* const c =
++              (rs >= 0 && (uint32_t)rs < (uint32_t)kvs.n_blocks)
++                  ? (unsigned char*)kvs.cache +
++                        (((size_t)rs * nkv * kvs.block_size + off) * rowb +
++                         (size_t)lh * kvs.block_size * rowb)
++                  : nullptr;
++          if constexpr (KV == QK_KV_STREAMED_BF16) {
++            /* kv_store_bf16 writes the values themselves: no descales. */
++            *(__hip_bfloat16*)(m + EB * t)      = kb;
++            *(__hip_bfloat16*)(m + EB * (HD + t)) = vb;
++            if (c) {
++              *(__hip_bfloat16*)(c + EB * t)      = kb;
++              *(__hip_bfloat16*)(c + EB * (HD + t)) = vb;
++            }
++          } else {
++            const float kf = __bfloat162float(kb) * kvs.k_inv;
++            const float vf = __bfloat162float(vb) * kvs.v_inv;
++            const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf, -448.0f), 448.0f), 0.0f,
++                                                           0, false);
++            const int pv = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(vf, -448.0f), 448.0f), 0.0f,
++                                                           0, false);
++            m[t]      = (unsigned char)(pk & 0xFF);
++            m[HD + t] = (unsigned char)(pv & 0xFF);
++            if (c) {
++              c[t]      = (unsigned char)(pk & 0xFF);
++              c[HD + t] = (unsigned char)(pv & 0xFF);
++            }
++          }
++        }
++      } else if (sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < (uint32_t)kvs.n_blocks) {
++        const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
++        const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
++        const size_t rowb = (KV == QK_KV_F8V4 || KV == QK_KV_K6V4) ? (size_t)kvs.row : (size_t)(2 * HD);
++        const size_t at = ((size_t)blk * nkv * kvs.block_size + off) * rowb +
++                          (size_t)lh * kvs.block_size * rowb;
++        const __hip_bfloat16 kb = __float2bfloat16(res);
++        const __hip_bfloat16 vb = kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t];
++        if constexpr (KV == QK_KV_BF16) {
++          __hip_bfloat16* c = (__hip_bfloat16*)kvs.cache + at;
++          c[t]      = kb;
++          c[HD + t] = vb;
++        } else if constexpr (KV == QK_KV_F8V4 || KV == QK_KV_K6V4) {
++          // fp8_v4: K as the E4M3 form writes it. k6_v4: K as int6 in groups of 32 (one wave)
++          // with an f16 scale, absmax / 31, in kv_store_k6v4's layout. V as int4 in groups of 32
++          // with an f16 scale, absmax / 7. The even lane of a pair writes the pair's nibble byte.
++          unsigned char* c = (unsigned char*)kvs.cache + at;
++          const float kf = __bfloat162float(kb) * kvs.k_inv;
++          constexpr int voff = KV == QK_KV_K6V4 ? HD * 3 / 4 : HD;
++          constexpr int vsoff = KV == QK_KV_K6V4 ? HD * 21 / 16 : HD * 3 / 2;
++          if constexpr (KV == QK_KV_K6V4) {
++            float kmax = fabsf(kf);
++            for (int m = 16; m >= 1; m >>= 1) kmax = fmaxf(kmax, __shfl_xor(kmax, m, 32));
++            const __fp16 k16 = (__fp16)fminf(kmax / 31.0f, 2112.0f);   // finite codes, as kv_store_k6v4
++            const float ksc = (float)k16;
++            const float r = ksc > 0.0f ? rintf(kf / ksc) : 0.0f;
++            const int q = ((int)fminf(fmaxf(r, -31.0f), 31.0f)) & 0x3F;
++            const int qn = __shfl_xor(q & 15, 1, 32);
++            if ((t & 1) == 0) c[t / 2] = (unsigned char)((q & 15) | (qn << 4));
++            // High bits: a pair's four into bits 0-3 at its even lane, then the pair eight dims on
++            // into bits 4-7; lane 2j of a 16-dim chunk writes byte j.
++            const int h01 = (q >> 4) | (__shfl_xor(q >> 4, 1, 32) << 2);
++            const int hb  = h01 | (__shfl_xor(h01, 8, 32) << 4);
++            if ((t & 1) == 0 && (t & 15) < 8) c[HD / 2 + (t / 16) * 4 + (t & 7) / 2] = (unsigned char)hb;
++            if ((t & 31) == 0) *(uint16_t*)(c + HD * 5 / 4 + (t / 32) * 2) = __builtin_bit_cast(uint16_t, k16);
++          } else {
++            const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf, -448.0f), 448.0f), 0.0f,
++                                                           0, false);
++            c[t] = (unsigned char)(pk & 0xFF);
++          }
++          const float vf = __bfloat162float(vb) * kvs.v_inv;
++          float amax = fabsf(vf);
++          for (int m = 16; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor(amax, m, 32));
++          const __fp16 s16 = (__fp16)fminf(amax / 7.0f, 8188.0f);   // finite codes, as kv_store_fp8v4
++          const float sc = (float)s16;
++          const float r = sc > 0.0f ? rintf(vf / sc) : 0.0f;
++          const int q = ((int)fminf(fmaxf(r, -7.0f), 7.0f)) & 0xF;
++          const int qn = __shfl_xor(q, 1, 32);
++          if ((t & 1) == 0) c[voff + t / 2] = (unsigned char)(q | (qn << 4));
++          if ((t & 31) == 0) *(uint16_t*)(c + vsoff + (t / 32) * 2) = __builtin_bit_cast(uint16_t, s16);
++        } else {
++          unsigned char* c = (unsigned char*)kvs.cache + at;
++          const float kf = __bfloat162float(kb) * kvs.k_inv;
++          const float vf = __bfloat162float(vb) * kvs.v_inv;
++          const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf, -448.0f), 448.0f), 0.0f,
++                                                         0, false);
++          const int pv = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(vf, -448.0f), 448.0f), 0.0f,
++                                                         0, false);
++          c[t]      = (unsigned char)(pk & 0xFF);
++          c[HD + t] = (unsigned char)(pv & 0xFF);
++        }
++      }
++    }
++  }
++}
++
++// ============================================================ the cos/sin table
++//
++// The fused kernel reads a precomputed table instead of theta, and this fills it: one launch per
++// step for every attention layer, instead of a rope launch per layer (~7 us of dispatch for ~1 us
++// of work at head_dim 256).
++//
++// Each position is written at its own row, so the table has a row per nameable position and only
++// the rows a step touches are filled (kilobytes at decode, not the whole ~6 MB table). Rows nothing
++// addresses are never read.
++//
++// The arithmetic is r4d_model_bf16.hip's rope_kernel line for line, which makes the fusion
++// bit-identical: `1.0f / powf(theta, 2i/den)` with `den` the ladder's width (`rot` for `rotary`,
++// `head_dim` for `head`), the position divided by `rscale` in f32, `sincosf`, and the products
++// consumed in f32 by the caller. Changing any of it changes the model's output.
++__global__ __launch_bounds__(64) void r4d_qk_rope_table_kernel(
++    const void* __restrict__ POS, void* __restrict__ CS, long rows, int rot, int den, float theta,
++    float rscale, int cs_f32, int pos_i64, RadYarn yarn) {
++  const int m = blockIdx.x;
++  const long pp = pos_i64 ? ((const long*)POS)[m] : (long)((const int*)POS)[m];
++  // A padded row addresses no table row, and a position at or past the table's height writes
++  // nothing (it would land in whatever the arena placed after the plane). libref and libavx skip
++  // the same rows.
++  if (pp < 0 || pp >= rows) return;
++  const int half = rot >> 1;
++  const float p = (float)pp / (rscale != 0.0f ? rscale : 1.0f);
++  const size_t o = (size_t)pp * rot;
++  for (int i = threadIdx.x; i < half; i += (int)blockDim.x) {
++    const float inv = yarn.frequency(1.0f / powf(theta, (float)(2 * i) / (float)den), i);
++    float c, s;
++    sincosf(p * inv, &s, &c);
++    if (yarn.factor != 0.0f) { c *= yarn.magnitude; s *= yarn.magnitude; }
++    if (cs_f32) {
++      ((float*)CS)[o + i] = c;
++      ((float*)CS)[o + half + i] = s;
++    } else {
++      ((__hip_bfloat16*)CS)[o + i] = __float2bfloat16(c);
++      ((__hip_bfloat16*)CS)[o + half + i] = __float2bfloat16(s);
++    }
++  }
++}
++
++// The two launches, as the plugin ABI's RadLaunchFn. See the note at the head of
++// r4d_quant_act_i8.hip on the argument list and status return.
++enum { QK_QGATE = 0, QK_K, QK_COSSIN, QK_POS, QK_WQ, QK_WK, QK_QOUT, QK_KOUT, QK_GOUT,
++       QK_V, QK_SLOT, QK_CACHE, QK_RES, QK_HOST };
++
++/* The body of both forms; KVF is the kv_store fold and `kvs` its cache, already checked. */
++template <int KVF>
++static int qk_body(const RadArgs* args, RadStream stream, const QkKvStore& kvs) {
++  const RadTensor* qg = r4d_opt(args, QK_QGATE);
++  const RadTensor* k  = r4d_opt(args, QK_K);
++  const RadTensor* cs = r4d_opt(args, QK_COSSIN);
++  const RadTensor* po = r4d_opt(args, QK_POS);
++  const RadTensor* wq = r4d_opt(args, QK_WQ);
++  const RadTensor* wk = r4d_opt(args, QK_WK);
++  const RadTensor* qo = r4d_opt(args, QK_QOUT);
++  const RadTensor* ko = r4d_opt(args, QK_KOUT);
++  const RadTensor* go = r4d_opt(args, QK_GOUT);
++  // The k-only form: `n_head` 0 means there is no [q|gate] projection to split (each head is a
++  // plain `head_dim` run), so `q_gate`, `q_w` and `q_out` are absent and every head is served off
++  // `k`. The kernel needs nothing for it: `isk` is `h >= nq`, so at nq 0 every block takes the k
++  // path and the absent operands (null via r4d_p / r4d_wp) are never dereferenced.
++  if (!k || !cs || !po || !wk || !ko) return R4D_NO(RAD_E_INVAL);
++  if (!r4d_contig(cs) || !r4d_contig(po) || !r4d_contig(wk)) return R4D_NO(RAD_E_STRIDE);
++  if (!r4d_contig(ko)) return R4D_NO(RAD_E_STRIDE);
++  if (go && !r4d_contig(go)) return R4D_NO(RAD_E_STRIDE);
++
++  const long long hd  = r4d_geti_or(args, "head_dim", 0);
++  const long long nq  = r4d_geti_or(args, "n_head", 0);
++  const long long nkv = r4d_geti_or(args, "n_head_kv", 0);
++  const long long rot = r4d_geti_or(args, "rot", 0);
++  if (nq < 0 || nkv < 1) return R4D_NO(RAD_E_SHAPE);
++  if (nq >= 1 && (!qg || !wq || !qo)) return R4D_NO(RAD_E_INVAL);
++  if (qg && (!r4d_contig(wq) || !r4d_contig(qo))) return R4D_NO(RAD_E_STRIDE);
++
++  const long long qg_pitch = qg ? r4d_row_pitch(qg) : 0;
++  const long long k_pitch  = r4d_row_pitch(k);
++  if (qg_pitch < 0 || k_pitch < 0) return R4D_NO(RAD_E_STRIDE);
++
++  // The row count is the operand's; which operand carries it depends on the form.
++  const long long M = qg ? qg->shape[0] : k->shape[0];
++  if (M < 1) return R4D_NO(RAD_E_SHAPE);
++  if (hd != 64 && hd != 128 && hd != 256) return R4D_NO(RAD_E_SHAPE);   // the compiled set
++  if (rot < 2 || (rot & 1) || rot > hd) return R4D_NO(RAD_E_SHAPE);
++  const long long cs_rows = r4d_numel(cs) / rot;
++  if (cs_rows < 1 || r4d_numel(cs) % rot) return R4D_NO(RAD_E_SHAPE);
++
++  const float eps  = (float)r4d_getf(args, "eps", 1e-6);
++  const float wadd = (float)r4d_getf(args, "wadd", 0.0);
++  // The width flags come from the operands: a cos/sin table in f32 and positions in int64 are what
++  // the tensors say they are.
++  const int cs_f32  = (cs->dtype == RAD_F32) ? 1 : 0;
++  const int pos_i64 = (po->dtype == RAD_I64) ? 1 : 0;
++  // The norm gain's width is the operand's too (f32 in every architecture plugin here, bf16 in
++  // vLLM). One flag serves both gains, so they must agree.
++  if (wq && wq->dtype != wk->dtype) return R4D_NO(RAD_E_DTYPE);
++  if (wk->dtype != RAD_F32 && wk->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
++  const int w_f32 = (wk->dtype == RAD_F32) ? 1 : 0;
++
++  const int nh = (int)(nq + nkv);
++  // One block per (token, head), 256 threads, one element per lane. The width is fixed at 256, not
++  // fitted to the head count, so the sum of squares matches r4d_rmsnorm_bf16 (see the kernel).
++#define R4D_QKG_L(H) emit_rc = R4D_EMIT(r4d_stream_sink(stream), (r4d_qk_norm_rope_gate_kernel<H, KVF>), \
++    dim3((int)M, nh), dim3(256), 0, (const __hip_bfloat16*)r4d_p(qg), \
++    (const __hip_bfloat16*)r4d_p(k), (__hip_bfloat16*)r4d_wp(qo), (__hip_bfloat16*)r4d_wp(ko), \
++    (__hip_bfloat16*)r4d_wp(go), r4d_p(wq), r4d_p(wk), r4d_p(cs), r4d_p(po), (long)cs_rows, \
++    (int)nq, (int)nkv, (int)rot, eps, wadd, (int)qg_pitch, (int)k_pitch, cs_f32, pos_i64, w_f32, \
++    kvs)
++  int emit_rc = RAD_OK;
++  switch (hd) {
++    case 64:  R4D_QKG_L(64); break;
++    case 128: R4D_QKG_L(128); break;
++    default:  R4D_QKG_L(256); break;
++  }
++#undef R4D_QKG_L
++  return emit_rc;
++}
++
++
++static int qk_kv_q4(const RadArgs* args, RadStream stream, int k6) {
++  const long long r16 = k6 ? 22 : 25;
++  const RadTensor* k  = r4d_opt(args, QK_K);
++  const RadTensor* qg = r4d_opt(args, QK_QGATE);
++  const RadTensor* v  = r4d_opt(args, QK_V);
++  const RadTensor* sm = r4d_opt(args, QK_SLOT);
++  const RadTensor* kv = r4d_opt(args, QK_CACHE);
++  if (!k || !v || !sm || !kv) return R4D_NO(RAD_E_INVAL);
++  if (v->dtype != RAD_BF16 || sm->dtype != RAD_I32 || kv->dtype != RAD_F8E4M3)
++    return R4D_NO(RAD_E_DTYPE);
++  if (!r4d_contig(sm) || !r4d_contig(kv)) return R4D_NO(RAD_E_STRIDE);
++  const long long hd  = r4d_geti_or(args, "head_dim", 0);
++  const long long nkv = r4d_geti_or(args, "n_head_kv", 0);
++  const long long bs  = r4d_geti_or(args, "block_size", 0);
++  if (hd <= 0 || nkv <= 0 || bs <= 0 || hd % 32) return R4D_NO(RAD_E_SHAPE);
++  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != hd * r16 / 16)
++    return R4D_NO(RAD_E_SHAPE);
++  const long long M = qg ? qg->shape[0] : k->shape[0];
++  long long Mv = 0;
++  const long long v_ld = r4d_rows_pitch(v, nkv * hd, &Mv);
++  if (v_ld < 0) return R4D_NO(RAD_E_STRIDE);
++  if (Mv < M || r4d_numel(sm) != M) return R4D_NO(RAD_E_SHAPE);
++  const double ks = r4d_getf(args, "k_scale", 1.0);
++  const double vs = r4d_getf(args, "v_scale", 1.0);
++  if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
++  QkKvStore kvs{};
++  kvs.v          = (const __hip_bfloat16*)r4d_p(v);
++  kvs.slot       = (const int32_t*)r4d_p(sm);
++  kvs.cache      = r4d_wp(kv);
++  kvs.v_pitch    = (int)v_ld;
++  kvs.block_size = (int)bs;
++  kvs.n_blocks   = (int)kv->shape[0];
++  kvs.k_inv      = 1.0f / (float)ks;
++  kvs.v_inv      = 1.0f / (float)vs;
++  kvs.row        = (int)(hd * r16 / 16);
++  return k6 ? qk_body<QK_KV_K6V4>(args, stream, kvs) : qk_body<QK_KV_F8V4>(args, stream, kvs);
++}
++}
++extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_fp8v4(const RadArgs* a, RadStream s) {return kvmem_packed_qk::qk_kv_q4(a,s,0);}
++extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_k6v4(const RadArgs* a, RadStream s) {return kvmem_packed_qk::qk_kv_q4(a,s,1);}
+diff --git a/libr4d/r4d_packed_kv_store.hip b/libr4d/r4d_packed_kv_store.hip
+new file mode 100644
+--- /dev/null
++++ b/libr4d/r4d_packed_kv_store.hip
+@@ -0,0 +1,153 @@
++// Packed KV store from upstream 203064b; group rounding/layout unchanged.
++#include <hip/hip_runtime.h>
++#include <cmath>
++#include "r4d_args.h"
++#include "r4d_emit.h"
++namespace {
++constexpr int kThreads=256;
++__device__ __forceinline__ float bf16_to_f32(uint16_t x) { return __builtin_bit_cast(float,(uint32_t)x<<16); }
++static bool dt_bf16(const RadTensor* t) { return t && t->dtype==RAD_BF16; }
++static bool dt_i32(const RadTensor* t) { return t && t->dtype==RAD_I32; }
++enum { KS_K=0, KS_V, KS_SLOT, KS_CACHE };
++template <int K6>
++__global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
++    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
++    const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
++    uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks,
++    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv, uint32_t row) {
++    const uint32_t t = blockIdx.x;
++    const int32_t s = slot[t];
++    if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
++    const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
++    const size_t slot_base = ((size_t)blk * kv_heads * block_size + (size_t)off) * row;
++    const size_t head_step = (size_t)block_size * row;
++
++    for (uint32_t j = threadIdx.x * 4u; j < kv_heads * head_dim; j += kThreads * 4u) {
++        const uint32_t h = j / head_dim, d = j % head_dim;
++        uint8_t* __restrict__ c = kv + slot_base + (size_t)h * head_step;
++        float kf[4], vf[4];
++#pragma unroll
++        for (int e = 0; e < 4; ++e) {
++            kf[e] = bf16_to_f32(k[(size_t)t * k_ld + j + (uint32_t)e]) * k_inv;
++            vf[e] = bf16_to_f32(v[(size_t)t * v_ld + j + (uint32_t)e]) * v_inv;
++        }
++        const uint32_t voff = K6 ? head_dim * 3 / 4 : head_dim;
++        const uint32_t vsoff = K6 ? head_dim * 21 / 16 : head_dim * 3 / 2;
++        if constexpr (K6) {
++            // A group of 32 is 8 lanes; its scale absmax / 31 in f16, codes 6-bit two's complement.
++            float kmax = fmaxf(fmaxf(fabsf(kf[0]), fabsf(kf[1])), fmaxf(fabsf(kf[2]), fabsf(kf[3])));
++            for (int m = 4; m >= 1; m >>= 1) kmax = fmaxf(kmax, __shfl_xor(kmax, m, 32));
++            // Clamped so 31 times it stays an f16 (65504): a group gone inf
++            // or NaN decodes finite, as the E4M3 form's clamp to 448 does.
++            const __fp16 k16 = (__fp16)fminf(kmax / 31.0f, 2112.0f);
++            const float ksc = (float)k16;
++            uint32_t q[4];
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                const float r = ksc > 0.0f ? rintf(kf[e] / ksc) : 0.0f;
++                q[e] = (uint32_t)((int)fminf(fmaxf(r, -31.0f), 31.0f)) & 0x3Fu;
++            }
++            *(uint16_t*)(c + d / 2) = (uint16_t)((q[0] & 15u) | ((q[1] & 15u) << 4) |
++                                                 ((q[2] & 15u) << 8) | ((q[3] & 15u) << 12));
++            // The high bits of dims x..x+3 of a 16-dim chunk (x = d % 16 in 0, 4, 8, 12): bits
++            // 0-3 of bytes x/2 and x/2+1 for x < 8, bits 4-7 of bytes (x-8)/2 and (x-8)/2+1 for
++            // x >= 8. The lane two over holds the dims eight on, so the lower lane writes both.
++            const uint32_t hb = ((q[0] >> 4) | ((q[1] >> 4) << 2)) | ((((q[2] >> 4) | ((q[3] >> 4) << 2))) << 8);
++            const uint32_t up = (uint32_t)__shfl_xor((int)hb, 2, 32);
++            if ((d & 15u) < 8u)
++                *(uint16_t*)(c + head_dim / 2 + (d / 16) * 4 + (d & 7u) / 2) = (uint16_t)(hb | (up << 4));
++            if ((d & 31u) == 0)
++                *(uint16_t*)(c + head_dim * 5 / 4 + (d / 32) * 2) = __builtin_bit_cast(uint16_t, k16);
++        } else {
++            int pk = 0;
++            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf[0], -448.0f), 448.0f),
++                                                 fminf(fmaxf(kf[1], -448.0f), 448.0f), pk, false);
++            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf[2], -448.0f), 448.0f),
++                                                 fminf(fmaxf(kf[3], -448.0f), 448.0f), pk, true);
++            *(uint32_t*)(c + d) = (uint32_t)pk;
++        }
++
++        float amax = fmaxf(fmaxf(fabsf(vf[0]), fabsf(vf[1])), fmaxf(fabsf(vf[2]), fabsf(vf[3])));
++        for (int m = 4; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor(amax, m, 32));
++        // Clamped so 7 times it stays an f16: see the K scale above.
++        const __fp16 s16 = (__fp16)fminf(amax / 7.0f, 8188.0f);
++        const float sc = (float)s16;
++        uint32_t q[4];
++#pragma unroll
++        for (int e = 0; e < 4; ++e) {
++            const float r = sc > 0.0f ? rintf(vf[e] / sc) : 0.0f;
++            q[e] = (uint32_t)((int)fminf(fmaxf(r, -7.0f), 7.0f)) & 0xFu;
++        }
++        *(uint16_t*)(c + voff + d / 2) = (uint16_t)(q[0] | (q[1] << 4) | (q[2] << 8) | (q[3] << 12));
++        if ((d & 31u) == 0)
++            *(uint16_t*)(c + vsoff + (d / 32) * 2) = __builtin_bit_cast(uint16_t, s16);
++    }
++}
++
++struct KvStoreGeom {
++    const RadTensor *k, *v, *sm, *kv;
++    long long head_dim, block_size, kv_heads, n_blocks, k_ld, v_ld, T;
++};
++
++static int kv_store_geom(const RadArgs* a, KvStoreGeom* g, long long row_per_hd16 = 32) {
++    g->k  = r4d_opt(a, KS_K);
++    g->v  = r4d_opt(a, KS_V);
++    g->sm = r4d_opt(a, KS_SLOT);
++    g->kv = r4d_opt(a, KS_CACHE);
++    if (!g->k || !g->v || !g->sm || !g->kv) return R4D_NO(RAD_E_INVAL);
++    if (!dt_bf16(g->k)) return RAD_E_DTYPE;
++    if (!dt_bf16(g->v)) return RAD_E_DTYPE;
++    if (!dt_i32(g->sm)) return RAD_E_DTYPE;
++    if (!r4d_contig(g->sm) || !r4d_contig(g->kv)) return R4D_NO(RAD_E_STRIDE);
++
++    g->head_dim   = r4d_geti_or(a, "head_dim", r4d_dim(g->k, (int)g->k->rank - 1));
++    g->block_size = r4d_geti_or(a, "block_size", 0);
++    g->kv_heads   = r4d_geti_or(a, "n_head_kv", g->kv->rank == 4 ? g->kv->shape[1] : 0);
++    if (g->head_dim <= 0 || g->block_size <= 0 || g->kv_heads <= 0) return R4D_NO(RAD_E_SHAPE);
++    /* The shared paged layout is [n_blocks, kv_heads, block_size, 2*head_dim]; refuse a cache that
++     * disagrees. */
++    if (g->kv->rank != 4) return R4D_NO(RAD_E_SHAPE);
++    if (g->kv->shape[1] != g->kv_heads || g->kv->shape[2] != g->block_size ||
++        g->kv->shape[3] != g->head_dim * row_per_hd16 / 16) return R4D_NO(RAD_E_SHAPE);
++    g->n_blocks = g->kv->shape[0];
++
++    const long long lane = g->kv_heads * g->head_dim;
++    long long M = 0, Mv = 0;
++    g->k_ld = r4d_rows_pitch(g->k, lane, &M);
++    g->v_ld = r4d_rows_pitch(g->v, lane, &Mv);
++    if (g->k_ld < 0 || g->v_ld < 0) return R4D_NO(RAD_E_STRIDE);
++    g->T = r4d_numel(g->sm);
++    if (g->T <= 0 || M < g->T || Mv < g->T) return R4D_NO(RAD_E_SHAPE);
++    return RAD_OK;
++}
++
++
++static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
++    const long long r16 = k6 ? 22 : 25;
++    KvStoreGeom g{};
++    const int rc = kv_store_geom(a, &g, r16);
++    if (rc != RAD_OK) return rc;
++    if (g.kv->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
++    if (g.head_dim % 32) return R4D_NO(RAD_E_SHAPE);
++    const double ks = r4d_getf(a, "k_scale", 1.0);
++    const double vs = r4d_getf(a, "v_scale", 1.0);
++    if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
++    long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
++    long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
++    if (k6)
++        return R4D_EMIT(r4d_stream_sink(stream), kv_store_fp8v4_kernel<1>, dim3((uint32_t)g.T), dim3(kThreads), 0,
++                        (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
++                        (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
++                        (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
++                        (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld, (float)(1.0 / ks),
++                        (float)(1.0 / vs), (uint32_t)(g.head_dim * r16 / 16)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
++    return R4D_EMIT(r4d_stream_sink(stream), kv_store_fp8v4_kernel<0>, dim3((uint32_t)g.T), dim3(kThreads), 0,
++                    (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
++                    (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
++                    (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
++                    (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld, (float)(1.0 / ks),
++                    (float)(1.0 / vs), (uint32_t)(g.head_dim * r16 / 16)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
++}
++}
++extern "C" int r4d_rad_kv_store_fp8v4(const RadArgs* a, RadStream s) { return kv_store_q4(a,s,0); }
++extern "C" int r4d_rad_kv_store_k6v4(const RadArgs* a, RadStream s) { return kv_store_q4(a,s,1); }
+diff --git a/libr4d/r4d_plugin.h b/libr4d/r4d_plugin.h
+--- a/libr4d/r4d_plugin.h
++++ b/libr4d/r4d_plugin.h
+@@ -79,6 +79,16 @@
+  * stays free of r4d.h.
+  */
+ extern "C" {
++
++int r4d_rad_attn_prefill_h256_fp8v4(const RadArgs*, RadStream);
++int r4d_rad_attn_decode_h256_fp8v4(const RadArgs*, RadStream);
++int64_t r4d_rad_attn_decode_h256_fp8v4_scratch(const RadArgs*);
++int r4d_rad_attn_prefill_h256_k6v4(const RadArgs*, RadStream);
++int r4d_rad_attn_decode_h256_k6v4(const RadArgs*, RadStream);
++int64_t r4d_rad_attn_decode_h256_k6v4_scratch(const RadArgs*);
++int r4d_rad_kv_store_fp8v4(const RadArgs*, RadStream);
++int r4d_rad_kv_store_k6v4(const RadArgs*, RadStream);
++
+ 
+ /* -- attention (r4d_attn_*.hip) -- */
+ int     r4d_rad_attn_prefill_h256_fp8 (const RadArgs*, RadStream);
+diff --git a/libr4d/r4d_rows.cpp b/libr4d/r4d_rows.cpp
+--- a/libr4d/r4d_rows.cpp
++++ b/libr4d/r4d_rows.cpp
+@@ -31,6 +31,8 @@
+  */
+ 
+ #include "r4d_plugin.h"
++extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_fp8v4(const RadArgs*, RadStream);
++extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_k6v4(const RadArgs*, RadStream);
+ 
+ #include <cstdlib>
+ #include <cstring>
+@@ -2398,6 +2400,25 @@
+ /* ---- attention ------------------------------------------------------------------------------
+  * `causal` is a constraint, not a note: the paged kernels are causal by construction and the
+  * vision kernel is dense, and neither can serve the other's masking. */
++static const RadConstraint cAttnPrefillV4[] = {
++    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
++    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_v4"),
++};
++static const RadConstraint cAttnDecodeV4[] = {
++    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
++    C_EQ("causal", 1), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_v4"),
++};
++static const RadConstraint cKvStoreV4[] = { C_GE("block_size",1), C_IN("kv_dtype","fp8_v4") };
++static const RadConstraint cAttnPrefillK6V4[] = {
++    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
++    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k6_v4"),
++};
++static const RadConstraint cAttnDecodeK6V4[] = {
++    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
++    C_EQ("causal", 1), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k6_v4"),
++};
++static const RadConstraint cKvStoreK6V4[] = { C_GE("block_size",1), C_IN("kv_dtype","k6_v4") };
++
+ static const RadConstraint cAttnPrefillFp8[] = {
+     C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
+     C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+@@ -3095,6 +3116,15 @@
+     C_EQ("world_size", 2),
+     C_P2P,
+ };
++static const RadConstraint cQkNormRopeGateKvFp8v4[] = {
++    C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
++    C_GE("block_size", 1), C_IN("kv_dtype", "fp8_v4"),
++};
++static const RadConstraint cQkNormRopeGateKvK6v4[] = {
++    C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
++    C_GE("block_size", 1), C_IN("kv_dtype", "k6_v4"),
++};
++
+ static const RadConstraint cQkNormRopeGate[] = {
+     C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
+ };
+@@ -3961,6 +3991,66 @@
+ 
+ 
+ /* ---------------------------------------------------------------------------------- attention */
++{ "qk_norm_rope_gate_kv_store_fp8v4", "qk_norm_rope_gate_kv_store", "attn",
++  "qk_norm_rope_gate, and kv_store into an fp8_v4 paged cache from the same launch",
++  "qk_norm_rope_gate's shapes; cache exactly [n_blocks, kv_heads, block_size, 25*head_dim/16], "
++  "head_dim a multiple of 32, one slot a row; a negative or out-of-range slot stores nothing",
++  "bf16 in and out, E4M3 K and int4 V with f16 scales, i32 slot mapping",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
++  ROW(cQkNormRopeGateKvFp8v4), NOTUNE,
++  nullptr, nullptr, r4d_rad_qk_norm_rope_gate_kv_store_fp8v4, nullptr, nullptr, nullptr,
++  nullptr },
++{ "qk_norm_rope_gate_kv_store_k6v4", "qk_norm_rope_gate_kv_store", "attn",
++  "qk_norm_rope_gate, and kv_store into a k6_v4 paged cache from the same launch",
++  "qk_norm_rope_gate's shapes; cache exactly [n_blocks, kv_heads, block_size, 22*head_dim/16], "
++  "head_dim a multiple of 32, one slot a row; a negative or out-of-range slot stores nothing",
++  "bf16 in and out, int6 K and int4 V with f16 scales, i32 slot mapping",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
++  ROW(cQkNormRopeGateKvK6v4), NOTUNE,
++  nullptr, nullptr, r4d_rad_qk_norm_rope_gate_kv_store_k6v4, nullptr, nullptr, nullptr,
++  nullptr },
++
++{ "attn_prefill_h256_gqa6_fp8v4kv", "attn_paged", "attn",
++  "paged causal attention, query-tiled (prefill / chunked prefill)",
++  "head_dim 256, 6 queries per kv head, paged block 16, varlen",
++  "bf16 query, fp8_v4 packed kv cache with per-(seq,head) descales, bf16 out",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
++  ROW(cAttnPrefillV4), NOTUNE,
++  nullptr, nullptr, r4d_rad_attn_prefill_h256_fp8v4, nullptr, nullptr, nullptr,
++  nullptr },
++{ "attn_decode_h256_gqa6_fp8v4kv", "attn_paged", "attn",
++  "paged causal attention, split-KV (decode / speculative verify)",
++  "head_dim 256, 6 queries per kv head, paged block 16, q_len*gqa <= 64",
++  "bf16 query, fp8_v4 packed kv cache with per-(seq,head) descales, bf16 out, f16 partials",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
++  ROW(cAttnDecodeV4), ROW(tAttnSplit), nullptr,
++  nullptr, nullptr, r4d_rad_attn_decode_h256_fp8v4, r4d_rad_attn_decode_h256_fp8v4_scratch,
++  nullptr, nullptr,
++  nullptr },
++{ "kv_store_fp8v4", "kv_store", "attn", "packed KV scatter", "head_dim multiple of 32", "fp8_v4",
++ RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cKvStoreV4), NOTUNE,
++ nullptr, nullptr, r4d_rad_kv_store_fp8v4, nullptr, nullptr, nullptr, nullptr },
++{ "attn_prefill_h256_gqa6_k6v4kv", "attn_paged", "attn",
++  "paged causal attention, query-tiled (prefill / chunked prefill)",
++  "head_dim 256, 6 queries per kv head, paged block 16, varlen",
++  "bf16 query, k6_v4 packed kv cache with per-(seq,head) descales, bf16 out",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
++  ROW(cAttnPrefillK6V4), NOTUNE,
++  nullptr, nullptr, r4d_rad_attn_prefill_h256_k6v4, nullptr, nullptr, nullptr,
++  nullptr },
++{ "attn_decode_h256_gqa6_k6v4kv", "attn_paged", "attn",
++  "paged causal attention, split-KV (decode / speculative verify)",
++  "head_dim 256, 6 queries per kv head, paged block 16, q_len*gqa <= 64",
++  "bf16 query, k6_v4 packed kv cache with per-(seq,head) descales, bf16 out, f16 partials",
++  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
++  ROW(cAttnDecodeK6V4), ROW(tAttnSplit), nullptr,
++  nullptr, nullptr, r4d_rad_attn_decode_h256_k6v4, r4d_rad_attn_decode_h256_k6v4_scratch,
++  nullptr, nullptr,
++  nullptr },
++{ "kv_store_k6v4", "kv_store", "attn", "packed KV scatter", "head_dim multiple of 32", "k6_v4",
++ RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cKvStoreK6V4), NOTUNE,
++ nullptr, nullptr, r4d_rad_kv_store_k6v4, nullptr, nullptr, nullptr, nullptr },
++
+ { "attn_prefill_h256_gqa6_fp8kv", "attn_paged", "attn",
+   "paged causal attention, query-tiled (prefill / chunked prefill)",
+   "head_dim 256, 6 queries per kv head, paged block 16, varlen",
