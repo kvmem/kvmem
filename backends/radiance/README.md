@@ -61,11 +61,11 @@ used `ram` to fit the 27B model and two sessions in 16GB.
 The CPU implementation includes an approved correction to both libavx and libref:
 GEMM must preserve a residual before writing an overlapping output. Independent
 arithmetic tests establish correctness rather than treating libref as an oracle
-for the defect it shared. Linux/AVX2 CPU vision passed real PNG tests at 64/256
-image tokens, MTP3/0 and two concurrent requests. CPU/GPU embeddings remain
-numerically different and CPU encoding is slower. Windows CPU vision, AVX512 and
-general vision-quality parity are not qualified by this run. See
-[CPU vision validation](../../docs/radiance/CPU-VISION-VALIDATION-20261031.md).
+for the defect it shared. The 2026-11-03 Linux/i7-8700/RX9060XT run passed PNG
+tests at 64/256 image tokens with MTP3 and two overlapping native requests.
+Windows CPU vision, other CPU ISA, natural-image/OCR quality and CPU/GPU
+performance parity are outside that run. See
+[CPU image validation](../../docs/radiance-cpu-image-validation-20261103.md).
 
 Original standalone profile: RX9060XT/gfx1200, BUDGET36864, generation reserve16384,
 batch512, context262144, FP8 K/V, MTP3. Service: localhost18380, model radiance-local.
