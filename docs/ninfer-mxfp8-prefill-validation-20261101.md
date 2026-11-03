@@ -1,11 +1,231 @@
 # GGUF MXFP8 prefill：当前实现、补丁边界与验证
 
-> Publication note (2026-11-02): native backend patch candidate, not an installed release. Machine identifiers are anonymized; measurements and hashes are retained. Uncommitted-status statements below describe the original experiment; this PR publishes source only. Raw requests/logs/traces remain local. See [the public evidence summary](benchmarks/ninfer-low-precision-20261102.json). Further FP4 tests are paused.
+> Publication update (2026-11-03): This default-off native candidate includes the measured device routes and equivalent image stores. Physical device identities/private paths are anonymized; measurements, hashes and adverse results are retained. Statements about uncommitted local builds below describe the dated experiments, not this publication. These are validation artifacts, not an installed release. Raw evidence remains local.
 
-更新于 2026-11-02。当前路径为 256≤T<1024 的融合 FP8 tile，以及 T≥1024 的
-64 MiB 有界 cuBLASLt slab。默认关闭，属于有损量化选项。最新数值/模型验证已完成主要项目；
-256 的原仓库速度差距仍存在，1024 的新版完整最终性能对照尚未完成，不能宣称全配置达标。
-本次整理仅重分补丁并更新文档，未加入此前讨论的按设备/形状选路或精确缩放新优化。
+更新于 2026-11-03。本轮已实现 NInfer 后端按设备、格式、N/K 和输出类型选择
+FP8 tile 或 Q8 matrix，并加入原生校准器及 5060 Ti 的 25 条 T=256 内置规则。
+未匹配形状仍用 256≤T<1024 的融合 FP8 tile，T≥1024 保持 64 MiB 有界 Lt。
+默认关闭，仍属于有损量化选项。FP4 的进一步实验暂停。
+
+## 2026-11-03：补齐原仓库的 128-bit 权重图像写回
+
+本轮先回到源码与实际 SASS 比对。确认原仓库 `image_kernel` 每个32字节切片用两条
+`STG.E.128`，本地移植却是八条标量 `STG.E`；两者另各有一条尺度写回。已恢复两个
+对齐的128-bit写回，不改变值的解码、实际amax、FP32乘法边界、E4M3编码或累加。
+IQ3_S 的 SASS 寄存器数原仓库30、本地旧版48、修复后47；旧/新均 STACK=0、LOCAL=0，
+共享内存同为3072字节。没有加入新查表、模型副本或工作区分配，64 MiB图像上限不变。
+
+原仓库还使用基于格式上界的尺度、折叠尺度乘法、直接BF16输出与BF16 gate/up中间值，
+本地则保留实际amax和FP32中间值；这些不是完全相同的数值路径。普通前缀缓存仍是
+本地hybrid、原仓库legacy。不能把全部差距视作同一FP8内核的调度差距，也不能为追平
+直接取消这些数值或缓存边界。本次只修复不改变语义的向量写回遗漏。
+
+同一5060 Ti UUID `GPU-A`、原27B artifact、
+int8 KV、MTP4、chunk1024、并发1；各臂两次镜像进程复测，KV capacity/max-context
+均25600，KVMem B24576/R1024。与此前组分开报告，本轮的新旧比较如下：
+
+| 路径 | 旧版两轮 tok/s | 修复后两轮 tok/s | 旧均值 → 新均值 | 增幅 |
+|---|---:|---:|---:|---:|
+| 普通 NInfer FP8 | 1377.819 / 1377.567 | 1396.669 / 1393.013 | 1377.693 → 1394.841 | +1.245% |
+| 预算内 KVMem FP8 | 1307.119 / 1307.759 | 1324.166 / 1323.032 | 1307.439 → 1323.599 | +1.236% |
+
+本轮原仓库普通FP8为1457.172 / 1458.711，均值1457.941 tok/s；本地普通路径差距
+从5.504%缩小到4.328%，尚未追平。没有把上轮KVMem的1280.335均值拼入本轮收益。
+每轮均为14806个新prompt token、cache0、本地native `no_pressure`。文档先行短确认，
+同会话另发真实问题，保存实际前缀复用和native计算span；十轮问题输出均相同，属于
+同文档的相关行为探针，不是新增独立质量分数。数值绑定仍为既有profile-v2签名。
+
+prefill阶段每秒采样的总卡显存最大值：普通路径旧/新均13806 MiB，KVMem旧/新均
+13652 MiB。它不是allocator精确峰值；源码中的工作区容量公式和显式分配也未增加。
+本轮只覆盖此卡/模型/1024，每臂两次；不宣称decode、其他设备或并发收益。
+
+资格验证在新旧两套链接上通过：独立CPU GGUF解码/E4M3枚举，8格式×3组形状，
+逐字节比较23,330,816个图像字节（含padding）及729,088个尺度；覆盖零、负零、正负
+最小FP16 subnormal、最大有限值与真实K。既有公开Linear/LinearAdd/SwiGLU、混合Q8
+路由、独立FP64、gather、Graph、行列尾部及canary也通过。该改动只重排同一编码字节
+的写回，不新增量化误差；FP8本身仍有损，之前的工具格式反例未被本轮修复或重测。
+公共Linear的三格式×三真实N/K形状另做ABBA：全部录得正收益，范围+0.593%–2.520%；
+这些Op成绩不代替上面的模型收益。未因编码完全相同而重跑整套PPL。
+
+保留的不利实验与失败：首版精确查表通过数值资格，但一次进程对照中IQ3公共Linear
+下降0.555%–4.513%，IQ4仅增0.174%–0.868%，没有采用；四线程协作草案只完成编译，
+在用户要求先审底层后未继续资格/计时，也未纳入补丁。聚焦链接首次缺少VS库环境
+而找不到delayimp.lib，补齐后通过。附带续问检查曾把有效14799-token复用误判为
+不满14800；原生证据是14799复用+44新计算=14843，现按实际native/HTTP span核对，
+原失败探针保留，新实验使用独立目录且没有混入该样本。
+
+构建每轮仅编译必要的一个CUDA对象，首次/最后一次另编主机测试对象，8 jobs；独立
+链接图复用同构建既有库，基线服务和原FP8库哈希保持不变，没有重编整个引擎。
+交付为第34层 `ninfer-gguf-mxfp8-image-stores.patch`，前33层字节不变，完整清单准备/
+回放通过，最终tree `10f662d686ca7a92d0d2e0044d840ffd7a84162f`。真实Git索引未变。
+原始证据在实验根 `fp8/image-opt-20261103`：`vector-opbench.json`、`qualify-vector-*`、
+`performance-vector/analysis.json`、SASS/resource、构建计划及`export.json`。
+本轮为本地验证构建，未安装、提交或推送，PR250保持原快照；所有测试服务已退出。
+
+## 2026-11-03：测试脚本修复及 1024 原仓库对照
+
+修复两处审计确认的实验脚本缺陷：结果仅在服务上下文正常退出（包括收尾 GPU
+冲突检查）后提交；续跑严格校验不可覆盖的实验配置，绑定模型、文档、二进制、
+GPU UUID、参数、环境、profile、依赖和脚本内容。结果原子写入，旧的无验证记录
+不作为新实验的成功样本。8 项主机回归及 Python 3.11 语法检查通过。首次实际续跑
+发现镜像计划的 tuple 经 JSON 变成 list，导致原样配置被误拒绝；现已在比较前统一
+为 JSON 表示，并新增实际 round-trip 回归，保留失败日志。
+
+另确认旧 `fp8/on-off` 队列在显存释放后因参数错误退出：普通路径显式容量 25600
+小于 max-context 32768，服务报 `--kv-capacity must be at least --max-context`。
+旧队列没有成功样本，并非仍在等待显存。新测试将三臂的 max-context 和 KV capacity
+均设为 25600，KVMem B24576/R1024；文档 14806 token 全在预算内。
+
+新版 FP8 开关脚本为 `fp8/on_off.py`，使用独立的 guarded 结果目录。新增
+`fp8/prefill_1024_compare.py` 复用已编译、固定哈希的原仓库与当前二进制，比较原仓库
+FP8、本地普通 FP8、预算内 KVMem FP8，三臂各两次镜像进程重复。固定 int8 KV、
+MTP4、ngram0、并发1、真实 chunk1024、空用户 profile；短请求和独立 system 的
+5018-token prime 后测原文档，要求零 prefix reuse，并核对 native 实际 chunk、
+容量、计算 token 数及本地 no_pressure。本轮仅测 prefill，不作质量或 decode 结论。
+
+此前 RTX 5060 Ti UUID `GPU-A`
+被驱动报告为 `GPU is lost. Reboot the system to recover this GPU`，两次启动检查
+在空闲检测阶段失败，未启动模型服务，也未保存成功速度样本。用户恢复显卡后，
+同日继续并完成以下六轮；5050 未参与比较，没有更换模型或混入旧失败尝试。
+
+| 路径，均开启 FP8 | 两轮 prefill tok/s | 均值 | 相对原仓库吞吐 |
+|---|---:|---:|---:|
+| 原仓库，固定提交 08c4fb70 | 1445.960 / 1458.600 | 1452.280 | 基线 |
+| 当前后端，关闭 KVMem | 1376.298 / 1379.462 | 1377.880 | −5.123% |
+| 当前后端，预算内 KVMem | 1308.167 / 1252.503 | 1280.335 | −11.840% |
+
+KVMem 相对同一当前后端普通路径吞吐低 7.079%。原仓库/普通/KVMem 的平均文档
+prefill 时间分别为 10.195、10.746、11.570 秒。相对原仓库的两轮配对差距：普通
+4.818% / 5.426%，KVMem 9.530% / 14.130%。KVMem 两轮波动明显大于另两臂，
+保留全部样本，不将较慢一轮排除或未经验证地归因于噪声。
+
+六轮均确认真实 chunk1024、实际 KV capacity25600、零缓存命中、14806 计算 token，
+文档回应均为 2 token 的 Received。本地四轮均为 native `no_pressure`，两轮 KVMem
+的文档全在 B24576 内，不能用超预算冷历史检索解释这组差距；具体开销来源未在本次
+计时中定位。启动前检查空闲，运行监测未记录其他计算进程冲突；结束后本任务服务
+全部退出，5060 Ti 为 0 MiB、0% 利用率、无计算进程。
+
+实验协议、每轮请求/响应、native 日志及最终 `analysis.json` 保存在
+`fp8/upstream-1024-20261103/validated`；首次配置及续跑误拒绝记录保留在父目录。
+仅限此卡、此 27B 模型和预热服务的两次进程重复，未新增质量、decode 或功耗结论。
+本次没有原生编译、内核或补丁链变更，没有提交或推送。
+
+### 1024 普通路径差距分析与可行方向
+
+1377.880 → 1452.280 tok/s 需要本地吞吐提升 5.400%；正式对照的额外 prefill
+时间为 550.603 ms/文档。原生日志中本地 engine boundary 和 program.post 的均值
+合计约 7.431 ms，原仓库约 0.282 ms；这些前后处理无法解释大部分差距。
+program.submit 包含 CUDA 提交及阻塞，不能把其整段时间当成纯 CPU 成本。
+
+关闭 KVMem 不会恢复原仓库的整个普通路径：正式运行的 native metadata 确认
+本地是 hybrid 前缀缓存，原仓库是 legacy，设备状态槽、checkpoint 发布策略及
+Host tier 配置也不同。因此 5.123% 是整个普通后端的差距，不是已隔离的 FP8 Op 差距。
+
+补抓相同模型/卡/1024 的普通路径诊断，两边 Host cache 均为 5120 MiB，沿用固定
+二进制、实际最大值 FP8 与原仓库各自的数值实现；每边一次完整文档记录：
+
+| 已记录活动累计耗时，ms | 当前普通路径 | 原仓库 |
+|---|---:|---:|
+| FP8 GEMM | 6066.315 | 6491.835 |
+| GGUF → FP8 权重图像 | 1283.873 | 689.170 |
+| 输出 store-plane / gated epilogue | 758.074 | 91.932 |
+| prompt attention | 992.379 | 1010.360 |
+| FP8 激活转换 | 182.066 | 169.097 |
+| D2H 拷贝 | 168.983 | 39.640 |
+
+D2H 记录量为本地 659,144,724 B、原仓库 153,954,324 B。这与不同的缓存发布实现
+同时出现，未以单因素实验确认每笔拷贝的必要性，不能称为已确认的冗余或缺陷。
+
+限制：两条跟踪均有 CUDA/NVTX 事件可能未全收集的警告，Nsight 还提示用 13.2
+库追踪 13.4 驱动；两次诊断的 Host cache 上限与正式测速不同。以上仅为记录到的
+活动累计，支持优化假设，不能相加解释 550.603 ms 或推算可追回的净收益。
+正式测速均值保持不变，不混入 profiler 耗时。诊断原始资料在实验根
+`fp8/upstream-1024-20261103/profile-host5120-60s`，结构化分析为同层 `diagnosis.json`。
+
+建议按下列顺序做独立 A/B，均属于 NInfer 后端 patch：
+
+1. 优化 IQ3_S、IQ4_XS、IQ3_XXS 等格式的 GGUF→FP8 转换。这三类占本地记录图像
+   转换约 1.013 秒。保留解码 FP32 值、每32值实际 amax 和现有 E4M3 舍入，验证
+   特定格式的编码/查表方法；不照搬原仓库的尺度上界、Q4_K FP16 中间值，或已被
+   实测否定的通用整数查表草案。原始 LUT 更快的原因尚未与 slab/L2 布局分离。
+2. 优先在输出本来就是 BF16 的普通 Linear Store 边界尝试融合，减少 FP32 plane
+   的额外读写；另行评估保留 FP32 的 gate/up 合并计算。两边 GEMM 均 FP32 累加，
+   但原仓库 gate/up 会先舍入到 BF16 再激活，本地保持 FP32，直接移植会改变数值。
+   758 ms 也不代表全部可删除；需独立 Op oracle 和模型质量验证。
+3. 检查普通 hybrid 缓存的 checkpoint 发布与部分/增量拷贝，保留缓存正确性与复用
+   合约，不能用关掉缓存发布来宣称产品优化。确认继承缺陷时继续遵循先记录并讨论的规则。
+4. 最后按真实 N/K/输出类型校准 slab 和 Lt 算法。本地图像上限64 MiB、原仓库10.5 MiB，
+   本地记录到的 GEMM 调用8484次、原仓库39410次；不能简单复制较小 slab 或认为
+   主乘法必然更慢。新增25条路由只覆盖T256，不优化主T1024 Lt产品；PDL两边均启用。
+
+未改计算路径或发布配置，以上收益均未实施或经端到端 A/B 证明。诊断失败全部保留：
+最初默认8 GiB本地Host tier因页锁内存不足退出；随后4 GiB本地已完成请求但脚本
+以60秒等待90秒采集导致收尾超时，已改成有界短轮询；原仓库4 GiB又因15份状态
+镜像占用超过预算一半而拒绝启动。最终同设5 GiB的两条记录完成，前述失败未混入。
+自动审批曾因连接中断未执行一次命令，正常重提同一审批后成功，没有绕过审批。
+所有诊断服务已退出，5060 Ti检查为0 MiB、0%、无计算进程。
+
+## 上轮设备选路结果（第33层补丁）
+
+同一张 GPU-A（RTX 5060 Ti）、原始 Qwen3.8-27B-GSQ-RCO-IQ3_S-vision-mtp、
+int8 KV、MTP4、真实 chunk=256、无 prefix cache 命中。文档为 14,806 token；
+KVMem B=24,576、R=1,024，文档与回答均在预算内，native 停止原因为 `no_pressure`。
+同一候选二进制只替换新增 FP8 profile 键，保留其他设备调优；每臂两次镜像进程复测。
+
+| 路径 | 旧 tile tok/s | 新选路 tok/s | 增幅 |
+|---|---:|---:|---:|
+| 普通 NInfer FP8，KV capacity=32768 | 918.899 | 934.820 | +1.733% |
+| 预算内 KVMem FP8，capacity=B+R=25600 | 881.646 | 902.832 | +2.403% |
+
+固定原仓库 FP8 在相同普通后端配置为 969.816 tok/s；普通本地差距从 5.250%
+缩小到 3.609%，尚未追平。两种容量的普通/KVMem 横向差额不能全部归因于集成开销。
+最后一次旧普通臂与一次 CMake configure 有重叠，未并行编译或运行其他 GPU 任务；
+最终二进制的单次复核单列，不混进上述均值。
+最终服务二进制 SHA256 为 `de54e2aaf4b51ba2c4b4b1cc5c451747dc23aba8d51bd6e0b5e5229447dde909`。
+单次抽查：旧普通 tile 914.716、新普通内置选路 934.622、预算内 KVMem 内置选路
+894.601 tok/s；KVMem 单次结果低于前述镜像均值，存在进程间波动。没有将单次结果
+并入均值。此前把普通臂的 32768 容量参数误用于 KVMem 的启动被参数校验拒绝，
+没有产生速度数据，保留失败记录后改回合法 B+R 配置。
+
+两轮独立校准各测 8 格式×10 形状×4 epilogue，共 320 键。使用 11 次中位数、
+3% 候选门槛、交错确认和既有 5% 输出峰值差异保护，保留两轮都胜出的 25 个 Q8 键。
+其中 16 键为 IQ4_XS，其他键主要是 N=1024 的较小输出；大部分组合中 Q8 更慢，
+保留 FP8。规则只覆盖测过的 T=256，不外推到 257/384/512，也不套用到其他卡。
+
+选路改变数值路径，因此本轮专门测试 context=257，即实际 256 个预测列。
+六域冻结留出语料共 127,744 scored tokens / 499 个不重叠窗口：
+
+| 模式 | PPL | 相对 Q8 | 最差域增幅 | 最差窗口增幅 |
+|---|---:|---:|---:|---:|
+| Q8 | 9.810739 | — | — | — |
+| 旧 FP8 tile | 9.850831 | +0.4087% | +0.7274% | +5.7071% |
+| 新 FP8/Q8 选路 | 9.843478 | +0.3337% | +0.5343% | +4.5797% |
+
+两者均通过预先确定的总体≤1%、每域≤3%门槛，新选路 PPL 比旧 FP8 低 0.0746%。
+这是语料层面的通过，不能承诺任意输入无损；已有 max128 工具文档格式反例仍保留。
+旧 513/2048 窗口数据在下文，属于此前实现验证，本轮未重跑。
+评分完成后仅补充 host 侧旧 catalog 兼容分支及保持 Turing catalog 不变；受测 sm120
+当前 catalog 路径、Op 对象和 25 条规则未改变。最终二进制另做原生、问答和速度复核。
+
+本轮长文本回归严格使用文档先行、同会话另发问题：旧 tile/新内置选路各 3 个会话，
+24/24 个事实正确，实际 prefix reuse 为 21,257、27,371、29,395 token；检查了 question
+turn 的 native Query 范围。每文档 4 个事实属于相关探针。请求、响应和两阶段耗时
+均保存在 `fp8/route/recall`，不能外推为 256K 或无限长度质量通过。
+
+工程验证包含独立 CPU GGUF 解码/FP64 原始权重点积、真实 N/K 抽样、四种输出、
+gather、混合 Q8/FP8 工作区、canary、Graph、非法/缺省 profile、宽度和部分行边界。
+双卡测试验证设备选择互不串用、每设备 shared-memory 初始化、rank 顺序签名和
+调用设备恢复；不代表 TP 整体资格通过。新增 catalog 的兼容迁移保留未变更的旧
+用户校准键，旧 provenance 不能授权新 FP8 键；任意其他 catalog 不匹配仍拒绝。
+
+成本与限制：最大工作区仍保守预留 Q8+FP8 空间；混合产品可多做一次激活格式转换，
+不新增模型副本。FP8 数值签名升级到 `mxfp8-e4m3-e8m0-f32-profile-v2`，逐 rank
+绑定选路规则，旧 FP8 状态/成本缓存失效；默认 Q8 数值签名不变。本轮不宣称 decode
+提升；1024 新版与原仓库的 prefill 对照已补测，见上文。选路原始记录在实验根 `fp8/route` 下的
+`analysis.json`、`selection.json`、`quality`、`speed`、`mixed-ops.log` 和 `two-device.log`。
+
+本轮作为独立的第 33 层后端补丁交付，前 32 层字节不变；本地已验证完整补丁链。
+GitHub PR #250 保持上一轮上传的快照，本轮未提交或推送。
 
 ## 当前后端补丁边界
 
@@ -18,9 +238,12 @@
 | `ninfer-gguf-mxfp8-prefill.patch` | 通用 FP8 计算、融合 tile、64 MiB Lt、数值签名、独立 CPU/FP64 测试 |
 | `ninfer-gguf-nvfp4-prefill.patch` | NVFP4 计算、显式 A4 权限、FFN producer、测试；进一步 FP4 测试暂停 |
 | `ninfer-kvmem-statistics-readback.patch` | KVMem 原生 Mean-K/Query 合并拷贝、注意力反馈批量回读和布局/字节校验 |
+| `ninfer-gguf-mxfp8-device-routes.patch` | 原生校准、逐设备/格式/形状/epilogue FP8/Q8 选路、数值绑定和旧 profile 兼容迁移 |
+| `ninfer-gguf-mxfp8-image-stores.patch` | 恢复权重图像128-bit写回；编码字节、数值边界、工作区上限不变 |
 
 FP8 和 NVFP4 计算在关闭 KVMem 时也可使用。FP8 测试先引入共享 CPU GGUF oracle，
-NVFP4 测试复用它；FP8 不依赖后续 NVFP4 层或 KVMem 回读层。性能/快照数值签名跟随
+NVFP4 测试复用它；FP8 基础计算层不依赖后续 NVFP4 层或 KVMem 回读层。第 33 层
+增量按完整清单应用，包含共享 dispatcher/signature 文件的上下文，不启用 FP4。性能/快照数值签名跟随
 计算模式维护。前端、启动器和协议中不增加显卡→CUDA kernel 的选择规则。
 
 ## 最新 FP8 正确性与质量
@@ -28,7 +251,7 @@ NVFP4 测试复用它；FP8 不依赖后续 NVFP4 层或 KVMem 回读层。性�
 原模型 Qwen3.8-27B-GSQ-RCO-IQ3_S-vision-mtp，权重不重转换，int8 KV。
 独立 CPU packed-GGUF 解码、CPU E4M3 编码和 FP64 乘积覆盖八格式、实际 K、
 gather、tails、signed/zero/subnormal/max scales、FP32/BF16 epilogue、Graph 和大 slab。
-另有新增 per-device shared-memory 初始化，但未完成双 GPU/TP 整体资格验证。
+本轮已补充双 GPU 的初始化及选路隔离测试；TP 整体资格仍未完成。
 
 固定独立六域留出语料，语料先于当前结果选定，使用相同原始模型及 Q8/FP8：
 
@@ -86,7 +309,7 @@ Nsight 仅用于定位，不作计时成绩：本地 IQ4_XS、IQ3_XXS 矩阵累�
   shared-K attention-page-mass 四种形状均变慢，也已撤回。未打入当前补丁。
 - 初次移植期间测试 oracle、MSVC includes/Ninja 元数据和受限 loopback 就绪失败均已记录并
   处理；没有伪造 Ninja 记录或为整理补丁重编整个引擎。
-- 256 之外新版完整受控速度、其他模型/卡、多 GPU/TP、256K 质量、发布安装仍未验收。
+- 当前受控速度覆盖 256/1024；其他宽度、其他模型/卡、多 GPU/TP、256K 质量、发布安装仍未验收。
   decode 数学未因当前 FP8 prefill 路由改变，不宣称 decode 加速或输出完全等价。
 - 未导出暂停的 FP4 quarter-scope 工具改动和实验 smoke/GDN probes。未提交、合并或安装。
 

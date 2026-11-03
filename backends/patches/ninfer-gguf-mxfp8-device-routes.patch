@@ -1,0 +1,869 @@
+diff --git a/docs/gguf-mxfp8-prefill.md b/docs/gguf-mxfp8-prefill.md
+index 85ca209b181d706eaa6b5272a50126e3ac814e70..f9803f780cc3d3f146a85e2d857707b252ecc2de 100644
+--- a/docs/gguf-mxfp8-prefill.md
++++ b/docs/gguf-mxfp8-prefill.md
+@@ -14,16 +14,41 @@ Q4_K. Unsupported devices/formats and calls below 256 columns retain the existin
+ route. Supported decode/verification batches are at most 128 columns and remain
+ on q8_1. Prefill errors can still affect later KV/GDN state and generated output.
+ 
+-- At 256 through 1023 columns, a fused 128-row by 128-column tile uses producer
++- At 256 through 1023 columns, the default fused 128-row by 128-column tile uses producer
+   warps with cp.async staging and native block-scaled E4M3 MMA consumer warps.
+   Results pass directly through the existing store, residual or gate epilogue.
+ - At 1024 columns and above, a bounded weight image feeds cuBLASLt. GEMM
+   accumulation and output are FP32, followed by the existing epilogue/BF16 cast.
+ 
+-This width/type gate is a support rule, not a measured profitability rule for
+-every device and matrix shape. There is no per-device FP8-tile/Q8-matrix selector
+-in this implementation. The existing device profiles for other kernels remain
+-separate. In particular, support for FP8 does not prove that FP8 is faster.
++The backend's existing device profiles can select the Q8 integer matrix route
++instead of the tile. Keys are `gguf_prefill_mxfp8/<format>/<N>x<K>/<epilogue>`;
++the four epilogues are `f32`, `bf16`, `bf16-add` and `bf16-silu`. Q8 overrides
++require whole 128-row tiles; unsupported formats, partial row tiles and other
++epilogues keep their existing route. A Q8 choice bypasses both FP8 kernels and
++the two-stage Lt path. T >= 1024 retains Lt irrespective of these profile keys.
++
++The first built-in set has 25 entries for the 36-SM RTX 5060 Ti, at exactly
++T=256. Two independent native calibrations measured 8 formats, 10 actual-model
++shapes and 4 epilogues; only Q8 winners confirmed in both runs were retained.
++Every run uses an 11-sample median, a 3% selection margin, interleaved confirmation
++and the existing 5% peak-output-difference rejection. The qualification test also
++uses an independent CPU/FP64 oracle. A win for one epilogue does not select the
++others. Other devices and unmeasured widths keep their previous choices; no
++5060 Ti SM-fill threshold is applied to them. User-calibrated profiles retain
++their normal per-key priority over built-ins.
++
++Adding this family does not discard previously calibrated non-FP8 routes. The
++loader recognizes only the verified additive catalog transition, excludes the
++new namespace from old provenance, and preserves unrelated old measurements
++when a partial FP8 calibration is stored. Missing provenance and other catalog
++mismatches retain their rejection behavior. Volta/Turing catalogs are unchanged.
++
++To measure this optional family on another supported device, set MXFP8=1 and run
++`ninfer-calibrate --only gguf_prefill_mxfp8/ --detail --repeat 11`.
++The normal profile schema, hardware/SM matching and route-catalog provenance
++apply. The family is skipped when MXFP8 is disabled or unsupported. Calibrate
++while the GPU is idle, then qualify full-model speed and quality before using
++the measured choices. Synthetic Op measurements alone do not prove a model win.
+ 
+ ## Numerical and resource boundaries
+ 
+@@ -47,8 +72,10 @@ the historical 8 MiB implementation. Tile-only plans do not reserve an unused
+ cuBLASLt slab. cuBLASLt plans are cached per device and geometry.
+ 
+ The enabled Qwen prefill signature and all-family snapshot binding identify
+-`mxfp8-e4m3-e8m0-f32-tile-v1`. Default signatures are unchanged. State from a
+-different numerical profile must not be treated as interchangeable.
++`mxfp8-e4m3-e8m0-f32-profile-v2` plus the ordered FP8 routing bands of every
++device rank. This deliberately invalidates older FP8 state/cost bindings and
++separates custom Q8/tile mixtures. Default Q8 signatures are unchanged. State
++from a different numerical profile must not be treated as interchangeable.
+ 
+ ## Qualification and use
+ 
+@@ -57,6 +84,17 @@ qualify represented operands, including gathers, tails, extreme scales, stores,
+ residual/gated epilogues, graph replay and a large slab boundary. Encoded-operand
+ accuracy does not measure the quantization loss against the original model;
+ model perplexity and request behavior are separate acceptance evidence.
++The route tests cover FP8/Q8 products sharing an input and workspace, gather,
++real N/K shapes, width/format/epilogue limits, canaries and numerical signatures.
++`ninfer_linear_gguf_mxfp8_test --two-device` additionally checks that a route
++installed on one device does not affect the other and that signature collection
++restores the calling thread's device. This is not tensor-parallel qualification.
++
++Mixed routing retains the conservative Q8-plus-FP8 workspace capacity bound;
++it does not reduce the maximum allocation or create a persistent repacked model.
++Q8 and FP8 products can require two activation layouts for the same input. That
++extra conversion is included in full-Op and full-model timings. FP8 remains a
++lossy opt-in even where a measured shape now uses the more accurate Q8 operands.
+ 
+ ```powershell
+ $env:NINFER_GGUF_PREFILL_MXFP8 = '1'
+diff --git a/src/calibration/device_calibration.cu b/src/calibration/device_calibration.cu
+index 14c99aa1766c799d36ea6540990f2811ce763cdb..ebe62a75984ebadcc4bd8788968a795f272540e4 100644
+--- a/src/calibration/device_calibration.cu
++++ b/src/calibration/device_calibration.cu
+@@ -23,6 +23,9 @@
+ #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+ #include "ops/linear/common/route_table.h"
+ #include "ops/linear/gguf/ggml_bridge.h"
++#include "ops/linear/gguf/gguf_linear.h"
++#include "ops/linear/gguf/gguf_mxfp8.h"
++#include "ops/linear/gguf/gguf_prefill_route.h"
+ #include "ops/linear/t2/t2_a8.h"
+ #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
+ #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
+@@ -300,9 +303,15 @@ struct Family {
+     std::function<std::pair<const void*, std::size_t>(std::int32_t)> output;
+     // Restores any state a run accumulates into (a residual) before a checked run.
+     std::function<void()> reset;
++    DType output_dtype = DType::BF16;
+ };
+ 
+-std::vector<float> bf16_host(std::pair<const void*, std::size_t> output) {
++std::vector<float> output_host(std::pair<const void*, std::size_t> output, DType dtype) {
++    if (dtype == DType::FP32) {
++        std::vector<float> values(output.second);
++        CUDA_CHECK(cudaMemcpy(values.data(), output.first, values.size()*sizeof(float), cudaMemcpyDeviceToHost));
++        return values;
++    }
+     std::vector<std::uint16_t> raw(output.second);
+     CUDA_CHECK(cudaMemcpy(raw.data(), output.first, raw.size() * 2, cudaMemcpyDeviceToHost));
+     std::vector<float> values(raw.size());
+@@ -347,7 +356,7 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
+             if (family.reset) { family.reset(); }
+             family.run(width, nullptr);
+             CUDA_CHECK(cudaDeviceSynchronize());
+-            reference = bf16_host(family.output(width));
++            reference = output_host(family.output(width), family.output_dtype);
+         }
+         double best_us = compiled;
+         std::string best;
+@@ -363,7 +372,7 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
+                     cudaGetLastError();
+                     continue;
+                 }
+-                const double difference = relative_difference(reference, bf16_host(family.output(width)));
++                const double difference = relative_difference(reference, output_host(family.output(width), family.output_dtype));
+                 if (!(difference <= 0.05)) {
+                     char line[256];
+                     std::snprintf(line, sizeof(line), "%s w=%d %s rejected: output differs by %.3g",
+@@ -439,9 +448,12 @@ std::vector<std::int32_t> decode_widths() {
+ }
+ 
+ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
+-                                   std::uint32_t seed = 0) {
++                                   std::uint32_t seed = 0, bool prefill = false) {
+     const GgufBlockShape block = gguf_block_shape(qtype);
+-    if ((qtype != QType::GGUF_Q4_K && qtype != QType::GGUF_Q6_K) || block.elements == 0 ||
++    const bool fp8_format = std::any_of(ops::gguf::mxfp8::kPrefillFormats.begin(),
++        ops::gguf::mxfp8::kPrefillFormats.end(), [=](const auto& f) { return f.qtype == qtype; });
++    if ((!prefill && qtype != QType::GGUF_Q4_K && qtype != QType::GGUF_Q6_K) ||
++        (prefill && !fp8_format) || block.elements == 0 ||
+         k % block.elements != 0) {
+         throw std::invalid_argument("calibration: unsupported GGUF vector weight format");
+     }
+@@ -455,11 +467,12 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
+     }
+     for (std::uint64_t index = 0; index < blocks; ++index) {
+         const std::size_t base = static_cast<std::size_t>(index) * block.bytes;
+-        const std::uint16_t d = 0x3c00;
+-        std::memcpy(host.data() + base + (qtype == QType::GGUF_Q6_K ? 208 : 0), &d, sizeof(d));
+-        if (qtype == QType::GGUF_Q4_K) {
+-            const std::uint16_t dmin = 0x3800;
+-            std::memcpy(host.data() + base + 2, &dmin, sizeof(dmin));
++        const std::uint16_t d = prefill ? 0x2266 : 0x3c00; // RN FP16(0.0125), or legacy 1
++        const int offset = qtype == QType::GGUF_Q6_K ? 208 : qtype == QType::GGUF_Q2_K ? 80 : 0;
++        std::memcpy(host.data() + base + offset, &d, sizeof(d));
++        if (qtype == QType::GGUF_Q4_K || qtype == QType::GGUF_Q2_K) {
++            const std::uint16_t dmin = prefill ? d : 0x3800;
++            std::memcpy(host.data() + base + offset + 2, &dmin, sizeof(dmin));
+         }
+     }
+     SyntheticWeight result{DeviceBuffer(static_cast<std::size_t>(bytes)), {}};
+@@ -483,6 +496,54 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
+     return result;
+ }
+ 
++void calibrate_gguf_mxfp8(ops::DeviceRouteProfile& profile, Timer& timer,
++                          const CalibrationOptions& options) {
++    namespace mx = ops::gguf::mxfp8;
++    if (!mx::enabled() || !mx::supported(ops::gguf::GgmlType::IQ3_S, 256)) { return; }
++    // Initially measure one width. A 256-only entry must not extrapolate a
++    // winner through the wave-fill discontinuities at 384, 512, ... .
++    constexpr int tokens = 256;
++    for (const auto& format : mx::kPrefillFormats) for (const auto shape : mx::kPrefillShapes) {
++        bool selected = options.only.empty();
++        for (const auto epilogue : mx::kPrefillEpilogues) {
++            const auto key = mx::prefill_route_key(format.type, shape.n, shape.k, epilogue);
++            selected |= key.starts_with(options.only);
++        }
++        if (!selected) { continue; }
++        auto weight = gguf_vector_weight(format.qtype, shape.n, shape.k, 5526, true);
++        auto input = bf16_buffer(std::size_t(shape.k)*tokens);
++        DeviceBuffer output(std::size_t(shape.n)*tokens*sizeof(float));
++        DeviceBuffer gate(std::size_t(shape.n)*tokens*sizeof(float));
++        fill_f32_kernel<<<fill_grid(std::size_t(shape.n)*tokens),256>>>(
++            static_cast<float*>(gate.p), std::size_t(shape.n)*tokens, 0.5f);
++        CUDA_CHECK(cudaGetLastError());
++        const ops::detail::GgufShape ws_shape{format.qtype,shape.n,shape.k};
++        WorkspaceArena workspace(ops::detail::gguf_project_workspace_bytes({&ws_shape,1},tokens,tokens));
++        const Tensor x(input.p,DType::BF16,{shape.k,tokens});
++        for (const auto epilogue : mx::kPrefillEpilogues) {
++            const auto key = mx::prefill_route_key(format.type,shape.n,shape.k,epilogue);
++            if (!options.only.empty() && !key.starts_with(options.only)) { continue; }
++            const bool f32 = epilogue == mx::PrefillEpilogue::F32;
++            Tensor y(output.p,f32?DType::FP32:DType::BF16,{shape.n,tokens});
++            ops::detail::GgufProduct product{&weight.weight,&y};
++            if (f32) { product.f32=static_cast<float*>(output.p);product.f32_rows=shape.n; }
++            if (epilogue == mx::PrefillEpilogue::Add) {
++                product.epilogue=ops::detail::GgufEpilogue::Accumulate;
++            } else if (epilogue == mx::PrefillEpilogue::Silu) {
++                product.epilogue=ops::detail::GgufEpilogue::GateProduct;
++                product.gate=static_cast<const float*>(gate.p);
++            }
++            const Family family{key,{tokens},
++                [&](int, cudaStream_t stream) {
++                    ops::detail::gguf_project(x,{&product,1},workspace,stream);
++                },
++                [&](int) { return std::pair<const void*,std::size_t>{output.p,std::size_t(shape.n)*tokens}; },
++                [&] { output.fill(0); }, f32?DType::FP32:DType::BF16};
++            profile.routes[key]=sweep(family,timer,options);
++        }
++    }
++}
++
+ void calibrate_gguf_vector(ops::DeviceRouteProfile& profile, Timer& timer,
+                            const CalibrationOptions& options) {
+     constexpr std::int32_t max_tokens = 8;
+@@ -1809,6 +1870,7 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
+             calibrate_q8_ksplit(profile, timer, options);
+         }
+         calibrate_gguf_vector(profile, timer, options);
++        calibrate_gguf_mxfp8(profile, timer, options);
+         calibrate_gguf_moe_vector(profile, timer, options);
+         calibrate_gguf_moe_up(profile, timer, options);
+     }
+diff --git a/src/calibration/route_catalog.cpp b/src/calibration/route_catalog.cpp
+index 302dc79eabf665273c27acdeda558e025c1c9d4d..3e720d80cb1bfc39329e4dd648393732e6ef2d02 100644
+--- a/src/calibration/route_catalog.cpp
++++ b/src/calibration/route_catalog.cpp
+@@ -1,4 +1,5 @@
+ #include "calibration/route_catalog.h"
++#include "ops/linear/gguf/gguf_prefill_route.h"
+ 
+ #include "ops/linear/common/route_table.h"
+ #include "ops/softmax_attention/dense/causal_cache/launch.h"
+@@ -31,6 +32,16 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
+     add("gguf_moe_up/q6_k", {"scalar", "cooperative"});
+ 
+     if (!volta) {
++        // Keep the catalog stable between compatible and native builds on one
++        // physical card. Runtime capability checks still admit MXFP8 only on sm120.
++        if (!turing_shapes) for (const auto& format : ops::gguf::mxfp8::kPrefillFormats) {
++            for (const auto shape : ops::gguf::mxfp8::kPrefillShapes) {
++                for (const auto epilogue : ops::gguf::mxfp8::kPrefillEpilogues) {
++                    add(ops::gguf::mxfp8::prefill_route_key(format.type, shape.n, shape.k, epilogue),
++                        {"tile", "q8"});
++                }
++            }
++        }
+         // A Volta card runs its own projection, decode-attention and single-row prompt routes
+         // (ops/linear/sm70, small_t_sm70.cuh, prompt_sm70.cu), which consult none of the projection
+         // and attention keys below; besides the GGUF load schedules above it calibrates the GDN
+diff --git a/src/models/qwen3_5/measurement.cpp b/src/models/qwen3_5/measurement.cpp
+index 3116aef3daff6c963be04adffe32ea53277ed443..ff849941440c6e3b733edc3b0de4f0d2e6c6e154 100644
+--- a/src/models/qwen3_5/measurement.cpp
++++ b/src/models/qwen3_5/measurement.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include "models/qwen3_5/frontend/digest.h"
+ #include "ops/linear/gguf/gguf_mxfp8.h"
++#include "ops/linear/gguf/gguf_prefill_route.h"
++#include "core/device.h"
+ #include "ops/linear/gguf/gguf_nvfp4.h"
+ 
+ #include <nlohmann/json.hpp>
+@@ -27,8 +29,18 @@ std::string prefill_signature(const Model& model) {
+     // This opt-in changes both prefill arithmetic and its measured cost. Keep the default
+     // signature stable, and isolate MXFP8 state/cost presets from the q8_1 profile.
+     if (ops::gguf::mxfp8::enabled()) {
+-        facts["gguf_prefill_compute"] = {"mxfp8-e4m3-e8m0-f32-tile-v1",
+-                                         ops::gguf::mxfp8::kMinColumns};
++        std::vector<int> devices;
++        for (const auto& arena : model.device_weight_arenas()) {
++            cudaPointerAttributes attributes{};
++            CUDA_CHECK(cudaPointerGetAttributes(&attributes, arena.span.data));
++            devices.push_back(attributes.device);
++        }
++        if (devices.empty()) {
++            int device = 0;
++            CUDA_CHECK(cudaGetDevice(&device));
++            devices.push_back(device);
++        }
++        facts["gguf_prefill_compute"] = ops::gguf::mxfp8::prefill_profile_signature(devices);
+     }
+     if (ops::gguf::nvfp4_enabled()) {
+         facts["gguf_nvfp4_prefill"] = {"e2m1-e4m3-mse4-bf16-v1",129};
+diff --git a/src/ops/linear/gguf/gguf_linear.cpp b/src/ops/linear/gguf/gguf_linear.cpp
+index fe471cb67cf255d490489817c49fe57afa9eda7c..681e649122705ded9b8441f5280a06178de1a1ed 100644
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -1,6 +1,9 @@
+ #include "ops/linear/gguf/gguf_linear.h"
+ #include "ops/linear/gguf/gguf_mxfp8.h"
+ #include "ops/linear/gguf/gguf_nvfp4.h"
++#include "ops/linear/gguf/gguf_prefill_route.h"
++#include "ops/common/device_route.h"
++#include "core/device.h"
+ #include <cstdlib>
+ #include <string_view>
+ 
+@@ -22,6 +25,59 @@ bool enabled() {
+     }();
+     return value;
+ }
++
++std::string prefill_route_key(GgmlType type, std::int32_t n, std::int32_t k,
++                              PrefillEpilogue epilogue) {
++    std::string_view format;
++    for (const auto& f : kPrefillFormats) { if (f.type == type) { format = f.name; break; } }
++    std::string_view suffix;
++    switch (epilogue) {
++    case PrefillEpilogue::F32: suffix = "f32"; break;
++    case PrefillEpilogue::BF16: suffix = "bf16"; break;
++    case PrefillEpilogue::Add: suffix = "bf16-add"; break;
++    case PrefillEpilogue::Silu: suffix = "bf16-silu"; break;
++    default: return {};
++    }
++    if (format.empty()) { return {}; }
++    return std::string(kPrefillRoutePrefix) + std::string(format) + '/' +
++           std::to_string(n) + 'x' + std::to_string(k) + '/' + std::string(suffix);
++}
++
++PrefillRoute prefill_route(GgmlType type, std::int32_t n, std::int32_t k,
++                           std::int32_t tokens, PrefillEpilogue epilogue) {
++    if (!enabled() || tokens < kMinColumns || !supported(type, k)) { return PrefillRoute::Q8; }
++    if (!takes_tile(type, k, tokens)) { return PrefillRoute::Lt; }
++    // The alternate integer matrix route requires whole output-row tiles. Never
++    // let a profile extend a candidate's mathematical or implementation domain.
++    if (n > 0 && n % 128 == 0 && has_matrix_kernel(type)) {
++        const std::string key = prefill_route_key(type, n, k, epilogue);
++        if (!key.empty() && device_route_schedule(key, tokens) == "q8") {
++            return PrefillRoute::Q8;
++        }
++    }
++    return PrefillRoute::Tile;
++}
++
++std::string prefill_profile_signature(std::span<const int> devices) {
++    if (!enabled()) { return {}; }
++    std::string result = "mxfp8-e4m3-e8m0-f32-profile-v2\n";
++    for (std::size_t rank = 0; rank < devices.size(); ++rank) {
++        const DeviceBinding binding(devices[rank]);
++        result += "rank=" + std::to_string(rank) + '\n';
++        const auto profile = installed_device_route_profile();
++        if (!profile) { continue; }
++        for (const auto& [key, bands] : profile->routes) {
++            if (!key.starts_with(kPrefillRoutePrefix)) { continue; }
++            result += std::to_string(key.size()) + ':' + key + '=';
++            for (const auto& band : bands) {
++                result += std::to_string(band.last) + ':' +
++                          std::to_string(band.schedule.size()) + ':' + band.schedule + ';';
++            }
++            result += '\n';
++        }
++    }
++    return result;
++}
+ } // namespace ninfer::ops::gguf::mxfp8
+ 
+ namespace ninfer::ops::detail {
+@@ -356,10 +412,25 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+     auto* plane = static_cast<float*>(
+         workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
+     void* fixup = workspace.alloc_bytes(fixup_bound()).data;
++    // Compute a product's route once, and use the same decision for workspace
++    // planning and execution. Q8 is a complete fallback, not a request for Lt.
++    std::vector<gguf::mxfp8::PrefillRoute> mx_routes;
+     std::size_t mx_bytes=0;
+-    if(gguf::mxfp8::enabled() && t>=gguf::mxfp8::kMinColumns) {
+-        for(const auto& p:products)if(gguf::mxfp8::supported(gguf_type(p.weight->qtype),k) && !gguf::mxfp8::takes_tile(gguf_type(p.weight->qtype),k,t))
++    if (gguf::mxfp8::enabled() && t >= gguf::mxfp8::kMinColumns) {
++      mx_routes.reserve(products.size());
++      for (const auto& p : products) {
++        using E = gguf::mxfp8::PrefillEpilogue;
++        E epilogue = E::Other;
++        if (p.epilogue == GgufEpilogue::Store) { epilogue = p.f32 ? E::F32 : E::BF16; }
++        else if (!p.f32 && p.epilogue == GgufEpilogue::Accumulate) { epilogue = E::Add; }
++        else if (!p.f32 && p.epilogue == GgufEpilogue::GateProduct &&
++                 p.activation == gguf::GateActivation::Silu) { epilogue = E::Silu; }
++        const auto route = gguf::mxfp8::prefill_route(gguf_type(p.weight->qtype),p.weight->n,k,t,epilogue);
++        mx_routes.push_back(route);
++        if (route == gguf::mxfp8::PrefillRoute::Lt) {
+             mx_bytes=std::max(mx_bytes,gguf::mxfp8::scratch_bytes(k,p.weight->n,t));
++        }
++      }
+     }
+     void* mx_scratch=mx_bytes?workspace.alloc_bytes(mx_bytes).data:nullptr;
+     constexpr auto fp4_form = gguf::LtForm::Nvfp4;
+@@ -380,7 +451,10 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+         scratch = workspace.alloc_bytes(kDequantizedScratchBytes).data;
+     }
+ 
++    std::size_t product_index = 0;
+     for (const auto& p : products) {
++        const auto mx_route = mx_routes.empty() ? gguf::mxfp8::PrefillRoute::Q8
++                                                : mx_routes[product_index++];
+         const Weight& w  = *p.weight;
+         const auto type  = gguf_type(w.qtype);
+         const bool direct = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
+@@ -398,7 +472,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+                              {w.fp4_choices,w.fp4_choices_amax},found->data,t,output(p,0),fp4_scratch,fp4_bytes,stream);
+             continue;
+         }
+-        if(gguf::mxfp8::enabled() && gguf::mxfp8::takes_tile(type,k,t)) {
++        if(mx_route == gguf::mxfp8::PrefillRoute::Tile) {
+             constexpr int tile_layout=-3;
+             auto found=std::find_if(activations.begin(),activations.end(),[&](const Activation& a){return a.layout==tile_layout&&a.columns==w.input_columns;});
+             if(found==activations.end()) {
+@@ -409,7 +483,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
+             gguf::mxfp8::tile_product(type,w.qdata,row_bytes(w),w.n,k,found->data,t,output(p,0),stream);
+             continue;
+         }
+-        if(mx_scratch && gguf::mxfp8::supported(type,k)) {
++        if(mx_route == gguf::mxfp8::PrefillRoute::Lt) {
+             constexpr int mx_layout=-1;
+             auto found=std::find_if(activations.begin(),activations.end(),[&](const Activation& a){return a.layout==mx_layout&&a.columns==w.input_columns;});
+             if(found==activations.end()) {
+diff --git a/src/ops/linear/gguf/gguf_prefill_route.h b/src/ops/linear/gguf/gguf_prefill_route.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9039d78c4844d6209968c175412d67b7d6b74136
+--- /dev/null
++++ b/src/ops/linear/gguf/gguf_prefill_route.h
+@@ -0,0 +1,46 @@
++#pragma once
++
++// Host-only routing metadata. Keep this out of the CUDA kernel headers: a new
++// device measurement must not rebuild the arithmetic implementations.
++#include "core/weight.h"
++#include "ops/linear/gguf/ggml_bridge.h"
++
++#include <array>
++#include <cstdint>
++#include <span>
++#include <string>
++#include <string_view>
++
++namespace ninfer::ops::gguf::mxfp8 {
++
++enum class PrefillRoute { Q8, Tile, Lt };
++enum class PrefillEpilogue { F32, BF16, Add, Silu, Other };
++struct PrefillFormat { QType qtype; GgmlType type; std::string_view name; };
++inline constexpr std::array<PrefillFormat, 8> kPrefillFormats = {{
++    {QType::GGUF_IQ3_XXS, GgmlType::IQ3_XXS, "iq3_xxs"},
++    {QType::GGUF_IQ3_S, GgmlType::IQ3_S, "iq3_s"},
++    {QType::GGUF_IQ2_XXS, GgmlType::IQ2_XXS, "iq2_xxs"},
++    {QType::GGUF_IQ2_XS, GgmlType::IQ2_XS, "iq2_xs"},
++    {QType::GGUF_IQ2_S, GgmlType::IQ2_S, "iq2_s"},
++    {QType::GGUF_IQ4_XS, GgmlType::IQ4_XS, "iq4_xs"},
++    {QType::GGUF_Q2_K, GgmlType::Q2_K, "q2_k"},
++    {QType::GGUF_Q4_K, GgmlType::Q4_K, "q4_k"},
++}};
++struct PrefillShape { std::int32_t n; std::int32_t k; };
++inline constexpr std::array<PrefillShape, 10> kPrefillShapes = {{
++    {5120,5120}, {5120,6144}, {5120,17408}, {6144,5120}, {17408,5120},
++    {4096,5120}, {8192,5120}, {1024,5120}, {10240,5120}, {34816,5120},
++}};
++inline constexpr std::array<PrefillEpilogue, 4> kPrefillEpilogues = {
++    PrefillEpilogue::F32, PrefillEpilogue::BF16, PrefillEpilogue::Add, PrefillEpilogue::Silu};
++inline constexpr std::string_view kPrefillRoutePrefix = "gguf_prefill_mxfp8/";
++
++[[nodiscard]] std::string prefill_route_key(GgmlType type, std::int32_t n, std::int32_t k,
++                                           PrefillEpilogue epilogue);
++[[nodiscard]] PrefillRoute prefill_route(GgmlType type, std::int32_t n, std::int32_t k,
++                                        std::int32_t tokens, PrefillEpilogue epilogue);
++// Numeric route choices participate in persistent state and prefill-cost bindings.
++// Rank order matters; physical CUDA ordinals do not enter the serialized signature.
++[[nodiscard]] std::string prefill_profile_signature(std::span<const int> devices);
++
++} // namespace ninfer::ops::gguf::mxfp8
+diff --git a/src/runtime/engine/device_profile.cpp b/src/runtime/engine/device_profile.cpp
+index 4b0d0b52226b77390feb9f05bca4cf8ce083c6a4..4d0c325d4efcd71f94479b3a9a4e30bac068bd1f 100644
+--- a/src/runtime/engine/device_profile.cpp
++++ b/src/runtime/engine/device_profile.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/engine/device_profile.h"
+ 
+ #include "runtime/engine/device_profiles_builtin.h"
++#include "runtime/engine/mxfp8_profile_compat.h"
+ 
+ #include <cuda_runtime_api.h>
+ #include <nlohmann/json.hpp>
+@@ -284,6 +285,13 @@ std::optional<ops::DeviceRouteProfile> find_device_route_profile(
+                 note(path.string() + ": the entry for " + std::string(hardware_class) +
+                      " records no route catalog and is ignored; recalibrate (ninfer-calibrate, or "
+                      "--device-profile calibrate)");
++            } else if (detail::additive_mxfp8_catalog(route_catalog, found->calibration->route_catalog)) {
++                measured = found->profile;
++                std::erase_if(measured->routes, [](const auto& item) {
++                    return item.first.starts_with(detail::kMxfp8ProfilePrefix);
++                });
++                note(path.string() + ": retained unchanged pre-MXFP8 calibrated routes; "
++                     "new FP8 keys require current-catalog calibration");
+             } else if (found->calibration->route_catalog != route_catalog) {
+                 note(path.string() + ": the entry for " + std::string(hardware_class) +
+                      " was calibrated against route catalog " + found->calibration->route_catalog +
+@@ -321,9 +329,13 @@ DeviceProfileEntry upsert_device_route_profile_atomic(const std::filesystem::pat
+             existing.profile.multiprocessors != profile.multiprocessors) {
+             continue;
+         }
++        const bool additive = existing.calibration && entry.calibration &&
++            detail::additive_mxfp8_catalog(entry.calibration->route_catalog,
++                                           existing.calibration->route_catalog);
+         if (!replaced && existing.calibration && entry.calibration &&
+-            existing.calibration->route_catalog == entry.calibration->route_catalog) {
++            (existing.calibration->route_catalog == entry.calibration->route_catalog || additive)) {
+             for (const auto& [key, bands] : existing.profile.routes) {
++                if (additive && key.starts_with(detail::kMxfp8ProfilePrefix)) { continue; }
+                 stored.profile.routes.try_emplace(key, bands);
+             }
+         }
+diff --git a/src/runtime/engine/device_profiles.json b/src/runtime/engine/device_profiles.json
+index 120d0f6a93c52cdefe3d4048486eec76e6b88fcc..f611d140b97b8322db2d4c8bbb99ce0a6fbb0933 100644
+--- a/src/runtime/engine/device_profiles.json
++++ b/src/runtime/engine/device_profiles.json
+@@ -426,8 +426,33 @@
+         "t2_i8_small/5120x6144": [[8, "r32c8k4"], [16, "r32c16"], [32, ""]],
+         "t2_i8_small/7168+7168x5120": [[3, "r32c8k4"], [14, ""], [16, "r32c16"], [32, ""]]
+      }},
+-    {"hardware_class": "nvidia-geforce-rtx-5060-ti-sm120", "multiprocessors": 36, "origin": "built in: RTX 5060 Ti at 180 W, 2026-10-16; GGUF Q4_K/Q6_K dense loads, CUDA 13.2, 2026-11-01",
++    {"hardware_class": "nvidia-geforce-rtx-5060-ti-sm120", "multiprocessors": 36, "origin": "built in: RTX 5060 Ti at 180 W, 2026-10-16; GGUF Q4_K/Q6_K dense loads, CUDA 13.2, 2026-11-01; MXFP8 T256 shape/epilogue routes, two calibrated runs, 2026-11-02",
+      "routes": {
++        "gguf_prefill_mxfp8/iq2_xxs/1024x5120/bf16-silu": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq3_s/1024x5120/f32": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq3_xxs/1024x5120/bf16": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq3_xxs/1024x5120/bf16-silu": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq3_xxs/1024x5120/f32": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/1024x5120/bf16": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/1024x5120/bf16-add": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/1024x5120/bf16-silu": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/1024x5120/f32": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x17408/bf16": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x17408/bf16-add": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x17408/bf16-silu": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x17408/f32": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x5120/bf16": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x5120/bf16-add": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x5120/bf16-silu": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x5120/f32": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x6144/bf16": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x6144/bf16-add": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x6144/bf16-silu": [[256, "q8"]],
++        "gguf_prefill_mxfp8/iq4_xs/5120x6144/f32": [[256, "q8"]],
++        "gguf_prefill_mxfp8/q4_k/1024x5120/bf16": [[256, "q8"]],
++        "gguf_prefill_mxfp8/q4_k/1024x5120/bf16-add": [[256, "q8"]],
++        "gguf_prefill_mxfp8/q4_k/1024x5120/bf16-silu": [[256, "q8"]],
++        "gguf_prefill_mxfp8/q4_k/1024x5120/f32": [[256, "q8"]],
+         "gguf_vector/q4_k": [[8, ""]],
+         "gguf_vector/q6_k": [[1, ""], [8, "cooperative"]],
+         "attn_i8_small/h24/int8/w1": [[1048576, ""]],
+diff --git a/src/runtime/engine/engine.cpp b/src/runtime/engine/engine.cpp
+index 493c8fefa4fec99a6624b71f45369069f809c879..c6a497599fa70718f6b702258084b4788358cb39 100644
+--- a/src/runtime/engine/engine.cpp
++++ b/src/runtime/engine/engine.cpp
+@@ -1,6 +1,7 @@
+ #include "ninfer/engine.h"
+ #include "text/structured_output.h"
+ #include "ops/linear/gguf/gguf_mxfp8.h"
++#include "ops/linear/gguf/gguf_prefill_route.h"
+ #include "ops/linear/gguf/gguf_nvfp4.h"
+ 
+ #include "artifact/reader.h"
+@@ -355,7 +356,11 @@ std::string slot_model_binding(const EngineOptions& options, const LoadSummary&
+     binding += '\n' + load.prefill_signature + '\n';
+     // Other model families have coarser load signatures. The process-wide arithmetic
+     // opt-in must still prevent their session snapshots crossing numerical profiles.
+-    if (ops::gguf::mxfp8::enabled()) { binding += "gguf-mxfp8-e4m3-e8m0-f32-tile-v1\n"; }
++    if (ops::gguf::mxfp8::enabled()) {
++        const std::vector<int> devices = options.devices.size() > 1 ? options.devices
++                                                                  : std::vector<int>{options.device};
++        binding += ops::gguf::mxfp8::prefill_profile_signature(devices);
++    }
+     if (ops::gguf::nvfp4_enabled()) { binding += "gguf-nvfp4-e2m1-e4m3-mse4-bf16-v1\n"; }
+     std::error_code size_error;
+     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, size_error);
+diff --git a/src/runtime/engine/mxfp8_profile_compat.h b/src/runtime/engine/mxfp8_profile_compat.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..24924d01ab861ef08709628f83361fbc2d4175c8
+--- /dev/null
++++ b/src/runtime/engine/mxfp8_profile_compat.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include <string_view>
++
++namespace ninfer::runtime::detail {
++
++// One strictly additive catalog transition. Tests recompute both digests and
++// verify that removing only this new namespace reproduces the old catalog.
++// A future change to an existing key/candidate must not inherit this exception.
++inline constexpr std::string_view kBeforeMxfp8Catalog = "29b2a2a7f55b5a61";
++inline constexpr std::string_view kWithMxfp8Catalog = "ce71cc3cfb807c21";
++inline constexpr std::string_view kMxfp8ProfilePrefix = "gguf_prefill_mxfp8/";
++
++[[nodiscard]] inline bool additive_mxfp8_catalog(std::string_view current,
++                                                 std::string_view stored) {
++    return current == kWithMxfp8Catalog && stored == kBeforeMxfp8Catalog;
++}
++
++} // namespace ninfer::runtime::detail
+diff --git a/tests/ops/linear/test_gguf_mxfp8.cpp b/tests/ops/linear/test_gguf_mxfp8.cpp
+index cc8c0fa2d2fdc1c80ced52b45e301170c8ad9864..8dd75f15805cff8aacea9b979878b74e380c8e43 100644
+--- a/tests/ops/linear/test_gguf_mxfp8.cpp
++++ b/tests/ops/linear/test_gguf_mxfp8.cpp
+@@ -5,6 +5,8 @@
+ #include "ninfer/ops/linear_swiglu.h"
+ #include "ops/linear/gguf/gguf_linear.h"
+ #include "ops/linear/gguf/gguf_mxfp8.h"
++#include "ops/linear/gguf/gguf_prefill_route.h"
++#include "ops/common/device_route.h"
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ #include <algorithm>
+@@ -186,6 +188,120 @@ void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
+     }
+     if(workspace.peak_used()>capacity)throw std::runtime_error("workspace exceeds capacity query");
+ }
++void route_boundaries() {
++    using R=mx::PrefillRoute;using E=mx::PrefillEpilogue;
++    const auto type=ops::gguf::GgmlType::IQ3_S;
++    const auto key=mx::prefill_route_key(type,5120,5120,E::F32);
++    const auto saved=ops::installed_device_route_profile();
++    int device=0;checked(cudaGetDevice(&device));const std::array devices{device};
++    ops::install_device_route_profile(nullptr);
++    const auto plain=mx::prefill_profile_signature(devices);
++    auto profile=std::make_shared<ops::DeviceRouteProfile>();
++    profile->routes[key]={{256,"q8"}};
++    ops::install_device_route_profile(profile);
++    const auto routed=mx::prefill_profile_signature(devices);
++    const auto expect=[](bool value){if(!value)throw std::runtime_error("prefill route boundary/signature");};
++    expect(plain!=routed);
++    expect(mx::prefill_route(type,5120,5120,255,E::F32)==R::Q8);
++    expect(mx::prefill_route(type,5120,5120,256,E::F32)==R::Q8);
++    expect(mx::prefill_route(type,5120,5120,257,E::F32)==R::Tile);
++    expect(mx::prefill_route(type,5120,5120,1023,E::F32)==R::Tile);
++    expect(mx::prefill_route(type,5120,5120,1024,E::F32)==R::Lt);
++    expect(mx::prefill_route(type,5120,5120,256,E::BF16)==R::Tile);
++    expect(mx::prefill_route(type,5120,5120,256,E::Other)==R::Tile);
++    expect(mx::prefill_route(type,5120,255,256,E::F32)==R::Q8);
++    expect(mx::prefill_route(ops::gguf::GgmlType::Q6_K,5120,5120,256,E::F32)==R::Q8);
++    {
++        const ops::DeviceRouteForce force(mx::prefill_route_key(type,129,5120,E::F32),"q8");
++        expect(mx::prefill_route(type,129,5120,256,E::F32)==R::Tile);
++    }
++    {
++        const ops::DeviceRouteForce force(key,"invalid");
++        expect(mx::prefill_route(type,5120,5120,256,E::F32)==R::Tile);
++    }
++    profile->routes["unrelated"]={{1024,"test"}};
++    expect(mx::prefill_profile_signature(devices)==routed);
++    ops::install_device_route_profile(saved);
++    std::cout<<"MXFP8 profile width/format/epilogue/tail/signature checks passed\n";
++}
++
++void routed_oracle(const Format& f,int n=128,int k=256,bool sampled=false) {
++    // Q8 is checked against independently decoded original weights and FP64
++    // dots, not against the numerically different FP8 encoded-product oracle.
++    constexpr int t=256;
++    const auto b=gguf_block_shape(f.q);const auto rb=k/b.elements*b.bytes;
++    std::mt19937 rng(7712);std::vector<unsigned char> raw(n*rb+256);
++    for(auto&v:raw)v=static_cast<unsigned char>(rng()%256);
++    const auto h=__float2half(.0125f);unsigned short hs;std::memcpy(&hs,&h,2);
++    for(int at=0;at<n*rb;at+=b.bytes)for(int off:f.scales)std::memcpy(raw.data()+at+off,&hs,2);
++    std::vector<float>w(n*k);gguf_cpu_decode(int(ops::detail::gguf_type(f.q)),raw.data(),w.data(),n*k);
++    std::normal_distribution<float>normal(0,1);std::vector<__nv_bfloat16>x(k*t);
++    for(auto&v:x)v=__float2bfloat16(normal(rng));
++    std::vector<int>gather(k);std::iota(gather.begin(),gather.end(),0);std::shuffle(gather.begin(),gather.end(),rng);
++    DeviceBuffer dw(raw.size()),dx(x.size()*2),dg(k*4),dy(n*t*4+32),gate(n*t*4);
++    dw.copy_from_host(raw.data(),raw.size());dx.copy_from_host(x.data(),x.size()*2);dg.copy_from_host(gather.data(),k*4);
++    std::vector<float>g(n*t);for(std::size_t i=0;i<g.size();++i)g[i]=float(int(i%17)-8)*.25f;gate.copy_from_host(g.data(),g.size()*4);
++    Weight weight;weight.qtype=f.q;weight.layout=QuantLayout::GgufBlocks;weight.scale_dtype=DType::FP16;
++    weight.n=n;weight.k=k;weight.qdata=dw.p;
++    const ops::detail::GgufShape shapes[]={{f.q,n,k},{f.q,n,k}};
++    WorkspaceArena work(ops::detail::gguf_project_workspace_bytes(shapes,1,t));
++    DeviceBuffer mixed_output(std::size_t(n)*t*2);
++    const Tensor tx(dx.p,DType::BF16,{k,t});
++    std::vector<int> rows,columns;
++    if(sampled){rows={0,1,127,128,n/2,n-129,n-128,n-1};columns={0,1,127,128,255};}
++    else{rows.resize(n);columns.resize(t);std::iota(rows.begin(),rows.end(),0);std::iota(columns.begin(),columns.end(),0);}
++    for(bool permute:{false,true}) {
++        weight.input_columns=permute?static_cast<int*>(dg.p):nullptr;
++        std::vector<double>ref(n*t);
++        for(int c:columns)for(int r:rows){double sum=0;for(int j=0;j<k;++j)sum+=double(w[r*k+j])*__bfloat162float(x[c*k+(permute?gather[j]:j)]);ref[c*n+r]=sum;}
++        for(const auto epi:mx::kPrefillEpilogues) {
++            const bool fp32=epi==mx::PrefillEpilogue::F32;
++            const ops::DeviceRouteForce force(mx::prefill_route_key(ops::detail::gguf_type(f.q),n,k,epi),"q8");
++            dy.fill(0x42);auto* result=static_cast<unsigned char*>(dy.p)+16;
++            Tensor y(result,fp32?DType::FP32:DType::BF16,{n,t});
++            ops::detail::GgufProduct product{&weight,&y};
++            auto expected=ref;
++            if(fp32){product.f32=reinterpret_cast<float*>(result);product.f32_rows=n;}
++            if(epi==mx::PrefillEpilogue::Add){
++                product.epilogue=ops::detail::GgufEpilogue::Accumulate;
++                std::vector<__nv_bfloat16>initial(n*t,__float2bfloat16(.25f));checked(cudaMemcpy(result,initial.data(),n*t*2,cudaMemcpyHostToDevice));
++                for(auto&v:expected)v+=.25;
++            } else if(epi==mx::PrefillEpilogue::Silu){
++                product.epilogue=ops::detail::GgufEpilogue::GateProduct;product.gate=static_cast<const float*>(gate.p);
++                for(std::size_t i=0;i<expected.size();++i)expected[i]*=double(g[i])/(1+std::exp(-double(g[i])));
++            }
++            Tensor mixed_y(mixed_output.p,DType::BF16,{n,t});
++            const std::array products{product,ops::detail::GgufProduct{&weight,&mixed_y}};
++            const auto count=fp32&&!sampled?2u:1u;
++            ops::detail::gguf_project(tx,std::span(products.data(),count),work,nullptr);checked(cudaDeviceSynchronize());
++            if(count==2) {
++                // One shared activation is needed in both Q8 and tile layouts.
++                // Capture/replay the actual mixed product boundary and check it
++                // against original-weight FP64, not the other GPU route.
++                cudaStream_t stream;checked(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
++                checked(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
++                ops::detail::gguf_project(tx,std::span(products.data(),count),work,stream);
++                cudaGraph_t graph;checked(cudaStreamEndCapture(stream,&graph));cudaGraphExec_t exe;
++                checked(cudaGraphInstantiate(&exe,graph,nullptr,nullptr,0));checked(cudaGraphLaunch(exe,stream));checked(cudaStreamSynchronize(stream));
++                std::vector<__nv_bfloat16>bits(n*t);mixed_output.copy_to_host(bits.data(),bits.size()*2);
++                std::vector<float>mixed(n*t);for(int i=0;i<n*t;++i)mixed[i]=__bfloat162float(bits[i]);
++                error(mixed,ref,.20,.08,"mixed FP8 original-weight FP64 oracle");
++                checked(cudaGraphExecDestroy(exe));checked(cudaGraphDestroy(graph));checked(cudaStreamDestroy(stream));
++            }
++            std::vector<float>got(n*t);
++            if(fp32)checked(cudaMemcpy(got.data(),result,n*t*4,cudaMemcpyDeviceToHost));
++            else{std::vector<__nv_bfloat16>bits(n*t);checked(cudaMemcpy(bits.data(),result,n*t*2,cudaMemcpyDeviceToHost));for(int i=0;i<n*t;++i)got[i]=__bfloat162float(bits[i]);}
++            std::vector<float>selected;std::vector<double>reference;
++            for(int c:columns)for(int r:rows){selected.push_back(got[c*n+r]);reference.push_back(expected[c*n+r]);}
++            error(selected,reference,.03,.015,"routed Q8 original-weight FP64 oracle");
++            std::vector<unsigned char>guards(dy.bytes);dy.copy_to_host(guards.data(),guards.size());
++            const auto end=16+std::size_t(n)*t*(fp32?4:2);
++            for(int i=0;i<16;++i)if(guards[i]!=0x42||guards[end+i]!=0x42)throw std::runtime_error("routed output guard");
++        }
++    }
++    if(work.peak_used()>work.capacity())throw std::runtime_error("routed workspace capacity");
++}
++
+ void bench(const Format& f,int n,int k,int t) {
+     const auto b=gguf_block_shape(f.q);const auto rb=std::int64_t(k/b.elements)*b.bytes;
+     std::mt19937 rng(5526);std::vector<unsigned char> raw(n*rb+256);for(auto&v:raw)v=static_cast<unsigned char>(rng()%256);
+@@ -256,13 +372,34 @@ int main(int argc,char** argv){try{
+     if(!mx::supported(ops::gguf::GgmlType::IQ3_S,256)){std::cout<<"SKIP MXFP8 requires sm120\n";return 77;}
+     activation_codec();
+     std::vector<Format> formats={{QType::GGUF_IQ3_XXS,"iq3_xxs",{0}},{QType::GGUF_IQ3_S,"iq3_s",{0}},{QType::GGUF_IQ2_XXS,"iq2_xxs",{0}},{QType::GGUF_IQ2_XS,"iq2_xs",{0}},{QType::GGUF_IQ2_S,"iq2_s",{0}},{QType::GGUF_IQ4_XS,"iq4_xs",{0}},{QType::GGUF_Q2_K,"q2_k",{80,82}},{QType::GGUF_Q4_K,"q4_k",{0,2}}};
++    route_boundaries();
++    if(argc==2 && std::string_view(argv[1])=="--routes") {
++        for(const auto& f:formats)routed_oracle(f);
++        for(int index:{0,1,2,5,7})routed_oracle(formats[index],1024,5120,true);
++        for(int k:{5120,6144,17408})routed_oracle(formats[5],5120,k,true);
++        std::cout<<"MXFP8/Q8 route independent qualification passed\n";return 0;
++    }
+     if(argc==2 && std::string_view(argv[1])=="--two-device") {
+         int count=0;checked(cudaGetDeviceCount(&count));if(count<2)return 77;
++        checked(cudaSetDevice(0));const auto saved0=ops::installed_device_route_profile();
++        checked(cudaSetDevice(1));const auto saved1=ops::installed_device_route_profile();
++        auto profile=std::make_shared<ops::DeviceRouteProfile>();
++        const auto type=ops::gguf::GgmlType::IQ3_S;
++        profile->routes[mx::prefill_route_key(type,5120,5120,mx::PrefillEpilogue::F32)]={{256,"q8"}};
++        ops::install_device_route_profile(0,profile);ops::install_device_route_profile(1,nullptr);
++        const std::array forward{0,1},reverse{1,0};
++        const auto signature=mx::prefill_profile_signature(forward);
++        if(signature==mx::prefill_profile_signature(reverse))throw std::runtime_error("rank profile signature ordering");
++        int restored=-1;checked(cudaGetDevice(&restored));if(restored!=1)throw std::runtime_error("signature device binding restore");
+         for(int device=0;device<2;++device) {
+             checked(cudaSetDevice(device));activation_codec();
++            const auto expected=device==0?mx::PrefillRoute::Q8:mx::PrefillRoute::Tile;
++            if(mx::prefill_route(type,5120,5120,256,mx::PrefillEpilogue::F32)!=expected)
++                throw std::runtime_error("a device inherited another device's FP8 route");
+             for(const auto& f:formats)run(f,17,256,257,true);
+             std::cout<<"MXFP8 device "<<device<<" independent qualification passed\n";
+         }
++        ops::install_device_route_profile(0,saved0);ops::install_device_route_profile(1,saved1);
+         return 0;
+     }
+     if(argc==2 && std::string_view(argv[1])=="--bench") {
+@@ -271,6 +408,9 @@ int main(int argc,char** argv){try{
+         bench(formats[1],8192,5120,256);return 0;
+     }
+     for(const auto& f:formats)run(f,17,256,257,true);
++    for(const auto& f:formats)routed_oracle(f);
++    for(int index:{0,1,2,5,7})routed_oracle(formats[index],1024,5120,true);
++    for(int k:{5120,6144,17408})routed_oracle(formats[5],5120,k,true);
+     run(formats[1],128,5120,256,false);run(formats[2],33,6144,1024,false);run(formats[5],17,17408,256,false);
+     run(formats[7],129,512,1023,true);
+     for(const auto& f:formats)for(int scale_case=1;scale_case<=3;++scale_case)run(f,3,256,257,false,scale_case);
+diff --git a/tests/test_device_profile.cpp b/tests/test_device_profile.cpp
+index dbf59a04a3e6d53dff8ce5f6b2904525f615cca6..cb72c98912524a5f5cdc57c214d82461e4826f68 100644
+--- a/tests/test_device_profile.cpp
++++ b/tests/test_device_profile.cpp
+@@ -4,9 +4,11 @@
+ #include "runtime/engine/context_cache/context_cost.h"
+ #include "runtime/engine/device_profile.h"
+ #include "runtime/engine/device_profiles_builtin.h"
++#include "runtime/engine/mxfp8_profile_compat.h"
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdio>
+ #include <filesystem>
+ #include <fstream>
+ #include <iostream>
+@@ -137,6 +139,14 @@ void test_compiled_table_names_catalog_schedules() {
+         for (const auto& [key, bands] : entry.profile.routes) {
+             const auto found = std::find_if(catalog.begin(), catalog.end(),
+                                             [&](const auto& item) { return item.key == key; });
++            if (key.starts_with("gguf_prefill_mxfp8/")) {
++                expect(found != catalog.end(), "an FP8 prefill key is registered in the catalog");
++                expect(entry.profile.hardware_class == "nvidia-geforce-rtx-5060-ti-sm120" &&
++                           entry.profile.multiprocessors == 36,
++                       "the measured FP8 overrides belong only to the 36-SM 5060 Ti");
++                expect(bands.size() == 1 && bands[0].last == 256 && bands[0].schedule == "q8",
++                       "initial FP8 overrides reach only the measured 256-column width");
++            }
+             if (found == catalog.end()) { continue; }
+             for (const auto& band : bands) {
+                 const bool known =
+@@ -329,6 +339,49 @@ void test_file_layers_over_builtin() {
+     std::filesystem::remove(path);
+ }
+ 
++void test_additive_mxfp8_catalog() {
++    namespace compat = ninfer::runtime::detail;
++    using ninfer::ops::DeviceTier;
++    for (auto tier : {DeviceTier::Ampere,DeviceTier::Blackwell}) {
++        std::uint64_t hash=0xcbf29ce484222325ULL;
++        const auto feed=[&](std::string_view s,char end) {
++            for(char c:s){hash^=static_cast<unsigned char>(c);hash*=0x100000001b3ULL;}
++            hash^=static_cast<unsigned char>(end);hash*=0x100000001b3ULL;
++        };
++        for(const auto& item:ninfer::calibration::calibration_route_catalog(tier)) {
++            if(item.key.starts_with(compat::kMxfp8ProfilePrefix))continue;
++            feed(item.key,'\n');for(const auto& name:item.candidates)feed(name,'\0');
++        }
++        char digest[17];std::snprintf(digest,sizeof(digest),"%016llx",static_cast<unsigned long long>(hash));
++        expect(digest==compat::kBeforeMxfp8Catalog,
++               "catalog migration changes only the new MXFP8 namespace");
++        expect(ninfer::calibration::calibration_route_catalog_digest(tier)==compat::kWithMxfp8Catalog,
++               "catalog compatibility must be re-audited after any further key/candidate change");
++    }
++    expect(ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Turing)=="f6b3f6b11c7a36c2",
++           "the unsupported Turing catalog remains unchanged");
++    const auto path=temporary_profile_path("mxfp8-additive");
++    auto legacy=sample_entry(compat::kBeforeMxfp8Catalog);
++    const std::string unmeasured="gguf_prefill_mxfp8/iq3_s/5120x5120/bf16";
++    legacy.profile.routes[unmeasured]={{256,"q8"}};
++    (void)ninfer::runtime::upsert_device_route_profile_atomic(path,legacy);
++    auto found=ninfer::runtime::find_device_route_profile("test-gpu-sm86",82,path,compat::kWithMxfp8Catalog);
++    expect(found && found->routes.count("attn_pv_f16")==1 && found->routes.count(unmeasured)==0,
++           "old calibrated routes survive but cannot authorize new FP8 keys");
++    auto current=sample_entry(compat::kWithMxfp8Catalog);current.profile.routes.clear();
++    const std::string measured="gguf_prefill_mxfp8/iq3_s/5120x5120/f32";
++    current.profile.routes[measured]={{256,"q8"}};
++    (void)ninfer::runtime::upsert_device_route_profile_atomic(path,current);
++    found=ninfer::runtime::find_device_route_profile("test-gpu-sm86",82,path,compat::kWithMxfp8Catalog);
++    expect(found && found->routes.count("attn_pv_f16")==1 && found->routes.count(measured)==1 &&
++               found->routes.count(unmeasured)==0,
++           "partial FP8 calibration retains old valid measurements without blessing new stale keys");
++    expect(!compat::additive_mxfp8_catalog(kCatalog,compat::kBeforeMxfp8Catalog) &&
++               !compat::additive_mxfp8_catalog(compat::kWithMxfp8Catalog,kCatalog),
++           "arbitrary catalog mismatches remain rejected");
++    std::filesystem::remove(path);
++}
++
+ void test_schema_versions_on_disk() {
+     const std::filesystem::path path = temporary_profile_path("schema");
+     write_text(path, R"({"schema": "ninfer.device-route-profiles", "schema_version": 1, "devices": [
+@@ -438,6 +491,7 @@ int main() {
+     test_file_lookup();
+     test_file_layers_over_builtin();
+     test_schema_versions_on_disk();
++    test_additive_mxfp8_catalog();
+     test_bands_and_force();
+     test_wide_tables();
+     if (failures != 0) {

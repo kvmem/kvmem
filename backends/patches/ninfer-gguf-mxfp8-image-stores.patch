@@ -1,0 +1,138 @@
+diff --git a/docs/gguf-mxfp8-prefill.md b/docs/gguf-mxfp8-prefill.md
+index f9803f780cc3d3f146a85e2d857707b252ecc2de..953b9f0ff3cd132e9bb4414862893d594f2fed92 100644
+--- a/docs/gguf-mxfp8-prefill.md
++++ b/docs/gguf-mxfp8-prefill.md
+@@ -19,6 +19,11 @@ on q8_1. Prefill errors can still affect later KV/GDN state and generated output
+   Results pass directly through the existing store, residual or gate epilogue.
+ - At 1024 columns and above, a bounded weight image feeds cuBLASLt. GEMM
+   accumulation and output are FP32, followed by the existing epilogue/BF16 cast.
++  Each 32-byte image slice is written as two aligned 128-bit stores. This keeps
++  the scalar decoder's exact FP8 bytes/scales and the existing 64 MiB slab limit;
++  it adds no model copy, codebook allocation or workspace. Independent weight
++  codec tests cover all eight formats, signed/zero/subnormal/maximal finite
++  scales, padded rows and real K, alongside public-Op FP64 and Graph checks.
+ 
+ The backend's existing device profiles can select the Q8 integer matrix route
+ instead of the tile. Keys are `gguf_prefill_mxfp8/<format>/<N>x<K>/<epilogue>`;
+diff --git a/src/ops/linear/gguf/gguf_mxfp8.cu b/src/ops/linear/gguf/gguf_mxfp8.cu
+index 2e48ec2d85697ffdfdffce12ad3684c58f892a6c..66ed790782ca82724891cceb5a56883ceb28231d 100644
+--- a/src/ops/linear/gguf/gguf_mxfp8.cu
++++ b/src/ops/linear/gguf/gguf_mxfp8.cu
+@@ -178,13 +178,22 @@ __launch_bounds__(kImageThreads) __global__ void image_kernel(ImageArgs p) {
+     const unsigned e=exponent(amax);const float inv=ldexpf(1.0f,127-int(e));
+     const unsigned e1=__shfl_down_sync(0xffffffff,e,1),e2=__shfl_down_sync(0xffffffff,e,2),e3=__shfl_down_sync(0xffffffff,e,3);
+     if(row>=p.padded_rows)return;
+-    auto* dst=reinterpret_cast<unsigned*>(p.image+std::int64_t(row)*p.k+first);
++    // The caller-owned image is 256-byte aligned, K is a multiple of 256,
++    // and a slice begins on 32 bytes. Preserve the two aligned 128-bit stores
++    // used by the original image kernel, rather than eight scalar stores.
++    auto* dst=reinterpret_cast<uint4*>(p.image+std::int64_t(row)*p.k+first);
+ #pragma unroll
+-    for(int i=0;i<8;++i){
+-        unsigned short a,b;
+-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;":"=h"(a):"f"(v[4*i+1]*inv),"f"(v[4*i]*inv));
+-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;":"=h"(b):"f"(v[4*i+3]*inv),"f"(v[4*i+2]*inv));
+-        dst[i]=unsigned(a)|(unsigned(b)<<16);
++    for(int half=0;half<2;++half){
++        unsigned words[4];
++#pragma unroll
++        for(int j=0;j<4;++j){
++            const int i=4*half+j;
++            unsigned short a,b;
++            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;":"=h"(a):"f"(v[4*i+1]*inv),"f"(v[4*i]*inv));
++            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;":"=h"(b):"f"(v[4*i+3]*inv),"f"(v[4*i+2]*inv));
++            words[j]=unsigned(a)|(unsigned(b)<<16);
++        }
++        dst[half]=make_uint4(words[0],words[1],words[2],words[3]);
+     }
+     const int group=int(first/32);
+     if(group%4==0)*reinterpret_cast<unsigned*>(p.scales+lt_scale_offset(row,group,p.k/32))=e|(e1<<8)|(e2<<16)|(e3<<24);
+diff --git a/tests/ops/linear/test_gguf_mxfp8.cpp b/tests/ops/linear/test_gguf_mxfp8.cpp
+index 8dd75f15805cff8aacea9b979878b74e380c8e43..6484b8d1661290efed8dd60f9523bf38aff20e5d 100644
+--- a/tests/ops/linear/test_gguf_mxfp8.cpp
++++ b/tests/ops/linear/test_gguf_mxfp8.cpp
+@@ -98,6 +98,38 @@ void activation_codec(){
+     std::cout<<"MXFP8 codec exact: zero/tiny/large/negative/gather/padding passed\n";
+ }
+ struct Format{QType q;const char* name;std::vector<int> scales;};
++void weight_codec(const Format& f,int n,int k) {
++    // Observe the image in caller-owned scratch after a one-slab production
++    // product. The oracle independently decodes GGUF and enumerates E4M3.
++    constexpr int t=1024,padded=128;
++    const auto block=gguf_block_shape(f.q); const auto rb=k/block.elements*block.bytes;
++    std::mt19937 rng(51037+k+n); std::vector<unsigned char>raw(std::size_t(n)*rb);
++    for(auto&v:raw)v=static_cast<unsigned char>(rng());
++    constexpr unsigned short scales[]={0,0x8000,1,0x8001,0x7bff,0xfbff,0x3c00,0xbc00,0x3555,0xb555,0x0400,0x8400};
++    for(std::size_t at=0,index=0;at<raw.size();at+=block.bytes,++index)
++        for(int off:f.scales)std::memcpy(raw.data()+at+off,&scales[index%std::size(scales)],2);
++    std::vector<float>decoded(std::size_t(n)*k);
++    const auto type=ops::detail::gguf_type(f.q); gguf_cpu_decode(int(type),raw.data(),decoded.data(),n*k);
++    DeviceBuffer dw(raw.size()),dx(std::size_t(k)*t*2),dy(std::size_t(n)*t*4),
++        activation(mx::activation_bytes(k,t)),scratch(mx::scratch_bytes(k,n,t)+32);
++    dw.copy_from_host(raw.data(),raw.size());dx.fill(0);scratch.fill(0x42);
++    mx::quantize(static_cast<const __nv_bfloat16*>(dx.p),k,t,nullptr,activation.p,nullptr);
++    mx::product(type,dw.p,rb,n,k,activation.p,t,static_cast<float*>(dy.p),n,scratch.p,scratch.bytes-32,nullptr);
++    std::vector<unsigned char>got(scratch.bytes);scratch.copy_to_host(got.data(),got.size());
++    for(int r=0;r<padded;++r)for(int group=0;group<k/32;++group) {
++        float values[32]{};
++        if(r<n)std::copy_n(decoded.data()+std::size_t(r)*k+32*group,32,values);
++        const int e=scale_exponent(values);
++        if(got[std::size_t(padded)*k+scale_at(r,group,k/32)]!=e+127)
++            throw std::runtime_error(std::string(f.name)+" weight scale mismatch");
++        for(int i=0;i<32;++i)
++            if(got[std::size_t(r)*k+32*group+i]!=fp8_code(std::ldexp(double(values[i]),-e)))
++                throw std::runtime_error(std::string(f.name)+" weight FP8 byte mismatch");
++    }
++    for(std::size_t i=got.size()-32;i<got.size();++i)
++        if(got[i]!=0x42)throw std::runtime_error("weight image workspace canary");
++    std::cout<<"MXFP8 weight codec exact "<<f.name<<" N="<<n<<" K="<<k<<" mixed finite scales/sign/zero/padding passed\n";
++}
+ void run(const Format& f,int n,int k,int t,bool fusion,int scale_case=0){
+     std::mt19937 rng(9017+k+t);const auto block=gguf_block_shape(f.q);const auto rb=std::int64_t(k/block.elements)*block.bytes;
+     const int weight_rows=2*n;
+@@ -312,16 +344,21 @@ void bench(const Format& f,int n,int k,int t) {
+     dw.copy_from_host(raw.data(),raw.size());dx.copy_from_host(x.data(),x.size()*2);
+     Weight w;w.qtype=f.q;w.layout=QuantLayout::GgufBlocks;w.scale_dtype=DType::FP16;w.n=n;w.k=k;w.qdata=dw.p;
+     Tensor tx(dx.p,DType::BF16,{k,t}),ty(dy.p,DType::FP32,{n,t});
++    WorkspaceArena public_work(ops::linear_workspace_capacity_bytes(f.q,n,k,ops::LinearPolicy::A16Only,1,t));
+     DeviceBuffer activation(mx::tile_activation_bytes(k,t));
+     mx::quantize_tile(static_cast<const __nv_bfloat16*>(dx.p),k,t,nullptr,activation.p,nullptr);checked(cudaDeviceSynchronize());
+     ops::gguf::VectorOutput out;out.f32=static_cast<float*>(dy.p);out.column_stride=n;
++    const auto execute=[&](cudaStream_t stream) {
++        if(t>=1024)ops::linear(tx,w,ty,ops::LinearPolicy::A16Only,public_work,stream);
++        else mx::tile_product(ops::detail::gguf_type(f.q),dw.p,rb,n,k,activation.p,t,out,stream);
++    };
+     for(int trial=0;trial<4;++trial) {
+     cudaStream_t stream;checked(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+-    for(int i=0;i<3;++i)mx::tile_product(ops::detail::gguf_type(f.q),dw.p,rb,n,k,activation.p,t,out,stream);
++    for(int i=0;i<3;++i)execute(stream);
+     checked(cudaStreamSynchronize(stream));
+-    constexpr int batch=16,repeats=32;
++    const int batch=t>=1024?4:16,repeats=t>=1024?8:32;
+     checked(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
+-    for(int i=0;i<batch;++i)mx::tile_product(ops::detail::gguf_type(f.q),dw.p,rb,n,k,activation.p,t,out,stream);
++    for(int i=0;i<batch;++i)execute(stream);
+     cudaGraph_t graph;checked(cudaStreamEndCapture(stream,&graph));cudaGraphExec_t exe;
+     checked(cudaGraphInstantiate(&exe,graph,nullptr,nullptr,0));checked(cudaGraphLaunch(exe,stream));checked(cudaStreamSynchronize(stream));
+     cudaEvent_t start,end;checked(cudaEventCreate(&start));checked(cudaEventCreate(&end));
+@@ -372,7 +409,20 @@ int main(int argc,char** argv){try{
+     if(!mx::supported(ops::gguf::GgmlType::IQ3_S,256)){std::cout<<"SKIP MXFP8 requires sm120\n";return 77;}
+     activation_codec();
+     std::vector<Format> formats={{QType::GGUF_IQ3_XXS,"iq3_xxs",{0}},{QType::GGUF_IQ3_S,"iq3_s",{0}},{QType::GGUF_IQ2_XXS,"iq2_xxs",{0}},{QType::GGUF_IQ2_XS,"iq2_xs",{0}},{QType::GGUF_IQ2_S,"iq2_s",{0}},{QType::GGUF_IQ4_XS,"iq4_xs",{0}},{QType::GGUF_Q2_K,"q2_k",{80,82}},{QType::GGUF_Q4_K,"q4_k",{0,2}}};
++    for(const auto& format:formats) {
++        weight_codec(format,17,256);
++        weight_codec(format,128,5120);
++        weight_codec(format,128,17408);
++    }
+     route_boundaries();
++    if(argc==2 && std::string_view(argv[1])=="--image-bench") {
++        for(int index:{0,1,5}) {
++            bench(formats[index],5120,5120,1024);
++            bench(formats[index],17408,5120,1024);
++            bench(formats[index],5120,17408,1024);
++        }
++        return 0;
++    }
+     if(argc==2 && std::string_view(argv[1])=="--routes") {
+         for(const auto& f:formats)routed_oracle(f);
+         for(int index:{0,1,2,5,7})routed_oracle(formats[index],1024,5120,true);

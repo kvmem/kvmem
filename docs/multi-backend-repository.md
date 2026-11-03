@@ -29,12 +29,17 @@ The 2026-11-02 low-precision work uses these independently reviewable layers:
 |---|---|
 | `gguf-coop-5060` | Measured 5060 Ti Q4_K/Q6_K device-profile entries |
 | `gguf-mxfp8-prefill` | Generic FP8 arithmetic, fused tile/Lt paths, numerical signatures and independent CPU/FP64 qualification |
+| `gguf-mxfp8-device-routes` | Backend device/shape calibration, 25 measured T=256 overrides, profile signatures |
+| `gguf-mxfp8-image-stores` | Equivalent vectorized image writes, byte-exact qualification and bounded memory |
 | `gguf-nvfp4-prefill` | Generic NVFP4 arithmetic, explicit A4 permissions, FFN integration and tests |
 | `kvmem-statistics-readback` | Precision-independent native KVMem Mean-K/Query copy coalescing and sampled-attention readback |
 
 FP8/NVFP4 remain usable without KVMem. The common CPU packed-GGUF oracle is
-introduced with FP8 and reused by NVFP4. Device-specific FP8/Q8 profitability
-selection remains a proposal; this reorganization does not implement it.
+introduced with FP8 and reused by NVFP4. Native device routing now includes 25
+measured Q8 overrides for T=256 on the 36-SM RTX 5060 Ti; unmatched devices/shapes
+retain the generic path. Equivalent 128-bit image stores preserve encoding and
+the existing 64 MiB image bound. FP8 remains default-off and lossy; further FP4
+experiments are paused.
 Further FP4 experiments remain paused, and unfinished artifact-tool variants
 are not included in the prepared backend.
 
