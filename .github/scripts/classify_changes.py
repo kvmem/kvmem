@@ -17,6 +17,7 @@ NON_CUDA_PATHS = {
 }
 CONSOLE_PATHS = {
     '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
+    'tests/test_radiance_launcher.py',
     'START-HERE-CN.sh', 'START-HERE-EN.sh', 'START-HERE-CN.bat', 'START-HERE-EN.bat',
     'scripts/local-console.py', 'scripts/launcher-cli.py', 'scripts/launcher-capabilities.json',
     'scripts/console_chat.py', 'scripts/console_hardware.py', 'scripts/model_health.py',
@@ -52,12 +53,91 @@ def is_console_path(path):
 
 
 def requires_native(paths, before=None, after=None, cwd=None):
+    if radiance_only_change(paths, before, after, cwd):
+        return False
     # Unknown paths and CI recipe changes stay conservative. Pure UI changes
     # still run Python/browser checks, without configuring or building engines.
     return not paths or any(
         not is_documentation(path) and not is_console_path(path) and path not in EVIDENCE_PATHS
         and not (path == WORKFLOW and only_evidence_test_step_changed(before, after, cwd))
         for path in paths)
+
+
+def radiance_only_change(paths, before=None, after=None, cwd=None):
+    """Route isolated Radiance work to its own native checks, retaining unknown-path fallback."""
+    if not paths or not any(path not in EVIDENCE_PATHS and path.startswith(('backends/radiance/', 'backends/patches/radiance-'))
+                            for path in paths):
+        return False
+    if WORKFLOW in paths and not only_radiance_workflow_changed(before, after, cwd):
+        return False
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if '..' in parts or path.startswith('/'):
+            return False
+        if (is_documentation(path) or is_console_path(path) or path == WORKFLOW
+                or path.startswith('backends/radiance/')
+                or re.fullmatch(r'backends/patches/radiance-[A-Za-z0-9_-]+\.patch', path)
+                or re.fullmatch(r'docs/benchmarks/radiance-[A-Za-z0-9_-]+\.json', path)):
+            continue
+        if path == '.gitattributes' and before and after:
+            try:
+                old = git('show', before + ':.gitattributes', cwd=cwd).decode().replace('\r\n', '\n')
+                new = git('show', after + ':.gitattributes', cwd=cwd).decode().replace('\r\n', '\n')
+            except (OSError, UnicodeError, subprocess.CalledProcessError):
+                return False
+            addition = ('\n# These files retain their existing CRLF byte layout.\n'
+                        'backends/radiance/upstream.json whitespace=cr-at-eol\n'
+                        'ui/test-monitor.cjs whitespace=cr-at-eol\n'
+                        '.github/workflows/server-compat.yml whitespace=cr-at-eol\n')
+            if new == old + addition:
+                continue
+        return False
+    return True
+
+
+def only_radiance_workflow_changed(before, after, cwd=None):
+    if not before or not after:
+        return False
+    try:
+        old = git('show', before + ':' + WORKFLOW, cwd=cwd).decode().replace('\r\n', '\n')
+        new = git('show', after + ':' + WORKFLOW, cwd=cwd).decode().replace('\r\n', '\n')
+    except (OSError, UnicodeError, subprocess.CalledProcessError):
+        return False
+    def sections(text):
+        start = text.find('\njobs:\n')
+        if start < 0:
+            return None, {}
+        matches = list(re.finditer(r'^  ([A-Za-z0-9_-]+):[ \t]*$', text[start:], re.MULTILINE))
+        return text[:start], {m[1]: text[start+m.start():start+(matches[i+1].start()
+            if i+1<len(matches) else len(text)-start)] for i,m in enumerate(matches)}
+    prefix_old, jobs_old = sections(old)
+    prefix_new, jobs_new = sections(new)
+    if prefix_old is None or prefix_old != prefix_new or jobs_old.keys() != jobs_new.keys():
+        return False
+    output = '      run_native: ${{ steps.classify.outputs.run_native }}\n'
+    expected_changes = jobs_old.get('changes', '').replace(output,
+        output + '      run_radiance: ${{ steps.classify.outputs.run_radiance }}\n')
+    expected_gate = jobs_old.get('host-and-server-units-linux', '')
+    env = '          RUN_NATIVE: ${{ needs.changes.outputs.run_native }}\n'
+    expected_gate = expected_gate.replace(env,
+        env + '          RUN_RADIANCE: ${{ needs.changes.outputs.run_radiance }}\n')
+    expected_gate = expected_gate.replace('            test "$RADIANCE_RESULT" = success\n', '')
+    expected_gate = expected_gate.replace('            test "$RADIANCE_RESULT" = skipped\n', '')
+    expected_gate = expected_gate.replace('          if [ "$RUN_CUDA" = true ]; then',
+        '          if [ "$RUN_RADIANCE" = true ]; then\n'
+        '            test "$RADIANCE_RESULT" = success\n'
+        '          else\n'
+        '            test "$RUN_RADIANCE" = false\n'
+        '            test "$RADIANCE_RESULT" = skipped\n'
+        '          fi\n'
+        '          if [ "$RUN_CUDA" = true ]; then')
+    for name, body in jobs_new.items():
+        if name == 'radiance-host-contracts':
+            continue
+        expected = expected_changes if name == 'changes' else expected_gate if name == 'host-and-server-units-linux' else jobs_old[name]
+        if body != expected:
+            return False
+    return True
 
 
 def is_documentation(path):
@@ -145,7 +225,8 @@ def ninfer_only_backend_change(paths, before, after, cwd=None):
 
 def requires_cuda(paths, before, after, cwd=None):
     if not paths or any(not is_documentation(path) and path not in NON_CUDA_PATHS and not is_console_path(path) and path not in EVIDENCE_PATHS for path in paths):
-        if not ninfer_only_backend_change(paths, before, after, cwd):
+        if not (ninfer_only_backend_change(paths, before, after, cwd)
+                or radiance_only_change(paths, before, after, cwd)):
             return True
     if WORKFLOW in paths:
         try:
@@ -193,11 +274,14 @@ def main():
     else:
         before, after = event.get('before'), event.get('after')
     native = full and requires_native(paths, before, after)
+    radiance = full and (native or radiance_only_change(paths, before, after))
     with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
         output.write('run_ci=' + str(full).lower() + '\n')
         output.write('run_cuda=' + str(cuda).lower() + '\n')
         output.write('run_native=' + str(native).lower() + '\n')
-    print(json.dumps({'run_ci': full, 'run_cuda': cuda, 'run_native': native, 'reason': reason, 'paths': paths}, ensure_ascii=True))
+        output.write('run_radiance=' + str(radiance).lower() + '\n')
+    print(json.dumps({'run_ci': full, 'run_cuda': cuda, 'run_native': native,
+                      'run_radiance': radiance, 'reason': reason, 'paths': paths}, ensure_ascii=True))
 
 
 if __name__ == '__main__':

@@ -1,0 +1,127 @@
+--- a/core/engine_mm.cpp
++++ b/core/engine_mm.cpp
+@@ -115,13 +115,23 @@
+ 
+ void Engine::stop_vision(){if(vision_)rad_dev_set(vision_->device);vision_.reset();}
+ int Engine::run_cpu_encodes(std::vector<std::shared_ptr<mm::Item>> items) {
++    if(!vision_ && items.empty())return RAD_OK;
+     if(!vision_) {
+-        vision_=std::make_shared<VisionPipeline>(mm::vision_cache_bytes());
+-        vision_->program=cpu_vision_program(ranks_[0]->program);
+-        vision_->device=ranks_[0]->device;vision_->step=arch_step_;
++        try {
++            auto pending=std::make_shared<VisionPipeline>(mm::vision_cache_bytes());
++            pending->program=cpu_vision_program(ranks_[0]->program);
++            pending->device=ranks_[0]->device;pending->step=arch_step_;
++            vision_=std::move(pending);
++        } catch(const std::exception& e) {
++            for(const auto& item:items)item->stats->status=RAD_E_STATE;
++            RAD_ERR("CPU image context could not initialize: %s",e.what());return RAD_OK;
++        }
+     }
+     auto& v=*vision_;
+-    for(auto& item:items)if(!item->encoded)v.waiting.push_back(std::move(item));
++    for(auto& item:items)if(!item->encoded) {
++        try {v.waiting.push_back(item);}
++        catch(const std::exception& e){item->stats->status=RAD_E_NOMEM;RAD_ERR("CPU image queue: %s",e.what());}
++    }
+     if(v.work.valid()) {
+         if(!sched_.media_needed(v.source.get()))v.cancel=true;
+         if(v.work.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return RAD_OK;
+@@ -137,8 +147,13 @@
+         if(item->encoded || !sched_.media_needed(item.get()))continue;
+         if(v.cache.get(*item)) {item->stats->queued_ns=mm::vision_now_ns()-item->queued_at_ns;std::vector<uint16_t>().swap(item->pixels);continue;}
+         item->stats->cache_misses=1;
+-        v.source=item;v.result=std::make_shared<mm::Item>(*item);v.cancel=false;
+-        v.work=std::async(std::launch::async,[&v]{return encode_cpu_item(v);});break;
++        try {
++            v.source=item;v.result=std::make_shared<mm::Item>(*item);v.cancel=false;
++            v.work=std::async(std::launch::async,[&v]{return encode_cpu_item(v);});break;
++        } catch(const std::exception& e) {
++            item->stats->status=RAD_E_NOMEM;v.source.reset();v.result.reset();
++            RAD_ERR("CPU image worker could not start: %s",e.what());
++        }
+     }
+     return RAD_OK;
+ }
+@@ -146,11 +161,12 @@
+ int Engine::run_encodes() {
+     std::vector<std::shared_ptr<mm::Item>> items;
+     sched_.take_encodes(&items);
+-    if(cfg_.vision_cpu)return run_cpu_encodes(std::move(items));
++    if(cfg_.vision_cpu && observer_)return run_cpu_encodes(std::move(items));
+     if (items.empty()) return RAD_OK;
+-    if(!vision_)vision_=std::make_shared<VisionPipeline>(mm::vision_cache_bytes());
++    if(!vision_)try {vision_=std::make_shared<VisionPipeline>(mm::vision_cache_bytes());}
++        catch(const std::exception& e){RAD_WARN("optional image cache disabled: %s",e.what());}
+     for(auto& item:items) if(!item->encoded) {
+-        if(vision_->cache.get(*item))std::vector<uint16_t>().swap(item->pixels);
++        if(vision_ && vision_->cache.get(*item))std::vector<uint16_t>().swap(item->pixels);
+         else item->stats->cache_misses=1;
+     }
+ 
+@@ -275,7 +291,7 @@
+         mm::Item& it = *ip;
+         if (it.encoded) continue;
+         it.encoded = true;
+-        vision_->cache.put(it);
++        if(vision_)vision_->cache.put(it);
+         it.pixels.clear();
+         it.pixels.shrink_to_fit();
+         if (dump_dir && *dump_dir) dump(it, ".bf16", it.embd.data(), it.embd.size());
+--- a/core/mm/vision_cache.h
++++ b/core/mm/vision_cache.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ #include "mm/processor.h"
+ #include <list>
++#include <iterator>
+ #include <charconv>
+ #include <cstdlib>
+ #include <cstring>
+@@ -31,25 +32,36 @@
+ public:
+     explicit VisionCache(size_t limit):limit_(limit) {}
+     size_t bytes() const { return bytes_; }
+-    bool get(Item& item) {
++    bool get(Item& item) noexcept {
++        try {
+         if (!limit_) return false;
+         for(auto it=entries_.begin();it!=entries_.end();++it) if(same(it->identity,item)) {
+             item.embd=it->output;item.encoded=true;item.stats->cache_hits=1;item.stats->phase=4;
+             entries_.splice(entries_.begin(),entries_,it);return true;
+         }
+         return false;
++        } catch (...) { return false; } // Optional hit: allocation failure falls back to encoding.
+     }
+-    void put(const Item& item) {
+-        if(!limit_ || !item.encoded || item.kind!=Kind::Image || item.embd.empty())return;
++    bool put(const Item& item) noexcept {
++        try {
++        if(!limit_ || !item.encoded || item.kind!=Kind::Image || item.embd.empty())return false;
++        const size_t max_elements=limit_/sizeof(uint16_t);
++        if(item.pixels.size()>max_elements || item.embd.size()>max_elements-item.pixels.size())return false;
+         const size_t bytes=(item.pixels.size()+item.embd.size())*sizeof(uint16_t);
+-        if(bytes>limit_)return;
+-        // Replace a duplicate rather than charging the same image twice.
+-        for(auto it=entries_.begin();it!=entries_.end();) {
++        // Allocate the complete replacement before changing the LRU or its accounting.
++        Entry e; e.identity=item;
++        std::vector<uint16_t>().swap(e.identity.embd);
++        std::vector<int32_t>().swap(e.identity.expand);
++        std::vector<int32_t>().swap(e.identity.seg_at);
++        e.output=item.embd;e.bytes=bytes;
++        entries_.push_front(std::move(e));bytes_+=bytes;
++        for(auto it=std::next(entries_.begin());it!=entries_.end();) {
+             if(same(it->identity,item)){bytes_-=it->bytes;it=entries_.erase(it);}else ++it;
+         }
+-        while(bytes_>limit_-bytes){bytes_-=entries_.back().bytes;entries_.pop_back();}
+-        Entry e; e.identity=item; std::vector<uint16_t>().swap(e.identity.embd);std::vector<int32_t>().swap(e.identity.expand);std::vector<int32_t>().swap(e.identity.seg_at);
+-        e.output=item.embd;e.bytes=bytes;entries_.push_front(std::move(e));bytes_+=bytes;
++        while(bytes_>limit_){bytes_-=entries_.back().bytes;entries_.pop_back();}
++        return true;
++        } catch (...) { return false; } // Cache insertion is optional; preserve live inference.
++
+     }
+ };
+ }

@@ -59,7 +59,7 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         raise ValueError('SSD storage requires a nonempty DiskPath')
     if p.get('NgramDrafts'):
         raise ValueError('Radiance KVMem n-gram drafts are not implemented yet')
-    for key,low,high in [('Context',256,2147483647),('Budget',256,2147483647),('Reserve',256,2147483647),
+    for key,low,high in [('CpuThreads',1,256),('VisionCacheMiB',0,65536),('Context',256,2147483647),('Budget',256,2147483647),('Reserve',256,2147483647),
         ('HostMiB',1,1048576),('Prefill',1,2147483647),('Concurrency',1,8),('RetainedSessions',0,1024),
         ('VramReserveMiB',256,65536)]:
         if not low<=p[key]<=high:raise ValueError(f'{key} must be in [{low},{high}]')
@@ -114,7 +114,7 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     elif level!='info':raise ValueError('Radiance LogLevel currently supports info, debug or trace')
     argv+=scoring_args(supplied)+p.get('WorkerArgs',[])
     env={'ROCR_VISIBLE_DEVICES':p['Gpu'],'HIP_VISIBLE_DEVICES':','.join(str(i) for i in range(len(gpu_ids))),
-         'KVMEM_RAD_MTP_HEAD':'shared','OMP_NUM_THREADS':'2'}
+         'KVMEM_RAD_MTP_HEAD':'shared','OMP_NUM_THREADS':str(p['CpuThreads']),'KVMEM_RAD_VISION_CACHE_MIB':str(p['VisionCacheMiB'])}
     if p.get('RocmPath'):
         rocm=Path(p['RocmPath']).resolve()
         runtime=rocm/('bin/amdhip64_7.dll' if platform=='windows' else 'lib/libamdhip64.so')

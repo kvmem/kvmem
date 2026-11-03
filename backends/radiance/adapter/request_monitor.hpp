@@ -2,6 +2,7 @@
 #include "kvmem/monitor.hpp"
 #include "rad_core.h"
 #include "server/sink.h"
+#include "mm/processor.h"
 #include <deque>
 #include <unordered_map>
 
@@ -68,6 +69,19 @@ public:
                         data["decode_tps_sampled_at_ms"]=now-(age-last)/1000000;
                     }
                 } else if(admit>=0 && !terminal)data["prefill_elapsed_ms"]=double(age-admit)*1e-6;
+            }
+            if(r.media) {
+                int64_t dec=0,pre=0,queue=0,enc=0,hits=0,misses=0,tokens=0,encoding=0,queued=0,live=0;
+                for(const auto& p:r.media->items) {
+                    const auto& v=*p.item->stats;
+                    dec+=v.decode_ns.load();pre+=v.preprocess_ns.load();queue+=v.queued_ns.load();enc+=v.encode_ns.load();
+                    if(!terminal && v.phase.load()==2){++encoding;live+=std::max<int64_t>(0,rad::mm::vision_now_ns()-v.encode_start_ns.load());}
+                    if(!terminal && v.phase.load()==1)++queued;
+                    hits+=v.cache_hits.load();misses+=v.cache_misses.load();tokens+=p.item->n_rows();
+                }
+                data["image"]={{"decode_ms",dec/1e6},{"preprocess_ms",pre/1e6},{"queue_ms",queue/1e6},
+                    {"encode_ms",enc/1e6},{"cache_hits",hits},{"cache_misses",misses},{"tokens",tokens},
+                    {"encoding_items",encoding},{"queued_items",queued},{"encode_elapsed_ms",live/1e6}};
             }
             requests_.update(id,data);
             if(terminal) {

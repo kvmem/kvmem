@@ -181,10 +181,19 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     assert.equal(await page.locator('[data-gpu="power"]').textContent(), "—");
     fixtureScenario={backend:'radiance',monitorCache:{host_payload_bytes:1048576,host_payload_budget_bytes:8388608,
       retained_sessions:3,history_hits:5,history_evictions:2,disk_payload_bytes:0,disk_payload_budget_bytes:0},
-      active:[{...record(),status:'queued',prefill_tps:null,decode_tps:null}]};
+      active:[{...record(),status:'queued',prefill_tps:null,decode_tps:null,
+        image:{decode_ms:1,preprocess_ms:2,queue_ms:3,encode_ms:0,cache_hits:1,cache_misses:0}}]};
     await page.waitForFunction(()=>document.querySelector('[data-value="queue"]').textContent==='活动 1 · 排队 1');
     assert.equal(await page.locator('[data-value="sessions"]').textContent(),'3');
     assert.equal(await page.locator('[data-value="history"]').textContent(),'5 / 2');
+    await page.locator('[data-requests] button').first().click();
+    assert.match(await page.locator('[data-detail-body]').textContent(),/图片解码.*1.0 \/ 2.0 \/ 3.0 \/ 0.0/);
+    assert.match(await page.locator('[data-detail-body]').textContent(),/图片缓存命中.*1 \/ 0/);
+    await page.locator('[data-language-select]').selectOption('en');
+    assert.match(await page.locator('[data-detail-body]').textContent(),/Image cache hits \/ misses: 1 \/ 0/);
+    await page.locator('[data-language-select]').selectOption('zh-CN');
+    await page.locator('[data-close]').click();
+
     assert.equal(await page.locator('[data-bar="host"]').evaluate(e=>e.style.width),'12.5%');
     assert.notEqual(await page.locator('.s-state').getAttribute('data-stale'),'true');
     fixtureScenario={backend:'llamacpp',monitorCache:{host_payload_bytes:1048576,host_payload_budget_bytes:8388608,

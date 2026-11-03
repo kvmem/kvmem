@@ -29,6 +29,14 @@ class RadiancePlanTest(unittest.TestCase):
         parameters.update(settings)
         return build_plan(dict(schema_version=1,parameters=parameters))
 
+    def test_cpu_threads_and_image_cache_budget(self):
+        plan=self.plan(CpuThreads=8,VisionCacheMiB=64)
+        self.assertEqual(plan['environment']['OMP_NUM_THREADS'],'8')
+        self.assertEqual(plan['environment']['KVMEM_RAD_VISION_CACHE_MIB'],'64')
+        self.assertEqual(self.plan(VisionCacheMiB=0)['effective_parameters']['VisionCacheMiB'],0)
+        for values in [dict(CpuThreads=0),dict(CpuThreads=257),dict(VisionCacheMiB=65537)]:
+            with self.subTest(values=values),self.assertRaises(ValueError):self.plan(**values)
+
     def test_packed_kv_and_recurrent_state(self):
         for kv in ('fp8','bf16','fp8_v4','k6_v4'):
             for state in ('f32','f16'):
