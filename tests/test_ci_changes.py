@@ -127,6 +127,9 @@ class DocumentationChangesTest(unittest.TestCase):
                     '  polystrata-cuda-build-linux:\n'
                     "    needs: changes\n    if: needs.changes.outputs.run_ci == 'true'\n"
                     '    runs-on: ubuntu-latest\n    steps:\n      - run: cmake --build build-polystrata\n'
+                    '  polystrata-hip-build-linux:\n'
+                    "    needs: changes\n    if: needs.changes.outputs.run_ci == 'true'\n"
+                    '    runs-on: ubuntu-latest\n    steps:\n      - run: cmake --build build-polystrata-hip\n'
                     '  other:\n    runs-on: ubuntu-latest\n')
         self.assertIsNotNone(changes.cuda_build_definition(original))
         eligibility = original.replace('outputs.run_ci', 'outputs.run_cuda')
@@ -135,6 +138,8 @@ class DocumentationChangesTest(unittest.TestCase):
         self.assertNotEqual(changes.cuda_build_definition(original), changes.cuda_build_definition(recipe))
         poly_recipe = original.replace('--build build-polystrata', '--build different-polystrata')
         self.assertNotEqual(changes.cuda_build_definition(original), changes.cuda_build_definition(poly_recipe))
+        hip_recipe = original.replace('--build build-polystrata-hip', '--build different-hip')
+        self.assertNotEqual(changes.cuda_build_definition(original), changes.cuda_build_definition(hip_recipe))
         removed = original.replace('  polystrata-cuda-build-linux:', '  removed-build:')
         self.assertIsNone(changes.cuda_build_definition(removed))
         global_env = original.replace('jobs:', 'env:\n  CXXFLAGS: new-flags\njobs:')
@@ -166,6 +171,10 @@ class DocumentationChangesTest(unittest.TestCase):
             self.assertNotEqual(original, modified)
             after = commit(modified)
             self.assertTrue(changes.requires_cuda([changes.WORKFLOW], before, after, root))
+            hip_modified = modified.replace('-DSTRATA_ENABLE_HIP=ON', '-DSTRATA_ENABLE_HIP=OFF')
+            self.assertNotEqual(modified, hip_modified)
+            hip_after = commit(hip_modified)
+            self.assertTrue(changes.requires_cuda([changes.WORKFLOW], after, hip_after, root))
             renamed = commit(modified.replace('name: Server and UI compatibility', 'name: Renamed CI'))
             self.assertTrue(changes.requires_cuda([changes.WORKFLOW], after, renamed, root))
 

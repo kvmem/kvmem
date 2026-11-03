@@ -7,7 +7,7 @@ import subprocess
 
 DOC_SUFFIXES = {'.md', '.rst', '.txt', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.pdf'}
 WORKFLOW = '.github/workflows/server-compat.yml'
-CUDA_JOBS = ('cuda-build-linux', 'polystrata-cuda-build-linux')
+CUDA_JOBS = ('cuda-build-linux', 'polystrata-cuda-build-linux', 'polystrata-hip-build-linux')
 NON_CUDA_PATHS = {
     WORKFLOW, '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
     'scripts/windows/start-backend.ps1', 'scripts/windows/start-ninfer.ps1',
@@ -85,7 +85,7 @@ def cuda_build_definition(text):
 
 
 def ninfer_only_backend_change(paths, before, after, cwd=None):
-    # The CUDA jobs build llama.cpp and PolyStrata, not NInfer. A manifest
+    # The CUDA/HIP jobs build llama.cpp and PolyStrata, not NInfer. A manifest
     # update may skip those jobs only when every other backend record is equal.
     if 'backends/versions.json' not in paths:
         return False
