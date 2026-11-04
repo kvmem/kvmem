@@ -113,7 +113,8 @@ class DocumentationChangesTest(unittest.TestCase):
             self.assertFalse(cuda)
             self.assertFalse(changes.classify('push', {'before': before, 'after': after}, root)[1])
             self.assertFalse(changes.requires_cuda(paths + ['docs/guide.md', 'tests/test_ci_changes.py',
-                                                         'tests/test_ninfer_dflash_conditioning.py'],
+                                                         'tests/test_ninfer_dflash_conditioning.py',
+                                                         'tests/query-pressure-regression.py'],
                                                   before, after, root))
             for extra in ('kvmem/src/host/memory_contract.cpp', 'CMakeLists.txt',
                           'backends/patches/llamacpp-kvmem.patch', 'backends/polystrata',

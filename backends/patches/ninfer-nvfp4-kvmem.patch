@@ -1,8 +1,8 @@
 diff --git a/docs/cli.md b/docs/cli.md
-index f9ca68d73f753e4ec6307d2ae5831bc13e88c7f6..32ddd5b510062bcce5188ba72bc91f692f41cdce 100644
+index 23291834cca2650eedf4299f24fa2498c809cd3a..e94fe99c980104881c851fe1a69c9e41adde1156 100644
 --- a/docs/cli.md
 +++ b/docs/cli.md
-@@ -303,6 +303,8 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
+@@ -310,6 +310,8 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
  | `--mtp-experts-q4` | Qwen3.6-35B-A3B: store the MTP layer's routed experts in the text layers' formats | off |
  | `--gdn-state-fp16` | keep the GDN recurrent state in FP16 | FP32 |
  | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
@@ -28,10 +28,10 @@ index 33c4d5709c645f9cce59c7d95e78835ad27b6434..9a125d2d3f6569aa6808564ae98104f7
  
  A profile picks each width's fastest schedule, and schedules differ in the order in which they sum.
 diff --git a/docs/serving.md b/docs/serving.md
-index 4085814a760ec013c936975bbc00514a81979745..51ee3f4ca711554ccf9582810aab3ab291c5a82d 100644
+index 5fdc761ce6ad5b8eda272169e9d0c9dadb3bdb01..23c1bff56958292e705b0b01dd9a162b1880b8ea 100644
 --- a/docs/serving.md
 +++ b/docs/serving.md
-@@ -2259,6 +2259,8 @@ The table lists executable defaults. The startup example selects a long-context
+@@ -2347,6 +2347,8 @@ The table lists executable defaults. The startup example selects a long-context
  | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
  | `--no-prefill-a8` | prefill every projection on the A16 routes instead of the integer-activation ones | integer routes |
  | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
@@ -56,191 +56,6 @@ index efcade9e992e8f1413e2aed5eb3b0a3c32b8184e..a3455f192ca74249c88b20acd481680f
      if (t.attention) {
          const auto& a      = *t.attention;
          facts["attention"] = {a.num_attention_heads, a.num_key_value_heads, a.head_dim};
-diff --git a/src/ops/kv_cache/fp8_e4m3_row_codec.cuh b/src/ops/kv_cache/fp8_e4m3_row_codec.cuh
-index 31c8d1c91f8895762c7ae29981cdbe70a921f044..159b8a087a603f663c59a422f2110b9a19ac6b52 100644
---- a/src/ops/kv_cache/fp8_e4m3_row_codec.cuh
-+++ b/src/ops/kv_cache/fp8_e4m3_row_codec.cuh
-@@ -85,6 +85,12 @@ __device__ __forceinline__ __half2 kv_cache_fp8_code2_to_half2_x2m8(unsigned cod
- 
- __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint16_t storage,
-                                                                        __half scale) {
-+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-+    // Blackwell keeps its native packed conversions; the software expansion below
-+    // avoids outlined conversions on pre-Blackwell devices.
-+    return __hmul2(kv_cache_fp8_code2_to_half2(storage), __halves2half2(scale, scale));
-+
-+#else
-     // The integer expansion above carries the code times 2^-8 exactly, so the 2^8 that the vendor
-     // conversion applies rides in a second half2 operand instead: scaling by a power of two is
-     // exact, and the final multiply rounds once, exactly where the converted code times the scale
-@@ -92,6 +98,8 @@ __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint
-     const __half2 bias = __float2half2_rn(256.0F);
-     return __hmul2(__hmul2(kv_cache_fp8_code2_to_half2_x2m8(storage), bias),
-                    __halves2half2(scale, scale));
-+
-+#endif
- }
- 
- // Dequantizes 8 contiguous E4M3 codes (16 bytes) to FP16, for PV MMA operands on hardware with
-@@ -115,6 +123,26 @@ __device__ __forceinline__ int4 kv_cache_fp8_dequant_f16x8(const std::uint8_t* c
- // Blackwell-only mma.sync...kind::f8f6f4, so K needs a real (not just reinterpreted) wide copy.
- __device__ __forceinline__ int4 kv_cache_fp8_dequant_bf16x8(const std::uint8_t* codes,
-                                                              __half scale) {
-+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-+    // Blackwell keeps its native packed conversions; the software expansion below
-+    // avoids outlined conversions on pre-Blackwell devices.
-+    const int2 raw         = load_vec<int2>(codes);
-+    const std::uint16_t* c = reinterpret_cast<const std::uint16_t*>(&raw);
-+    const float scale_f    = __half2float(scale);
-+    unsigned packed[4];
-+#pragma unroll
-+    for (int i = 0; i < 4; ++i) {
-+        __nv_fp8x2_e4m3 value;
-+        value.__x                   = c[i];
-+        const float2 decoded        = static_cast<float2>(value);
-+        const __nv_bfloat162 value2 =
-+            __floats2bfloat162_rn(decoded.x * scale_f, decoded.y * scale_f);
-+        packed[i] = *reinterpret_cast<const unsigned*>(&value2);
-+    }
-+    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
-+                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
-+
-+#else
-     // The integer expansion carries the code times 2^-8 exactly, so the scale absorbs the 2^8
-     // (exact, a power of two) and the product is the same FP32 value the vendor conversion feeds
-     // the bf16 rounding. The K plane of k8v4 reads through here, and that path is issue-bound on
-@@ -132,6 +160,8 @@ __device__ __forceinline__ int4 kv_cache_fp8_dequant_bf16x8(const std::uint8_t*
-     }
-     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
-                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
-+
-+#endif
- }
- 
- } // namespace ninfer::ops
-diff --git a/src/ops/kv_cache/nvfp4_group16_codec.cuh b/src/ops/kv_cache/nvfp4_group16_codec.cuh
-index 6c3aa460f3168cb5b257f8019a772c15fe36f9e8..60671bdc12cfa0485bbd21e206c4fc983337ed8f 100644
---- a/src/ops/kv_cache/nvfp4_group16_codec.cuh
-+++ b/src/ops/kv_cache/nvfp4_group16_codec.cuh
-@@ -88,6 +88,30 @@ __device__ __forceinline__ __half2 kv_cache_e2m1x2_to_half2(unsigned codes) {
- 
- __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t* codes,
-                                                              std::uint8_t scale_code) {
-+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-+    // Blackwell keeps its native packed conversions; the software expansion below
-+    // avoids outlined conversions on pre-Blackwell devices.
-+    // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable
-+    // in FP16 (at most four product fraction bits and magnitude <= 2688). Half2 multiplication is
-+    // therefore the exact FP16 expansion boundary, not an additional approximation.
-+    const std::uint32_t packed = load_vec<std::uint32_t>(codes);
-+    const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
-+    __nv_fp8_e4m3 encoded_scale;
-+    encoded_scale.__x    = scale_code;
-+    const __half scale   = static_cast<__half>(encoded_scale);
-+    const __half2 scale2 = __halves2half2(scale, scale);
-+    unsigned half_bits[4];
-+#pragma unroll
-+    for (int pair = 0; pair < 4; ++pair) {
-+        __nv_fp4x2_e2m1 encoded;
-+        encoded.__x         = bytes[pair];
-+        const __half2 value = __hmul2(static_cast<__half2>(encoded), scale2);
-+        half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
-+    }
-+    return make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
-+                     static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3]));
-+
-+#else
-     // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable
-     // in FP16 (at most four product fraction bits and magnitude <= 2688). Half2 multiplication is
-     // therefore the exact FP16 expansion boundary, not an additional approximation.
-@@ -115,6 +139,8 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
-     }
-     return make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
-                      static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3]));
-+
-+#endif
- }
- 
- // BF16 counterpart of kv_cache_nvfp4_dequant_f16x8, for QK MMA operands on hardware with no FP4
-@@ -122,6 +148,28 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
- // Q's storage) instead of FP16.
- __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_bf16x8(const std::uint8_t* codes,
-                                                               std::uint8_t scale_code) {
-+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-+    // Blackwell keeps its native packed conversions; the software expansion below
-+    // avoids outlined conversions on pre-Blackwell devices.
-+    const std::uint32_t packed = load_vec<std::uint32_t>(codes);
-+    const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
-+    __nv_fp8_e4m3 encoded_scale;
-+    encoded_scale.__x  = scale_code;
-+    const float scale_f = static_cast<float>(encoded_scale);
-+    unsigned bf16_bits[4];
-+#pragma unroll
-+    for (int pair = 0; pair < 4; ++pair) {
-+        __nv_fp4x2_e2m1 encoded;
-+        encoded.__x           = bytes[pair];
-+        const float2 decoded  = static_cast<float2>(encoded);
-+        const __nv_bfloat162 value =
-+            __floats2bfloat162_rn(decoded.x * scale_f, decoded.y * scale_f);
-+        bf16_bits[pair] = *reinterpret_cast<const unsigned*>(&value);
-+    }
-+    return make_int4(static_cast<int>(bf16_bits[0]), static_cast<int>(bf16_bits[1]),
-+                     static_cast<int>(bf16_bits[2]), static_cast<int>(bf16_bits[3]));
-+
-+#else
-     // Same two substitutions as the FP16 form above, and the same reasoning: the E2M1 half2 the
-     // sm70 path builds carries the exact value, so widening it to FP32 and multiplying by the
-     // table-derived scale reproduces the vendor expression bit for bit.
-@@ -138,6 +186,8 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_bf16x8(const std::uint8_t
-     }
-     return make_int4(static_cast<int>(bf16_bits[0]), static_cast<int>(bf16_bits[1]),
-                      static_cast<int>(bf16_bits[2]), static_cast<int>(bf16_bits[3]));
-+
-+#endif
- }
- 
- struct KVCacheNvfp4DequantizedF16x16 {
-@@ -147,6 +197,31 @@ struct KVCacheNvfp4DequantizedF16x16 {
- 
- __device__ __forceinline__ KVCacheNvfp4DequantizedF16x16
- kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code) {
-+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-+    // Blackwell keeps its native packed conversions; the software expansion below
-+    // avoids outlined conversions on pre-Blackwell devices.
-+    const int2 packed         = load_vec<int2>(codes);
-+    const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
-+    __nv_fp8_e4m3 encoded_scale;
-+    encoded_scale.__x    = scale_code;
-+    const __half scale   = static_cast<__half>(encoded_scale);
-+    const __half2 scale2 = __halves2half2(scale, scale);
-+    unsigned half_bits[8];
-+#pragma unroll
-+    for (int pair = 0; pair < 8; ++pair) {
-+        __nv_fp4x2_e2m1 encoded;
-+        encoded.__x         = bytes[pair];
-+        const __half2 value = __hmul2(static_cast<__half2>(encoded), scale2);
-+        half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
-+    }
-+    return {
-+        make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
-+                  static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3])),
-+        make_int4(static_cast<int>(half_bits[4]), static_cast<int>(half_bits[5]),
-+                  static_cast<int>(half_bits[6]), static_cast<int>(half_bits[7])),
-+    };
-+
-+#else
-     const float scale_f  = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
-     const __half2 scale2 = __float2half2_rn(scale_f);
-     const int2 packed         = load_vec<int2>(codes);
-@@ -163,6 +238,8 @@ kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code
-         make_int4(static_cast<int>(half_bits[4]), static_cast<int>(half_bits[5]),
-                   static_cast<int>(half_bits[6]), static_cast<int>(half_bits[7])),
-     };
-+
-+#endif
- }
- 
- } // namespace ninfer::ops
 diff --git a/src/ops/linear/common/route_table.cpp b/src/ops/linear/common/route_table.cpp
 index 27885e7a189213f7d01c0723e8c08c3611cdc50a..b50be998cd58d35087f83d810a66a02caf777383 100644
 --- a/src/ops/linear/common/route_table.cpp
@@ -356,69 +171,6 @@ index 84aa75646ab49ffa6905892fd256a4505d8aca6f..edea4f57387fbeba672d70a568efa7c8
  [[nodiscard]] LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t,
                                                    LinearRouteTable wide = LinearRouteTable::Legacy);
  
-diff --git a/src/ops/linear/nvfp4/nvfp4_dispatch.cpp b/src/ops/linear/nvfp4/nvfp4_dispatch.cpp
-index 4ef6ed05744a1986794b1cda605eaae8f846c74c..bff72847c0adfd16e9a2a0b432bf800aab01c660 100644
---- a/src/ops/linear/nvfp4/nvfp4_dispatch.cpp
-+++ b/src/ops/linear/nvfp4/nvfp4_dispatch.cpp
-@@ -13,6 +13,12 @@ namespace {
- const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
-                          &kNvfp4N5120K6144, &kNvfp4N5120K17408};
- 
-+LinearRouteTable route_table(LinearPolicy policy, std::int32_t width) {
-+    return linear_route_table(allows_nvfp4_int8(policy) ? LinearRouteFamily::Nvfp4Int8
-+                                                       : LinearRouteFamily::Nvfp4,
-+                              width);
-+}
-+
- const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
-     if (!valid_linear_policy(policy))
-         throw std::invalid_argument("nvfp4 linear: unsupported policy");
-@@ -34,6 +40,8 @@ static std::size_t nvfp4_linear_workspace_capacity_bytes_own(std::int32_t n, std
-                                                              std::int32_t max_tokens) {
-     if (min_tokens <= 0 || max_tokens < min_tokens)
-         throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
-+    if (allows_nvfp4_int8(policy))
-+        throw std::invalid_argument("nvfp4 linear workspace: plain-Linear int8 requires the unified route table");
-     const auto& shape = resolve_shape(n, k, policy);
-     return allows_a4(policy) && shape.uses_a4(min_tokens, max_tokens)
-                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, k)
-@@ -54,7 +62,7 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
-     }
-     return capacity_by_table(
-         min_tokens, max_tokens,
--        [](std::int32_t width) { return linear_route_table(LinearRouteFamily::Nvfp4, width); },
-+        [policy](std::int32_t width) { return route_table(policy, width); },
-         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
-             return table == LinearRouteTable::Unified
-                        ? unified::nvfp4_linear_workspace_capacity_bytes(n, k, policy, first, last)
-@@ -78,22 +86,18 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
-         return nvfp4_general_a16(x, weight, out, stream);
-     }
-     if (x.ne[1] > 0 &&
--        linear_route_table(LinearRouteFamily::Nvfp4, x.ne[1]) == LinearRouteTable::Unified) {
-+        route_table(policy, x.ne[1]) == LinearRouteTable::Unified) {
-         unified::nvfp4_dispatch(x, weight, out, policy, workspace, stream);
-         return;
-     }
--    // This table registers no plain-Linear int8 route at all: an int8 call here would answer by
--    // running the A16 family, which is the hollow-green failure the family exists to avoid -- an
--    // "int8" run that never touched an int8 kernel. Which table a width resolves to is a property
--    // of the device profile's width bands (or NINFER_LINEAR_ROUTES), not of the flag, so the fix
--    // is configuration and the message says so rather than pretending to fall back. The fused
--    // NVFP4 ops are unaffected: each carries an int8 branch on both tables.
-+    // Plain-Linear int8 defaults to Unified. An explicit Legacy override (or a device without
-+    // Unified support) is rejected rather than silently changing activation precision.
-     if (allows_nvfp4_int8(policy))
-         throw std::invalid_argument(
-             "nvfp4 linear: T=" + std::to_string(x.ne[1]) +
-             " resolves to the own (non-unified) shape table, which registers no plain-Linear int8 "
--            "route. Run with NINFER_LINEAR_ROUTES=unified, or widen the device profile's nvfp4 "
--            "width band to cover it");
-+            "route. Remove the Legacy override or use NINFER_LINEAR_ROUTES=int8:unified "
-+            "on a device supporting the unified table");
-     validate_nvfp4_weight(weight, "nvfp4 linear");
-     if (x.ne[1] <= 0) throw std::invalid_argument("nvfp4 linear: T must be positive");
-     const auto& shape = resolve_shape(weight.n, weight.k, policy);
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
 index 7b0ae96967d377da59bb267f06128bf3e74d83a4..b4b6868e051bedbcc05f5d93c163ae301d0294e4 100644
 --- a/tests/CMakeLists.txt
@@ -458,7 +210,7 @@ index 7b0ae96967d377da59bb267f06128bf3e74d83a4..b4b6868e051bedbcc05f5d93c163ae30
  set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_cpu_vision_tests_PROGRAMS
    ninfer_qwen3_5_vision_cpu_test ninfer_cli_options_test ninfer_serve_options_test
 diff --git a/tests/README.md b/tests/README.md
-index 6632e1eec1ec87ffbebf3e1c14114d120146eb43..f020ac4a47cdd7a392fe623f21191024d12ef264 100644
+index 7d98c21dda5a67f02d66ef958cca55a6a44fa594..c4e2b355d835442ef5a4690f641c8da777e63f7d 100644
 --- a/tests/README.md
 +++ b/tests/README.md
 @@ -1,5 +1,10 @@
