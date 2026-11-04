@@ -19,7 +19,8 @@ public:
             requests_.begin("generation",id);
             requests_.update(id,{{"planned_cached_tokens",planned},{"actual_cached_tokens",actual},
                 {"planned_cache_source",planned ? (shared ? "shared" : "own") : "miss"},
-                {"cache_source",actual ? (shared ? "shared" : "own") : "miss"}});
+                {"cache_source",actual ? (shared ? "shared" : "own") : "miss"},
+                {"cache_semantics_revision",2},{"restore_path",actual ? (shared ? "snapshot" : "continuation") : "miss"}});
         } catch(...) { RAD_ERR("KVMem request reuse metadata allocation failed"); }
     }
     void update(const rad::Request& r,int64_t age_us,int64_t first_us) noexcept {

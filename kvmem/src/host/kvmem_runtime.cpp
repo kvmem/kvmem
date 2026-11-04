@@ -47,6 +47,21 @@ void KvMemRuntime::rebind_backend(KvMemBackend * backend) {
     backend_ = backend ? backend : &null_backend_;
 }
 
+void KvMemRuntime::clone_cpu_tier_from(const KvMemRuntime & source) {
+    if (this == &source) throw std::invalid_argument("cannot clone a CPU tier onto itself");
+    if (pending_ || source.pending_ || !pending_gpu_frees_.empty() || !source.pending_gpu_frees_.empty())
+        throw std::logic_error("cannot clone a CPU tier with pending transfers");
+    if (cfg_.cpu_bytes != source.cfg_.cpu_bytes || slot_bytes_ != source.slot_bytes_ ||
+        cpu_arena_.size() != source.cpu_arena_.size())
+        throw std::invalid_argument("incompatible CPU tier geometry");
+    auto tier = source.cpu_tier_ ? std::make_unique<PinnedKvTier>(*source.cpu_tier_) : nullptr;
+    // Prepare all throwing metadata first. The matching destination arena was
+    // already allocated by its runtime; copying into it needs no third arena.
+    if (!cpu_arena_.empty())
+        std::memcpy(cpu_arena_.data(), source.cpu_arena_.data(), cpu_arena_.size());
+    cpu_tier_ = std::move(tier);
+}
+
 uint8_t *KvMemRuntime::cpu_ptr(int32_t slot) {
     if (slot < 0 || cpu_arena_.empty()) {
         return nullptr;

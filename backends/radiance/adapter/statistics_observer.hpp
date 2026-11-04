@@ -8,7 +8,9 @@
 #include "rank_prefix.hpp"
 #include "prefix_directory.hpp"
 #include "query_identity.hpp"
+#include "kvmem/checkpoint_policy.hpp"
 #include "image_contract.hpp"
+#include "canonical_input.hpp"
 #include "attention_capture.hpp"
 #include "recall_policy.hpp"
 #include "kvmem/page_softmax_cuda.hpp"
@@ -91,11 +93,13 @@ private:
     std::unique_ptr<RawKvStore> store_;
     RawKvStoreConfig store_config_;
     SessionIdentity session_{};
-    uint64_t active_request_ = 0;
+    uint64_t active_request_ = 0, cache_group_ = 0;
     struct CachedIdentity {
         std::vector<int32_t> tokens;
         ImageIdentities images;
         std::string scope;
+        uint64_t input_end=0; // Native input boundary, before generated output.
+        std::shared_ptr<const NativeCanonicalInput<ImageIdentity>> canonical;
         bool fallback = false;
         std::vector<int32_t> query_tokens;
         int32_t query_begin = -1, query_end = -1;
@@ -104,7 +108,20 @@ private:
                 std::equal(tokens.begin(), tokens.end(), r.prompt.begin()) &&
                 image_prefix_matches(images,r.media.get(),r.prompt.size(),tokens.size());
         }
-        bool matches(const rad::Request& r) const {return scope==r.cache_owner && prefix_matches(r);}
+        bool continues_input(const rad::Request& r) const {
+            const auto n=std::min(tokens.size(),r.prompt.size());
+            const auto common=size_t(std::mismatch(tokens.begin(),tokens.begin()+n,r.prompt.begin()).first-tokens.begin());
+            return input_end>0 && checkpoint_anonymous_continuation(common,input_end,tokens.size()) &&
+                image_prefix_matches(images,r.media.get(),r.prompt.size(),std::min<uint64_t>(common,input_end));
+        }
+        bool continues_group_input(const rad::Request& r) const {
+            return canonical && !canonical->tokens.empty() && r.prompt.size()>=canonical->tokens.size() &&
+                std::equal(canonical->tokens.begin(),canonical->tokens.end(),r.prompt.begin()) &&
+                image_prefix_matches(canonical->images,r.media.get(),r.prompt.size(),canonical->tokens.size());
+        }
+        // Client labels do not own execution state. Exact native content and
+        // media positions remain required by the continuation path.
+        bool matches(const rad::Request& r) const {return prefix_matches(r);}
     };
     ImageIdentities images_; // immutable layout of the active native request
     std::shared_ptr<const CachedIdentity> cached_identity_; // atomic immutable HTTP snapshot
@@ -112,7 +129,7 @@ private:
     std::vector<float> prefix_mean_;
     struct RetainedSession {
         SessionIdentity session;
-        uint64_t content_version = 0, bytes = 0;
+        uint64_t content_version = 0, bytes = 0, group = 0; // Directory fairness metadata, never native identity.
         std::shared_ptr<const CachedIdentity> identity;
         std::unique_ptr<RankPrefix> prefix;
         std::vector<float> mean;
@@ -147,12 +164,22 @@ private:
         std::vector<std::unique_ptr<PendingPark>> parking;
         struct Finishing {uint64_t id;std::shared_ptr<const CachedIdentity> identity, input_identity, fallback_identity;};
         std::vector<Finishing> finishing; // bounded by active native sequence count
-        uint64_t next_park=1,park_errors=0;
+        uint64_t next_park=1,park_errors=0,next_group=1;
+        uint64_t allocate_group() {
+            if(!next_group || next_group==UINT64_MAX)throw std::overflow_error("native cache group identity exhausted");
+            return next_group++;
+        }
         size_t count() const noexcept {return sessions.size()+parking.size();}
+        size_t groups() const {
+            std::set<uint64_t> origins;
+            for(const auto& saved:sessions)origins.insert(saved.group ? saved.group : saved.session.id);
+            return origins.size();
+        }
         bool pending(uint64_t id) const noexcept {
             return std::any_of(parking.begin(),parking.end(),[&](const auto& x){return x->id==id;}) ||
                 std::any_of(finishing.begin(),finishing.end(),[&](const auto& x){return x.id==id;});
         }
+        bool publish(RetainedSession&&,size_t max_groups,bool already_charged=false);
         uint64_t bytes = 0, active_archive_bytes = 0, active_checkpoint_bytes = 0;
         std::set<const StatisticsObserver*> observers; // scheduler-thread ownership only
         uint64_t sharing_credit(const RetainedSession* extra=nullptr) const;
@@ -231,7 +258,7 @@ private:
     std::unique_ptr<RetainedSession> carry_input(const RetainedSession&, const RetainedSession&, const rad::Request&,bool fallback=false);
     void admit_carried_input(std::unique_ptr<RetainedSession>);
     static uint64_t retained_bytes(const RetainedSession&);
-    static RetainedSession* select_checkpoint(RetainedSession&, const rad::Request&, bool shared=false);
+    static RetainedSession* select_checkpoint(RetainedSession&, const rad::Request&);
     uint64_t pending_cache_=0;
     bool pending_io() const noexcept {return pending_cache_ || bool(pending_prefix_) || bool(pending_selection_) || bool(pending_finish_) || bool(pending_input_) || bool(input_parking_);}
     bool poll_prefix();

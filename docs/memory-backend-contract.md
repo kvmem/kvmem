@@ -65,7 +65,8 @@ idle checkpoint 写出借用由引擎持有的不可变 pinned 源；worker 不�
 完成时核对历史 generation 和原 checkpoint，再发布 SSD 附件并归还原 RAM；历史已
 恢复或被淘汰时仅丢弃未发布目的。活跃原生 KV 不再被 idle serializer 重复写出。
 llama 的并发 lane 共用一个 H/D 账户；会话附件 I/O 在目录锁和 GPU 执行锁之外运行，
-目录 switching 状态与请求引用阻止同一 owner 被同时恢复、写出或淘汰。
+目录 switching 状态保护原生可变执行绑定；请求引用保护不可变源。源可被多个请求
+分别恢复，但同一可变 GPU 视图不能同时交给两个请求。淘汰目录引用不撤销其他读者。
 
 公共存储已通过 Windows 和 WSL/GCC 主机测试及地址/未定义行为检查；WSL 的
 ThreadSanitizer 在进入测试前因地址映射失败退出，并未提供竞态检测结论。
@@ -110,12 +111,70 @@ LCP，作为重新计算时捕获复用锚点的提示。`prefix_anchor` 将提�
 活跃请求持有的状态引用继续存活。目录默认保留 llama 四项、NInfer 五个用途槽；共享状态按
 所有者地址只计一次。checkpoint 及统计附件仍独立于 KV payload 的 H 预算计量。
 
-候选选择取适配器校验通过的最大合法 frontier；NInfer 在相同 frontier 保留 Endpoint 优先规则。
-会话归属、分支规则、原生 KV 格式和 MTP 接受边界继续由后端负责。llama 多会话的 continuation
-判定仍可能让请求走 fresh。会话选择在持锁的实际 admission 中重新计算候选的 token/media LCP，
-并将它作为本次冷算的捕获提示传给 driver；已绑定的 conversation id 仍限制候选，显式 reset
-清除提示。该提示不随会话状态交换、不参与恢复授权，也不承诺任意历史编辑首次就能复用。
-本功能沿现有 KVMem 路径自动工作，没有新增启动参数或 UI 开关。
+候选选择以内容和原生恢复证明为准。`prompt_cache_key`、`promptCacheKey`、
+`kvmem.conversation_id` 等兼容字段不限制候选、不绑定单一可变历史、不提供发布优先权，
+也不能触发按同 key 批量清除快照。真正的状态式会话接口继续使用其显式状态引用。
+内部 `SessionIdentity`、incarnation 和 generation 仍防止过期引用或完成回调错配，
+它们不等于客户端身份。admission 在安全边界重新核对 token/media/position 与源版本。
+
+新用户 Query 可查找已验证的内容前缀；工具续接只允许原生可证明的 continuation，
+随后 append 加 resident-only Pressure。读取恢复所需的冷字节不授权用旧 Q 重选冷历史。
+LCP 提示仍只规划新的捕获点，不能恢复任意 recurrent 中间状态。回退或编辑只撤销本次
+私有分支的后缀，不得改写已发布源快照。
+
+## 公共内容快照目录
+
+`content_cache.hpp` 的公共策略不接收客户端 ID。`rank_content_candidates` 对适配器
+提供的候选执行 Query/continuation 门及 frontier、冷读取量、最近使用排序；原生精确
+证明仍由适配器完成。`select_content_publication` 只认可同一封存对象的身份去重，
+否则按空槽/容量/LRU 选择；相同 token 或 frontier 不表示可以合并不同执行状态。
+
+`ContentSnapshotDirectory<Record>` 为可发布不可变原生对象的适配器提供有界索引。
+它按兼容域与前缀摘要筛选，先取得源引用，再在锁外调用原生证明；摘要碰撞必须被精确
+证明拒绝。目录用完整准备好的元数据副本原子发布，不按请求开始顺序压制兄弟分支。
+原生目录也可复用这些公共策略并保留自己的 checkpoint、调度和存储封装；这不等于所有
+适配器已经切换到同一种 hash 索引。
+
+源快照包含恢复所需的原生状态和策略基线。`shared_ptr<const Record>` 要求调用方封存
+原生内容并停止可变别名写入；它不能把一个仍会被 GPU/CPU 改写的对象变成快照。
+请求分支独立保存选择器、统计更新、Query、LRFU、图反馈、回滚及活动 recurrent 状态。
+独占的驻留执行绑定可走热续接，同时保留可供其他请求恢复的不可变源。
+
+容量 group 仅服务公平保留。公共 `plan_content_group_publication` 分别限制组数与物理
+目录项，整组 LRU 用组内最近访问，多版本组优先让出重复占用；同组不意味着覆盖许可。
+NInfer 用原生 continuation 关系继承或创建内部组，深分支可建立新组，候选匹配始终对
+全部内容执行原生证明。未知组不合并为一个匿名 owner。
+组分类须精确证明完整且已接受的 canonical input（token、媒体和位置），不使用短模板尾
+容忍来合并不同问题。发布时重新检查组内所有已完成 input 与本次 input 均在同一精确
+前缀路径，再选择最深匹配的组；冲突或未知边界建立独立内部组。这样从旧祖先同时准备的
+两个分支也不会因发布先后而混成一组。此分类只影响容量公平性，不提供原生恢复权限。
+
+`content_snapshot_covers` 仅检查非空、非零 immutable-origin 集合覆盖。调用方还必须证明
+这些 origin 保留完整 KV/位置、原生状态和策略基线；NInfer 的覆盖合并还要求原 archive
+分配身份一致，COW 尾页保守地阻止合并。一般容量淘汰与这种无损覆盖压缩分别记账。
+
+目录元数据限额独立于 payload、checkpoint 池、临时缓冲区和在途引用。队列中的快照
+使用 `HostKvSource` 类内容引用保留字节，不长期钉住 RAM 驻留；实际复制才取得短读租约。
+普通目录淘汰不使已取得引用失效，最后一个分支/读者结束后才释放实际字节及配额。
+公共目录锁内不调用原生证明、不等待 I/O/GPU，也不销毁最后一个原生资源引用。
+`publish`/`clear` 返回 retired 引用；适配器必须在设备安全边界或通过延迟 deleter 回收。
+包含 GPU/rank 对象的目录本体和最后一份外部引用同样遵守该销毁约束。
+
+llama 旧 CPU arena 不能作为封存共享页：分支复制独立 arena 及 tier table，按独立分配
+计费。lane 目录在 create/fork 前预留一个配置容量，承诺上限为
+`(snapshot_slots + lanes) * cpu_bytes`，涵盖 active、parked 和 in-flight store；失败释放
+预留并保留源。该保守账户与 raw H/D、RSS 分开报告，复制直接写入已分配目标，避免第三份
+完整临时 arena。原生 recurrent checkpoint 池也有独立上限；保留源再执行私有分支会增加
+其存活状态，目录未满不代表这个池仍有空间，容量不足仍可淘汰空闲源或重新 prefill。
+
+只有已接受、实际执行完成、KV/统计/原生状态附件齐全的边界可发布。恢复或发布失败不能
+提前取走源目录项；取消后的运行中 I/O 必须安全排空。worker 不得安装 GPU 状态或发布
+目录。多 rank 原生对象只有在必需 rank 的边界与完成条件一致时才能作为完整恢复源。
+这些规则不增加跨后端 KV 格式、跨进程持久化、GPU 页共享或新的 ingest 协议。
+
+`content_cache_test` 的主机测试覆盖并发反序发布、原生状态变体、hash 碰撞、工具门、
+源引用、容量组公平性、元数据限额及失败保持源。四后端的 MTP/视觉/SSD/多卡实机状态
+必须看对应新版本的验证记录，公共主机测试和旧二进制报告都不能替代这些验收。
 
 验证入口：公共层 `prefix_checkpoint_test`；llama 的 `kvmem-prefix-reuse-regression` 在没有
 `KVMEM_TEST_MODEL`/`KVMEM_TEST_GPU` 时以 77 跳过，有模型时运行六轮尾部改写 HTTP 回归；
@@ -134,7 +193,8 @@ NInfer 的 `ninfer_p4_history` 提供 `prefix-anchor` 与 `prefix-anchor-ssd` �
 | `PayloadLayout` / `NativeKvPayload` | 原生 bytes、所有 planes、stride、alignment、格式版本 | 解释量化编码，执行实际复制 |
 | `MemoryBackend` / `MemoryTransfer` | 必须实现的适配器契约 | 唯一的设备分配器、reservation、stream、event 和 graph |
 | `CheckpointIdentity` | 精确检查后端/模型/布局/会话/执行历史/frontier | checkpoint 字节、GDN 还原与 query 重放 |
-| `CheckpointCatalog` | 最大合法恢复点、用途、目录保留及数量/字节约束 | 原生状态、完整前缀证明、状态捕获/恢复和安全执行边界 |
+| `CheckpointCatalog` | 分支内最大合法恢复点、用途、覆盖与数量/字节约束 | 原生状态、完整前缀证明、状态捕获/恢复和安全执行边界 |
+| `content_cache.hpp` | 无客户端身份的候选排序、发布与组容量策略、可选不可变目录 | 原生完整性/续接证明、资源账户、设备安装和安全销毁 |
 
 新后端不能继承旧 `KvMemBackend` 的默认空复制来表示已支持。`MemoryBackend`、`MemoryTransfer` 全部必需操作均为纯虚函数；缺失 backend、返回空 transaction 或缺少所需能力会明确失败。
 
@@ -270,6 +330,6 @@ Retrieval TopK may rank blocks by `H_t(b) = lambda * H_parent(b) + hit_t(b) * sc
 
 A logical request opens one round. Every preview derives from the same immutable parent scores. The final accepted input view commits once, after complete query capture and retrieval replay; later pressure selections and speculative verification cannot reward the round again. New blocks start with zero history. GQA max compares each query head's query-token sum with the matching KV head's mean K, takes the maximum cosine inside that group, then averages over KV heads and active layers. It changes no Q capture, RoPE, payload format or KV acceptance rule.
 
-Physical reconstruction frontiers do not define the logical history parent. Each retained conversation has an ordered timeline of accepted input boundaries and immutable committed scores, plus one canonical input identity. When the frontend proves a message boundary before the transient assistant generation header, that boundary defines the input identity; otherwise the full input is required. Header-only blocks are not inherited. Only boundaries strictly before the incoming input end and proven to match its tokens/media/positions may be inherited. An exact repeat therefore uses its parent history. An edit drops later timeline entries when the new round is accepted. A physical rewind inside a verified continuation retains the selected logical history while rebuilding missing KV blocks; a same-request query rewind retains the open round. Reset or eviction drops the timeline. llama conversation swaps move the timeline and its input identity with the corresponding host store; failed multimodal requests restore their chosen parent history. ninfer's retained histories carry the same timeline alongside query and recurrent checkpoints.
+Physical reconstruction frontiers do not define the logical history parent. Each retained conversation has an ordered timeline of accepted input boundaries and immutable committed scores, plus one canonical input identity. When the frontend proves a message boundary before the transient assistant generation header, that boundary defines the input identity; otherwise the full input is required. Header-only blocks are not inherited. Only boundaries strictly before the incoming input end and proven to match its tokens/media/positions may be inherited. An exact repeat therefore uses its parent history. An edit drops later timeline entries only in the private execution branch when the new round is accepted; published source snapshots retain their own timelines. A physical rewind inside a verified continuation retains the selected logical history while rebuilding missing KV blocks; a same-request query rewind retains the open round. Reset or eviction drops the timeline. llama conversation swaps move the timeline and its input identity with the corresponding host store; failed multimodal requests restore their chosen parent history. ninfer's retained histories carry the same timeline alongside query and recurrent checkpoints.
 
 With process-local SSD tiering, ninfer retains the LRFU timeline, input identity and checkpoint scores in the owning history metadata while native KV and recurrent-state bytes may move to SSD. Restoring cold bytes therefore preserves the same logical parent selection as a RAM-only history. The former whole-history snapshot codec has been removed by the tiering implementation. llama's session cold files also remain private to one server run; history and input identities stay in that run's conversation metadata. Neither backend gains cross-process recovery from these retrieval changes.

@@ -1298,7 +1298,6 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::make_conv() {
 }
 
 std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_conv(ConvStore & source) {
-    if (rt_cfg_.cpu_bytes) throw std::runtime_error("shared forks do not clone legacy pinned CPU tiers");
     if (source.cold || source.model != &model_ || source.type_k != kv_->type_k() || source.type_v != kv_->type_v() ||
         source.slots != n_slots_ || source.has_mtp != bool(mtp_) || !source.content || !source.content->stamp().valid)
         throw std::invalid_argument("incompatible native conversation fork");
@@ -1309,6 +1308,7 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_conv(Con
     result->raw = source.raw->fork_prefix(rows);
     if (source.mtp_raw) result->mtp_raw = source.mtp_raw->fork_prefix(rows);
     result->runtime->store() = source.runtime->store();
+    result->runtime->clone_cpu_tier_from(*source.runtime);
     result->runtime->store().restore_retrieval(source.runtime->store().retrieval_checkpoint());
     result->row_positions = source.row_positions; result->resident = source.resident;
     result->q_rows = source.q_rows; result->q_count = source.q_count;
@@ -1319,7 +1319,6 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_conv(Con
 }
 
 std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_conv() {
-    if (rt_cfg_.cpu_bytes) throw std::runtime_error("shared forks do not clone legacy pinned CPU tiers");
     kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
     decode_mean_reset(); harvest_flush(); harvest_gpu_v_commit();
     const auto rows = runtime_->store().total_tokens();
@@ -1344,8 +1343,16 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_c
     result->raw = raw_->fork_prefix(rows);
     if (mtp_) result->mtp_raw = mtp_->fork_raw(rows);
     result->runtime->store() = runtime_->store();
+    result->runtime->clone_cpu_tier_from(*runtime_);
     result->runtime->store().restore_retrieval(runtime_->store().retrieval_checkpoint());
-    for (auto id : result->resident) result->runtime->store().set_block_tier(id,kvmem::KvTier::CPU,int32_t(id));
+    for (auto id : result->resident) {
+        // GPU rows are recovered from their sealed packed mirror. A logical
+        // block id is not a legacy CPU-arena slot; the copied arena contains
+        // only the source's real CPU placements.
+        if (auto* tier=result->runtime->cpu_tier()) tier->release_block(id);
+        result->runtime->store().set_block_tier(id,kvmem::KvTier::CPU,-1);
+        result->runtime->store().set_block_cpu_copy(id,-1);
+    }
     result->row_positions = row_positions_; result->q_rows = q_rows_; result->q_count = q_count_;
     result->graph = graph_; result->feedback.restore(feedback_.snapshot());
     result->scope = attention_scope_; result->output_begin = attention_output_begin_;

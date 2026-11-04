@@ -68,6 +68,7 @@ public:
     auto begin() const { return entries_.begin(); }
     auto end() const { return entries_.end(); }
     size_t slots() const { return entries_.size(); }
+    size_t capacity() const { return entries_.capacity(); }
     Entry * at(size_t i) { return i < entries_.size() && entries_[i].info.identity ? &entries_[i] : nullptr; }
     const Entry * at(size_t i) const { return i < entries_.size() && entries_[i].info.identity ? &entries_[i] : nullptr; }
     void clear() { entries_.clear(); }

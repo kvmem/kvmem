@@ -113,6 +113,8 @@ struct kvmem_conversation {
 
 kvmem_conversation llama_driver_fork_conversation(const kvmem_conversation&, int keep);
 kvmem_conversation llama_driver_fork_conversation(const LlamaEngineState&, int keep);
+// Preserve the full accepted source catalog before its resident view is reused.
+kvmem_conversation llama_driver_snapshot_conversation(const LlamaEngineState&, int accepted_end);
 
 struct kvmem_conv_counts {
     uint64_t disk_bytes = 0, disk_bytes_max = 0;

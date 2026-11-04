@@ -1,6 +1,92 @@
 # Paths and device identities anonymized; measurements unchanged.
 # Checkpoint policy validation, 2026-10-25
 
+Historical qualification: cache-key and owner behavior below describes the
+recorded implementations. For key-independent content/native-snapshot reuse,
+see [current semantics](checkpoint-policy.md#content-snapshots-across-backends).
+
+## Content snapshot implementation and review, 2026-11-04
+
+This later implementation starts from parent commit `8cf44cb`. It makes client
+cache aliases diagnostic metadata across NInfer, llama.cpp, PolyStrata and
+Radiance. Native token/media/position/checkpoint compatibility still authorizes
+restore; each executing branch preserves its immutable source. Resource groups
+only distribute bounded retention capacity. Tool continuation remains append
+plus resident-only Pressure, without old-Query cold-history selection.
+
+The review reran nine native host executables covering the common directory,
+conversation selection, CPU-tier independence, lane admission/failure, shared
+sources, PolyStrata sessions and image collisions, Radiance prefix policy and
+sampling capacity. All passed. Python checks passed four actual frontend
+image/template cases and seven evidence-harness self-tests. The prepared
+PolyStrata frontend suite ran 42 tests: 40 passed and two CMake declaration
+checks were initially skipped. Both declaration checks then passed in a focused
+rerun with the existing bundled CMake, completing all42 checks without compiling
+CUDA or HIP. Initial frontend discovery failed with an empty backend
+placeholder and sandbox-denied localhost sockets; preparing the backend path
+and allowing the mock localhost service resolved those environment failures.
+No native recompilation was needed for this review.
+
+The following GPU qualifications belong to their separately recorded binaries
+and frontends. They are functional arms, not a performance comparison. Only
+PolyStrata was rerun for the notification repair described below.
+
+| Backend | Qualified scope and limits |
+|---|---|
+| NInfer | Final worker `b5342dd8dc6a`: strict Responses18 and real OpenCode18 each prove six native concurrent pairs; parent returns reuse 2052/2085 and 5106/5141 tokens respectively. Native SSD/MTP/cancellation checks are separate workloads. |
+| llama.cpp | Final worker `d43e7e583c4f`: strict18 proves six native concurrent pairs and parent reuse 2042/2086. The earlier 40 SSD/MTP/CPU-tier variant requests belong to their earlier explicitly recorded workers. |
+| PolyStrata | Worker `da268a6b8968` with the repaired production frontend passes all 18 actual-cache assertions and all six materialized concurrent pairs, with minimum hot reuse 97.69% and parent reuse 1835/1866. Before the notification repair, two runs and a preserved older-worker control passed cache checks but failed the strict concurrency gate at pair0; those failures remain historical evidence. Native restore/decode interleaving was present, but live cache observations arrived late. The older H4 six-pair PASS and H2 missing-pair FAIL belong to their older runs. |
+| Radiance | Final worker `b38c6bff1ec1`: B1024/R512/C2/H4/MTP3 strict18 proves six materialized pairs. The separate low-H SSD/MTP0 arm has nine attempts: seven complete, one required EIO, one early native cancellation; healthy-peer completion and same-source retries pass. Full raw evidence was independently checked. Actual TP2/multi-GPU execution remains unqualified. |
+
+PolyStrata's fixed-worker and pre-fix control use the same RTX 5050 Laptop
+(`GPU-B`), Gemma-4-26B-A4B UD-Q2_K_XL,
+B1024/R256/C2/H4096MiB, prefill128, sessions4 and MTP0. Generated answers become
+later history, so the control is not an exact-output oracle. Each run independently
+passes native accepted-prefix, response correlation and tool-policy checks.
+These short tool fixtures do not establish physical Pressure behavior.
+
+The pair0 failure was localized to the earlier shared-cache frontend adaptation.
+`StrataEngine._control` parsed `CACHE_REUSE` without yielding, while Service only
+published the observation on its next progress/token callback. In a timestamped
+diagnostic, the second request had restored before the first generated seven
+more native tokens and finished; monitor publication lagged parsing by 1.012s.
+The old worker contained the same frontend observation path, so its failure did
+not establish a native scheduling defect.
+
+The applied repair yields one existing progress notification immediately after
+parsing `CACHE_REUSE`. No native code or execution policy changed. A deterministic
+test withholds all subsequent PP/token input: the old branch fails, while the
+repair publishes both positive and zero actual reuse immediately and counts each
+request once. All 43 frontend tests pass, including the CUDA/HIP CMake declaration
+checks using the existing bundled CMake. The formal GPU arm uses the actual fixed
+frontend without the diagnostic wrapper or an in-memory proposal; the binary,
+GPU, budgets, sampling configuration and frozen acceptance gates stay the same.
+
+Two audit defects are repaired. PolyStrata now checks the complete existing
+FNV64 media fingerprint, grid and original position in live/idle/batch restore
+selection, including snapshot-only fallbacks. Unknown proof declines reuse after
+the first image. A real parser fixture with different embeddings and identical
+truncated image token IDs now restores to token16 before the image; the same-image
+control still restores128. Immutable proof reservations share the Host quota and
+release on the last reference. This is a native parser/planner proof, not GPU
+image-output qualification or cryptographic raw-image equality. Optional
+history-only Jinja failures now disable that grouping hint; required generation
+errors still propagate.
+
+Radiance also includes the user-approved minimum repair of an inherited sampling
+capacity defect. The old worker failed the original2038-token cold request at
+B1024/R512 before cache reuse; the repaired worker traverses that same native
+Query/checkpoint/replay boundary successfully. Canonical grouping separately uses
+unrounded native message spans, rather than scheduler-rounded history boundaries.
+
+All backend patch hashes and prepared trees are pinned in
+[`backends/versions.json`](../backends/versions.json). NInfer and PolyStrata patches
+were strictly reapplied and checked against their prepared source files. Finite
+memory can still evict a source or reject optional reuse. Source-preserving forks
+can increase live state costs; CPU arenas and native checkpoint quotas are
+accounted separately. Throughput, general recall quality, GPU image output and
+other untested model/backend combinations are not qualified by these checks.
+
 Status: the original redesign and nearby-point experiment are complete within
 the qualification limits below. Nearby thinning defaults off. The policy is
 opt-in; `legacy` remains the default. These qualification runs preceded submission

@@ -10,7 +10,7 @@ llama.cpp、NInfer、PolyStrata 与 Radiance 适配器共用 `kvmem/` 中的原�
 ## 使用与预算
 
 各 worker 的公共分层使用相同的三个参数；原生后端能力与已验证范围见
-[公共前缀与检查点契约](checkpoint-policy.md#shared-owners-across-backends)：
+[公共前缀与检查点契约](checkpoint-policy.md#content-snapshots-across-backends)：
 
 ```text
 --kvmem-host-mib H --kvmem-disk-path PATH --kvmem-disk-mib D

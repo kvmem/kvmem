@@ -99,6 +99,10 @@ int main() {
     check(tool.action==kvmem_store_action::fresh,"tool continuation discovered foreign history");
     a.allow_bound_edit=true;
     auto edit=kvmem_store_select_shared({a},600,false,"A",limits,true);
-    check(edit.action==kvmem_store_action::extend && edit.id==1,"explicit owner edit lost its lineage");
-    std::cout << "shared-cache accepted boundaries, independent proofs, sealed KV COW, cold references and owner policy PASS\n";
+    check(edit.action==kvmem_store_action::fork && edit.source==1,"same-key deep edit consumed its source");
+    for(const auto& key: {std::string{},std::string("A"),std::string("B")}) {
+        const auto same=kvmem_store_select_shared({a},600,false,key,limits,true);
+        check(same.action==edit.action && same.source==edit.source && same.keep==edit.keep,"key changed native prefix plan");
+    }
+    std::cout << "shared-cache accepted boundaries, independent proofs, sealed KV COW, cold references and content policy PASS\n";
 }
