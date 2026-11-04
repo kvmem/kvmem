@@ -1,5 +1,10 @@
 # NInfer chat rollback and cross-owner checkpoint validation
 
+Historical qualification of the 2026-10-29 owner-bound implementation. The
+key-independent content/native-snapshot policy supersedes that ownership
+contract; see [current semantics](checkpoint-policy.md#content-snapshots-across-backends).
+The results below belong to their original source and binaries.
+
 The [checkpoint policy](checkpoint-policy.md) now binds Chat cache keys to live
 owners and allows a named NInfer Qwen3.5 spread request with a current user Query
 to discover a retained prefix in another owner. OpenCode requires no modification.

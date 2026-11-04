@@ -5,113 +5,153 @@ NInfer Qwen3.5 KVMem paths. The default remains `legacy`. PolyStrata keeps its o
 native checkpoint policy. This feature does not add a request mode or persistence
 across process restarts.
 
-## Shared owners across backends
+## Content snapshots across backends
 
-For Chat Completions, `kvmem.conversation_id` names the mutable lineage;
-`prompt_cache_key` and the SDK spelling `promptCacheKey` are aliases with lower
-priority. Conflicting nonempty aliases are rejected, including when an explicit
-conversation ID is present. Keys preserve all bytes up to the 256-byte limit.
-Radiance also accepts its existing `session_id` as a legacy fallback; the
-128-byte dashboard label is separate from cache identity. Longer legacy labels
-remain accepted for display without becoming an owner key.
+Full-context requests use their evaluated token/media/position prefixes to find
+native checkpoints. `kvmem.conversation_id`, `prompt_cache_key`, the SDK spelling
+`promptCacheKey`, and Radiance's legacy `session_id` do not own a mutable cache
+slot. Giving a parent and child the same key does not authorize replacement,
+serialize them, or suppress either publication. Missing, different and shared
+keys use the same content policy. Existing field/alias validation is retained
+for protocol compatibility; display labels are independent of native identity.
+Explicit stateful session handles and internal incarnation/generation stamps
+still have their separate lifecycle contracts.
 
-The same owner contract applies to llama.cpp and PolyStrata. An explicit owner
-selects a mutable lineage, not a bypass for token, media, position, accepted-state
-or model/layout checks. An anonymous request may discover a reusable native
-prefix; it does not acquire a durable named conversation. Keys are bounded by
-UTF-8 bytes, not dashboard label length. Invalid types, empty explicit owners and
-conflicting aliases return an input error.
+`kvmem/content_cache.hpp` supplies shared candidate ordering, publication and
+capacity-group policies, plus an optional typed `ContentSnapshotDirectory`.
+Native catalogs can call those policies without changing their payload formats.
+The typed directory holds immutable objects through reader references, performs
+native proof callbacks outside its metadata lock, and commits prepared metadata
+atomically. Its returned retired objects must be released at the backend's safe
+boundary or through a native deferred deleter. It is not a second allocator.
+The current adapters retain native catalog wrappers; using the common policy
+does not mean that every adapter uses the typed directory's hash index.
 
-| Backend | Native source and independent branch | Boundaries |
+| Backend | Source and independent branch | Native boundaries |
 |---|---|---|
-| NInfer Qwen3.5 KVMem | Owner-first native history lookup; sealed archive references and immutable state images, private selectors/Query/rollback | `legacy` and `spread`; active GPU pages and mutable recurrent state remain per lane |
-| llama.cpp KVMem | Exact native checkpoints; source-preserving bundles, sealed packed KV and read-only recurrent/draft checkpoint references | Modern host/SSD tier or multi-conversation mode; old pinned CPU arenas disable foreign forks; SSD requires Flash Attention |
-| PolyStrata KVMem | Native accepted stamp and recurrent checkpoint; parked source preserved while child enters, shared sealed archive/state | CUDA qualification; solo MTP and ordinary batch decode keep their native execution modes; HIP hardware validation is separate |
-| Radiance KVMem | Native rank-prefix state, accepted token/media proof and independent rank memory policy | CPU/portable validation is separate from AMD execution; remote GPU qualification requires the machine to be running |
+| NInfer Qwen3.5 KVMem | Content-selected retained histories; sealed archive references, copied checkpoint wrappers and private selectors/Query/rollback | `legacy` and `spread`; exact recurrent checkpoint and original positions; GPU working sets stay per lane |
+| llama.cpp KVMem | Exact checkpoints and source-preserving bundles; private execution branch with shared sealed packed KV/state where supported | Legacy pinned CPU arenas require independent arena/table copies; they receive no shared-payload credit |
+| PolyStrata KVMem | Content-selected accepted checkpoints; preserved parked source and independent branch metadata | Solo MTP, batch and yielded prefill retain their native accepted-state rules; CUDA/HIP qualification is separate |
+| Radiance KVMem | Content-selected rank-prefix snapshots with native leases and private memory policy | Capture, restore and destruction obey scheduler/rank safe boundaries; CPU tests do not qualify AMD or multi-GPU execution |
 
-These are host/SSD and read-only checkpoint references within one loaded
-backend/model configuration. They are not a portable KV format, a cross-process
-cache, or a promise that separate GPU working sets share their physical pages.
-Different backends keep their native restore rules. No second cache manager or
+Snapshot reuse is confined to one compatible loaded backend/model instance.
+The proof must cover model/layout, exact tokens and media, original positions,
+accepted frontier, KV/statistics coverage and native recurrent/draft state.
+Hashes and LCP are candidate filters. An arbitrary LCP is not a restorable
+recurrent state. Equal token prefixes may have different sparse/replayed native
+states and must remain separate unless the adapter proves equivalence.
+
+A new user Query can discover a compatible content prefix. Tool continuation
+requires the native continuation proof and then uses append plus resident-only
+Pressure; it does not acquire general prefix discovery or cached-old-Q cold
+history reselection. Reading cold bytes needed to restore a proven checkpoint
+is separate from selecting cold history with a Query. No ingestion mode or new
 document-ingestion endpoint is introduced.
 
-No key is required for sharing. A new user Query may discover a complete exact
-prefix from another owner, including an anonymous owner, in either NInfer
-`legacy` or `spread` mode. The selected checkpoint must still prove model/layout,
-token and media identity, original positions, accepted frontier and native
-recurrent state. Lookup examines RAM metadata and reads only selected cold
-payloads. Hashes and longest common prefixes are candidate filters, never a
-substitute for those proofs. Tool continuation does not enable foreign-owner
-discovery or cold-history Query reselection; it uses append and resident-only
-Pressure. Existing proven continuations remain eligible for native restore.
+Restoring does not consume the retained source. Sealed Host/SSD payloads and
+read-only native images may share allocations; selectors, MeanK updates, LRFU,
+Query buffers, coverage wrappers, graph feedback, rollback and live recurrent
+state are private to the executing branch. A later write detaches a shared
+tail. Independent copies of equal bytes are charged independently. A resident
+execution binding may be reused exclusively after native validation, while a
+recoverable source snapshot remains available to another request.
 
-llama.cpp clones an active source without switching its GPU working set first;
-normal lane handover then restores the child. A partial archive tail is private,
-and restored checkpoint statistics supply its exact state. PolyStrata preserves
-the selected parked source until the branch is published; failed enter/restore
-does not consume it. Checkpoint wrappers, coverage catalogs, MeanK, LRFU, graph
-feedback, Query buffers and draft rollback are mutable per owner even when
-their sealed byte allocations are shared.
+Only complete accepted states may publish. Publication order is recency for
+retention, not a per-client winner rule: an older-started request may publish
+after a newer-started sibling. Incomplete captures and failed preparation leave
+the old source valid. A request that disables cache use must not erase other
+snapshots by matching its client key. Explicit management/reset operations keep
+their own protocol meaning rather than being inferred from key equality.
 
-Capacity admission charges the native physical H/D account once, plus new
-growth and outstanding reservations. Logical bytes summed across owners can
-exceed physical bytes. Metadata, statistics, model weights, OS file cache,
-temporary transfers, process RSS and GPU VRAM have separate scopes; H is not an
-RSS limit. An LRU directory eviction releases only its own references. The last
-reader or owner releases the allocation and its quota.
+Native group IDs only allocate retention fairly. They are not client identities,
+candidate filters, or permission to overwrite a previous version. The common
+group planner limits both entries and groups, uses the most recent access in a
+group for group LRU, and first recycles old entries from groups with multiple
+versions when the physical directory is full. A new group exceeding the group
+limit can evict an idle group as a capacity event. Pinned native bindings remain
+protected. Unknown group IDs do not merge anonymous requests into one group.
+Group classification uses a complete, accepted canonical input boundary with
+exact tokens, media and positions. A short template-tail continuation hint does
+not prove that two different user questions belong to one resource group.
+Publication rechecks the group's completed inputs: each must lie on the same
+exact prefix path as the incoming input. Among compatible groups it chooses the
+deepest match; otherwise it creates an internal group. This also separates
+siblings that prepared concurrently from an older common ancestor. Unknown or
+incompletely accepted canonical boundaries do not authorize inheritance.
+The four adapters use the common group retention policy while retaining native
+admission and configured physical-entry limits. Checkpoint count/byte limits
+still apply per native history version, not as a new aggregate per-client quota.
+Native KV/checkpoint pressure also uses the common idle-entry eviction order:
+extra versions yield before singleton groups, while active restore sources and
+other native pins stay protected. Physical pressure may evict a snapshot before
+the directory count is full; an outstanding lease can keep its bytes charged.
 
-The monitor distinguishes `planned_cached_tokens`, `actual_cached_tokens` and
-`cache_source` (`own`, `shared`, `miss`). Missing native observations stay absent
-or null. NInfer's pre-existing `cached_tokens` wire accounting is an admission
-quote: a best-effort failed restore can silently recompute that prefix. Its new
-independent actual observation reports zero in that case, and the monitor uses
-the actual value when available. This does not rewrite the original wire
-timings or Prometheus admission accounting. A created fork is not an actual
-cache hit until native restore succeeds. llama.cpp's physical checkpoint bytes
-also include private retrieval metadata and are labelled separately from pure
-recurrent-state bytes.
+Removing a covered version requires a native dominance proof, not a larger
+frontier. `content_snapshot_covers` checks nonempty, nonzero immutable-origin
+sets; the adapter must also preserve all relevant KV/position/state/policy
+inputs. NInfer additionally checks archive allocation identities before merging
+covered groups. A copied or rewritten tail conservatively prevents that merge.
+Ordinary LRU capacity eviction remains possible even without a dominance proof.
 
-PolyStrata reports the first successful native restore boundary per HTTP request;
-input computed before an internal yield is not newly credited on resume. This
-is not net compute saved across every later replay. Its scope-version-2 memory
-snapshot includes all native sequence archives, slot checkpoint references and
-parked histories. Foreign discovery requires more than one retained history;
-with one history, different named owners start fresh. Internal solo/batch/MTP
-continuations after decode retain the owner with an empty Query span. A prefill
-yielded before its new Query retains that still-pending bounded span.
+Capacity admission uses the existing physical H/D account plus new growth and
+outstanding reservations. A deferred content reference keeps bytes alive without
+pinning their current RAM tier; actual readers take short leases. A directory
+eviction releases only its reference, and physical quota returns after the last
+reader/branch releases the allocation. Checkpoint pools, private metadata,
+temporary transfers, model weights, RSS and GPU VRAM have distinct scopes. The
+typed directory's metadata limit is a retention bound, not a total RSS limit.
 
-A foreign hit forks the native history. Historical sealed RAM/SSD records and
-read-only state may share physical allocations; mutable selectors, feedback,
-catalogs and live recurrent state belong to each branch. Releasing or editing one
-owner cannot change bytes still leased by another. Normal capacity eviction may
-remove an idle directory entry, and physical release waits for its last lease.
-For NInfer anonymous requests, the existing native continuation proof still
-permits dropped output and a re-templated input tail of at most 64 tokens; deeper
-shared prefixes now use a fork. An anonymous request is not a durable named
-conversation. Clients that need reliable lineage selection should send a key.
+The llama legacy CPU arena is copied into an independently allocated destination
+arena, including its private tier table; it is not a sealed shared payload.
+Before creating or forking a store, the lane catalog reserves one configured
+arena commitment. The cap is `(snapshot_slots + lanes) * cpu_bytes`, charged for
+active, parked and in-flight stores; failure refunds the reservation and keeps
+the source available. This conservative ledger is reported separately from raw
+H/D bytes and RSS. Copying into the already allocated destination avoids a third
+temporary arena. Native recurrent checkpoint pools also keep their own limits:
+retaining a source while executing a private branch can need more checkpoint
+space than the former consuming restore, and insufficient space can still evict
+an idle source or require prefill.
+PolyStrata and Radiance retain shared immutable canonical token/media metadata
+with a Host reservation taken before allocation. That reservation lasts until
+the last metadata reference is destroyed. Their optional CPU identity capture
+can decline to an unknown group after a storage/allocation failure, recording
+the error; it does not turn a new fairness hint into a required I/O dependency.
+Required native KV/checkpoint operations and device failures keep their existing
+error semantics. Directory-level retained-byte totals may conservatively count
+a shared metadata object more than once; those totals are distinct from the
+physical reservation and RSS.
 
-Radiance retains both a deep input point and a conservative point before the
-first assistant message, when those are safe native chunk boundaries. An input
-edit or template rewrite may require falling back or recomputation. It cannot
-restore recurrent state at an arbitrary LCP. The scheduler respects native
-prefill quantum and speculative refill requirements. Extra prefill cuts can
-change floating-point accumulation; text equality is not the sole correctness
-test.
+The monitor retains `planned_cached_tokens`, `actual_cached_tokens` and the
+legacy native-path labels `own`, `shared`, `miss`. These labels must not be used
+as evidence of client ownership or physical byte deduplication. Missing native
+observations stay absent/null. NInfer's legacy `cached_tokens` is an admission
+quote and may remain positive when an optional restore falls back to prefill;
+the independent actual observation reports the completed native boundary. A
+created branch is not an actual cache hit until native restore succeeds.
+PolyStrata credits the first successful restore per HTTP request, not input
+already computed before an internal yield. Those counters are not net compute
+saved across all later replay.
 
-Radiance admission counts repeated sealed allocation identities once across
-active histories, input points and parked sessions. Independent captures of
-equal bytes and per-branch metadata remain charged separately. The monitor
-exposes logical bytes, proven sharing credit and accounted cache bytes, alongside
-the storage account's actual RAM/SSD payload charges. Pending parking retains a
-conservative full reservation until publication. These counters do not describe
-total process RSS, model weights or transient runtime workspace.
+Revision-2 observations add `cache_semantics_revision=2` and `restore_path`
+(`continuation`, `snapshot`, `miss`). Continuation describes the native content
+path; it does not promise that GPU state stayed resident. Older workers may omit
+these fields, which must remain unknown rather than being synthesized as a miss.
+NInfer publishes native actual reuse at completion and in streamed prompt
+progress when available. Its aggregate consumer has no live progress contract;
+an active HTTP request or an admission quote alone does not prove a restore.
 
-This scope shares physical host/SSD records inside one worker and compatible
-native model instance. It does not add a common GPU page pool, transfer KV
-between backends or persist caches across restart. Radiance retains its existing
-native prefix references. Owner keys are routing hints, not a tenant
-security boundary. Concurrent requests are native snapshot branches; applications
-requiring a single ordered conversation must serialize submissions themselves.
+Radiance retains deep input and conservative pre-assistant points only at legal
+native boundaries. Its sharing counters deduplicate actual sealed allocation
+identities, not equal contents; pending parking retains its reservation until
+complete. Extra prefill cuts can change accumulation, so text equality alone
+does not establish native correctness.
+
+This policy is process-local. It does not transfer KV between backend formats,
+persist caches across restart, or promise shared physical GPU pages. Ordered
+application conversations must still serialize dependent submissions. Historical
+GPU reports qualify their recorded binaries and settings; they do not qualify
+the new content-cache implementation or untested hardware combinations.
 
 ## Configuration
 
@@ -122,8 +162,8 @@ Set these environment variables before starting the worker:
 | `KVMEM_CHECKPOINT_POLICY` | `legacy` | `legacy` or `spread` |
 | `KVMEM_CHECKPOINT_INTERVAL` | 16384 | Approximate token spacing of optional captures |
 | `KVMEM_CHECKPOINT_MIN_GAP` | 0 | Minimum spacing of ordinary retained points; 0 disables nearby thinning; 64 is the tested experimental setting |
-| `KVMEM_CHECKPOINT_COUNT` | 24 | Retained records per conversation, 1–256 |
-| `KVMEM_CHECKPOINT_MIB` | 4096 | Logical retained payload and native metadata budget per conversation |
+| `KVMEM_CHECKPOINT_COUNT` | 24 | Retained coverage records per native history version, 1–256 |
+| `KVMEM_CHECKPOINT_MIB` | 4096 | Logical retained payload and native metadata budget per native history version |
 | `KVMEM_CHECKPOINT_HOT` | min(4, count) | Target number of images in RAM; at most count |
 | `KVMEM_CHECKPOINT_HOST_MIB` | 1024 | Checkpoint Host budget per lane |
 
@@ -311,15 +351,16 @@ skip when there is no room. Required captures first reclaim idle buffers, demote
 eligible images, or evict optional retention; if admission still fails, they
 report capacity exhaustion before allocating the image. Required snapshots are
 never silently replaced by an approximate periodic point.
-When parked owners consume the creator lane's remaining Host quota, required
-admission can evict an older idle owner. Busy, switching, queued and resident
-owners remain protected. A later request for an evicted owner recomputes its
-prefix. A request rejected after prefill began uses its existing rollback lease.
+When retained branches consume the creator lane's remaining Host quota, required
+admission can evict an older idle directory entry. Busy, switching, queued and
+resident native bindings remain protected. A request whose reusable entry was
+evicted recomputes its prefix. A request rejected after prefill began uses its existing rollback lease.
 
 After a turn, reusable execution snapshots enter the bounded archive and release
-their execution slots. Shared payload identities are counted once. A new payload
-at the same frontier replaces the directory entry; equality of frontier alone
-never aliases recurrent or Query-replay state.
+their execution slots. Shared payload identities are counted once. Within a branch-local coverage catalog, a new payload
+at the same frontier may replace that catalog's old version. Across request
+branches, equal frontiers neither replace entries nor alias recurrent or
+Query-replay state.
 
 Retention softly protects the root, latest anchor and newest frontier. Among
 other records, remove the smallest
@@ -332,65 +373,36 @@ future prompt's legal restore frontier, requiring a full prefill.
 Selection considers metadata from RAM and SSD together, chooses the deepest
 legal frontier and preserves native prefix, accepted-token, media, KV-coverage,
 recurrent, MTP, mean-K and retrieval-history checks. It does not read every image
-to find a candidate. Restoring a prefix invalidates the edited suffix.
+to find a candidate. Restoring a prefix discards the edited suffix only
+from the new private execution branch; it leaves retained source snapshots valid.
 
-In llama multi-conversation selection, spread mode permits an explicit, already
-bound `kvmem.conversation_id` to edit that owner's earlier history using a valid
-checkpoint. This replaces that owner's suffix, rather than retaining an extra
-branch. Inferred/unknown conversation IDs retain the existing continuation gate;
-legacy mode also keeps that gate for explicit IDs. This is an intentional policy
-change required for middle-edit reuse, not a correction of the old fork policy.
+Full-context Chat Completions and non-stateful Responses use content selection,
+including for edits, regenerate and rollback. Cache keys do not select a single
+mutable lineage in either checkpoint policy. OpenCode parent/child sessions may
+share a key or omit it; no client-derived key or parent/fork protocol is needed.
+This does not remove explicit server-side response/session handles from actual
+stateful protocols.
 
-NInfer's Responses route binds `prompt_cache_key` to a session key
-(`store: false`, without a previous response); that explicit owner can also replace an earlier
-suffix. Chat Completions now binds a non-empty `prompt_cache_key` to the same live-session
-semantics, including `store:false`. An explicit `kvmem.conversation_id` takes precedence.
-The OpenCode compatible SDK spelling `promptCacheKey` is also accepted on Chat;
-conflicting non-empty values under both spellings are rejected.
-For OpenCode's `@ai-sdk/openai-compatible` provider, enable
-`provider.<id>.options.setCacheKey: true`; OpenCode then sends its session ID as
-`promptCacheKey`. Reverting messages within that session preserves the key.
-Keep the identity stable through append, regenerate and rollback. Separate conversations
-should use distinct identities; sharing a key shares one owner, so a suffix edit can discard
-checkpoints another branch would otherwise reuse. A key identifies an owner; token/media,
-native-state and KV proofs still govern every restore. Missing/null/empty cache keys remain
-anonymous. Both NInfer policies protect anonymous histories from consumptive
-restores by unrelated requests sharing only the system prefix: a continuation
-must reach the previous accepted input boundary, allowing a 64-token template
-tail margin. Earlier edits without a session key start a separate history or fork
-a proven foreign prefix. This
-keeps a short unrelated conversation from truncating the retained long history.
+The bounded native directories, digests and placement metadata remain in RAM.
+After shortlist ordering, each adapter still verifies its exact native restore
+proof before use. NInfer bounds the ranked restore candidates; a filtered digest
+does not prove state completeness. The common typed directory can perform native
+validation before limiting returned candidates, while native adapters retain
+their own bounded validation loops. Neither path reads all SSD images to search.
 
-NInfer first searches the current owner's checkpoints. If none is
-valid, a request with a current user Query may discover another named or anonymous owner's
-matching prefix. The bounded retained directory, token/media/position digests,
-coverage and placement metadata live in RAM. Digest filtering reads no SSD
-payload; at most 16 foreign candidates receive exact prefix checks. Candidates
-prefer the deepest legal frontier, then the fewest cold state/KV bytes, then
-recent publication. A hash match never replaces the exact identity checks.
+The executing branch owns mutable selectors/statistics and checkpoint wrappers.
+Sealed KV and immutable images retain their existing physical accounts. Once
+other branches/readers release a page, a sole writer may update it without a
+second copy. Holding a deferred source or active reader requires COW until that
+reference ends. RAM/SSD capacity limits apply after publication regardless of
+whether client keys are present.
 
-The new owner copies mutable selector/statistics and checkpoint metadata through
-the selected frontier. Sealed KV records and immutable native images share their
-physical storage; a later KV write detaches that owner's record. Physical payload
-quota is charged once while shared. Owner metadata and mean-K copies still cost
-RAM, and the first divergent page costs a new KV allocation. The source owner
-remains intact and both branches can independently append, roll back and return.
-Once the other owners and all outstanding readers release a KV page, its sole
-owner can write it without allocating a second copy. A deferred read source or
-active read lease still requires copy-on-write until that reader releases it.
-Ordinary session/count/byte eviction limits still apply after publication.
-
-RAM and SSD candidates are equally eligible. After selection and capacity checks,
-the transaction binds the source generation and reads only the selected cold
-image and required native KV pages. Read workers do not mutate the parent.
-Cancellation releases unpublished child references; preparation failure falls
-back to the admitted full prefill. The native restore verifies state before a
-history hit is recorded. Previously quoted API reuse counters can still include
-the planned prefix on that fallback; use the native restore log to distinguish
-completed reuse. OpenCode needs no parent ID or fork protocol change: its new
-session/cache key selects a new owner with an identical serialized prefix.
-The payload format and restore proof remain specific to the NInfer Qwen3.5 KVMem
-path; the shared owner contract above also applies to the other backends.
+After capacity checks, a restore binds the source generation and reads only the
+selected cold image and required KV pages. Workers cannot mutate the source or
+publish engine state. Cancellation releases unpublished branch references after
+running work drains; preparation failure follows the native clean-prefill or
+rollback path. Native restore success, rather than the admission quote, records
+actual prefix reuse.
 
 Ordinary tool continuation still appends with resident-only Pressure. A saved Q
 does not authorize cold-history recall. Checkpoint policy does not change the
@@ -420,8 +432,22 @@ larger directories do not guarantee more points under a small Host budget.
 
 ## Verification
 
-See the [validation record](checkpoint-policy-validation-20261025.md) for current
-results, fixed failures and qualification limits.
+The [historical validation record](checkpoint-policy-validation-20261025.md)
+contains results and limits for its recorded checkpoint-policy binaries. New
+content-cache backend combinations require their own validation records.
+`content_cache_test` covers reverse-order concurrent publication, native proof
+rejection, source lifetime, metadata limits, group fairness, origin coverage and
+publication/restore failure without loading a GPU.
+`tests/content-cache-regression.py` tests an already configured dedicated HTTP
+endpoint: document and acknowledgement first, separate questions on three
+branches, six overlapping pairs cycling shared/different/missing keys, old-parent
+return, and ordinary tool continuation. It requires correlated native actual
+observations and two materialized active requests for every pair. Use `--stream`
+when the backend exposes live actual observations only through streaming, as
+NInfer does. Launcher/GPU/budget arguments record settings; the script does not
+configure the server. Its `--self-test` and replay transport fixtures do not
+qualify a native backend or GPU. Save the launch configuration and native logs
+with each real run; a small-budget miss remains adverse capacity evidence.
 The [NInfer cross-owner validation](ninfer-cross-owner-validation-20261029.md)
 records Chat rollback, OpenCode forks, shared storage and cold-read failure tests.
 

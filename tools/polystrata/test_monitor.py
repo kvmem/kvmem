@@ -107,5 +107,15 @@ class MonitorTest(unittest.TestCase):
             s.engine.gen+=1
             self.assertIsNone(snapshot(s)['kvmem']['history_hits'])
 
+    def test_native_capacity_groups_are_distinct_from_snapshot_records(self):
+        s=self.service()
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'native.log'
+            path.write_text('KVMEM_SESSIONS parked=12 parked_groups=3 evictions=2 restores=7\n')
+            s.engine.log_path=str(path);s.engine.log_start=0
+            usage=snapshot(s)['kvmem']
+            self.assertEqual(usage['retained_sessions'],3)
+            self.assertEqual(usage['retained_records'],12)
+
 
 if __name__ == '__main__':unittest.main()

@@ -62,7 +62,7 @@ add_test(NAME kvmem-lane-pool-test COMMAND kvmem-lane-pool-test)
 # Conversation selection and eviction policy: header-only and free of llama.cpp
 # and CUDA, so it stays testable in the portable KVMEM_BUILD_LLAMA=OFF build.
 add_executable(kvmem-conversation-store-test tests/conversation-store-test.cpp)
-target_include_directories(kvmem-conversation-store-test PRIVATE tools)
+target_include_directories(kvmem-conversation-store-test PRIVATE tools kvmem/include)
 add_test(NAME kvmem-conversation-store-test COMMAND kvmem-conversation-store-test)
 
 add_executable(kvmem-shared-cache-test tests/shared-cache-test.cpp)
@@ -85,6 +85,9 @@ target_include_directories(kvmem-spill-lifecycle-worker PRIVATE tools)
 target_link_libraries(kvmem-spill-lifecycle-worker PRIVATE kvmem)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
+    add_test(NAME kvmem-content-cache-http-evidence-test
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/content-cache-regression.py --self-test)
+    set_tests_properties(kvmem-content-cache-http-evidence-test PROPERTIES TIMEOUT 30)
     add_test(NAME kvmem-spill-lifecycle-test
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spill_lifecycle.py
                 $<TARGET_FILE:kvmem-spill-lifecycle-worker>)

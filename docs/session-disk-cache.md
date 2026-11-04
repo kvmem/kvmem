@@ -2,8 +2,8 @@
 
 活动和非活动历史共用原生 KV 的 H/D 预算、文件和所有权；恢复仍检查本后端的前缀、
 状态及已提交 token 边界。完整说明见[活跃 KV 分层](active-kv-tiering.md)。
-跨会话的只读物理引用、会话归属与计划/实际命中口径见
-[公共前缀与检查点契约](checkpoint-policy.md#shared-owners-across-backends)。
+跨请求的只读物理引用、内容选择与计划/实际命中口径见
+[公共前缀与检查点契约](checkpoint-policy.md#content-snapshots-across-backends)。
 
 ```text
 --kvmem --kvmem-host-mib H --kvmem-disk-path PATH --kvmem-disk-mib D
@@ -11,7 +11,8 @@
 ```
 
 H/D 单位是 MiB。H 需容纳全部并发工作集；D 包括持有的原生 KV、状态附件和未发布写入。
-N 只限制非活动历史数量。公共层支持并发，llama 需要 Flash Attention；SSD 文件限当前进程，
+N 控制后端的内部保留容量；内部组和物理目录项各有原生上限，不按客户端 key 分配。
+公共层支持并发，llama 需要 Flash Attention；SSD 文件限当前进程，
 最后一个所有者退出或进程被终止时由操作系统清理，不提供重启恢复。
 
 旧在线 NVMe、raw-K NVMe、独立会话磁盘接口和旧目录清理器已移除；旧参数报错提示迁移，

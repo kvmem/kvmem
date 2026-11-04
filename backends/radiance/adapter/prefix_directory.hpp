@@ -1,5 +1,6 @@
 #pragma once
 #include "kvmem/prefix_checkpoint.hpp"
+#include "kvmem/content_cache.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <vector>
@@ -12,26 +13,28 @@ struct PrefixCandidate {
     const void* storage = nullptr;
     CheckpointPurpose purposes = CheckpointPurpose::None;
     bool eligible = false;
+    bool continuation = false;
     CheckpointInfo checkpoint_info() const {
         return {tokens ? tokens->size() : 0, purposes, storage, 0};
     }
 };
 inline const void* select_prefix_checkpoint(const std::vector<int32_t>& prompt,
-        const std::vector<PrefixCandidate>& candidates, uint64_t query_limit = UINT64_MAX) {
+        const std::vector<PrefixCandidate>& candidates, uint64_t query_limit = UINT64_MAX,
+        bool new_user_query = true) {
     if (prompt.empty()) return nullptr;
-    CheckpointCatalog<PrefixCandidate> directory({candidates.size(), UINT64_MAX});
-    for (const auto& candidate : candidates) {
+    std::vector<ContentCacheCandidate> proven;
+    for (size_t slot=0;slot<candidates.size();++slot) {
+        const auto& candidate=candidates[slot];
         if (!candidate.storage || !candidate.tokens || candidate.tokens->empty()) continue;
-        directory.slot(candidate.purposes) = candidate;
-    }
-    const auto* selected = directory.select(std::min<uint64_t>(prompt.size()-1, query_limit),
-        [&](const PrefixCandidate& candidate) {
-            if (!candidate.eligible) return false;
+        if (candidate.eligible) {
             const auto& saved = *candidate.tokens;
             const auto n = std::min(prompt.size(), saved.size());
             const auto lcp = size_t(std::mismatch(saved.begin(), saved.begin()+n, prompt.begin()).first-saved.begin());
-            return saved.size() <= prefix_restore_limit(lcp, saved.size(), prompt.size(), true);
-        });
-    return selected ? selected->storage : nullptr;
+            if(saved.size()<=query_limit && saved.size()<=prefix_restore_limit(lcp,saved.size(),prompt.size(),true))
+                proven.push_back({slot,saved.size(),0,0,candidate.continuation});
+        }
+    }
+    const auto ranked=rank_content_candidates(std::move(proven),new_user_query);
+    return ranked.empty() ? nullptr : candidates[ranked.front().slot].storage;
 }
 } // namespace kvmem::radiance

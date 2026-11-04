@@ -312,7 +312,8 @@
         [v.decode_ms,v.preprocess_ms,v.queue_ms,v.encode_ms].map(x=>fmt(x,1)).join(' / '));
       lines.push((i18n.language==='en'?'Image cache hits / misses: ':'图片缓存命中 / 未命中：')+`${fmt(v.cache_hits)} / ${fmt(v.cache_misses)}`);
     }
-    if (typeof row.cache_source === 'string' && row.cache_source) lines.push((i18n.language === 'en' ? 'Cache source' : '缓存来源') + `: ${row.cache_source}`);
+    const restore = row.cache_semantics_revision >= 2 ? row.restore_path : row.cache_source;
+    if (typeof restore === 'string' && restore) lines.push((i18n.language === 'en' ? 'Cache source' : '缓存来源') + `: ${restore}`);
     if (number(row.planned_cached_tokens)) lines.push((i18n.language === 'en' ? 'Planned reuse' : '计划复用') + `: ${fmt(row.planned_cached_tokens)} tokens`);
     if (number(row.actual_cached_tokens)) lines.push((i18n.language === 'en' ? 'Actual reuse' : '实际复用') + `: ${fmt(row.actual_cached_tokens)} tokens`);
     if (number(row.decode_ms)) lines.push(t("解码耗时 {0}s", fmt(row.decode_ms / 1000, 2)));

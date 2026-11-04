@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "kvmem/content_cache.hpp"
 
 struct kvmem_store_limits {
     int      max_stores = 1; // live host stores in this selection snapshot
@@ -171,23 +172,11 @@ inline kvmem_store_plan kvmem_store_select(const std::vector<kvmem_store_match> 
                                            const std::string & client_id,
                                            const kvmem_store_limits & limits) {
     kvmem_store_plan plan;
-    // Rule 5: an explicit conversation id is a pure optimization that
-    // restricts the candidate set. An unknown id degrades to inferred
-    // matching, and a bound id never bypasses the checkpoint rule.
+    // Client identity is diagnostic metadata. Continuations are selected by
+    // content and complete native checkpoint evidence for every spelling/key.
+    (void) client_id;
     std::vector<const kvmem_store_match *> candidates;
-    if (!client_id.empty()) {
-        for (const auto & store : stores) {
-            if (store.client_id == client_id) {
-                candidates.push_back(&store);
-            }
-        }
-    }
-    const bool id_bound = !candidates.empty();
-    if (!id_bound) {
-        for (const auto & store : stores) {
-            candidates.push_back(&store);
-        }
-    }
+    for (const auto & store : stores) candidates.push_back(&store);
 
     const kvmem_store_match * best = nullptr;
     int  best_keep     = 0;
@@ -204,8 +193,7 @@ inline kvmem_store_plan kvmem_store_select(const std::vector<kvmem_store_match> 
         // keep == 0 has nothing to resume, so extending buys nothing and only
         // risks truncating the store. Rank by keep, which is the prefix the
         // hybrid model can actually restore; lcp is aspiration.
-        const bool owner_edit = id_bound && store->allow_bound_edit;
-        if (!found || keep <= 0 || (!owner_edit && !kvmem_store_continuation(*store))) {
+        if (!found || keep <= 0 || !kvmem_store_continuation(*store)) {
             continue;
         }
         if (!best || keep > best_keep || (keep == best_keep && store->used > best->used)) {
@@ -218,7 +206,7 @@ inline kvmem_store_plan kvmem_store_select(const std::vector<kvmem_store_match> 
         plan.id     = best->id;
         plan.lcp    = best->lcp;
         plan.keep   = best_keep;
-        plan.reason = id_bound ? "client_id" : "extend";
+        plan.reason = "extend";
         kvmem_store_plan_evictions(stores, limits, false, plan);
         return plan;
     }
@@ -234,30 +222,31 @@ inline kvmem_store_plan kvmem_store_select(const std::vector<kvmem_store_match> 
     return plan;
 }
 
-// Owner lookup has priority. A foreign match always gets a new mutable owner.
+// One content policy for all callers. Deep edits fork their source; proven
+// continuations may use an exclusive resident binding. A tool continuation
+// cannot discover an unrelated historical prefix merely by supplying a key.
 inline kvmem_store_plan kvmem_store_select_shared(const std::vector<kvmem_store_match>& stores,
         int eval_end, bool spec_ok, const std::string& key, const kvmem_store_limits& limits, bool discover) {
-    std::vector<kvmem_store_match> own;
-    for (const auto& store : stores)
-        if (store.client_id == key && (!key.empty() || kvmem_store_continuation(store))) own.push_back(store);
-    auto result = kvmem_store_select(own, eval_end, spec_ok, key, limits);
-    if (result.action == kvmem_store_action::extend) {
-        result.evict.clear(); kvmem_store_plan_evictions(stores, limits, false, result);
-        return result;
+    auto result = kvmem_store_select(stores, eval_end, spec_ok, key, limits);
+    std::vector<kvmem::ContentCacheCandidate> candidates;
+    for (size_t index = 0; index < stores.size(); ++index) {
+        const auto& store = stores[index];
+        int keep = 0;
+        if (kvmem_store_checkpoint(store, kvmem_store_keep_cap(store, eval_end, spec_ok), keep) && keep > 0)
+            candidates.push_back({index, uint64_t(keep), 0, store.used, kvmem_store_continuation(store)});
     }
-    if (discover) {
-        uint64_t used = 0;
-        for (const auto& store : stores) {
-            result.observed_lcp = std::max(result.observed_lcp, store.lcp);
-            int keep = 0;
-            if (kvmem_store_checkpoint(store, kvmem_store_keep_cap(store, eval_end, spec_ok), keep) && keep > 0 &&
-                (keep > result.keep || (keep == result.keep && store.used > used))) {
-                result.action = kvmem_store_action::fork; result.source = store.id;
-                result.keep = keep; result.lcp = store.lcp; used = store.used; result.reason = "shared_prefix";
-            }
-        }
+    const auto ranked = kvmem::rank_content_candidates(std::move(candidates), discover);
+    if (!ranked.empty()) {
+        const auto& selected = ranked.front();
+        const auto& store = stores[selected.slot];
+        result.action = selected.continuation ? kvmem_store_action::extend : kvmem_store_action::fork;
+        result.id = selected.continuation ? store.id : -1;
+        result.source = selected.continuation ? -1 : store.id;
+        result.keep = int(selected.frontier); result.lcp = store.lcp;
+        result.reason = selected.continuation ? "extend" : "shared_prefix";
     }
-    result.evict.clear(); kvmem_store_plan_evictions(stores, limits, true, result);
+    result.evict.clear();
+    kvmem_store_plan_evictions(stores, limits, result.action != kvmem_store_action::extend, result);
     return result;
 }
 
