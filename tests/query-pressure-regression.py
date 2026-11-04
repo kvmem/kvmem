@@ -24,6 +24,8 @@ def main():
     p.add_argument('--gpu', required=True)
     p.add_argument('--tool-repeats', type=int, default=160,
                    help='observation repetitions; increase to exceed a larger append reserve')
+    p.add_argument('--resident-lines', type=int, default=80,
+                   help='reference lines for the B < prompt <= B+R resident-view fixture')
     p.add_argument('--reject-replay', action='store_true')
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=False)
@@ -184,9 +186,15 @@ def main():
             ask('after-cancel',messages,16)
             check('health after cancel',call('/health') is not None)
             fits=[{'role':'user','content':''.join(
-                f'Record {i}: the river flows through the valley.\n' for i in range(80))+
+                f'Record {i}: the river flows through the valley.\n' for i in range(a.resident_lines))+
                 '\nReply briefly.'}]
-            _,trace=ask('fits-device',fits,8,session='policy-fits',reset=True)
+            fit_response,trace=ask('fits-device',fits,8,session='policy-fits',reset=True)
+            if '--kvmem-budget' in command and '--kvmem-gen-reserve' in command:
+                budget = int(command[command.index('--kvmem-budget')+1])
+                reserve = int(command[command.index('--kvmem-gen-reserve')+1])
+                fit_tokens = fit_response['usage']['prompt_tokens']
+                check('resident fixture crosses B', fit_tokens > budget)
+                check('resident fixture fits B+R', fit_tokens <= budget + reserve)
             check('resident history above B avoids Query replay','path=query_replay ' not in trace and
                 'KVMEM_QUERY_REPLAY from=' not in trace and 'KVMEM_QUERY scorer=' not in trace)
             check('resident view captures no unused Query', 'capture_query=0' in trace if a.backend=='ninfer'

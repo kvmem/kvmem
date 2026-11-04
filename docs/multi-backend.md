@@ -2,7 +2,7 @@
 
 本文描述当前多后端源码，包含活跃 KV 的 RAM/SSD 分层；具体依赖以 `backends/versions.json` 为准。历史 Windows NInfer [0.18.0 正式版](https://github.com/kvmem/kvmem/releases/tag/v0.18.0)基于 RC3 引擎，默认 sink=12288 tokens（12K）、recent=1024 tokens（1K）。两后端参数差异见 [实现差异](multi-backend-differences.md)，历史验收范围见 [分层验收记录](active-kv-tiering-validation-20261010.md)。
 
-本轮 NInfer 固定到 `iamwavecut/ninfer-all` 的 `2026-10-29.2` / `d0da39796697`，dense heads TP 的范围、测量及限制见 [本轮验收](ninfer-heads-validation-20261030.md)。0.18.0 的 `8319e8f51247` [迁移记录](ninfer-all-migration-validation.md)及下文各有日期的实验仍是历史证据，不能视为新基线已经完成同等覆盖。KVMem 暂不支持新增的 `qwen4_exp`、模型 suspend、prompt graft 和 router，开启这些组合时明确报错。
+当前 NInfer 固定到 `iamwavecut/ninfer-all` 的 `2026-11-04.2` / `6cc1f9fa438b`，本次升级范围与验证见 [升级记录](ninfer-release-20261104.md)。dense heads TP 的既有测量及限制见 [历史验收](ninfer-heads-validation-20261030.md)；其中的速度数据没有在新版本上重新测量。0.18.0 的 `8319e8f51247` [迁移记录](ninfer-all-migration-validation.md)及下文各有日期的实验仍是历史证据，不能视为新基线已经完成同等覆盖。KVMem 暂不支持新增的 `qwen4_exp`、模型 suspend、prompt graft 和 router，开启这些组合时明确报错。
 
 Windows 入口 `scripts/windows/start-backend.ps1` 在当前源码可选择 `llamacpp`、`ninfer` 或下文限定范围的 `polystrata`。两个 worker 分进程运行，各自拥有推理引擎和 GPU 内存；公共 KVMem 策略库直接链接在 worker 内。
 
