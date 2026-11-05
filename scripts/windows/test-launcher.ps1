@@ -51,7 +51,7 @@ public class ArgvEcho {
                 $env:KVMEM_TEST_LORA_CAPABILITY = $case.json
                 $accepted = $false
                 try {
-                    & (Join-Path $PSScriptRoot 'start-backend.ps1') -Backend llamacpp -Model $model -Worker $echoExe -Lora $mmproj -Gpu 'GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29' -DiskMiB 0 | Out-Null
+                    & (Join-Path $PSScriptRoot 'start-backend.ps1') -Backend llamacpp -Model $model -Worker $echoExe -Lora $mmproj -Gpu 'GPU-00000000-0000-0000-0000-000000000001' -DiskMiB 0 | Out-Null
                     $accepted = $true
                 } catch {
                     if ($case.accepted) { throw }
