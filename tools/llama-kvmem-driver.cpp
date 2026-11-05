@@ -931,23 +931,26 @@ template<class Source> static kvmem_conversation fork_conversation(const Source&
     kvmem_conversation result;
     result.cached_tokens = source.cached_tokens; result.cached_prompt = source.cached_prompt;
     result.history_input_prompt = source.history_input_prompt; result.history_points = source.history_points;
+    // Earlier accepted checkpoints remain valid in the forked prefix. Keep
+    // their catalog so restoring a branch does not erase future edit coverage.
+    result.mm_checkpoints = source.mm_checkpoints;
+    result.mm_archive = source.mm_archive;
+    result.mm_checkpoints.truncate(uint64_t(keep));
+    result.mm_archive.truncate(uint64_t(keep));
     auto cp = *selected;
     result.mm_checkpoints.remember(cp);
     result.mm_archive.remember(cp, kvmem::CoveragePurpose::Input);
+    for (const auto & checkpoint : result.mm_checkpoints)
+        if (checkpoint.data) checkpoint.data->shared.store(true);
+    for (const auto & entry : result.mm_archive)
+        if (entry.info.identity && entry.record.data) entry.record.data->shared.store(true);
     result.mm_live_row = keep; result.last_n_gen = source.last_n_gen;
     return result;
 }
 kvmem_conversation llama_driver_fork_conversation(const kvmem_conversation& source, int keep) { return fork_conversation(source, keep); }
 kvmem_conversation llama_driver_fork_conversation(const LlamaEngineState& source, int keep) { return fork_conversation(source, keep); }
 kvmem_conversation llama_driver_snapshot_conversation(const LlamaEngineState& source, int accepted_end) {
-    auto result=fork_conversation(source,accepted_end);
-    result.mm_checkpoints=source.mm_checkpoints;
-    result.mm_archive=source.mm_archive;
-    result.mm_checkpoints.truncate(uint64_t(accepted_end));
-    result.mm_archive.truncate(uint64_t(accepted_end));
-    for(const auto& cp:result.mm_checkpoints)if(cp.data)cp.data->shared.store(true);
-    for(const auto& entry:result.mm_archive)if(entry.info.identity && entry.record.data)entry.record.data->shared.store(true);
-    return result;
+    return fork_conversation(source, accepted_end);
 }
 
 std::shared_ptr<const MultimodalCheckpointData> llama_driver_materialize_checkpoint(
