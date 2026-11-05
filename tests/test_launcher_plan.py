@@ -68,6 +68,25 @@ class PlanTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Worker changed'):
                 probe_worker(self.worker, 'ninfer')
 
+    def test_fixed_lora(self):
+        adapter = self.directory / 'rank two.gguf'
+        adapter.touch()
+        argv = self.plan('llamacpp', Lora=str(adapter), LoraScale=-0.5)['argv']
+        start = argv.index('--lora')
+        self.assertEqual(argv[start:start+4], ['--lora', str(adapter), '--lora-scale', '-0.5'])
+        self.assertNotIn('--lora', self.plan('llamacpp')['argv'])
+        for scale in (0, -0.5, 1e-300):
+            planned = self.plan('llamacpp', Lora=str(adapter), LoraScale=scale)['argv']
+            self.assertEqual(float(planned[planned.index('--lora-scale')+1]), scale)
+        for values in [dict(LoraScale=0.5), dict(Lora=str(adapter), LoraScale=float('nan')),
+                       dict(Lora=str(adapter.with_suffix('.missing')))]:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.plan('llamacpp', **values)
+        with self.assertRaises(ValueError):
+            self.plan('ninfer', Lora=str(adapter))
+        with self.assertRaisesRegex(ValueError, 'worker'):
+            require_launch_features({}, {'Lora': str(adapter)})
+
     def test_zero_native_prefill_sentinel_is_explicit(self):
         result = token_settings('ninfer', dict(Budget=1024, Reserve=512, SinkTokens=0,
                                               RecentTokens=64, Prefill=0, Context=2048))
@@ -270,6 +289,7 @@ class PlanTest(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'PowerShell regression comparison')
     def test_windows_canonical_cli_equivalence(self):
         cases = [('ninfer', {}), ('llamacpp', {}),
+                 ('llamacpp', dict(Lora=str(self.models['llamacpp']), LoraScale=-0.5)),
                  ('ninfer', dict(CheckpointExtraRecomputeTokens=16)),
                  ('ninfer', dict(TensorParallel=True, TensorSplit=[3.5, 1],
                      Gpu=GPU+',GPU-00000000-0000-0000-0000-000000000002')),

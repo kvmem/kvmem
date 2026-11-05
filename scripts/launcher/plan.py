@@ -156,7 +156,7 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
     data = copy.deepcopy(data)
     params = data.get('parameters') if isinstance(data, dict) else None
     if isinstance(params, dict):
-        for key in ('Worker', 'Model', 'DraftModel', 'ChatTemplateFile', 'Mmproj', 'DiskPath',
+        for key in ('Worker', 'Model', 'DraftModel', 'ChatTemplateFile', 'Mmproj', 'Lora', 'DiskPath',
                     'Tokenizer', 'PolystrataSource', 'Python', 'VisionWorker', 'RadianceHome', 'RocmPath'):
             value = params.get(key)
             if isinstance(value, str) and value:
@@ -288,6 +288,12 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
             pair('--reasoning-effort', p['ReasoningEffort'])
         if 'PreserveThinking' in supplied:
             pair('--chat-template-kwargs', json.dumps({'preserve_thinking': p['PreserveThinking']}, separators=(',', ':')))
+        if p.get('Lora'):
+            adapter = _existing_file(p['Lora'], 'Lora')
+            if Path(adapter).suffix.lower() != '.gguf':
+                raise ValueError('Lora must be a GGUF file')
+            pair('--lora', adapter)
+            pair('--lora-scale', p.get('LoraScale', 1))
         if p['Vision']:
             model = Path(p['Model'])
             if not p.get('Mmproj'):
