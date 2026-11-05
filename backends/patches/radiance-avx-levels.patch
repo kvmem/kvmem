@@ -1,0 +1,206 @@
+diff --git a/libavx/CMakeLists.txt b/libavx/CMakeLists.txt
+--- a/libavx/CMakeLists.txt
++++ b/libavx/CMakeLists.txt
+@@ -2,8 +2,9 @@
+ #
+ # This build is what makes runtime dispatch safe:
+ #
+-#   The kernels are compiled four times, once per ISA level, into OBJECT libraries with different
+-#   -m flags and AVX_LEVEL=0..3. avx_vec.h wraps each level in its own inline namespace; without
++#   By default the kernels are compiled four times, once per ISA level, into OBJECT libraries.
++#   RAD_AVX_LEVELS may select a subset, using the same -m flags and AVX_LEVEL=0..3. avx_vec.h wraps
++#   each level in its own inline namespace; without
+ #   that the linker would keep one definition (e.g. of avx::row_to_f32) for all four tables, and
+ #   the scalar path could execute AVX-512 and fault.
+ #
+@@ -78,7 +79,23 @@
+ 
+ find_package(OpenMP QUIET)
+ 
+-foreach(lvl RANGE 0 3)
++set(RAD_AVX_LEVELS "0;1;2;3" CACHE STRING "Compiled libavx ISA levels (0 scalar, 1 AVX, 2 AVX2, 3 AVX512)")
++if(NOT RAD_AVX_LEVELS)
++  message(FATAL_ERROR "RAD_AVX_LEVELS must contain at least one ISA level")
++endif()
++set(_avx_levels ${RAD_AVX_LEVELS})
++set(_avx_level_mask 0)
++foreach(lvl IN LISTS _avx_levels)
++  if(NOT lvl MATCHES "^[0-3]$")
++    message(FATAL_ERROR "Invalid RAD_AVX_LEVELS entry '${lvl}'; expected 0, 1, 2 or 3")
++  endif()
++  math(EXPR _avx_level_mask "${_avx_level_mask} | (1 << ${lvl})")
++endforeach()
++list(REMOVE_DUPLICATES _avx_levels)
++list(SORT _avx_levels COMPARE NATURAL)
++message(STATUS "libavx: compiled ISA levels ${_avx_levels}")
++
++foreach(lvl IN LISTS _avx_levels)
+   add_library(avx_lvl${lvl} OBJECT ${AVX_KERNEL_SRC})
+   target_compile_definitions(avx_lvl${lvl} PRIVATE AVX_LEVEL=${lvl})
+   target_link_libraries(avx_lvl${lvl} PRIVATE radiance::abi)
+@@ -103,8 +120,9 @@
+ set(AVX_BASELINE_SRC avx_dispatch.cpp avx_registry.cpp avx_ngram.cpp)
+ 
+ rad_add_plugin(libavx kernels SOURCES ${AVX_BASELINE_SRC} INCLUDES ${CMAKE_CURRENT_SOURCE_DIR})
++target_compile_definitions(libavx PRIVATE RAD_AVX_LEVEL_MASK=${_avx_level_mask})
+ 
+-foreach(lvl RANGE 0 3)
++foreach(lvl IN LISTS _avx_levels)
+   target_link_libraries(libavx PRIVATE avx_lvl${lvl})
+ endforeach()
+ find_package(Threads REQUIRED)
+diff --git a/libavx/avx_dispatch.cpp b/libavx/avx_dispatch.cpp
+--- a/libavx/avx_dispatch.cpp
++++ b/libavx/avx_dispatch.cpp
+@@ -77,11 +77,28 @@
+ 
+ extern "C" const AvxKernelTable* avx_table_for(int level) {
+     switch (level) {
++#if RAD_AVX_LEVEL_MASK & 8
+         case AVX_LEVEL_AVX512: return &avx_table_v3;
++#endif
++#if RAD_AVX_LEVEL_MASK & 4
+         case AVX_LEVEL_AVX2:   return &avx_table_v2;
++#endif
++#if RAD_AVX_LEVEL_MASK & 2
+         case AVX_LEVEL_AVX:    return &avx_table_v1;
+-        default:               return &avx_table_sc;
+-    }
++#endif
++#if RAD_AVX_LEVEL_MASK & 1
++        case AVX_LEVEL_SCALAR: return &avx_table_sc;
++        default: return level < 0 || level >= AVX_N_LEVELS ? &avx_table_sc : nullptr;
++#else
++        default: return nullptr;
++#endif
++    }
++}
++
++static int compiled_level_at_most(int level) {
++    for (int candidate = level; candidate >= AVX_LEVEL_SCALAR; --candidate)
++        if (avx_table_for(candidate)) return candidate;
++    return -1;
+ }
+ 
+ static std::atomic<const AvxKernelTable*> g_tab{nullptr};
+@@ -89,7 +106,8 @@
+ extern "C" const AvxKernelTable* avx_table_live(void) {
+     const AvxKernelTable* t = g_tab.load(std::memory_order_acquire);
+     if (t) return t;
+-    const int level = avx_isa_detect();
++    const int level = compiled_level_at_most(avx_isa_detect());
++    if (level < 0) return nullptr;
+     g_level.store(level, std::memory_order_relaxed);
+     t = avx_table_for(level);
+     g_tab.store(t, std::memory_order_release);
+@@ -107,6 +125,8 @@
+      * that it ran a lower level than it asked for. */
+     if (level < 0) level = 0;
+     if (level > cap) level = cap;
++    level = compiled_level_at_most(level);
++    if (level < 0) return RAD_E_UNSUPPORTED;
+     g_level.store(level, std::memory_order_relaxed);
+     g_tab.store(avx_table_for(level), std::memory_order_release);
+     return level;
+@@ -139,7 +159,8 @@
+  * a row patched in open() would be briefly null. The extra indirect branch is not measurable. */
+ #define AVX_THUNK(nm)                                                                             \
+     extern "C" int avx_thunk_##nm(const RadArgs* a, RadStream s) {                                \
+-        return avx_table_live()->nm(a, s);                                                        \
++        const AvxKernelTable* table = avx_table_live();                                           \
++        return table ? table->nm(a, s) : RAD_E_UNSUPPORTED;                                        \
+     }
+ AVX_OP_LIST(AVX_THUNK)
+ #undef AVX_THUNK
+@@ -194,8 +215,7 @@
+  * leave the fp8 tables zero. The typedef checks below make a signature drift a compile error. */
+ extern "C" int rad_plugin_open(void) {
+     fp8_tables_init();
+-    (void)avx_table_live();
+-    return RAD_OK;
++    return avx_table_live() ? RAD_OK : RAD_E_UNSUPPORTED;
+ }
+ 
+ extern "C" void rad_plugin_close(void) {}
+@@ -216,10 +236,22 @@
+ extern "C" double avx_peak_fma_v3(int64_t);
+ 
+ extern "C" double avx_peak_fma(int level, int64_t iters) {
++    if (level > avx_isa_detect()) return 0.0;
+     switch (level) {
++#if RAD_AVX_LEVEL_MASK & 8
+         case AVX_LEVEL_AVX512: return avx_peak_fma_v3(iters);
++#endif
++#if RAD_AVX_LEVEL_MASK & 4
+         case AVX_LEVEL_AVX2:   return avx_peak_fma_v2(iters);
++#endif
++#if RAD_AVX_LEVEL_MASK & 2
+         case AVX_LEVEL_AVX:    return avx_peak_fma_v1(iters);
+-        default:               return avx_peak_fma_sc(iters);
+-    }
+-}
++#endif
++#if RAD_AVX_LEVEL_MASK & 1
++        case AVX_LEVEL_SCALAR: return avx_peak_fma_sc(iters);
++        default: return level < 0 ? avx_peak_fma_sc(iters) : 0.0;
++#else
++        default: return 0.0;
++#endif
++    }
++}
+diff --git a/libavx/avx_isa.h b/libavx/avx_isa.h
+--- a/libavx/avx_isa.h
++++ b/libavx/avx_isa.h
+@@ -10,8 +10,8 @@
+  *
+  * Levels:
+  *   AVX_LEVEL_SCALAR (0)  x86-64 baseline. The compiler uses SSE2 for scalar float, but nothing is
+- *                         hand-vectorised. Always selectable; every other level is checked
+- *                         against it.
++ *                         hand-vectorised. Included in the default build; every other level is
++ *                         checked against it.
+  *   AVX_LEVEL_AVX    (1)  AVX. 256-bit float only: Sandy/Ivy Bridge have no 256-bit integer ALU
+  *                         and no FMA, so the bf16<->f32 conversions in avx_vec.h split into two
+  *                         128-bit halves and every a*b+c is a separate mul and add.
+@@ -35,6 +35,13 @@
+ 
+ #include "rad_abi.h"
+ 
++#ifndef RAD_AVX_LEVEL_MASK
++#define RAD_AVX_LEVEL_MASK 15
++#endif
++#if RAD_AVX_LEVEL_MASK <= 0 || (RAD_AVX_LEVEL_MASK & ~15)
++#error "RAD_AVX_LEVEL_MASK must select at least one of levels 0 through 3"
++#endif
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -49,14 +56,14 @@
+ 
+ /* The highest level this CPU can execute, computed once. Safe to call before rad_plugin_open. */
+ int         avx_isa_detect(void);
+-/* The level currently selected. Defaults to avx_isa_detect(). */
++/* The compiled level currently selected, or -1 when none runs on this CPU. */
+ int         avx_isa_level(void);
+ const char* avx_isa_name(int level);
+ 
+ /* Force a level; for the checker only. An exported symbol rather than an environment variable, so
+  * a deployment cannot change what a kernel computes by accident and the engine never reaches it.
+- * Returns the level selected, min(requested, detected): a level the CPU cannot execute would
+- * SIGILL. */
++ * Returns the highest compiled level no greater than requested and detected. Returns
++ * RAD_E_UNSUPPORTED without changing the live table when no such level was compiled. */
+ int         avx_isa_force(int level);
+ 
+ /* Run every parallel region with `threads` team threads whatever its work threshold, or restore
+@@ -169,7 +176,8 @@
+ extern const AvxKernelTable avx_table_v2;
+ extern const AvxKernelTable avx_table_v3;
+ 
+-/* The table for a level, or the scalar table if that level was not built. */
++/* The exact table for a level, or null when that level was not compiled. An invalid
++ * level preserves the scalar fallback when the scalar implementation was compiled. */
+ const AvxKernelTable* avx_table_for(int level);
+ /* The live table the thunks call. Repointed by avx_isa_force. */
+ const AvxKernelTable* avx_table_live(void);

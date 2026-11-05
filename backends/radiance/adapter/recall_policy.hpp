@@ -9,6 +9,17 @@
 #include <stdexcept>
 
 namespace kvmem::radiance {
+// Ordinary prefill samples against the resident Pressure threshold. A fixed
+// Query replay cannot select again while rebuilding its suffix: its admission
+// already proves that selected history + suffix + workspace fit the actual
+// bounded device pool. Its sampling geometry uses that same physical bound.
+inline std::vector<uint32_t> prefill_attention_samples(uint64_t begin, uint32_t rows,
+        uint64_t last_end, uint64_t visible, uint64_t pressure_capacity,
+        uint64_t device_capacity, bool fixed_query_replay, uint32_t block) {
+    return prefill_sample_rows(begin, rows, last_end, visible,
+        fixed_query_replay ? device_capacity : pressure_capacity, 1024, 32, block);
+}
+
 struct RecallOptions {
     QueryScorer scorer = QueryScorer::PageSoftmax;
     int aggregation = 0;

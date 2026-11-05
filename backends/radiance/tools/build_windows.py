@@ -17,15 +17,18 @@ def main():
     p.add_argument('--ffmpeg-prefix', type=Path)
     p.add_argument('--ffmpeg-static', action='store_true')
     p.add_argument('--configure-only', action='store_true')
+    p.add_argument('--target', action='append', help='Specific audited Ninja target; repeat for multiple targets (for IQR-V4 use qwen35_w8a8)')
     a = p.parse_args()
     if os.name != 'nt' or a.jobs < 1:
         p.error('requires Windows and a positive job count')
+    if not a.configure_only and not a.target:
+        p.error('pass --configure-only, review the Ninja dry run, then pass explicit --target values')
     source, build, sdk = a.source.resolve(), a.build.resolve(), a.rocm.resolve()
     root = Path(__file__).resolve().parents[3]
     meta = json.loads((root / 'backends/radiance/upstream.json').read_text(encoding='utf-8'))
     head = source_revision(source)
     if head != meta['revision']:
-        p.error('native checkout differs from ABI15 pin; run prepare_native.py')
+        p.error('native checkout differs from the adapter pin; run prepare_native.py')
     for file in (sdk/'bin/clang.exe', sdk/'bin/clang++.exe', sdk/'bin/hipcc.exe', sdk/'lib/amdhip64.lib'):
         if not file.is_file():
             p.error(f'missing SDK component: {file}')
@@ -45,12 +48,11 @@ def main():
         if not (pc/'libavcodec.pc').is_file():p.error('missing FFmpeg pkg-config files')
         env['PKG_CONFIG_PATH']=str(pc)
     if a.ffmpeg_static:command.append('-DPKG_CONFIG_ARGN=--static')
-    (build/'kvmem-build-inputs.json').write_text(json.dumps({'revision':head, 'configure':command}, indent=2), encoding='utf-8')
+    (build/'kvmem-build-inputs.json').write_text(json.dumps({'revision':head, 'configure':command, 'targets':a.target or []}, indent=2), encoding='utf-8')
     subprocess.run(command, env=env, check=True)
     if not a.configure_only:
         subprocess.run(['cmake', '--build', str(build), '--parallel', str(a.jobs), '--target',
-                        'kvmem-radiance-observer-probe', 'radiance', 'rad-info', 'rad-convert',
-                        'libr4d', 'libref', 'libquant', 'qwen35_fp8'], env=env, check=True)
+                        *a.target], env=env, check=True)
 
 
 if __name__ == '__main__':

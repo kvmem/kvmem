@@ -1,0 +1,221 @@
+diff --git a/core/build/rad_builder.cpp b/core/build/rad_builder.cpp
+--- a/core/build/rad_builder.cpp
++++ b/core/build/rad_builder.cpp
+@@ -51,6 +51,15 @@
+         if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.index, m.span);
+     std::vector<const Miss*> out;
+     for (const Miss& m : misses) {
++        /* Whole-region CPU execution is explicit, including weightless encoder attention.
++         * Its device rows are deliberately absent. Require the host row for every band;
++         * a device row must never silently replace a missing forced-host implementation. */
++        const bool forced_host = m.index > 0 && (size_t)m.index < ops.size() &&
++                                 ops[(size_t)m.index].host_forced;
++        if (forced_host) {
++            if (m.domain == RAD_DOMAIN_HOST) out.push_back(&m);
++            continue;
++        }
+         if (m.domain == RAD_DOMAIN_HOST) continue;
+         const bool host_kernel = no_host.count(std::make_pair(m.index, m.span)) == 0;
+         /* An instance with no weight has nothing the planner places, so nothing moves it. */
+@@ -2710,11 +2719,11 @@
+         /* Reported whole at the end (spec §1 step 4); the engine decides what is fatal. Split by
+          * domain, since the tools read only this line. A device miss a host kernel stands in for
+          * is not a hole (Program::device_holes; engine_bringup.cpp's miss_report). */
+-        const size_t dev = prog_.device_holes(device_is_host()).size();
+-        /* Host-only misses are not a warning (see engine_bringup.cpp). */
+-        RAD_LOG_AT(dev ? Log::Warn : Log::Debug,
+-                   "declare: %zu device band(s) and %zu host band(s) resolved to nothing; "
+-                   "run with --debug-graph for the full list", dev, prog_.misses.size() - dev);
++        const size_t required = prog_.device_holes(device_is_host()).size();
++        /* Optional placement misses are not a warning; forced-host misses are required. */
++        RAD_LOG_AT(required ? Log::Warn : Log::Debug,
++                   "declare: %zu required execution band(s) unresolved (%zu total misses); "
++                   "run with --debug-graph for the full list", required, prog_.misses.size());
+     }
+     return status_;
+ }
+diff --git a/core/engine_bringup.cpp b/core/engine_bringup.cpp
+--- a/core/engine_bringup.cpp
++++ b/core/engine_bringup.cpp
+@@ -77,6 +77,7 @@
+  * Printed alike, host misses would bury a real device hole in thousands of lines. */
+ struct MissReport {
+     std::vector<std::string> device;   /* one line each; the engine does not start */
++    std::vector<std::string> forced_host; /* explicit CPU execution: a host row is required */
+     std::string              host;     /* one line, or empty */
+     /* Device misses covered by a host kernel (Tier::Mapped weights); informational. */
+     std::string              host_only;
+@@ -86,7 +87,8 @@
+     bool                     lossy_wire = false;
+ 
+     bool operator==(const MissReport& o) const {
+-        return device == o.device && host == o.host && host_only == o.host_only &&
++        return device == o.device && forced_host == o.forced_host && host == o.host &&
++               host_only == o.host_only &&
+                lossy_wire == o.lossy_wire;
+     }
+ };
+@@ -116,10 +118,17 @@
+     std::map<std::string, std::string>    host_spans;  /* op -> "M <= 64, M in (64, 512]" */
+ 
+     const std::vector<const Program::Miss*> holes = p.device_holes(host_backend);
++    const auto forced_host = [&p](int32_t index) {
++        return index > 0 && (size_t)index < p.ops.size() && p.ops[(size_t)index].host_forced;
++    };
+     std::set<std::pair<int32_t, std::string>> no_host;   /* (instance, band) with no host kernel */
+     for (const Program::Miss& m : p.misses)
+         if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.index, m.span);
+     for (const Program::Miss* m : holes) {
++        if (m->domain == RAD_DOMAIN_HOST) {
++            r.forced_host.push_back(m->line());
++            continue;
++        }
+         long long exact = 1;
+         if (m->index > 0 && (size_t)m->index < p.ops.size() &&
+             p.ops[(size_t)m->index].base.get_i("exact", &exact) && exact == 0)
+@@ -132,6 +141,8 @@
+ 
+     std::vector<std::string> host_only_ops;
+     for (const Program::Miss& m : p.misses) {
++        /* Explicit CPU regions are neither a host fallback nor an optional host placement. */
++        if (forced_host(m.index)) continue;
+         if (m.domain != RAD_DOMAIN_HOST) {
+             if (std::find(holes.begin(), holes.end(), &m) == holes.end() &&
+                 std::find(host_only_ops.begin(), host_only_ops.end(), m.op) ==
+@@ -1485,6 +1496,11 @@
+                         "one of them cannot run:", who.c_str(), rep[i].device.size());
+                 for (const std::string& l : rep[i].device) RAD_ERR("    %s", l.c_str());
+             }
++            if (!rep[i].forced_host.empty()) {
++                RAD_ERR("%s: %zu forced-host band(s) resolved to no host kernel:",
++                        who.c_str(), rep[i].forced_host.size());
++                for (const std::string& l : rep[i].forced_host) RAD_ERR("    %s", l.c_str());
++            }
+             if (!rep[i].host_only.empty()) RAD_INFO("%s", rep[i].host_only.c_str());
+             if (!rep[i].host.empty()) RAD_INFO("%s", rep[i].host.c_str());
+         }
+@@ -1493,13 +1509,13 @@
+          * so it continues to print the graph and reports the holes in its exit status
+          * (Engine::dump). */
+         for (const MissReport& m : rep)
+-            if (!m.device.empty() && !cfg_.debug_graph) {
++            if ((!m.device.empty() || !m.forced_host.empty()) && !cfg_.debug_graph) {
+                 if (m.lossy_wire)
+                     RAD_ERR("the band(s) above include the lossy wire --tp-wire wht6 asks for, "
+                             "which the loaded kernel libraries do not implement at --tp %d; "
+                             "--tp-wire exact asks for the exact one", cfg_.tp);
+-                RAD_ERR("not starting: the kernel libraries loaded have no kernel for the device "
+-                        "band(s) above, and this model needs them");
++                RAD_ERR("not starting: the kernel libraries loaded have no kernel for the required "
++                        "execution band(s) above, and this model needs them");
+                 return RAD_E_UNSUPPORTED;
+             }
+     }
+diff --git a/tests/cpu_domain_coverage_test.cpp b/tests/cpu_domain_coverage_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/cpu_domain_coverage_test.cpp
+@@ -0,0 +1,103 @@
++/* Explicit whole-region CPU execution must validate its own execution domain. */
++#include "rad_test.h"
++#include "rad_core.h"
++
++using namespace rad;
++
++namespace {
++Program fixture(bool forced, bool weighted = false) {
++    Program p;
++    p.ops.resize(2);
++    p.ops[1].op = "attn_dense";
++    p.ops[1].index = 1;
++    p.ops[1].host_forced = forced;
++    if (weighted) p.ops[1].weights = {1};
++    return p;
++}
++
++void miss(Program& p, int domain, const char* span = "M <= 256", int index = 1) {
++    Program::Miss m;
++    m.op = "attn_dense";
++    m.index = index;
++    m.domain = domain;
++    m.span = span;
++    m.why = "no kernel matched";
++    p.misses.push_back(m);
++}
++}
++
++TEST(forced_cpu_weightless_attention_needs_no_device_band) {
++    auto p = fixture(true);
++    miss(p, RAD_DOMAIN_DEVICE);
++    CHECK(p.device_holes(false).empty());
++    CHECK(p.device_holes(true).empty());
++}
++
++TEST(forced_cpu_requires_host_even_when_device_kernel_exists) {
++    auto p = fixture(true);
++    miss(p, RAD_DOMAIN_HOST);
++    for (bool host_backend : {false, true}) {
++        const auto holes = p.device_holes(host_backend);
++        CHECK_EQ(holes.size(), 1u);
++        if (holes.size() != 1) continue;
++        CHECK(holes[0] == &p.misses[0]);
++        CHECK_EQ(holes[0]->domain, RAD_DOMAIN_HOST);
++    }
++}
++
++TEST(forced_cpu_without_either_kernel_reports_only_its_host_requirement) {
++    auto p = fixture(true);
++    miss(p, RAD_DOMAIN_DEVICE);
++    miss(p, RAD_DOMAIN_HOST);
++    const auto holes = p.device_holes(false);
++    CHECK_EQ(holes.size(), 1u);
++    if (holes.size() != 1) return;
++    CHECK(holes[0] == &p.misses[1]);
++}
++
++TEST(forced_cpu_coverage_is_per_band_and_per_instance) {
++    auto p = fixture(true);
++    p.ops.resize(3);
++    p.ops[2].op = "attn_dense";
++    p.ops[2].index = 2;
++    miss(p, RAD_DOMAIN_DEVICE, "M <= 128");
++    miss(p, RAD_DOMAIN_DEVICE, "M <= 256");
++    miss(p, RAD_DOMAIN_HOST, "M <= 256");
++    miss(p, RAD_DOMAIN_DEVICE, "M <= 128", 2);
++    const auto holes = p.device_holes(false);
++    CHECK_EQ(holes.size(), 2u);
++    if (holes.size() != 2) return;
++    CHECK(holes[0] == &p.misses[2]);
++    CHECK(holes[1] == &p.misses[3]);
++    CHECK_EQ(holes[0]->domain, RAD_DOMAIN_HOST);
++    CHECK_EQ(holes[1]->domain, RAD_DOMAIN_DEVICE);
++}
++
++TEST(ordinary_weightless_device_ops_do_not_fall_back_to_host) {
++    auto p = fixture(false);
++    miss(p, RAD_DOMAIN_DEVICE);
++    const auto holes = p.device_holes(false);
++    CHECK_EQ(holes.size(), 1u);
++    if (holes.size() != 1) return;
++    CHECK(holes[0] == &p.misses[0]);
++    CHECK(p.device_holes(true).empty());
++}
++
++TEST(ordinary_weighted_host_placement_keeps_existing_rules) {
++    auto p = fixture(false, true);
++    miss(p, RAD_DOMAIN_DEVICE);
++    CHECK(p.device_holes(false).empty());
++    miss(p, RAD_DOMAIN_HOST);
++    const auto holes = p.device_holes(false);
++    CHECK_EQ(holes.size(), 1u);
++    if (holes.size() != 1) return;
++    CHECK(holes[0] == &p.misses[0]);
++}
++
++TEST(optional_host_miss_does_not_reject_ordinary_device_execution) {
++    auto p = fixture(false);
++    miss(p, RAD_DOMAIN_HOST);
++    CHECK(p.device_holes(false).empty());
++}
++
++RAD_TEST_MAIN()

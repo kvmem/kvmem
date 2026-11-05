@@ -1,5 +1,7 @@
 # Radiance：Windows / Linux AMD后端
 
+2026-11-05 的 Radiance 1.17.0 / IQ3R-S v4 已完成 Linux RX 9060 XT gfx1200、TP1/C1、FP8 KV/F32 state 的文本、DFlash2 7、有界 RAM/SSD 和 12K 两阶段验证。CPU PNG 请求、缓存与 placement 检查通过；原始图片 suite 为 21/22，低分辨率 OCR `5829→5029` 在普通 native 也复现，高分辨率附加 probe 两条路径均正确。JPEG 模型请求、Windows、TP2 和 general profile 未资格验证。固定版本、构建范围、性能和质量限制见[本轮接入记录](radiance-iqr-v4-integration-20261105.md)，独立启动见[runbook](radiance-iq3v4-runbook-20261105.md)。下文带日期的章节保留各次模型与平台的验证记录。
+
 ## 主线整合验证（2026-10-31）
 
 统一控制台已接入 Radiance 的多会话前缀缓存、同前缀并行分支、最多八并发文本解码、
@@ -98,13 +100,13 @@ CPU `encode_ms` 是视觉算子执行的 wall time，包含执行中的权重触
 
 基于 `amd/Qwen3.8-27B-Quark-AWQ-MXFP4`，进一步量化六个 MTP 投影矩阵和主输出头为 MXFP4；K/V缓存均为FP8。
 
-## 默认配置
+## 独立启动 profile 的默认配置
 
 | 参数 | 默认值 |
 |---|---:|
 | KVMem BUDGET | 36864 tokens |
 | 生成预留 | 16384 tokens |
-| Batch / context | 512 / 262144 |
+| Batch / context | 256 / 262144 |
 | MTP | 3 |
 | K / V cache | FP8 / FP8 |
 | Block size | 128 tokens |
@@ -117,7 +119,7 @@ CPU `encode_ms` 是视觉算子执行的 wall time，包含执行中的权重触
 | API / model ID | http://127.0.0.1:18380/v1 / radiance-local |
 | 交互设置 | xhigh, 思考与答案共用输出额度, max_tokens=65536 |
 
-生成时复用16384-token工作空间，交互请求的总输出额度为65536 tokens，包含思考和答案。
+生成时复用16384-token工作空间，交互请求的总输出额度为65536 tokens，包含思考和答案。以下历史性能测试保留其实际使用的 batch 512；已部署的旧服务配置可能不同。
 
 ## Windows 原生部署及完整测试
 

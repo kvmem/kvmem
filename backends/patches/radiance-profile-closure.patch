@@ -1,0 +1,220 @@
+diff --git a/libr4d/CMakeLists.txt b/libr4d/CMakeLists.txt
+--- a/libr4d/CMakeLists.txt
++++ b/libr4d/CMakeLists.txt
+@@ -240,6 +240,17 @@
+     if(NOT _r4d_found)
+       message(FATAL_ERROR "Profile names an unknown R4D unit: ${_r4d_unit}")
+     endif()
++    string(JSON _r4d_define_count ERROR_VARIABLE _r4d_define_error
++      LENGTH "${_r4d_profile_json}" unit_defines "${_r4d_unit}")
++    if(NOT _r4d_define_error AND _r4d_define_count GREATER 0)
++      math(EXPR _r4d_define_last "${_r4d_define_count} - 1")
++      foreach(_r4d_define_index RANGE ${_r4d_define_last})
++        string(JSON _r4d_define GET "${_r4d_profile_json}" unit_defines
++          "${_r4d_unit}" ${_r4d_define_index})
++        set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/${_r4d_unit}.hip"
++          APPEND PROPERTY COMPILE_DEFINITIONS "${_r4d_define}")
++      endforeach()
++    endif()
+   endforeach()
+   set(R4D_UNITS ${_r4d_selected})
+   set(_r4d_profile_dir "${CMAKE_CURRENT_BINARY_DIR}/profile-${R4D_PROFILE}")
+diff --git a/libr4d/generate_profile.py b/libr4d/generate_profile.py
+--- a/libr4d/generate_profile.py
++++ b/libr4d/generate_profile.py
+@@ -164,6 +164,10 @@
+         command += shlex.split(args.hip_flags if device else args.cxx_flags)
+         if device:
+             command += ['-x', 'hip', '--cuda-host-only', '--offload-arch=' + args.arch]
++            for define in profile.get('unit_defines', {}).get(Path(name).stem, []):
++                if not re.fullmatch(r'[A-Z_]\w*(?:=[A-Za-z0-9_]+)?', define):
++                    raise ValueError(f'invalid unit definition {define}')
++                command.append('-D' + define)
+             if args.rocm_root:
+                 command += ['--rocm-path=' + args.rocm_root]
+         command.append(str(source / name))
+@@ -210,6 +214,7 @@
+     write_if_changed(args.output / 'dependencies.txt', '\n'.join(dependencies) + '\n')
+     manifest = {
+         'profile': args.profile.stem, 'arch': args.arch, 'units': units,
++        'unit_defines': profile.get('unit_defines', {}),
+         'preprocessors': {'cxx': args.cxx, 'hip': args.hip,
+                           'cxx_flags': args.cxx_flags, 'hip_flags': args.hip_flags},
+         'unit_count': len(units), 'all_row_count': len(rows), 'retained_row_count': len(retained),
+diff --git a/libr4d/profiles/qwen35-dense-tp1.json b/libr4d/profiles/qwen35-dense-tp1.json
+--- a/libr4d/profiles/qwen35-dense-tp1.json
++++ b/libr4d/profiles/qwen35-dense-tp1.json
+@@ -1,5 +1,11 @@
+ {
+   "description": "Qwen3.8-27B IQR-V4 and MXFP4, TP1, CPU vision, DFlash2, FP8/packed KV and F32/F16 state",
++  "unit_defines": {
++    "r4d_attn_paged_h256_gqa6": ["R4D_PROFILE_QWEN35_DENSE_TP1=1"],
++    "r4d_fused_quant_fp8": ["R4D_PROFILE_QWEN35_DENSE_TP1=1"],
++    "r4d_rmsnorm_quant_i8": ["R4D_PROFILE_QWEN35_DENSE_TP1=1"],
++    "r4d_model_bf16": ["R4D_PROFILE_QWEN35_DENSE_TP1=1"]
++  },
+   "units": [
+     "r4d_attn_paged_h256_gqa6", "r4d_attn_paged_h128_gqa4",
+     "r4d_gdn_chunk_scan_k128_v128_c64_bf16", "r4d_gdn_conv_w4_h128_bf16",
+diff --git a/libr4d/audit_profile_objects.py b/libr4d/audit_profile_objects.py
+new file mode 100644
+--- /dev/null
++++ b/libr4d/audit_profile_objects.py
+@@ -0,0 +1,62 @@
++"""Verify internal symbol closure using the actual compiled profile objects."""
++from pathlib import Path
++import argparse
++import json
++import subprocess
++
++
++def symbols(nm: str, path: Path, mode: str) -> set[str]:
++    result = subprocess.run([nm, '-g', mode, str(path)], text=True, capture_output=True, check=True)
++    names = set()
++    for line in result.stdout.splitlines():
++        fields = line.split()
++        if len(fields) < 2:
++            continue
++        name, kind = fields[-1], fields[-2]
++        # Weak undefined symbols are optional and are zero when absent. Strong r4d
++        # helpers, including mangled C++ names, must resolve within this plugin.
++        if 'r4d_' in name and (mode != '--undefined-only' or kind == 'U'):
++            names.add(name)
++    return names
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--manifest', type=Path, required=True)
++    parser.add_argument('--object-root', type=Path, required=True)
++    parser.add_argument('--nm', default='nm')
++    parser.add_argument('--output', type=Path, required=True)
++    args = parser.parse_args()
++    manifest = json.loads(args.manifest.read_text(encoding='utf8'))
++    expected = {name + '.hip.o' for name in manifest['units']}
++    expected.update(name + '.o' for name in ['r4d_profile_rows.cpp', 'r4d_layout.cpp',
++                    'r4d_fp8_layout.cpp', 'r4d_iqr_layout.cpp', 'r4d_shapes.cpp', 'r4d_fuse.cpp'])
++    objects = {}
++    for path in args.object_root.rglob('*.o'):
++        if path.name not in expected:
++            continue
++        if path.name in objects:
++            raise ValueError(f'duplicate profile object {path.name}')
++        objects[path.name] = path.resolve()
++    missing_objects = sorted(expected - objects.keys())
++    if missing_objects:
++        raise ValueError(f'profile objects incomplete: {missing_objects}')
++    defined = set()
++    references = {}
++    for name, path in sorted(objects.items()):
++        defined.update(symbols(args.nm, path, '--defined-only'))
++        references[name] = symbols(args.nm, path, '--undefined-only')
++    unresolved = {name: sorted(values - defined) for name, values in references.items() if values - defined}
++    report = {'profile': manifest['profile'], 'object_count': len(objects),
++              'objects': {name: str(path) for name, path in sorted(objects.items())},
++              'internal_definitions': len(defined), 'unresolved_internal_symbols': unresolved,
++              'passed': not unresolved}
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    args.output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf8')
++    if unresolved:
++        raise SystemExit(json.dumps(unresolved, indent=2))
++    print(f'profile object closure passed: {len(objects)} actual objects, {len(defined)} internal definitions')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/libr4d/r4d_attn_paged_h256_gqa6.hip b/libr4d/r4d_attn_paged_h256_gqa6.hip
+--- a/libr4d/r4d_attn_paged_h256_gqa6.hip
++++ b/libr4d/r4d_attn_paged_h256_gqa6.hip
+@@ -312,8 +312,12 @@
+ // which: 0 = h256/gqa6, 1 = h128/gqa4, 2 = h256/gqa2 (Gemma 4 windowed).
+ static int64_t decode_scratch_bytes_of(const R4DArgs* r, int which) {
+     if (which == 1) return (int64_t)r4d_attn_decode_h128_gqa4_scratch_bytes(r);
++#if defined(R4D_PROFILE_QWEN35_DENSE_TP1)
++    if (which != 0) return RAD_E_UNSUPPORTED;
++#else
+     if (which == 2) return (int64_t)r4d_attn_decode_h256_gqa2_scratch_bytes(r);
+     if (which == 3) return (int64_t)r4d_attn_decode_h128_gqa2w_scratch_bytes(r);
++#endif
+     return (int64_t)r4d_attn_decode_h256_gqa6_scratch_bytes(r);
+ }
+ 
+@@ -463,6 +467,7 @@
+     return r4d_attn_decode_h128_gqa4_bf16kv(&r, (hipStream_t)s);
+ }
+ 
++#if !defined(R4D_PROFILE_QWEN35_DENSE_TP1)
+ /* Gemma 4 dense sliding window (head_dim 256, gqa 2, window 1024) decode; its prefill entry points
+  * are in r4d_attn_paged_h256_gqa2.hip. No check_dims_once: this is not the geometry that reports
+  * dims. */
+@@ -549,6 +554,8 @@
+     return r4d_attn_decode_h256_gqa2_qld_tree_bf16kv(&r, (hipStream_t)s);
+ }
+ 
++#endif
++
+ /* Head_dim 128 at 8 queries per kv head, any window, causal or not, q_len up to 16, under
+  * attn_paged_qrow: the gqa-4 kernel with each kv head mapped onto two query groups
+  * (R4DArgs::kv_rep = 2), the 31B's DFlash drafter's attention over a cache that holds each kv head
+diff --git a/libr4d/r4d_fused_quant_fp8.hip b/libr4d/r4d_fused_quant_fp8.hip
+--- a/libr4d/r4d_fused_quant_fp8.hip
++++ b/libr4d/r4d_fused_quant_fp8.hip
+@@ -934,6 +934,9 @@
+                                    int nblocks, int nthreads, int drain, int acq, int wire,
+                                    long loc_pack, long loc_scale_off, long wp, bool hi8,
+                                    long stage) {
++#if defined(R4D_PROFILE_QWEN35_DENSE_TP1)
++    return RAD_E_UNSUPPORTED;
++#else
+     if (!x || !w || !q || !s) return -1;
+     if (wp && !res) return -10;                  // a post-norm needs the stream
+     if (hi8 && wp) return -11;
+@@ -998,6 +1001,7 @@
+ #undef R4D_ARQ_H
+ #undef R4D_ARQ_HP
+     return hipGetLastError() == hipSuccess ? 0 : -4;
++#endif
+ }
+ 
+ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flags,
+diff --git a/libr4d/r4d_rmsnorm_quant_i8.hip b/libr4d/r4d_rmsnorm_quant_i8.hip
+--- a/libr4d/r4d_rmsnorm_quant_i8.hip
++++ b/libr4d/r4d_rmsnorm_quant_i8.hip
+@@ -1016,6 +1016,9 @@
+                                        long y, long q, long s, int M, int n, float eps, float wadd,
+                                        int w_f32, int r_ld, int y_ld, long stream, int nblocks,
+                                        int drain, int acq, int grp, long stage) {
++#if defined(R4D_PROFILE_QWEN35_DENSE_TP1)
++    return RAD_E_UNSUPPORTED;
++#else
+     if (!x || !w || !q || !s) return -1;
+     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
+     if (M <= 0 || n <= 0) return -2;
+@@ -1060,6 +1063,7 @@
+ #undef R4D_ARQ8
+ #undef R4D_ARQ8_T
+     return hipGetLastError() == hipSuccess ? 0 : -4;
++#endif
+ }
+ 
+ // The four-rank form's launch. The IPC arguments are r4d_ar_oneshot_4rank_exact's -- each peer's
+diff --git a/libr4d/r4d_model_bf16.hip b/libr4d/r4d_model_bf16.hip
+--- a/libr4d/r4d_model_bf16.hip
++++ b/libr4d/r4d_model_bf16.hip
+@@ -1796,8 +1796,16 @@
+      * while the source holds the live rows, so the source need only have at least as many. */
+     if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
+ 
++#if defined(R4D_PROFILE_QWEN35_DENSE_TP1)
++    // TP1 taps still need the strided copy. This is the same runtime operation as
++    // r4d_p2p_copy2d, without linking the multi-rank all-reduce unit that owns it.
++    return hipMemcpy2DAsync(y->data, size_t(y_ld * es), x->data, size_t(x_ld * es),
++                            size_t(n * es), size_t(M), hipMemcpyDeviceToDevice,
++                            (hipStream_t)s) == hipSuccess ? RAD_OK : RAD_E_DEVICE;
++#else
+     return r4d_p2p_copy2d(r4d_addr(y), r4d_addr(x), y_ld * es, x_ld * es, n * es, M,
+                           (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
++#endif
+ }
+ 
+ /* ------------------------------------------------------------------ rmsnorm */

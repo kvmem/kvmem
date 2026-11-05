@@ -6,6 +6,7 @@
 #include "mem/kv.h"
 #include "build/startup.h"
 #include "platform/module.h"
+#include "rad_abi_layout.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -40,6 +41,8 @@ int failure(const char* where, const std::exception& error) {
 int StatisticsObserver::pool_token_limit(const rad::Config& cfg, const rad::Program& p, int64_t* out) noexcept {
     try {
         *out = 0;
+        require(cfg.n_spec>=0 && uint32_t(cfg.n_spec)<=options_.max_draft_tokens,
+                "resolved draft depth exceeds the Radiance KVMem capability");
         if (!options_.budget_tokens) return RAD_OK;
         require((cfg.tp == 1 || cfg.tp == 2) && cfg.max_seqs == 1 && !cfg.prefix_cache && !cfg.kld(),
                 "bounded residency requires TP1/TP2, one controller per sequence and no engine prefix cache");
@@ -71,11 +74,20 @@ int StatisticsObserver::configure(const rad::Config& cfg, rad::CtxDesc& desc) no
         require(cfg.max_seqs == 1 && !cfg.prefix_cache && !cfg.kld(),
                 "use max-num-seqs 1 and no-prefix-cache");
         const auto& p = *desc.program;
+        require(cfg.n_spec>=0 && uint32_t(cfg.n_spec)<=options_.max_draft_tokens,
+                "resolved draft depth exceeds the Radiance KVMem capability");
+        require(options_.drafter_mode=="auto" ||
+                (options_.drafter_mode=="off" && cfg.n_spec==0) ||
+                (cfg.n_spec>0 && p.drafter_name==options_.drafter_mode),
+                "native drafter does not match --kvmem-drafter");
         require(p.meta.n_head>0 && p.meta.n_head_kv>0 && p.meta.n_head%cfg.tp==0 && p.meta.n_head_kv%cfg.tp==0,
             "TP statistics require evenly sharded query and KV heads");
         require(cfg.n_spec == 0 || p.drafter.kind == RAD_DRAFT_BLOCK || p.drafter.kind == RAD_DRAFT_SERIAL,
                 "speculation bridge needs a native block or serial drafter");
         serial_drafter_ = cfg.n_spec > 0 && p.drafter.kind == RAD_DRAFT_SERIAL;
+        defer_prefill_storage_ = cfg.n_spec > 0;
+        block_drafter_window_ = cfg.n_spec > 0 && p.drafter.kind == RAD_DRAFT_BLOCK && p.drafter.window > 0
+            ? positive(p.drafter.window) : 0;
         require(cfg.draft_window!=rad::DraftWindow::Adaptive || serial_drafter_,
                 "adaptive KVMem drafting requires an active native serial drafter");
         require(!p.pooled_buf && !p.audio_encoder.modalities,
@@ -141,18 +153,34 @@ int StatisticsObserver::configure(const rad::Config& cfg, rad::CtxDesc& desc) no
         max_rows_ = positive(cfg.max_tok);
         head_dim_ = layers[0].head_dim; query_heads_ = layers[0].query_heads*world_size_; kv_heads_ = layers[0].kv_heads*world_size_;
         rank->query_heads=layers[0].query_heads;rank->groups = p.kv_groups;
-        if (cfg.n_spec > 0) {
-            for (const auto& op : p.ops) if (op.op == "gdn_recurrent_update")
+        const bool anchor_state = cfg.n_spec > 0 && std::any_of(p.kv_groups.begin(),p.kv_groups.end(),
+            [](const auto& group) { return group.decl.kind==RAD_KV_LINEAR && !group.zero; });
+        if (anchor_state) {
+            const rad::Plugin* producer = nullptr;
+            for (const auto& op : p.ops) if (op.op == "gdn_recurrent_update" ||
+                    op.op == "gdn_conv_recurrent_update" || op.op == "gdn_conv_recurrent_update_had")
                 for (const auto& band : op.bands) {
                     const auto* row = band.dom[RAD_DOMAIN_DEVICE].row;
                     if (!row) continue;
                     const auto* plugin = rad::rad_tools_registry().plugin(row->plugin);
-                    const auto fn = plugin ? reinterpret_cast<GdnMaterialize>(
-                        rad::platform::module_symbol(plugin->handle, "rad_gdn_materialize_v1")) : nullptr;
+                    require(plugin && plugin->handle && plugin->kind==RAD_PLUGIN_KERNEL && plugin->name=="libr4d" &&
+                            (!producer || producer==plugin),
+                            "accepted recurrent state needs one libr4d producer across all kernel bands");
+                    const auto abi = reinterpret_cast<uint32_t (*)()>(
+                        rad::platform::module_symbol(plugin->handle,"rad_plugin_abi_version"));
+                    const auto layout = reinterpret_cast<uint64_t (*)()>(
+                        rad::platform::module_symbol(plugin->handle,"rad_plugin_abi_layout"));
+                    require(abi && abi()==RAD_ABI_VERSION && layout && layout()==rad_abi_layout(),
+                            "accepted recurrent-state producer ABI differs from the adapter");
+                    const auto fn = reinterpret_cast<GdnMaterialize>(
+                        rad::platform::module_symbol(plugin->handle, "rad_gdn_materialize_v1"));
                     require(fn && (!rank->materialize_gdn || fn == rank->materialize_gdn),
                             "selected recurrent producer lacks a compatible accepted-state materializer");
+                    producer=plugin;
                     rank->materialize_gdn = fn;
                 }
+            require(rank->materialize_gdn,
+                    "anchor recurrent state requires an accepted-state materializer");
         }
         identity_ = {"radiance", KVMEM_RADIANCE_UPSTREAM_REVISION, cfg.model, "full-native-pages-v2:" + cfg.kv_cache_dtype + ":" + cfg.state_cache_dtype + "/tp"+std::to_string(world_size_)};
         rank->capture = std::make_unique<StatisticsCapture>(desc.device, layers, positive(cfg.max_tok));
@@ -314,8 +342,11 @@ uint64_t StatisticsObserver::input_extra_bytes() const {
     }
     return total;
 }
+uint64_t StatisticsObserver::restore_limit(const rad::Request& request) const {
+    return restorable_prefix_limit(request.prompt.size(), request.query_begin, block_drafter_window_);
+}
 StatisticsObserver::RetainedSession* StatisticsObserver::select_checkpoint(RetainedSession& saved,
-                                                                         const rad::Request& request, bool shared) {
+                                                                         const rad::Request& request, bool shared) const {
     std::vector<PrefixCandidate> candidates;
     auto add=[&](RetainedSession& point,CheckpointPurpose purpose) {
         const auto& identity=*point.identity;
@@ -326,7 +357,7 @@ StatisticsObserver::RetainedSession* StatisticsObserver::select_checkpoint(Retai
     if(saved.input)add(*saved.input,CheckpointPurpose::ReuseAnchor);
     if(saved.fallback)add(*saved.fallback,CheckpointPurpose::InputFallback);
     return const_cast<RetainedSession*>(static_cast<const RetainedSession*>(select_prefix_checkpoint(
-        request.prompt,candidates,request.query_begin<0 ? UINT64_MAX : uint64_t(request.query_begin))));
+        request.prompt,candidates,restore_limit(request))));
 }
 void StatisticsObserver::retain_input(const rad::StepEntry& entry) {
     if(!policy_ || !options_.cache_sessions || !entry.is_prefill || !entry.req ||
@@ -340,10 +371,15 @@ void StatisticsObserver::retain_input(const rad::StepEntry& entry) {
     for(const auto& image:images_)if(uint64_t(image.begin)<end && end<uint64_t(image.end)) {
         RAD_INFO("KVMEM_INPUT_SKIP session=%llu reason=image_boundary",(unsigned long long)session_.id);return;
     }
-    // A probe is not committed history. Tool continuation has no Query, and
-    // must not inherit an old one merely to obtain an input checkpoint.
+    // A probe's Query rows and rewind suffix are not reusable history. A
+    // declared native input anchor before both is unchanged by the later replay,
+    // including its accepted sparse view after Pressure. Tool continuation has
+    // no Query and must not inherit an old one merely to obtain a checkpoint.
     if(query_begin_>=0 && !replay_done_ && !replaying_ && entry.req->prompt.size()>options_.budget_tokens &&
-       !(fallback && frontier_<=uint64_t(query_begin_)))return;
+       !(fallback && frontier_<=uint64_t(query_begin_))) {
+        if (!retain_drafter_input_anchor(frontier_, entry.req->history_reuse_end,
+                query_begin_, block_drafter_window_, checkpoint_ ? int64_t(replay_start_) : -1)) return;
+    }
     auto identity=std::make_shared<CachedIdentity>();identity->fallback=fallback;
     identity->tokens.assign(entry.req->prompt.begin(),entry.req->prompt.begin()+end);
     identity->images=image_prefix(images_,end);identity->scope=entry.req->cache_owner;
@@ -578,9 +614,8 @@ void StatisticsObserver::activate_session(const rad::Request& request) {
     }
     for(const auto& pending:cache_->finishing) {
         for(const auto& identity:{pending.identity,pending.input_identity,pending.fallback_identity}) {
-            if(identity && identity->tokens.size()>longest &&
-               (shared ? identity->scope!=request.cache_owner : identity->scope==request.cache_owner) && identity->prefix_matches(request) &&
-               (request.query_begin<0 || uint64_t(request.query_begin)>=identity->tokens.size())) {
+            if(identity && identity->tokens.size()>longest && identity->tokens.size()<=restore_limit(request) &&
+               (shared ? identity->scope!=request.cache_owner : identity->scope==request.cache_owner) && identity->prefix_matches(request)) {
                 pending_cache_=pending.id;longest=identity->tokens.size();
             }
         }
@@ -672,7 +707,7 @@ int StatisticsObserver::resume(const rad::StepPlan& plan, int64_t* resumed, std:
         const auto identity = std::atomic_load(&cached_identity_);
         const auto next_query = e.req->query_begin >= 0 ? bounded_query(e.req->query_begin,
             e.req->query_end-e.req->query_begin,e.req->prompt.size(),options_.query_tokens) : QueryRange{};
-        if (prefix_ && identity && identity->matches(*e.req) &&
+        if (prefix_ && identity && identity->matches(*e.req) && prefix_->frontier() <= restore_limit(*e.req) &&
             (next_query.empty() || next_query.begin >= prefix_->frontier()) && fresh_reserve_error(*e.req).empty()) {
             require(store_ && memory_ && recall_ && prefix_recall_, "incomplete retained session");
             drain_ranks("drain new state clears before resume");
@@ -765,9 +800,9 @@ void StatisticsObserver::begin_attention(const rad::StepEntry& entry) {
     const uint32_t compact=pages.back().compact+pages.back().count;
     exposed_.clear();for(const auto& page:pages)exposed_.push_back(page.start);
     step_tokens_.clear();
-    if (entry.is_prefill) sample_rows_=prefill_sample_rows(frontier_,entry.n_tokens,
+    if (entry.is_prefill) sample_rows_=prefill_attention_samples(frontier_,entry.n_tokens,
         recall_->feedback().prefill_end,compact-entry.n_tokens,
-        uint64_t(options_.budget_tokens)+options_.replay_tokens,1024,32,block);
+        uint64_t(options_.budget_tokens)+options_.replay_tokens,device_tokens_,replaying_,block);
     else {
         require(entry.req && frontier_>=entry.req->prompt.size(),"decode token history missing");
         const auto output_index=frontier_-entry.req->prompt.size();
@@ -873,11 +908,11 @@ int StatisticsObserver::after_forward(const rad::StepPlan& plan, int64_t* rewind
             // checkpoint only during the corrected replay, never the probe.
             if (!replay_done_ && !replaying_ && e.req->prompt.size() <= options_.budget_tokens)
                 replay_done_ = true;
-            if(!serial_drafter_)retain_input(e);
+            if(!defer_prefill_storage_)retain_input(e);
             return RAD_OK;
         }
         if (!query_frozen_) {
-            if(!serial_drafter_)retain_input(e);
+            if(!defer_prefill_storage_)retain_input(e);
             return RAD_OK;
         }
         if (replaying_) {
@@ -948,7 +983,7 @@ int StatisticsObserver::after_forward(const rad::StepPlan& plan, int64_t* rewind
             RAD_INFO("KVMEM_QUERY_REPLAY session=%llu begin=%u end=%u scorer=%s fixed_selection=1 before_sampler=1",
                 (unsigned long long)session_.id, replay_start_, probe_end,query_scorer_name(options_.scorer));
         } else replay_done_ = true;
-        if(*rewind<0 && !serial_drafter_)retain_input(e);
+        if(*rewind<0 && !defer_prefill_storage_)retain_input(e);
         return RAD_OK;
     } catch (const std::exception& e) { return failure("replay", e); }
 }
@@ -958,11 +993,13 @@ int StatisticsObserver::collect(const rad::StepPlan& plan, const rad::Scheduler:
         require(plan.e.size() == 1 && result.n_seq == 1 && plan.e[0].seq == active_request_,
                 "statistics collection identity mismatch");
         if (plan.e[0].is_prefill && prefill_collected_) {
-            // Second callback: collect_step has fenced native serial history
-            // and proposals. Publish pages only now, with all layer payloads
-            // initialized. Block drafters use their separate native window.
-            if (serial_drafter_) {
-                rollback_ranks(plan.e[0].seq,frontier_,"trim serial lookahead before page publication");
+            // The native drafter may reserve ALL paged groups beyond the trunk
+            // frontier, even when a mid-prefill step proposes no token. A zero-
+            // logit collect_step does not wait for its passes. Drain them before
+            // returning their unevaluated capacity and freezing the storage view.
+            if (defer_prefill_storage_) {
+                drain_ranks("drain drafter before the prefill storage boundary");
+                rollback_ranks(plan.e[0].seq,frontier_,"trim drafter lookahead before page publication");
                 if (deferred_selection_) reselect(SelectionReason::PrefillPressure);
                 retain_input(plan.e[0]);
             }
@@ -1060,7 +1097,7 @@ int StatisticsObserver::collect(const rad::StepPlan& plan, const rad::Scheduler:
             const auto resident = selected_visible_ + frontier_ - selected_frontier_;
             if (entry.is_prefill && !replaying_ && (!final_probe || replay_done_) &&
                 rolling::needs_pressure(resident,options_.budget_tokens,options_.replay_tokens,max_rows_,store_config_.block_tokens)) {
-                if (serial_drafter_) deferred_selection_ = true;
+                if (defer_prefill_storage_) deferred_selection_ = true;
                 else reselect(SelectionReason::PrefillPressure);
             }
         }

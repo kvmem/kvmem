@@ -1,0 +1,155 @@
+diff --git a/core/sched/scheduler.h b/core/sched/scheduler.h
+--- a/core/sched/scheduler.h
++++ b/core/sched/scheduler.h
+@@ -207,6 +207,9 @@
+     int      cancel(uint64_t id);
+     // Startup-only observer policy; ordinary native scheduling is unchanged.
+     void set_serial_prefill(bool value) { serial_prefill_=value; }
++    // A controller that retires pages between steps separates physical residency
++    // from logical context. Only its declared pool contract enables this.
++    void set_bounded_residency(bool value) { bounded_residency_=value; }
+     int fail_capacity(uint64_t id);
+     int fail_observer(uint64_t id,int status);
+     int reject_unsampled(uint64_t id,int status=RAD_E_FULL);
+@@ -805,6 +808,7 @@
+     /* The single-sequence decode floor (rad::DecodeFloor), fed by step_finished. */
+     DecodeFloor decode_floor_;
+     bool    serial_prefill_ = false, next_prefill_ = true;
++    bool    bounded_residency_ = false;
+     RequestObserver request_observer_;
+     void observe_request(const SchedReq&);
+ 
+diff --git a/core/sched/scheduler.cpp b/core/sched/scheduler.cpp
+--- a/core/sched/scheduler.cpp
++++ b/core/sched/scheduler.cpp
+@@ -332,8 +332,11 @@
+     /* Nor could a prompt the KV pool cannot hold even alone: admission takes only what the pool
+      * holds, so it would wait at the head of the queue, and everything behind it, forever. The
+      * prompt is the least a request needs: its first token comes from the prefill's last row.
+-     * RAD_E_FULL with the sink failed here, so the caller answers it as a context overflow. */
+-    if (!kv_->can_ever_fit((int64_t)r->prompt.size())) {
++     * RAD_E_FULL with the sink failed here, so the caller answers it as a context overflow.
++     * A bounded-residency controller instead guarantees space by retiring pages between
++     * chunks. Its logical prompt need not fit the physical pool at once; each step still
++     * goes through ensure_from/can_ever_fit_for and the logical context bound below. */
++    if ((!bounded_residency_ || r->embed) && !kv_->can_ever_fit((int64_t)r->prompt.size())) {
+         RAD_WARN("request %llu refused: its %zu-token prompt is longer than the KV cache can hold "
+                  "for one sequence (%lld tokens)", (unsigned long long)r->id, r->prompt.size(),
+                  (long long)pool_tokens_);
+diff --git a/core/engine.cpp b/core/engine.cpp
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -2399,6 +2399,7 @@
+     } else
+     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+     sched_.set_serial_prefill(observer_ && observer_->serial_prefill());
++    sched_.set_bounded_residency(observer_pool_tokens_ > 0);
+     if(observer_)sched_.set_request_observer([this](const Request& request,int64_t age,int64_t first) {
+         observer_->request_metadata(request,age,first);
+     });
+diff --git a/tests/sched_test.cpp b/tests/sched_test.cpp
+--- a/tests/sched_test.cpp
++++ b/tests/sched_test.cpp
+@@ -6779,6 +6779,102 @@
+     CHECK(fits.done());
+     CHECK_EQ(fits.n_produced(), (int64_t)1);
+     CHECK_EQ((int)fits.finish_reason(), (int)server::Finish::Length);
++}
++
++/* A bounded controller retires old pages after each committed chunk. Admission must use the
++ * logical context rather than require the whole prompt in the physical pool. Original positions
++ * still advance, while each compact execution view stays within the same 320-token pool. */
++TEST(a_bounded_controller_can_prefill_beyond_the_physical_pool) {
++    struct BoundedKV : FakeKV {
++        std::unordered_map<uint64_t, int64_t> offsets;
++        int64_t offset(uint64_t id) const {
++            const auto it = offsets.find(id);
++            return it == offsets.end() ? 0 : it->second;
++        }
++        int ensure_from(uint64_t id, int64_t n, int64_t) override {
++            return FakeKV::ensure(id, n - offset(id));
++        }
++        bool can_ever_fit_for(uint64_t id, int64_t n) const override {
++            return FakeKV::can_ever_fit(n - offset(id));
++        }
++        int64_t execution_offset(uint64_t id, int32_t g) const override {
++            return geom.g[(size_t)g].paged ? offset(id) : 0;
++        }
++        bool canonical(uint64_t id) const override { return offset(id) == 0; }
++        void retire_prefix(uint64_t id, int64_t frontier) {
++            CHECK_OK(FakeKV::rollback(id, 64));
++            offsets[id] = frontier - 64;
++        }
++    } kv;
++    Fixture f;
++    f.build(/*blocks=*/20, /*states=*/64, /*max_tok=*/256, /*max_ctx=*/1024,
++            /*windowed=*/false, /*linear=*/false);
++    f.cfg.prefix_cache = false;
++    kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 20, 64);
++    f.pc.kv = &kv;
++    std::vector<BatchBuilder::RankIO> ranks{{0, nullptr, &f.prog}};
++    CHECK_OK(f.sch.init(f.prog, f.cfg, &kv, &f.pc, ranks));
++    f.sch.set_bounded_residency(true);
++    f.sch.set_serial_prefill(true);
++    server::Sink sink;
++    CHECK(!kv.can_ever_fit(700));
++    const uint64_t id = f.submit_to(&sink, 700, 1);
++    REQUIRE(id != 0);
++    int64_t frontier = 0;
++    int chunks = 0;
++    while (!sink.done() && chunks < 8) {
++        const RadBatch* batch = f.sch.step();
++        REQUIRE(batch != nullptr);
++        REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
++        const auto& e = f.sch.plan().e[0];
++        CHECK_EQ(e.ctx_len, frontier);
++        CHECK_EQ(batch->positions_h[0], frontier);
++        CHECK(e.ctx_len + e.n_tokens - kv.offset(id) <= 320);
++        frontier += e.n_tokens;
++        ++chunks;
++        f.commit_plain();
++        if (!sink.done()) kv.retire_prefix(id, frontier);
++    }
++    CHECK_EQ(frontier, (int64_t)700);
++    CHECK_EQ(chunks, 3);
++    CHECK(sink.done());
++    CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Length);
++    CHECK_EQ(sink.n_produced(), (int64_t)1);
++}
++
++/* The bounded contract changes only whole-prompt physical admission. It cannot extend the
++ * logical context, and a controller that fails to make room still fails at the actual step. */
++TEST(bounded_admission_preserves_logical_and_step_capacity_checks) {
++    {
++        Fixture f;
++        f.build(/*blocks=*/10, /*states=*/64, /*max_tok=*/256, /*max_ctx=*/1024,
++                /*windowed=*/false, /*linear=*/false);
++        CHECK_OK(f.start());
++        f.sch.set_bounded_residency(true);
++        auto request = f.request(200, 1);
++        request->embed = true; // One indivisible pass cannot retire pages between chunks.
++        CHECK_EQ(f.sch.add(std::move(request)), (int)RAD_E_FULL);
++    }
++    for (int prompt : {600, 1024, 1025}) {
++        Fixture f;
++        f.build(/*blocks=*/20, /*states=*/64, /*max_tok=*/256, /*max_ctx=*/1024,
++                /*windowed=*/false, /*linear=*/false);
++        f.cfg.prefix_cache = false;
++        CHECK_OK(f.start());
++        f.sch.set_bounded_residency(true);
++        server::Sink sink;
++        const uint64_t id = f.submit_to(&sink, prompt, 1);
++        REQUIRE(id != 0);
++        if (prompt < 1024) {
++            REQUIRE(f.sch.step() != nullptr);
++            f.commit_plain();
++        }
++        CHECK(f.sch.step() == nullptr);
++        CHECK(sink.done());
++        CHECK_EQ((int)sink.finish_reason(), (int)server::Finish::Error);
++        CHECK_EQ(sink.status(), (int)RAD_E_FULL);
++        CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Failed);
++    }
+ }
+ 
+ /* A client that hung up is closed Cancelled at the next commit, and its blocks go back then. */

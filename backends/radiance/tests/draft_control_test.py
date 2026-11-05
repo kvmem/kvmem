@@ -9,7 +9,7 @@ from draft_control import resolve, verify_log
 from inspect_rad import inspect
 
 
-def container(path, names, metadata=()):
+def container(path, names, metadata=(), arch='qwen35', quant='fp8_e4m3'):
     """Small valid directory fixture; no real model payload or GPU needed."""
     header = struct.Struct("<II30Q")
     entry = struct.Struct("<3Q2I6q3iI5Q")
@@ -22,7 +22,7 @@ def container(path, names, metadata=()):
 
     h = [0] * 32
     h[:2] = [0x31444152, 2]
-    h[3], h[4], h[5] = string("qwen35"), string("test"), string("fp8_e4m3")
+    h[3], h[4], h[5] = string(arch), string("test"), string(quant)
     entries = []
     for name in names:
         values = [0] * 20

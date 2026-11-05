@@ -5,6 +5,15 @@ from pathlib import Path
 import json
 
 
+def draft_selection(model, mode, depth):
+    import importlib.util
+    tools=Path(__file__).resolve().parents[2]/'backends/radiance/tools'
+    # Use the same container checks as the standalone Radiance launch tools.
+    spec=importlib.util.spec_from_file_location('radiance_draft_control',tools/'draft_control.py')
+    reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(reader)
+    return reader.resolve(Path(model), 'dflash' if mode=='dflash2' else mode, depth)
+
+
 def vision_geometry(model):
     import importlib.util
     source=Path(__file__).resolve().parents[2]/'backends/radiance/tools/inspect_rad.py'
@@ -68,11 +77,16 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     if p.get('StateCacheType','f32') not in ('f32','f16'):
         raise ValueError('Radiance recurrent state format must be f32 or f16')
     tokens=token_settings('radiance',p);p.update(tokens['effective'])
-    _speculative(p,supplied)
     suffix='.exe' if platform=='windows' else ''
     p['Worker']=_existing_file(p['Worker'] or root/'workers/radiance'/('radiance-kvmem-server'+suffix),'Worker')
     p['Model']=_existing_file(p['Model'],'Model')
     if Path(p['Model']).suffix.lower()!='.rad':raise ValueError('Radiance requires a .rad model')
+    mode=p['SpeculativeMode']
+    if mode in ('mtp','dflash2'):
+        explicit_depth=p['DraftTokens'] if {'DraftTokens','MtpDrafts'} & supplied.keys() else None
+        selection=draft_selection(p['Model'],mode,explicit_depth)
+        p['DraftTokens']=selection['depth']
+    _speculative(p,supplied)
     if platform=='linux' and os.name!='nt' and not os.access(p['Worker'],os.X_OK):
         raise ValueError('Worker is not executable')
     home=Path(p.get('RadianceHome') or Path(p['Worker']).parent/'radiance_home').resolve()
@@ -87,9 +101,10 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         ('--kvmem-budget','Budget'),('--kvmem-gen-reserve','Reserve'),('--kvmem-host-mib','HostMiB'),
         ('--kvmem-sink-tokens','SinkTokens'),('--kvmem-recent-tokens','RecentTokens'),('--kvmem-sessions','RetainedSessions'),
         ('--kv-cache-dtype','KvType'),('--state-cache-dtype','StateCacheType'),('--gpu-headroom-mib','VramReserveMiB'),('--num-speculative-tokens','MtpDrafts')]:pair(flag,p[key])
-    argv+=['--tp',str(len(gpu_ids)),'--tp-wire','exact','--no-prefix-cache','--host-pool-mib','0','--prefix-cache-host-mib','0',
+    argv+=['--tp',str(len(gpu_ids)),'--tp-wire','exact','--no-prefix-cache','--host-pool-mib','0','--prefix-cache-mib','0',
            '--placement','all_vram','--embedding-placement',p['EmbeddingPlacement'],
            '--draft-window',p['DraftPolicy'],'--kvmem','--kvmem-block-tokens','128']
+    pair('--kvmem-drafter','off' if mode=='none' else mode)
     if p.get('Vision'):
         patch,merge=vision_geometry(p['Model'])
         pair('--vision-residency',p['VisionResidency'])

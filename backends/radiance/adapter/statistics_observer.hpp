@@ -21,6 +21,8 @@
 namespace kvmem::radiance {
 class BatchedStatisticsObserver;
 struct SelectionOptions : RecallOptions {
+    std::string drafter_mode = "auto";
+    uint32_t max_draft_tokens = 7;
     bool rolling_generation = true;
     uint32_t budget_tokens = 0; // zero: observation-only probe
     uint32_t block_tokens = 128;
@@ -171,6 +173,8 @@ private:
     // Native serial heads write their own layer in the trunk's FULL KV group
     // AFTER the target pass. Do not spill/lease those pages until it finishes.
     bool serial_drafter_ = false;
+    bool defer_prefill_storage_ = false;
+    uint32_t block_drafter_window_ = 0;
     bool prefill_collected_ = false, deferred_selection_ = false;
     bool replaying_ = false, replay_done_ = false;
     uint32_t replay_start_ = 0;
@@ -231,7 +235,8 @@ private:
     std::unique_ptr<RetainedSession> carry_input(const RetainedSession&, const RetainedSession&, const rad::Request&,bool fallback=false);
     void admit_carried_input(std::unique_ptr<RetainedSession>);
     static uint64_t retained_bytes(const RetainedSession&);
-    static RetainedSession* select_checkpoint(RetainedSession&, const rad::Request&, bool shared=false);
+    RetainedSession* select_checkpoint(RetainedSession&, const rad::Request&, bool shared=false) const;
+    uint64_t restore_limit(const rad::Request&) const;
     uint64_t pending_cache_=0;
     bool pending_io() const noexcept {return pending_cache_ || bool(pending_prefix_) || bool(pending_selection_) || bool(pending_finish_) || bool(pending_input_) || bool(input_parking_);}
     bool poll_prefix();

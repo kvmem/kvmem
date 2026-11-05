@@ -1,5 +1,6 @@
 """CPU-only launcher contract tests: never load a model or GPU library."""
 import argparse
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -9,14 +10,17 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import build
+import build_linux
 import serve
 from platform_dispatch import select_platform
+from draft_control_test import container
 
 
 class PlatformLaunchTest(unittest.TestCase):
     def args(self, root=Path('.')):
         return argparse.Namespace(exe=root/'probe', model=root/'model.rad', home=root/'home',
-                                  rocm=root/'sdk', port=18380, wsl_runtime_dir=None)
+                                  rocm=root/'sdk', port=18380, wsl_runtime_dir=None,
+                                  drafter='auto',speculative_tokens=None)
 
     def test_platform_selection_and_rejection(self):
         for actual, target in [('win32', 'windows'), ('linux', 'linux')]:
@@ -33,14 +37,63 @@ class PlatformLaunchTest(unittest.TestCase):
             self.assertEqual(Path(run.call_args.args[0][1]).name, 'build_linux.py')
             self.assertEqual(run.call_args.args[0][2:], ['--source', 'native', '--jobs', '2'])
 
+    def test_linux_build_retains_cached_kernel_profile_unless_explicit(self):
+        revision=json.loads((Path(build_linux.__file__).parents[1]/'upstream.json').read_text())['revision']
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            sdk=root/'sdk'
+            for relative in ('bin/hipcc','llvm/bin/clang++','lib/libamdhip64.so','lib/libhsa-runtime64.so'):
+                path=sdk/relative;path.parent.mkdir(parents=True,exist_ok=True);path.touch()
+            base=['build_linux.py','--source',str(root/'native'),'--build',str(root/'build'),
+                  '--rocm',str(sdk),'--arch','gfx1200','--target','radiance-kvmem-server']
+            for profile in (None,'qwen35-dense-tp1','all'):
+                argv=base+(['--kernel-profile',profile] if profile else [])
+                with self.subTest(profile=profile), patch.object(build_linux,'os') as host, \
+                        patch.object(sys,'argv',argv), \
+                        patch.object(build_linux,'source_revision',return_value=revision), \
+                        patch.object(build_linux.subprocess,'run') as execute:
+                    host.name='posix';host.environ.copy.return_value={}
+                    build_linux.main()
+                    configure=execute.call_args_list[0].args[0]
+                    selected=[flag for flag in configure if flag.startswith('-DR4D_PROFILE=')]
+                    self.assertEqual(selected,[] if profile is None else ['-DR4D_PROFILE='+profile])
+                    self.assertEqual(execute.call_args_list[1].args[0][-2:],['--target','radiance-kvmem-server'])
+
     def test_command_capacity_is_shared(self):
         config = serve.profile()
         cmd = serve.command_for(self.args(), config)
         self.assertEqual(cmd[-len(config['arguments']):], config['arguments'])
         for name, expected in [('kvmem-budget', '36864'), ('kvmem-replay-tokens', '16384'),
-                               ('max-num-batched-tokens', '512'), ('max-model-len', '262144'),
-                               ('num-speculative-tokens', '3'), ('kv-cache-dtype', 'fp8')]:
+                               ('max-num-batched-tokens', '256'), ('max-model-len', '262144'),
+                               ('num-speculative-tokens', '3'), ('kv-cache-dtype', 'fp8'),('prefix-cache-mib','0')]:
             self.assertEqual(cmd[cmd.index('--' + name) + 1], expected)
+
+    def test_model_profile_preserves_mtp_and_selects_iqr_v4(self):
+        with tempfile.TemporaryDirectory() as directory:
+            a=self.args(Path(directory))
+            container(a.model,['mtp.fc.weight'],[('mtp_num_hidden_layers',1)])
+            historical=serve.profile()
+            resolved,plugin=serve.model_profile(a,historical)
+            self.assertEqual(plugin,'qwen35_fp8')
+            self.assertEqual(resolved['arguments'][:-2],historical['arguments'])
+            self.assertEqual(resolved['arguments'][-2:],['--kvmem-drafter','mtp'])
+            container(a.model,['dflash.fc.weight'],[
+                ('draft.architectures','DFlash2Model'),('draft.dflash_config.block_size',8)],
+                quant='w8a8_fwht128')
+            resolved,plugin=serve.model_profile(a,historical)
+            self.assertEqual(plugin,'qwen35_w8a8')
+            args=resolved['arguments']
+            self.assertEqual(args[args.index('--num-speculative-tokens')+1],'7')
+            self.assertEqual(args[-2:],['--kvmem-drafter','dflash2'])
+            self.assertEqual(historical['arguments'][historical['arguments'].index('--num-speculative-tokens')+1],'3')
+            for mode,depth in [('mtp',None),('dflash2',5),('off',7)]:
+                a.drafter,a.speculative_tokens=mode,depth
+                with self.subTest(mode=mode,depth=depth),self.assertRaises(ValueError):
+                    serve.model_profile(a,historical)
+            a.drafter,a.speculative_tokens='off',None
+            resolved,_=serve.model_profile(a,historical)
+            self.assertEqual(resolved['arguments'][-1],'off')
+            self.assertEqual(resolved['arguments'][args.index('--num-speculative-tokens')+1],'0')
 
     def test_linux_environment_isolated(self):
         inherited = {'PATH':'system', 'LD_PRELOAD':'wrong.so', 'LD_LIBRARY_PATH':'wrong',
@@ -149,8 +202,9 @@ class PlatformLaunchTest(unittest.TestCase):
 
     def test_dryrun_never_spawns(self):
         args = ['--exe','probe','--model','model','--home','home','--rocm','sdk','--dry-run']
-        with patch.object(serve, 'validate_inputs'), patch.object(serve, 'supervise') as run:
+        with patch.object(serve, 'model_profile',return_value=(serve.profile(),'qwen35_w8a8')), patch.object(serve, 'validate_inputs') as validate, patch.object(serve, 'supervise') as run:
             self.assertEqual(serve.main(args), 0)
+            self.assertEqual(validate.call_args.args[-1],'qwen35_w8a8')
             run.assert_not_called()
 
 

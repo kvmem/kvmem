@@ -31,8 +31,47 @@ static void checkpoint_publication_preserves_ownership() {
         check(rejected && input.get()==before_input && fallback.get()==before_fallback,"invalid completion must not replace published state");
     }
 }
+static void drafter_refill_limits_and_early_input_anchors() {
+    check(restorable_prefix_limit(1010,-1,2048)==0,"short tool continuation must cold-prefill its drafter window");
+    check(restorable_prefix_limit(4192,4165,2048)==2144,"drafter refill must cap a two-stage document hit");
+    check(restorable_prefix_limit(4192,2000,2048)==2000,"new Query is an independent restore bound");
+    check(restorable_prefix_limit(4192,-1,2048)==2144,"unknown Query does not remove native drafter refill");
+    check(restorable_prefix_limit(4192,4165,0)==4165,"ordinary native prefixes retain their existing Query limit");
+    check(restorable_prefix_limit(0,-1,2048)==0,"empty input has no restorable state");
+    std::vector<int32_t> prompt(4192);std::iota(prompt.begin(),prompt.end(),1000);
+    const std::vector<int32_t> input(prompt.begin(),prompt.begin()+2048);
+    const std::vector<int32_t> terminal(prompt.begin(),prompt.begin()+4160);
+    int input_state=1,terminal_state=2;
+    std::vector<PrefixCandidate> points{{&terminal,&terminal_state,CheckpointPurpose::Endpoint,true},
+        {&input,&input_state,CheckpointPurpose::ReuseAnchor,true}};
+    const auto limit=restorable_prefix_limit(prompt.size(),4165,2048);
+    check(select_prefix_checkpoint(prompt,points,limit)==&input_state,
+        "document question must choose its real 2048 native input state instead of the late terminal state");
+    check(select_prefix_checkpoint(prompt,points,restorable_prefix_limit(prompt.size(),4165,0))==&terminal_state,
+        "spec-off keeps its later exact terminal prefix");
+    points.pop_back();
+    check(!select_prefix_checkpoint(prompt,points,limit),"an LCP cannot invent the missing early recurrent state");
+    check(retain_drafter_input_anchor(2048,2048,3638,2048,-1),
+        "first-pass natural input state before Query and its future checkpoint is reusable");
+    check(retain_drafter_input_anchor(2048,2048,3638,2048,3584),
+        "the 4K document anchor stays before its proven rewind boundary");
+    check(retain_drafter_input_anchor(10240,10240,11776,2048,-1),
+        "a 12K native input anchor may retain the accepted sparse history after Pressure");
+    check(retain_drafter_input_anchor(10240,10240,11776,2048,11520),
+        "a later Query replay cannot change the retained 12K input prefix");
+    check(retain_drafter_input_anchor(10240,10240,11776,2048,10240),
+        "a checkpoint exactly at the retained frontier preserves that state");
+    check(!retain_drafter_input_anchor(2048,2048,3638,0,-1),"this exception is only for a declared block drafter");
+    check(!retain_drafter_input_anchor(2048,-1,3638,2048,-1),"an unknown input boundary grants no checkpoint");
+    check(!retain_drafter_input_anchor(2047,2048,3638,2048,-1),"only the scheduler's exact natural anchor may be retained");
+    check(!retain_drafter_input_anchor(2048,2048,2047,2048,-1),"Query probe rows must not enter a retained input prefix");
+    check(!retain_drafter_input_anchor(2048,2048,-1,2048,-1),"a missing Query bound does not prove a safe probe anchor");
+    check(!retain_drafter_input_anchor(10240,10240,11776,2048,10239),"a rewind that crosses the anchor disqualifies retention");
+    check(!retain_drafter_input_anchor(2048,2048,3638,2048,-2),"an invalid checkpoint sentinel grants no retention");
+}
 int main() {
     checkpoint_publication_preserves_ownership();
+    drafter_refill_limits_and_early_input_anchors();
     std::vector<int32_t> input(128);std::iota(input.begin(),input.end(),1000);
     auto terminal=input;terminal.insert(terminal.end(),{21,22,23,24});
     int before=1,after=2;

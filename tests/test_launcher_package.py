@@ -3,6 +3,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -42,6 +44,9 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256((directory/name).read_bytes()).hexdigest(),sha)
         for name,expected in info['controller_files'].items():
             self.assertEqual(hashlib.sha256((directory/name).read_bytes()).hexdigest(),expected)
+        run=subprocess.run([sys.executable,'-I',str(directory/'scripts/local-console.py'),'--help'],
+                           cwd=self.directory,capture_output=True,text=True,timeout=15)
+        self.assertEqual(run.returncode,0,run.stdout+run.stderr)
         with tarfile.open(result['archive']) as archive:
             for name in ('START-HERE-CN.sh','START-HERE-EN.sh','scripts/linux/start-ui.sh'):
                 member=archive.getmember('package/'+name)
@@ -61,9 +66,33 @@ class PackageTests(unittest.TestCase):
         directory=Path(result['directory'])
         info=json.loads((directory/'console-build.json').read_text())
         self.assertEqual(info['supported_backends'],['radiance'])
-        self.assertIn('radiance',(directory/'START-HERE.txt').read_text())
-        for name in ('scripts/launcher/radiance.py','backends/radiance/tools/inspect_rad.py'):
+        self.assertIn('radiance',(directory/'START-HERE.txt').read_text(encoding='utf-8'))
+        for name in ('scripts/launcher/radiance.py','backends/radiance/tools/inspect_rad.py',
+                     'backends/radiance/tools/draft_control.py'):
             self.assertEqual(hashlib.sha256((directory/name).read_bytes()).hexdigest(),info['controller_files'][name])
+
+    def test_packaged_radiance_drafters_resolve_without_the_source_checkout(self):
+        fixture_spec=importlib.util.spec_from_file_location('rad_fixture',ROOT/'backends/radiance/tests/draft_control_test.py')
+        fixture=importlib.util.module_from_spec(fixture_spec)
+        fixture_spec.loader.exec_module(fixture)
+        model=self.directory/'embedded.RAD'
+        code=('import sys; sys.path.insert(0,sys.argv[1]); '
+              'from launcher.radiance import draft_selection; '
+              'print(draft_selection(sys.argv[2],sys.argv[3],None)["depth"])')
+        for backend in ('radiance','all'):
+            result=package.package(ROOT,self.directory/backend,self.chat,self.wheel,self.sha,backend)
+            scripts=Path(result['directory'])/'scripts'
+            for mode,names,metadata,depth in [
+                ('mtp',['mtp.fc.weight'],[('mtp_num_hidden_layers',1)],3),
+                ('dflash2',['dflash.fc.weight'],[
+                    ('draft.architectures','DFlash2Model'),('draft.dflash_config.block_size',8)],7),
+            ]:
+                with self.subTest(backend=backend,mode=mode):
+                    fixture.container(model,names,metadata)
+                    run=subprocess.run([sys.executable,'-I','-c',code,str(scripts),str(model),mode],
+                                       cwd=self.directory,capture_output=True,text=True,timeout=15)
+                    self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+                    self.assertEqual(run.stdout.strip(),str(depth))
 
     def test_wheel_traversal_is_rejected_and_partial_folder_removed(self):
         with zipfile.ZipFile(self.wheel,'a') as archive:

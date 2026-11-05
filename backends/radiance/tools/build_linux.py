@@ -18,10 +18,15 @@ def main():
     p.add_argument("--ffmpeg", choices=["AUTO","ON","OFF"], default="AUTO")
     p.add_argument("--ffmpeg-prefix", type=Path, help="Pinned FFmpeg install containing lib/pkgconfig")
     p.add_argument("--ffmpeg-static", action="store_true")
+    p.add_argument("--kernel-profile", choices=("all","qwen35-dense-tp1"),
+                   help="Override the cached kernel profile; omitted retains an existing selection")
     p.add_argument("--configure-only", action="store_true")
+    p.add_argument("--target", action="append", help="Specific audited Ninja target; repeat for multiple targets (for IQR-V4 use qwen35_w8a8)")
     a = p.parse_args()
     if os.name != "posix" or a.jobs < 1:
         p.error("use Linux/WSL with a positive job count")
+    if not a.configure_only and not a.target:
+        p.error("pass --configure-only, review the Ninja dry run, then pass explicit --target values")
     a.source, a.build, a.rocm = a.source.resolve(), a.build.resolve(), a.rocm.resolve()
     metadata = json.loads((Path(__file__).resolve().parents[1] / "upstream.json").read_text())
     head = source_revision(a.source)
@@ -56,25 +61,21 @@ def main():
         p.error("pinned libr4d has RDNA4 kernels only; a new ISA needs a kernel plugin")
     a.build.mkdir(parents=True, exist_ok=True)
     command = ["cmake", "-S", str(a.source), "-B", str(a.build), "-G", "Ninja",
-               "-DCMAKE_BUILD_TYPE=Release", "-DRAD_WITH_HIP=ON", f"-DRAD_WITH_FFMPEG={a.ffmpeg}",
+               "-DCMAKE_BUILD_TYPE=Release", "-DRAD_WITH_HIP=ON", "-DRAD_CORE_GENERIC_GPU_TARGETS=OFF", f"-DRAD_WITH_FFMPEG={a.ffmpeg}",
                f"-DRAD_HIPCC={hipcc}", f"-DCMAKE_HIP_COMPILER={clang}",
                f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={a.rocm}", f"-DCMAKE_PREFIX_PATH={a.rocm}",
                f"-DRAD_GPU_TARGETS={';'.join(arch)}", f"-DCMAKE_HIP_ARCHITECTURES={';'.join(arch)}",
                f"-DRAD_HIP_RUNTIME={hip}", f"-DRAD_HSA_RUNTIME={hsa}",
                f"-DRAD_KVMEM_SOURCE_DIR={Path(__file__).resolve().parents[3]}"]
+    if a.kernel_profile is not None:command.append(f'-DR4D_PROFILE={a.kernel_profile}')
     if a.ffmpeg_static:command.append('-DPKG_CONFIG_ARGN=--static')
     inputs = {"revision": head, "source": str(a.source), "sdk": str(a.rocm),
-              "architectures": arch, "configure": command}
+              "architectures": arch, "configure": command, "targets": a.target or []}
     (a.build / "kvmem-build-inputs.json").write_text(json.dumps(inputs, indent=2))
     subprocess.run(command, env=env, check=True)
     if not a.configure_only:
         subprocess.run(["cmake", "--build", str(a.build), "--parallel", str(a.jobs),
-                        "--target", "radiance", "rad-kbench", "rad-info", "rad-convert", "libr4d",
-                        "libref", "libquant", "libavx", "llama_fp8", "llama_dense_fp8", "qwen35_bf16", "qwen35_fp8",
-                        "sched_test", "server_test", "radiance_pool_geometry_test",
-                        "radiance_native_pages_test", "radiance_execution_pages_test", "radiance_query_identity_test",
-                        "radiance_page_transfer_test", "radiance_page_transfer_gpu_test", "radiance_native_memory_gpu_test",
-                        "radiance_statistics_capture_gpu_test", "kvmem-radiance-observer-probe"], env=env, check=True)
+                        "--target", *a.target], env=env, check=True)
 
 
 if __name__ == "__main__":
