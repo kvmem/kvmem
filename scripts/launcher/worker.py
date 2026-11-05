@@ -50,6 +50,8 @@ def probe_worker(worker, backend, environment=None):
 
 
 def require_launch_features(capabilities, parameters):
+    if parameters.get('Lora') and capabilities.get('fixed_lora') is not True:
+        raise ValueError('This worker does not support fixed LoRA; update the llama.cpp worker')
     checkpoint_revision = capabilities.get('checkpoint_recompute_revision')
     if parameters.get('CheckpointExtraRecomputeTokens', 0) and (
             type(checkpoint_revision) is not int or checkpoint_revision < 1):

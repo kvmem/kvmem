@@ -15,6 +15,10 @@ using System;
 using System.Text;
 public class ArgvEcho {
     public static void Main(string[] args) {
+        if (args.Length == 1 && args[0] == "--kvmem-capabilities") {
+            Console.WriteLine(Environment.GetEnvironmentVariable("KVMEM_TEST_LORA_CAPABILITY") ?? "{}");
+            return;
+        }
         foreach (string a in args) Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(a)));
     }
 }
@@ -35,6 +39,30 @@ public class ArgvEcho {
     $model = Join-Path $temp 'model with spaces.gguf'
     $mmproj = Join-Path $temp 'mmproj.gguf'
     [IO.File]::WriteAllText($model, 'fixture'); [IO.File]::WriteAllText($mmproj, 'fixture')
+    if (!$DryRunOnly) {
+        try {
+            foreach ($case in @(
+                @{json='{"fixed_lora":true}'; accepted=$true},
+                @{json='{"fixed_lora":1}'; accepted=$false},
+                @{json='{"fixed_lora":"true"}'; accepted=$false},
+                @{json='{"fixed_lora":false}'; accepted=$false},
+                @{json='{}'; accepted=$false}
+            )) {
+                $env:KVMEM_TEST_LORA_CAPABILITY = $case.json
+                $accepted = $false
+                try {
+                    & (Join-Path $PSScriptRoot 'start-backend.ps1') -Backend llamacpp -Model $model -Worker $echoExe -Lora $mmproj -Gpu 'GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29' -DiskMiB 0 | Out-Null
+                    $accepted = $true
+                } catch {
+                    if ($case.accepted) { throw }
+                    Check ($_.Exception.Message -match 'does not support fixed LoRA') 'LoRA capability rejection'
+                }
+                Check ($accepted -eq $case.accepted) 'LoRA capability must be boolean true'
+            }
+        } finally {
+            Remove-Item Env:KVMEM_TEST_LORA_CAPABILITY -ErrorAction SilentlyContinue
+        }
+    }
     foreach ($recipe in 'iq3', 'iq4') {
         $data = & (Join-Path $PSScriptRoot "start-$recipe.ps1") -BuildDir $temp -Model $model -Mmproj $mmproj `
             -Gpu 0 -BlockTokens 32 -ReasoningEffort medium -ChatTemplateKwargs '{"enable_thinking":true}' -DryRun | ConvertFrom-Json

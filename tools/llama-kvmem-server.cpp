@@ -78,6 +78,8 @@ static void print_usage(const char * argv0) {
             "             /v1/models, /props, /slots, /health, plus the bundled chat UI.\n"
             "\n"
             "  -m, --model PATH           GGUF path\n"
+            "  --lora PATH                load one fixed GGUF LoRA on every target context\n"
+            "  --lora-scale N             adapter strength (default: 1)\n"
             "  --mmproj PATH              vision projector GGUF\n"
             "  --mmproj-offload           place vision encoder on GPU (default)\n"
             "  --no-mmproj-offload        place vision encoder on CPU\n"
@@ -695,6 +697,10 @@ static bool strip_stop(std::string & content, const std::vector<std::string> & s
 }
 
 static bool parse_chat_request(const json & body, ChatRequest & out, std::string & err) {
+    if (body.contains("lora")) {
+        err = "LoRA is fixed at startup; per-request adapter selection is unsupported";
+        return false;
+    }
     if (!body.is_object()) {
         err = "request must be a JSON object";
         return false;
@@ -835,14 +841,18 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
 
 int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--kvmem-capabilities") {
-        puts(kvmem::launch_capabilities("llamacpp").c_str());
+        auto contract = json::parse(kvmem::launch_capabilities("llamacpp"));
+        contract["fixed_lora"] = true;
+        puts(contract.dump().c_str());
         return 0;
     }
     // Flush asynchronous common logs on every exit, including startup errors.
     struct log_flush_guard { ~log_flush_guard() { common_log_flush(common_log_main()); } } flush_logs;
     std::string ui_dir;
     bool no_ui = false;
-    std::string model_path;
+    std::string model_path, lora_path;
+    float lora_scale = 1.0f;
+    bool lora_scale_set = false;
     std::string mmproj_path;
     std::string mmproj_device_name;
     std::string chat_template;
@@ -858,6 +868,7 @@ int main(int argc, char ** argv) {
     int ngl = 99;
     kvmem_server_devices device_config;
     std::unique_ptr<llama_model, decltype(&llama_model_free)> shared_model(nullptr, llama_model_free);
+    std::unique_ptr<llama_adapter_lora, decltype(&llama_adapter_lora_free)> adapter(nullptr, llama_adapter_lora_free);
     ServerState st;
     kvmem_execution_scope startup_execution(st.execution.get());
     kvmem_server_options options;
@@ -899,6 +910,21 @@ int main(int argc, char ** argv) {
             return 0;
         } else if (eq(arg, "-m") || eq(arg, "--model")) {
             model_path = need(arg);
+        } else if (eq(arg, "--lora")) {
+            if (!lora_path.empty()) throw std::invalid_argument("only one --lora is supported");
+            lora_path = need(arg);
+            if (lora_path.empty()) throw std::invalid_argument("--lora requires a GGUF path");
+        } else if (eq(arg, "--lora-scale")) {
+            const char * value = need(arg);
+            char * end = nullptr;
+            const double parsed = std::strtod(value, &end);
+            if (!*value || end == value || *end || !std::isfinite(parsed) ||
+                    std::abs(parsed) > std::numeric_limits<float>::max() ||
+                    std::isspace(static_cast<unsigned char>(*value)))
+                throw std::invalid_argument("--lora-scale requires a finite float");
+            // Match numeric launcher inputs: smaller magnitudes round to zero.
+            lora_scale = static_cast<float>(parsed);
+            lora_scale_set = true;
         } else if (eq(arg, "--mmproj")) {
             mmproj_path = need(arg);
         } else if (eq(arg, "--mmproj-offload")) {
@@ -1187,6 +1213,10 @@ int main(int argc, char ** argv) {
         common_print_available_devices();
         return 0;
     }
+    if (lora_scale_set && lora_path.empty()) {
+        fprintf(stderr, "--lora-scale requires --lora\n");
+        return 1;
+    }
     if (model_path.empty()) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR missing model; set --model PATH or LLAMA_ARG_MODEL\n");
         print_usage(argv[0]);
@@ -1295,6 +1325,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR --spec-draft-model file is missing or unreadable\n");
         return 1;
     }
+    if (!lora_path.empty() && !readable(lora_path)) {
+        fprintf(stderr, "KVMEM_STARTUP_ERROR --lora file is missing or unreadable: %s\n", lora_path.c_str());
+        return 1;
+    }
     if (!mmproj_path.empty() && !readable(mmproj_path)) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR --mmproj file is missing or unreadable: %s\n", mmproj_path.c_str());
         return 1;
@@ -1305,6 +1339,7 @@ int main(int argc, char ** argv) {
     }
     json startup = {
         {"model", model_path}, {"alias", st.model_name},
+        {"lora", lora_path.empty() ? json(nullptr) : json{{"path", lora_path}, {"scale", lora_scale}}},
         {"gpu", {{"device_requested", options.device_names.empty() ? "auto" : options.device_names},
                   {"main_gpu", mparams.main_gpu}, {"split_mode", mparams.split_mode == LLAMA_SPLIT_MODE_NONE ? "none" :
                       mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR ? "tensor" : "layer"},
@@ -1333,6 +1368,14 @@ int main(int argc, char ** argv) {
     if (st.spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 && llama_model_n_devices(st.model) > 1) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR DFlash2 requires a single target GPU; select one device\n");
         return 1;
+    }
+    if (!lora_path.empty()) {
+        adapter.reset(llama_adapter_lora_init(st.model, lora_path.c_str()));
+        if (!adapter) return 1;
+        if (llama_adapter_get_alora_n_invocation_tokens(adapter.get())) {
+            fprintf(stderr, "activated LoRA requires per-request invocation handling; use a standard LoRA\n");
+            return 1;
+        }
     }
     st.vocab = llama_model_get_vocab(st.model);
     try {
@@ -1374,6 +1417,13 @@ int main(int argc, char ** argv) {
         if (!st.ctx) {
             fprintf(stderr, "KVMEM_STARTUP_ERROR failed to create context; check --ctx-size, KV types, --flash-attn and available memory\n");
             return false;
+        }
+        if (adapter) {
+            auto * handle = adapter.get();
+            if (llama_set_adapters_lora(st.ctx, &handle, 1, &lora_scale) != 0) {
+                fprintf(stderr, "failed to apply LoRA to target context\n");
+                return false;
+            }
         }
         kvmem_diag("KVMEM_CONTEXT target threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
                 llama_n_threads(st.ctx), llama_n_threads_batch(st.ctx), llama_n_ubatch(st.ctx),
@@ -1610,6 +1660,7 @@ int main(int argc, char ** argv) {
         // 中文：当前 kvmem 的 llama.cpp 尚无 llama_model_ftype_name()，保留空字段以兼容上游 UI 展示
         {"model_ftype", ""},
         {"model_path", model_path},
+        {"lora", lora_path.empty() ? json(nullptr) : json{{"path", lora_path}, {"scale", lora_scale}}},
         {"modalities", {{"vision", st.vision != nullptr}, {"audio", false},
                         {"video", st.vision && options.parallel == 1 && st.vision->supports_video()}}},
         {"media_marker", mtmd_default_marker()},

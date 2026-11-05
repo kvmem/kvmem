@@ -127,6 +127,7 @@ static void kvmem_responses_merge_system_turns(json & body) {
 
 std::string kvmem_responses_to_chatcmpl(const std::string & body) {
     json parsed = json::parse(body);
+    if (parsed.contains("lora")) throw std::invalid_argument("LoRA is fixed at startup; per-request adapter selection is unsupported");
     kvmem_responses_fold_reasoning_summary(parsed);
     kvmem_responses_fill_message_type(parsed);
     json converted = server_chat_convert_responses_to_chatcmpl(parsed);
