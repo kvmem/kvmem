@@ -83,6 +83,36 @@ struct kvmem_lane_conversations_test_access {
 };
 
 int main() {
+    const auto check_fork_coverage = [](auto & source) {
+        kvmem::CheckpointPolicy policy;
+        policy.enabled = true; policy.count = 12;
+        source.mm_archive = kvmem::CheckpointArchive<MultimodalCheckpoint>(policy);
+        source.cached_tokens.resize(256);
+        std::vector<std::shared_ptr<MultimodalCheckpointData>> data;
+        for (int row : {32, 96, 160, 224}) {
+            auto state = std::make_shared<MultimodalCheckpointData>();
+            data.push_back(state);
+            MultimodalCheckpoint checkpoint;
+            checkpoint.row = row; checkpoint.data = state;
+            assert(source.mm_archive.remember(checkpoint, kvmem::CoveragePurpose::Periodic));
+        }
+        auto branch = llama_driver_fork_conversation(source, 160);
+        std::set<int> rows;
+        for (const auto & entry : branch.mm_archive) {
+            if (entry.info.identity) rows.insert(entry.record.row);
+        }
+        assert((rows == std::set<int>{32, 96, 160}));
+        assert(branch.mm_archive.policy().count == policy.count);
+        assert(data[0]->shared && data[1]->shared && data[2]->shared && !data[3]->shared);
+        branch.mm_archive.truncate(96);
+        assert(source.mm_archive.size() == 4);
+        assert(branch.mm_archive.size() == 2);
+    };
+    kvmem_conversation parked;
+    check_fork_coverage(parked);
+    LlamaEngineState live;
+    check_fork_coverage(live);
+
     using access = kvmem_lane_conversations_test_access;
     for(bool exact_tip:{false,true}) {
         ServerState state;kvmem_lane_conversations catalog({&state},8,0,true);
