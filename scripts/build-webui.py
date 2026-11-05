@@ -109,6 +109,12 @@ def main():
                 path.write_text(re.sub(r"export const STORAGE_APP_NAME = .*;", "export const STORAGE_APP_NAME = 'kvmem-chat';", text), encoding='utf-8')
         hook = work / 'src/lib/hooks/use-keyboard-shortcuts.svelte.ts'
         hook.write_text(hook.read_text(encoding='utf-8').replace("page.route.id === '/(chat)'", "(page.route.id as string | null) === '/(chat)'"), encoding='utf-8')
+        # The lightweight entry only generates the `/` route, so comparisons with
+        # full-app route ids no longer overlap the inferred union; widen the ids.
+        store = work / 'src/lib/stores/ui.svelte.ts'
+        store.write_text(store.read_text(encoding='utf-8').replace(
+            'page.route.id === MODELS_ROUTE_ID',
+            '(page.route.id as string | null) === MODELS_ROUTE_ID'), encoding='utf-8')
         tsconfig = work / 'tsconfig.json'
         tsconfig.write_text('\n'.join(line for line in tsconfig.read_text(encoding='utf-8').splitlines()
                                       if '"tests/' not in line and '".storybook/' not in line), encoding='utf-8')
