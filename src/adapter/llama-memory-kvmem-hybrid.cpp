@@ -45,11 +45,11 @@ llama_memory_kvmem_hybrid::llama_memory_kvmem_hybrid(
         const llama_cparams & cparams) :
     llama_memory_hybrid(
             model,
+            params.no_alloc,
             params.type_k,
             params.type_v,
             !cparams.flash_attn,
             llama_kvmem_pool_cells(model, params, cparams),
-            /* n_pad */ 1,
             model.hparams.n_swa,
             model.hparams.swa_type,
             GGML_TYPE_F32,

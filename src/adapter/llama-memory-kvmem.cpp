@@ -937,6 +937,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     } else {
         kv_owned_ = std::make_unique<llama_kv_cache>(
                 model,
+                params.no_alloc,
                 model.hparams,
                 params.type_k,
                 params.type_v,
@@ -945,7 +946,6 @@ llama_memory_kvmem::llama_memory_kvmem(
                 /* unified */ true,
                 kv_size_,
                 /* n_seq_max */ 1,
-                /* n_pad */ 1,
                 model.hparams.n_swa,
                 model.hparams.swa_type,
                 nullptr,
@@ -5926,7 +5926,7 @@ struct llama_memory_kvmem::NativeBackend final : kvmem::MemoryBackend {
     kvmem::MemoryDescriptor descriptor() const override {
         kvmem::MemoryDescriptor d;
         // In-process compatibility, never a claim of a portable state image.
-        d.identity = {"llama.cpp", "620d222+kvmem-native-v1",
+        d.identity = {"llama.cpp", "cd959ba+kvmem-native-v1",
             std::to_string(reinterpret_cast<uintptr_t>(&owner.model_)), "attention-only-v1"};
         d.layout = kvmem::raw_kv_payload_layout(owner.raw_cfg_,
             std::string("llama-packed-") + ggml_type_name(owner.type_k_) + "/" + ggml_type_name(owner.type_v_),

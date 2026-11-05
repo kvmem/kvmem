@@ -127,13 +127,22 @@ def main():
             if args.expect_mixed_capture:
                 assert 'harvest_sync reason=non_uniform_capture' in trace, 'mixed capture path was not exercised'
             restored = re.findall(r'checkpoint_tail_restore row=(\d+) block=(\d+)', trace)
+            reuse = [int(x) for x in re.findall(r'prefix_hit_rows=(\d+)', trace)]
+            staged = re.findall(r'stage_in_packed block=(\d+) slot=\d+ n=(\d+) orig=(\d+)', trace)
+            full_blocks = {int(block) for block, n, _ in staged if int(n) == args.block_tokens}
+            partial_blocks = {row // args.block_tokens for row in reuse
+                              if row > 128 and row % args.block_tokens}
             if args.checkpoint_policy == 'legacy':
-                assert restored and any(int(row) % args.block_tokens for row, _ in restored), 'cold partial block was not restored'
+                # v0.9.0 can stage the partial block at full width from the
+                # packed store before restoring a checkpoint inside it, which
+                # materializes the retained prefix without a cold-tail reload.
+                # Accept either the transaction or that full-width staging.
+                cold = {int(block) for row, block in restored if int(row) % args.block_tokens}
+                assert cold or (partial_blocks & full_blocks), 'cold partial block was not restored'
             else:
                 # Spread may restore a different native frontier whose partial
                 # block is already resident, so no tail reload is required.
-                reuse = re.findall(r'prefix_hit_rows=(\d+)', trace)
-                assert any(int(row) > 128 and int(row) % args.block_tokens for row in reuse), 'unaligned history restore was not exercised'
+                assert partial_blocks, 'unaligned history restore was not exercised'
             assert not re.search(r'position/coverage gap|checkpoint_restore_fallback|multimodal_error|CUDA error:', trace)
             if args.mtp or args.dflash2_draft:
                 assert sum(map(int, re.findall(r'spec_stats[^\r\n]* n_drafted=(\d+)', trace))) > 0

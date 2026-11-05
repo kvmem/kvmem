@@ -1596,9 +1596,9 @@ int main(int argc, char ** argv) {
     }
     json chat_template_caps = json::object();
     if (st.tmpls) {
-        for (const auto & cap : common_chat_templates_get_caps(st.tmpls.get())) {
-            chat_template_caps[cap.first] = cap.second;
-        }
+        // v0.9.0 caps: common_json object, walk insertion order and convert for nlohmann
+        const common_json caps = common_chat_templates_get_caps(st.tmpls.get());
+        chat_template_caps = json::parse(caps.dump());
     }
     json props = {
         // upstream get_res_props fields
@@ -1901,9 +1901,8 @@ int main(int argc, char ** argv) {
         if (cr.parallel_tool_calls_set) {
             inputs.parallel_tool_calls = cr.parallel_tool_calls;
         } else {
-            const auto caps = common_chat_templates_get_caps(preparation_templates.get());
-            const auto it = caps.find("supports_parallel_tool_calls");
-            inputs.parallel_tool_calls = it != caps.end() && it->second;
+            const common_json caps = common_chat_templates_get_caps(preparation_templates.get());
+            inputs.parallel_tool_calls = caps.value("supports_parallel_tool_calls", false);
         }
         common_chat_params formatted;
         try {
