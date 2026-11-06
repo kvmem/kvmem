@@ -69,14 +69,16 @@ int main(int argc, char** argv) {
             else options.recent_tokens = value;
             continue;
         }
-        if (flag == "--kvmem-cache-sessions") {
-            if (++i>=argc) { std::cerr << "missing cache session count\n"; return 2; }
+        if (flag == "--kvmem-cache-sessions" || flag == "--kvmem-cache-records") {
+            if (++i>=argc) { std::cerr << "missing cache group/record count\n"; return 2; }
             uint32_t value=0; const std::string_view text(argv[i]);
             const auto parsed=std::from_chars(text.data(),text.data()+text.size(),value);
             if (parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size() || value>1024) {
-                std::cerr << "cache session count must be between 0 and 1024\n"; return 2;
+                std::cerr << "cache group/record count must be between 0 and 1024\n"; return 2;
             }
-            options.cache_sessions=value; continue;
+            if(flag == "--kvmem-cache-records")options.cache_records=value;
+            else options.cache_sessions=value;
+            continue;
         }
         if (flag == "--kvmem-budget" || flag == "--kvmem-block-tokens" || flag == "--kvmem-host-mib" || flag=="--kvmem-disk-mib" ||
             flag == "--kvmem-replay-tokens" || flag == "--kvmem-query-tokens" || flag == "--kvmem-query-replay-tokens") {
@@ -112,7 +114,8 @@ int main(int argc, char** argv) {
         std::cout << "Query: --kvmem-query-scorer page-softmax|meanq-cosine --kvmem-score-agg mean|max --kvmem-graph-alpha [0,1]\n";
         std::cout << "Bounds: --kvmem-query-tokens 512 --kvmem-query-replay-tokens 2048; generation reserve: --kvmem-replay-tokens\n";
         std::cout << "History: --kvmem-lrfu|--no-kvmem-lrfu --kvmem-lrfu-lambda [0,1] --kvmem-lrfu-top-fraction (0,1]\n";
-        std::cout << "Retained conversations: --kvmem-cache-sessions N (default 8; 0 disables), sharing --kvmem-host-mib\n";
+        std::cout << "Retained content groups: --kvmem-cache-sessions N (default 8; 0 disables), sharing --kvmem-host-mib\n";
+        std::cout << "Retained records: --kvmem-cache-records N (default 0: follow group limit; each record has up to 3 restore points)\n";
         std::cout << "Optional SSD: --kvmem-disk-path DIR --kvmem-disk-mib MiB (shared native KV and retained state)\n";
         return 0;
     }

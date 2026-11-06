@@ -549,7 +549,7 @@ void StatisticsObserver::admit_carried_input(std::unique_ptr<RetainedSession> sa
     RAD_INFO("KVMEM_INPUT_CARRY request=%llu frontier=%zu immutable_payload_shared=1",
         (unsigned long long)session,frontier);
 }
-bool StatisticsObserver::CacheState::publish(RetainedSession&& saved,size_t max_groups,bool already_charged) {
+bool StatisticsObserver::CacheState::publish(RetainedSession&& saved,size_t max_groups,size_t max_records,bool already_charged) {
     const bool complete=saved.identity && saved.prefix && saved.memory && saved.store && saved.policy && saved.recall && saved.recall_snapshot;
     if(!complete)return false;
     std::vector<CanonicalGroupMember<ImageIdentity>> members;
@@ -559,7 +559,7 @@ bool StatisticsObserver::CacheState::publish(RetainedSession&& saved,size_t max_
     std::vector<ContentCacheSlot> slots;
     for(const auto& previous:sessions)slots.push_back({true,false,uint64_t(slots.size()+1),previous.identity.get(),
         previous.group ? previous.group : previous.session.id});
-    const auto plan=plan_content_group_publication(slots,std::max<size_t>(16,max_groups),max_groups,group);
+    const auto plan=plan_content_group_publication(slots,max_records,max_groups,group);
     if(!plan)return false;
     uint64_t released=0;
     for(auto index:plan.retired_slots) {
@@ -648,7 +648,7 @@ void StatisticsObserver::park_session() {
     saved.recall_snapshot=std::move(prefix_recall_);
     if(parking) {
         parking->saved=std::move(saved);cache_->parking.push_back(std::move(parking));cache_->bytes+=bytes;
-    } else if(!cache_->publish(std::move(saved),options_.cache_sessions)) {
+    } else if(!cache_->publish(std::move(saved),options_.cache_sessions,options_.effective_cache_records())) {
         RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=directory_capacity source_preserved=1",(unsigned long long)session_.id);
     }
     RAD_INFO("KVMEM_SESSION_CACHE entries=%zu logical_bytes=%llu limit=%llu gpu_pages=0 pending=%zu",

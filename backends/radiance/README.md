@@ -28,6 +28,22 @@ native branches share sealed host/SSD records while keeping mutable state
 independent. Admission deducts only proven physical aliases. GPU page sharing
 and cache persistence are outside this implementation.
 
+Radiance checkpoints now reference immutable blocks in the common host/SSD
+store. New frontiers capture only missing blocks and a private partial tail;
+unchanged full blocks also alias the historical archive. Rewind invalidates
+changed origins immediately, even when a later block reuses its logical ID.
+Recurrent state and accepted draft windows keep their existing native snapshots.
+Restoration still stages the selected execution window; the reported capability
+is `full_selected_view`, not full-history RAM promotion.
+
+`--kvmem-cache-sessions` bounds content groups. `--kvmem-cache-records N` separately
+bounds published records; zero (default) follows the group limit, replacing the
+previous hidden minimum of 16 records. A record can carry endpoint, input and
+fallback recovery points. Active readers and bounded in-flight parking retain
+their own leases. The monitor distinguishes groups, records, recovery points,
+logical view bytes and actual captured KV bytes. Use an explicit record limit
+when comparing versions.
+
 The shared launcher and standalone profile default to a 256-token prefill chunk. Existing
 shared-launcher configurations with an explicit `Prefill` retain that value.
 

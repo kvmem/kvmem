@@ -35,7 +35,9 @@ struct SelectionOptions : RecallOptions {
         if(disk_bytes>UINT64_MAX-host_bytes)throw std::invalid_argument("history storage capacity overflow");
         return host_bytes+disk_bytes;
     }
-    uint32_t cache_sessions = 8;
+    uint32_t cache_sessions = 8; // content groups, not checkpoint count
+    uint32_t cache_records = 0; // zero follows cache_sessions; never a hidden floor
+    uint32_t effective_cache_records() const noexcept {return cache_sessions ? (cache_records ? cache_records : cache_sessions) : 0;}
     uint32_t replay_tokens = 1024; // generation/verify reserve; prefill is blockwise
     int64_t sink_tokens = -1;   // shared KVMem automatic allocation
     int64_t recent_tokens = -1; // explicit nonnegative values override auto
@@ -172,6 +174,9 @@ private:
             if(!next_group || next_group==UINT64_MAX)throw std::overflow_error("native cache group identity exhausted");
             return next_group++;
         }
+        size_t recovery_points() const noexcept {
+            size_t n=0;for(const auto& saved:sessions)n+=1+bool(saved.input)+bool(saved.fallback);return n;
+        }
         size_t count() const noexcept {return sessions.size()+parking.size();}
         size_t groups() const {
             std::set<uint64_t> origins;
@@ -182,7 +187,7 @@ private:
             return std::any_of(parking.begin(),parking.end(),[&](const auto& x){return x->id==id;}) ||
                 std::any_of(finishing.begin(),finishing.end(),[&](const auto& x){return x.id==id;});
         }
-        bool publish(RetainedSession&&,size_t max_groups,bool already_charged=false);
+        bool publish(RetainedSession&&,size_t max_groups,size_t max_records,bool already_charged=false);
         uint64_t bytes = 0, active_archive_bytes = 0, active_checkpoint_bytes = 0;
         std::set<const StatisticsObserver*> observers; // scheduler-thread ownership only
         uint64_t sharing_credit(const RetainedSession* extra=nullptr,const RankPrefix* incoming=nullptr) const;
