@@ -42,6 +42,12 @@ static void check(llama_model * model, int rows) {
     llama_synchronize(ctx.get());
     const auto before = state(ctx.get());
     const auto checkpoint = state(ctx.get(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    using Bundle = std::unique_ptr<llama_kvmem_store_bundle, decltype(&llama_kvmem_store_bundle_free)>;
+    Bundle parent(llama_kvmem_store_bundle_fork(), llama_kvmem_store_bundle_free);
+    require(bool(parent), "cannot preserve parent attention snapshot");
+    std::printf("CHECKPOINT_CAPTURE rows=%d full_state_bytes=%zu partial_state_bytes=%zu host_capacity_bytes=%llu\n",
+            rows, before.size(), checkpoint.size(),
+            static_cast<unsigned long long>(llama_kvmem_store_capacity(rows)));
     std::vector<llama_pos> positions(32);
     for (int i = 0; i < 32; ++i) positions[i] = rows + i;
     auto extra = llama_batch_get_one(tokens.data() + rows, 32);
@@ -49,7 +55,7 @@ static void check(llama_model * model, int rows) {
     require(llama_decode(ctx.get(), extra) == 0, "extra suffix prefill failed");
     llama_synchronize(ctx.get());
     auto selection = llama_kvmem_preview_retrieval();
-    require(selection.blocks.size() == 4, "fixture must have four blocks before rewind");
+    require(selection.blocks.size() == (tokens.size() + 31) / 32, "fixture block coverage is incomplete");
     selection.blocks = {0, 2};
     llama_kvmem_apply_selection(selection);
     require(llama_kvmem_get_attention_view().valid && llama_kvmem_get_attention_view().blocks.size() == 2,
@@ -57,7 +63,7 @@ static void check(llama_model * model, int rows) {
     selection = llama_kvmem_preview_retrieval();
     selection.blocks = {0};
     llama_kvmem_apply_selection(selection);
-    require(llama_kvmem_get_attention_view().blocks.size() == 1, "partial tail was not evicted");
+    require(llama_kvmem_get_attention_view().blocks.size() == 1, "checkpoint suffix was not evicted");
     require(llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0,
             LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint.size(), "recurrent checkpoint restore failed");
     require(llama_kvmem_remove_logical(ctx.get(), rows, -1), "suffix removal failed");
@@ -76,7 +82,30 @@ static void check(llama_model * model, int rows) {
     require(llama_decode(ctx.get(), llama_batch_get_one(tokens.data(), rows)) == 0, "cold recovery failed");
     llama_synchronize(ctx.get());
     require(state(ctx.get()) == before, "cold recovery retained invalid state");
+
+    // Reuse native cells and logical block IDs with different accepted bytes.
+    // The old parent's sealed records must survive both reset and this append.
+    for (int i = rows; i < (int) tokens.size(); ++i) tokens[i] += 500;
+    require(llama_decode(ctx.get(), extra) == 0, "branch suffix prefill failed");
+    llama_synchronize(ctx.get());
+    const auto branch_state = state(ctx.get());
+    const auto branch_checkpoint = state(ctx.get(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    Bundle branch(llama_kvmem_store_bundle_fork(), llama_kvmem_store_bundle_free);
+    require(llama_kvmem_store_bundle_swap(parent.get()), "old parent attention restore failed");
+    require(llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0,
+            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint.size(), "old parent model-state restore failed");
+    llama_kvmem_apply_selection(llama_kvmem_preview_retrieval());
+    require(state(ctx.get()) == before, "old parent changed after native cell reuse");
+    require(llama_kvmem_store_bundle_swap(branch.get()), "branch attention restore failed");
+    require(llama_state_seq_set_data_ext(ctx.get(), branch_checkpoint.data(), branch_checkpoint.size(), 0,
+            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == branch_checkpoint.size(), "branch model-state restore failed");
+    llama_kvmem_apply_selection(llama_kvmem_preview_retrieval());
+    require(state(ctx.get()) == branch_state, "branch changed after restoring old parent");
+    llama_kvmem_store_bundle_reset(branch.get());
+    parent.reset();
+    require(state(ctx.get()) == branch_state, "releasing parked owners changed active branch");
     std::printf("PASS checkpoint tail %d/32: exact native bytes, coverage rejection, cold recovery\n", rows % 32);
+    std::printf("PASS checkpoint branches rows=%d: native ID reuse, old parent restore, owner release\n", rows);
 }
 
 int main(int argc, char ** argv) {
@@ -88,8 +117,10 @@ int main(int argc, char ** argv) {
         params.n_gpu_layers = argc == 3 ? std::stoi(argv[2]) : 99;
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(argv[1], params), llama_model_free);
         require(bool(model), "model loading failed");
+        check(model.get(), 64);
         check(model.get(), 65);
         check(model.get(), 95);
+        check(model.get(), 96);
         llama_kvmem_set_params(nullptr);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "%s\n", error.what());

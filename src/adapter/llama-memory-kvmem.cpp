@@ -1419,12 +1419,10 @@ uint64_t llama_memory_kvmem::host_capacity(uint32_t tokens) const {
     if (recr_) {
         for (const auto * list : { &recr_->r_l, &recr_->s_l, &recr_->p_l })
             for (const auto * t : *list) if (t) checkpoint += ggml_row_size(t->type, t->ne[0]);
-    } else {
-        // Dense memory does not implement PARTIAL_ONLY: its server checkpoint
-        // contains the attention working set and cell metadata.
-        for (const auto & buffer : kv_->memory_breakdown()) checkpoint += buffer.second;
-        checkpoint += uint64_t(kv_size_)*64;
     }
+    // The pinned native cache skips non-SWA attention for PARTIAL_ONLY.
+    // KVMem rejects SWA at construction, so dense checkpoints contain only
+    // native framing here; packed attention is already counted in raw_ below.
     checkpoint += uint64_t(n_layer_)*(n_embd_k_ + uint64_t(n_head_)*n_embd_head_)*sizeof(float);
     // MTP carry, token/prompt indexes, query state and bounded allocator slack.
     return 8*checkpoint + 8*1024*1024 + uint64_t(tokens)*64 +
