@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <atomic>
 #include "kvmem/host_kv_storage.hpp"
 
 namespace kvmem {
@@ -30,6 +31,36 @@ struct RawKvStoreConfig {
     uint64_t k_gpu_row_bytes = 0;  // 0 = no packed GPU K; else bytes per token row
     uint64_t v_gpu_row_bytes = 0;  // 0 = no packed GPU V; else bytes per token row
     std::shared_ptr<HostKvStorage> payload_storage;
+};
+
+// Immutable packed-record exchange. Native layout/frontier proof remains with
+// the caller; this API proves stored row coverage and account ownership only.
+struct PackedKvSelection {
+    uint32_t block = 0, layer = 0, valid_tokens = 0;
+};
+struct PackedKvOptions {
+    // Caller-supplied metadata admission allowance, not a separate payload pool.
+    size_t metadata_limit = SIZE_MAX;
+    const std::atomic<bool> * cancelled = nullptr;
+};
+class PackedKvSnapshot {
+public:
+    struct Entry {
+        PackedKvSelection selection;
+        HostKvRecord k, v;
+    };
+    PackedKvSnapshot(PackedKvSnapshot &&) noexcept = default;
+    PackedKvSnapshot & operator=(PackedKvSnapshot &&) noexcept = default;
+    const std::vector<Entry> & entries() const noexcept { return entries_; }
+    const RawKvStoreConfig & config() const noexcept { return config_; }
+    size_t metadata_bytes() const noexcept {
+        return sizeof(*this) + entries_.capacity() * sizeof(Entry);
+    }
+private:
+    friend class RawKvStore;
+    PackedKvSnapshot() = default;
+    RawKvStoreConfig config_;
+    std::vector<Entry> entries_;
 };
 
 class RawKvStore {
@@ -105,6 +136,18 @@ public:
     // sources; raw rows and mutable statistics remain private to the branch.
     std::unique_ptr<RawKvStore> fork_prefix(uint32_t token_pos);
 
+    // PROTOTYPE: caller drains native writers and serializes store lifecycle.
+    // Every selected layer requires both planes. Full records share storage;
+    // partial records are private capacity-sized copies with zero padding.
+    // Sealing/inspection is under mu_; payload allocation/read is outside mu_.
+    PackedKvSnapshot export_packed(const std::vector<PackedKvSelection> & selection,
+                                  PackedKvOptions options = {});
+    // Atomically replace ALL packed bindings. Unselected packed planes vanish;
+    // existing raw rows/MeanK statistics remain private and unchanged. Caller
+    // must restore their checkpoint version and native layout separately.
+    // Import rejects a foreign storage account. No payload allocation or I/O.
+    void import_packed(const PackedKvSnapshot & snapshot, PackedKvOptions options = {});
+
 private:
     struct LayerBlk {
         uint32_t n_tokens = 0;
@@ -115,6 +158,8 @@ private:
         std::vector<uint16_t> v;
         HostKvRecord k_gpu;
         HostKvRecord v_gpu;
+        // Export proof only. Legacy serialized records intentionally have none.
+        std::vector<uint64_t> k_coverage, v_coverage;
         std::vector<float> k_sum;
         bool k_gpu_fmt = false;
         bool v_gpu_fmt = false;

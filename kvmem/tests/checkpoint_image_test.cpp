@@ -14,6 +14,31 @@ int main() {
     const std::array<uint8_t,5> first{0,255,7,4,19};
     const std::array<uint8_t,3> second{2,1,17};
     std::array<uint8_t,5> a{}; std::array<uint8_t,3> b{};
+    {
+        auto disk=std::make_shared<SpillFile>(path,4096);
+        HostKvStorage storage(256,disk);
+        auto image=storage.allocate(checkpoint_image_size(8,2));
+        write_checkpoint_image(image,97,{{first.data(),first.size()},{second.data(),second.size()}});
+        image.seal();
+        auto saved=image.fork();
+        { auto lease=image.lease();
+          read_checkpoint_image(lease,97,{{a.data(),a.size()},{b.data(),b.size()}});
+          require(a==first && b==second,"hot record image changed bits"); }
+        require(storage.demote(image),"checkpoint record did not migrate");
+        image.reset();
+        read_checkpoint_image(saved,97,{{a.data(),a.size()},{b.data(),b.size()}});
+        require(a==first && b==second && storage.charged_bytes()==0,"cold read promoted or changed image");
+        rejects([&]{read_checkpoint_image(saved,98,{{a.data(),a.size()},{b.data(),b.size()}});});
+        rejects([&]{read_checkpoint_image(saved,97,{{a.data(),4},{b.data(),b.size()}});});
+        auto corrupt_image=saved.fork();
+        const uint8_t corrupt_byte=42; corrupt_image.write(36,&corrupt_byte,1); corrupt_image.seal();
+        require(storage.demote(corrupt_image),"corrupt test image did not migrate");
+        rejects([&]{read_checkpoint_image(corrupt_image,97,{{a.data(),a.size()},{b.data(),b.size()}});});
+        read_checkpoint_image(saved,97,{{a.data(),a.size()},{b.data(),b.size()}});
+        require(a==first && b==second,"failed branch damaged saved checkpoint");
+        auto short_record=storage.allocate(16); short_record.seal();
+        rejects([&]{read_checkpoint_image(short_record,97,{{a.data(),a.size()}});});
+    }
     auto extent=file.reserve(checkpoint_image_size(8,2));
     write_checkpoint_image(extent,97,{{first.data(),first.size()},{second.data(),second.size()}});
     read_checkpoint_image(extent,97,{{a.data(),a.size()},{b.data(),b.size()}});
