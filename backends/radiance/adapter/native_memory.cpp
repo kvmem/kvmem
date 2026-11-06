@@ -1,4 +1,5 @@
 #include "native_memory.hpp"
+#include "execution_options.hpp"
 #include "native_pages.hpp"
 #include "execution_pages.hpp"
 #include "page_transfer.hpp"
@@ -149,7 +150,11 @@ class NativeMemory::Transaction final : public MemoryTransfer, public StorageWai
         PayloadLayout layout;
         std::shared_ptr<HostKvStorage> storage;
         std::vector<BlockDescriptor> blocks;
-        std::vector<uint8_t> captured,restored;
+        // Borrow completed pinned bytes from Transaction::spill_. abort() joins
+        // the I/O ticket before releasing that transfer, including cancellation.
+        std::span<const uint8_t> captured;
+        std::vector<uint8_t> captured_copy; // control path for reproducible ablation
+        std::vector<uint8_t> restored;
         std::vector<HostKvSource> sources;
         std::vector<HostKvRecord> previous;
         std::vector<TieredArchive::Prepared> records;
@@ -171,8 +176,9 @@ class NativeMemory::Transaction final : public MemoryTransfer, public StorageWai
         if(!work)return true;
         if(!s_->io) { work->run();return true; }
         if(!ticket) {
-            // Both the captured vector and per-record staging copies are bounded
-            // by the prepared working window, independently of the H/D payload.
+            // Keep the conservative I/O reservation for the retained pinned view
+            // and per-record staging; borrowing removes a whole-window CPU copy
+            // without weakening the shared resource policy.
             const auto charge=checked_bytes(work->captured.size(),3)+work->restored.size();
             try { ticket=s_->io->submit(charge,[work]{work->run();}); }
             catch(const MemoryError& error) {
@@ -345,7 +351,17 @@ public:
             const auto result = spill_ ? spill_->poll() : TransferPoll{TransferStatus::Complete, {}};
             if (result.status != TransferStatus::Complete) return result;
             if(!captured_) {
-                if(spill_)storage_work_->captured=spill_->payload();
+                if(spill_) {
+                    if(borrow_spill_capture()) {
+                        storage_work_->captured=spill_->payload_view();
+                        s_->reuse.spill_copy_bytes_avoided+=storage_work_->captured.size();
+                        s_->reuse.spill_staging_bytes_avoided_peak=std::max(s_->reuse.spill_staging_bytes_avoided_peak,
+                            uint64_t(storage_work_->captured.size()));
+                    } else {
+                        storage_work_->captured_copy=spill_->payload();
+                        storage_work_->captured=storage_work_->captured_copy;
+                    }
+                }
                 captured_=true;
             }
             if(!storage_ready(storage_work_,storage_ticket_))return {TransferStatus::Pending,{}};

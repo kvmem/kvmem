@@ -1,4 +1,5 @@
 #include "statistics_capture.hpp"
+#include "execution_options.hpp"
 #include "kvmem/raw_kv_store.hpp"
 #include "rad_device.h"
 #include "rad_plugin.h"
@@ -70,7 +71,7 @@ StatisticsCapture::StatisticsCapture(int device, std::vector<StatisticsLayer> la
     auto& s = *state_;
     s.device = device; s.max_rows = max_rows;
     const char* early = std::getenv("KVMEM_CAPTURE_EARLY_SEAL");
-    s.early_event = early && std::strcmp(early, "1") == 0;
+    s.early_event = early_statistics_collection() || (early && std::strcmp(early, "1") == 0);
     if (s.early_event) std::fprintf(stderr, "KVMEM_CAPTURE_EARLY_SEAL enabled=1 same_producer_stream=1\n");
     if (device < 0 || !max_rows || layers.empty()) bad("missing statistics geometry");
     std::set<int> ids;

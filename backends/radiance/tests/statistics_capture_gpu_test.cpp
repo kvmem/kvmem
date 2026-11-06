@@ -19,7 +19,23 @@ struct Buffer {
     Buffer(int64_t n, int k) : p(rad_dev_alloc(n, k)), kind(k) { CHECK(p); }
     ~Buffer() { rad_dev_free(p, kind); }
 };
+struct Dispatch {
+    StatisticsCapture* current;
+    bool reject = false;
+    static int observe(void* opaque, int layer, rad_kvgroup group, int64_t head_dim,
+                       const RadTensor& q, const RadTensor& k, const RadBatch& b, RadStream stream) {
+        auto& self=*static_cast<Dispatch*>(opaque);
+        return self.reject ? RAD_E_STATE : StatisticsCapture::observe(self.current,layer,group,head_dim,q,k,b,stream);
+    }
+};
+static int upload_input(rad::Ctx& ctx,const void* data,int64_t bytes) {
+    const auto first=rad_memcpy_async(ctx.buf_ptr(1),data,bytes,ctx.stream());
+    return first<0 ? first : rad_memcpy_async(ctx.buf_ptr(2),data,bytes,ctx.stream());
+}
 static void arch_step(RadCtx* c, const RadBatch* b) {
+    // This producer is inside the recorded stretch immediately preceding the
+    // live callback. A replay must see this frame's data, not the prior output.
+    CHECK(rad_memcpy_async(rad_buf_ptr(c,1),rad_buf_ptr(c,2),b->n_tok*16*4,rad_stream(c))==RAD_OK);
     CHECK(bool(rad_kv_observing(c)) == (b->draft_pass == 0));
     const RadOperand q{RAD_OPK_BUF, RAD_DT_INVALID, 1, nullptr, 0, b->n_tok, 8};
     const RadOperand k{RAD_OPK_BUF, RAD_DT_INVALID, 1, nullptr, 8, b->n_tok, 4};
@@ -60,21 +76,23 @@ int main(int argc, char** argv) {
         rad::Program program;
         program.meta.n_layers = 4;
         program.arena_bytes = 4096;
-        program.weights.resize(1); program.buffers.resize(2); program.ops.resize(2);
+        program.weights.resize(1); program.buffers.resize(3); program.ops.resize(2);
         auto& buffer = program.buffers[1];
         buffer.name = "qkv"; buffer.decl.dtype = RAD_F32; buffer.decl.rank = 2;
         buffer.decl.domain = RAD_DOMAIN_DEVICE; buffer.decl.shape[0] = 3; buffer.decl.shape[1] = 16;
         buffer.bytes = 3 * 16 * 4; buffer.arena_offset = 0; buffer.first_def = buffer.last_use = 1;
+        program.buffers[2]=buffer;program.buffers[2].name="producer-input";program.buffers[2].arena_offset=512;
         program.ops[1].op = "observation-lifetime-anchor"; program.ops[1].index = 1;
         rad::CtxDesc desc;
         desc.program = &program; desc.device = device; desc.arch_step = arch_step;
-        desc.kv_observer = StatisticsCapture::observe; desc.kv_observer_data = &capture;
+        Dispatch dispatch{&capture};
+        desc.kv_observer = Dispatch::observe; desc.kv_observer_data = &dispatch;
         desc.kv.resize(2); desc.kv[1].layer_slot = {-1, -1, -1, 0};
         rad::Ctx ctx;
         CHECK(ctx.init(desc) == RAD_OK);
         CHECK(!rad_kv_observing(&ctx)); // no active trunk pass
         CHECK(rad_memcpy_async(positions.p, hp, 12, ctx.stream()) == RAD_OK);
-        CHECK(rad_memcpy_async(ctx.buf_ptr(1), data, buffer.bytes, ctx.stream()) == RAD_OK);
+        CHECK(upload_input(ctx, data, buffer.bytes) == RAD_OK);
         RadBatch batch{};
         batch.n_seq = 1; batch.n_tok = 3; batch.step = 11; batch.phase = RAD_PHASE_PREFILL;
         batch.n_spec = 2; // A native verify pass; only its accepted prefix is committed.
@@ -113,7 +131,7 @@ int main(int argc, char** argv) {
         batch.n_spec = 0;
         // Query is a bounded half-open span; rows after it remain committed K
         // but must never change the frozen query with assistant/decode tokens.
-        CHECK(rad_memcpy_async(ctx.buf_ptr(1), data, buffer.bytes, ctx.stream()) == RAD_OK);
+        CHECK(upload_input(ctx, data, buffer.bytes) == RAD_OK);
         capture.begin({18, 1}, 0, 3, 1, 2);
         CHECK(ctx.run_step(&batch) == RAD_OK); capture.seal();
         while (capture.poll().status == TransferStatus::Pending) {
@@ -131,7 +149,7 @@ int main(int argc, char** argv) {
         CHECK(bounded.n_tokens(0) == 3);
         // A frozen query needs no Q transfers on replay/decode, but all K rows
         // remain necessary. Stale staging contents must never be credited.
-        CHECK(rad_memcpy_async(ctx.buf_ptr(1), data, buffer.bytes, ctx.stream()) == RAD_OK);
+        CHECK(upload_input(ctx, data, buffer.bytes) == RAD_OK);
         capture.begin({19, 1}, 0, 3, UINT32_MAX, UINT32_MAX);
         CHECK(ctx.run_step(&batch) == RAD_OK); capture.seal();
         while (capture.poll().status == TransferStatus::Pending) {
@@ -151,7 +169,7 @@ int main(int argc, char** argv) {
         // The early event must never publish a partial multi-layer frame, nor
         // skip explicit seal(), and must precede later in-place overwrites.
         StatisticsCapture multi(device, {{3,1,0,4,2,1},{7,1,1,4,2,1}}, 3);
-        CHECK(rad_memcpy_async(ctx.buf_ptr(1), data, buffer.bytes, ctx.stream()) == RAD_OK);
+        CHECK(upload_input(ctx, data, buffer.bytes) == RAD_OK);
         RadTensor q{}, k{};
         q.data=ctx.buf_ptr(1);q.dtype=RAD_F32;q.rank=2;q.shape[0]=3;q.shape[1]=8;q.stride[0]=16;q.stride[1]=1;
         k=q;k.data=static_cast<float*>(ctx.buf_ptr(1))+8;k.shape[1]=4;
@@ -180,6 +198,36 @@ int main(int argc, char** argv) {
             for(int col=0;col<8;++col)CHECK(both.sums[layer*8+col]==float(16+col));
             two.mean_k(0,layer,mean);for(int col=0;col<4;++col)CHECK(mean[col]==float(16+col));
         }
+        // Reuse one pass key across changing requests, destination allocations,
+        // Q slices and values. A tape retaining an old callback destination must
+        // fail these byte checks, including after its periodic audit.
+        const char* tape_mode=std::getenv("KVMEM_RAD_TAPE_MODE");
+        const bool replay=tape_mode && std::strcmp(tape_mode,"all")==0 && rad::tape_supported();
+        std::unique_ptr<StatisticsCapture> previous;
+        for (int iteration=0;iteration<(replay ? 1035 : 8);++iteration) {
+            auto owned=std::make_unique<StatisticsCapture>(device,std::vector<StatisticsLayer>{{3,1,0,4,2,1}},3);
+            auto& fresh=*owned;
+            dispatch.current=&fresh;
+            const uint32_t qrow=iteration%3;
+            for (int j=0;j<48;++j) data[j]=float(iteration*100+j);
+            CHECK(upload_input(ctx,data,buffer.bytes)==RAD_OK);
+            const SessionIdentity id{uint64_t(100+iteration),1};
+            fresh.begin(id,0,3,qrow,qrow+1);
+            CHECK(ctx.run_step(&batch)==RAD_OK);fresh.seal();
+            CHECK(rad_stream_sync(ctx.stream())==RAD_OK);
+            RawKvStore target(cfg);
+            const auto observed=fresh.commit(target,id,2,qrow,qrow+1);
+            // Only the two accepted rows contribute, including a rejected Q row.
+            CHECK(observed.token_counts[0]==uint32_t(qrow<2));
+            for(int col=0;col<8;++col)
+                CHECK(observed.sums[col]==(qrow<2 ? float(iteration*100+qrow*16+col) : 0.f));
+            target.mean_k(0,0,mean);
+            for(int col=0;col<4;++col)CHECK(mean[col]==float(iteration*100+16+col));
+            previous=std::move(owned);
+        }
+        if(replay) CHECK(ctx.pass_counts().played>=1024);
+        dispatch.reject=true;
+        CHECK(ctx.run_step(&batch)<0); // live callback failure must also fail a replay
         std::cout << "PASS pre-RoPE stream ordering, column stride, GQA widths, accepted rows, identity, coverage, early-event lifecycle\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

@@ -1,5 +1,6 @@
 // Real MemorySession -> Radiance allocator -> GPU copy -> sparse table roundtrip.
 #include "native_memory.hpp"
+#include "execution_options.hpp"
 #include "native_pages.hpp"
 #include "page_transfer.hpp"
 #include "state_checkpoint.hpp"
@@ -464,6 +465,10 @@ int main(int argc, char** argv) {
         verify({0, 3, 4});
         session.prepare(backend->stamp(), {1, 4}, {4}, budget(64)); finish(); session.publish();
         verify({1, 4});
+        if(borrow_spill_capture()) {
+            CHECK(backend->reuse_stats().spill_copy_bytes_avoided>=pages.layout().record_bytes);
+            CHECK(backend->reuse_stats().spill_staging_bytes_avoided_peak>=pages.layout().record_bytes);
+        } else CHECK(backend->reuse_stats().spill_copy_bytes_avoided==0);
         // A prompt can end between native page boundaries. Keep its mutable
         // tail resident while historical complete blocks are spilled/restored.
         CHECK(engine->kv.ensure(17, 163) == RAD_OK);
