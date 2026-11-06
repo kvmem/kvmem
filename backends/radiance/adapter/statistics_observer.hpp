@@ -1,4 +1,5 @@
 #pragma once
+#include "execution_options.hpp"
 #include "statistics_capture.hpp"
 #include "runtime/step_observer.h"
 #include "kvmem/raw_kv_store.hpp"
@@ -51,6 +52,7 @@ struct SelectionOptions : RecallOptions {
 // the engine-owned prefix cache is disabled in favor of the shared KVMem cache.
 class StatisticsObserver final : public rad::StepObserver {
 public:
+    bool early_collect() const noexcept override { return early_statistics_collection(); }
     explicit StatisticsObserver(SelectionOptions options = {}) : options_(options) {cache_->observers.insert(this);}
     ~StatisticsObserver() override {cache_->observers.erase(this);}
     bool retain_history_boundary() const noexcept override { return options_.budget_tokens > 0; }

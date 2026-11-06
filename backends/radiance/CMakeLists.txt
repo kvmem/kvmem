@@ -93,6 +93,11 @@ endif()
 
 # Device symbols are supplied by Radiance in the engine build, and by the fault
 # injection fake in the portable tests. No HIP/OS types leak into the KVMem core.
+add_executable(radiance_attention_capture_test tests/attention_capture_test.cpp adapter/attention_capture.cpp)
+target_include_directories(radiance_attention_capture_test PRIVATE adapter ${RADIANCE_SOURCE_DIR}/abi)
+target_link_libraries(radiance_attention_capture_test PRIVATE kvmem)
+add_test(NAME radiance_attention_capture_test COMMAND radiance_attention_capture_test)
+
 add_library(kvmem_radiance_transfer STATIC adapter/page_transfer.cpp)
 target_include_directories(kvmem_radiance_transfer SYSTEM PUBLIC ${RADIANCE_SOURCE_DIR}/abi)
 target_link_libraries(kvmem_radiance_transfer PUBLIC kvmem_radiance_pages)

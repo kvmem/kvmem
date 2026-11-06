@@ -52,6 +52,8 @@ public:
             const auto stats=rank->reuse_stats();
             out.transactions+=stats.transactions;out.recycled_pages+=stats.recycled_pages;
             out.journal_bytes_peak+=stats.journal_bytes_peak;out.rollbacks+=stats.rollbacks;
+            out.spill_copy_bytes_avoided+=stats.spill_copy_bytes_avoided;
+            out.spill_staging_bytes_avoided_peak+=stats.spill_staging_bytes_avoided_peak;
         }return out;
     }
 };

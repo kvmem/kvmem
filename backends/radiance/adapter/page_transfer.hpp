@@ -2,6 +2,7 @@
 #include "native_pages.hpp"
 #include "rad_device.h"
 #include <memory>
+#include <span>
 
 namespace kvmem::radiance {
 struct GroupPool {
@@ -27,6 +28,10 @@ public:
                  RadStream compute, const std::vector<uint8_t>& payload);
     TransferPoll poll();
     std::vector<uint8_t> payload(); // completed spill only
+    // Immutable CPU view, after the completion event. Valid until this transfer
+    // is destroyed. An asynchronous reader must finish before its owner releases
+    // the transfer; the view itself performs no device calls on the I/O worker.
+    std::span<const uint8_t> payload_view();
     // Quiesce ALL copies, even if event creation/record failed after a partial
     // enqueue. False indicates a fatal device error: invalidate the engine.
     bool drain() noexcept;

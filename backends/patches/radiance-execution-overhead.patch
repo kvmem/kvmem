@@ -1,0 +1,187 @@
+--- a/core/engine.cpp
++++ b/core/engine.cpp
+@@ -784,7 +784,7 @@
+      * pass issued ahead would overwrite them. */
+     pipelining_ = !observer_ && !cfg_.kld() && !cfg_.calib() && !embedding_ &&
+                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
+-    early_ids_ = !observer_ && !cfg_.kld() && !embedding_;
++    early_ids_ = (!observer_ || observer_->early_collect()) && !cfg_.kld() && !embedding_;
+     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
+      * drafts nothing and an embedding model declares no drafter, so no server reaches this today;
+      * it keeps a tree from running unverified should another path turn pipelining off. */
+@@ -1224,6 +1224,11 @@
+             }
+             st = observe([&] { return observer_->collect(plan, res); });
+             if (st < 0) return fail_loop(st);
++            if (so.early) {
++                st = rad_event_sync(step_end_);
++                if (st < 0) return fail_loop(st);
++                so.early = false;
++            }
+             int refusal_status=RAD_E_FULL;
+             for(auto id=observer_->take_request_refusal(&refusal_status);id;id=observer_->take_request_refusal(&refusal_status)) {
+                 st=sched_.fail_observer(id,refusal_status);if(st<0)return fail_loop(st);
+--- a/core/runtime/ctx.cpp
++++ b/core/runtime/ctx.cpp
+@@ -143,7 +143,16 @@
+      * hold more rows than their header says and be written late. */
+     const bool taps = std::any_of(program_->ops.begin(), program_->ops.end(),
+                                   [](const OpInfo& o) { return o.op == "gram_accum"; });
+-    tape_on_ = record_passes_ && !kv_observer_ && tape_supported() && !profiling_ && !oracle_ && !taps;
++    observer_tape_mode_ = 0;
++    if (kv_observer_) {
++        const char* mode = std::getenv("KVMEM_RAD_TAPE_MODE");
++        if (!mode || std::strcmp(mode, "off") == 0) observer_tape_mode_ = 0;
++        else if (std::strcmp(mode, "draft") == 0) observer_tape_mode_ = 1;
++        else if (std::strcmp(mode, "all") == 0) observer_tape_mode_ = 2;
++        else { RAD_ERR("KVMEM_RAD_TAPE_MODE must be off, draft or all"); return RAD_E_INVAL; }
++    }
++    tape_on_ = record_passes_ && (!kv_observer_ || observer_tape_mode_ != 0) &&
++               tape_supported() && !profiling_ && !oracle_ && !taps;
+     if (taps && record_passes_ && tape_supported() && rank_ == 0)
+         RAD_INFO("recorded passes: off, the program accumulates calibration Grams (gram_accum)");
+     return RAD_OK;
+@@ -1259,6 +1268,21 @@
+             *why = fmt("routing report %zu (layer %d) differs", i, a.route[i].first);
+             return false;
+         }
++    if (a.observers.size() != b.observers.size()) {
++        *why = "observer call count differs"; return false;
++    }
++    const auto same_operand = [](const RadOperand& x, const RadOperand& y) {
++        return x.kind == y.kind && x.dtype == y.dtype && x.handle == y.handle &&
++               x.raw == y.raw && x.offset == y.offset && x.rows == y.rows && x.cols == y.cols;
++    };
++    for (size_t i = 0; i < a.observers.size(); ++i) {
++        const auto& x = a.observers[i]; const auto& y = b.observers[i];
++        if (x.layer != y.layer || x.group != y.group || x.head_dim != y.head_dim ||
++            x.anchor != y.anchor || x.attention != y.attention ||
++            !same_operand(x.q, y.q) || !same_operand(x.k, y.k)) {
++            *why = fmt("observer call %zu differs", i); return false;
++        }
++    }
+     std::string d;
+     if (tape_diff(a.dev, b.dev, &d) >= 0) { *why = d; return false; }
+     return true;
+@@ -1297,6 +1321,13 @@
+                                          (unsigned)th.h, rad_strerror(rc));
+             break;
+         }
++        case kTapeObserver: {
++            const auto& o = t.observers[(size_t)st.a];
++            lane_ = st.lane;
++            rc = kv_observe_live(o.layer, o.group, o.head_dim, o.anchor, o.q, o.k, o.attention);
++            lane_ = l0;
++            break;
++        }
+         case kTapeRoute:
+             rc = route_report_impl(t.route[(size_t)st.a].first, &t.route[(size_t)st.a].second,
+                                    false);
+@@ -1347,9 +1378,9 @@
+     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
+     scratch_cur_[0] = scratch_cur_[1] = 0;
+     /* A pass the stager armed for is issued live: see runtime/stager.h. */
+-    // Observer-owned staging changes each pass and cannot be replayed from a
+-    // tape containing a prior pass's pointers. Normal inference is unchanged.
+-    if (!tape_on_ || staging_ || kv_observer_) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
++    // Observer calls are live host steps: no request-owned destinations enter the tape.
++    // Draft-only mode provides an independent ablation of the callback path.
++    if (!tape_on_ || staging_ || (kv_observer_ && observer_tape_mode_ == 1 && !b->draft_pass)) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+     const uint64_t key = pass_key(b);
+     if (key == 0) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+     if (std::find(tape_refused_.begin(), tape_refused_.end(), key) != tape_refused_.end()) {
+--- a/core/runtime/ctx.h
++++ b/core/runtime/ctx.h
+@@ -508,7 +508,7 @@
+      * differing dispatch. */
+     enum TapeKind : uint8_t { kTapePlay = 0, kTapeTable = 1, kTapeHost = 2, kTapeRoute = 3,
+                               kTapeXp = 4, kTapeXpMark = 5, kTapeXpStep = 6,
+-                              kTapeKvStage = 7, kTapeKvStageAfter = 8 };
++                              kTapeKvStage = 7, kTapeKvStageAfter = 8, kTapeObserver = 9 };
+     /* A prefetch call (Ctx::xp_predict), run again where the pass made it. */
+     struct TapeXp {
+         RadPrefetchNext next{};
+@@ -529,11 +529,20 @@
+         int64_t          n = 0;
+         bool             drain = false;    /* an operand the arena does not track: drain instead */
+     };
++    struct TapeObserver {
++        int layer = 0;
++        rad_kvgroup group = 0;
++        int64_t head_dim = 0;
++        rad_op anchor = 0;
++        RadOperand q{}, k{};
++        bool attention = false;
++    };
+     struct PassTape {
+         uint64_t key = 0;
+         RadTape  dev = nullptr;
+         std::vector<TapeStep>  steps;
+         std::vector<TapeHost>  host;
++        std::vector<TapeObserver> observers;
+         std::vector<std::pair<int, RadRouting>> route;
+         std::vector<TapeXp> xp;
+         /* What the recording added to the Ctx's counters, and the bookkeeping it ended on. */
+@@ -576,6 +585,7 @@
+     std::vector<uint64_t> tape_refused_;       /* keys whose pass could not be recorded */
+     uint64_t              tape_told_ = 0;      /* draft passes whose first recording was logged */
+     bool                  tape_on_ = false;    /* the backend can, and nothing needs every issue */
++    int                   observer_tape_mode_ = 0; // 0 off, 1 draft only, 2 live observer steps
+     bool                  record_passes_ = true;   /* CtxDesc::record_passes */
+     CtxDesc::KvObserver kv_observer_ = nullptr;
+     CtxDesc::KvObserver attention_observer_ = nullptr;
+@@ -584,6 +594,8 @@
+     int                   rec_mark_ = 0;       /* the backend record its current play step starts at */
+     std::atomic<uint64_t> domain_epoch_{0};    /* bumped by set_op_domain */
+ 
++    int kv_observe_live(int layer, rad_kvgroup group, int64_t head_dim, rad_op anchor,
++                        RadOperand q, RadOperand k, bool attention);
+     int      run_pass(const RadBatch* b);
+     int      record_pass(const RadBatch* b, uint64_t key, PassTape* out);
+     int      play_pass(PassTape& t);
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -1393,6 +1393,22 @@
+ int Ctx::kv_observe(int layer, rad_kvgroup group, int64_t head_dim,
+                     rad_op anchor, RadOperand q, RadOperand k, bool attention) {
+     if (!kv_observing() || (attention && !attention_observer_)) return RAD_OK;
++    if (rec_) {
++        const auto index = rec_->observers.size();
++        rec_->observers.push_back({layer, group, head_dim, anchor, q, k, attention});
++        TapeStep st;
++        st.kind = kTapeObserver;
++        st.a = (int32_t)index;
++        // Resolve live buffers and enqueue capture with recording paused. Neither the
++        // callback's scratch nor its changing host destination may enter the device tape.
++        return tape_host(st, [&] { return kv_observe_live(layer, group, head_dim, anchor, q, k, attention); });
++    }
++    return kv_observe_live(layer, group, head_dim, anchor, q, k, attention);
++}
++
++int Ctx::kv_observe_live(int layer, rad_kvgroup group, int64_t head_dim,
++                        rad_op anchor, RadOperand q, RadOperand k, bool attention) {
++    if (!kv_observing() || (attention && !attention_observer_)) return RAD_OK;
+     if (!in_step_ || !batch_ || head_dim <= 0 || group == 0 || group >= kv_.size() ||
+         layer < 0 || size_t(layer) >= kv_[group].layer_slot.size() || kv_[group].layer_slot[layer] < 0 ||
+         anchor == 0 || anchor >= plans_.size())
+--- a/core/runtime/step_observer.h
++++ b/core/runtime/step_observer.h
+@@ -11,12 +11,16 @@
+ };
+ // Optional integration seam. The engine owns dispatch/lifetimes; an observer
+ // owns its statistics and receives only declared tensors and accepted steps.
+-// Installing one serializes steps and bypasses tapes whose captured destinations
+-// would otherwise outlive a frame. A null observer preserves ordinary execution.
++// Installing one serializes plans. Tape observer callbacks resolve live frame
++// destinations on every replay. A null observer preserves ordinary execution.
+ // No KVMem policy, host archive, or vendor-specific type belongs in this interface.
+ class StepObserver {
+ public:
+     virtual ~StepObserver() = default;
++    // Opt-in: collect may start after accepted IDs, while draft kernels run.
++    // The observer must fence every rank before changing native KV/state.
++    // The engine additionally fences before commit/finish can release a sequence.
++    virtual bool early_collect() const noexcept { return false; }
+     // Statistics alone must not add a prefix-retention checkpoint.
+     virtual bool retain_history_boundary() const noexcept { return false; }
+     // An integration with per-request Query replay may isolate prefill steps
