@@ -90,6 +90,7 @@ public:
     void reset() noexcept { allocation_.reset(); }
 private:
     friend class HostKvReservation;
+    friend class HostKvStorage;
     explicit HostKvRecord(std::shared_ptr<detail::HostKvAllocation> allocation);
     std::shared_ptr<detail::HostKvAllocation> allocation_;
 };
@@ -119,6 +120,8 @@ public:
     HostKvStorage(uint64_t capacity_bytes, std::shared_ptr<SpillFile> spill);
     HostKvReservation reserve(uint64_t bytes);
     HostKvRecord allocate(size_t bytes, const void * source = nullptr);
+    // Account identity, not byte/content identity. Empty records are not owned.
+    bool owns(const HostKvRecord & record) const noexcept;
     uint64_t charged_bytes() const;
     uint64_t capacity_bytes() const noexcept;
     uint64_t disk_bytes() const;
@@ -129,6 +132,12 @@ public:
     // Explicit idle reclamation uses the same records/quota as active pressure.
     // Leased/mutable records remain resident. Failure preserves their valid bytes.
     void trim(uint64_t resident_target);
+    // Migrate only this account's selected record, using the existing tier path.
+    // True means already cold or migration completed. False means no disk tier,
+    // mutable/pinned/busy content, or an in-flight relocation; retry is optional.
+    // Synchronous I/O may throw; failure preserves valid bytes and their charge.
+    // The caller owns victim selection, scheduling and cancellation/publication.
+    bool demote(const HostKvRecord & record);
 private:
     friend class HostKvRecord;
     explicit HostKvStorage(std::shared_ptr<detail::HostKvAccount> account);
