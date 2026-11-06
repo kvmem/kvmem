@@ -1,5 +1,9 @@
 # NInfer shared snapshots: implementation and qualification
 
+Public paths and device identities use stable aliases; measurements are unchanged.
+Full UUIDs and paths remain in the private raw manifests, bound by the JSON
+`_sanitization.original_sha256` digest.
+
 The adapter uses the public `SealedKvBlock` / `KvSnapshot` manifests introduced
 by PR #267. It retains NInfer's native page transfer batches, lane scheduler,
 checkpoint directory, `HostKvStorage` account and `StorageIoQueue`. No second
@@ -66,9 +70,9 @@ not PCIe bus counters. Existing physical/IO/state/staging counters remain expose
 ## Validation environment and scope
 
 All compilation and execution took place on the isolated M16 worktree:
-`C:/Users/wangl/AppData/Local/KVMem-Lab/ninfer-shared-snapshots-20261106`.
+`$ARTIFACTS-Lab/ninfer-shared-snapshots-20261106`.
 GPU: RTX 3080 Ti Laptop, UUID
-`GPU-efccbf18-69bb-6d42-5bea-b6b70e26524e`, driver 555.97.
+`GPU-A`, driver 555.97.
 MSVC 19.44.35222, CUDA 12.9.86, SDK 10.0.26100, Release, SM86. Dependency
 bundles were pinned and checked before build/validation. GPU occupancy and an
 exclusive task marker were checked before each run; foreign processes were not
