@@ -57,7 +57,7 @@ struct Engine {
         if (speculative) {
             infos.resize(6);
             auto& draft = infos[5];
-            draft.name = "drafter-window"; draft.layers = {8};
+            draft.name = "drafter-window"; draft.layers = {8}; draft.drafter = true;
             draft.decl.kind = RAD_KV_WINDOW; draft.decl.dtype = dtype;
             draft.decl.n_head_kv = 1; draft.decl.head_dim = 8;
             draft.decl.window = 64; draft.block_size = 16;
@@ -205,7 +205,40 @@ int main(int argc, char** argv) {
             kv.clear_state_clears();
             tokens.push_back(10);anchor->restore(kv,29,tokens,device,sidecar->stream);
             CHECK(kv.seq_tokens(29)==128 && read_pages(29,1)==full1 && read_pages(29,2)==full2);
-            CHECK(kv.block_table(29,5).empty() && kv.window_epoch(29)==1 && kv.window_floor(29)==128);
+            CHECK(kv.first_block_pos(29,5)==window_begin && read_pages(29,5)==accepted_window);
+            CHECK(kv.window_epoch(29)>0 && kv.window_floor(29)==window_begin);
+            // Tiered/forked prefixes must retain their own immutable draft bytes.
+            anchor->demote(device,sidecar->stream,1024*1024);
+            auto window_storage=std::make_shared<HostKvStorage>(1024*1024);
+            anchor->park(window_storage,{});
+            auto forked=anchor->fork();
+            auto payload=forked->load_cpu();
+            kv.free_sequence(29);
+            CHECK(kv.add_sequence(31)==RAD_OK && kv.ensure(31,1)==RAD_OK);
+            kv.clear_state_clears();
+            auto truncated=payload;
+            truncated.window.pop_back();
+            bool truncated_refused=false;
+            try{forked->restore(kv,31,tokens,device,sidecar->stream,&truncated);}
+            catch(const std::runtime_error&){truncated_refused=true;}
+            CHECK(truncated_refused && kv.seq_tokens(31)==1 && kv.window_epoch(31)==0);
+            forked->restore(kv,31,tokens,device,sidecar->stream,&payload);
+            CHECK(kv.seq_tokens(31)==128 && read_pages(31,5)==accepted_window);
+            WindowCheckpoint query_window;
+            query_window.save(kv,31,128,device,sidecar->stream);
+            std::vector<rad::KVManager::FullTable> query_tables;
+            for(int group=1;group<=2;++group)query_tables.push_back({group,kv.block_table(31,group)});
+            CHECK(kv.ensure(31,160,128)==RAD_OK);
+            CHECK(kv.rewind_full_tables(31,160,128,128,query_tables)==RAD_OK);
+            CHECK(kv.block_table(31,5).empty() && kv.window_floor(31)==128);
+            query_window.restore(kv,31,device,sidecar->stream);
+            CHECK(read_pages(31,5)==accepted_window && kv.window_floor(31)==window_begin);
+            const auto restored_epoch=kv.window_epoch(31);
+            auto duplicate=kv.block_table(31,5);
+            CHECK(duplicate.size()>1);
+            duplicate[1]=duplicate[0];
+            CHECK(kv.restore_window_tables(31,128,window_begin,{{5,window_begin,duplicate}})==RAD_E_INVAL);
+            CHECK(kv.window_epoch(31)==restored_epoch && read_pages(31,5)==accepted_window);
             std::cout<<"DFlash split-prefill boundary: stale reserved lookahead rejected; drained trim, Pressure, window bytes/epoch and immutable anchor PASS\n";
         }
         const auto disk_directory=std::filesystem::temp_directory_path()/
@@ -556,6 +589,8 @@ int main(int argc, char** argv) {
                 sparse.push_back({g, selected});
             }
             CHECK(kv.publish_full_tables(17, 133, 69, sparse) == RAD_OK);
+            const auto saved_window_first = speculative ? std::max<int64_t>(kv.first_block_pos(17, 5),
+                (133 / kv.plan(5)->block_size - (kv.plan(5)->window_blocks - 1)) * kv.plan(5)->block_size) : 0;
             std::vector<int32_t> prefix(133);
             for (size_t i = 0; i < prefix.size(); ++i) prefix[i] = int32_t(i);
             auto lease = std::make_unique<PrefixLease>(leased_engine, kv, 17, prefix, device, leased_engine->stream);
@@ -591,8 +626,18 @@ int main(int argc, char** argv) {
             CHECK(refused_prefix && kv.seq_tokens(29) == 1);
             lease->restore(kv, 29, next, device, leased_engine->stream);
             if (speculative) {
-                CHECK(kv.block_table(29, 5).empty());
-                CHECK(kv.window_epoch(29) == 1 && kv.window_floor(29) == 133);
+                CHECK(!kv.block_table(29, 5).empty());
+                CHECK(kv.first_block_pos(29, 5) == saved_window_first);
+                CHECK(kv.window_epoch(29) == 2 && kv.window_floor(29) == saved_window_first);
+                const auto& p = *kv.plan(5);
+                for (auto page : kv.block_table(29, 5)) {
+                    PageTransfer read(device, p.layer_bytes_per_block(), leased_engine->stream);
+                    read.spill({{5, uint64_t(page) * p.layer_bytes_per_block(), 0,
+                                 uint64_t(p.layer_bytes_per_block())}},
+                               {{5, p.base, uint64_t(p.pool_bytes)}}, leased_engine->stream);
+                    CHECK(read.drain());
+                    for (auto value : read.payload()) CHECK(value == 47);
+                }
             }
             CHECK(kv.seq_tokens(29) == 133 && !kv.canonical(29));
             for (const auto& t : sparse) {

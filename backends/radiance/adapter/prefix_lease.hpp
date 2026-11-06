@@ -1,5 +1,6 @@
 #pragma once
 #include "state_checkpoint.hpp"
+#include "window_checkpoint.hpp"
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
@@ -19,6 +20,7 @@ class PrefixLease {
     std::vector<std::pair<int32_t, int32_t>> refs_;
     std::vector<int32_t> tokens_;
     StateCheckpoint state_;
+    WindowCheckpoint window_;
     int64_t visible_ = -1;
     std::vector<uint8_t> host_;
     std::unique_ptr<TieredBuffer> parked_host_;
@@ -27,7 +29,7 @@ class PrefixLease {
     struct ForkTag {};
     PrefixLease(const PrefixLease& source,ForkTag)
         : lifetime_(source.lifetime_),owner_(source.owner_),tables_(source.tables_),tokens_(source.tokens_),
-          state_(source.state_.fork()),visible_(source.visible_),host_(source.host_),io_(source.io_),payload_identity_(source.payload_identity_) {
+          state_(source.state_.fork()),window_(source.window_.fork()),visible_(source.visible_),host_(source.host_),io_(source.io_),payload_identity_(source.payload_identity_) {
         if(!source.refs_.empty() || !source.host_bytes())throw std::runtime_error("fork requires a parked prefix");
         if(source.parked_host_)parked_host_=source.parked_host_->fork();
     }
@@ -56,19 +58,20 @@ class PrefixLease {
     }
 public:
     void account(SharedPayloadAccounting& out) const {
-        if(parked_host_)parked_host_->account(out);state_.account(out);
+        if(parked_host_)parked_host_->account(out);state_.account(out);window_.account(out);
     }
     class Payload {
         friend class PrefixLease;
         std::shared_ptr<const int> identity_;
     public:
-        std::vector<uint8_t> kv,state;
+        std::vector<uint8_t> kv,state,window;
     };
     // CPU-worker operation on an immutable parked fork. No device calls.
     Payload load_cpu() const {
         if(!refs_.empty() || !host_bytes())throw std::runtime_error("CPU prefix load requires parked pages");
         Payload out;out.identity_=payload_identity_;
-        out.kv=parked_host_ ? parked_host_->read() : host_;out.state=state_.load_cpu();return out;
+        out.kv=parked_host_ ? parked_host_->read() : host_;
+        out.state=state_.load_cpu();out.window=window_.load_cpu();return out;
     }
     PrefixLease(std::shared_ptr<void> lifetime, rad::KVManager& kv, uint64_t source,
                 std::vector<int32_t> evaluated_prefix, int device, RadStream stream,
@@ -96,6 +99,7 @@ public:
         refs_.reserve(count);
         try {
             state_.save(kv, source, device, stream, accepted);
+            window_.save(kv, source, int64_t(tokens_.size()), device, stream);
             for (const auto& t : tables_) for (const auto block : t.blocks) {
                 if (kv.retain_block(t.group, block) < 0) throw std::runtime_error("prefix page retention failed");
                 refs_.emplace_back(t.group, block);
@@ -116,7 +120,7 @@ public:
     }
     size_t frontier() const noexcept { return tokens_.size(); }
     size_t host_bytes() const noexcept { return parked_host_ ? parked_host_->size() : host_.size(); }
-    size_t state_bytes() const noexcept { return state_.bytes(); }
+    size_t state_bytes() const noexcept { return state_.bytes() + window_.bytes(); }
     uint64_t page_bytes() const { return host_bytes() ? host_bytes() : copies(tables_).bytes; }
     // Only called at a drained boundary when the live selection needs leased
     // pages. No new page allocator; save opaque native bytes before releasing
@@ -136,12 +140,14 @@ public:
     }
     void park(const std::shared_ptr<HostKvStorage>& storage,const std::shared_ptr<StorageIoQueue>& io) {
         if(!refs_.empty() || !host_bytes())throw std::runtime_error("prefix must be demoted before tiering");
-        state_.park(storage,io);park_buffer(host_,parked_host_,storage,io);io_=io;
+        state_.park(storage,io);window_.park(storage,io);
+        park_buffer(host_,parked_host_,storage,io);io_=io;
     }
     void restore(rad::KVManager& kv, uint64_t destination, const std::vector<int32_t>& prompt,
                  int device, RadStream stream,const Payload* prepared=nullptr) const {
         if (&kv != owner_ || !matches(prompt)) throw std::runtime_error("prefix identity mismatch");
-        if(prepared && (prepared->identity_!=payload_identity_ || prepared->kv.size()!=host_bytes() || prepared->state.size()!=state_bytes()))
+        if(prepared && (prepared->identity_!=payload_identity_ || prepared->kv.size()!=host_bytes() ||
+            prepared->state.size()!=state_.bytes() || prepared->window.size()!=window_.bytes()))
             throw std::runtime_error("prepared prefix payload size mismatch");
         const auto expected = kv.seq_tokens(destination);
         auto tables = tables_;
@@ -184,6 +190,7 @@ public:
                 throw std::runtime_error("prefix page publication failed");
             published = true;
             state_.restore_rebound(kv, destination, device, stream,prepared ? &prepared->state : nullptr);
+            window_.restore(kv, destination, device, stream,prepared ? &prepared->window : nullptr);
             release_reserved(); // publication retained its own native references
         }
         catch (...) {

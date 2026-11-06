@@ -5,12 +5,11 @@
 #include <vector>
 
 namespace kvmem::radiance {
-// A restored trunk prefix does not include a block drafter's hidden-state/KV
-// window. Leave that declared window to prefill, and never cross a new Query.
-inline uint64_t restorable_prefix_limit(uint64_t prompt, int64_t query_begin, uint64_t draft_window) {
+// Prefix leases include accepted draft-window bytes. A restore stays behind the
+// final token (no saved logits) and before a new Query.
+inline uint64_t restorable_prefix_limit(uint64_t prompt, int64_t query_begin) {
     if (!prompt) return 0;
     uint64_t limit = prompt - 1; // A cached state carries no logits for the final token.
-    if (draft_window) limit = std::min(limit, prompt > draft_window ? prompt - draft_window : 0);
     if (query_begin >= 0) limit = std::min(limit, uint64_t(query_begin));
     return limit;
 }

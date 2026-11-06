@@ -1,5 +1,6 @@
 #include "prefix_directory.hpp"
 #include "checkpoint_handoff.hpp"
+#include "draft_conditioning.hpp"
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -32,25 +33,31 @@ static void checkpoint_publication_preserves_ownership() {
     }
 }
 static void drafter_refill_limits_and_early_input_anchors() {
-    check(restorable_prefix_limit(1010,-1,2048)==0,"short tool continuation must cold-prefill its drafter window");
-    check(restorable_prefix_limit(4192,4165,2048)==2144,"drafter refill must cap a two-stage document hit");
-    check(restorable_prefix_limit(4192,2000,2048)==2000,"new Query is an independent restore bound");
-    check(restorable_prefix_limit(4192,-1,2048)==2144,"unknown Query does not remove native drafter refill");
-    check(restorable_prefix_limit(4192,4165,0)==4165,"ordinary native prefixes retain their existing Query limit");
-    check(restorable_prefix_limit(0,-1,2048)==0,"empty input has no restorable state");
+    check(restorable_prefix_limit(1010,-1)==1009,"complete draft state supports short follow-ups");
+    check(restorable_prefix_limit(4192,4165)==4165,"new Query remains an independent restore bound");
+    check(restorable_prefix_limit(4192,2000)==2000,"restored state must not cross the new Query");
+    check(restorable_prefix_limit(4192,-1)==4191,"complete windows do not impose a fixed rewind");
+    check(restorable_prefix_limit(0,-1)==0,"empty input has no restorable state");
+    const auto keep=draft_keep_allocation(128,4096,128,128,2048);
+    check(keep.recent_effective_tokens==2048 && keep.sink_effective_tokens==128,"protect draft conditioning pages inside the same budget");
+    check(draft_keep_allocation(128,4096,128,3072,2048).recent_effective_tokens==3072,"larger recent allocation is retained");
+    check(draft_keep_allocation(128,4096,128,128,0).recent_effective_tokens==128,"non-block drafting keeps the requested recent");
+    bool refused=false;
+    try{(void)draft_keep_allocation(128,2048,128,128,2048);}catch(const std::runtime_error&){refused=true;}
+    check(refused,"a draft ring cannot silently grow the selected budget");
     std::vector<int32_t> prompt(4192);std::iota(prompt.begin(),prompt.end(),1000);
     const std::vector<int32_t> input(prompt.begin(),prompt.begin()+2048);
     const std::vector<int32_t> terminal(prompt.begin(),prompt.begin()+4160);
     int input_state=1,terminal_state=2;
     std::vector<PrefixCandidate> points{{&terminal,&terminal_state,CheckpointPurpose::Endpoint,true},
         {&input,&input_state,CheckpointPurpose::ReuseAnchor,true}};
-    const auto limit=restorable_prefix_limit(prompt.size(),4165,2048);
-    check(select_prefix_checkpoint(prompt,points,limit)==&input_state,
-        "document question must choose its real 2048 native input state instead of the late terminal state");
-    check(select_prefix_checkpoint(prompt,points,restorable_prefix_limit(prompt.size(),4165,0))==&terminal_state,
+    const auto limit=restorable_prefix_limit(prompt.size(),4165);
+    check(select_prefix_checkpoint(prompt,points,limit)==&terminal_state,
+        "complete native draft state permits the later terminal checkpoint");
+    check(select_prefix_checkpoint(prompt,points,restorable_prefix_limit(prompt.size(),4165))==&terminal_state,
         "spec-off keeps its later exact terminal prefix");
     points.pop_back();
-    check(!select_prefix_checkpoint(prompt,points,limit),"an LCP cannot invent the missing early recurrent state");
+    check(select_prefix_checkpoint(prompt,points,limit)==&terminal_state,"restoring the actual terminal state does not require an earlier checkpoint");
     check(retain_drafter_input_anchor(2048,2048,3638,2048,-1),
         "first-pass natural input state before Query and its future checkpoint is reusable");
     check(retain_drafter_input_anchor(2048,2048,3638,2048,3584),

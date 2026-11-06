@@ -1,0 +1,126 @@
+diff --git a/core/mem/kv.h b/core/mem/kv.h
+--- a/core/mem/kv.h
++++ b/core/mem/kv.h
+@@ -556,6 +556,11 @@
+     // releases its old references; the caller retains and releases reservations.
+     // All FULL groups publish together. WINDOW groups are not supported here.
+     struct FullTable { int32_t group; std::vector<int32_t> blocks; };
++    // Accepted draft-window bytes are restored by the adapter before publishing
++    // these tables. This operation does not move the logical checkpoint.
++    struct WindowTable { int32_t group; int64_t first; std::vector<int32_t> blocks; };
++    int restore_window_tables(uint64_t seq, int64_t frontier, int64_t floor,
++                              const std::vector<WindowTable>& tables);
+     int publish_full_tables(uint64_t seq, int64_t expected_frontier, int64_t visible_tokens,
+                             const std::vector<FullTable>& tables);
+     // Explicit replay boundary: replace the attention view and rewind its logical
+diff --git a/core/mem/kv.cpp b/core/mem/kv.cpp
+--- a/core/mem/kv.cpp
++++ b/core/mem/kv.cpp
+@@ -1107,6 +1107,51 @@
+     return s && s->canonical;
+ }
+ 
++int KVManager::restore_window_tables(uint64_t id, int64_t frontier, int64_t floor,
++                                     const std::vector<WindowTable>& tables) {
++    Seq* sequence = find(id);
++    if (!sequence || sequence->n_tokens != frontier || frontier < 0 || floor < 0 || floor > frontier ||
++        sequence->window_epoch == UINT64_MAX) return RAD_E_STATE;
++    auto next = tables;
++    std::vector<bool> seen(plans_.size(), false);
++    for (const auto& table : next) {
++        const auto* group = plan(table.group);
++        if (!group || group->kind != RAD_KV_WINDOW || !group->drafter || group->zero ||
++            group->runtime_win || sequence->win[(size_t)table.group].set ||
++            seen[(size_t)table.group] || group->block_size <= 0 ||
++            table.first < 0 || table.first > floor || table.first % group->block_size ||
++            int64_t(table.blocks.size()) != ceil_div(frontier - table.first, group->block_size) ||
++            int64_t(table.blocks.size()) > window_seq_cap(*group)) return RAD_E_INVAL;
++        seen[(size_t)table.group] = true;
++        std::set<int32_t> unique;
++        for (auto page : table.blocks) {
++            if (page < 0 || page >= live_blocks(table.group) ||
++                block_refcount(table.group, page) <= 0 || !unique.insert(page).second)
++                return RAD_E_INVAL;
++        }
++    }
++    for (const auto& group : plans_) {
++        if (group.kind == RAD_KV_WINDOW && !group.zero && !seen[(size_t)group.index])
++            return RAD_E_INVAL;
++    }
++    if (next.empty()) return RAD_E_INVAL;
++    for (const auto& table : next) {
++        auto& free = free_blocks_[(size_t)table.group];
++        free.reserve(free.size() + sequence->blocks[(size_t)table.group].size());
++    }
++    // All validation/allocation precedes reference-count and table publication.
++    for (auto& table : next) {
++        for (auto page : table.blocks) add_ref((size_t)table.group, page);
++        sequence->blocks[(size_t)table.group].swap(table.blocks);
++        for (auto page : table.blocks) drop_block(table.group, page);
++        sequence->first_block_pos[(size_t)table.group] = table.first;
++        sequence->dirty_from[(size_t)table.group] = 0;
++    }
++    sequence->window_floor = floor;
++    ++sequence->window_epoch;
++    return RAD_OK;
++}
++
+ uint64_t KVManager::window_epoch(uint64_t id) const {
+     const Seq* s = find(id);
+     return s ? s->window_epoch : 0;
+diff --git a/core/sched/scheduler.cpp b/core/sched/scheduler.cpp
+--- a/core/sched/scheduler.cpp
++++ b/core/sched/scheduler.cpp
+@@ -1363,7 +1363,7 @@
+     Request& r = *s.req;
+     if (r.history_end > 0) {
+         const auto q = std::max<int64_t>(geo_.quantum, 1);
+-        r.history_reuse_end=int32_t(std::max<int64_t>(0,int64_t(r.history_reuse_end)-draft_refill_)/q*q);
++        r.history_reuse_end=r.history_reuse_end>0 ? int32_t(int64_t(r.history_reuse_end)/q*q) : -1;
+         r.history_fallback_end=r.history_fallback_end>0 ? int32_t(int64_t(r.history_fallback_end)/q*q) : -1;
+         // Retain an already natural prefill boundary. Splitting a native chunk
+         // just to save history changes recurrent FP arithmetic even before any
+@@ -1371,10 +1371,9 @@
+         auto stride = std::max<int64_t>(q, cfg_.max_tok / q * q);
+         if (geo_.checkpoint_interval > 0)
+             stride = std::gcd(stride, geo_.checkpoint_interval);
+-        // An integration checkpoint must obey the same declared drafter-window
+-        // refill as the native prefix-cache hit cap below. Leave its final
+-        // window unevaluated after a future resume, at a natural chunk boundary.
+-        r.history_end = int32_t(std::max<int64_t>(0, int64_t(r.history_end) - draft_refill_) / stride * stride);
++        // The integration captures the native draft window with this accepted
++        // input state. Retain its natural boundary without a fixed rewind.
++        r.history_end = int32_t(int64_t(r.history_end) / stride * stride);
+     }
+ 
+     /* A REQUEST THAT WAS PREEMPTED WAITS FOR ROOM FOR THE WHOLE RECOMPUTE, plus one block of
+@@ -2640,7 +2639,9 @@
+     // IKVManager deliberately exposes no backend-specific snapshot ownership.
+     if (refusal.empty() && (pos <= 0 || pos >= int64_t(s.req->prompt.size()))) return RAD_E_INVAL;
+     if (refusal.empty() && draft_refill_ > 0 &&
+-        pos > int64_t(s.req->prompt.size()) - draft_refill_) return RAD_E_INVAL;
++        pos > int64_t(s.req->prompt.size()) - draft_refill_ &&
++        (!kv_->window_epoch(seq) ||
++         kv_->window_floor(seq) > std::max<int64_t>(0, pos - draft_refill_))) return RAD_E_INVAL;
+     s.entry = -1; s.sched_tokens = 0;
+     step_open_ = false;
+     // No model work has occurred: neither evaluated-token counters nor an
+@@ -2654,6 +2655,9 @@
+         } else {
+             s.req->n_computed = s.req->n_cached = int32_t(pos);
+             s.req->n_draft = 0; s.drafter_reset();
++            sync_draft_window(s);
++            // Complete restoration proves coverage through this accepted frontier.
++            s.draft_hi = std::max<int64_t>(s.draft_lo, pos);
+             m_.attn_cached_tokens += pos;
+             if (has_linear_state_) m_.linear_cached_tokens += pos;
+             server::sink_prompt_progress(s.req->sink, int32_t(pos), int32_t(s.req->prompt.size()), int32_t(pos));
+@@ -2677,6 +2681,8 @@
+         s.req->n_computed = pos;
+         s.req->n_draft = 0;
+         s.drafter_reset();
++        sync_draft_window(s);
++        s.draft_hi = std::max<int64_t>(s.draft_lo, pos);
+     }
+     s.entry = -1; s.sched_tokens = 0;
+     step_open_ = false;

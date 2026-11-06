@@ -26,7 +26,7 @@
 
 共享启动器使用 `SpeculativeMode=dflash2`，启动前核对容器的草稿类型与训练深度。关闭草稿使用 `SpeculativeMode=none`。独立 `backends/radiance/tools/serve.py` 根据模型目录选择架构插件和草稿，显式参数经过匹配校验。Radiance 1.17 的 prefix host cache 参数为 `--prefix-cache-mib`，普通启动入口已采用该名称。
 
-原生缓存观察、Query 回放、已接受 token 的统计和 recurrent state 物化已迁移。DFlash 窗口在回放后通过 epoch 失效，草稿覆盖范围从恢复位置重新累计。GDN materializer 核对实际 producer 的 ABI、layout 和导出函数。物理 KV 池由 KVMem 工作集预算限制，原生 admission 使用独立的逻辑上下文上限检查请求。
+原生缓存观察、Query 回放、已接受 token 的统计和 recurrent state 物化已迁移。11 月 5 日的历史版本在回放后通过 epoch 使 DFlash 窗口失效，再从恢复位置重新累计；[11 月 6 日的窗口保留改动](radiance-dflash-conditioning-20261106.md)已替代此策略，保存并恢复接受位置的实际草稿 KV，不再固定提前 checkpoint。GDN materializer 核对实际 producer 的 ABI、layout 和导出函数。物理 KV 池由 KVMem 工作集预算限制，原生 admission 使用独立的逻辑上下文上限检查请求。
 
 本轮构建先核对既有对象、完整头依赖、编译命令与固定依赖，再审查指定目标的 dry-run。23 个旧 host 对象经过 fresh proof 重验后符合复用条件。记录中的编译阶段如下，各阶段包含对已有单元的增量编译。
 

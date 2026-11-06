@@ -93,8 +93,12 @@ conversation. Clients that need reliable lineage selection should send a key.
 Radiance retains both a deep input point and a conservative point before the
 first assistant message, when those are safe native chunk boundaries. An input
 edit or template rewrite may require falling back or recomputation. It cannot
-restore recurrent state at an arbitrary LCP. The scheduler respects native
-prefill quantum and speculative refill requirements. Extra prefill cuts can
+restore recurrent state at an arbitrary LCP. DFlash recent selection covers its
+declared window; accepted prefix and Query checkpoints include the matching
+native window bytes, including RAM/SSD parking and forks. Restoring these bytes
+keeps the saved frontier instead of subtracting a fixed window. The scheduler
+still respects native prefill quantum, Query boundaries and uncached logits;
+its separate native-cache refill gate remains for hits without window state. Extra prefill cuts can
 change floating-point accumulation; text equality is not the sole correctness
 test.
 

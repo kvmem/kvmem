@@ -2,6 +2,7 @@
 #include "pool_geometry.hpp"
 #include "checkpoint_handoff.hpp"
 #include "rolling_pressure.hpp"
+#include "draft_conditioning.hpp"
 #include "kvmem/mean_key_retrieval.hpp"
 #include "mem/kv.h"
 #include "build/startup.h"
@@ -55,6 +56,10 @@ int StatisticsObserver::pool_token_limit(const rad::Config& cfg, const rad::Prog
             pages.push_back(positive(p.kv_groups[g].block_size));
         }
         const auto geometry = pool_geometry(options_.block_tokens, options_.budget_tokens, positive(cfg.max_tok), pages);
+        const auto draft_window = cfg.n_spec > 0 && p.drafter.kind == RAD_DRAFT_BLOCK && p.drafter.window > 0
+            ? positive(p.drafter.window) : 0U;
+        (void)draft_keep_allocation(geometry.block_tokens, options_.budget_tokens,
+            options_.sink_tokens, options_.recent_tokens, draft_window);
         // Native refs stay shared until pressure. Host demotion then makes old
         // pages recyclable without a permanent second view-sized GPU reserve.
         *out = leased_pool_tokens(geometry, options_.budget_tokens, options_.replay_tokens);
@@ -143,8 +148,11 @@ int StatisticsObserver::configure(const rad::Config& cfg, rad::CtxDesc& desc) no
         require(!options_.budget_tokens || (options_.budget_tokens % block_tokens == 0 &&
                 options_.budget_tokens >= 2 * block_tokens), "selection budget needs whole blocks and room for sink + tail");
         if (options_.budget_tokens) {
-            keep_ = resolve_kvmem_keep_allocation(uint32_t(block_tokens), options_.budget_tokens,
-                -1, -1, options_.sink_tokens, options_.recent_tokens);
+            keep_ = draft_keep_allocation(uint32_t(block_tokens), options_.budget_tokens,
+                options_.sink_tokens, options_.recent_tokens, block_drafter_window_);
+            if (block_drafter_window_)
+                RAD_INFO("KVMEM_DFLASH_RECENT requested=%lld effective=%u ring=%u window_checkpoint=1",
+                    (long long)options_.recent_tokens, keep_.recent_effective_tokens, block_drafter_window_);
             RAD_INFO("KVMEM_KEEP sink_tokens=%u recent_tokens=%u sink_blocks=%u recent_blocks=%u budget=%u",
                 keep_.sink_effective_tokens, keep_.recent_effective_tokens,
                 keep_.sink_blocks, keep_.recent_blocks, options_.budget_tokens);
@@ -343,7 +351,7 @@ uint64_t StatisticsObserver::input_extra_bytes() const {
     return total;
 }
 uint64_t StatisticsObserver::restore_limit(const rad::Request& request) const {
-    return restorable_prefix_limit(request.prompt.size(), request.query_begin, block_drafter_window_);
+    return restorable_prefix_limit(request.prompt.size(), request.query_begin);
 }
 StatisticsObserver::RetainedSession* StatisticsObserver::select_checkpoint(RetainedSession& saved,
                                                                          const rad::Request& request, bool shared) const {
@@ -856,7 +864,7 @@ int StatisticsObserver::begin(const rad::StepPlan& plan) noexcept {
              frontier_ / store_config_.block_tokens == uint32_t(query_begin_) / store_config_.block_tokens)) {
             require(fresh_reserve_error(*e.req).empty(), "output and verify step exceed the generation reserve");
             checkpoint_ = std::make_unique<RankCheckpoint>();
-            for(auto& rank:ranks_)checkpoint_->save_rank(*rank->resources.kv,active_request_,rank->device,rank->resources.ctx->stream());
+            for(auto& rank:ranks_)checkpoint_->save_rank(*rank->resources.kv,active_request_,rank->device,rank->resources.ctx->stream(),frontier_);
             checkpoint_mean_ = store_->mean_checkpoint(frontier_);
             replay_start_ = frontier_;
             checkpoint_recall_ = std::make_unique<RecallSnapshot>(recall_->checkpoint());

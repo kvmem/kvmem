@@ -12,6 +12,13 @@ replay, graph recall and LRFU. Prefill/decode Pressure selects resident history;
 ordinary tool continuation does not recall cold history.
 
 Cache ownership follows the common [checkpoint contract](../../docs/checkpoint-policy.md#shared-owners-in-ninfer-and-radiance).
+
+DFlash keeps at least its declared window in the recent selection. Accepted
+prefix and Query checkpoints carry an immutable copy of the native draft-window
+KV alongside recurrent state; RAM/SSD parking and forks include these bytes.
+Restoration publishes both at the saved frontier, without a fixed window-sized
+checkpoint setback. Native prefill alignment, Query boundaries and the final
+uncached token still constrain reuse. See the [conditioning validation](../../docs/radiance-dflash-conditioning-20261106.md).
 New user requests may discover exact prefixes across named or anonymous owners;
 native branches share sealed host/SSD records while keeping mutable state
 independent. Admission deducts only proven physical aliases. GPU page sharing
