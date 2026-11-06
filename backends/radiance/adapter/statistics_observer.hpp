@@ -161,6 +161,7 @@ private:
         std::shared_ptr<HostKvStorage> payload;
         std::shared_ptr<StorageIoQueue> io;
         uint64_t hits=0,evictions=0,forks=0,cross_owner_forks=0;
+        uint64_t capture_bytes=0,capture_logical_bytes=0;
         uint64_t actual_own_hits=0,actual_shared_hits=0,actual_misses=0;
         std::deque<RetainedSession> sessions; // LRU, owns no live native sequence
         std::vector<std::unique_ptr<PendingPark>> parking;
@@ -184,12 +185,12 @@ private:
         bool publish(RetainedSession&&,size_t max_groups,bool already_charged=false);
         uint64_t bytes = 0, active_archive_bytes = 0, active_checkpoint_bytes = 0;
         std::set<const StatisticsObserver*> observers; // scheduler-thread ownership only
-        uint64_t sharing_credit(const RetainedSession* extra=nullptr) const;
+        uint64_t sharing_credit(const RetainedSession* extra=nullptr,const RankPrefix* incoming=nullptr) const;
     };
     std::shared_ptr<CacheState> cache_ = std::make_shared<CacheState>();
     uint64_t archive_charge_ = 0;
     uint64_t input_charge_ = 0;
-    uint64_t history_allowance(const RetainedSession* extra=nullptr) const;
+    uint64_t history_allowance(const RetainedSession* extra=nullptr,const RankPrefix* incoming=nullptr) const;
     uint64_t next_incarnation_ = 1, steps_ = 0;
     uint32_t frontier_ = 0, max_position_ = 0;
     std::vector<double> query_total_;

@@ -79,6 +79,13 @@ public:
         }
     }
     std::shared_ptr<HostKvStorage> storage() const noexcept { return storage_; }
+    // Native-proven capture in this exact layout: no copy or extra charge.
+    void import(const BlockDescriptor& block,const HostKvRecord& record) {
+        if(record.size()!=layout_.record_bytes)
+            fail(MemoryErrorCode::InvalidPlan,"captured archive layout size differs");
+        Prepared next;next.backend=backend_;next.layout=layout_;next.block=block;
+        next.record=record.fork();publish(std::move(next));
+    }
     TieredArchive fork(SessionIdentity branch,const MemorySnapshot& snapshot) const {
         if(branch==session_)fail(MemoryErrorCode::InvalidPlan,"archive branch needs a distinct session identity");
         TieredArchive next(backend_,branch,layout_,capacity_,storage_);

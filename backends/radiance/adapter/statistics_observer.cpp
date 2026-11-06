@@ -292,7 +292,7 @@ void StatisticsObserver::clear_session() {
     recall_.reset(); checkpoint_recall_.reset(); prefix_recall_.reset();
     accepted_view_ = {};
 }
-uint64_t StatisticsObserver::CacheState::sharing_credit(const RetainedSession* extra) const {
+uint64_t StatisticsObserver::CacheState::sharing_credit(const RetainedSession* extra,const RankPrefix* incoming) const {
     SharedPayloadAccounting out;
     const auto saved=[&](auto&& self,const RetainedSession& point)->void {
         if(point.memory)point.memory->account_archive(out);
@@ -313,10 +313,11 @@ uint64_t StatisticsObserver::CacheState::sharing_credit(const RetainedSession* e
         }
     }
     if(extra)saved(saved,*extra);
+    if(incoming)incoming->account(out);
     return out.credit();
 }
-uint64_t StatisticsObserver::history_allowance(const RetainedSession* extra) const {
-    const auto limit=options_.history_bytes(),credit=cache_->sharing_credit(extra);
+uint64_t StatisticsObserver::history_allowance(const RetainedSession* extra,const RankPrefix* incoming) const {
+    const auto limit=options_.history_bytes(),credit=cache_->sharing_credit(extra,incoming);
     require(credit<=UINT64_MAX-limit,"shared history allowance overflow");
     return limit+credit;
 }
@@ -336,7 +337,7 @@ void StatisticsObserver::update_input_charge(uint64_t bytes) {
 uint64_t StatisticsObserver::retained_bytes(const RetainedSession& saved) {
     require(saved.prefix && saved.memory && saved.store && saved.policy && saved.recall &&
         saved.recall_snapshot && saved.identity, "incomplete checkpoint accounting");
-    return saved.prefix->page_bytes()+saved.prefix->state_bytes()+saved.memory->archive_bytes()+
+    return saved.prefix->page_bytes()+saved.prefix->state_bytes()+saved.prefix->metadata_bytes()+saved.memory->archive_bytes()+
         saved.store->allocated_bytes()+saved.policy->allocated_bytes()+saved.recall->allocated_bytes()+
         saved.recall_snapshot->graph.bytes()+saved.recall_snapshot->feedback.bytes()+
         saved.mean.size()*sizeof(float)+saved.identity->tokens.size()*sizeof(int32_t)+
@@ -409,9 +410,10 @@ void StatisticsObserver::capture_input(std::shared_ptr<const CachedIdentity> ide
     auto saved=std::make_unique<RetainedSession>();
     saved->session={session_.id,next_incarnation_++};saved->content_version=content_version_;saved->group=cache_group_;saved->identity=std::move(identity);
     saved->prefix=std::make_unique<RankPrefix>();
-    for(auto& rank:ranks_) {
+    for(size_t i=0;i<ranks_.size();++i) {
+        auto& rank=ranks_[i];auto capture=memory_->prefix_capture(i);
         auto lease=std::make_unique<PrefixLease>(rank->resources.lifetime,*rank->resources.kv,active_request_,
-            saved->identity->tokens,rank->device,rank->resources.ctx->stream());
+            saved->identity->tokens,rank->device,rank->resources.ctx->stream(),AcceptedState{},&capture);
         saved->prefix->add_rank(rank->device,rank->resources.ctx->stream(),*rank->resources.kv,std::move(lease));
     }
     saved->mean=store_->mean_checkpoint(frontier_);
@@ -434,7 +436,14 @@ void StatisticsObserver::capture_input(std::shared_ptr<const CachedIdentity> ide
     }
     // No extra persistent GPU view: copy once, release page references before
     // the next append/Pressure, then let the bounded storage worker seal it.
+    const bool capture_needed=!saved->prefix->host_bytes();
+    const auto copied_before=saved->prefix->copied_bytes();
     saved->prefix->demote(saved->prefix->page_bytes());
+    const auto copied=saved->prefix->copied_bytes()-copied_before;
+    cache_->capture_bytes+=copied;
+    if(capture_needed)cache_->capture_logical_bytes+=saved->prefix->page_bytes();
+    RAD_INFO("KVMEM_PREFIX_CAPTURE frontier=%u logical_bytes=%llu copied_bytes=%llu",frontier_,
+        (unsigned long long)(capture_needed ? saved->prefix->page_bytes() : 0),(unsigned long long)copied);
     if(asynchronous_ && cache_->payload && cache_->io) {
         input_parking_=std::make_unique<PendingPark>();
         input_parking_->work=std::make_shared<ParkWork>();input_parking_->work->storage=cache_->payload;
@@ -467,7 +476,7 @@ bool StatisticsObserver::poll_input() {
     try {
         if(!pending.ticket) {
             const auto work=pending.work;
-            pending.ticket=cache_->io->submit(work->prefix->host_bytes()+work->prefix->state_bytes(),[work]{work->run();});
+            pending.ticket=cache_->io->submit(work->prefix->staging_bytes(),[work]{work->run();});
         }
         if(!pending.ticket.ready())return false;
         pending.ticket.wait();pending.saved.prefix=std::move(pending.work->prefix);
@@ -586,14 +595,14 @@ void StatisticsObserver::park_session() {
     require(identity && memory_ && store_ && policy_ && recall_, "incomplete session cache entry");
     // Count inactive KV, recurrent state and statistical metadata against one
     // retained-host allowance. Model/runtime workspace is not a cache payload.
-    const uint64_t fixed = input_extra_bytes() + prefix_->state_bytes() + memory_->archive_bytes() + store_->allocated_bytes() +
+    const uint64_t fixed = input_extra_bytes() + prefix_->state_bytes() + prefix_->metadata_bytes() + memory_->archive_bytes() + store_->allocated_bytes() +
         policy_->allocated_bytes() + recall_->allocated_bytes() + prefix_recall_->graph.bytes() +
         prefix_recall_->feedback.bytes() + prefix_mean_.size()*sizeof(float) + identity->tokens.size()*sizeof(int32_t) +
         identity->images.size()*sizeof(ImageIdentity)+(identity->canonical ? identity->canonical->bytes() : 0);
     const uint64_t pages = prefix_->page_bytes();
     const uint64_t other=cache_->active_archive_bytes-archive_charge_+cache_->active_checkpoint_bytes-input_charge_;
-    require(other<=history_allowance(),"other active archives exceed host allowance");
-    auto available=[&]{const auto limit=history_allowance();return limit>other ? limit-other : 0;};
+    require(other<=history_allowance(nullptr,prefix_.get()),"other active archives exceed host allowance");
+    auto available=[&]{const auto limit=history_allowance(nullptr,prefix_.get());return limit>other ? limit-other : 0;};
     if (fixed > available() || pages > available() - fixed) {
         RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=host_budget required_bytes=%llu limit=%llu",
             (unsigned long long)session_.id, (unsigned long long)(fixed+pages), (unsigned long long)options_.history_bytes());
@@ -608,12 +617,19 @@ void StatisticsObserver::park_session() {
         clear_session();return;
     }
     // An inactive conversation never pins GPU pages needed by another one.
+    const bool capture_needed=!prefix_->host_bytes();
+    const auto copied_before=prefix_->copied_bytes();
     prefix_->demote(pages);
+    const auto copied=prefix_->copied_bytes()-copied_before;
+    cache_->capture_bytes+=copied;
+    if(capture_needed)cache_->capture_logical_bytes+=pages;
+    RAD_INFO("KVMEM_PREFIX_CAPTURE frontier=%u logical_bytes=%llu copied_bytes=%llu",frontier_,
+        (unsigned long long)(capture_needed ? pages : 0),(unsigned long long)copied);
     std::unique_ptr<PendingPark> parking;
     if(asynchronous_ && cache_->payload && cache_->io) {
         parking=std::make_unique<PendingPark>();parking->id=finishing_id_ ? finishing_id_ : cache_->next_park++;
         parking->work=std::make_shared<ParkWork>();parking->work->storage=cache_->payload;
-        const uint64_t charge=prefix_->host_bytes()+prefix_->state_bytes();
+        const uint64_t charge=prefix_->staging_bytes();
         parking->work->prefix=std::move(prefix_);
         try {
             const auto work=parking->work;parking->ticket=cache_->io->submit(charge,[work]{work->run();});
@@ -1165,7 +1181,7 @@ void StatisticsObserver::sync_memory() {
     const uint32_t block = store_config_.block_tokens;
     std::vector<BlockDescriptor> added;
     const uint64_t old = memory_ ? memory_->stamp().frontier : 0;
-    if (memory_ && old == frontier_) return;
+    if (memory_ && old == frontier_) {memory_->refresh_captured();update_archive_charge();return;}
     require(content_version_ != UINT64_MAX, "KV content version exhausted");
     ++content_version_;
     for (uint64_t pos = old / block * block; pos < frontier_; pos += block) {
@@ -1183,6 +1199,7 @@ void StatisticsObserver::sync_memory() {
         memory_=std::make_shared<RankNativeMemory>(std::move(memories),identity_);
         memory_session_ = std::make_unique<MemorySession>(memory_);
     } else memory_->accept_append(frontier_, added);
+    memory_->refresh_captured();update_archive_charge();
     accepted_view_ = memory_->snapshot();
     verify_rank_view(active_request_);
 }
@@ -1403,13 +1420,21 @@ void StatisticsObserver::capture_terminal(const TerminalSnapshot& terminal) {
         }
         for(const auto& rank:ranks_)
             native_bytes+=WindowCheckpoint::required_bytes(*rank->resources.kv,active_request_,frontier_);
-        const uint64_t needed=input_extra_bytes()+native_bytes+memory_->archive_bytes()+store_->allocated_bytes()+
+        auto lease=std::make_unique<RankPrefix>();
+        for(size_t i=0;i<ranks_.size();++i) {
+            auto& rank=ranks_[i];auto capture=memory_->prefix_capture(i);
+            const AcceptedState accepted{&rank->groups,rank->materialize_gdn,terminal.accepted_rows};
+            auto part=std::make_unique<PrefixLease>(rank->resources.lifetime,*rank->resources.kv,
+                active_request_,terminal.identity->tokens,rank->device,rank->resources.ctx->stream(),accepted,&capture);
+            lease->add_rank(rank->device,rank->resources.ctx->stream(),*rank->resources.kv,std::move(part));
+        }
+        const uint64_t needed=input_extra_bytes()+native_bytes+lease->metadata_bytes()+memory_->archive_bytes()+store_->allocated_bytes()+
             policy_->allocated_bytes()+2*recall_->allocated_bytes()+terminal.identity->tokens.size()*sizeof(int32_t)+
             terminal.identity->images.size()*sizeof(ImageIdentity)+(terminal.identity->canonical ? terminal.identity->canonical->bytes() : 0)+
             uint64_t(store_config_.n_layer)*(store_config_.n_embd_k+1)*sizeof(float);
         const auto other=cache_->active_archive_bytes-archive_charge_+cache_->active_checkpoint_bytes-input_charge_;
-        require(other<=history_allowance(),"active archive quota exceeded");
-        auto available=[&]{const auto limit=history_allowance();return limit>other ? limit-other : 0;};
+        require(other<=history_allowance(nullptr,lease.get()),"active archive quota exceeded");
+        auto available=[&]{const auto limit=history_allowance(nullptr,lease.get());return limit>other ? limit-other : 0;};
         if (needed>available()) {
             RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=host_budget required_bytes=%llu limit=%llu",
                 (unsigned long long)session_.id,(unsigned long long)needed,(unsigned long long)options_.history_bytes());
@@ -1421,13 +1446,6 @@ void StatisticsObserver::capture_terminal(const TerminalSnapshot& terminal) {
         if(!fits()) {
             RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=pending_cache_capacity",(unsigned long long)session_.id);
             return;
-        }
-        auto lease=std::make_unique<RankPrefix>();
-        for(auto& rank:ranks_) {
-            const AcceptedState accepted{&rank->groups,rank->materialize_gdn,terminal.accepted_rows};
-            auto part=std::make_unique<PrefixLease>(rank->resources.lifetime,*rank->resources.kv,
-                active_request_,terminal.identity->tokens,rank->device,rank->resources.ctx->stream(),accepted);
-            lease->add_rank(rank->device,rank->resources.ctx->stream(),*rank->resources.kv,std::move(part));
         }
         auto mean = store_->mean_checkpoint(frontier_);
         auto recall = std::make_unique<RecallSnapshot>(recall_->checkpoint());

@@ -4,8 +4,9 @@
 #include <stdexcept>
 
 namespace kvmem::radiance {
-// Count only proven aliases of sealed allocations. Metadata, mutable buffers
-// and independently captured equal bytes receive no sharing credit.
+// Count proven aliases of sealed payloads and immutable snapshot manifests.
+// Private metadata, mutable buffers and independently captured equal bytes
+// receive no sharing credit. Every counted identity has a live owning lease.
 class SharedPayloadAccounting {
     std::map<const void*, uint64_t> records_;
     uint64_t credit_=0;

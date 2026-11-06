@@ -777,10 +777,18 @@ int main(int argc, char** argv) {
                 }
                 transaction.publish();
             };
-            select_branch(root,{0,3});root->retain_view();const auto root_stamp=root->stamp();
+            select_branch(root,{0,3});const auto root_stamp=root->stamp();
             std::vector<int32_t> prompt(128,7);
-            auto prefix=std::make_unique<PrefixLease>(branched,kv,17,prompt,device,branched->stream);
+            auto capture=root->prefix_capture();
+            auto foreign_capture=capture;foreign_capture.engine_lifetime=std::make_shared<int>(0);
+            bool wrong_owner=false;
+            try {PrefixLease bad(branched,kv,17,prompt,device,branched->stream,AcceptedState{},&foreign_capture);}
+            catch(const std::exception&){wrong_owner=true;}
+            CHECK(wrong_owner && kv.seq_tokens(17)==128);
+            auto prefix=std::make_unique<PrefixLease>(branched,kv,17,prompt,device,branched->stream,AcceptedState{},&capture);
             prefix->demote(device,branched->stream,1024*1024);prefix->park(storage,shared_io);
+            root->refresh_captured();root->retain_view();
+            const auto original_prefix_bytes=prefix->load_cpu().kv;
             const auto charged=storage->charged_bytes()+storage->disk_bytes();
             auto a=root->fork_retained({29,334}),c=root->fork_retained({41,335});
             CHECK(root->shared_archive_bytes(*a)==root->archive_bytes());
@@ -803,6 +811,7 @@ int main(int argc, char** argv) {
             CHECK(refused && kv.seq_tokens(29)==1);
             pa->restore(kv,29,prompt,device,branched->stream,&prepared);a->rebind_sequence(29,true);
             pc->restore(kv,41,prompt,device,branched->stream);c->rebind_sequence(41,true);
+            a->refresh_captured();c->refresh_captured();
             pa.reset();pc.reset();
             for(int g=1;g<=2;++g)for(auto page:kv.block_table(29,g))
                 CHECK(std::find(kv.block_table(41,g).begin(),kv.block_table(41,g).end(),page)==kv.block_table(41,g).end());
@@ -820,8 +829,17 @@ int main(int argc, char** argv) {
                     p.layer_bytes_per_state(),branched->stream)==RAD_OK);
             CHECK(rad_stream_sync(branched->stream)==RAD_OK);
             std::vector<int32_t> terminal_tokens(145,7);
-            auto terminal=std::make_unique<PrefixLease>(branched,kv,29,terminal_tokens,device,branched->stream);
+            auto next_capture=a->prefix_capture();
+            size_t fresh_bytes=0;
+            for(const auto& b:next_capture.blocks)if(!b.origin->ready())fresh_bytes+=b.origin->size();
+            CHECK(fresh_bytes>0); // partial tail is a private immutable version
+            auto terminal=std::make_unique<PrefixLease>(branched,kv,29,terminal_tokens,device,branched->stream,AcceptedState{},&next_capture);
+            auto oracle=std::make_unique<PrefixLease>(branched,kv,29,terminal_tokens,device,branched->stream);
+            oracle->demote(device,branched->stream,1024*1024);
             a->retain_view();terminal->demote(device,branched->stream,1024*1024);terminal->park(storage,shared_io);
+            CHECK(terminal->copied_bytes()==fresh_bytes && fresh_bytes<terminal->page_bytes());
+            CHECK(terminal->load_cpu().kv==oracle->load_cpu().kv);
+            CHECK(prefix->load_cpu().kv==original_prefix_bytes);oracle.reset();
             kv.free_sequence(29);
             CHECK(kv.add_sequence(53)==RAD_OK && kv.ensure(53,1)==RAD_OK);kv.clear_state_clears();
             terminal_tokens.push_back(9);terminal->restore(kv,53,terminal_tokens,device,branched->stream);
@@ -858,6 +876,16 @@ int main(int argc, char** argv) {
             for (uint64_t i=0;i<4;++i) blocks.push_back({mark.session,i,i*32,32,1,0});
             auto memory = std::make_shared<NativeMemory>(MemoryBinding{partial_engine,&kv,partial_engine->stream,device,1},
                 partial_engine->infos,BackendIdentity{"radiance","unit","partial","test"},mark,blocks,32,256,1024*1024);
+            // Reusing a logical id/version after Query replay is NOT proof
+            // of equal bytes. Keep the old origins alive to catch stale lookup.
+            const auto original_capture=memory->prefix_capture();
+            memory->rewind(96);
+            CHECK(kv.ensure(17,128)==RAD_OK);
+            memory->accept_append(128,{{mark.session,3,96,32,1,0}});
+            const auto replay_capture=memory->prefix_capture();
+            CHECK(replay_capture.blocks.size()==original_capture.blocks.size());
+            CHECK(replay_capture.blocks.front().origin==original_capture.blocks.front().origin);
+            CHECK(replay_capture.blocks.back().origin!=original_capture.blocks.back().origin);
             memory->rewind(123);
             CHECK(memory->snapshot().blocks.back().block.valid_tokens==27);
             CHECK(memory->snapshot().blocks.back().block.content_version==2);

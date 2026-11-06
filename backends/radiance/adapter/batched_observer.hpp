@@ -65,6 +65,7 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
                 {"disk_payload_budget_bytes",options_.disk_bytes},{"selected_tokens",options_.budget_tokens},
                 {"disk_read_bytes",io.read_bytes},{"disk_written_bytes",io.written_bytes},
                 {"disk_reads",io.reads},{"disk_writes",io.writes},{"disk_errors",io.errors},
+                {"checkpoint_kv_capture_bytes",cache_->capture_bytes},{"checkpoint_kv_logical_bytes",cache_->capture_logical_bytes},
                 {"retained_logical_bytes",cache_->bytes},{"active_archive_bytes",cache_->active_archive_bytes},
                 {"active_checkpoint_bytes",cache_->active_checkpoint_bytes},
                 {"shared_payload_credit_bytes",sharing_credit},
@@ -236,7 +237,9 @@ public:
                 {"graph_alpha",options_.graph_alpha},{"query_max_tokens",options_.query_tokens},
                 {"query_replay_max_tokens",options_.query_replay_tokens},{"rolling_generation",options_.rolling_generation},
                 {"capabilities",{{"disk_budget_bytes",options_.disk_bytes},{"ssd_enabled",options_.disk_bytes>0},
-                    {"retained_sessions_limit",options_.cache_sessions},{"max_active_requests",cfg.max_seqs}}}};
+                    {"retained_sessions_limit",options_.cache_sessions},
+                    {"snapshot_storage_revision",1},{"incremental_checkpoint_capture",true},
+                    {"restore_staging","full_selected_view"},{"max_active_requests",cfg.max_seqs}}}};
             publish_monitor();
             return RAD_OK;
         } catch (const std::exception& error) { RAD_ERR("KVMem batch configure: %s",error.what()); return RAD_E_STATE; }
