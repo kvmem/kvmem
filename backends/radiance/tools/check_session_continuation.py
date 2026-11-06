@@ -16,6 +16,8 @@ def main():
     p.add_argument("--context", type=int, default=8192)
     p.add_argument("--replay-tokens", type=int, default=1024)
     p.add_argument("--budget", type=int, default=256)
+    p.add_argument("--batch", type=int, default=256,
+                   help="native prefill chunk tokens; record explicit overrides in comparisons")
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=False)
     messages = [
@@ -44,6 +46,7 @@ def main():
     for name in ("exe", "home", "model", "sdk"):
         cmd += ["--" + name, str(getattr(a, name))]
     cmd += ["--cases", str(casefile), "--rounds", "5", "--context", str(a.context),
+            "--batch", str(a.batch),
             "--replay-tokens", str(a.replay_tokens), "--embedding-placement", "ram",
             "--observe-statistics", "--disable-thinking"]
     dense = subprocess.run(cmd + ["--output", str(a.output / "dense")], check=False).returncode

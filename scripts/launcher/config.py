@@ -113,7 +113,7 @@ ENGINE_DEFAULTS['radiance'] = dict(Backend='radiance', Context=65536, Budget=409
     SpeculativeMode='none', DraftTokens=0, DraftPolicy='fixed', Vision=False, MaxTokens=0,
     ThinkingMode='default', ThinkingBudget=0, VramReserveMiB=1024,
     VisionTokens=1024, VisionResidency='resident', EmbeddingPlacement='vram', CpuThreads=2, VisionCacheMiB=256)
-STRINGS = {'StateCacheType', 'EmbeddingPlacement', 'RadianceHome', 'RocmPath', 'Tokenizer','PolystrataSource','Python','VisionWorker','Mmproj','QueryScorer','Backend', 'Model', 'Worker', 'Gpu', 'ListenHost', 'KvType', 'KvTypeK', 'KvTypeV', 'DiskPath',
+STRINGS = {'StateCacheType', 'EmbeddingPlacement', 'RadianceHome', 'RocmPath', 'Tokenizer','PolystrataSource','Python','VisionWorker','Mmproj','Lora','QueryScorer','Backend', 'Model', 'Worker', 'Gpu', 'ListenHost', 'KvType', 'KvTypeK', 'KvTypeV', 'DiskPath',
            'VisionResidency',
            'DeviceProfile', 'ScoreAggregation', 'QueryScorer', 'ApiKey', 'ModelAlias', 'LogLevel',
            'ChatTemplateFile', 'ThinkingMode', 'ReasoningEffort', 'SpeculativeMode', 'DraftPolicy', 'DraftModel'}
@@ -142,12 +142,18 @@ def normalize(data, backends):
     params = data.get('parameters')
     if not isinstance(params, dict):
         raise ValueError('parameters must be an object')
-    allowed = STRINGS | INTEGERS | BOOLEANS | DECIMALS | {'StageLayers', 'TensorSplit', 'WorkerArgs'}
+    allowed = STRINGS | INTEGERS | BOOLEANS | DECIMALS | {'LoraScale', 'StageLayers', 'TensorSplit', 'WorkerArgs'}
     if set(params) - allowed:
         raise ValueError('Unknown parameters: ' + ', '.join(sorted(set(params) - allowed)))
     p = copy.deepcopy(params)
     if p.get('Backend') not in NATIVE or p.get('Backend') not in backends:
         raise ValueError('This backend is not installed in the selected backend checkout')
+    if {'Lora', 'LoraScale'} & p.keys() and p['Backend'] != 'llamacpp':
+        raise ValueError('Lora configures llama.cpp only')
+    if 'LoraScale' in p:
+        scale = p['LoraScale']
+        if not p.get('Lora') or type(scale) not in (int, float) or not -3.4028234663852886e38 <= scale <= 3.4028234663852886e38:
+            raise ValueError('LoraScale requires Lora and a finite float scale')
     if p['Backend'] == 'polystrata':
         p.setdefault('BlockTokens', 32)
         if type(p['BlockTokens']) is not int or p['BlockTokens'] not in (32, 64):

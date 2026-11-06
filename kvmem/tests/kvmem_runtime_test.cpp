@@ -265,7 +265,50 @@ static void test_discard_pending_plan() {
     CHECK(be.frees.empty());
 }
 
+static void test_cpu_tier_clone_is_independent() {
+    struct BytesBackend : KvMemBackend {
+        uint8_t fill = 0x31;
+        std::vector<uint8_t> restored;
+        int32_t alloc_gpu_slot() override { return 0; }
+        void copy_block_to_host(uint32_t, int32_t, void* data, uint64_t bytes) override {
+            std::memset(data, fill, size_t(bytes));
+        }
+        void copy_block_from_host(uint32_t, int32_t, const void* data, uint64_t bytes) override {
+            const auto* p = static_cast<const uint8_t*>(data);
+            restored.assign(p,p+size_t(bytes));
+        }
+    } parent_io, child_io;
+    auto cfg=make_cfg();cfg.store.block_tokens=4;cfg.store.select_budget=4;
+    cfg.store.select_method=KvMemMethod::Retrieval;
+    cfg.store.estimated_block_bytes=16;cfg.cpu_bytes=16;
+    KvMemRuntime parent(cfg,&parent_io), child(cfg,&child_io);
+    parent.register_append(4);
+    parent.store().set_block_tier(0,KvTier::GPU);
+    parent.store().set_block_gpu_slot(0,0);
+    parent.prepare_selection({});parent.finish_reselect();
+    child.store()=parent.store();child.clone_cpu_tier_from(parent);
+    CHECK(parent.cpu_tier()->block_slot(0)==child.cpu_tier()->block_slot(0));
+    // Reuse and overwrite the parent's arena after cloning. The child keeps
+    // its original bytes, mapping, and independent slot-release lifecycle.
+    parent.prepare_selection({0});parent.finish_reselect();
+    CHECK(parent_io.restored==std::vector<uint8_t>(16,0x31));
+    parent_io.fill=0x52;
+    parent.prepare_selection({});parent.finish_reselect();
+    child.prepare_selection({0});child.finish_reselect();
+    CHECK(child_io.restored==std::vector<uint8_t>(16,0x31));
+    CHECK(parent.cpu_tier()->used_slots()==1 && child.cpu_tier()->used_slots()==0);
+    parent.prepare_selection({0});parent.finish_reselect();
+    CHECK(parent_io.restored==std::vector<uint8_t>(16,0x52));
+    parent.prepare_selection({});
+    bool rejected=false;try{child.clone_cpu_tier_from(parent);}catch(const std::logic_error&){rejected=true;}
+    CHECK(rejected);parent.discard_pending();
+    auto other=cfg;other.cpu_bytes=32;KvMemRuntime incompatible(other);
+    rejected=false;try{incompatible.clone_cpu_tier_from(parent);}catch(const std::invalid_argument&){rejected=true;}
+    CHECK(rejected);
+}
+
 int main() {
+    test_cpu_tier_clone_is_independent();
     test_selection_preview_and_resident_commit();
     test_full_drain_then_restage();
     test_discard_pending_plan();

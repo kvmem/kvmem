@@ -69,7 +69,7 @@ def render_script(plan, lock_path, secret_ref=None):
             raise ValueError('Invalid worker SHA-256')
         lines += ['kvmem_worker_hash=$(/usr/bin/sha256sum < ' + worker + ') || fail "Cannot verify worker."',
                   '[[ ${kvmem_worker_hash:0:64} == ' + digest + ' ]] || fail "Worker changed; regenerate this version."']
-    for key in ('Model', 'DraftModel', 'ChatTemplateFile', 'Mmproj'):
+    for key in ('Model', 'DraftModel', 'ChatTemplateFile', 'Mmproj', 'Lora'):
         value = plan['effective_parameters'].get(key)
         if value:
             lines.append('[[ -f ' + shlex.quote(value) + ' && -r ' + shlex.quote(value)

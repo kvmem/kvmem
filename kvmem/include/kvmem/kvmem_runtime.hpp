@@ -57,6 +57,10 @@ public:
     }
 
     PinnedKvTier *cpu_tier() { return cpu_tier_.get(); }
+    // Native writers must be drained by the caller. Copy the legacy CPU tier
+    // independently: sharing its writable arena or only copying cpu_slot ids
+    // would let sibling branches overwrite each other's packed KV.
+    void clone_cpu_tier_from(const KvMemRuntime & source);
 
     void register_append(uint32_t n_tokens);
     std::vector<KvMemDroppedBlock> truncate_to(uint32_t token_pos);

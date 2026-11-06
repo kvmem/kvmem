@@ -1,0 +1,1241 @@
+diff --git a/docs/maintainer/resource-scheduling-and-context-cache.md b/docs/maintainer/resource-scheduling-and-context-cache.md
+index d30eda1e6eb49a942f8b4b2302ad5dd5331b64c1..698e3964e03dc6e65d3d3b357064358a879f2c09 100644
+--- a/docs/maintainer/resource-scheduling-and-context-cache.md
++++ b/docs/maintainer/resource-scheduling-and-context-cache.md
+@@ -1146,20 +1146,28 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive
+ 
+ 路径用于定位当前实现，不改变本文定义的所有权边界。
+ 
+-## KVMem bounded history 的共享归属
+-
+-Qwen3.5 KVMem 路径在 `legacy` 和 `spread` 两种策略下都先查当前归属，
+-再允许带当前 user Query 的请求查找其他命名或匿名归属的完整前缀。Chat
+-归属字段通过 common `kvmem/cache_owner.hpp` 解析；归属相同本身不证明可复用。
+-查找只读取目录元数据，选中后仍须验证精确 token、media/position、accepted
+-frontier、StateImage 和 KV coverage，再由原生 materialization transaction 恢复。
+-
+-跨归属命中必须 fork。历史 sealed KV 和不可变 StateImage 可共享物理记录，
+-selector、statistics、feedback、catalog 与运行中的 recurrent state 独立。
+-匿名的原生 continuation 证明继续保留；较深的匿名分支编辑使用 fork，不能
+-因为两个 session_key 都为空而消费来源。取消和读取失败只能释放未发布的子分支。
+-普通工具续接不因此获得外部缓存发现或 cached-Q 冷历史重选权限。
+-
+-此实现不把 GPU page、Program 或不兼容模型的 KV 合并；请求归属也不承担租户
+-安全隔离。校验入口包含 OpenAI schema、两阶段 document/question 的真实请求、
+-`tests/experimental/ssd_failure.cpp --fork` 的冷读取失败及取消测试。
++## KVMem 内容快照目录
++
++Qwen3.5 KVMem 的 legacy/spread 路径按真实内容和原生恢复证明选择快照。
++Chat 的 key/ID 字段继续校验输入，但不选择可变 owner，不影响目录发布顺序。
++内部 session、generation、内容版本和执行 stamp 仍用于拒绝过期或不完整状态。
++
++恢复先获得独立分支，sealed KV 和只读 StateImage 可共享物理记录；源目录
++保持可复用。statistics、selector、feedback、Query 和回滚状态归请求私有。
++准备失败和取消释放本次分支；新请求不按客户端 key 清除既有快照。
++
++公共 content_cache.hpp 负责候选排序和保留计划。原生目录最多
++min(16, retained_sessions) 个槽，retained_sessions 同时限制内部资源组数量。
++物理目录额度沿用原配置，资源组按完整且已接受的 canonical input 精确前缀分类，
++不能用64-token模板尾提示合并不同短问题。发布时重新比较组内所有已完成输入，选择最深
++兼容组；从旧祖先并发准备的分叉在此分开，未知边界保守建立新组。
++组只用于容量公平性，组内多个版本同时存在，绝不因同组而替换。
++满槽优先淘汰多版本组的旧条目，新增组超额时按组 LRU 淘汰。只在 checkpoint
++origin 和原生 KV 分配引用均证明完整覆盖时压缩冗余组；COW 尾页保守保留。
++所有物理 allocation、未兑现预留及仍被引用的冷记录继续由既有资源账户计费。
++
++查找只读取RAM元数据；摘要和LCP只筛选候选，适配器仍验证 token、媒体、
++原始位置、accepted frontier、state image、统计与KV覆盖。工具续接必须
++通过原生续接证明，仍为append加resident-only Pressure，不获得旧Query冷召回。
++发布在封存完整附件之后执行；先准备元数据再提交。原生安全边界管理GPU对象。
++这不增加跨后端KV格式、跨进程持久化或通用GPU页池。
+diff --git a/docs/serving.md b/docs/serving.md
+index 0f59b3039998951be08e607db4bf9bcfc0a1e7c7..62dfda3c2172c090b86b84d1ee04df8adc0b5b75 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -1016,27 +1016,35 @@ Semantically neutral fields do not make an otherwise executable request fail. Al
+ `logit_bias`, `logprobs:false`, `verbosity:"medium"`, empty legacy tool controls,
+ text-only `audio` configuration, and `prediction` are accepted without changing Engine execution.
+ Metadata, user/safety identifiers and service-tier hints are likewise advisory.
+-`prompt_cache_key` (at most 256 bytes, beyond the API's 64 so that a gateway can namespace keys per
+-user) is not a prefix identity. A non-empty Chat Completions key binds a live cache session,
+-advances its session index and keeps a private long anchor at the prompt end, including when
+-`store:false`. This matches the client-managed Responses path (`store:false`, no previous response).
+-Chat also accepts `promptCacheKey`, as emitted by OpenCode's openai-compatible SDK adapter.
+-If both spellings have non-empty values they must agree; a conflict is a request error.
+-The optional `kvmem.conversation_id` (1–256 bytes) takes precedence over `prompt_cache_key`.
+-Keep the identity stable across append, regenerate and history rollback; use separate identities
+-for independent conversations. Shared keys share one cache lineage: editing an earlier prefix
+-can discard its later checkpoints, so independently retained branches require distinct owners.
+-Every restore still validates the token/media prefix and native KV/state; a matching key alone
+-does not make incompatible inputs reusable. Missing, null or empty cache keys remain anonymous.
+-With Qwen3.5 KVMem `spread` checkpoints, a named request carrying a current user Query
+-first tries its own owner. If no valid point exists, it can fork an exact token/media/position
+-prefix from another named owner, including SSD-backed checkpoints. Candidate discovery uses
+-RAM metadata; only the selected cold state and required KV pages are read. The new owner
+-shares immutable payloads and copies mutable history, preserving the parent until ordinary
+-retention limits evict it. Independent OpenCode forks therefore need distinct keys but no
+-parent-ID extension. Failed preparation falls back to full prefill; native history-hit logs
+-record completed restores, whereas already quoted reuse counters retain the planned frontier.
+-Ordinary tool continuation retains its append and resident-only Pressure behavior.
++Chat accepts `prompt_cache_key` and the SDK spelling `promptCacheKey` (at most
++256 bytes), plus `kvmem.conversation_id` (1–256 bytes), as validated metadata.
++Conflicting nonempty SDK/wire spellings are rejected. These fields do not bind
++Chat requests to mutable Engine cache owners or select retention classes.
++Full-context Chat requests receive a prompt-tail continuation boundary regardless
++of these fields, except when explicit cache-write policy disables automatic cuts.
++Stateful Responses handles remain a separate protocol contract.
++
++Qwen3.5 KVMem `legacy` and `spread` histories select compatible native checkpoints
++by content. Lookup checks RAM metadata and exact tokens, media/positions, accepted
++frontier, StateImage and KV coverage; only selected cold payloads are read.
++Every history restore creates an independent branch without consuming its source.
++Sealed Host/SSD KV and immutable native images share allocations; selectors,
++statistics, Query, graph feedback and live recurrent state are private.
++
++Client keys do not suppress publication or replace a unique history slot.
++Multiple versions coexist. The bounded directory uses internal resource groups
++to prevent one growing branch's nearby versions from evicting every idle branch;
++groups never authorize restoration. Group classification requires complete
++accepted canonical input and exact tokens/media/positions; a 64-token template
++tail hint cannot merge different short questions. Publication rechecks all
++completed members of a group, including concurrent children of an older common
++ancestor. Retained-group limits, the directory bounded by min(16, retained_sessions)
++and physical H/D/checkpoint budgets still permit ordinary capacity eviction.
++A fresh/read-disabled request does not erase other published histories.
++Failed preparation recomputes under the admitted full-prefill budget. Actual
++restores are reported independently of the original admission quote.
++Ordinary tool continuation requires native continuation evidence and retains
++append plus resident-only Pressure, without old-Query cold-history reselection.
+ Unknown top-level fields are ignored.
+ 
+ A string `name` on any message is accepted and ignored, as the optional OpenAI participant label
+@@ -1781,7 +1789,7 @@ wire response contains typed `output` Items.
+ | `background` | omitted or `false` |
+ | `include` | omitted, empty, or any of `reasoning.encrypted_content`, which requests the local raw-reasoning mirror described below, and `message.output_text.logprobs`, which requests [token log probabilities](#token-log-probabilities) |
+ | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
+-| cache and client hints | valid `prompt_cache_key` (at most 256 bytes; it keeps a private long anchor at the prompt end and names the cache session of a response that is neither stored nor chained to a previous one), `prompt_cache_options`, `prompt_cache_retention`, `safety_identifier` (at most 128 characters), and `user` values |
++| cache and client hints | validated `prompt_cache_key` transport metadata (at most 256 bytes), `prompt_cache_options`, `prompt_cache_retention`, `safety_identifier` (at most 128 characters), and `user` values; cache selection and retention do not depend on key presence |
+ 
+ Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
+ with a field-specific 400 error instead of being silently ignored. When a rejection is caused by a
+@@ -1789,6 +1797,15 @@ specific value, the error names that value (ASCII-escaped and truncated), its si
+ and its location in the request, both in the error `param` (for example `tools[0].function.name`
+ or `messages[2].tool_calls[0].function.name`) and in the message text.
+ 
++Complete-input requests without `previous_response_id` can retain content
++snapshots with `store:false` and no cache key; `store` controls Response-object
++retrieval. Explicit parent handles keep their lifecycle: a `store:false` reply
++to an existing parent does not advance its session index. Automatic prompt-end
++checkpoint opportunities respect explicit-only cache-write policy. Native actual
++reuse is available at completion and, when emitted, in streamed progress;
++aggregate consumers have no live-progress contract. Responses monitor records
++use the wire Response id for request correlation.
++
+ ### Input Item contract
+ 
+ String `input` is normalized to one user `message` with an `input_text` part. Array input accepts:
+@@ -2442,7 +2459,7 @@ The table lists executable defaults. The startup example selects a long-context
+ | `--disk-kv-gib N` | disk tier budget in GiB | `64` |
+ | `--disk-kv-restore` | seed a new request's matching prefix from the disk tier | write-only |
+ | `--disk-kv-directstorage` | read restores through Microsoft DirectStorage; Windows builds with `-DNINFER_DIRECTSTORAGE=ON` only, untested | mapped reads |
+-| `--context-cache-policy default\|rolling` | `rolling`: within one cache session (a Responses `prompt_cache_key`), a capture that extends a resident checkpoint the request matched exactly inherits that resident's demand, so a conversation whose prompt only grows keeps rolling its frontier forward; with conversations sharing a prefix, one conversation's extension can evict the prefix the others use | `default` |
++| `--context-cache-policy default\|rolling` | `rolling`: within one native cache session, a capture that extends a resident checkpoint the request matched exactly inherits that resident's demand, so a conversation whose prompt only grows keeps rolling its frontier forward; with conversations sharing a prefix, one conversation's extension can evict the prefix the others use. Client cache keys do not create a session; explicit stateful handles keep their own lifecycle | `default` |
+ | `--concurrent-prefill` | admit waiting requests to free lanes while other requests prefill, instead of holding admission until the staged prefill finishes; without it a staged prefill whose last chunk can share a pass with others still admits them ([Execution behavior](#execution-behavior)) | off |
+ | `--kv-lease-growth` | admission reserves the prompt plus a 4096-token output window (or `--prefill-chunk` when larger) instead of the whole `max_tokens` budget and extends it at decode-round boundaries, releasing idle retained cache owners least recently used first when the pool is short; an answer whose smallest step still does not fit ends with `finish_reason=length` before `max_tokens` | off |
+ | `--recency-eviction` | pressure ranks private conversations and shared prefixes in one least-recently-used order (latest hit or publication): a request that does not fit gives up the fewest oldest owners that make it fit and spares those it does not need, instead of clearing every owner it cannot reuse; kept owners, shared prefixes included, are demoted to Host where it has room, and the search may fully evict only inside that tail and only an owner Host cannot take. A private checkpoint that finds the state pools full reclaims the idle conversation that is oldest in this order, not the oldest publication | off |
+diff --git a/src/models/qwen3_5/program/prefill.cpp b/src/models/qwen3_5/program/prefill.cpp
+index 639ff054fc7576fa7c6a999f85788fc22c73479e..90af5577476a09c9253aa1d3283a3f9a523eac24 100644
+--- a/src/models/qwen3_5/program/prefill.cpp
++++ b/src/models/qwen3_5/program/prefill.cpp
+@@ -759,7 +759,6 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
+                                        request_plan.drafting && !request_plan.branches;
+         request.allow_memory_reuse = request_plan.allow_memory_reuse;
+         request.memory_payload_reservation = request_plan.memory_payload_reservation;
+-        request.memory_session_key = staged.prompt.context_cache.session_key;
+         sequence.mtp_draft_count     = 0;
+         sequence.mtp_drafts_pending  = false;
+         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
+@@ -782,7 +781,6 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
+                 ? memory_reuse_anchor(staged.prompt, staged.cursor, observed) : 0U;
+             if (sequence.window.reuse_anchor && sequence.window.reuse_anchor == staged.cursor)
+                 capture_memory_anchor(sequence, 0);
+-            sequence.window.session_key = staged.prompt.context_cache.session_key;
+             sequence.window.publication_order = request_plan.publication_order;
+             sequence.window.update_session_index = staged.prompt.context_cache.update_session_index;
+             sequence.window.media_pages = memory_image_pages(staged.prompt);
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index b37676cb0ecaf35d84053d3891f2b5f1f55b2ec9..b53aeeec4f28d35dadb58586a1c0da99e58a865e 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -1266,11 +1266,16 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+             }
+         };
+         for (const auto& sequence : continuation_states) collect(sequence.window);
++        std::array<uint64_t,16> retained_groups{};
++        size_t group_count=0;
+         for (const auto& history : memory_histories) {
+             if (!history) continue;
+-            ++memory.retained_sessions;
++            const auto group=history->cache_group ? history->cache_group : history->stamp.session.id;
++            if(std::find(retained_groups.begin(),retained_groups.begin()+group_count,group)==retained_groups.begin()+group_count)
++                retained_groups[group_count++]=group;
+             collect(*history);
+         }
++        memory.retained_sessions=group_count;
+         if(const auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_);
+            transaction && transaction->memory_history && transaction->memory_history->fork)
+             collect(*transaction->memory_history->fork);
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index e45a7d599a914fd566f4bfeba16e3f6bb34f1871..55667e8e6434a77b7cb74e2585d921d575d5782f 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -516,6 +516,9 @@ struct DecodeGraphFamily {
+ // request which produced it has finished, so it is deliberately separate from request lifecycle,
+ // output, sampling, and round-control state.
+ struct KvmemPrefixCheckpoint {
++    // A capture origin denotes the entire sealed recovery point, including
++    // its native/policy state. Forks preserve it; a new capture gets a new one.
++    std::uint64_t immutable_origin = 0;
+     kvmem::LrfuState history;
+     kvmem::GraphSnapshot graph;
+     kvmem::AttentionFeedbackSnapshot feedback;
+@@ -639,7 +642,9 @@ inline qwen3_5::TokenSpan bounded_memory_query(const PreparedPromptData& prompt,
+ }
+ 
+ struct KvmemWindowState {
+-    std::optional<PreparedSessionKey> session_key;
++    // Internal retention grouping only. It never authorizes native restore and
++    // has no relation to a caller's conversation/cache key.
++    std::uint64_t cache_group = 0;
+     std::uint64_t publication_order = 0;
+     bool update_session_index = true;
+     // Compact execution slots -> original logical pages. Host records retain native
+@@ -803,7 +808,6 @@ struct RequestControl {
+     bool publish_continuation = true;
+     bool allow_memory_reuse = false;
+     std::uint64_t memory_payload_reservation = 0;
+-    std::optional<PreparedSessionKey> memory_session_key;
+     // The sequence's own output ceiling: the largest frontier its lease may ever cover, so
+     // on-demand growth never leases pages the request cannot reach.
+     std::uint32_t lease_ceiling = 0;
+@@ -886,7 +890,6 @@ struct RequestControl {
+         publish_continuation = true;
+         allow_memory_reuse = false;
+         memory_payload_reservation = 0;
+-        memory_session_key.reset();
+         lease_settled        = false;
+         lease_space_limited  = false;
+         lease_minimum_target = {};
+@@ -1274,16 +1277,9 @@ public:
+     // uses ordinary host RAM, so pinned allocation count does not grow with H.
+     std::unique_ptr<PinnedHostBuffer> memory_kv_staging;
+     std::array<std::int32_t, 4> memory_statistics_ranges{};
+-    // Inactive physical Host histories. Keys follow frontend ContextCacheHints;
+-    // exact checkpoint identity still decides whether any bytes can be reused.
++    // Inactive sealed Host snapshots. Exact content and native checkpoint
++    // identity decide reuse; client affinity keys never identify these entries.
+     std::array<std::optional<KvmemWindowState>, 16> memory_histories;
+-    struct MemoryPublication {
+-        std::optional<PreparedSessionKey> key;
+-        std::uint64_t order = 0;
+-    };
+-    // Bounded high-watermarks also cover newer requests that finish without
+-    // retaining a checkpoint, preventing an older concurrent result publishing.
+-    std::array<MemoryPublication, 32> memory_publications;
+     std::uint64_t memory_history_hits = 0, memory_history_misses = 0, memory_history_evictions = 0;
+ 
+     std::optional<Tensor> score_hidden;
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index b9ad4355513cc867510b25192eb4400970798acb..3ee8016bad22b6e2cc7e3e99588a2bf04d4091cc 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -5,6 +5,7 @@
+ #include "models/qwen3_5/program/storage/checkpoint_recompute_policy.h"
+ #include "runtime/contract/dflash_conditioning.h"
+ #include "kvmem/cache_owner.hpp"
++#include "kvmem/content_cache.hpp"
+ 
+ #include <atomic>
+ #include <cstdio>
+@@ -17,11 +18,100 @@ namespace {
+ constexpr std::uint32_t page_tokens = 64;
+ constexpr std::size_t transfer_staging_limit = 64ULL << 20;
+ std::atomic<std::uint64_t> next_window_session{1};
++std::atomic<std::uint64_t> next_history_access{1};
++std::atomic<std::uint64_t> next_checkpoint_origin{1};
++std::atomic<std::uint64_t> next_snapshot_group{1};
+ 
+ std::uint32_t valid_columns(std::uint32_t logical_page, std::uint32_t frontier) {
+     return std::min(page_tokens, frontier - logical_page * page_tokens);
+ }
+ 
++struct CanonicalSnapshotInput {
++    std::size_t frontier = 0;
++    const KvmemPrefixCheckpoint* checkpoint = nullptr;
++    explicit operator bool() const noexcept { return checkpoint != nullptr; }
++};
++
++// Capacity lineage is the complete accepted input, excluding only the proven
++// rendering opener. A short edit to a real user/tool input is still a branch;
++// the anonymous continuation tail allowance is not an input-identity proof.
++CanonicalSnapshotInput canonical_snapshot_input(const KvmemWindowState& window,
++                                                std::size_t image_bytes) {
++    if (!window.stamp.valid || !window.statistics || !window.selector || !image_bytes) return {};
++    std::size_t frontier = window.output_begin;
++    bool found = false;
++    if (window.request_messages) for (const auto& span : *window.request_messages) if (!span.end_known) {
++        if (!span.begin || span.begin > window.output_begin || (found && frontier != span.begin)) return {};
++        frontier = span.begin; found = true;
++    }
++    if (!frontier) return {};
++    const KvmemPrefixCheckpoint* latest = nullptr;
++    const auto consider = [&](const std::shared_ptr<KvmemPrefixCheckpoint>& candidate) {
++        if (!candidate) return;
++        const auto& cp = *candidate;
++        const auto end = cp.prefix.size();
++        if (end < frontier || end > UINT32_MAX || end > window.statistics_frontier ||
++            !cp.identity.stamp.valid || cp.identity.stamp.frontier != end ||
++            !(cp.identity.stamp.session == window.stamp.session) ||
++            cp.state_bytes() != image_bytes || cp.prefix_identity.size() < end ||
++            cp.graph.accepted_through != end || cp.graph.block_tokens != page_tokens) return;
++        const auto pages = (end + page_tokens - 1) / page_tokens;
++        if (window.archive.size() < pages || window.host_versions.size() < pages) return;
++        for (std::size_t page = 0; page < pages; ++page)
++            if (!window.archive[page] || window.host_versions[page] < valid_columns(
++                    static_cast<std::uint32_t>(page), static_cast<std::uint32_t>(end))) return;
++        if (!std::all_of(cp.resident_pages.begin(), cp.resident_pages.end(),
++                        [pages](auto page) { return page < pages; })) return;
++        if (!latest || end > latest->prefix.size()) latest = &cp;
++    };
++    for (const auto& record : window.checkpoints) consider(record.data);
++    for (const auto& entry : window.coverage) if (entry.info.identity) consider(entry.record.data);
++    return latest ? CanonicalSnapshotInput{frontier, latest} : CanonicalSnapshotInput{};
++}
++
++bool snapshot_input_matches(const CanonicalSnapshotInput& source, const PreparedPromptData& prompt) {
++    return source && source.frontier <= prompt.token_ids.size() &&
++        std::equal(source.checkpoint->prefix.begin(), source.checkpoint->prefix.begin() + source.frontier,
++                   prompt.token_ids.begin()) &&
++        source.checkpoint->prefix_identity.matches(prompt, source.frontier);
++}
++
++bool snapshot_inputs_comparable(const CanonicalSnapshotInput& left, const CanonicalSnapshotInput& right) {
++    if (!left || !right) return false;
++    const auto common = std::min(left.frontier, right.frontier);
++    return std::equal(left.checkpoint->prefix.begin(), left.checkpoint->prefix.begin() + common,
++                      right.checkpoint->prefix.begin()) &&
++        left.checkpoint->prefix_identity.prefix_equals(right.checkpoint->prefix_identity, common);
++}
++
++template<std::size_t Count>
++std::uint64_t snapshot_content_group(const CanonicalSnapshotInput& input, std::uint64_t previous,
++        const std::array<std::optional<KvmemWindowState>, Count>& histories, std::size_t image_bytes) {
++    if (!input) return next_snapshot_group.fetch_add(1);
++    std::array<std::uint64_t, Count> checked{};
++    std::size_t count = 0, deepest = 0;
++    std::uint64_t selected = 0;
++    for (const auto& history : histories) {
++        if (!history || !history->cache_group || std::find(checked.begin(), checked.begin() + count,
++                history->cache_group) != checked.begin() + count) continue;
++        const auto group = history->cache_group;
++        checked[count++] = group;
++        bool comparable = true;
++        std::size_t depth = 0;
++        for (const auto& member : histories) if (member && member->cache_group == group) {
++            const auto other = canonical_snapshot_input(*member, image_bytes);
++            if (!snapshot_inputs_comparable(input, other)) { comparable = false; break; }
++            depth = std::max(depth, std::min(input.frontier, other.frontier));
++        }
++        if (comparable && (!selected || depth > deepest ||
++                (depth == deepest && group == previous && selected != previous) ||
++                (depth == deepest && selected != previous && group < selected))) {
++            selected = group; deepest = depth;
++        }
++    }
++    return selected ? selected : next_snapshot_group.fetch_add(1);
++}
++
+ void publish_memory_checkpoint_source(KvmemWindowState& window,
+                                      std::shared_ptr<KvmemPrefixCheckpoint> checkpoint,
+                                      bool query_source) {
+@@ -974,14 +1064,19 @@ void ProgramImpl::checkpoint_memory_room(KvmemWindowState& window,size_t bytes,b
+             }
+         };
+         for(auto& lane:continuation_states) reclaim(lane.window);
+-        for(auto& history:memory_histories) if(history) reclaim(*history);
++        // Published recovery points remain immutable. In spread mode all
++        // points live in coverage; clearing it in slot order would preserve
++        // an empty directory shell while bypassing group-aware retention.
++        // Reclaim idle sources as complete directory entries below instead.
+         // A fresh conversation may need the quota held by an older idle owner.
+         // The currently admitted restore source remains protected until publish.
+         while(!fits()) {
+-            std::optional<size_t> victim;
+-            for(size_t i=0;i<memory_histories.size();++i) if(memory_histories[i] &&
+-                    memory_histories[i]->stamp.session.id!=restoring && (!victim ||
+-                    memory_histories[i]->publication_order<memory_histories[*victim]->publication_order)) victim=i;
++            std::vector<kvmem::ContentCacheSlot> slots;
++            for(const auto& history:memory_histories)
++                slots.push_back({bool(history),history && history->stamp.session.id==restoring,
++                    history ? history->publication_order : 0,
++                    history ? static_cast<const void*>(&*history) : nullptr,history ? history->cache_group : 0});
++            const auto victim=kvmem::select_content_eviction(slots);
+             if(!victim) break;
+             memory_histories[*victim].reset(); ++memory_history_evictions;
+             memory_checkpoint_pool->trim();
+@@ -1230,6 +1325,7 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
+     // capacity, all attachments and the native image before constructing them.
+     checkpoint_memory_room(sequence.window,(optional ? 2*bytes : bytes)+metadata,optional);
+     auto checkpoint = std::make_unique<KvmemPrefixCheckpoint>();
++    checkpoint->immutable_origin=next_checkpoint_origin.fetch_add(1);
+     checkpoint->identity = std::move(identity);
+     checkpoint->prefix.assign(sequence.ledger.begin(), sequence.ledger.begin() + frontier);
+     checkpoint->prefix_identity = sequence.prefix_identity;
+@@ -1307,7 +1403,7 @@ std::uint32_t ProgramImpl::memory_observed_prefix(const PreparedPromptData& prom
+     if (!prompt.identity.reusable) return 0;
+     std::size_t best = 0;
+     for (const auto& history : memory_histories) {
+-        if (!history || !history->stamp.valid || history->session_key != prompt.context_cache.session_key) continue;
++        if (!history || !history->stamp.valid) continue;
+         for (const auto kind : checkpoint_kinds(*history)) {
+             const auto* checkpoint = memory_checkpoint(*history, kind);
+             if (!checkpoint) continue;
+@@ -1612,8 +1708,7 @@ KvmemHistoryPreparation::~KvmemHistoryPreparation() { ticket.cancel(); }
+ 
+ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+     const PreparedPromptData& prompt, const PrefixShortlistDigests* digests) const {
+-    if (!kvmem_window_tokens || !prompt.identity.reusable || (prompt.context_cache.session_key &&
+-        !prompt.context_cache.update_session_index)) return std::nullopt;
++    if (!kvmem_window_tokens || !prompt.identity.reusable) return std::nullopt;
+     const auto started = Clock::now();
+     const auto limit = kvmem::prefix_restore_limit(prompt.token_ids.size(), prompt.token_ids.size(),
+                                                    prompt.token_ids.size(), true);
+@@ -1629,19 +1724,13 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+     PrefixShortlistDigests incoming;
+     std::optional<KvmemHistoryMatch> best;
+     bool fork=false;
+-    for (unsigned pass=0; pass<2 && !best; ++pass) {
+-        // Anonymous requests may discover immutable prefixes too. A current
+-        // user Query remains required; tool continuation does not gain recall.
+-        if (pass && !kvmem::may_discover_shared_prefix(prompt.memory_query &&
+-                     prompt.memory_query->count)) break;
++    const bool new_query=prompt.memory_query && prompt.memory_query->count;
++    {
+         std::vector<Candidate> candidates;
+         for (size_t index=0; index<memory_histories.size(); ++index) {
+             const auto& history=memory_histories[index];
+             if (!history || !history->stamp.valid) continue;
+-            const bool own=history->session_key==prompt.context_cache.session_key;
+-            if (!pass && !own) continue;
+-            if (pass && own && prompt.context_cache.session_key) continue;
+-            if (!pass && !history->session_key) {
++            if (!new_query) {
+                 const KvmemPrefixCheckpoint* latest=nullptr;
+                 for (const auto kind:checkpoint_kinds(*history)) {
+                     const auto* cp=memory_checkpoint(*history,kind);
+@@ -1661,7 +1750,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+                 const auto* cp=memory_checkpoint(*history,kind);
+                 const auto order=rank++;
+                 if(!cp || !seen.insert(cp).second || !cp->prefix.size() || cp->prefix.size()>limit) continue;
+-                if(pass) {
++                {
+                     if(!digests || digests->size()!=prompt.token_ids.size()) {
+                         incoming.assign(prompt); digests=&incoming;
+                     }
+@@ -1673,20 +1762,22 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+                     const auto& record=history->archive[page];
+                     if(!record.resident_bytes()) cold+=record.size();
+                 }
+-                candidates.push_back({{index,kind,static_cast<uint32_t>(cp->prefix.size()),pass!=0},cp,cold,order});
++                candidates.push_back({{index,kind,static_cast<uint32_t>(cp->prefix.size()),true},cp,cold,order});
+             }
+         }
+-        std::stable_sort(candidates.begin(),candidates.end(),[&](const auto& a,const auto& b) {
+-            if(a.match.frontier!=b.match.frontier) return a.match.frontier>b.match.frontier;
+-            if(pass && a.cold_bytes!=b.cold_bytes) return a.cold_bytes<b.cold_bytes;
+-            if(a.match.history!=b.match.history)
+-                return memory_histories[a.match.history]->publication_order>memory_histories[b.match.history]->publication_order;
+-            return a.rank<b.rank;
+-        });
++        std::vector<kvmem::ContentCacheCandidate> ranked;
++        ranked.reserve(candidates.size());
++        for(size_t index=0;index<candidates.size();++index) {
++            const auto& candidate=candidates[index];
++            ranked.push_back({index,candidate.match.frontier,candidate.cold_bytes,
++                memory_histories[candidate.match.history]->publication_order,!new_query});
++        }
++        // The native directory is bounded. Do not let incomplete or Query-
++        // incompatible points consume a shortlist cap before native validation.
++        ranked=kvmem::rank_content_candidates(std::move(ranked),new_query,candidates.size());
+         shortlisted+=static_cast<unsigned>(candidates.size());
+-        unsigned foreign_checks=0;
+-        for(const auto& candidate:candidates) {
+-            if(pass && foreign_checks++==16) break;
++        for(const auto& ranked_candidate:ranked) {
++            const auto& candidate=candidates[ranked_candidate.slot];
+             const auto& checkpoint=*candidate.checkpoint;
+             const auto& history=*memory_histories[candidate.match.history];
+             const auto frontier=candidate.match.frontier;
+@@ -1714,7 +1805,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+                 prompt.token_ids.size()+workspace>kvmem_window_tokens;
+             if(admission.admitted && needs_recall && prompt.memory_query && frontier>query.begin &&
+                !memory_user_already_evaluated(prompt,frontier)) { ++query_rejected; continue; }
+-            best=candidate.match; fork=pass!=0; break;
++            best=candidate.match; fork=true; break;
+         }
+     }
+     if(kvmem_options.verify_transfers) std::fprintf(stderr,
+@@ -1738,6 +1829,7 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+     // Optional optimization: never evict the source to make room for its fork.
+     checkpoint_memory_room(const_cast<KvmemWindowState&>(source),metadata,true);
+     auto child=std::make_unique<KvmemWindowState>();
++    child->cache_group=source.cache_group;
+     child->stamp=source.stamp;
+     child->stamp.session={next_window_session.fetch_add(1),1};
+     child->stamp.frontier=frontier;
+@@ -1812,7 +1904,10 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+                 if(required>memory_retained_budget)
+                     throw std::runtime_error("fork cannot retain its source within the payload budget");
+                 pending->fork=fork_memory_history(source,match->frontier);
+-                pending->fork->session_key=staged.prompt.context_cache.session_key;
++                const auto input = canonical_snapshot_input(source, state_images->host_layout().image_bytes);
++                if (!snapshot_input_matches(input, staged.prompt))
++                    pending->fork->cache_group=0;
++                memory_histories[match->history]->publication_order=next_history_access.fetch_add(1);
+             }
+         }
+         if(pending->native_ready) return true;
+@@ -1913,8 +2008,10 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
+     } else {
+         auto& history=memory_histories[prepared->history];
+         if(!history || history->stamp.session.id!=prepared->generation) return false;
+-        sequence.window=std::move(*history);
+-        history.reset();
++        // A directory hit never consumes its source, including a continuation.
++        // Normally preparation already owns the fork; retain this invariant on
++        // the synchronous fallback path as well.
++        sequence.window=std::move(*fork_memory_history(*history,*frontier));
+     }
+     auto& window = sequence.window;
+     const bool same_query = memory_user_already_evaluated(staged.prompt, *frontier);
+@@ -2018,37 +2115,11 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
+ 
+ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl& request,
+                                          const PreparedPromptData& prompt) {
+-    const auto& key = prompt.context_cache.session_key;
+-    if (key && prompt.context_cache.update_session_index) {
+-        MemoryPublication* target = nullptr;
+-        for (auto& publication : memory_publications) {
+-            if (publication.key == key) { target = &publication; break; }
+-            if (!publication.key) { target = &publication; }
+-        }
+-        if (!target) {
+-            for (auto& publication : memory_publications) {
+-                const bool active = std::any_of(requests.begin(), requests.end(), [&](const auto& value) {
+-                    return value.memory_session_key == publication.key;
+-                });
+-                const bool retained = std::any_of(memory_histories.begin(), memory_histories.end(), [&](const auto& value) {
+-                    return value && value->session_key == publication.key;
+-                });
+-                if (!active && !retained && (!target || publication.order < target->order)) target = &publication;
+-            }
+-        }
+-        if (!target) throw std::logic_error("KVMem publication table has no reclaimable entry");
+-        if (target->key != key) { target->key = key; target->order = 0; }
+-        target->order = std::max(target->order, sequence.window.publication_order);
+-    }
++    (void)prompt;
++    if(!sequence.window.cache_group) sequence.window.cache_group=next_snapshot_group.fetch_add(1);
+     if (!sequence.window.statistics) ++memory_history_misses;
+-    // An explicit fresh request invalidates only its own lineage. A caller that
+-    // forbids index updates cannot consume or erase the named cached history.
+-    if (!request.allow_memory_reuse && prompt.context_cache.update_session_index) {
+-        for (auto& history : memory_histories) {
+-            if (history && history->session_key == prompt.context_cache.session_key &&
+-                history->publication_order <= sequence.window.publication_order) history.reset();
+-        }
+-    }
++    // Read/write permission belongs to this request; a fresh request never
++    // invalidates other independently published content snapshots.
+     std::uint64_t reserved = 0;
+     for (const auto& active : requests) reserved += active.memory_payload_reservation;
+     if (reserved > memory_retained_budget) {
+@@ -2057,7 +2128,7 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
+     auto available = memory_retained_budget - reserved;
+     for (;;) {
+         std::uint64_t cached_bytes = memory_idle_transfer ? memory_idle_transfer->work->destination.size() : 0;
+-        std::optional<std::size_t> victim;
++        std::vector<kvmem::ContentCacheSlot> slots;
+         std::unordered_set<const void*> payloads,cold;
+         // Active reservations already include the shared physical prefix.
+         for(const auto& lane:continuation_states) if(lane.window.statistics)
+@@ -2065,6 +2136,9 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
+         const auto protected_source=request.prefill ? request.prefill->memory_restore_generation : 0;
+         for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+             const auto& history = memory_histories[index];
++            slots.push_back({bool(history),history && history->stamp.session.id==protected_source,
++                history ? history->publication_order : 0,
++                history ? static_cast<const void*>(&*history) : nullptr,history ? history->cache_group : 0});
+             if (!history) continue;
+             for(const auto& record:history->archive)
+                 if(record && payloads.insert(record.storage_identity()).second) cached_bytes+=record.size();
+@@ -2076,10 +2150,9 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
+                         cached_bytes += checkpoint->cold_state.size();
+                     seen.push_back(checkpoint);
+                 }
+-            if(history->stamp.session.id!=protected_source &&
+-               (!victim || history->publication_order < memory_histories[*victim]->publication_order)) victim = index;
+         }
+         if (cached_bytes <= available) break;
++        const auto victim=kvmem::select_content_eviction(slots);
+         if (!victim) throw std::logic_error("KVMem retained Host accounting has no victim");
+         memory_histories[*victim].reset();
+         ++memory_history_evictions;
+@@ -2095,16 +2168,11 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+     if (!kvmem_window_tokens || !request.allow_memory_reuse || !sequence.window.stamp.valid ||
+         (sequence.window.checkpoints.empty() && sequence.window.coverage.size()==0)) return;
+     auto& window = sequence.window;
+-    if (window.session_key && !window.update_session_index) return;
++    if (!window.update_session_index) return;
+     window.query_tokens=0;
+     window.query_capture=false;
+     for(auto& rows:window.query_rows) std::vector<float>().swap(rows);
+     std::vector<float>().swap(window.query_sums);
+-    if (window.session_key) {
+-        for (const auto& publication : memory_publications) {
+-            if (publication.key == window.session_key && publication.order > window.publication_order) return;
+-        }
+-    }
+     // Only the successful finish caller releases execution protection. Neither
+     // query_replayed (set at rewind start) nor a late cancellation of a Finishable
+     // request is proof that this is the successful publication path.
+@@ -2168,25 +2236,49 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+     window.archive.resize(pages);
+     window.host_versions.resize(pages);
+     window.payload_bytes = pages * page_bytes;
+-    std::optional<std::size_t> destination;
+-    std::optional<std::size_t> oldest;
+-    std::size_t count = 0;
+-    for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+-        auto& history = memory_histories[index];
+-        if (!history) { if (!destination) destination = index; continue; }
+-        ++count;
+-        if (window.session_key && history->session_key == window.session_key) {
+-            if (history->publication_order > window.publication_order) return;
+-            destination = index;
+-            break;
+-        }
+-        if (!oldest || history->publication_order < memory_histories[*oldest]->publication_order) oldest = index;
+-    }
+-    if (count >= kvmem_options.retained_sessions && (!destination || !memory_histories[*destination])) {
+-        destination = oldest;
+-        ++memory_history_evictions;
++    try {
++    // Recheck at publication: two independent requests can prepare from the
++    // same old ancestor before either branch publishes. Only groups whose
++    // complete canonical inputs all lie on one exact path may be inherited.
++    const auto input = canonical_snapshot_input(window, state_images->host_layout().image_bytes);
++    window.cache_group = snapshot_content_group(input, window.cache_group, memory_histories,
++                                                state_images->host_layout().image_bytes);
++    if (kvmem_options.verify_transfers) std::fprintf(stderr,
++        "KVMEM_SNAPSHOT_GROUP canonical=%zu accepted=%zu group=%llu\n", input.frontier,
++        input ? input.checkpoint->prefix.size() : 0, (unsigned long long)window.cache_group);
++    const auto origins=[&](const KvmemWindowState& owner) {
++        std::vector<uint64_t> result;
++        for(const auto kind:checkpoint_kinds(owner))
++            if(const auto* cp=memory_checkpoint(owner,kind)) result.push_back(cp->immutable_origin);
++        return result;
++    };
++    const auto incoming_origins=origins(window);
++    std::vector<kvmem::ContentCacheSlot> slots;
++    std::vector<size_t> superseded;
++    slots.reserve(memory_histories.size());
++    for (size_t index=0;index<memory_histories.size();++index) {
++        const auto& history=memory_histories[index];
++        bool covered=history && kvmem::content_snapshot_covers(incoming_origins,origins(*history));
++        // A checkpoint origin alone does not prove an archive that has since
++        // been replayed. Compact groups only when their native KV allocations
++        // are also still the exact immutable sources. COW tails are retained
++        // conservatively until a native byte-range proof is available.
++        for(size_t page=0;covered && page<history->archive.size();++page)
++            covered=page<window.archive.size() &&
++                history->archive[page].storage_identity()==window.archive[page].storage_identity();
++        if(covered) superseded.push_back(index);
++        slots.push_back({bool(history) && !covered, false, history ? history->publication_order : 0,
++                         history ? static_cast<const void*>(&*history) : nullptr,
++                         history ? history->cache_group : 0});
++    }
++    const auto destination=kvmem::plan_content_group_publication(slots,
++        std::min<size_t>(memory_histories.size(),kvmem_options.retained_sessions),
++        kvmem_options.retained_sessions,window.cache_group);
++    if (!destination) {
++        if(kvmem_options.verify_transfers) std::fprintf(stderr,"KVMEM_SNAPSHOT_PUBLISH admitted=0 reason=%u\n",unsigned(destination.reason));
++        return;
+     }
+-    if (!destination) return;
++    if(memory_histories[*destination] && slots[*destination].occupied) ++memory_history_evictions;
+     // Capture already completed every Host copy. The active state's later
+     // writes and unpublished output never become this checkpoint's contents.
+     for (auto& record : window.archive) record.seal();
+@@ -2199,8 +2291,18 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+                 cp->prefix.size(),int(!cp->state),(unsigned long long)(cp->state_bytes()+cp->metadata_bytes()),(const void*)cp);
+         }
+     }
++    window.publication_order=next_history_access.fetch_add(1);
+     memory_histories[*destination].emplace(std::move(window));
++    for(const auto index:superseded) if(index!=*destination) memory_histories[index].reset();
++    for(const auto index:destination.retired_slots) if(index!=*destination && memory_histories[index]) {
++        memory_histories[index].reset(); ++memory_history_evictions;
++    }
++    if(kvmem_options.verify_transfers) std::fprintf(stderr,"KVMEM_SNAPSHOT_PUBLISH admitted=1 reason=%u slot=%zu group=%llu\n",
++        unsigned(destination.reason),*destination,(unsigned long long)memory_histories[*destination]->cache_group);
+     if (memory_io && memory_payload_storage.disk_bytes()) memory_idle_requested = true;
++    } catch(const std::exception& error) {
++        std::fprintf(stderr,"KVMEM_SNAPSHOT_PUBLISH admitted=0 reason=allocation_failed error=%s\n",error.what());
++    }
+ 
+ }
+ 
+diff --git a/src/serve/generation_service.cpp b/src/serve/generation_service.cpp
+index ae33f4cb27f8487b4d3f8735db0673634d28b026..af753171d8173661c4a140963bb8f81c63fe7596 100644
+--- a/src/serve/generation_service.cpp
++++ b/src/serve/generation_service.cpp
+@@ -260,6 +260,7 @@ public:
+         const bool replayed_quote = progress.actual_reused_prompt_tokens && *progress.actual_reused_prompt_tokens != progress.reused_prompt_tokens;
+         if (monitor_) monitor_({{"prompt_processed_tokens", replayed_quote ? nlohmann::json(nullptr) : nlohmann::json(progress.processed_prompt_tokens)},
+             {"prefill_elapsed_ms", progress.elapsed_ns / 1e6},
++            {"cache_semantics_revision", progress.actual_reused_prompt_tokens ? nlohmann::json(2) : nlohmann::json(nullptr)},
+             {"actual_cached_tokens", progress.actual_reused_prompt_tokens ? nlohmann::json(*progress.actual_reused_prompt_tokens) : nlohmann::json(nullptr)}});
+         if (sink_->on_progress) { sink_->on_progress(progress); }
+     }
+diff --git a/src/serve/kvmem_metrics.h b/src/serve/kvmem_metrics.h
+index a66a651a450a5b78894269dd8f74b5bce2d1c614..ab50763e39b2478c92c6a8f89ae935ff36a11b72 100644
+--- a/src/serve/kvmem_metrics.h
++++ b/src/serve/kvmem_metrics.h
+@@ -15,10 +15,14 @@ inline const char* kvmem_reuse_source(PrefixReusePath path, std::uint32_t tokens
+ inline nlohmann::json kvmem_cache_reuse(const GenerationMetrics& metrics) {
+     using Json = nlohmann::json;
+     const auto actual = metrics.materialization.actual_reused_prompt_tokens;
+-    return {{"planned_cached_tokens", metrics.prefix_cache_hit_tokens},
++    const auto source=actual ? kvmem_reuse_source(metrics.prefix_reuse_path,*actual) : nullptr;
++    const auto restore= !actual ? Json(nullptr) : !*actual ? Json("miss") :
++        metrics.prefix_reuse_path==PrefixReusePath::SharedStablePrefix ? Json("snapshot") : Json("continuation");
++    return {{"cache_semantics_revision", 2}, {"restore_path",restore},
++            {"planned_cached_tokens", metrics.prefix_cache_hit_tokens},
+             {"actual_cached_tokens", actual ? Json(*actual) : Json(nullptr)},
+             {"planned_cache_source", kvmem_reuse_source(metrics.prefix_reuse_path, metrics.prefix_cache_hit_tokens)},
+-            {"cache_source", actual ? Json(kvmem_reuse_source(metrics.prefix_reuse_path, *actual)) : Json(nullptr)}};
++            {"cache_source", source ? Json(source) : Json(nullptr)}};
+ }
+ 
+ // Additive diagnostics; the native usage, timings and Prometheus series stay intact.
+diff --git a/src/serve/kvmem_status_json.h b/src/serve/kvmem_status_json.h
+index 0cbbed8b7c13cfac2a2f336d7cf42457b30baed1..205046aeb942975d26c8eb2ca4f431e889acc1ee 100644
+--- a/src/serve/kvmem_status_json.h
++++ b/src/serve/kvmem_status_json.h
+@@ -1,10 +1,14 @@
+ #pragma once
+ #include "ninfer/types.h"
++#include <algorithm>
+ #include <nlohmann/json.hpp>
+ 
+ namespace ninfer::serve {
+ inline nlohmann::json kvmem_status_json(const KvmemMemorySummary& m) {
+-    return {{"enabled", m.enabled}, {"selected_tokens", m.selected_tokens},
++    return {{"enabled", m.enabled}, {"cache_semantics_revision",2},
++        {"retained_sessions_unit","internal_content_groups"},
++        {"retained_groups",m.retained_sessions}, {"retained_groups_limit",m.retained_sessions_limit},
++        {"retained_snapshot_limit",std::min<uint64_t>(16,m.retained_sessions_limit)}, {"selected_tokens", m.selected_tokens},
+         {"reserve_tokens", m.reserve_tokens}, {"host_payload_budget_bytes", m.host_payload_budget_bytes},
+         {"host_payload_bytes", m.host_payload_bytes}, {"statistics_bytes", m.statistics_bytes},
+         {"disk_payload_budget_bytes", m.disk_payload_budget_bytes}, {"disk_payload_bytes", m.disk_payload_bytes},
+diff --git a/src/serve/openai_chat_request.cpp b/src/serve/openai_chat_request.cpp
+index 67ba8c3916eb7dac4ed2ed1854b664787e439e31..fdcd60ad621c820c786c5b5bd02a782a7db5fe26 100644
+--- a/src/serve/openai_chat_request.cpp
++++ b/src/serve/openai_chat_request.cpp
+@@ -1000,12 +1000,11 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
+     output.generation.lora                      = parse_lora_field(body);
+     output.generation.thinking_budget           = parse_thinking_budget_field(body);
+     apply_openai_prompt_cache_policy(output.generation, cache_policy);
+-    // As on Responses: a client that names its conversation will extend the prompt, so the Engine
+-    // keeps a resumable point at its end. The automatic boundary sits before the last user
+-    // message, so a tool-calling exchange (many requests, no new user turn between them) would
+-    // otherwise resume from the start of the exchange instead of from the previous request.
++    // Full-context chat requests keep their prompt-tail continuation boundary
++    // independently of client affinity metadata, including ordinary tool turns.
++    (void)parse_chat_context_cache_hints(body);
+     output.generation.private_cache_boundary_at_prompt_end =
+-        parse_chat_context_cache_hints(body).session_key.has_value();
++        cache_policy.automatic != OpenAIPromptCacheAutomatic::Disabled;
+     return output;
+ }
+ 
+@@ -1035,12 +1034,10 @@ ContextCacheHints parse_chat_context_cache_hints(const RequestJson& body) {
+             owner.conversation = key(extension.at("conversation_id"), "kvmem.conversation_id", false);
+         }
+     }
+-    try{hints.session_key=kvmem::resolve_cache_owner(owner);}
++    try{(void)kvmem::resolve_cache_owner(owner);}
+     catch(const std::invalid_argument& error){bad_request(error.what(),"promptCacheKey");}
+-    if (hints.session_key) {
+-        hints.retention = CacheRetentionHint::LiveSession;
+-        hints.update_session_index = true;
+-    }
++    // Keys are accepted and validated as transport metadata, never as owners
++    // of a mutable inference history. Native stateful handles remain separate.
+     return hints;
+ }
+ 
+diff --git a/src/serve/openai_responses_http.cpp b/src/serve/openai_responses_http.cpp
+index 8898318f1c2b40ca0ba8d785bc5fddf6aac60a3c..d7183387e543fecc48117dd6befe5f50e123e258 100644
+--- a/src/serve/openai_responses_http.cpp
++++ b/src/serve/openai_responses_http.cpp
+@@ -297,6 +297,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
+     const std::int64_t created = unix_time_now();
+     auto lifecycle             = begin_request(make_request_log_context(
+         req_id, "openai_responses", resolved.generation, metadata, prepared), prepared);
++    prepared.monitor_update({{"native_request_id", id}});
+     resolved.generation.messages.clear();
+ 
+     if (!request.stream) {
+diff --git a/src/serve/openai_responses_request.cpp b/src/serve/openai_responses_request.cpp
+index ef0b67cae003839bfeffa670b9cebed1710a2ae7..53a9de9429616526c88a03b168abf4d876c46f9b 100644
+--- a/src/serve/openai_responses_request.cpp
++++ b/src/serve/openai_responses_request.cpp
+@@ -1175,9 +1175,9 @@ void validate_metadata(const Json& body, nlohmann::json& metadata) {
+     metadata = body.at("metadata");
+ }
+ 
+-// Returns the validated prompt_cache_key, if any. It identifies a client-managed conversation
+-// lineage for cache retention purposes; it is independent of `store` (response-object
+-// persistence) and of prompt_cache_options.mode (explicit shared-prefix breakpoints).
++// Retain the validated transport hint for compatibility. It does not identify a
++// mutable cache lineage or grant publication rights; explicit response handles
++// and prompt_cache_options keep their separate protocol meanings.
+ std::optional<std::string> parse_prompt_cache_hints(const Json& body) {
+     require_string_hint(body, "prompt_cache_key", ninfer::kMaximumContextCacheSessionKeyBytes);
+     require_string_hint(body, "safety_identifier", 128);
+@@ -1316,14 +1316,10 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
+     OpenAIResponsesCreateRequest out;
+     out.prompt                  = std::move(parsed.prompt);
+     out.prompt.prompt_cache_key = std::move(prompt_cache_key);
+-    // Anthropic clients get a private long-anchor checkpoint at the prompt end whenever they send
+-    // cache_control:ephemeral (anthropic_messages_request.cpp), so a growing tool-calling exchange
+-    // -- many requests, no new user turn between them -- keeps a resumable point past the single
+-    // automatic TurnClosure boundary (which sits before the *last user message*, not the latest
+-    // request). The Responses API has no equivalent client-supplied marker, so grant the same
+-    // opportunity whenever the client has signaled caching intent via prompt_cache_key.
++    // Full-context requests receive the same native prompt-end opportunity with
++    // or without a key. Explicit-only cache markers still control their writes.
+     out.prompt.generation.private_cache_boundary_at_prompt_end =
+-        out.prompt.prompt_cache_key.has_value();
++        cache_policy.automatic != OpenAIPromptCacheAutomatic::Disabled;
+     out.tools                   = std::move(parsed.wire_tools);
+     out.tool_choice             = std::move(parsed.wire_tool_choice);
+     out.tool_identities         = std::move(parsed.tool_identities);
+diff --git a/src/serve/openai_responses_state.cpp b/src/serve/openai_responses_state.cpp
+index 3cac4147a9aa0ca62a284dd1f04102e21c6937e3..bcfcc62082ea06beabb527640bcbc73ccd31bfb8 100644
+--- a/src/serve/openai_responses_state.cpp
++++ b/src/serve/openai_responses_state.cpp
+@@ -187,24 +187,14 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
+             resolved.session_key = *response_id;
+         }
+ 
+-        // Cache retention identity is independent of `store`: `store` only controls whether this
+-        // Response object becomes retrievable by id later. A client that manages its own history
+-        // client-side (never sends previous_response_id, never wants a retrievable Response) can
+-        // still name its own conversation lineage via prompt_cache_key, so the Engine keeps its
+-        // checkpoints instead of grading them Disposable and losing them to the first request from
+-        // any other lineage. Only take this path when there is no parent chain and no store-based
+-        // session already in play, so it never changes behavior for clients using those mechanisms
+-        // (in particular, a stored parent consumed by a store=false reply must stay Disposable and
+-        // must not advance the session index).
+-        const bool use_prompt_cache_key =
+-            !parent_record && !store_response && request.prompt_cache_key.has_value();
+-
+-        resolved.cache_hints.session_key =
+-            use_prompt_cache_key ? request.prompt_cache_key : resolved.session_key;
+-        resolved.cache_hints.retention = (store_response || use_prompt_cache_key)
+-                                             ? CacheRetentionHint::LiveSession
+-                                             : CacheRetentionHint::Disposable;
+-        resolved.cache_hints.update_session_index = store_response || use_prompt_cache_key;
++        // A client resending complete input can retain content snapshots without
++        // a cache key or a retrievable Response object. A read-only continuation
++        // of an explicit parent still must not advance that parent's index.
++        const bool retain_content = !parent_record;
++        resolved.cache_hints.session_key = resolved.session_key;
++        resolved.cache_hints.retention = store_response ? CacheRetentionHint::LiveSession
++            : retain_content ? CacheRetentionHint::Default : CacheRetentionHint::Disposable;
++        resolved.cache_hints.update_session_index = store_response || retain_content;
+     }
+     return resolved;
+ }
+diff --git a/tests/experimental/p4_history.cpp b/tests/experimental/p4_history.cpp
+index fad9b544cf294f9c0cf4c17dbaea76c730b3a44b..57dffb6d2c9649007a4016274c461f2702f8d914 100644
+--- a/tests/experimental/p4_history.cpp
++++ b/tests/experimental/p4_history.cpp
+@@ -1,6 +1,7 @@
+ #include "ninfer/engine.h"
+ #include "kvmem_test_options.h"
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <charconv>
+ #include <cstdlib>
+@@ -139,10 +140,18 @@ int main(int argc, char** argv) {
+             o.speculative.draft_tokens = static_cast<std::uint32_t>(std::stoul(argv[5]));
+         }
+         const std::string mode = argc >= 7 ? argv[6] : "";
++        if (mode == "content-groups") {
++            o.max_concurrency = 2; o.prefill_chunk = 256;
++            o.kvmem.selected_tokens = 8192; o.kvmem.reserve_tokens = 256;
++            o.kvmem.host_bytes = 1ULL << 30; o.kvmem.retained_sessions = 8;
++            o.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(16896);
++        }
+         if (mode.starts_with("input-fallback-disk-"))
+             throw std::invalid_argument("persistent KVMem snapshots are retired; use tests/ninfer_memory_disk.py in the parent repository for process-local SSD lifecycle checks");
+         if (mode == "prefix-anchor-ssd") {
+-            o.kvmem.host_bytes = 64ULL << 20;
++            // Sharing can keep this ~32 MiB archive entirely hot at 64 MiB.
++            // Keep enough transfer headroom but force actual cold KV reads.
++            o.kvmem.host_bytes = 16ULL << 20;
+             o.kvmem.disk_path = std::filesystem::path(argv[4]).parent_path() / "prefix-spill";
+             o.kvmem.disk_bytes = 1ULL << 30;
+         }
+@@ -225,6 +234,77 @@ int main(int argc, char** argv) {
+             }
+             return result;
+         };
++        if (mode == "content-groups") {
++            // All branches start from exactly one acknowledged document. Their
++            // short user queries differ within the old 64-token render-tail
++            // allowance, but are independent canonical input paths.
++            ninfer::PromptInput seed;
++            seed.options.enable_thinking = false;
++            add(seed, ninfer::ChatRole::System, "Acknowledge notes with Noted. Answer later questions briefly.");
++            std::string notes;
++            for (int i = 0; i < 96; ++i) notes += "Coastal station maintenance and tide gauge inspection recorded. ";
++            add(seed, ninfer::ChatRole::User, notes +
++                " Station Alder uses an ultraviolet spectrometer. Supervisor Mara Lin. Code ALDER-73.");
++            const auto acknowledged = run("group-document", seed, true, false, 0, 0, 8, true);
++            require(!acknowledged.content.empty(), "group document produced no acknowledgement");
++            add(seed, ninfer::ChatRole::Assistant, acknowledged.content);
++            std::array<ninfer::PromptInput, 3> branches{seed, seed, seed};
++            const std::array<const char*, 3> questions{
++                "Which instrument is assigned to Alder?", "Who supervises Alder?", "What is Alder's code?"};
++            const auto turn = [&](const char* name, ninfer::PromptInput& input) {
++                const auto result = run(name, input, true, true, 0, 0, 16, true);
++                require(result.materialization.actual_reused_prompt_tokens &&
++                        *result.materialization.actual_reused_prompt_tokens > 0,
++                        "group fixture quote lacked successful native reuse");
++                require(!result.content.empty(), "group fixture produced no assistant text");
++                add(input, ninfer::ChatRole::Assistant, result.content);
++            };
++            for (size_t branch = 0; branch < branches.size(); ++branch) {
++                branches[branch].context_cache.session_key = "same-parent-cache-key";
++                add(branches[branch], ninfer::ChatRole::User, questions[branch]);
++                turn("group-first-question", branches[branch]);
++            }
++            require(engine.memory_summary().kvmem.retained_sessions >= 3,
++                    "short independent user queries collapsed into one resource group");
++            for (int round = 0; round < 6; ++round) for (size_t branch : {size_t(1), size_t(2)}) {
++                auto& input = branches[branch];
++                if (round % 3 == 0) input.context_cache.session_key = "same-parent-cache-key";
++                else if (round % 3 == 1) input.context_cache.session_key = "branch-" + std::to_string(branch);
++                else input.context_cache.session_key.reset();
++                add(input, ninfer::ChatRole::User, "Review " + std::to_string(round) +
++                    ": repeat Alder's instrument and supervisor.");
++                turn("group-hot-question", input);
++                require(engine.memory_summary().kvmem.retained_sessions <= 4,
++                        "append continuation minted a fresh resource group each turn");
++            }
++            add(branches[0], ninfer::ChatRole::User, "Confirm Alder's instrument and code.");
++            turn("group-old-parent", branches[0]);
++            std::cout << "CONTENT_GROUPS PASS groups=" << engine.memory_summary().kvmem.retained_sessions
++                      << " evictions=" << engine.memory_summary().kvmem.history_evictions << std::endl;
++            return 0;
++        }
++        if (mode == "content-keys") {
++            ninfer::PromptInput input;
++            input.options.enable_thinking=false;
++            add(input,ninfer::ChatRole::System,"Answer briefly.");
++            std::string document;
++            for(int i=0;i<96;++i) document += "The violet observatory studies pulsars and cosmic rays. ";
++            add(input,ninfer::ChatRole::User,document+" Acknowledge only OK.");
++            input.context_cache.session_key="parent";
++            run("content-seed",input,true,false,0,0,8);
++            for(const auto* key:{"parent","child","another"}) {
++                input.context_cache.session_key=key;
++                run("content-key-variant",input,true,true,0,0,8);
++            }
++            input.context_cache.session_key.reset();
++            run("content-anonymous",input,true,true,0,0,8);
++            run("content-read-disabled",input,false,false,0,0,8);
++            run("content-source-survives",input,true,true,0,0,8);
++            input.context_cache.update_session_index=false;
++            run("content-read-only",input,true,true,0,0,8);
++            std::cout << "CONTENT_KEYS PASS" << std::endl;
++            return 0;
++        }
+         if (mode == "prefix-anchor" || mode == "prefix-anchor-ssd") {
+             ninfer::PromptInput history;
+             history.options.enable_thinking = false;
+@@ -239,7 +319,9 @@ int main(int argc, char** argv) {
+                 current = history;
+                 add(current, ninfer::ChatRole::User, "Tool-call turn " + std::to_string(turn) +
+                     " of 100. State one fact.");
+-                run("rewritten-tail", current, true, turn >= 3, 0, 0, 8);
++                run("rewritten-tail", current, true,
++                    turn==1 ? std::optional<bool>(false) : turn>=3 ? std::optional<bool>(true) : std::nullopt,
++                    0, 0, 8);
+                 add(history, ninfer::ChatRole::Assistant, "The archive is recorded.");
+                 add(history, ninfer::ChatRole::Tool, "Observation: the observatory studies pulsars.");
+             }
+@@ -611,7 +693,7 @@ int main(int argc, char** argv) {
+         // independently by Program before generation.
+         std::cout << "P4_HISTORY warm_fresh_tokens_equal="
+                   << (warm.generated_token_ids == fresh.generated_token_ids) << std::endl;
+-        run("reuse-disabled-cleared", b, true, false);
++        run("reuse-disabled-source-preserved", b, true, true);
+         auto edited = b;
+         edited.messages[1].parts[0].text = "Edited archive: the observatory is now named amber.";
+         const auto edited_cold = run("history-edit", edited, true, false);
+diff --git a/tests/test_openai_responses.cpp b/tests/test_openai_responses.cpp
+index 8e9ebda742f65e729642a1ac8e9282f281ed2517..dcacd687083c0de7080a955f927377c3ce8ba336 100644
+--- a/tests/test_openai_responses.cpp
++++ b/tests/test_openai_responses.cpp
+@@ -435,14 +435,19 @@ int test_typed_items_and_cache_markers() {
+             media.bytes = {1};
+             return media;
+         });
+-    failures += check(translated.context_cache.markers.size() == 2 &&
++    failures += check(translated.context_cache.markers.size() == 3 &&
+                           translated.context_cache.markers[0].kind ==
+-                              ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
++                              ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
+                           translated.context_cache.markers[0].location ==
+-                              ninfer::PromptCacheMarkerLocation::MessagePartBoundary &&
++                              ninfer::PromptCacheMarkerLocation::MessageBoundary &&
++                          translated.context_cache.markers[0].after_message_count == translated.messages.size() &&
+                           translated.context_cache.markers[1].kind ==
++                              ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
++                          translated.context_cache.markers[1].location ==
++                              ninfer::PromptCacheMarkerLocation::MessagePartBoundary &&
++                          translated.context_cache.markers[2].kind ==
+                               ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+-                      "Responses breakpoints become shared Engine part boundaries");
++                      "shared part boundaries survive alongside the key-independent private prompt-end anchor");
+     return failures;
+ }
+ 
+@@ -1149,11 +1154,9 @@ int test_previous_response_call_graph() {
+     return failures;
+ }
+ 
+-// A client that never sends previous_response_id or store=true (it manages its own history
+-// client-side, e.g. resending the full growing transcript every turn) can still name its own
+-// conversation lineage via prompt_cache_key. That must grant the same cache retention a stored
+-// session gets, without ever depending on a retrievable Response object.
+-int test_prompt_cache_key_retention() {
++// Full-context cache retention is independent of key metadata and response-object
++// persistence. Explicit parent handles keep their own read-only lifecycle.
++int test_content_cache_retention() {
+     OpenAIResponsesStore store(16, 1ULL << 20);
+     const Json base = {{"model", "m"}, {"input", "hello"}};
+     int failures    = 0;
+@@ -1167,16 +1170,14 @@ int test_prompt_cache_key_retention() {
+                       "prompt_cache_key reaches the wire-independent prompt");
+     failures += check(
+         keyed_request.prompt.generation.private_cache_boundary_at_prompt_end,
+-        "prompt_cache_key grants a private long-anchor opportunity, matching the Anthropic "
+-        "cache_control:ephemeral path, so a growing tool-calling exchange keeps a resumable point "
+-        "past the single automatic TurnClosure boundary");
++        "full-context input grants a native prompt-end opportunity");
+     const OpenAIResponsesResolvedPrompt keyed_resolved =
+         resolve_openai_responses_prompt(keyed_request.prompt, store, "resp_keyed_1", false);
+     failures += check(
+-        keyed_resolved.cache_hints.session_key == "pi-session-1" &&
+-            keyed_resolved.cache_hints.retention == ninfer::CacheRetentionHint::LiveSession &&
++        !keyed_resolved.cache_hints.session_key &&
++            keyed_resolved.cache_hints.retention == ninfer::CacheRetentionHint::Default &&
+             keyed_resolved.cache_hints.update_session_index && !keyed_resolved.session_key,
+-        "prompt_cache_key grants LiveSession retention without store or a stored session_key");
++        "key metadata does not create an Engine session or own content retention");
+ 
+     Json unkeyed     = base;
+     unkeyed["store"] = false;
+@@ -1186,11 +1187,27 @@ int test_prompt_cache_key_retention() {
+         resolve_openai_responses_prompt(unkeyed_request.prompt, store, "resp_unkeyed_1", false);
+     failures += check(!unkeyed_resolved.cache_hints.session_key &&
+                           unkeyed_resolved.cache_hints.retention ==
+-                              ninfer::CacheRetentionHint::Disposable &&
+-                          !unkeyed_resolved.cache_hints.update_session_index,
+-                      "store=false with no prompt_cache_key stays Disposable as before");
+-    failures += check(!unkeyed_request.prompt.generation.private_cache_boundary_at_prompt_end,
+-                      "no prompt_cache_key grants no private long-anchor opportunity, unchanged");
++                              ninfer::CacheRetentionHint::Default &&
++                          unkeyed_resolved.cache_hints.update_session_index,
++                      "unkeyed complete input retains content without storing a Response");
++    failures += check(unkeyed_request.prompt.generation.private_cache_boundary_at_prompt_end,
++                      "unkeyed input has the same native checkpoint opportunity");
++
++    for (const Json& key : {Json("other-key"), Json(nullptr)}) {
++        Json variant = unkeyed;
++        variant["prompt_cache_key"] = key;
++        const auto parsed = parse_openai_responses_create_request(variant, limits());
++        const auto resolved = resolve_openai_responses_prompt(parsed.prompt, store, "resp_variant", false);
++        failures += check(!resolved.cache_hints.session_key &&
++                              resolved.cache_hints.retention == ninfer::CacheRetentionHint::Default &&
++                              resolved.cache_hints.update_session_index &&
++                              parsed.prompt.generation.private_cache_boundary_at_prompt_end,
++                          "changed and null keys preserve the same content-cache permissions");
++        variant["prompt_cache_options"] = {{"mode", "explicit"}};
++        failures += check(!parse_openai_responses_create_request(variant, limits())
++                               .prompt.generation.private_cache_boundary_at_prompt_end,
++                          "key metadata cannot override explicit-only checkpoint writes");
++    }
+ 
+     // prompt_cache_key must never override an existing previous_response_id chain: the
+     // store=false-consumes-parent-without-advancing behavior must be unchanged.
+@@ -1715,7 +1732,7 @@ int main(int argc, char** argv) {
+     failures += test_namespace_tools();
+     failures += test_explicit_rejections();
+     failures += test_previous_response_call_graph();
+-    failures += test_prompt_cache_key_retention();
++    failures += test_content_cache_retention();
+     failures += test_reasoning_summary_options();
+     failures += test_response_object();
+     failures += test_logprobs_response();
+diff --git a/tests/test_openai_schema.cpp b/tests/test_openai_schema.cpp
+index 3018698c97df044bf7fbda9638b7d949f4b24f5b..55f6e73203e7315c3ee48ce379174491b2bb01ad 100644
+--- a/tests/test_openai_schema.cpp
++++ b/tests/test_openai_schema.cpp
+@@ -1273,6 +1273,13 @@ int test_monitor_outcome() {
+     failures += check(fallback["planned_cached_tokens"] == 80 && fallback["actual_cached_tokens"] == 0 &&
+                           fallback["cache_source"] == "miss" && fallback["planned_cache_source"] == "shared",
+                       "failed restore separates planned and actual native cache source");
++    failures += check(fallback["cache_semantics_revision"]==2 && fallback["restore_path"]=="miss",
++                      "a failed snapshot restore cannot report an actual snapshot path");
++    outcome.metrics.materialization.actual_reused_prompt_tokens.reset();
++    const auto unknown=kvmem_cache_reuse(outcome.metrics);
++    failures += check(unknown["restore_path"].is_null() && unknown["actual_cached_tokens"].is_null(),
++                      "missing native observations remain unknown instead of a false miss");
++    outcome.metrics.materialization.actual_reused_prompt_tokens=0;
+     failures += check(fallback["prompt_new_tokens"] == 100 && fallback["prefill_tps"] == 1000 &&
+                           completion_timings_json(outcome)["cache_n"] == 80,
+                       "monitor accounts fallback computation without changing the admission wire contract");
+@@ -1747,23 +1754,22 @@ int test_assistant_continuation_mode() {
+     return failures;
+ }
+ 
+-// A Chat request that names its conversation gets the private long anchor at the end of its prompt
+-// that Responses (prompt_cache_key) and Anthropic (cache_control) requests get.
+-int test_prompt_cache_key_grants_long_anchor() {
++// Full-context Chat requests retain prompt-tail boundaries independently of affinity metadata.
++int test_chat_prompt_tail_is_key_independent() {
+     int failures = 0;
+-    failures += check(!parse(base_request()).generation.private_cache_boundary_at_prompt_end,
+-                      "a Chat request that names no conversation gets no long anchor");
++    failures += check(parse(base_request()).generation.private_cache_boundary_at_prompt_end,
++                      "unkeyed Chat receives a prompt-tail continuation boundary");
+ 
+     Json keyed                = base_request();
+     keyed["prompt_cache_key"] = "pi-session-1";
+     failures += check(parse(keyed).generation.private_cache_boundary_at_prompt_end,
+-                      "a Chat prompt_cache_key grants a long anchor at the end of the prompt");
++                      "keyed Chat has the same prompt-tail boundary");
+     keyed["prompt_cache_key"] = nullptr;
+-    failures += check(!parse(keyed).generation.private_cache_boundary_at_prompt_end,
+-                      "a null prompt_cache_key names no conversation");
++    failures += check(parse(keyed).generation.private_cache_boundary_at_prompt_end,
++                      "null affinity metadata preserves the prompt-tail boundary");
+     keyed["prompt_cache_key"] = "";
+-    failures += check(!parse(keyed).generation.private_cache_boundary_at_prompt_end,
+-                      "an empty prompt_cache_key names no conversation");
++    failures += check(parse(keyed).generation.private_cache_boundary_at_prompt_end,
++                      "empty affinity metadata preserves the prompt-tail boundary");
+ 
+     // A gateway that namespaces keys per user sends more than the API's 64 bytes.
+     keyed["prompt_cache_key"] = std::string(ninfer::kMaximumContextCacheSessionKeyBytes, 'k');
+@@ -1773,6 +1779,12 @@ int test_prompt_cache_key_grants_long_anchor() {
+     failures += check(api_error([&] { (void)parse(keyed); }).param == "prompt_cache_key",
+                       "a longer prompt_cache_key is rejected");
+ 
++    Json explicit_cache=base_request();
++    explicit_cache["prompt_cache_options"]={{"mode","explicit"}};
++    explicit_cache["prompt_cache_key"]="metadata";
++    failures += check(!parse(explicit_cache).generation.private_cache_boundary_at_prompt_end,
++                      "affinity metadata cannot override explicit cache write boundaries");
++
+     Json identified                 = base_request();
+     identified["safety_identifier"] = std::string(128, 'x');
+     failures += check(!parse(identified).generation.messages.empty(),
+@@ -1783,7 +1795,7 @@ int test_prompt_cache_key_grants_long_anchor() {
+     return failures;
+ }
+ 
+-int test_chat_cache_session_binding() {
++int test_chat_cache_metadata_is_not_ownership() {
+     int failures = 0;
+     Json body = base_request();
+     const auto anonymous = parse_chat_context_cache_hints(body);
+@@ -1791,37 +1803,37 @@ int test_chat_cache_session_binding() {
+                       "unkeyed Chat preserves anonymous cache semantics");
+     body["prompt_cache_key"] = "opencode-session-a";
+     auto hints = parse_chat_context_cache_hints(body);
+-    failures += check(hints.session_key == "opencode-session-a" &&
+-                          hints.retention == ninfer::CacheRetentionHint::LiveSession && hints.update_session_index,
+-                      "Chat cache key binds a retained, advancing session lineage");
++    failures += check(!hints.session_key &&
++                          hints.retention == ninfer::CacheRetentionHint::Default && hints.update_session_index,
++                      "Chat affinity metadata does not bind mutable cache ownership");
+     body["store"] = false;
+     failures += check(parse_chat_context_cache_hints(body).session_key == hints.session_key,
+                       "Chat store:false does not disable cache identity");
+     body["prompt_cache_key"] = "opencode-session-b";
+-    failures += check(parse_chat_context_cache_hints(body).session_key != hints.session_key,
+-                      "different client keys remain distinct owners");
++    failures += check(parse_chat_context_cache_hints(body).session_key == hints.session_key,
++                      "different client keys produce identical cache hints");
+     body["promptCacheKey"] = "opencode-session-b";
+-    failures += check(parse_chat_context_cache_hints(body).session_key == "opencode-session-b",
++    failures += check(!parse_chat_context_cache_hints(body).session_key,
+                       "matching SDK and wire cache keys are accepted");
+     body["promptCacheKey"] = "different-owner";
+     failures += check(api_error([&] { (void)parse(body); }).param == "promptCacheKey",
+                       "conflicting SDK and wire keys are rejected");
+     body.erase("prompt_cache_key");
+     body["promptCacheKey"] = "opencode-session-b";
+-    failures += check(parse_chat_context_cache_hints(body).session_key == "opencode-session-b" &&
++    failures += check(!parse_chat_context_cache_hints(body).session_key &&
+                           parse(body).generation.private_cache_boundary_at_prompt_end,
+-                      "OpenCode compatible SDK spelling binds the session and anchor");
++                      "SDK metadata preserves content lookup and the prompt-tail boundary");
+     body["promptCacheKey"] = 17;
+     failures += check(api_error([&] { (void)parse(body); }).param == "promptCacheKey",
+                       "malformed SDK cache key rejected");
+     body.erase("promptCacheKey");
+     body["prompt_cache_key"] = "opencode-session-b";
+     body["kvmem"] = Json{{"conversation_id", "explicit-owner"}};
+-    failures += check(parse_chat_context_cache_hints(body).session_key == "explicit-owner",
+-                      "explicit conversation identity takes precedence over cache affinity");
++    failures += check(!parse_chat_context_cache_hints(body).session_key,
++                      "explicit conversation metadata does not bind mutable cache ownership");
+     body.erase("prompt_cache_key");
+     failures += check(parse(body).generation.private_cache_boundary_at_prompt_end,
+-                      "explicit owner gets an endpoint anchor without a cache key");
++                      "explicit metadata preserves the same prompt-tail boundary");
+     for (const auto& invalid : std::vector<Json>{"", 17, std::string(257, 'x')}) {
+         body["kvmem"]["conversation_id"] = invalid;
+         failures += check(api_error([&] { (void)parse(body); }).param == "kvmem.conversation_id",
+@@ -1846,8 +1858,8 @@ int main(int argc, char** argv) {
+         return failures == 0 ? 0 : 1;
+     }
+     int failures = 0;
+-    failures += test_prompt_cache_key_grants_long_anchor();
+-    failures += test_chat_cache_session_binding();
++    failures += test_chat_prompt_tail_is_key_independent();
++    failures += test_chat_cache_metadata_is_not_ownership();
+     failures += test_graft_extension();
+     failures += test_lora_extension();
+     failures += test_thinking_budget_extension();

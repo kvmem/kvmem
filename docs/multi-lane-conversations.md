@@ -1,138 +1,73 @@
 # Multi-lane conversations
 
-`--parallel P` is the number of independent GPU execution lanes (1 through 8).
-`--kvmem-conversations N` is the global number of host conversation stores.
-After environment/CLI parsing and before validation, N becomes `max(N, P)`.
-The server logs an adjustment once and exposes requested/effective values.
+`--parallel P` selects independent GPU execution lanes (1 through 8). Model weights are shared; every lane has its own KV working set, recurrent buffers and optional MTP follower. More lanes permit overlap but require more working-set/scratch memory and do not guarantee higher throughput.
+
+The current [content-snapshot contract](checkpoint-policy.md#content-snapshots-across-backends) governs reuse. `--kvmem-sessions N` configures internal retained content groups. The deprecated explicit `--kvmem-conversations N` path is normalized to at least P and cannot be combined with `--kvmem-sessions`. The current catalog retains at most `C=max(2*N,P)` physical versions under its publication policy. This differs from the historical N-total-store limit; report group and physical-version limits separately.
 
 For example:
 
 ```sh
 llama-kvmem-server -m model.gguf --device CUDA0 --flash-attn on \
-  --parallel 2 --kvmem-conversations 3 --threads-http 8 \
+  --parallel 2 --kvmem-sessions 3 --threads-http 8 \
   --kvmem-budget 2048 --kvmem-gen-reserve 1024 --kvmem-cpu-gb 0.5
 ```
 
-Choose budgets for the model and card. Each of the P contexts gets its own
-`budget + gen_reserve` GPU KV window, recurrent buffers and optional MTP follower.
-Model weights are shared. `--kvmem-cpu-gb` is per host store, so 3 stores at
-0.5 GiB can allocate 1.5 GiB of arenas, plus raw KV and checkpoints. P stores
-exist at startup; additional stores are lazy, with a hard global N limit.
-`--kvmem-conversations-gb` is a soft cap on accounted retained host bytes, not
-process RSS. Idle parked, unreferenced stores are evicted by LRU; resident or
-queued stores can keep the total above the cap, with a warning.
+Choose budgets for the model and GPU. In this example P=2, C=6, and the separate legacy arena commitment cap is `(C+P)*0.5GiB=4GiB`, plus raw KV, checkpoints and other allocations. Arenas are lazy, not all allocated at startup. This is not the former three-store 1.5GiB layout. Default CPU bytes are zero; public SSD and the legacy CPU arena remain mutually exclusive. [Multi-conversation KV cache](multi-conversation-kv-cache.md#legacy-cpu-arena-ledger) describes its copy and reservation ledger.
 
-For four lanes, use `--parallel 4 --kvmem-conversations 8 --threads-http 16`.
-Multiple lanes require at least `2 * P` HTTP workers; automatic worker selection
-also enforces that floor. More lanes increase GPU working-set/scratch memory
-and permit more simultaneous execution, but do not guarantee higher throughput.
+Multiple lanes require at least `2*P` HTTP workers; automatic worker selection enforces that floor. `/slots` always has P lane entries, independently of how many content versions are parked.
 
-## Scheduling
+## Scheduling and cache hints
 
-A conversation has host state and, optionally, one lane residency. No lane is
-assigned permanently. Completion leaves a warm residency; returning requests
-prefer it when free. A parked conversation can resume on any free lane.
+Ready requests are considered in arrival order while skipping unavailable execution resources. Media preparation happens before taking a lane; a request can retry preparation when its cache hint was evicted. Preview results are hints, and admission rechecks content/native state. Queued previews do not pin all retained metadata or reserve GPU residency. Active, switching and admitted source bindings are protected during native work.
 
-Ready request heads are considered in arrival order, skipping heads whose store
-or lane is busy. A request still preparing media is not ready. With an explicit
-`kvmem.conversation_id`, requests serialize in arrival order before preparation,
-so a second turn never reads a half-written first turn. Different IDs can use
-other lanes while that turn waits. Queued references protect host caches from
-soft byte-cap eviction, but cannot reserve the last count-limited slots or pin
-their GPU residency. Without IDs, the existing
-media-aware prefix and recurrent-checkpoint policy infers cache identity;
-explicit IDs are recommended when overlapping requests belong to one conversation.
-An ID never bypasses prefix/checkpoint validation.
+`kvmem.conversation_id`, `prompt_cache_key` and `promptCacheKey` are validated compatibility metadata, not mutable cache owners. The same, different or missing key follows the same content-selection policy. Applications must order dependent turns themselves; cache aliases do not provide an explicit stateful-session contract. A returned protocol resource handle, where supported, has its own lifecycle.
 
-The modern host/SSD tier and multi-conversation path also allow a different
-owner to fork an exact native prefix. Full owner keys and their aliases follow
-the [shared-owner contract](checkpoint-policy.md#shared-owners-across-backends).
-The source catalog entry and sealed allocations remain valid when the child
-rewinds, generates, fails or is released. A live source is captured read-only;
-only the subsequent normal handover moves the lane working set. Old pinned CPU
-arenas do not support these foreign forks; the monitor reports
-`shared_prefix_fork_supported=false` for that configuration.
+A completed native prefix can seed a source-preserving fork on an available lane. Sealed KV and immutable images retain references; selectors, MeanK, Query, feedback, rollback and checkpoint wrappers remain private. A native-successful continuation can inherit its source's internal capacity group. Group equality alone cannot select or overwrite a source. Tool continuation still requires content/native continuation proof and uses resident-only Pressure rather than rediscovering cold history.
 
-| Event (P=2, N=3) | Lane 0 | Lane 1 | Parked in RAM |
+A warm resident continuation can leave the GPU working set in place, but first creates the required independent host source. This is still a source-preserving branch and can incur CPU-arena/state cost. `restore_path=continuation` does not imply zero copies or physical GPU residency.
+
+| Event with two lanes | Lane 0 | Lane 1 | Retained sources |
 |---|---|---|---|
-| A and B begin | A running | B running | none |
-| A finishes; C arrives | C running | B running | A |
-| B finishes; A returns while C runs | C running | A running | B |
-| A finishes; queued A2 is ready | C running | A2 running, warm | B |
+| A and B begin | A running | B running | Existing complete versions stay independent |
+| A finishes; C is admitted | C running | B running | A can remain as an immutable host source |
+| A returns while C runs | C running | A branch running | B and older eligible versions can remain |
+| A continuation becomes ready | C running | A continuation | Native proof and budgets are rechecked |
 
-At N=P, a new conversation recycles an eligible idle store instead of allocating
-an N+1 arena. If all stores are busy or switching, it waits. Queued cache hints
-alone cannot prevent admission; their prefix and media needs are rechecked.
-An invalid request is rejected before any reservation, eviction or KV switch.
-Disconnected waiters release queue/cache references. Completion, disconnect and
-errors release lane reservations and commit a usable prefix or clear a failed
-restore into a cache miss.
+A physical-slot or Host/checkpoint-pressure victim is selected through the common group-fair policy: old redundant versions precede another group's sole version, while pinned execution bindings remain protected. Leased bytes may remain charged after a directory entry is retired. If no eligible resource can be released, admission or optional reuse can fail; the source must not be consumed to manufacture room. A new request does not acquire an unbounded extra arena merely because it wants the same prefix.
+
+Disconnect, completion and error paths release operation/source reservations. A partially repaired native binding can be cleared into a cache miss, and a storage/GPU failure can return an error. This does not promise to restore every old cache byte after arbitrary device failure.
 
 ## Switching a lane
 
-The outgoing entry is marked as transitioning while the incoming entry is
-reserved. Inference and GPU copies execute outside the scheduler mutex.
+The outgoing entry is marked as transitioning while the incoming entry is reserved. Inference and copies execute outside the catalog mutex.
 
-1. Synchronize outgoing writers, harvest partial KV/mean state and drain the
-   GPU working set to the host mirror.
-2. Invalidate all outgoing target/MTP cell mappings and positions, reset the
-   lane's slot allocator and invalidate attention-view epochs. The buffers stay.
-3. Park raw KV, runtime arena, row positions and query accumulators as one
-   independently mutable bundle. Its sealed KV and read-only checkpoints may
-   retain references shared with another bundle. A parked runtime has no lane backend pointer.
-4. Bind the incoming bundle to this lane, stage its valid working set and
-   restore recurrent/MTP checkpoints through the existing prefill path.
-5. Publish matching metadata only after quiescence. Scheduling reads committed
-   snapshots, never a busy lane's changing token/checkpoint containers.
+1. Reserve any additional legacy CPU arena before constructing a runtime or source-preserving fork.
+2. Synchronize outgoing writers and harvest partial KV/MeanK; drain the outgoing working set when a handover needs it.
+3. Invalidate outgoing target/MTP cell mappings, positions and attention-view epochs while preserving the engine-sized buffers.
+4. Move raw KV, runtime, row positions and Query accumulators as one native bundle. A parked runtime has no lane backend pointer; shared sealed payload references survive independently.
+5. Bind the incoming bundle, restore its native working set and recurrent/MTP state, then publish matching committed metadata.
 
-Transfer/restore failures keep ownership consistent and invalidate affected
-cached content for subsequent requests; the current request can return an error.
-This does not promise to roll back every old cache byte after a GPU/storage error. Startup and swaps
-check the model, KV types, MTP presence and pool geometry.
+The arena ledger counts active lanes, parked bundles and in-flight reservations under the catalog mutex. Normal and exceptional attach paths account installed handles before returning the reservation. Its configured-commitment charge is independent of raw H/D and checkpoint pools and is not an RSS limit. Runtime geometry, Flash Attention/KV support and accepted-state checks still apply to every restore.
 
 ## Shared projector
 
-Add `--mmproj projector.gguf --mmproj-device none` for CPU, or a device reported
-by `--list-devices`, such as `CUDA0` or `Vulkan0` when built with Vulkan.
-The projector is loaded once and its placement is independent of target lanes.
-It may share the target GPU; size for model weights, both lanes, projector
-weights and the encoder's peak scratch memory together.
+`--mmproj projector.gguf --mmproj-device none` selects CPU encoding; `--list-devices` lists other available placements. The projector is loaded once independently of target lanes. Size shared GPU placement for model weights, all lane working sets, projector weights and encoder peak scratch together.
 
-Tokenization and encoding use a shared mutex. Encoding happens before acquiring
-a lane, including when both lanes are decoding. Request-owned immutable
-embeddings and native chunk metadata are then consumed without holding the
-encoder mutex during target decode. Identical media reuse the bounded embedding
-cache. Cache plus in-flight embeddings share a 128 MiB ceiling; an individual
-prepared request exceeding it is rejected, and other preparers wait with
-cancellation support when live references occupy the ceiling. Native video/audio
-concurrency is outside this multi-lane implementation.
+Tokenization/encoding use a shared mutex before lane admission. Requests consume immutable embeddings/native chunk metadata without holding the encoder mutex during target decode. The bounded media cache and in-flight embeddings share their configured ceiling; live references can make preparers wait with cancellation support. Native video/audio concurrency is outside this lane implementation.
 
-## Status and validation
+## Status and current validation scope
 
-Shared-prefix admission keeps the catalog-to-lane mapping one-to-one. A new
-or detached branch can run on the source lane; a slot resident on another lane
-cannot be rebound there. When the legacy total-store limit leaves no room for
-a detached branch, a resident target runs fresh on its own lane. This preserves
-the source when a separate target exists, at the cost of recomputing that request.
-If the only usable target is the request's own source, fresh execution replaces
-that old history. Queued preview pins are hints, not hard count reservations:
-selection replans and rechecks media preparation after reuse is lost. Active or
-switching entries remain protected. Inactive-limit mode can still allocate a
-detached shared branch while another lane is empty.
+Catalog-to-lane mappings remain one-to-one. An entry resident on another lane is not rebound onto a source lane. A detached branch can use the source lane while the old host source stays preserved; source protection does not imply unlimited capacity. Publication may decline a version when all admissible victims are protected.
 
-`/props` reports physical P, effective/requested N, per-store CPU budget, soft
-host byte cap and projector placement. `/slots` always has P entries. Each
-entry reports the same global store count/counters, its resident store and
-transition state. `X-KVMem-Lane` identifies the selected physical lane.
+`/props` reports P, retention configuration, per-store CPU bytes and the legacy soft byte target. `/slots` includes group/version limits, physical payload counters, independent CPU arena live/reserved/charged/budget fields, and actual hit observations. `X-KVMem-Lane` identifies the physical lane. Revision2 adds `cache_semantics_revision=2` and `restore_path=continuation|snapshot|miss`; unknown native observations stay null.
 
-`tests/lane-pool-test.cpp` covers eligible FIFO, same-ID serialization,
-cancellation and media retry. `kvmem/tests/backend_rebind_test.cpp` verifies that
-resident/pending runtimes refuse migration and drained runtimes allocate/free
-on the new backend. `scripts/test_server_lane_conversations.py` checks real KV
-hits and secret/image isolation across a lane migration, capacity normalization,
-invalid input, disconnect recovery and mixed projector/decode work; use
-`--conversations 1` for N<P and `--mmproj ... --mmproj-device ... --mtp` for vision/MTP.
-Add `--parallel 4 --conversations 5` to exercise four lanes and a parked store.
+`tests/lane-conversations-test.cpp` covers controlled source protection, handover failures, checkpoint admission, group-fair reclamation and CPU-arena reservations. `tests/lane-pool-test.cpp` tests the generic queue primitive, including its keyed-queue mode; that alone does not prove current cache aliases serialize or overlap in the HTTP server. `kvmem/tests/backend_rebind_test.cpp` checks runtime migration constraints. GPU qualification additionally needs real simultaneous native work, not just two overlapping HTTP wall-clock intervals or a peak admitted counter.
+
+Source preservation can keep additional full checkpoint images alive. A functional test with a larger checkpoint pool, or a 2N-version catalog compared with the former N-store catalog, must record that resource change. It is not evidence of unchanged-budget performance improvement.
+
+## Historical validation
+
+The following record belongs to its 2026-10-01 binaries and configurations. Its counts are preserved as history; they do not qualify the new content-cache code, arena ledger, current group/version capacities or untested hardware. Old exact-output/store-count expectations are not the sole correctness oracle.
 
 Local validation on 2026-10-01 used Windows/MSVC, CUDA 13.2.86 and Vulkan:
 
@@ -166,11 +101,6 @@ ancestor, with its original author, so GitHub shows the contributor's work.
 
 ## Public SSD storage
 
-Public `--kvmem-host-mib H --kvmem-disk-path PATH --kvmem-disk-mib D` works with
-multiple lanes; H must hold all concurrent working windows. It cannot be combined
-with the optional legacy `--kvmem-cpu-gb` arena. The old NVMe and separate session
-disk interfaces have been retired; see [migration and validation](legacy-ssd-retirement-20261019.md).
-The existing lane runner accepts `--host-mib`, `--disk-mib`, `--disk-path` and an
-optional DFlash2 `--draft-model`/`--draft-tokens` pair. For eight lanes at its default
-B2048/R1024, choose a larger H (for example 512 MiB for the small-model fixture)
-than the B512/R256 qualification; its final checks require actual SSD reads/writes.
+`--kvmem-host-mib H --kvmem-disk-path PATH --kvmem-disk-mib D` supplies the shared raw payload account across lanes. H must accommodate concurrent working windows. It cannot be combined with the optional legacy CPU arena. The old NVMe and separate session-disk interfaces are retired; see [migration and historical validation](legacy-ssd-retirement-20261019.md).
+
+The lane runner accepts `--host-mib`, `--disk-mib`, `--disk-path` and an optional DFlash2 `--draft-model`/`--draft-tokens` pair. A storage qualification must show actual SSD reads/writes and preserve source state through failure/cancellation; enabling flags alone is insufficient. Model, KV/MTP type, H/D, checkpoint and arena scope, GPU UUID and native overlap evidence must accompany the result. Different-budget or different-GPU arms are reported separately.

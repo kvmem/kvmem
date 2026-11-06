@@ -295,23 +295,20 @@ static void test_decision_table() {
         CHECK(plan.evict == std::vector<int>({attached.id}));
     }
     {
-        g_row = "T16 a client id restricts the candidate set";
+        g_row = "T16 client ids do not restrict the content candidate set";
         kvmem_store_match a = store_fixture(1, 4000, 200, {0, 3800}, 1 * GiB, 10);
         kvmem_store_match b = store_fixture(2, 9000, 100, {0, 8900}, 2 * GiB, 20);
         a.client_id = "x";
         b.client_id = "y";
         a.lcp = 300;   // shared prefix only
         b.lcp = 8950;  // genuine continuation
-        // The hint never lets a request attach to a store it does not name,
-        // even when that store has the longer prefix.
         kvmem_store_plan plan = select({a, b}, 9300, false, "x", many);
-        CHECK(plan.action == kvmem_store_action::fresh && plan.id == -1);
-        CHECK(std::string(plan.reason) == "fork_zero_keep");
-        // A bound id that does continue its store is the cheap path.
-        CHECK(plan.observed_lcp == 300);
+        CHECK(plan.action == kvmem_store_action::extend && plan.id == 2);
+        CHECK(std::string(plan.reason) == "extend");
+        CHECK(plan.observed_lcp == 8950);
         plan = select({a, b}, 9300, false, "y", many);
         CHECK(plan.action == kvmem_store_action::extend && plan.id == 2);
-        CHECK(std::string(plan.reason) == "client_id");
+        CHECK(std::string(plan.reason) == "extend");
         // An unknown id is not an error: it degrades to inferred matching.
         plan = select({a, b}, 9300, false, "z", many);
         CHECK(plan.action == kvmem_store_action::extend && plan.id == 2);
@@ -321,20 +318,20 @@ static void test_decision_table() {
         b_no_ckpt.ckpt_rows.clear();
         plan = select({a, b_no_ckpt}, 9300, false, "y", many);
         CHECK(plan.action == kvmem_store_action::fresh && plan.id == -1);
-        CHECK(std::string(plan.reason) == "no_recurrent_checkpoint");
+        CHECK(std::string(plan.reason) == "fork_zero_keep");
         CHECK(plan.observed_lcp == 8950);
     }
 }
 
 static void test_explicit_owner_edit() {
-    g_row = "spread permits editing only the explicitly bound owner";
+    g_row = "spread never authorizes destructive edits from a client label";
     auto owner = store_fixture(1, 9000, 100, {26, 2048, 4096, 8900}, 1 * GiB, 10);
     owner.client_id = "owner";
     owner.lcp = 3800;
     CHECK(select({owner}, 9100, false, "owner", {4, 0}).action == kvmem_store_action::fresh);
     owner.allow_bound_edit = true;
     const auto edit = select({owner}, 9100, false, "owner", {4, 0});
-    CHECK(edit.action == kvmem_store_action::extend && edit.keep == 2048 && edit.id == 1);
+    CHECK(edit.action == kvmem_store_action::fresh);
     CHECK(select({owner}, 9100, false, "", {4, 0}).action == kvmem_store_action::fresh);
     CHECK(select({owner}, 9100, false, "different", {4, 0}).action == kvmem_store_action::fresh);
     owner.ckpt_rows = {4096, 8900};

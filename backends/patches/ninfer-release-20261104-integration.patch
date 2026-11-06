@@ -1,0 +1,574 @@
+diff --git a/include/ninfer/ops/token_sums.h b/include/ninfer/ops/token_sums.h
+index 1e044764a2463435b1ad462e7038f44bd1859094..21fb6cc2c13422a0acacafdc84e7de6f8f9924b2 100644
+--- a/include/ninfer/ops/token_sums.h
++++ b/include/ninfer/ops/token_sums.h
+@@ -15,7 +15,8 @@ namespace ninfer::ops {
+ // frontier update, normalization, quantization, allocation or host copy occurs.
+ // Numerical reference: naive FP64 sums of the represented BF16 inputs.
+ void token_sums(const Tensor& input, const Tensor& origin, const Tensor& range,
+-                std::uint32_t block_tokens, Tensor& output, cudaStream_t stream);
++                std::uint32_t block_tokens, Tensor& output, cudaStream_t stream,
++                std::int32_t input_offset = 0, std::int32_t chunk_tokens = 0);
+ 
+ // Copy the represented BF16 rows in the intersection of [origin,origin+T) and
+ // range into contiguous output [channels,capacity], starting at row zero. The
+@@ -24,7 +25,8 @@ void token_sums(const Tensor& input, const Tensor& origin, const Tensor& range,
+ // every buffer is contiguous and disjoint. Origin/range may change on replay.
+ // The reference is an exact copy of the selected represented input bits.
+ void capture_query_rows(const Tensor& input, const Tensor& origin, const Tensor& range,
+-                        Tensor& output, cudaStream_t stream);
++                        Tensor& output, cudaStream_t stream,
++                        std::int32_t input_offset = 0, std::int32_t chunk_tokens = 0);
+ 
+ // Add that intersection, in increasing token order, to an FP32 [channels,1]
+ // accumulator. The caller seeds it with the accepted Query prefix before each
+@@ -34,5 +36,12 @@ void capture_query_rows(const Tensor& input, const Tensor& origin, const Tensor&
+ // Numerical reference: FP64 sum including the represented FP32 seed. The
+ // chronological FP32 additions are also a state boundary across chunk splits.
+ void accumulate_query_sum(const Tensor& input, const Tensor& origin, const Tensor& range,
+-                          Tensor& output, cudaStream_t stream);
++                          Tensor& output, cudaStream_t stream,
++                          std::int32_t input_offset = 0, std::int32_t chunk_tokens = 0);
++
++// A split chunk keeps origin at the whole chunk's first token. Pass each consecutive piece's
++// input_offset and the whole chunk_tokens; offset zero initializes token_sums/capture_query_rows,
++// later pieces preserve their other rows/buckets. accumulate_query_sum always adds to the caller's
++// seed and continues the chronological FP32 sum, including at offset zero. All pieces of a
++// shard execute in order on the same stream. chunk_tokens==0 means one whole input (offset zero).
+ } // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/execution/attention.cpp b/src/models/qwen3_5/execution/attention.cpp
+index afff8cf8571ee10a52da2d3d9568344fb500fda9..5755d1dd889c2c62ca7b7838f42633ecdb7968b3 100644
+--- a/src/models/qwen3_5/execution/attention.cpp
++++ b/src/models/qwen3_5/execution/attention.cpp
+@@ -122,7 +122,8 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
+     if (statistics != nullptr) {
+         const auto tokens = query.ne[2];
+         const auto block = static_cast<std::int32_t>(statistics->block_tokens);
+-        const auto buckets = (tokens + 2 * block - 2) / block;
++        const auto chunk_tokens = statistics->chunk_tokens != 0 ? statistics->chunk_tokens : tokens;
++        const auto buckets = (chunk_tokens + 2 * block - 2) / block;
+         // Decode columns are independent candidates, potentially belonging to
+         // different requests. Copy their represented keys without interpreting
+         // flattened columns as a consecutive logical token range.
+@@ -131,16 +132,19 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
+         Tensor k_sum = statistics->key_sums.slice(2, layer, 1)
+                            .slice(1, 0, buckets).view({dimension(attention.key_width()), buckets});
+         ops::token_sums(normalized_key.view({dimension(attention.key_width()), tokens}),
+-                        origin, statistics->ranges.slice(0, 0, 2), block, k_sum, stream);
++                        origin, statistics->ranges.slice(0, 0, 2), block, k_sum, stream,
++                        statistics->input_offset, statistics->chunk_tokens);
+         if (block != 1) {
+             Tensor q_values = statistics->query_values.slice(2, layer, 1)
+                                   .view({dimension(attention.query_width()), statistics->query_values.ne[1]});
+             const auto q_input = normalized_query.view({dimension(attention.query_width()), tokens});
+             const auto q_range = statistics->ranges.slice(0, 2, 2);
+             if (q_values.dtype == DType::FP32) {
+-                ops::accumulate_query_sum(q_input, origin, q_range, q_values, stream);
++                ops::accumulate_query_sum(q_input, origin, q_range, q_values, stream,
++                                         statistics->input_offset, statistics->chunk_tokens);
+             } else {
+-                ops::capture_query_rows(q_input, origin, q_range, q_values, stream);
++                ops::capture_query_rows(q_input, origin, q_range, q_values, stream,
++                                       statistics->input_offset, statistics->chunk_tokens);
+             }
+         }
+     }
+diff --git a/src/models/qwen3_5/execution/memory_statistics.h b/src/models/qwen3_5/execution/memory_statistics.h
+index 6232299b8469c96eb24a48e6b5885afc45aa7e4a..2259a3d7a4c9e51a3921f589086617407d2aed87 100644
+--- a/src/models/qwen3_5/execution/memory_statistics.h
++++ b/src/models/qwen3_5/execution/memory_statistics.h
+@@ -29,6 +29,9 @@ struct MemoryStatisticsShard {
+     // Feature offsets in a whole layer, derived from the rank's KV/query head range.
+     std::uint32_t key_offset = 0;
+     std::uint32_t query_offset = 0;
++    // Consecutive TP prefill pieces share one whole-chunk statistics record.
++    std::int32_t input_offset = 0;
++    std::int32_t chunk_tokens = 0;
+ };
+ 
+ // One contiguous shard's columns scattered into the complete host head order.
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index 67d524fcb25047023390596476da5734f2c67471..53261c6e5c0c932d727b4a6cc999c935f514fb59 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -1573,6 +1573,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+     std::int32_t statistics_layer = fidx;
+     if (statistics_ != nullptr) {
+         local_statistics = statistics_->ranks.at(ctx_.active_rank());
++        local_statistics.input_offset = active_memory_input_offset_;
++        local_statistics.chunk_tokens = active_memory_chunk_tokens_;
+         if (active_memory_prefill_origin_ != nullptr) {
+             local_statistics.prefill_origin = *active_memory_prefill_origin_;
+         }
+@@ -1590,7 +1592,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+             static_cast<std::int32_t>(config_.full_attention_layers-1)};
+         for(std::int32_t slot=0;slot<3;++slot) {
+             if(selected[slot]!=fidx || (slot && selected[slot]==selected[slot-1])) continue;
+-            auto capture=statistics->attention_queries.slice(2,slot,1).slice(1,0,T)
++            auto capture=statistics->attention_queries.slice(2,slot,1)
++                .slice(1,statistics->input_offset,T)
+                 .view({dimension(config.attention->query_width()),T});
+             CUDA_CHECK(cudaMemcpyAsync(capture.data,qn.data,capture.bytes(),cudaMemcpyDeviceToDevice,s));
+         }
+@@ -2561,6 +2564,10 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
+                     arena_guard.emplace(work_, rank);
+                 }
+                 ScopedControl control_guard(current, piece.control[rank], slots);
++                ScopedValue<std::int32_t> statistics_offset(
++                    active_memory_input_offset_, piece.column);
++                ScopedValue<std::int32_t> statistics_chunk(
++                    active_memory_chunk_tokens_, T);
+                 ScopedValue<const ops::CausalAttentionExecutionEnvelope*> envelope_guard(
+                     active_causal_attention_envelope_, &piece.envelope);
+                 // Later pieces continue the Gated DeltaNet state the earlier ones wrote.
+diff --git a/src/models/qwen3_5/execution/text.h b/src/models/qwen3_5/execution/text.h
+index ec4ff4397232aafe236c3d844b90c8960e712f8b..70b2e4d18a8b32093860a170c41f8bf4f9fd2e97 100644
+--- a/src/models/qwen3_5/execution/text.h
++++ b/src/models/qwen3_5/execution/text.h
+@@ -420,6 +420,8 @@ private:
+     const Tensor* active_linear_state_destination_slots_                           = nullptr;
+     const Tensor* active_valid_columns_                                            = nullptr;
+     const Tensor* active_memory_prefill_origin_                                    = nullptr;
++    std::int32_t active_memory_input_offset_ = 0;
++    std::int32_t active_memory_chunk_tokens_ = 0;
+     const Tensor* active_backend_kv_table_rows_                                    = nullptr;
+     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
+     std::int32_t active_sequence_batch_                                            = 0;
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index 3ee8016bad22b6e2cc7e3e99588a2bf04d4091cc..d55d3b07d034ca07ffd1dcd09aa957a082d3820d 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -12,6 +12,7 @@
+ #include <cstring>
+ #include <unordered_set>
+ #include <unordered_map>
++#include <numeric>
+ 
+ namespace ninfer::models::qwen3_5::detail {
+ namespace {
+@@ -165,8 +166,8 @@ public:
+             const auto byte = std::to_integer<unsigned char>(value);
+             model_id += hex[byte >> 4]; model_id += hex[byte & 15];
+         }
+-        d.identity = {"ninfer", program.backend_kv_pages ? "kvmem-main-mtp-pages-v3" : "kvmem-native-pages-v2",
+-            model_id, "qwen3.5-kvmem-state-image-v4"};
++        d.identity = {"ninfer", program.backend_kv_pages ? "kvmem-main-mtp-pages-v4" : "kvmem-native-pages-v2",
++            model_id, "qwen3.5-kvmem-state-image-v5"};
+         // StateImage contains every GDN shard, including ranks without KV heads.
+         // Bind checkpoints to this partition rather than only to its byte size.
+         for (std::size_t i = 0; i < program.state_images->shard_count(); ++i) {
+@@ -231,11 +232,47 @@ public:
+         }
+         if (ordinal != layout.planes.size()) { throw std::logic_error("KVMem plane inventory mismatch"); }
+         if (mtp_layout) {
+-            for (std::uint32_t kind = 0; kind < planes; ++kind) {
+-                const auto& plane = mtp_layout->planes.at(kind);
+-                d.layout.planes.push_back({static_cast<std::uint32_t>(config.layer_types.size()),
+-                    kinds[kind], layout.page_stride + plane.offset, plane.page_payload_bytes, 1, 0,
+-                    0, 0, static_cast<std::uint32_t>(config.attention->num_key_value_heads)});
++            const auto* mtp = program.backend_kv_cache();
++            if (mtp == nullptr || mtp->position_ranks() > 1) {
++                throw std::logic_error("KVMem MTP pages require a heads cache");
++            }
++            const auto mtp_shares = mtp->head_shares();
++            const auto mtp_ranks = mtp_shares.empty() ? 1U : mtp_shares.size();
++            const auto mtp_heads = mtp_shares.empty()
++                ? static_cast<std::uint32_t>(mtp->page_pool().geometry().planes.at(0).head_extent)
++                : static_cast<std::uint32_t>(std::accumulate(mtp_shares.begin(), mtp_shares.end(), 0));
++            // The auxiliary cache owns its storage geometry: DFlash full-attention
++            // KV is BF16 even when the target cache has quantized scale planes.
++            const auto groups = std::size_t(mtp->layers()) * mtp_ranks;
++            if (groups == 0 || mtp_layout->planes.size() % groups != 0) {
++                throw std::logic_error("KVMem auxiliary KV plane groups mismatch");
++            }
++            const auto auxiliary_planes = mtp_layout->planes.size() / groups;
++            if (auxiliary_planes != 2 && auxiliary_planes != 4) {
++                throw std::logic_error("KVMem auxiliary KV has an unsupported storage geometry");
++            }
++            std::size_t mtp_ordinal = 0;
++            for (std::uint32_t layer = 0; layer < mtp->layers(); ++layer) {
++                std::uint32_t head_begin = 0;
++                for (std::size_t rank = 0; rank < mtp_ranks; ++rank) {
++                    const auto head_count = static_cast<std::uint32_t>(mtp_shares.empty()
++                        ? mtp_heads : mtp_shares[rank]);
++                    const auto owner = static_cast<std::uint32_t>(mtp_shares.empty()
++                        ? mtp->layer_rank(layer) : rank);
++                    for (std::uint32_t kind = 0; kind < auxiliary_planes; ++kind) {
++                        const auto& plane = mtp_layout->planes.at(mtp_ordinal++);
++                        d.layout.planes.push_back({static_cast<std::uint32_t>(config.layer_types.size()) + layer,
++                            kinds[kind], layout.page_stride + plane.offset, plane.page_payload_bytes,
++                            1, 0, owner, head_begin, head_count});
++                    }
++                    head_begin += head_count;
++                }
++                if (head_begin != mtp_heads) {
++                    throw std::logic_error("KVMem MTP inventory does not cover every KV head");
++                }
++            }
++            if (mtp_ordinal != mtp_layout->planes.size()) {
++                throw std::logic_error("KVMem MTP plane inventory mismatch");
+             }
+         }
+         d.capabilities = {page_tokens, program.capacity, true, true, true, false, false, false};
+diff --git a/src/models/qwen4_exp/dflash2.cpp b/src/models/qwen4_exp/dflash2.cpp
+index 3dce6b3887940fe092ac1517fcf5acbfc33bf482..b260a37a3b76c99c0e6dd47b9c3c1c50c8a4e49d 100644
+--- a/src/models/qwen4_exp/dflash2.cpp
++++ b/src/models/qwen4_exp/dflash2.cpp
+@@ -172,7 +172,7 @@ void DFlash2Drafter::propose(const DFlash2ProposalCall& call, WorkspaceArena& wo
+             Tensor k_heads = k.view({d, kv, columns});
+             ops::rope(flat_positions, d, config_.rope_theta, q_heads, k_heads, stream);
+             Tensor attended = work.alloc(DType::BF16, {d, hq, w, b});
+-            ops::sliding_window_attention(q, k, v, positions, call.valid_columns, call.lanes,
++            ops::sliding_window_attention(q, k, v, positions, call.valid_columns, call.lanes, Tensor{},
+                                           {d, hq, kv}, *config_.sliding_window, scale, ring_[l],
+                                           envelope, work, attended, stream);
+             Tensor output = work.alloc(DType::BF16, {h, w, b});
+diff --git a/src/ops/token_sums/token_sums.cu b/src/ops/token_sums/token_sums.cu
+index 9a750fbe22fa272a9b6cca23d3accac638b73d3c..ba8baf5d0fb79b65e0c59f5c0459ec4b1e26c589 100644
+--- a/src/ops/token_sums/token_sums.cu
++++ b/src/ops/token_sums/token_sums.cu
+@@ -10,21 +10,22 @@ namespace {
+ __global__ void sum_tokens(const __nv_bfloat16* input, const std::int32_t* origin,
+                            const std::int32_t* range, std::uint32_t block_tokens,
+                            std::int64_t channels, std::int64_t tokens,
+-                           std::int64_t count, float* output) {
+-    const std::int64_t begin = origin[0];
++                           std::int64_t count, float* output, std::int32_t input_offset) {
++    const std::int64_t begin = std::int64_t(origin[0]) + input_offset;
+     for (std::int64_t cell = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+          cell < count; cell += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
+         const auto channel = cell % channels;
+         const auto bucket = cell / channels;
+         std::int64_t first = 0, last = tokens;
+         if (block_tokens) {
+-            const auto page_begin = (begin / block_tokens + bucket) * block_tokens;
++            const auto page_begin = (std::int64_t(origin[0]) / block_tokens + bucket) * block_tokens;
+             first = max(std::int64_t{0}, page_begin - begin);
+             last = min(tokens, page_begin + block_tokens - begin);
+         }
+         first = max(first, static_cast<std::int64_t>(range[0]) - begin);
+         last = min(last, static_cast<std::int64_t>(range[1]) - begin);
+-        float sum = 0.0F;
++        if (input_offset != 0 && first >= last) { continue; }
++        float sum = input_offset == 0 ? 0.0F : output[cell];
+         for (auto token = first; token < last; ++token) {
+             sum += __bfloat162float(input[token * channels + channel]);
+         }
+@@ -35,22 +36,29 @@ __global__ void sum_tokens(const __nv_bfloat16* input, const std::int32_t* origi
+ __global__ void capture_rows(const __nv_bfloat16* input, const std::int32_t* origin,
+                              const std::int32_t* range, std::int64_t channels,
+                              std::int64_t tokens, std::int64_t count,
+-                             __nv_bfloat16* output) {
+-    const auto first = max(std::int64_t{0}, std::int64_t(range[0]) - origin[0]);
+-    const auto last = min(tokens, std::int64_t(range[1]) - origin[0]);
++                             __nv_bfloat16* output, std::int32_t input_offset,
++                             std::int32_t chunk_tokens) {
++    const auto first = max(std::int64_t(origin[0]), std::int64_t(range[0]));
++    const auto last = min(std::int64_t(origin[0]) + chunk_tokens, std::int64_t(range[1]));
+     for (std::int64_t cell = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+          cell < count; cell += std::int64_t(gridDim.x) * blockDim.x) {
+         const auto row = cell / channels;
+-        output[cell] = first + row < last ? input[(first + row) * channels + cell % channels]
+-                                         : __float2bfloat16(0.0F);
++        const auto position = first + row;
++        const auto local = position - (std::int64_t(origin[0]) + input_offset);
++        if (position < last && local >= 0 && local < tokens) {
++            output[cell] = input[local * channels + cell % channels];
++        } else if (input_offset == 0) {
++            output[cell] = __float2bfloat16(0.0F);
++        }
+     }
+ }
+ 
+ __global__ void accumulate_rows(const __nv_bfloat16* input, const std::int32_t* origin,
+                                 const std::int32_t* range, std::int64_t channels,
+-                                std::int64_t tokens, float* output) {
+-    const auto first = max(std::int64_t{0}, std::int64_t(range[0]) - origin[0]);
+-    const auto last = min(tokens, std::int64_t(range[1]) - origin[0]);
++                                std::int64_t tokens, float* output, std::int32_t input_offset) {
++    const auto begin = std::int64_t(origin[0]) + input_offset;
++    const auto first = max(std::int64_t{0}, std::int64_t(range[0]) - begin);
++    const auto last = min(tokens, std::int64_t(range[1]) - begin);
+     if (first >= last) { return; }
+     for (std::int64_t channel = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+          channel < channels; channel += std::int64_t(gridDim.x) * blockDim.x) {
+@@ -90,37 +98,53 @@ void check_query_launch() {
+         throw std::runtime_error(std::string("query statistics: ") + cudaGetErrorString(status));
+     }
+ }
++
++std::int32_t checked_chunk(const Tensor& input, std::int32_t offset, std::int32_t tokens) {
++    const auto total = tokens == 0 ? input.ne[1] : std::int64_t(tokens);
++    if (offset < 0 || total <= 0 || total > std::numeric_limits<std::int32_t>::max() ||
++        std::int64_t(offset) + input.ne[1] > total || (tokens == 0 && offset != 0)) {
++        throw std::invalid_argument("token statistics: input piece is outside its chunk");
++    }
++    return static_cast<std::int32_t>(total);
++}
+ } // namespace
+ 
+ void capture_query_rows(const Tensor& input, const Tensor& origin, const Tensor& range,
+-                        Tensor& output, cudaStream_t stream) {
++                        Tensor& output, cudaStream_t stream, std::int32_t input_offset,
++                        std::int32_t chunk_tokens) {
+     require_query_buffers(input, origin, range, output, DType::BF16);
++    chunk_tokens = checked_chunk(input, input_offset, chunk_tokens);
+     constexpr int threads = 128;
+     const auto blocks = static_cast<unsigned>(std::min<std::int64_t>(65535,
+         (output.numel() + threads - 1) / threads));
+     capture_rows<<<blocks, threads, 0, stream>>>(static_cast<const __nv_bfloat16*>(input.data),
+         static_cast<const std::int32_t*>(origin.data), static_cast<const std::int32_t*>(range.data),
+-        input.ne[0], input.ne[1], output.numel(), static_cast<__nv_bfloat16*>(output.data));
++        input.ne[0], input.ne[1], output.numel(), static_cast<__nv_bfloat16*>(output.data),
++        input_offset, chunk_tokens);
+     check_query_launch();
+ }
+ 
+ void accumulate_query_sum(const Tensor& input, const Tensor& origin, const Tensor& range,
+-                          Tensor& output, cudaStream_t stream) {
++                          Tensor& output, cudaStream_t stream, std::int32_t input_offset,
++                          std::int32_t chunk_tokens) {
+     require_query_buffers(input, origin, range, output, DType::FP32);
++    (void)checked_chunk(input, input_offset, chunk_tokens);
+     constexpr int threads = 128;
+     const auto blocks = static_cast<unsigned>(std::min<std::int64_t>(65535,
+         (input.ne[0] + threads - 1) / threads));
+     accumulate_rows<<<blocks, threads, 0, stream>>>(static_cast<const __nv_bfloat16*>(input.data),
+         static_cast<const std::int32_t*>(origin.data), static_cast<const std::int32_t*>(range.data),
+-        input.ne[0], input.ne[1], static_cast<float*>(output.data));
++        input.ne[0], input.ne[1], static_cast<float*>(output.data), input_offset);
+     check_query_launch();
+ }
+ 
+ void token_sums(const Tensor& input, const Tensor& origin, const Tensor& range,
+-                std::uint32_t block_tokens, Tensor& output, cudaStream_t stream) {
++                std::uint32_t block_tokens, Tensor& output, cudaStream_t stream,
++                std::int32_t input_offset, std::int32_t chunk_tokens) {
+     const auto tokens = static_cast<std::int64_t>(input.ne[1]);
++    chunk_tokens = checked_chunk(input, input_offset, chunk_tokens);
+     const auto buckets = block_tokens
+-        ? (tokens + 2 * static_cast<std::int64_t>(block_tokens) - 2) / block_tokens : 1;
++        ? (std::int64_t(chunk_tokens) + 2 * static_cast<std::int64_t>(block_tokens) - 2) / block_tokens : 1;
+     if (!input.data || !origin.data || !range.data || !output.data ||
+         !input.is_contiguous() || !origin.is_contiguous() || !range.is_contiguous() ||
+         !output.is_contiguous() || input.dtype != DType::BF16 ||
+@@ -138,7 +162,8 @@ void token_sums(const Tensor& input, const Tensor& origin, const Tensor& range,
+         (output.numel() + threads - 1) / threads));
+     sum_tokens<<<blocks, threads, 0, stream>>>(static_cast<const __nv_bfloat16*>(input.data),
+         static_cast<const std::int32_t*>(origin.data), static_cast<const std::int32_t*>(range.data),
+-        block_tokens, input.ne[0], tokens, output.numel(), static_cast<float*>(output.data));
++        block_tokens, input.ne[0], tokens, output.numel(), static_cast<float*>(output.data),
++        input_offset);
+     const auto status = cudaGetLastError();
+     if (status != cudaSuccess) {
+         throw std::runtime_error(std::string("token_sums: ") + cudaGetErrorString(status));
+diff --git a/tests/cmake/RuntimeTests.cmake b/tests/cmake/RuntimeTests.cmake
+index d71c2007b43fb3fba76014d57c316e076a5abf97..9c3dae276a29b64191b7d1807e771fd5031bc445 100644
+--- a/tests/cmake/RuntimeTests.cmake
++++ b/tests/cmake/RuntimeTests.cmake
+@@ -42,7 +42,7 @@ ninfer_add_test(ninfer_device_profile_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/..
+ 
+ ninfer_add_test(ninfer_context_cache_defaults_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_cache_defaults.cpp"
+-  LIBRARIES ninfer_engine ninfer_core ninfer::json)
++  LIBRARIES ninfer_engine ninfer_core ninfer::json kvmem)
+ 
+ ninfer_add_test(ninfer_sampling_defaults_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_sampling_defaults.cpp"
+diff --git a/tests/convert/test_dense_geometry.py b/tests/convert/test_dense_geometry.py
+index b71be6573302f5a338a813c5b2f3ddcf1358eb56..2c485628db5e8dcdb100182f66928e99f89863a4 100644
+--- a/tests/convert/test_dense_geometry.py
++++ b/tests/convert/test_dense_geometry.py
+@@ -76,8 +76,10 @@ def test_dense_tensor_contract_and_rejection(geometry, mtp):
+         assert shapes[f"blk.{g.layers}.nextn.eh_proj.weight"][0] == (g.hidden, 2 * g.hidden)
+     tensors = {}
+     for name, (shape, kind) in shapes.items():
+-        tensors[name] = SimpleNamespace(shape=shape, type_id=12 if kind == "blocks" else 0,
+-                                       type_name="Q4_K" if kind == "blocks" else "F32", offset=0, nbytes=1)
++        kinds = (kind,) if isinstance(kind, str) else kind
++        blocked = "blocks" in kinds
++        tensors[name] = SimpleNamespace(shape=shape, type_id=12 if blocked else 0,
++                                       type_name="Q4_K" if blocked else "F32", offset=0, nbytes=1)
+     source = SimpleNamespace(path="synthetic.gguf", tensors=tensors, data_bytes_available=1,
+                              kv={**g.expected_header(), "qwen35.block_count": g.layers + int(mtp)})
+     validate(source, g)
+diff --git a/tests/experimental/token_sums.cpp b/tests/experimental/token_sums.cpp
+index 2444dd695f36374d7ee0c633675960540a80d4ea..300ce2a9edc8ece770488ae101f136834b4532a2 100644
+--- a/tests/experimental/token_sums.cpp
++++ b/tests/experimental/token_sums.cpp
+@@ -196,10 +196,119 @@ void check_query_accumulation(int channels, int tokens, bool graph) {
+     cuda_check(cudaStreamDestroy(stream), "destroy sum stream");
+ }
+ 
++// TP prefill splits one logical chunk into pieces on the same compute stream.
++// Positions, page bins and compact Query rows must still describe that whole
++// chunk, including when a piece boundary crosses a KV page or Query boundary.
++void check_pieces(int channels, const std::vector<int>& sizes, int block, bool graph) {
++    int tokens = 0;
++    for (int size : sizes) tokens += size;
++    const int buckets = block ? (tokens + 2 * block - 2) / block : 1;
++    const int capacity = tokens;
++    constexpr int guard = 64;
++    std::mt19937 rng(251U + channels + tokens);
++    std::uniform_real_distribution<float> random(-4.0F, 4.0F);
++    std::vector<std::uint16_t> represented(std::size_t(channels) * tokens);
++    for (auto& value : represented) value = f32_to_bf16(random(rng));
++    auto x = to_device(represented);
++    auto origin_buffer = to_device(std::vector<int>{0});
++    auto range_buffer = to_device(std::vector<int>{0, 0});
++    auto sums_buffer = to_device(std::vector<float>(std::size_t(channels) * buckets + guard, 12345.0F));
++    auto query_buffer = to_device(std::vector<std::uint16_t>(std::size_t(channels) * capacity + guard, 0xA55A));
++    auto mean_buffer = to_device(std::vector<float>(channels + guard, 12345.0F));
++    Tensor input(x.p, DType::BF16, {channels, tokens});
++    Tensor origin(origin_buffer.p, DType::I32, {1});
++    Tensor range(range_buffer.p, DType::I32, {2});
++    Tensor sums(sums_buffer.p, DType::FP32, {channels, buckets});
++    Tensor query(query_buffer.p, DType::BF16, {channels, capacity});
++    Tensor mean(mean_buffer.p, DType::FP32, {channels, 1});
++    cudaStream_t stream = nullptr;
++    cuda_check(cudaStreamCreate(&stream), "pieces stream");
++    const auto execute = [&] {
++        int offset = 0;
++        for (int size : sizes) {
++            auto piece = input.slice(1, offset, size);
++            ops::token_sums(piece, origin, range, block, sums, stream, offset, tokens);
++            ops::capture_query_rows(piece, origin, range, query, stream, offset, tokens);
++            ops::accumulate_query_sum(piece, origin, range, mean, stream, offset, tokens);
++            offset += size;
++        }
++    };
++    cudaGraph_t captured = nullptr;
++    cudaGraphExec_t executable = nullptr;
++    if (graph) {
++        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "pieces capture");
++        execute();
++        cuda_check(cudaStreamEndCapture(stream, &captured), "pieces capture end");
++        cuda_check(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0), "pieces instantiate");
++    }
++    const int spans[][2] = {{0, tokens}, {sizes.front()-7, tokens-13},
++                           {-17, sizes.front()+9}, {tokens+1, tokens+9}, {tokens-19, tokens+7}};
++    for (int pass = 0; pass < 5; ++pass) {
++        const int start = 498 + pass * 37;
++        const int limits[] = {start + spans[pass][0], start + spans[pass][1]};
++        origin_buffer.copy_from_host(&start, sizeof(start));
++        range_buffer.copy_from_host(limits, sizeof(limits));
++        std::vector<float> sequential_mean(channels, 1.25F);
++        mean_buffer.copy_from_host(sequential_mean.data(), channels*sizeof(float));
++        if (graph) cuda_check(cudaGraphLaunch(executable, stream), "pieces replay");
++        else execute();
++        cuda_check(cudaStreamSynchronize(stream), "pieces completion");
++        const auto actual_sums = from_device<float>(sums_buffer, sums.numel()+guard);
++        const auto actual_query = from_device<std::uint16_t>(query_buffer, query.numel()+guard);
++        const auto actual_mean = from_device<float>(mean_buffer, channels+guard);
++        std::vector<float> sequential_sums(sums.numel(), 0.0F);
++        std::vector<double> reference(sums.numel()), absolute(sums.numel());
++        std::vector<std::uint16_t> expected_query(query.numel(), 0);
++        int query_row = 0;
++        for (int row = 0; row < tokens; ++row) {
++            if (start+row < limits[0] || start+row >= limits[1]) continue;
++            const int bucket = block ? (start+row)/block-start/block : 0;
++            for (int channel = 0; channel < channels; ++channel) {
++                const auto bits = represented[std::size_t(row)*channels+channel];
++                const float value = bf16_to_f32(bits);
++                const auto cell = std::size_t(bucket)*channels+channel;
++                sequential_sums[cell] += value;
++                reference[cell] += value;
++                absolute[cell] += std::abs(value);
++                sequential_mean[channel] += value;
++                expected_query[std::size_t(query_row)*channels+channel] = bits;
++            }
++            ++query_row;
++        }
++        for (std::size_t cell = 0; cell < sums.numel(); ++cell) {
++            const double bound = 2.0*tokens*std::numeric_limits<float>::epsilon()*absolute[cell];
++            if (actual_sums[cell] != sequential_sums[cell] ||
++                !std::isfinite(actual_sums[cell]) ||
++                std::abs(actual_sums[cell]-reference[cell]) > std::max(1e-6, bound))
++                throw std::runtime_error("piece key sums differ from chronological/FP64 oracle");
++        }
++        if (!std::equal(expected_query.begin(), expected_query.end(), actual_query.begin()) ||
++            !std::equal(sequential_mean.begin(), sequential_mean.end(), actual_mean.begin()))
++            throw std::runtime_error("piece Query capture or Mean-Q differs from whole-chunk oracle");
++        if (!std::all_of(actual_sums.begin()+sums.numel(), actual_sums.end(), [](float x) { return x == 12345.0F; }) ||
++            !std::all_of(actual_mean.begin()+channels, actual_mean.end(), [](float x) { return x == 12345.0F; }) ||
++            !std::all_of(actual_query.begin()+query.numel(), actual_query.end(), [](auto x) { return x == 0xA55A; }))
++            throw std::runtime_error("piece statistics wrote beyond output");
++    }
++    if (executable) cuda_check(cudaGraphExecDestroy(executable), "pieces destroy executable");
++    if (captured) cuda_check(cudaGraphDestroy(captured), "pieces destroy graph");
++    cuda_check(cudaStreamDestroy(stream), "pieces destroy stream");
++}
++
+ int main(int argc, char** argv) {
+     try {
+         if (cuda_unavailable()) { return 77; }
+         int cases = 0;
++        if (argc == 2 && std::string(argv[1]) == "pieces") {
++            for (int channels : {513, 1024}) for (int block : {0, 1, 64})
++                for (bool graph : {false, true}) for (const auto& sizes :
++                     {std::vector<int>{512, 482}, std::vector<int>{384, 384, 221}}) {
++                    check_pieces(channels, sizes, block, graph);
++                    ++cases;
++                }
++            std::cout << "TOKEN_SUMS_PIECES PASS cases=" << cases << '\n';
++            return 0;
++        }
+         if (argc == 2 && std::string(argv[1]) == "candidates") {
+             for (int channels : {512, 1024}) {
+                 for (int tokens : {2, 4, 8, 12, 16, 32, 64}) {
+diff --git a/tests/models/qwen3_5/test_checkpoint_buffer_pool.cpp b/tests/models/qwen3_5/test_checkpoint_buffer_pool.cpp
+index 053240ba81c8f5b3d4817c43cee2eb1ef4df6500..37ab6f6379598a25be10a4023ccaee90f436d032 100644
+--- a/tests/models/qwen3_5/test_checkpoint_buffer_pool.cpp
++++ b/tests/models/qwen3_5/test_checkpoint_buffer_pool.cpp
+@@ -30,7 +30,15 @@ int main(int argc, char** argv) {
+         std::array<std::vector<int32_t>, 3> axes;
+         for (auto& axis : axes) axis.resize(32);
+         ResidentPrefixIdentity media;
+-        media.restore(std::vector<uint8_t>(32), std::move(axes), std::move(images), {4, 16});
++        const std::array<std::uint64_t, 2> adapter_key{11, 29};
++        media.restore(std::vector<uint8_t>(32), std::move(axes), std::move(images), {4, 16}, adapter_key);
++        CHECK(media.lora_key() == adapter_key);
++        ResidentPrefixIdentity other_adapter;
++        other_adapter.restore(media.token_types(),
++            {media.position_axis(0), media.position_axis(1), media.position_axis(2)},
++            media.vision_items(), media.rewrite_execution_frontiers(), {11, 30});
++        CHECK(!media.prefix_equals(other_adapter, 4));
++        CHECK(media.prefix_equals(other_adapter, 0));
+         size_t owned = media.token_types().capacity() + media.vision_items().capacity()*sizeof(image) +
+             media.rewrite_execution_frontiers().capacity()*sizeof(uint32_t);
+         for (size_t i = 0; i < 3; ++i) owned += media.position_axis(i).capacity()*sizeof(int32_t);
+diff --git a/tests/models/qwen3_5/test_loading.cpp b/tests/models/qwen3_5/test_loading.cpp
+index c137f7520ca3b7c18ff73b548e4f5d0cad884b5b..93a1d39ce16d05d9cf95eafd53d267d2fe4ec1d3 100644
+--- a/tests/models/qwen3_5/test_loading.cpp
++++ b/tests/models/qwen3_5/test_loading.cpp
+@@ -290,6 +290,13 @@ void logical_data_and_instances() {
+ 
+ void shared_stage_auxiliaries() {
+     ModelFixture fixture;
++    // Only GGUF linears consume input_columns. Keep this cross-rank
++    // auxiliary-sharing fixture inside that contract.
++    for (const auto* role : {"gate", "up"}) {
++        const std::string object = std::string("gather-") + role;
++        fixture.tensor(object, {24, 128}, QType::GGUF_Q8_0, QuantLayout::GgufBlocks);
++        fixture.file.root["bindings"][std::string("text/layers/0/mlp/") + role] = {{"object", object}};
++    }
+     fixture.tensor("permutation", {128}, QType::INT32);
+     fixture.file.root["files"][0]["payload_bytes"] = fixture.file.payload.size();
+     const auto offset = fixture.file.root["objects"].back()["offset"].get<std::size_t>();
+diff --git a/tools/convert/gguf_blocks.py b/tools/convert/gguf_blocks.py
+index f1bcf722e081725792ed4e1d898236c95d05ba8a..f19e6648c598e0d5e5e7bd4fc96c9b29af032742 100644
+--- a/tools/convert/gguf_blocks.py
++++ b/tools/convert/gguf_blocks.py
+@@ -41,11 +41,10 @@ from .ternary import RowMap, _direct, _flat, _norm, rows
+ from .dense_geometry import DenseGeometry
+ 
+ GDN_CONTROL_TYPES = ("F32", "F16", "BF16", *(TYPE_NAMES[t] for t in GGUF_FORMATS_BY_TYPE))
++HEAD_TYPES = ("blocks", "BF16")
+ 
+ 
+ def _attention_tensors(prefix: str, geom: DenseGeometry) -> dict[str, tuple[tuple[int, ...], str]]:
+-
+-HEAD_TYPES = ("blocks", "BF16")
+     return {
+         prefix + "attn_q.weight": ((2 * geom.query_rows, geom.hidden), "blocks"),
+         prefix + "attn_k.weight": ((geom.kv_rows, geom.hidden), "blocks"),

@@ -469,6 +469,7 @@
   function syncDependencies(){
     const get=key=>root.querySelector(`[data-param=${key}]`);
     if(!get('Backend'))return;
+    dependency('LoraScale',!!get('Lora')?.value.trim(),tr('先选择 LoRA 适配器。','Select a LoRA adapter first.'));
     dependency('DiskEnabled',true,'');
     const disk=!!get('DiskEnabled')?.checked&&!get('DiskEnabled').disabled,vision=!!get('Vision')?.checked;
     for(const key of ['DiskPath','DiskMiB'])dependency(key,disk,tr('先开启 SSD 缓存。','Enable SSD cache first.'));
@@ -699,9 +700,10 @@
       perBackend[before.Backend] = captureDraft();
       const assets = perBackend[preset.parameters.Backend]?.parameters || {};
       const next = {...defaults, ...structuredClone(preset.parameters)};
-      for (const key of ['Model','Worker','ChatTemplateFile','Mmproj','VisionWorker','Tokenizer','PolystrataSource','Python','DraftModel','DiskPath']) {
+      for (const key of ['Model','Worker','ChatTemplateFile','Mmproj','Lora','VisionWorker','Tokenizer','PolystrataSource','Python','DraftModel','DiskPath']) {
         if (assets[key]) next[key] = assets[key];
       }
+      if (assets.Lora && Object.hasOwn(assets,'LoraScale')) next.LoraScale = assets.LoraScale;
       next.Port = before.Port ?? defaults.Port;
       next.ListenHost = before.ListenHost ?? defaults.ListenHost;
       next.Gpu = before.Gpu || '';
@@ -911,6 +913,11 @@
     }else{
       const kv=rad?['fp8','bf16','fp8_v4','k6_v4']:poly?['f16','q8_0','int8','int8k']:['int8','bf16','fp8','nvfp4','k8v4','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'];
       field(panels[0],{...p,KvType:p.KvType||kv[0]},'KvType','KV 格式','KV format','text',kv.map(v=>[v,v]));
+    }
+    if(b==='llamacpp'){
+      field(panels[3],p,'Lora','LoRA 适配器路径 · GGUF','LoRA adapter path · GGUF');
+      const scale=field(panels[3],p,'LoraScale','LoRA 强度','LoRA scale','number');
+      scale.removeAttribute('min');scale.step='any';scale.placeholder='1';
     }
     if(rad)field(panels[0],{...p,StateCacheType:p.StateCacheType||'f32'},'StateCacheType','循环状态缓存格式','Recurrent state cache format','text',[['f32','FP32'],['f16','FP16']],['FP16 可减少循环状态缓存显存，可能改变模型输出。','FP16 reduces recurrent-state memory and may change model output.']);
     // UI state only: the worker still receives the existing path/budget pair.

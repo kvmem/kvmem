@@ -12,6 +12,35 @@ spec.loader.exec_module(changes)
 
 
 class DocumentationChangesTest(unittest.TestCase):
+    def test_versioned_radiance_patch_uses_only_radiance_native_checks(self):
+        paths = ['backends/patches/radiance-1.17-kvmem.patch',
+                 'backends/radiance/adapter/window_checkpoint.hpp',
+                 '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py']
+        self.assertTrue(changes.radiance_only_change(paths))
+        self.assertFalse(changes.requires_native(paths))
+        self.assertFalse(changes.requires_cuda(paths, 'a', 'b'))
+        for extra in ['backends/patches/ninfer-new.patch', 'kvmem/src/host/kvmem_store.cpp',
+                      'backends/patches/radiance-1..17-kvmem.patch']:
+            self.assertTrue(changes.requires_native(paths + [extra]))
+
+    def test_existing_radiance_workflow_can_add_a_focused_unit(self):
+        from unittest.mock import patch
+        old = (Path(__file__).resolve().parents[1] / changes.WORKFLOW).read_bytes()
+        new = old.replace(b'engine_bringup engine_mm',
+                          b'engine_bringup mem/pools engine_mm')
+        self.assertNotEqual(new, old)
+        paths = [changes.WORKFLOW, 'backends/patches/radiance-1.17-kvmem.patch']
+        with patch.object(changes, 'git', side_effect=lambda _, ref, **kw:
+                          old if ref.startswith('old:') else new):
+            self.assertTrue(changes.radiance_only_change(paths, 'old', 'new'))
+            self.assertFalse(changes.requires_native(paths, 'old', 'new'))
+        unsafe = new.replace(b'cmake --build build --parallel 2',
+                             b'cmake --build unrelated --parallel 2', 1)
+        self.assertNotEqual(unsafe, new)
+        with patch.object(changes, 'git', side_effect=lambda _, ref, **kw:
+                          old if ref.startswith('old:') else unsafe):
+            self.assertTrue(changes.requires_native(paths, 'old', 'new'))
+
     def test_offline_evidence_changes_keep_python_checks_without_native_builds(self):
         paths = [*changes.EVIDENCE_PATHS, 'docs/radiance-cpu-image-validation-20261103.md',
                  '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py']
@@ -113,7 +142,8 @@ class DocumentationChangesTest(unittest.TestCase):
             self.assertFalse(cuda)
             self.assertFalse(changes.classify('push', {'before': before, 'after': after}, root)[1])
             self.assertFalse(changes.requires_cuda(paths + ['docs/guide.md', 'tests/test_ci_changes.py',
-                                                         'tests/test_ninfer_dflash_conditioning.py'],
+                                                         'tests/test_ninfer_dflash_conditioning.py',
+                                                         'tests/query-pressure-regression.py'],
                                                   before, after, root))
             for extra in ('kvmem/src/host/memory_contract.cpp', 'CMakeLists.txt',
                           'backends/patches/llamacpp-kvmem.patch', 'backends/polystrata',

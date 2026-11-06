@@ -155,6 +155,7 @@ int main(int argc, char** argv) {
             };
             const auto full1=read_pages(17,1),full2=read_pages(17,2),accepted_window=read_pages(17,5);
             std::vector<int32_t> tokens(128,9);
+            CHECK(WindowCheckpoint::required_bytes(kv,17,128)==accepted_window.size());
             auto anchor=std::make_unique<PrefixLease>(sidecar,kv,17,tokens,device,sidecar->stream);
             const MemoryStamp mark{true,{17,444},1,0,128,1};
             std::vector<BlockDescriptor> catalog;

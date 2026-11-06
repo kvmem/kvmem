@@ -527,13 +527,8 @@ static void conversation_commit(LlamaEngineState & st, uint32_t stored) {
     }
     entry->second.stored = stored;
     if (!st.turn_conversation_id.empty()) {
-        // One id names one conversation: a client that reuses an id after its
-        // own context was compacted must not leave two stores answering to it.
-        for (auto & other : st.conv) {
-            if (other.first != st.conv_active && other.second.client_id == st.turn_conversation_id) {
-                other.second.client_id.clear();
-            }
-        }
+        // Diagnostic label only. Different content branches may carry the
+        // same client label; neither publication nor selection binds it.
         entry->second.client_id = st.turn_conversation_id;
     }
     st.conv_table.touch(st.conv_active, ++st.conv_clock);
@@ -936,14 +931,27 @@ template<class Source> static kvmem_conversation fork_conversation(const Source&
     kvmem_conversation result;
     result.cached_tokens = source.cached_tokens; result.cached_prompt = source.cached_prompt;
     result.history_input_prompt = source.history_input_prompt; result.history_points = source.history_points;
+    // Earlier accepted checkpoints remain valid in the forked prefix. Keep
+    // their catalog so restoring a branch does not erase future edit coverage.
+    result.mm_checkpoints = source.mm_checkpoints;
+    result.mm_archive = source.mm_archive;
+    result.mm_checkpoints.truncate(uint64_t(keep));
+    result.mm_archive.truncate(uint64_t(keep));
     auto cp = *selected;
     result.mm_checkpoints.remember(cp);
     result.mm_archive.remember(cp, kvmem::CoveragePurpose::Input);
+    for (const auto & checkpoint : result.mm_checkpoints)
+        if (checkpoint.data) checkpoint.data->shared.store(true);
+    for (const auto & entry : result.mm_archive)
+        if (entry.info.identity && entry.record.data) entry.record.data->shared.store(true);
     result.mm_live_row = keep; result.last_n_gen = source.last_n_gen;
     return result;
 }
 kvmem_conversation llama_driver_fork_conversation(const kvmem_conversation& source, int keep) { return fork_conversation(source, keep); }
 kvmem_conversation llama_driver_fork_conversation(const LlamaEngineState& source, int keep) { return fork_conversation(source, keep); }
+kvmem_conversation llama_driver_snapshot_conversation(const LlamaEngineState& source, int accepted_end) {
+    return fork_conversation(source, accepted_end);
+}
 
 std::shared_ptr<const MultimodalCheckpointData> llama_driver_materialize_checkpoint(
         LlamaEngineState & st, const std::shared_ptr<const MultimodalCheckpointData> & saved) {

@@ -1,4 +1,5 @@
 #include "statistics_observer.hpp"
+#include "canonical_boundary.hpp"
 #include "pool_geometry.hpp"
 #include "checkpoint_handoff.hpp"
 #include "rolling_pressure.hpp"
@@ -286,7 +287,7 @@ void StatisticsObserver::clear_session() {
     prefix_.reset(); prefix_mean_.clear();
     checkpoint_.reset(); memory_session_.reset(); memory_.reset(); policy_.reset();
     update_archive_charge();
-    store_.reset(); session_ = {}; active_request_ = 0; images_.clear();
+    store_.reset(); session_ = {}; active_request_ = 0; cache_group_=0; images_.clear();
     query_total_.clear(); query_rows_.clear(); query_counts_.clear(); query_tokens_.clear();
     recall_.reset(); checkpoint_recall_.reset(); prefix_recall_.reset();
     accepted_view_ = {};
@@ -339,7 +340,7 @@ uint64_t StatisticsObserver::retained_bytes(const RetainedSession& saved) {
         saved.store->allocated_bytes()+saved.policy->allocated_bytes()+saved.recall->allocated_bytes()+
         saved.recall_snapshot->graph.bytes()+saved.recall_snapshot->feedback.bytes()+
         saved.mean.size()*sizeof(float)+saved.identity->tokens.size()*sizeof(int32_t)+
-        saved.identity->images.size()*sizeof(ImageIdentity);
+        saved.identity->images.size()*sizeof(ImageIdentity)+(saved.identity->canonical ? saved.identity->canonical->bytes() : 0);
 }
 uint64_t StatisticsObserver::input_extra_bytes() const {
     uint64_t total=0;
@@ -354,18 +355,20 @@ uint64_t StatisticsObserver::restore_limit(const rad::Request& request) const {
     return restorable_prefix_limit(request.prompt.size(), request.query_begin);
 }
 StatisticsObserver::RetainedSession* StatisticsObserver::select_checkpoint(RetainedSession& saved,
-                                                                         const rad::Request& request, bool shared) const {
+                                                                         const rad::Request& request) const {
     std::vector<PrefixCandidate> candidates;
+    const bool continuation=saved.identity && saved.identity->continues_input(request);
     auto add=[&](RetainedSession& point,CheckpointPurpose purpose) {
         const auto& identity=*point.identity;
-        candidates.push_back({&identity.tokens,&point,purpose,(shared ? identity.scope!=request.cache_owner : identity.scope==request.cache_owner) &&
-            image_prefix_matches(identity.images,request.media.get(),request.prompt.size(),identity.tokens.size())});
+        candidates.push_back({&identity.tokens,&point,purpose,
+            image_prefix_matches(identity.images,request.media.get(),request.prompt.size(),identity.tokens.size()),continuation});
     };
     add(saved,CheckpointPurpose::Endpoint);
     if(saved.input)add(*saved.input,CheckpointPurpose::ReuseAnchor);
     if(saved.fallback)add(*saved.fallback,CheckpointPurpose::InputFallback);
     return const_cast<RetainedSession*>(static_cast<const RetainedSession*>(select_prefix_checkpoint(
-        request.prompt,candidates,restore_limit(request))));
+        request.prompt,candidates,restore_limit(request),
+        request.query_begin>=0 && request.query_end>request.query_begin)));
 }
 void StatisticsObserver::retain_input(const rad::StepEntry& entry) {
     if(!policy_ || !options_.cache_sessions || !entry.is_prefill || !entry.req ||
@@ -390,7 +393,9 @@ void StatisticsObserver::retain_input(const rad::StepEntry& entry) {
     }
     auto identity=std::make_shared<CachedIdentity>();identity->fallback=fallback;
     identity->tokens.assign(entry.req->prompt.begin(),entry.req->prompt.begin()+end);
-    identity->images=image_prefix(images_,end);identity->scope=entry.req->cache_owner;
+    identity->images=image_prefix(images_,end);identity->scope=entry.req->cache_owner;identity->input_end=end;
+    const auto canonical_end=canonical_input_boundary(entry.req->prompt.size(),entry.req->message_spans);
+    identity->canonical=capture_canonical_input(entry.req->prompt,canonical_end,frontier_,images_,cache_->payload.get());
     pending_input_=std::move(identity);
     (void)poll_input();
 }
@@ -402,7 +407,7 @@ void StatisticsObserver::capture_input(std::shared_ptr<const CachedIdentity> ide
     sync_memory();
     require(next_incarnation_!=UINT64_MAX,"input checkpoint incarnation exhausted");
     auto saved=std::make_unique<RetainedSession>();
-    saved->session={session_.id,next_incarnation_++};saved->content_version=content_version_;saved->identity=std::move(identity);
+    saved->session={session_.id,next_incarnation_++};saved->content_version=content_version_;saved->group=cache_group_;saved->identity=std::move(identity);
     saved->prefix=std::make_unique<RankPrefix>();
     for(auto& rank:ranks_) {
         auto lease=std::make_unique<PrefixLease>(rank->resources.lifetime,*rank->resources.kv,active_request_,
@@ -488,7 +493,7 @@ bool StatisticsObserver::poll_input() {
 void StatisticsObserver::promote_input() {
     require(input_ && !input_parking_ && !pending_selection_,"input fallback is incomplete");
     auto saved=std::move(input_);memory_session_.reset();
-    session_=saved->session;content_version_=saved->content_version;
+    session_=saved->session;content_version_=saved->content_version;cache_group_=saved->group;
     prefix_=std::move(saved->prefix);prefix_mean_=std::move(saved->mean);
     store_=std::move(saved->store);policy_=std::move(saved->policy);memory_=std::move(saved->memory);
     recall_=std::move(saved->recall);prefix_recall_=std::move(saved->recall_snapshot);
@@ -508,7 +513,8 @@ std::unique_ptr<StatisticsObserver::RetainedSession> StatisticsObserver::carry_i
     auto next=std::make_unique<RetainedSession>();
     try {
         next->session={request.id,next_incarnation_++};next->content_version=point->content_version;
-        auto identity=std::make_shared<CachedIdentity>(*point->identity);identity->scope=request.cache_owner;
+        auto identity=std::make_shared<CachedIdentity>(*point->identity);identity->scope=request.cache_owner;identity->canonical=saved.identity->canonical;
+        next->group=saved.group;
         next->identity=std::move(identity);next->prefix=point->prefix->fork();next->mean=point->mean;
         next->store=point->store->fork_mean_prefix(uint32_t(point->identity->tokens.size()));
         next->policy=std::make_unique<KvMemStore>(*point->policy);
@@ -534,13 +540,45 @@ void StatisticsObserver::admit_carried_input(std::unique_ptr<RetainedSession> sa
     RAD_INFO("KVMEM_INPUT_CARRY request=%llu frontier=%zu immutable_payload_shared=1",
         (unsigned long long)session,frontier);
 }
+bool StatisticsObserver::CacheState::publish(RetainedSession&& saved,size_t max_groups,bool already_charged) {
+    const bool complete=saved.identity && saved.prefix && saved.memory && saved.store && saved.policy && saved.recall && saved.recall_snapshot;
+    if(!complete)return false;
+    std::vector<CanonicalGroupMember<ImageIdentity>> members;
+    for(const auto& previous:sessions)members.push_back({previous.group,previous.identity->canonical});
+    const auto compatible=classify_canonical_group(saved.identity->canonical,members);
+    const auto group=compatible ? *compatible : allocate_group();
+    std::vector<ContentCacheSlot> slots;
+    for(const auto& previous:sessions)slots.push_back({true,false,uint64_t(slots.size()+1),previous.identity.get(),
+        previous.group ? previous.group : previous.session.id});
+    const auto plan=plan_content_group_publication(slots,std::max<size_t>(16,max_groups),max_groups,group);
+    if(!plan)return false;
+    uint64_t released=0;
+    for(auto index:plan.retired_slots) {
+        require(index<sessions.size() && sessions[index].bytes<=UINT64_MAX-released,"invalid cache retirement accounting");
+        released+=sessions[index].bytes;
+    }
+    require(bytes>=released,"invalid cache publication accounting");
+    const auto added=already_charged ? 0 : saved.bytes;
+    require(added<=UINT64_MAX-(bytes-released),"cache publication charge overflow");
+    saved.group=group; // Only the ready incoming directory slot is reclassified.
+    if(!publish_content_checkpoint(sessions,std::move(saved),plan,complete))return false;
+    bytes=bytes-released+added;evictions+=plan.retired_slots.size();
+    RAD_INFO("KVMEM_SESSION_PUBLISH group=%llu retired=%zu records=%zu reason=%s",
+        (unsigned long long)group,plan.retired_slots.size(),sessions.size(),content_publication_reason(plan.reason));
+    return true;
+}
 void StatisticsObserver::evict_session() {
-    require(!cache_->sessions.empty() && cache_->bytes >= cache_->sessions.front().bytes, "invalid cache accounting");
-    RAD_INFO("KVMEM_SESSION_EVICT session=%llu bytes=%llu policy=lru",
-        (unsigned long long)cache_->sessions.front().session.id, (unsigned long long)cache_->sessions.front().bytes);
-    cache_->bytes -= cache_->sessions.front().bytes;
-    cache_->sessions.pop_front();
-    ++cache_->evictions;
+    require(!cache_->sessions.empty(),"invalid empty cache eviction");
+    std::vector<ContentCacheSlot> slots;
+    for(const auto& saved:cache_->sessions)slots.push_back({true,false,uint64_t(slots.size()+1),saved.identity.get(),
+        saved.group ? saved.group : saved.session.id});
+    const auto victim_index=select_content_eviction(slots);
+    require(victim_index.has_value(),"invalid cache eviction plan");
+    auto victim=std::next(cache_->sessions.begin(),*victim_index);
+    require(cache_->bytes>=victim->bytes,"invalid cache accounting");
+    RAD_INFO("KVMEM_SESSION_EVICT session=%llu bytes=%llu policy=content-group-lru reason=physical_capacity",
+        (unsigned long long)victim->session.id,(unsigned long long)victim->bytes);
+    cache_->bytes-=victim->bytes;cache_->sessions.erase(victim);++cache_->evictions;
 }
 void StatisticsObserver::park_session() {
     if (!prefix_ || !prefix_recall_ || !options_.cache_sessions) { clear_session(); return; }
@@ -551,7 +589,7 @@ void StatisticsObserver::park_session() {
     const uint64_t fixed = input_extra_bytes() + prefix_->state_bytes() + memory_->archive_bytes() + store_->allocated_bytes() +
         policy_->allocated_bytes() + recall_->allocated_bytes() + prefix_recall_->graph.bytes() +
         prefix_recall_->feedback.bytes() + prefix_mean_.size()*sizeof(float) + identity->tokens.size()*sizeof(int32_t) +
-        identity->images.size()*sizeof(ImageIdentity);
+        identity->images.size()*sizeof(ImageIdentity)+(identity->canonical ? identity->canonical->bytes() : 0);
     const uint64_t pages = prefix_->page_bytes();
     const uint64_t other=cache_->active_archive_bytes-archive_charge_+cache_->active_checkpoint_bytes-input_charge_;
     require(other<=history_allowance(),"other active archives exceed host allowance");
@@ -563,9 +601,9 @@ void StatisticsObserver::park_session() {
     }
     const uint64_t bytes = fixed + pages;
     auto fits=[&]{return bytes<=available() && cache_->bytes<=available()-bytes;};
-    while (!cache_->sessions.empty() && (cache_->count() >= options_.cache_sessions || !fits()))
+    while (!cache_->sessions.empty() && !fits())
         evict_session();
-    if(cache_->count()>=options_.cache_sessions || !fits() || cache_->next_park==UINT64_MAX) {
+    if(!fits() || cache_->next_park==UINT64_MAX || cache_->parking.size()>=2*cache_->observers.size()+2) {
         RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=pending_cache_capacity",(unsigned long long)session_.id);
         clear_session();return;
     }
@@ -586,16 +624,17 @@ void StatisticsObserver::park_session() {
         }
     } else if(cache_->payload)prefix_->park(cache_->payload,cache_->io);
     RetainedSession saved;
-    saved.session=session_; saved.content_version=content_version_; saved.bytes=bytes; saved.identity=identity;
+    saved.session=session_; saved.content_version=content_version_; saved.bytes=bytes; saved.identity=identity;saved.group=cache_group_;
     saved.prefix=std::move(prefix_); saved.mean=std::move(prefix_mean_); saved.store=std::move(store_);
     saved.policy=std::move(policy_); saved.memory=std::move(memory_); saved.recall=std::move(recall_);
     saved.input=std::move(input_);saved.fallback=std::move(fallback_);
     update_archive_charge();
     saved.recall_snapshot=std::move(prefix_recall_);
     if(parking) {
-        parking->saved=std::move(saved);cache_->parking.push_back(std::move(parking));
-    } else cache_->sessions.push_back(std::move(saved));
-    cache_->bytes+=bytes;
+        parking->saved=std::move(saved);cache_->parking.push_back(std::move(parking));cache_->bytes+=bytes;
+    } else if(!cache_->publish(std::move(saved),options_.cache_sessions)) {
+        RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=directory_capacity source_preserved=1",(unsigned long long)session_.id);
+    }
     RAD_INFO("KVMEM_SESSION_CACHE entries=%zu logical_bytes=%llu limit=%llu gpu_pages=0 pending=%zu",
         cache_->sessions.size(),(unsigned long long)cache_->bytes,(unsigned long long)options_.history_bytes(),cache_->parking.size());
     clear_session();
@@ -604,30 +643,38 @@ void StatisticsObserver::activate_session(const rad::Request& request) {
     require(!active_request_ && !store_, "cache activation requires an idle observer");
     auto best=cache_->sessions.end();
     RetainedSession* point=nullptr;
-    for(unsigned pass=0;pass<2 && !point && !pending_cache_;++pass) {
-    const bool shared=pass!=0;
-    if(shared && !(request.query_begin>=0 && request.query_end>request.query_begin))break;
+    const bool new_query=request.query_begin>=0 && request.query_end>request.query_begin;
+    std::vector<ContentCacheCandidate> candidates;
+    std::vector<RetainedSession*> points;
+    size_t slot=0;
     for (auto it=cache_->sessions.begin(); it!=cache_->sessions.end(); ++it) {
-        auto* candidate=select_checkpoint(*it,request,shared);
-        if(candidate && (!point || candidate->identity->tokens.size()>point->identity->tokens.size())) {
-            best=it;point=candidate;
-        }
+        auto* candidate=select_checkpoint(*it,request);
+        points.push_back(candidate);
+        if(candidate)candidates.push_back({slot,candidate->identity->tokens.size(),0,slot+1,
+            it->identity->continues_input(request)});
+        ++slot;
+    }
+    const auto ranked=rank_content_candidates(std::move(candidates),new_query);
+    if(!ranked.empty()) {
+        best=std::next(cache_->sessions.begin(),ranked.front().slot);
+        point=points[ranked.front().slot];
     }
     size_t longest=point ? point->identity->tokens.size() : 0;
     for(const auto& pending:cache_->parking) {
-        auto* candidate=select_checkpoint(pending->saved,request,shared);
+        auto* candidate=select_checkpoint(pending->saved,request);
         if(candidate && candidate->identity->tokens.size()>longest) {
             pending_cache_=pending->id;longest=candidate->identity->tokens.size();
         }
     }
     for(const auto& pending:cache_->finishing) {
+        const bool continuation=pending.identity && pending.identity->continues_input(request);
+        if(!new_query && !continuation)continue;
         for(const auto& identity:{pending.identity,pending.input_identity,pending.fallback_identity}) {
             if(identity && identity->tokens.size()>longest && identity->tokens.size()<=restore_limit(request) &&
-               (shared ? identity->scope!=request.cache_owner : identity->scope==request.cache_owner) && identity->prefix_matches(request)) {
+               identity->prefix_matches(request)) {
                 pending_cache_=pending.id;longest=identity->tokens.size();
             }
         }
-    }
     }
     if(pending_cache_)return;
     if (best==cache_->sessions.end()) return;
@@ -645,6 +692,8 @@ void StatisticsObserver::activate_session(const rad::Request& request) {
             branch.session={request.id,next_incarnation_};branch.content_version=point->content_version;
             branch.prefix=point->prefix->fork();branch.mean=point->mean;
             auto identity=std::make_shared<CachedIdentity>(*point->identity);identity->scope=request.cache_owner;
+            identity->canonical=best->identity->canonical;
+            branch.group=best->identity->continues_group_input(request) ? best->group : cache_->allocate_group();
             branch.identity=std::move(identity);
             branch.store=point->store->fork_mean_prefix(uint32_t(point->prefix->frontier()));
             branch.policy=std::make_unique<KvMemStore>(*point->policy);
@@ -666,12 +715,12 @@ void StatisticsObserver::activate_session(const rad::Request& request) {
         }
         if(branch.memory) {
             ++next_incarnation_;++cache_->hits;++cache_->forks;
-            // A private fork also protects an own continuation; only a
-            // different or anonymous owner is cross-session reuse.
-            if(request.cache_owner.empty() || point->identity->scope!=request.cache_owner)++cache_->cross_owner_forks;
+            // Kept for wire compatibility: a snapshot fork is shared regardless
+            // of the caller's display/affinity label.
+            ++cache_->cross_owner_forks;
             RAD_INFO("KVMEM_SESSION_FORK source=%llu branch=%llu frontier=%zu immutable_payload_shared=1",
                 (unsigned long long)point->session.id,(unsigned long long)branch.session.id,point->prefix->frontier());
-            session_=branch.session;content_version_=branch.content_version;
+            session_=branch.session;content_version_=branch.content_version;cache_group_=branch.group;
             prefix_=std::move(branch.prefix);prefix_mean_=std::move(branch.mean);store_=std::move(branch.store);
             policy_=std::move(branch.policy);memory_=std::move(branch.memory);recall_=std::move(branch.recall);
             prefix_recall_=std::move(branch.recall_snapshot);update_archive_charge();
@@ -681,21 +730,7 @@ void StatisticsObserver::activate_session(const rad::Request& request) {
             return;
         }
     }
-    if(point->identity->scope!=request.cache_owner || request.cache_owner.empty()) {
-        RAD_INFO("KVMEM_SESSION_SKIP request=%llu reason=fork_capacity source_preserved=1",(unsigned long long)request.id);
-        return;
-    }
-    ++cache_->hits;
-    require(cache_->bytes>=best->bytes,"invalid cache hit accounting");
-    cache_->bytes-=best->bytes;
-    session_=point->session; content_version_=point->content_version;
-    prefix_=std::move(point->prefix); prefix_mean_=std::move(point->mean); store_=std::move(point->store);
-    policy_=std::move(point->policy); memory_=std::move(point->memory); recall_=std::move(point->recall);
-    update_archive_charge();
-    prefix_recall_=std::move(point->recall_snapshot);
-    std::atomic_store(&cached_identity_,point->identity);
-    cache_->sessions.erase(best);
-    admit_carried_input(std::move(carried));admit_carried_input(std::move(carried_fallback));
+    RAD_INFO("KVMEM_SESSION_SKIP request=%llu reason=fork_capacity source_preserved=1",(unsigned long long)request.id);
 }
 int StatisticsObserver::resume(const rad::StepPlan& plan, int64_t* resumed, std::string* refusal) noexcept {
     SchedulerDeviceReturn device_return{device_};
@@ -764,8 +799,9 @@ int StatisticsObserver::resume(const rad::StepPlan& plan, int64_t* resumed, std:
     } catch (const std::exception& e) { return failure("resume", e); }
 }
 void StatisticsObserver::start_request(const rad::Request& request) {
-    RAD_INFO("KVMEM_HISTORY_BOUNDARY request=%llu prompt=%zu history_end=%d",
-        (unsigned long long)request.id,request.prompt.size(),request.history_end);
+    RAD_INFO("KVMEM_HISTORY_BOUNDARY request=%llu prompt=%zu history_end=%d canonical_end=%llu",
+        (unsigned long long)request.id,request.prompt.size(),request.history_end,
+        (unsigned long long)canonical_input_boundary(request.prompt.size(),request.message_spans));
     images_=image_identity(request.media.get(),request.prompt.size());
     image_budget_check(images_,store_config_.block_tokens,options_.budget_tokens,keep_.sink_blocks,keep_.recent_blocks);
     require((request.query_begin == -1 && request.query_end == -1) ||
@@ -806,6 +842,8 @@ void StatisticsObserver::begin_attention(const rad::StepEntry& entry) {
     const auto block=store_config_.block_tokens;
     const auto pages=attention_pages(memory_ ? &accepted_view_ : nullptr,frontier_,uint32_t(entry.n_tokens),block);
     const uint32_t compact=pages.back().compact+pages.back().count;
+    require(device_tokens_ && device_tokens_!=UINT64_MAX,"attention native KV capacity is unavailable");
+    require(uint64_t(compact)<=device_tokens_,"attention view exceeds native KV capacity");
     exposed_.clear();for(const auto& page:pages)exposed_.push_back(page.start);
     step_tokens_.clear();
     if (entry.is_prefill) sample_rows_=prefill_attention_samples(frontier_,entry.n_tokens,
@@ -834,7 +872,7 @@ int StatisticsObserver::begin(const rad::StepPlan& plan) noexcept {
                 "statistics step requires exact host positions and a valid verify prefix");
         if (!store_) {
             require(e.ctx_len == 0 && next_incarnation_ != 0, "new statistics session must start at position zero");
-            session_ = {e.seq, next_incarnation_++};
+            session_ = {e.seq, next_incarnation_++};cache_group_=cache_->allocate_group();
             active_request_ = e.seq;
             store_ = std::make_unique<RawKvStore>(store_config_);
             frontier_ = 0; steps_ = 0; query_total_.clear(); query_rows_.clear();
@@ -1332,7 +1370,12 @@ int StatisticsObserver::finish(const rad::StepEntry& e, const rad::Request& requ
         require(identity->tokens.size()>=frontier_,"terminal KV extends beyond emitted history");
         identity->tokens.resize(frontier_); // exclude the sampled, unevaluated tail
         identity->images=image_prefix(images_,frontier_);
-        identity->scope=request.cache_owner;
+        identity->scope=request.cache_owner;identity->input_end=std::min<uint64_t>(request.prompt.size(),frontier_);
+        const auto canonical_end=canonical_input_boundary(request.prompt.size(),request.message_spans);
+        identity->canonical=capture_canonical_input(request.prompt,canonical_end,frontier_,images_,cache_->payload.get());
+        RAD_INFO("KVMEM_CANONICAL_INPUT request=%llu end=%llu accepted=%u known=%d",
+            (unsigned long long)request.id,(unsigned long long)canonical_end,frontier_,int(bool(identity->canonical)));
+        if(!identity->canonical)RAD_INFO("KVMEM_CANONICAL_SKIP request=%llu reason=incomplete_or_capacity",(unsigned long long)request.id);
         auto terminal=std::make_unique<TerminalSnapshot>();terminal->identity=std::move(identity);
         terminal->request=request.id;terminal->output_tokens=request.output.size();
         terminal->accepted_rows=e.is_prefill ? 0u : uint32_t(frontier_-e.ctx_len);
@@ -1358,9 +1401,11 @@ void StatisticsObserver::capture_terminal(const TerminalSnapshot& terminal) {
             else if (p.kind==RAD_KV_FULL)
                 native_bytes+=rank->resources.kv->block_table(active_request_,p.index).size()*uint64_t(p.bytes_per_block);
         }
+        for(const auto& rank:ranks_)
+            native_bytes+=WindowCheckpoint::required_bytes(*rank->resources.kv,active_request_,frontier_);
         const uint64_t needed=input_extra_bytes()+native_bytes+memory_->archive_bytes()+store_->allocated_bytes()+
             policy_->allocated_bytes()+2*recall_->allocated_bytes()+terminal.identity->tokens.size()*sizeof(int32_t)+
-            terminal.identity->images.size()*sizeof(ImageIdentity)+
+            terminal.identity->images.size()*sizeof(ImageIdentity)+(terminal.identity->canonical ? terminal.identity->canonical->bytes() : 0)+
             uint64_t(store_config_.n_layer)*(store_config_.n_embd_k+1)*sizeof(float);
         const auto other=cache_->active_archive_bytes-archive_charge_+cache_->active_checkpoint_bytes-input_charge_;
         require(other<=history_allowance(),"active archive quota exceeded");
@@ -1371,9 +1416,9 @@ void StatisticsObserver::capture_terminal(const TerminalSnapshot& terminal) {
             return;
         }
         auto fits=[&]{return needed<=available() && cache_->bytes<=available()-needed;};
-        while (!cache_->sessions.empty() && (!fits() || cache_->count()>=options_.cache_sessions))
+        while (!cache_->sessions.empty() && !fits())
             evict_session();
-        if(!fits() || cache_->count()>=options_.cache_sessions) {
+        if(!fits()) {
             RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=pending_cache_capacity",(unsigned long long)session_.id);
             return;
         }

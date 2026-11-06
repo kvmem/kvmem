@@ -19,6 +19,10 @@ KV alongside recurrent state; RAM/SSD parking and forks include these bytes.
 Restoration publishes both at the saved frontier, without a fixed window-sized
 checkpoint setback. Native prefill alignment, Query boundaries and the final
 uncached token still constrain reuse. See the [conditioning validation](../../docs/radiance-dflash-conditioning-20261106.md).
+Recent also reserves partial-tail slack: a 2048-token draft window with
+128-token selection pages needs at least 2176 effective recent tokens. See the
+[merge audit](../../docs/radiance-v117-merge-audit-20261106.md) for the coverage,
+cache admission and DFlash7/MTP3 regression results.
 New user requests may discover exact prefixes across named or anonymous owners;
 native branches share sealed host/SSD records while keeping mutable state
 independent. Admission deducts only proven physical aliases. GPU page sharing

@@ -219,6 +219,7 @@ static void test_stream_passthrough() {
 }
 
 static void test_rejects_bad_input() {
+    CHECK(throws(R"({"input":"hi","lora":[{"id":0,"scale":0}]})"));
     CHECK(throws(R"({"model": "m"})"));                                  // no input
     CHECK(throws(R"({"input": "hi", "previous_response_id": "resp_1"})")); // unsupported
     CHECK(throws(R"({"input": 5})"));                                    // wrong input type

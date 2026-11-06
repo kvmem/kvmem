@@ -41,7 +41,31 @@ module.exports=async({browser,base,info,stage})=>{
       }
       await shot(backend+'-advanced');
     }
-    await f('Backend').selectOption('polystrata');assert.equal(await f('Python').inputValue(),'C:/python/python.exe');assert.deepEqual(JSON.parse(await page.locator('[data-native]').inputValue()),['--threads','6']);
+    await f('Backend').selectOption('llamacpp');
+    await f('Model').fill('C:/fixture/model.gguf');
+    await page.locator('#launch-tab-3').click();
+    assert.equal(await f('LoraScale').isDisabled(),true);
+    await f('Lora').fill('C:/adapters/rank two.gguf');
+    await f('LoraScale').fill('-0.5');
+    const adapted=await preview();
+    assert.equal(adapted.Lora,'C:/adapters/rank two.gguf');
+    assert.equal(adapted.LoraScale,-0.5);
+    for(const value of [-0.5,0]){
+      await page.locator('#launch-tab-3').click();
+      await f('LoraScale').fill(String(value));
+      await page.locator('[data-preset="llamacpp-default"]').click();
+      assert.equal(await f('Lora').inputValue(),'C:/adapters/rank two.gguf');
+      assert.equal(await f('LoraScale').inputValue(),String(value),'preset must retain the adapter scale with its path');
+      const reapplied=await preview();
+      assert.equal(reapplied.LoraScale,value);
+    }
+    await page.locator('#launch-tab-3').click();
+    await f('Lora').fill('');
+    assert.equal(await f('LoraScale').isDisabled(),true);
+    const plain=await preview();
+    assert.equal(plain.Lora,undefined);assert.equal(plain.LoraScale,undefined);
+    await f('Backend').selectOption('polystrata');assert.equal(await f('Lora').count(),0);
+    assert.equal(await f('Python').inputValue(),'C:/python/python.exe');assert.deepEqual(JSON.parse(await page.locator('[data-native]').inputValue()),['--threads','6']);
     await page.locator('.l-native > summary').click();await page.locator('[data-engine-environment] > summary').click();
     await page.setViewportSize({width:390,height:900});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await shot('runtime-mobile');
     await page.setViewportSize({width:1440,height:1050});await page.locator('[data-language-select]').selectOption('en');

@@ -12,7 +12,11 @@
 #include <dlfcn.h>
 #endif
 #if __has_include(<nvml.h>)
+// nvml.h defines a one-argument DEPRECATED macro that collides with llama.h's
+// two-argument DEPRECATED used by mtmd headers. Keep the scope local.
+#pragma push_macro("DEPRECATED")
 #include <nvml.h>
+#pragma pop_macro("DEPRECATED")
 #define KVMEM_MONITOR_NVML 1
 #endif
 

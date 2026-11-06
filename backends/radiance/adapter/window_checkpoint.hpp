@@ -42,18 +42,7 @@ class WindowCheckpoint {
         }
         return result;
     }
-public:
-    WindowCheckpoint fork() const {
-        if (!valid_) throw std::runtime_error("cannot fork an incomplete window checkpoint");
-        WindowCheckpoint next;
-        next.owner_ = owner_; next.tables_ = tables_;
-        next.frontier_ = frontier_; next.floor_ = floor_; next.bytes_ = bytes_;
-        if (parked_) next.parked_ = parked_->fork();
-        next.io_ = io_; next.valid_ = true;
-        return next;
-    }
-    void save(rad::KVManager& kv, uint64_t sequence, int64_t frontier,
-              int device, RadStream stream) {
+    void prepare(rad::KVManager& kv, uint64_t sequence, int64_t frontier) {
         if (valid_ || frontier < 0 || !kv.has_sequence(sequence) || frontier > kv.seq_tokens(sequence))
             throw std::runtime_error("invalid window checkpoint frontier");
         owner_ = &kv; frontier_ = frontier; floor_ = kv.window_floor(sequence);
@@ -80,6 +69,25 @@ public:
             tables_.push_back({plan.index, first, std::move(blocks)});
             floor_ = std::max(floor_, first);
         }
+    }
+public:
+    static uint64_t required_bytes(rad::KVManager& kv, uint64_t sequence, int64_t frontier) {
+        WindowCheckpoint geometry;
+        geometry.prepare(kv, sequence, frontier);
+        return geometry.copies(geometry.tables_).bytes;
+    }
+    WindowCheckpoint fork() const {
+        if (!valid_) throw std::runtime_error("cannot fork an incomplete window checkpoint");
+        WindowCheckpoint next;
+        next.owner_ = owner_; next.tables_ = tables_;
+        next.frontier_ = frontier_; next.floor_ = floor_; next.bytes_ = bytes_;
+        if (parked_) next.parked_ = parked_->fork();
+        next.io_ = io_; next.valid_ = true;
+        return next;
+    }
+    void save(rad::KVManager& kv, uint64_t sequence, int64_t frontier,
+              int device, RadStream stream) {
+        prepare(kv, sequence, frontier);
         const auto batch = copies(tables_);
         if (batch.bytes) {
             PageTransfer transfer(device, batch.bytes, stream);

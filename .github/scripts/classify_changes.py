@@ -11,6 +11,7 @@ CUDA_JOBS = ('cuda-build-linux', 'polystrata-cuda-build-linux', 'polystrata-hip-
 NON_CUDA_PATHS = {
     WORKFLOW, '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
     'tests/test_ninfer_dflash_conditioning.py',
+    'tests/query-pressure-regression.py',
     'scripts/windows/start-backend.ps1', 'scripts/windows/start-ninfer.ps1',
     'scripts/windows/start-server.ps1', 'scripts/windows/test-backend-launcher.ps1',
     'scripts/windows/test-launcher.ps1',
@@ -76,7 +77,7 @@ def radiance_only_change(paths, before=None, after=None, cwd=None):
             return False
         if (is_documentation(path) or is_console_path(path) or path == WORKFLOW
                 or path.startswith('backends/radiance/')
-                or re.fullmatch(r'backends/patches/radiance-[A-Za-z0-9_-]+\.patch', path)
+                or re.fullmatch(r'backends/patches/radiance-[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.patch', path)
                 or re.fullmatch(r'docs/benchmarks/radiance-[A-Za-z0-9_-]+\.json', path)):
             continue
         if path == '.gitattributes' and before and after:
@@ -114,6 +115,12 @@ def only_radiance_workflow_changed(before, after, cwd=None):
     prefix_new, jobs_new = sections(new)
     if prefix_old is None or prefix_old != prefix_new or jobs_old.keys() != jobs_new.keys():
         return False
+    if ('      run_radiance: ${{ steps.classify.outputs.run_radiance }}\n' in jobs_old.get('changes', '') and
+            '          RUN_RADIANCE: ${{ needs.changes.outputs.run_radiance }}\n' in jobs_old.get('host-and-server-units-linux', '')):
+        # Routing already exists: only its own job body may change. Retain the
+        # bootstrap transformation below for the original routing migration.
+        return all(body == jobs_old[name] for name, body in jobs_new.items()
+                   if name != 'radiance-host-contracts')
     output = '      run_native: ${{ steps.classify.outputs.run_native }}\n'
     expected_changes = jobs_old.get('changes', '').replace(output,
         output + '      run_radiance: ${{ steps.classify.outputs.run_radiance }}\n')

@@ -1,5 +1,136 @@
+diff --git a/docs/cli.md b/docs/cli.md
+index e94fe99c980104881c851fe1a69c9e41adde1156..cec11ce5f88486eecd53e9549746935ea6d16126 100644
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -436,6 +436,10 @@ optional Host backing.
+ 
+ All weight, sequence, workspace, and graph allocations are released when the Engine is destroyed.
+ 
++With DFlash2 and KVMem, the effective recent span is at least the model's draft ring
++(usually2048 tokens). Larger settings keep their existing page rounding. The selected
++budget must hold sink plus that span; see [DFlash2 conditioning](dflash-conditioning.md).
++
+ ## JSON and JSON Schema output
+ 
+ `--json` constrains output to a JSON object. `--json-schema FILE` constrains it to the supported
+diff --git a/docs/dflash-conditioning.md b/docs/dflash-conditioning.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fec40933fcafe294e244baca66f162e2115377e
+--- /dev/null
++++ b/docs/dflash-conditioning.md
+@@ -0,0 +1,32 @@
++# DFlash2 recent context with KVMem
++
++When KVMem is enabled with DFlash2, Engine startup resolves the effective recent span
++to at least the model's draft sliding-window capacity, rounded up to 64-token pages.
++For a 2048-token ring, requested recent64 or2000 becomes2048. A larger existing
++recent setting keeps its normal downward page rounding. Other speculative backends
++and runs without KVMem retain their requested setting.
++
++This uses the existing recent policy for both Query-required pages and resident-only
++Pressure. It adds no second page-pinning policy or cold recall to tool continuation.
++`KVMEM_DFLASH_RECENT requested=... effective=... ring=...` reports any increase, and
++the resolved Engine options carry the effective value.
++
++The selected budget B is unchanged. Keeping more recent pages leaves less room for
++other retrieved history. B must hold sink plus the effective recent span; with the
++default one-page sink and a2048-token ring, B must be at least2112. An executing
++Engine rejects a smaller budget explicitly. Budget planning uses the same resolved
++span as its minimum even if its seed B is smaller.
++
++The restored draft floor is bounded by its committed frontier, including immediately
++before DFlash2 decode. A truncating restore can therefore hide unavailable history
++without leaving a future lower bound. This guard does not expand the valid interval.
++
++Draft KV remains BF16. There is no INT8 draft storage, shadow buffer, new request
++protocol or ingestion state in this change. Recent=2048 already covers a2048-token
++ring: the minimum is idempotent, not an additional2048-token allocation.
++
++The ring-retention and restored-floor ideas originate in
++melis2023/ninfer-kvmem-actkv commits
++`f9cfb15dfa7251707d8f114c29ecb0f52eea62e6` and
++`e7996f7c3894bcfcef4b1a3c2d3ad832646f20d5`. This integration normalizes recent once
++instead of maintaining independent floor and page-pinning overrides.
+diff --git a/src/models/qwen3_5/program/decode.cpp b/src/models/qwen3_5/program/decode.cpp
+index 2e1f8b6624a37ded84f6f619e56d1f39e5e14ab0..ef0063f497fa0abaa18292e47f317bb857f0120f 100644
+--- a/src/models/qwen3_5/program/decode.cpp
++++ b/src/models/qwen3_5/program/decode.cpp
+@@ -1,5 +1,6 @@
+ #include "models/qwen3_5/program/structured_round.h"
+ #include "models/qwen3_5/program/program_impl.h"
++#include "runtime/contract/dflash_conditioning.h"
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/context.h"
+ #include "models/qwen3_5/program/graph_execution.h"
+@@ -1118,6 +1119,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
+             prepare_window(sequence, sequence.execution_frontier,
+                            std::min(capacity, sequence.execution_frontier + width),false,false,kvmem::SelectionReason::DecodePressure);
+         }
++        if (speculative_backend == SpeculativeBackend::DFlash2) {
++            runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
++                                                sequence.dflash_context_frontier);
++        }
+         // Graph selection follows compact target KV; the draft ring keeps logical positions.
+         maximum_frontier =
+             std::max(maximum_frontier, compact_position(sequence, sequence.execution_frontier));
+diff --git a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
+index e9aa61962356fb140db982f3eeff575abcc5d412..c16d8e04a5cd87990eea75c90a5da79770d39c46 100644
+--- a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
++++ b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
+@@ -1,6 +1,7 @@
+ #include "models/qwen3_5/program/program_impl.h"
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/planning/pressure_planner.h"
++#include "runtime/contract/dflash_conditioning.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -768,6 +769,10 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
+         const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * 64ULL;
+         sequence.dflash_context_floor = kvmem_window_tokens && retained->main_frontier > recent
+             ? static_cast<std::uint32_t>(retained->main_frontier - recent) : 0U;
++        if (speculative_backend == SpeculativeBackend::DFlash2) {
++            runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
++                                                sequence.dflash_context_frontier);
++        }
+     }
+     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+     refresh_state_views(sequence);
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index abd4aa90c3e9e7e036d9c3c7b94040d0b843d9f6..ff4e500e5742b96c3714170758008cc8c2de83e4 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -3,6 +3,7 @@
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/storage/kvmem_transfer_trace.h"
+ #include "models/qwen3_5/program/storage/checkpoint_recompute_policy.h"
++#include "runtime/contract/dflash_conditioning.h"
+ 
+ #include <atomic>
+ #include <cstdio>
+@@ -696,6 +697,10 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
+             static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
+         sequence.dflash_context_floor =
+             end > recent_tokens ? static_cast<std::uint32_t>(end - recent_tokens) : 0U;
++        if (speculative_backend == SpeculativeBackend::DFlash2) {
++            runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
++                                                sequence.dflash_context_frontier);
++        }
+         auto backend = std::make_shared<WindowMemoryBackend>(*this, sequence, end);
+         const auto count = kv_pages_for_tokens(begin);
+         const auto keep = std::min(count, kvmem_options.selected_tokens / page_tokens);
+@@ -1561,6 +1566,8 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
+         const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
+         sequence.dflash_context_floor = frontier > recent
+             ? static_cast<std::uint32_t>(frontier - recent) : 0U;
++        runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
++                                            sequence.dflash_context_frontier);
+     }
+     if (backend_kv_pages) { sequence.mtp_kv_valid = frontier; sequence.mtp_draft_count = 0; }
+     ++window.stamp.execution_history;
 diff --git a/src/runtime/contract/dflash_conditioning.h b/src/runtime/contract/dflash_conditioning.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..e14f80dce1e1b714ad377b8bed377f9cc4dae58b
 --- /dev/null
 +++ b/src/runtime/contract/dflash_conditioning.h
 @@ -0,0 +1,54 @@
@@ -58,111 +189,39 @@ new file mode 100644
 +
 +} // namespace ninfer::runtime
 diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index 28cd0e078c2466f77ddc5d85e3925a210ce86b4e..9d2f66173abfcf927fc0eebfe1c48c184772a74a 100644
 --- a/src/runtime/engine/model_instance.cpp
 +++ b/src/runtime/engine/model_instance.cpp
-@@ -25,6 +25,7 @@
+@@ -26,6 +26,7 @@
  #include "runtime/engine/graph_probe.h"
  #include "runtime/engine/memory_recovery.h"
  #include "runtime/contract/rope_scaling.h"
 +#include "runtime/contract/dflash_conditioning.h"
  
  #include <algorithm>
- #include <cmath>
-@@ -933,6 +934,16 @@
-         throw std::invalid_argument(
-             "strict requires all selected weights resident on the device; "
-             "the artifact materialized pinned Host weights");
-+    }
-+    const auto& draft_config = model->config().draft;
-+    const auto draft_ring = draft_config ? draft_config->sliding_window.value_or(0U) : 0U;
-+    const auto recent = dflash2_kvmem_recent_tokens(
-+        options.kvmem, options.speculative.backend, draft_ring, budget_plan == nullptr);
-+    if (recent != options.kvmem.recent_tokens) {
-+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-+            "KVMEM_DFLASH_RECENT requested=%u effective=%u ring=%u",
-+            options.kvmem.recent_tokens, recent, draft_ring);
-+        options.kvmem.recent_tokens = recent;
-     }
-     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
-     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
-diff --git a/src/models/qwen3_5/program/decode.cpp b/src/models/qwen3_5/program/decode.cpp
---- a/src/models/qwen3_5/program/decode.cpp
-+++ b/src/models/qwen3_5/program/decode.cpp
-@@ -1,5 +1,6 @@
- #include "models/qwen3_5/program/structured_round.h"
- #include "models/qwen3_5/program/program_impl.h"
-+#include "runtime/contract/dflash_conditioning.h"
- #include "models/qwen3_5/program/context_work.h"
- #include "models/qwen3_5/program/context.h"
- #include "models/qwen3_5/program/graph_execution.h"
-@@ -1115,6 +1116,10 @@
-         if (kvmem_window_tokens) {
-             prepare_window(sequence, sequence.execution_frontier,
-                            std::min(capacity, sequence.execution_frontier + width),false,false,kvmem::SelectionReason::DecodePressure);
-+        }
-+        if (speculative_backend == SpeculativeBackend::DFlash2) {
-+            runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
-+                                                sequence.dflash_context_frontier);
+ #include <numeric>
+@@ -1002,6 +1003,16 @@ static ConstructedModel construct_model_impl(const EngineOptions& requested, Dev
+                 "strict requires all selected weights resident on the device; "
+                 "the artifact materialized pinned Host weights");
          }
-         // Graph selection follows compact target KV; the draft ring keeps logical positions.
-         maximum_frontier =
-diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
---- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
-+++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
-@@ -3,6 +3,7 @@
- #include "models/qwen3_5/program/context_work.h"
- #include "models/qwen3_5/program/storage/kvmem_transfer_trace.h"
- #include "models/qwen3_5/program/storage/checkpoint_recompute_policy.h"
-+#include "runtime/contract/dflash_conditioning.h"
- 
- #include <atomic>
- #include <cstdio>
-@@ -696,6 +697,10 @@
-             static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
-         sequence.dflash_context_floor =
-             end > recent_tokens ? static_cast<std::uint32_t>(end - recent_tokens) : 0U;
-+        if (speculative_backend == SpeculativeBackend::DFlash2) {
-+            runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
-+                                                sequence.dflash_context_frontier);
++        const auto& draft_config = model->config().draft;
++        const auto draft_ring = draft_config ? draft_config->sliding_window.value_or(0U) : 0U;
++        const auto recent = dflash2_kvmem_recent_tokens(
++            options.kvmem, options.speculative.backend, draft_ring, budget_plan == nullptr);
++        if (recent != options.kvmem.recent_tokens) {
++            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
++                "KVMEM_DFLASH_RECENT requested=%u effective=%u ring=%u",
++                options.kvmem.recent_tokens, recent, draft_ring);
++            options.kvmem.recent_tokens = recent;
 +        }
-         auto backend = std::make_shared<WindowMemoryBackend>(*this, sequence, end);
-         const auto count = kv_pages_for_tokens(begin);
-         const auto keep = std::min(count, kvmem_options.selected_tokens / page_tokens);
-@@ -1561,6 +1566,8 @@
-         const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
-         sequence.dflash_context_floor = frontier > recent
-             ? static_cast<std::uint32_t>(frontier - recent) : 0U;
-+        runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
-+                                            sequence.dflash_context_frontier);
-     }
-     if (backend_kv_pages) { sequence.mtp_kv_valid = frontier; sequence.mtp_draft_count = 0; }
-     ++window.stamp.execution_history;
-diff --git a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
---- a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
-+++ b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
-@@ -1,6 +1,7 @@
- #include "models/qwen3_5/program/program_impl.h"
- #include "models/qwen3_5/program/context_work.h"
- #include "models/qwen3_5/program/planning/pressure_planner.h"
-+#include "runtime/contract/dflash_conditioning.h"
- 
- #include <algorithm>
- #include <array>
-@@ -768,6 +769,10 @@
-         const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * 64ULL;
-         sequence.dflash_context_floor = kvmem_window_tokens && retained->main_frontier > recent
-             ? static_cast<std::uint32_t>(retained->main_frontier - recent) : 0U;
-+        if (speculative_backend == SpeculativeBackend::DFlash2) {
-+            runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
-+                                                sequence.dflash_context_frontier);
-+        }
-     }
-     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
-     refresh_state_views(sequence);
+         StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
+         instance = std::make_unique<ModelInstance>(std::move(model), options);
+         instance->residency = residency;
 diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index d608c7b45237d8b4abdf1d45c9741ce26bbd4365..7e9d8355b19ec4728ae7965423530379861ad19a 100644
 --- a/src/serve/serve_options.cpp
 +++ b/src/serve/serve_options.cpp
-@@ -135,6 +135,8 @@
+@@ -135,6 +135,8 @@ std::string serve_usage_text(const char* argv0) {
             "                                page; positive values round down, minimum one page\n"
             "  --kvmem-recent-tokens N       always-kept newest suffix; default 64 (one page);\n"
             "                                minimum 64; values round down to whole pages\n"
@@ -173,6 +232,7 @@ diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
             "  --kvmem-disk-mib N            Shared SSD payload quota D, MiB; 0 = off (default)\n"
 diff --git a/tests/models/qwen3_5/test_dflash_conditioning.cpp b/tests/models/qwen3_5/test_dflash_conditioning.cpp
 new file mode 100644
+index 0000000000000000000000000000000000000000..ff06154cbe77cfba229d398ec3991c4cf8ae0313
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_dflash_conditioning.cpp
 @@ -0,0 +1,109 @@
@@ -286,9 +346,10 @@ new file mode 100644
 +    std::puts("DFlash conditioning policy passed");
 +}
 diff --git a/tests/models/qwen3_5/tests.cmake b/tests/models/qwen3_5/tests.cmake
+index 4a8f4db3838aec6f9a6f4aac8bf0f57b2c11662f..e83b0a544266046e7aaceb8c5603fa07fb8799d2 100644
 --- a/tests/models/qwen3_5/tests.cmake
 +++ b/tests/models/qwen3_5/tests.cmake
-@@ -239,6 +239,10 @@
+@@ -245,6 +245,10 @@ ninfer_add_test(ninfer_qwen3_5_mtp_adaptive_test
    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_adaptive.cpp"
    LIBRARIES ninfer_core)
  
@@ -299,54 +360,3 @@ diff --git a/tests/models/qwen3_5/tests.cmake b/tests/models/qwen3_5/tests.cmake
  ninfer_add_test(ninfer_qwen3_5_structured_round_test
    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_structured_round.cpp"
    LIBRARIES ninfer_model_runtime ninfer_core)
-diff --git a/docs/dflash-conditioning.md b/docs/dflash-conditioning.md
-new file mode 100644
---- /dev/null
-+++ b/docs/dflash-conditioning.md
-@@ -0,0 +1,32 @@
-+# DFlash2 recent context with KVMem
-+
-+When KVMem is enabled with DFlash2, Engine startup resolves the effective recent span
-+to at least the model's draft sliding-window capacity, rounded up to 64-token pages.
-+For a 2048-token ring, requested recent64 or2000 becomes2048. A larger existing
-+recent setting keeps its normal downward page rounding. Other speculative backends
-+and runs without KVMem retain their requested setting.
-+
-+This uses the existing recent policy for both Query-required pages and resident-only
-+Pressure. It adds no second page-pinning policy or cold recall to tool continuation.
-+`KVMEM_DFLASH_RECENT requested=... effective=... ring=...` reports any increase, and
-+the resolved Engine options carry the effective value.
-+
-+The selected budget B is unchanged. Keeping more recent pages leaves less room for
-+other retrieved history. B must hold sink plus the effective recent span; with the
-+default one-page sink and a2048-token ring, B must be at least2112. An executing
-+Engine rejects a smaller budget explicitly. Budget planning uses the same resolved
-+span as its minimum even if its seed B is smaller.
-+
-+The restored draft floor is bounded by its committed frontier, including immediately
-+before DFlash2 decode. A truncating restore can therefore hide unavailable history
-+without leaving a future lower bound. This guard does not expand the valid interval.
-+
-+Draft KV remains BF16. There is no INT8 draft storage, shadow buffer, new request
-+protocol or ingestion state in this change. Recent=2048 already covers a2048-token
-+ring: the minimum is idempotent, not an additional2048-token allocation.
-+
-+The ring-retention and restored-floor ideas originate in
-+melis2023/ninfer-kvmem-actkv commits
-+`f9cfb15dfa7251707d8f114c29ecb0f52eea62e6` and
-+`e7996f7c3894bcfcef4b1a3c2d3ad832646f20d5`. This integration normalizes recent once
-+instead of maintaining independent floor and page-pinning overrides.
-diff --git a/docs/cli.md b/docs/cli.md
---- a/docs/cli.md
-+++ b/docs/cli.md
-@@ -425,6 +425,10 @@
- 
- All weight, sequence, workspace, and graph allocations are released when the Engine is destroyed.
- 
-+With DFlash2 and KVMem, the effective recent span is at least the model's draft ring
-+(usually2048 tokens). Larger settings keep their existing page rounding. The selected
-+budget must hold sink plus that span; see [DFlash2 conditioning](dflash-conditioning.md).
-+
- ## JSON and JSON Schema output
- 
- `--json` constrains output to a JSON object. `--json-schema FILE` constrains it to the supported

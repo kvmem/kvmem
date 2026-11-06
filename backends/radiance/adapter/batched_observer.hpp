@@ -52,7 +52,7 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
             const auto io=cache_->payload ? cache_->payload->io_stats() : SpillIoStats{};
             const auto sharing_credit=cache_->sharing_credit();
             auto value=std::make_shared<nlohmann::json>(nlohmann::json{
-                {"retained_sessions",cache_->sessions.size()},{"planned_history_hits",cache_->hits},
+                {"retained_sessions",cache_->groups()},{"retained_records",cache_->sessions.size()},{"planned_history_hits",cache_->hits},
                 {"history_hits",cache_->actual_own_hits+cache_->actual_shared_hits},
                 {"own_history_hits",cache_->actual_own_hits},{"shared_history_hits",cache_->actual_shared_hits},
                 {"history_misses",cache_->actual_misses},
@@ -130,7 +130,12 @@ public:
             try {
                 pending->ticket.wait();pending->saved.prefix=std::move(pending->work->prefix);
                 const auto session=pending->saved.session.id;
-                cache_->sessions.push_back(std::move(pending->saved));
+                if(!cache_->publish(std::move(pending->saved),options_.cache_sessions,true)) {
+                    if(cache_->bytes<bytes)throw std::runtime_error("invalid pending cache charge");
+                    cache_->bytes-=bytes;
+                    RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=directory_capacity source_preserved=1",(unsigned long long)session);
+                    continue;
+                }
                 RAD_INFO("KVMEM_SESSION_PARK_READY session=%llu entries=%zu pending=%zu",
                     (unsigned long long)session,cache_->sessions.size(),cache_->parking.size());
             } catch(const std::exception& error) {

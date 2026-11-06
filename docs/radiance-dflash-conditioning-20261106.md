@@ -1,5 +1,7 @@
 # Radiance DFlash 窗口保留
 
+本文记录提交 `3268d34` 的历史验证及 256K 测量。随后合并审计补足部分尾页所需的 recent 余量（W2048/block128 时为 2176），修复窗口字节的提前准入估算，并对合并 worker 复测 DFlash7/MTP3；新结果见 [合并审计](radiance-v117-merge-audit-20261106.md)。下表不是该新 worker 的性能测量。
+
 按用户指定的 melis 补丁方向，recent 至少覆盖模型草稿窗口。Pressure 保留这些最近页面，prefix 和 Query checkpoint 保存接受位置对应的原生 WINDOW KV 及 recurrent state；恢复时同时恢复它们，再发布有效窗口范围。checkpoint 不再固定提前 2048 tokens。原生 quantum、自然 prefill 边界、Query 上界和最后一个未缓存 logits 的 token 仍约束复用。
 
 窗口快照只复制接受位置需要的最近页面，排除未来 reserved lookahead 及上一 prefill chunk 已不再需要的旧页。快照不长期持有滚动窗口的 GPU 引用；源请求继续生成或释放不会改写保存的字节。RAM/SSD 迁移、分支和准备好的 CPU payload 都包含窗口载荷并计入原有缓存额度。sink 加完整窗口超出既有 selected budget 时拒绝配置，不扩大预算。

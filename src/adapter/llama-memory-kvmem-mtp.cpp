@@ -85,6 +85,7 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
 
     kv_ = std::make_unique<llama_kv_cache>(
             model,
+            params.no_alloc,
             model.hparams,
             type_k_,
             type_v_,
@@ -93,7 +94,6 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
             /* unified */ true,
             kv_size_,
             /* n_seq_max */ 1,
-            /* n_pad */ 1,
             model.hparams.n_swa,
             model.hparams.swa_type,
             nullptr,
