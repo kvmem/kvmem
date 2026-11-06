@@ -52,7 +52,9 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
             const auto io=cache_->payload ? cache_->payload->io_stats() : SpillIoStats{};
             const auto sharing_credit=cache_->sharing_credit();
             auto value=std::make_shared<nlohmann::json>(nlohmann::json{
-                {"retained_sessions",cache_->groups()},{"retained_records",cache_->sessions.size()},{"planned_history_hits",cache_->hits},
+                {"retained_sessions",cache_->groups()},{"retained_records",cache_->sessions.size()},
+                {"retained_records_limit",options_.effective_cache_records()},{"cache_retention_revision",2},
+                {"retained_recovery_points",cache_->recovery_points()},{"planned_history_hits",cache_->hits},
                 {"history_hits",cache_->actual_own_hits+cache_->actual_shared_hits},
                 {"own_history_hits",cache_->actual_own_hits},{"shared_history_hits",cache_->actual_shared_hits},
                 {"history_misses",cache_->actual_misses},
@@ -65,6 +67,7 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
                 {"disk_payload_budget_bytes",options_.disk_bytes},{"selected_tokens",options_.budget_tokens},
                 {"disk_read_bytes",io.read_bytes},{"disk_written_bytes",io.written_bytes},
                 {"disk_reads",io.reads},{"disk_writes",io.writes},{"disk_errors",io.errors},
+                {"checkpoint_kv_capture_bytes",cache_->capture_bytes},{"checkpoint_kv_logical_bytes",cache_->capture_logical_bytes},
                 {"retained_logical_bytes",cache_->bytes},{"active_archive_bytes",cache_->active_archive_bytes},
                 {"active_checkpoint_bytes",cache_->active_checkpoint_bytes},
                 {"shared_payload_credit_bytes",sharing_credit},
@@ -130,7 +133,7 @@ public:
             try {
                 pending->ticket.wait();pending->saved.prefix=std::move(pending->work->prefix);
                 const auto session=pending->saved.session.id;
-                if(!cache_->publish(std::move(pending->saved),options_.cache_sessions,true)) {
+                if(!cache_->publish(std::move(pending->saved),options_.cache_sessions,options_.effective_cache_records(),true)) {
                     if(cache_->bytes<bytes)throw std::runtime_error("invalid pending cache charge");
                     cache_->bytes-=bytes;
                     RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=directory_capacity source_preserved=1",(unsigned long long)session);
@@ -236,7 +239,9 @@ public:
                 {"graph_alpha",options_.graph_alpha},{"query_max_tokens",options_.query_tokens},
                 {"query_replay_max_tokens",options_.query_replay_tokens},{"rolling_generation",options_.rolling_generation},
                 {"capabilities",{{"disk_budget_bytes",options_.disk_bytes},{"ssd_enabled",options_.disk_bytes>0},
-                    {"retained_sessions_limit",options_.cache_sessions},{"max_active_requests",cfg.max_seqs}}}};
+                    {"retained_sessions_limit",options_.cache_sessions},{"retained_records_limit",options_.effective_cache_records()},
+                    {"snapshot_storage_revision",1},{"incremental_checkpoint_capture",true},
+                    {"restore_staging","full_selected_view"},{"max_active_requests",cfg.max_seqs}}}};
             publish_monitor();
             return RAD_OK;
         } catch (const std::exception& error) { RAD_ERR("KVMem batch configure: %s",error.what()); return RAD_E_STATE; }

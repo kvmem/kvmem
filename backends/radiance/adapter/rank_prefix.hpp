@@ -30,6 +30,9 @@ public:
     size_t frontier() const {if(ranks_.empty())throw std::runtime_error("empty rank prefix");return ranks_[0].lease->frontier();}
     uint64_t host_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->host_bytes());return n;}
     uint64_t state_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->state_bytes());return n;}
+    uint64_t metadata_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->metadata_bytes());return n;}
+    uint64_t staging_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->staging_bytes());return n;}
+    uint64_t copied_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->copied_bytes());return n;}
     uint64_t page_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->page_bytes());return n;}
     Payload load_cpu() const {
         Payload out;for(const auto& r:ranks_)out.ranks.push_back(r.lease->load_cpu());return out;

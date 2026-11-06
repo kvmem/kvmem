@@ -53,6 +53,10 @@ def main():
     cases.append(('reject-removed-prefix-flag',
                   ['--prefix-cache-host-mib' if value=='--prefix-cache-mib' else value for value in valid],False,cases[0][3]))
     cases.append(('reject-unknown-native-flag',[*valid,'--invalid-native-argv-regression'],False,cases[0][3]))
+    for value in ('0','1','16','1024'):
+        cases.append(('cache-records-'+value,[*valid,'--kvmem-cache-records',value],True,cases[0][3]))
+    for value in ('-1','1025','1junk'):
+        cases.append(('reject-cache-records-'+value,[*valid,'--kvmem-cache-records',value],False,cases[0][3]))
     results=[]
     for name,argv,expected,env in cases:
         command=[str(args.probe.resolve()),*argv,'--help']

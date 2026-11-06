@@ -1,6 +1,7 @@
 #pragma once
 #include "kvmem/memory_contract.hpp"
 #include "rad_device.h"
+#include "prefix_capture.hpp"
 #include <memory>
 
 namespace rad { class KVManager; struct KVGroupInfo; }
@@ -55,6 +56,9 @@ public:
     // Save metadata matching a separately owned PrefixLease. Later bounded
     // prefill may change the live view; no native page/host payload is duplicated.
     void retain_view();
+    PrefixCapture prefix_capture();
+    // Scheduler boundary only. Completed CPU captures become archive aliases.
+    void refresh_captured();
     // Fork only an immutable retained catalog. The caller independently restores
     // its prefix/state before rebind_sequence; no device page references are copied.
     std::shared_ptr<NativeMemory> fork_retained(SessionIdentity branch) const;

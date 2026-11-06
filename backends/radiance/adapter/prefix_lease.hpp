@@ -1,8 +1,10 @@
 #pragma once
 #include "state_checkpoint.hpp"
 #include "window_checkpoint.hpp"
+#include "prefix_capture.hpp"
 #include <algorithm>
 #include <memory>
+#include <map>
 #include <stdexcept>
 
 namespace kvmem::radiance {
@@ -24,13 +26,20 @@ class PrefixLease {
     int64_t visible_ = -1;
     std::vector<uint8_t> host_;
     std::unique_ptr<TieredBuffer> parked_host_;
+    std::shared_ptr<const KvSnapshot> snapshot_;
+    std::vector<std::vector<CopySpan>> snapshot_spans_;
+    std::vector<std::pair<size_t,size_t>> captured_; // block index, staging offset
+    bool demoted_=false;
+    uint64_t copied_bytes_=0;
     std::shared_ptr<StorageIoQueue> io_;
     std::shared_ptr<const int> payload_identity_=std::make_shared<const int>(0);
     struct ForkTag {};
     PrefixLease(const PrefixLease& source,ForkTag)
         : lifetime_(source.lifetime_),owner_(source.owner_),tables_(source.tables_),tokens_(source.tokens_),
-          state_(source.state_.fork()),window_(source.window_.fork()),visible_(source.visible_),host_(source.host_),io_(source.io_),payload_identity_(source.payload_identity_) {
+          state_(source.state_.fork()),window_(source.window_.fork()),visible_(source.visible_),host_(source.host_),
+          snapshot_(source.snapshot_),demoted_(source.demoted_),io_(source.io_),payload_identity_(source.payload_identity_) {
         if(!source.refs_.empty() || !source.host_bytes())throw std::runtime_error("fork requires a parked prefix");
+        if(snapshot_ && !snapshot_->ready())throw std::runtime_error("fork requires completed snapshot records");
         if(source.parked_host_)parked_host_=source.parked_host_->fork();
     }
     struct Copies { std::vector<GroupPool> pools; std::vector<CopySpan> spans; uint64_t bytes = 0; };
@@ -56,8 +65,37 @@ class PrefixLease {
         for (const auto& [group, block] : refs_) owner_->release_block(group, block);
         refs_.clear();
     }
+    void bind_capture(const PrefixCapture& capture,uint64_t sequence) {
+        if(!capture.engine_lifetime || capture.engine_lifetime.owner_before(lifetime_) || lifetime_.owner_before(capture.engine_lifetime) ||
+           !capture.stamp.valid || capture.stamp.frontier!=tokens_.size() || capture.manager!=owner_ || capture.sequence!=sequence)
+            throw std::runtime_error("prefix capture is from a different native boundary");
+        const auto image=copies(tables_);
+        std::map<std::pair<int32_t,uint64_t>,CopySpan> positions;
+        for(const auto& span:image.spans)
+            if(!positions.emplace(std::make_pair(span.group,span.pool_offset),span).second)
+                throw std::runtime_error("duplicate native prefix page");
+        std::vector<std::shared_ptr<SealedKvBlock>> blocks;
+        std::vector<KvSnapshot::Span> spans;
+        for(const auto& block:capture.blocks) {
+            const auto index=blocks.size();blocks.push_back(block.origin);
+            snapshot_spans_.push_back(block.spans);
+            for(const auto& span:block.spans) {
+                const auto it=positions.find({span.group,span.pool_offset});
+                if(it==positions.end() || it->second.bytes!=span.bytes)
+                    throw std::runtime_error("snapshot does not cover the native execution view");
+                spans.push_back({index,size_t(span.record_offset),size_t(it->second.record_offset),size_t(span.bytes)});
+                positions.erase(it);
+            }
+        }
+        if(!positions.empty())throw std::runtime_error("snapshot omitted native pages");
+        snapshot_=std::make_shared<KvSnapshot>(std::move(blocks),std::move(spans),size_t(image.bytes));
+    }
 public:
     void account(SharedPayloadAccounting& out) const {
+        if(snapshot_) {
+            snapshot_->account([&](const void* id,uint64_t n){out.add(id,n);});
+            snapshot_->account_metadata([&](const void* id,uint64_t n){out.add(id,n);});
+        }
         if(parked_host_)parked_host_->account(out);state_.account(out);window_.account(out);
     }
     class Payload {
@@ -70,12 +108,12 @@ public:
     Payload load_cpu() const {
         if(!refs_.empty() || !host_bytes())throw std::runtime_error("CPU prefix load requires parked pages");
         Payload out;out.identity_=payload_identity_;
-        out.kv=parked_host_ ? parked_host_->read() : host_;
+        out.kv=snapshot_ ? snapshot_->read() : parked_host_ ? parked_host_->read() : host_;
         out.state=state_.load_cpu();out.window=window_.load_cpu();return out;
     }
     PrefixLease(std::shared_ptr<void> lifetime, rad::KVManager& kv, uint64_t source,
                 std::vector<int32_t> evaluated_prefix, int device, RadStream stream,
-                const AcceptedState& accepted = {})
+                const AcceptedState& accepted = {}, const PrefixCapture* capture=nullptr)
         : lifetime_(std::move(lifetime)), owner_(&kv), tokens_(std::move(evaluated_prefix)) {
         if (!lifetime_ || tokens_.empty() || kv.seq_tokens(source) != int64_t(tokens_.size()))
             throw std::runtime_error("prefix lease requires the exact evaluated frontier");
@@ -96,6 +134,7 @@ public:
             count += tables_.back().blocks.size();
         }
         if (tables_.empty()) throw std::runtime_error("prefix lease has no attention view");
+        if(capture)bind_capture(*capture,source);
         refs_.reserve(count);
         try {
             state_.save(kv, source, device, stream, accepted);
@@ -119,9 +158,12 @@ public:
         return prompt.size() > tokens_.size() && std::equal(tokens_.begin(), tokens_.end(), prompt.begin());
     }
     size_t frontier() const noexcept { return tokens_.size(); }
-    size_t host_bytes() const noexcept { return parked_host_ ? parked_host_->size() : host_.size(); }
+    size_t host_bytes() const noexcept { return snapshot_ ? (demoted_ ? snapshot_->size() : 0) : parked_host_ ? parked_host_->size() : host_.size(); }
+    size_t metadata_bytes() const noexcept {return snapshot_ ? snapshot_->metadata_bytes() : 0;}
+    size_t staging_bytes() const noexcept {return host_.size()+state_bytes();}
+    uint64_t copied_bytes() const noexcept {return copied_bytes_;}
     size_t state_bytes() const noexcept { return state_.bytes() + window_.bytes(); }
-    uint64_t page_bytes() const { return host_bytes() ? host_bytes() : copies(tables_).bytes; }
+    uint64_t page_bytes() const { return snapshot_ ? snapshot_->size() : host_bytes() ? host_bytes() : copies(tables_).bytes; }
     // Only called at a drained boundary when the live selection needs leased
     // pages. No new page allocator; save opaque native bytes before releasing
     // refs. Copy failure leaves the original lease intact. The caller shares
@@ -131,16 +173,46 @@ public:
         const auto batch = copies(tables_);
         if (!batch.bytes || batch.bytes > max_bytes)
             throw MemoryError(MemoryErrorCode::BudgetExceeded, "host allowance cannot hold retained prefix");
+        if(snapshot_) {
+            std::vector<CopySpan> spans;
+            std::vector<std::pair<size_t,size_t>> missing;
+            size_t bytes=0;
+            for(size_t i=0;i<snapshot_->blocks().size();++i)if(!snapshot_->blocks()[i]->ready()) {
+                missing.emplace_back(i,bytes);
+                for(auto span:snapshot_spans_[i]) {span.record_offset+=bytes;spans.push_back(span);}
+                bytes+=snapshot_->blocks()[i]->size();
+            }
+            std::vector<uint8_t> payload;
+            if(bytes) {
+                PageTransfer copy(device,bytes,stream);copy.spill(spans,batch.pools,stream);
+                if(!copy.drain())throw std::runtime_error("incremental prefix capture failed");
+                payload=copy.payload();
+            }
+            host_.swap(payload);captured_.swap(missing);copied_bytes_=bytes;demoted_=true;
+            release();decltype(snapshot_spans_)().swap(snapshot_spans_);
+            return;
+        }
         PageTransfer copy(device, batch.bytes, stream);
         copy.spill(batch.spans, batch.pools, stream);
         if (!copy.drain()) throw std::runtime_error("prefix demotion copy failed");
         auto payload = copy.payload();
         host_.swap(payload);
+        copied_bytes_=host_.size();
         release();
     }
     void park(const std::shared_ptr<HostKvStorage>& storage,const std::shared_ptr<StorageIoQueue>& io) {
         if(!refs_.empty() || !host_bytes())throw std::runtime_error("prefix must be demoted before tiering");
         state_.park(storage,io);window_.park(storage,io);
+        if(snapshot_) {
+            complete_storage(io,host_.size(),[&]{
+                for(const auto& [index,offset]:captured_) {
+                    const auto& block=snapshot_->blocks()[index];
+                    block->seal(*storage,host_.data()+offset,block->size());
+                }
+            });
+            if(!snapshot_->ready())throw std::runtime_error("snapshot publication missing captured blocks");
+            decltype(captured_)().swap(captured_);std::vector<uint8_t>().swap(host_);io_=io;return;
+        }
         park_buffer(host_,parked_host_,storage,io);io_=io;
     }
     void restore(rad::KVManager& kv, uint64_t destination, const std::vector<int32_t>& prompt,
@@ -160,8 +232,10 @@ public:
         try {
             if (host_bytes()) {
                 // File reads finish before reserving/writing destination pages.
-                const auto loaded=!prepared && parked_host_ ? read_buffer(*parked_host_,io_) : std::vector<uint8_t>{};
-                const auto& payload=prepared ? prepared->kv : parked_host_ ? loaded : host_;
+                std::vector<uint8_t> loaded;
+                if(!prepared && snapshot_)complete_storage(io_,snapshot_->size(),[&]{loaded=snapshot_->read();});
+                else if(!prepared && parked_host_)loaded=read_buffer(*parked_host_,io_);
+                const auto& payload=prepared ? prepared->kv : (snapshot_ || parked_host_) ? loaded : host_;
                 size_t count = 0;
                 for (const auto& t : tables) {
                     if (kv.reserve_release_space(t.group, t.blocks.size() + kv.block_table(destination, t.group).size()) < 0)

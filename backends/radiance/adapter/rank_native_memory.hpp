@@ -20,6 +20,8 @@ public:
     }
     void rewind(uint64_t frontier) {update([&](auto& rank){rank.rewind(frontier);});}
     void retain_view() {update([](auto& rank){rank.retain_view();});}
+    PrefixCapture prefix_capture(size_t rank) {return native_.at(rank)->prefix_capture();}
+    void refresh_captured() {update([](auto& rank){rank.refresh_captured();});}
     void rebind_sequence(uint64_t sequence,bool relocated=false) {
         update([&](auto& rank){rank.rebind_sequence(sequence,relocated);});
     }
