@@ -53,4 +53,4 @@ ROCm历史两列来自 [RX7900XTX测试记录](https://github.com/kvmem/kvmem/bl
 | 2026-10-30 DSH部署版，exe `52969463…` | prefix修复CPU回归；原生思考续接生成完整动画HTML；App短调用 |
 | 2026-10-31 PR候选（KVMem `89c66980`） | Windows全量构建；5请求短测：2次Host召回+3次prefix |
 
-新交互版配置仍B36864/R16384/batch512/context262144、FP8 K/V、MTP3。xhigh、不独立限制thinking、max_tokens65536来自新客户端/循环适配；旧33测试仍是thinking128/max512。以上性能表采用旧33轮的请求设置。
+2026-10-31的新交互版测试配置为B36864/R16384/batch512/context262144、FP8 K/V、MTP3。xhigh、不独立限制thinking、max_tokens65536来自新客户端/循环适配；旧33测试仍是thinking128/max512。以上性能表采用旧33轮的请求设置。

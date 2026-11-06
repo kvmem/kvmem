@@ -86,7 +86,7 @@ def main():
                         help="explicit always-kept suffix; omitted uses the engine/common KVMem default")
     parser.add_argument("--replay-tokens", type=int, default=1024)
     parser.add_argument("--host-archive-mib", type=int, default=256)
-    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--drafter", choices=("auto", "off", "mtp", "dflash"), default="auto",
                         help="reuse native drafter; MTP requires MTP weights, never silently falls back to DFlash")
     parser.add_argument("--speculative-tokens", type=int, default=None,
@@ -168,7 +168,7 @@ def main():
                "--max-num-batched-tokens", str(args.batch), "--num-speculative-tokens", str(args.speculative_tokens),
                "--gpu-headroom-mib", str(args.gpu_headroom_mib), "--kv-cache-dtype", args.kv_cache_dtype, "--state-cache-dtype", args.state_cache_dtype,
                "--placement", "all_vram", "--embedding-placement", args.embedding_placement,
-               "--host-pool-mib", "0", "--prefix-cache-host-mib", "0",
+               "--host-pool-mib", "0", "--prefix-cache-mib", "0",
                "--mm-max-patches", "0",
                "--no-prefix-cache", "--http-threads", "4", "--deterministic"]
     if args.selection_budget:

@@ -1,0 +1,348 @@
+diff --git a/libr4d/CMakeLists.txt b/libr4d/CMakeLists.txt
+--- a/libr4d/CMakeLists.txt
++++ b/libr4d/CMakeLists.txt
+@@ -209,6 +209,63 @@
+   "r4d_moe|"
+ )
+ 
++set(R4D_PROFILE "all" CACHE STRING "libr4d device kernel profile")
++set_property(CACHE R4D_PROFILE PROPERTY STRINGS all qwen35-dense-tp1)
++if(NOT R4D_PROFILE STREQUAL "all")
++  if(NOT R4D_PROFILE STREQUAL "qwen35-dense-tp1")
++    message(FATAL_ERROR "Unknown R4D_PROFILE=${R4D_PROFILE}")
++  endif()
++  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    message(FATAL_ERROR "R4D_PROFILE=qwen35-dense-tp1 currently requires Linux")
++  endif()
++  list(LENGTH R4D_GPU_TARGETS _r4d_arch_count)
++  if(NOT _r4d_arch_count EQUAL 1)
++    message(FATAL_ERROR "The narrowed profile requires exactly one RDNA4 GPU target")
++  endif()
++  find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
++  set(_r4d_profile_file "${CMAKE_CURRENT_SOURCE_DIR}/profiles/${R4D_PROFILE}.json")
++  file(READ "${_r4d_profile_file}" _r4d_profile_json)
++  string(JSON _r4d_profile_count LENGTH "${_r4d_profile_json}" units)
++  math(EXPR _r4d_profile_last "${_r4d_profile_count} - 1")
++  set(_r4d_selected "")
++  foreach(_r4d_index RANGE ${_r4d_profile_last})
++    string(JSON _r4d_unit GET "${_r4d_profile_json}" units ${_r4d_index})
++    set(_r4d_found FALSE)
++    foreach(_r4d_entry IN LISTS R4D_UNITS)
++      if(_r4d_entry MATCHES "^${_r4d_unit}\\|")
++        list(APPEND _r4d_selected "${_r4d_entry}")
++        set(_r4d_found TRUE)
++      endif()
++    endforeach()
++    if(NOT _r4d_found)
++      message(FATAL_ERROR "Profile names an unknown R4D unit: ${_r4d_unit}")
++    endif()
++  endforeach()
++  set(R4D_UNITS ${_r4d_selected})
++  set(_r4d_profile_dir "${CMAKE_CURRENT_BINARY_DIR}/profile-${R4D_PROFILE}")
++  set(_r4d_rocm_args "")
++  if(CMAKE_HIP_COMPILER_ROCM_ROOT)
++    list(APPEND _r4d_rocm_args --rocm-root "${CMAKE_HIP_COMPILER_ROCM_ROOT}")
++  endif()
++  string(TOUPPER "${CMAKE_BUILD_TYPE}" _r4d_build_type)
++  execute_process(
++    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/generate_profile.py"
++      --source "${CMAKE_CURRENT_SOURCE_DIR}" --profile "${_r4d_profile_file}"
++      --output "${_r4d_profile_dir}" --cxx "${CMAKE_CXX_COMPILER}"
++      --hip "${CMAKE_HIP_COMPILER}" --arch "${R4D_GPU_TARGETS}" ${_r4d_rocm_args}
++      "--cxx-flags=${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_r4d_build_type}}"
++      "--hip-flags=${CMAKE_HIP_FLAGS} ${CMAKE_HIP_FLAGS_${_r4d_build_type}}"
++    RESULT_VARIABLE _r4d_profile_status OUTPUT_VARIABLE _r4d_profile_report
++    ERROR_VARIABLE _r4d_profile_error)
++  if(NOT _r4d_profile_status EQUAL 0)
++    message(FATAL_ERROR "R4D profile generation failed:\n${_r4d_profile_report}${_r4d_profile_error}")
++  endif()
++  message(STATUS "${_r4d_profile_report}")
++  file(STRINGS "${_r4d_profile_dir}/dependencies.txt" _r4d_profile_dependencies)
++  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_r4d_profile_dependencies})
++  set(R4D_PROFILE_ROWS "${_r4d_profile_dir}/r4d_profile_rows.cpp")
++endif()
++
+ set(R4D_SRC "")
+ foreach(u ${R4D_UNITS})
+   string(REPLACE "|" ";" parts "${u}")
+@@ -233,12 +290,20 @@
+ # hip_runtime.h, so these tables compile and can be inspected without ROCm.
+ set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_iqr_layout.cpp r4d_shapes.cpp
+                     r4d_fuse.cpp)
++if(R4D_PROFILE_ROWS)
++  list(REMOVE_ITEM R4D_DECLARATION r4d_rows.cpp)
++  list(PREPEND R4D_DECLARATION "${R4D_PROFILE_ROWS}")
++endif()
+ 
+ rad_add_plugin(libr4d kernels
+   SOURCES     ${R4D_DECLARATION}
+   HIP_SOURCES ${R4D_SRC}
+   GPU_TARGETS ${R4D_GPU_TARGETS}
+   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR})
++if(R4D_PROFILE_ROWS)
++  # Catch cross-unit references as a link error, before a profiled plugin is installed.
++  target_link_options(libr4d PRIVATE "LINKER:--no-undefined")
++endif()
+ 
+ # Catalogue dump: prints every row and, on a card, calls each launch with a minimal valid input, to
+ # catch transcription errors in the constraint table. It dlopens the plugin so an undefined symbol
+diff --git a/libr4d/generate_profile.py b/libr4d/generate_profile.py
+new file mode 100644
+--- /dev/null
++++ b/libr4d/generate_profile.py
+@@ -0,0 +1,227 @@
++"""Generate a narrowed registry from the original row table, without compiling device code."""
++from __future__ import annotations
++
++import argparse
++from concurrent.futures import ThreadPoolExecutor
++import hashlib
++import json
++from pathlib import Path
++import re
++import shlex
++import subprocess
++
++
++TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[A-Za-z_]\w*|[^\s]', re.S)
++FUNCTION = re.compile(r'\b(r4d_\w+)\s*\([^;{}]*\)\s*(?:noexcept\s*)?\{', re.S)
++EXPORTED_FUNCTION = re.compile(r'extern\s+"C"\s+[^;{}()]*?\b(r4d_\w+)\s*\([^;{}]*\)\s*\{', re.S)
++PROTOTYPE = re.compile(r'\b(r4d_\w+)\s*\([^;{}]*\)\s*;', re.S)
++CALLBACK_FIELDS = {12: 'tune_valid', 13: 'init', 14: 'fini', 15: 'launch',
++                   16: 'scratch', 17: 'layout', 18: 'relayout', 19: 'opd_shape',
++                   20: 'unrelayout', 21: 'replaces'}
++INDEX_EXPORTS = ('rad_kernel_count', 'rad_kernel_at', 'rad_kernel_concurrent',
++                 'rad_kernel_chain', 'rad_kernel_collective')
++HOST_UNITS = ('r4d_rows.cpp', 'r4d_layout.cpp', 'r4d_fp8_layout.cpp',
++              'r4d_iqr_layout.cpp', 'r4d_shapes.cpp', 'r4d_fuse.cpp')
++
++
++def clean_preprocessed(text: str) -> str:
++    return re.sub(r'^\s*#.*$', '', text, flags=re.M)
++
++
++def split_fields(text: str) -> list[str]:
++    """Split an aggregate at top-level commas, preserving nested macros' expansions."""
++    parts = []
++    start = 0
++    depth = 0
++    for token in TOKEN.finditer(text):
++        value = token.group()
++        if value in ('{', '(', '['):
++            depth += 1
++        elif value in ('}', ')', ']'):
++            depth -= 1
++        elif value == ',' and depth == 0:
++            parts.append(text[start:token.start()].strip())
++            start = token.end()
++    tail = text[start:].strip()
++    if tail:
++        parts.append(tail)
++    return parts
++
++
++def rows_from_preprocessed(text: str) -> list[list[str]]:
++    match = re.search(r'static\s+const\s+RadKernelInfo\s+kKernels\s*\[\s*\]\s*=\s*\{', text)
++    if not match:
++        raise ValueError('the original kKernels table was not found')
++    depth = 1
++    end = None
++    for token in TOKEN.finditer(text, match.end()):
++        if token.group() == '{':
++            depth += 1
++        elif token.group() == '}':
++            depth -= 1
++            if depth == 0:
++                end = token.start()
++                break
++    if end is None:
++        raise ValueError('unterminated kKernels table')
++    rows = []
++    for initializer in split_fields(text[match.end():end]):
++        if not initializer.startswith('{') or not initializer.endswith('}'):
++            raise ValueError('unexpected kernel initializer')
++        fields = split_fields(initializer[1:-1])
++        if not 16 <= len(fields) <= 23:
++            raise ValueError(f'RadKernelInfo field count changed: {len(fields)}')
++        rows.append(fields)
++    return rows
++
++
++def symbol(value: str) -> str | None:
++    if value in ('nullptr', '0', '__null', ''):
++        return None
++    match = re.fullmatch(r'&?\s*(r4d_\w+)', value)
++    if not match:
++        raise ValueError(f'unsupported callback expression: {value}')
++    return match.group(1)
++
++
++def write_if_changed(path: Path, value: str) -> None:
++    if path.exists() and path.read_text(encoding='utf8') == value:
++        return
++    path.write_text(value, encoding='utf8', newline='\n')
++
++
++def wrapper(disabled: list[str]) -> str:
++    lines = ['// Generated from the original registry and compiler-expanded unit definitions.',
++             '#include "r4d_plugin.h"']
++    lines.extend(f'#define {name} nullptr' for name in disabled)
++    lines.extend(f'#define {name} r4d_profile_raw_{name}' for name in INDEX_EXPORTS)
++    lines.append('#include "r4d_rows.cpp"')
++    lines.extend(f'#undef {name}' for name in INDEX_EXPORTS)
++    lines.extend(f'#undef {name}' for name in disabled)
++    lines.append(r'''
++namespace {
++const std::vector<int>& profile_indices() {
++    static const std::vector<int> indices = [] {
++        std::vector<int> result;
++        const int count = r4d_profile_raw_rad_kernel_count();
++        for (int i = 0; i < count; ++i) {
++            const RadKernelInfo* row = r4d_profile_raw_rad_kernel_at(i);
++            if (row && row->launch) result.push_back(i);
++        }
++        return result;
++    }();
++    return indices;
++}
++int profile_raw_index(int index) {
++    const auto& indices = profile_indices();
++    return index >= 0 && size_t(index) < indices.size() ? indices[size_t(index)] : -1;
++}
++}
++extern "C" int rad_kernel_count() { return int(profile_indices().size()); }
++extern "C" const RadKernelInfo* rad_kernel_at(int index) {
++    return r4d_profile_raw_rad_kernel_at(profile_raw_index(index));
++}
++extern "C" int rad_kernel_concurrent(int index) {
++    return r4d_profile_raw_rad_kernel_concurrent(profile_raw_index(index));
++}
++extern "C" int rad_kernel_chain(int index) {
++    return r4d_profile_raw_rad_kernel_chain(profile_raw_index(index));
++}
++extern "C" int rad_kernel_collective(int index) {
++    return r4d_profile_raw_rad_kernel_collective(profile_raw_index(index));
++}
++''')
++    return '\n'.join(lines)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--source', required=True, type=Path)
++    parser.add_argument('--profile', required=True, type=Path)
++    parser.add_argument('--output', required=True, type=Path)
++    parser.add_argument('--cxx', required=True)
++    parser.add_argument('--hip', required=True)
++    parser.add_argument('--arch', required=True)
++    parser.add_argument('--rocm-root')
++    parser.add_argument('--cxx-flags', default='')
++    parser.add_argument('--hip-flags', default='')
++    parser.add_argument('--jobs', type=int, default=8)
++    args = parser.parse_args()
++    source = args.source.resolve()
++    profile = json.loads(args.profile.read_text(encoding='utf8'))
++    units = profile['units']
++    if not units or len(set(units)) != len(units):
++        raise ValueError('profile must contain unique device units')
++    for unit in units:
++        if not re.fullmatch(r'r4d_\w+', unit) or not (source / (unit + '.hip')).is_file():
++            raise ValueError(f'unknown device unit {unit}')
++    args.output.mkdir(parents=True, exist_ok=True)
++
++    def preprocess(name: str) -> tuple[str, str, list[str]]:
++        device = name.endswith('.hip')
++        command = [args.hip if device else args.cxx, '-E', '-std=c++17' if device else '-std=c++20',
++                   '-I' + str(source), '-I' + str(source.parent / 'abi')]
++        command += shlex.split(args.hip_flags if device else args.cxx_flags)
++        if device:
++            command += ['-x', 'hip', '--cuda-host-only', '--offload-arch=' + args.arch]
++            if args.rocm_root:
++                command += ['--rocm-path=' + args.rocm_root]
++        command.append(str(source / name))
++        result = subprocess.run(command, text=True, encoding='utf8', capture_output=True)
++        if result.returncode:
++            raise RuntimeError(f'preprocessing {name} failed\n{result.stderr}')
++        dependencies = sorted({p for p in re.findall(r'^#\s+\d+\s+"([^"<>]+)"', result.stdout, re.M)
++                               if Path(p).is_file()})
++        return name, clean_preprocessed(result.stdout), dependencies
++
++    names = list(HOST_UNITS) + [unit + '.hip' for unit in units]
++    with ThreadPoolExecutor(max_workers=max(1, min(args.jobs, 8))) as pool:
++        expanded = list(pool.map(preprocess, names))
++    texts = {name: text for name, text, _ in expanded}
++    definitions = {name: set(FUNCTION.findall(text)) for name, text in texts.items()}
++    exported = {name: set(EXPORTED_FUNCTION.findall(text)) for name, text in texts.items()}
++    host_definitions = set().union(*(definitions[name] for name in HOST_UNITS))
++    unit_definitions = set().union(*(exported[unit + '.hip'] for unit in units))
++    available_callbacks = host_definitions | unit_definitions
++    available = host_definitions | set().union(*definitions.values())
++    rows = rows_from_preprocessed(texts['r4d_rows.cpp'])
++    retained = []
++    callbacks = set()
++    for fields in rows:
++        functions = {field: symbol(fields[index]) for index, field in CALLBACK_FIELDS.items()
++                     if index < len(fields)}
++        callbacks.update(value for value in functions.values() if value)
++        if functions['launch'] not in unit_definitions:
++            continue
++        missing = {field: value for field, value in functions.items() if value and value not in available_callbacks}
++        if missing:
++            raise ValueError(f'profile callback closure incomplete for {fields[0]}: {missing}')
++        retained.append({'name': fields[0], 'callbacks': functions})
++    if not retained:
++        raise ValueError('profile retained no kernel rows')
++    # The original table also names peer init callbacks outside kKernels (host twins and
++    # collective metadata). Declarations are read after macro expansion, including token-pasted
++    # window/trellis names, so absent symbols cannot leak through those helper tables.
++    declarations = set(PROTOTYPE.findall(texts['r4d_rows.cpp']))
++    disabled = sorted((declarations - available) | (callbacks - available_callbacks))
++    write_if_changed(args.output / 'r4d_profile_rows.cpp', wrapper(disabled))
++    dependencies = sorted({str(Path(dep).resolve()) for _, _, deps in expanded for dep in deps}
++                          | {str(args.profile.resolve()), str(Path(__file__).resolve())})
++    write_if_changed(args.output / 'dependencies.txt', '\n'.join(dependencies) + '\n')
++    manifest = {
++        'profile': args.profile.stem, 'arch': args.arch, 'units': units,
++        'preprocessors': {'cxx': args.cxx, 'hip': args.hip,
++                          'cxx_flags': args.cxx_flags, 'hip_flags': args.hip_flags},
++        'unit_count': len(units), 'all_row_count': len(rows), 'retained_row_count': len(retained),
++        'disabled_callback_count': len(disabled), 'rows': retained,
++        'device_definitions': sorted(unit_definitions & declarations),
++        'definitions': {name: sorted(values & declarations) for name, values in definitions.items()},
++        'source_sha256': {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in names},
++        'preprocessing_only': True,
++    }
++    write_if_changed(args.output / 'manifest.json', json.dumps(manifest, indent=2) + '\n')
++    print(f'R4D profile {args.profile.stem}: {len(units)} HIP units, {len(retained)}/{len(rows)} rows; callback closure verified')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/libr4d/profiles/qwen35-dense-tp1.json b/libr4d/profiles/qwen35-dense-tp1.json
+new file mode 100644
+--- /dev/null
++++ b/libr4d/profiles/qwen35-dense-tp1.json
+@@ -0,0 +1,23 @@
++{
++  "description": "Qwen3.8-27B IQR-V4 and MXFP4, TP1, CPU vision, DFlash2, FP8/packed KV and F32/F16 state",
++  "units": [
++    "r4d_attn_paged_h256_gqa6", "r4d_attn_paged_h128_gqa4",
++    "r4d_gdn_chunk_scan_k128_v128_c64_bf16", "r4d_gdn_conv_w4_h128_bf16",
++    "r4d_gdn_kkt_solve_k128_c64_bf16", "r4d_gdn_recurrent_update_k128_v128_bf16_fp32state",
++    "r4d_gdn_gated_rmsnorm_h128_bf16",
++    "r4d_gemm_bf16_nt_m16", "r4d_gemm_bf16_nt_m64", "r4d_gemm_bf16_nt_tiled",
++    "r4d_gemm_w2a8_nt", "r4d_gemm_w8a8_nt_m64", "r4d_gemm_w8a8_tiled",
++    "r4d_gemm_mxfp4a8_nt_m64", "r4d_gemm_mxfp4a8_tiled",
++    "r4d_gemm_mxfp4a8_decode", "r4d_gemm_mxfp4a8_gemv",
++    "r4d_gemm_fp8a16_nt_m1", "r4d_gemm_fp8a8",
++    "r4d_gemm_iqr", "r4d_iqr_embed", "r4d_logits_vocab",
++    "r4d_quant_act_fp8", "r4d_fused_quant_fp8",
++    "r4d_qsa_block_key_bf16", "r4d_qsa_score_bf16", "r4d_qsa_select_bf16",
++    "r4d_qsa_tail_store_bf16", "r4d_qsa_work_bf16",
++    "r4d_sample_chain_f32", "r4d_model_bf16", "r4d_sample_stages_f32", "r4d_sample_ngram_f32",
++    "r4d_quant_act_i8", "r4d_rmsnorm_quant_i8", "r4d_qkv_norm_rope",
++    "r4d_had_quant_act_i8", "r4d_rmsnorm_had_quant_i8", "r4d_gated_had_quant_i8",
++    "r4d_qk_norm_rope_gate", "r4d_gdn_gated_norm_had_quant_i8", "r4d_rowtopk_bf16",
++    "r4d_dflash_conv_t2_g16_bf16", "r4d_dflash_select_bf16", "r4d_dflash_markov_bf16"
++  ]
++}

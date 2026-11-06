@@ -83,7 +83,7 @@
     QueryScorer:'page-softmax',GraphAlpha:0.2,Lrfu:false,ScoreAggregation:'mean',QueryMaxTokens:512,QueryReplayMaxTokens:2048};
   const ninferDefaultPreset={...commonPreset,Backend:'ninfer',ThinkingMode:'default',ThinkingBudget:0,KvType:'int8',Prefill:256,DraftTokens:4,DraftPolicy:'adaptive',NgramDrafts:31,NgramMinMatch:12,FastPrefill:true,DeviceProfile:'auto',Vision:true};
   const presets = [
-    {id:'radiance',title:['Radiance AMD','Radiance AMD'],note:['单卡或双卡张量并行、图像、跨轮历史和并发解码。','One or two GPUs with tensor parallelism, images, conversation history and batched decode.'],parameters:{"Backend":"radiance","Context":65536,"Budget":4096,"Reserve":1024,"HostMiB":8192,"SinkTokens":128,"RecentTokens":512,"Concurrency":1,"RetainedSessions":8,"QueryScorer":"page-softmax","ScoreAggregation":"mean","GraphAlpha":0.2,"Lrfu":false,"QueryMaxTokens":512,"QueryReplayMaxTokens":2048,"KvType":"fp8","Prefill":512,"SpeculativeMode":"none","DraftTokens":0,"DraftPolicy":"fixed","Vision":false,"MaxTokens":0,"ThinkingMode":"default","ThinkingBudget":0,"VramReserveMiB":1024}},
+    {id:'radiance',title:['Radiance AMD','Radiance AMD'],note:['单卡或双卡张量并行、图像、跨轮历史和并发解码。','One or two GPUs with tensor parallelism, images, conversation history and batched decode.'],parameters:{"Backend":"radiance","Context":65536,"Budget":4096,"Reserve":1024,"HostMiB":8192,"SinkTokens":128,"RecentTokens":512,"Concurrency":1,"RetainedSessions":8,"QueryScorer":"page-softmax","ScoreAggregation":"mean","GraphAlpha":0.2,"Lrfu":false,"QueryMaxTokens":512,"QueryReplayMaxTokens":2048,"KvType":"fp8","Prefill":256,"SpeculativeMode":"none","DraftTokens":0,"DraftPolicy":"fixed","Vision":false,"MaxTokens":0,"ThinkingMode":"default","ThinkingBudget":0,"VramReserveMiB":1024}},
     {id:'ninfer-speed',title:['NInfer · 极速档','NInfer · Speed'],
       parameters:{...ninferDefaultPreset,SpeculativeMode:'dflash2',DraftTokens:5,DraftPolicy:'fixed',Budget:36*1024,Reserve:4*1024,NgramDrafts:0},
       note:['启用 DFlash2，历史 KV 预算较少，侧重响应速度。','Uses DFlash2 with a smaller history KV budget, prioritizing response speed.']},
@@ -968,9 +968,9 @@
     ],poly?['单请求执行可使用 MTP；进入批处理时使用普通生成。','MTP is available in solo execution; batches use ordinary decode.']:['需要模型支持。可用选项取决于后端、并发和显卡数量。','Requires model support. Availability depends on backend, concurrency and GPU count.']);
     for(const option of specMode.options)option.disabled=!specModes[option.value];
     const draftTokens=field(panels[1],p,'DraftTokens','草稿长度 · tokens','Draft length · tokens','number',null,
-      ['主模型会验证草稿；实际长度还受草稿模型限制。DFlash2 首次选择使用 5。','The target verifies the drafts. The draft model can impose a smaller limit. DFlash2 starts at 5.']);
+      rad?['DFlash2 长度必须匹配容器训练块，Qwen3.8-27B 为 7。','DFlash2 depth must match the trained block in the container. Qwen3.8-27B uses 7.']:['主模型会验证草稿；实际长度还受草稿模型限制。DFlash2 首次选择使用 5。','The target verifies the drafts. The draft model can impose a smaller limit. DFlash2 starts at 5.']);
     draftTokens.min='1';
-    specMode.addEventListener('change',()=>{if(specMode.value==='dflash2')draftTokens.value='5';else if(specMode.value!=='none'&&Number(draftTokens.value)<=0)draftTokens.value=String(rad?3:poly?2:4);});
+    specMode.addEventListener('change',()=>{if(specMode.value==='dflash2')draftTokens.value=String(rad?7:5);else if(specMode.value!=='none'&&Number(draftTokens.value)<=0)draftTokens.value=String(rad?3:poly?2:4);});
     field(panels[1],p,'DraftPolicy','草稿长度策略','Draft length policy','text',[
       ['fixed',tr('固定','Fixed')],['adaptive',tr('自动调整','Adaptive')]
     ],['自动调整仅在后端和所选草稿方式支持时生效。','Adaptive mode applies only when supported by the backend and draft method.']);

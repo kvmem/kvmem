@@ -56,13 +56,13 @@ python3 backends/radiance/tools/serve.py --platform linux --exe ../radiance-buil
 
 实测设备为RX9060XT/gfx1200；新机器部署后先执行短请求。
 
-## 默认部署配置
+## 源码默认部署配置
 
-| 名称 | 当前显式部署profile |
+| 名称 | 源码显式部署 profile（已部署的旧服务可能不同） |
 |---|---:|
 | KVMem选择预算 | 36864 tokens |
 | 生成/验证KV工作空间预留 | 16384 tokens |
-| batch / context | 512 / 262144 |
+| batch / context | 256 / 262144 |
 | MTP | 3 |
 | K和V类型 | FP8 / FP8 |
 | Host archive上限 | 9216 MiB |
@@ -115,6 +115,6 @@ print("usage:", result.get("usage"))
 
 ## 发给维护者的话（可直接改称呼使用）
 
-> 为 KVMem 接入 Radiance AMD RDNA4 后端，支持 Windows 原生与 Linux/WSL。提供 packed KV 页布局、Host KV 换出与召回、前缀缓存、循环生成，以及 Windows 显存分配与映射优化。复用公共 pressure_selection，采用 mean-key 评分。默认 BUDGET 36864、生成预留 16384、batch 512、context 262144、MTP 3，K/V 均为 FP8。模型通过 ModelScope 提供，配套文档包含双系统完整测试数据、量化清单及构建和启动命令。
+> 为 KVMem 接入 Radiance AMD RDNA4 后端，支持 Windows 原生与 Linux/WSL。提供 packed KV 页布局、Host KV 换出与召回、前缀缓存、循环生成，以及 Windows 显存分配与映射优化。复用公共 pressure_selection，采用 mean-key 评分。源码默认 BUDGET 36864、生成预留 16384、batch 256、context 262144、MTP 3，K/V 均为 FP8。模型通过 ModelScope 提供，配套文档包含双系统完整测试数据、量化清单及构建和启动命令。
 
 部署说明及完整测试表见 `docs/radiance-integration.md`。

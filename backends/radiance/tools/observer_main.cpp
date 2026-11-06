@@ -12,12 +12,28 @@ int main(int argc, char** argv) {
         std::cout << kvmem_radiance_capabilities << '\n'; return 0;
     }
     kvmem::radiance::SelectionOptions options;
+    options.max_draft_tokens=kvmem_radiance_max_draft_tokens;
     bool aggregation_set = false, alpha_set = false, lrfu_set = false;
     std::vector<char*> engine_args{argv[0]};
     try {
     for (int i = 1; i < argc; ++i) {
         std::string_view flag(argv[i]);
+#ifdef KVMEM_RADIANCE_ARGV_PARSE_TEST
+        // config_parse gives help precedence over errors. The parser test removes its trailing
+        // help marker so every preceding option is validated, then exits before model startup.
+        if (flag=="--help") {
+            if(i!=argc-1)throw std::invalid_argument("parser test requires --help at the end");
+            continue;
+        }
+#endif
         if (flag=="--kvmem") continue;
+        if (flag=="--kvmem-drafter") {
+            if (++i>=argc) throw std::invalid_argument("missing native drafter mode");
+            options.drafter_mode=argv[i];
+            if (options.drafter_mode!="off" && options.drafter_mode!="mtp" && options.drafter_mode!="dflash2")
+                throw std::invalid_argument("native drafter mode must be off, mtp or dflash2");
+            continue;
+        }
         if (flag=="--kvmem-gen-reserve") flag="--kvmem-replay-tokens";
         if (flag=="--kvmem-sessions") flag="--kvmem-cache-sessions";
         if (flag=="--kvmem-query-max-tokens") flag="--kvmem-query-tokens";
@@ -109,9 +125,14 @@ int main(int argc, char** argv) {
                   << " speculative draft tokens; larger GDN deployment windows are not supported\n";
         return 2;
     }
+#ifdef KVMEM_RADIANCE_ARGV_PARSE_TEST
+    std::cout << "KVMEM_NATIVE_ARGV_VALID\n";
+    return 0;
+#else
     if (!rad::resolve_hf_model(cfg)) return 1;
     rad::Engine engine(std::move(cfg), std::make_unique<kvmem::radiance::BatchedStatisticsObserver>(options));
     if (engine.start() < 0) return 1;
     if (engine.config().debug_graph) return engine.dump();
     return engine.serve() < 0 ? 1 : 0;
+#endif
 }

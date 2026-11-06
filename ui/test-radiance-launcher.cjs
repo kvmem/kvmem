@@ -16,6 +16,7 @@ module.exports=async({browser,base,info})=>{
  await page.goto(base+'/monitor/?lang=en#config');
  await page.locator('[data-param=Backend]').waitFor();
  assert.equal(await page.locator('[data-param=Backend]').inputValue(),'radiance');
+ assert.equal(await page.locator('[data-param=Prefill]').inputValue(),'512','explicit saved chunk is retained');
  assert.equal(await page.locator('[data-param=EmbeddingPlacement]').inputValue(),'vram');
  assert.deepEqual(await page.locator('[data-param=EmbeddingPlacement] option').evaluateAll(items=>items.map(x=>x.value)),['vram','ram']);
  assert.equal(await page.locator('[data-param=Model]').inputValue(),'C:/models/target.rad');
@@ -74,6 +75,10 @@ module.exports=async({browser,base,info})=>{
  assert.equal(await gpu(uuid).evaluate(x=>x.checkValidity()),false);
  await gpu(nvidia).uncheck();await gpu(second).check();
  assert.equal(await gpu(uuid).evaluate(x=>x.checkValidity()),true);
+ await page.locator('[data-preset=radiance]').click();
+ assert.equal(await page.locator('[data-param=Prefill]').inputValue(),'256','Radiance template uses the new default');
+ await page.locator('[data-preset-undo]').click();
+ assert.equal(await page.locator('[data-param=Prefill]').inputValue(),'512','undo restores the explicit saved chunk');
  assert.deepEqual(errors,[]);
  if(process.env.SCREENSHOT_DIR)await page.screenshot({path:require('node:path').join(process.env.SCREENSHOT_DIR,'radiance-launcher.png'),fullPage:true});
  await context.close();console.log('PASS: Radiance model format, AMD UUID, supported controls and explicit capability gates');

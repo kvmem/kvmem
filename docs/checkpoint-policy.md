@@ -122,6 +122,18 @@ error semantics. Directory-level retained-byte totals may conservatively count
 a shared metadata object more than once; those totals are distinct from the
 physical reservation and RSS.
 
+Radiance retains both a deep input point and a conservative point before the
+first assistant message, when those are safe native chunk boundaries. An input
+edit or template rewrite may require falling back or recomputation. It cannot
+restore recurrent state at an arbitrary LCP. DFlash recent selection covers its
+declared window; accepted prefix and Query checkpoints include the matching
+native window bytes, including RAM/SSD parking and forks. Restoring these bytes
+keeps the saved frontier instead of subtracting a fixed window. The scheduler
+still respects native prefill quantum, Query boundaries and uncached logits;
+its separate native-cache refill gate remains for hits without window state. Extra prefill cuts can
+change floating-point accumulation; text equality is not the sole correctness
+test.
+
 The monitor retains `planned_cached_tokens`, `actual_cached_tokens` and the
 legacy native-path labels `own`, `shared`, `miss`. These labels must not be used
 as evidence of client ownership or physical byte deduplication. Missing native

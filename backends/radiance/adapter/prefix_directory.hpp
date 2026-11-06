@@ -6,6 +6,24 @@
 #include <vector>
 
 namespace kvmem::radiance {
+// Prefix leases include accepted draft-window bytes. A restore stays behind the
+// final token (no saved logits) and before a new Query.
+inline uint64_t restorable_prefix_limit(uint64_t prompt, int64_t query_begin) {
+    if (!prompt) return 0;
+    uint64_t limit = prompt - 1; // A cached state carries no logits for the final token.
+    if (query_begin >= 0) limit = std::min(limit, uint64_t(query_begin));
+    return limit;
+}
+// The scheduler already stops at this declared input anchor. It is outside
+// the Query rows and any suffix the probe may later rewind. Pressure before
+// this point is accepted history, captured with its actual sparse native view.
+// Without a checkpoint yet, monotone prefill can only save one at/after here.
+inline bool retain_drafter_input_anchor(uint64_t frontier, int64_t requested_anchor,
+        int64_t query_begin, uint64_t draft_window, int64_t replay_checkpoint) {
+    return draft_window && requested_anchor > 0 && frontier == uint64_t(requested_anchor) &&
+        query_begin >= 0 && frontier <= uint64_t(query_begin) && replay_checkpoint >= -1 &&
+        (replay_checkpoint < 0 || frontier <= uint64_t(replay_checkpoint));
+}
 // Payloads remain native and immutable. A directory only selects a proven
 // complete frontier; an LCP alone is never a restorable recurrent state.
 struct PrefixCandidate {

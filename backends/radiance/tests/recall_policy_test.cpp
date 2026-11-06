@@ -19,6 +19,31 @@ int main() {
     CHECK(pages[2].start==12 && pages[2].compact==8 && pages[3].count==1);
     rejects([&]{attention_pages(&frozen,9,1,4);});
     frozen.resident={0};rejects([&]{attention_pages(&frozen,10,1,4);});
+    // A 775-token fixed replay is admitted by the 5376-token native pool,
+    // although its last batch begins above the normal 4096+512 Pressure threshold.
+    // Keep all 32 selected pages fixed; sampling must not demand a new selection.
+    MemorySnapshot replay;replay.stamp.valid=true;replay.stamp.frontier=11520;
+    for(uint32_t id=0;id<90;++id) {
+        replay.blocks.push_back({{{},id,uint64_t(id)*128,128,1,1},0});
+        if(id<16 || id>=74)replay.resident.push_back(id);
+    }
+    CHECK(query_replay_plan({11776,12288},11520,12295,2048,128,32,42,256).admitted);
+    uint64_t last_sample=11520,last_visible=0;
+    unsigned replay_steps=0;
+    for(uint32_t begin=11520;begin<12295;) {
+        const auto count=std::min<uint32_t>(256,12295-begin);
+        const auto view=attention_pages(&replay,begin,count,128);
+        const uint64_t visible=view.back().compact+view.back().count-count;
+        const auto samples=prefill_attention_samples(begin,count,last_sample,visible,4608,5376,true,128);
+        for(auto row:samples)CHECK(row<count);
+        if(!samples.empty())last_sample=begin+count;
+        last_visible=visible;++replay_steps;begin+=count;
+    }
+    CHECK(replay_steps==4 && last_visible==4864);
+    rejects([&]{prefill_attention_samples(12288,7,last_sample,4864,4608,5376,false,128);});
+    rejects([&]{prefill_attention_samples(12288,7,last_sample,5377,4608,5376,true,128);});
+    CHECK(prefill_attention_samples(128,128,128,128,4608,5376,false,128)==
+          prefill_sample_rows(128,128,128,128,4608,1024,32,128));
     auto global=std::make_shared<GraphStatisticsBudget>(256u<<20);
     RecallPolicy policy({},4,global);
     policy.start_request(true,false);

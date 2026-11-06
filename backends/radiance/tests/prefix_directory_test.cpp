@@ -1,5 +1,6 @@
 #include "prefix_directory.hpp"
 #include "checkpoint_handoff.hpp"
+#include "draft_conditioning.hpp"
 #include "canonical_input.hpp"
 #include "canonical_boundary.hpp"
 #include <iostream>
@@ -108,6 +109,65 @@ static void checkpoint_publication_preserves_ownership() {
         check(rejected && input.get()==before_input && fallback.get()==before_fallback,"invalid completion must not replace published state");
     }
 }
+static void drafter_refill_limits_and_early_input_anchors() {
+    check(restorable_prefix_limit(1010,-1)==1009,"complete draft state supports short follow-ups");
+    check(restorable_prefix_limit(4192,4165)==4165,"new Query remains an independent restore bound");
+    check(restorable_prefix_limit(4192,2000)==2000,"restored state must not cross the new Query");
+    check(restorable_prefix_limit(4192,-1)==4191,"complete windows do not impose a fixed rewind");
+    check(restorable_prefix_limit(0,-1)==0,"empty input has no restorable state");
+    // Independent position oracle: protecting N pages must cover every token
+    // in the trailing W positions, including a one-token partial final page.
+    for (uint32_t window : {1U, 128U, 129U, 2048U}) {
+        const auto allocation=draft_keep_allocation(128,4096,128,128,window);
+        for (uint64_t frontier=4096; frontier<4352; ++frontier) {
+            const auto pages=(frontier+127)/128;
+            const auto first=pages>allocation.recent_blocks ? (pages-allocation.recent_blocks)*128 : 0;
+            check(first<=frontier-window, "recent pages must cover the full draft window at a partial frontier");
+        }
+    }
+    const auto keep=draft_keep_allocation(128,4096,128,128,2048);
+    check(keep.recent_effective_tokens==2176 && keep.sink_effective_tokens==128,"protect draft conditioning pages inside the same budget");
+    check(draft_keep_allocation(128,4096,128,3072,2048).recent_effective_tokens==3072,"larger recent allocation is retained");
+    check(draft_keep_allocation(128,4096,128,128,0).recent_effective_tokens==128,"non-block drafting keeps the requested recent");
+    bool refused=false;
+    try{(void)draft_keep_allocation(128,2048,128,128,2048);}catch(const std::runtime_error&){refused=true;}
+    check(refused,"a draft ring cannot silently grow the selected budget");
+    refused=false;
+    try{(void)draft_keep_allocation(128,2176,128,512,2048);}catch(const std::runtime_error&){refused=true;}
+    check(refused,"sink plus a full window including partial tail must fit the existing budget");
+    check(draft_keep_allocation(128,2304,128,512,2048).recent_blocks==17,
+        "minimum valid selected budget preserves sink and every conditioning position");
+    std::vector<int32_t> prompt(4192);std::iota(prompt.begin(),prompt.end(),1000);
+    const std::vector<int32_t> input(prompt.begin(),prompt.begin()+2048);
+    const std::vector<int32_t> terminal(prompt.begin(),prompt.begin()+4160);
+    int input_state=1,terminal_state=2;
+    std::vector<PrefixCandidate> points{{&terminal,&terminal_state,CheckpointPurpose::Endpoint,true},
+        {&input,&input_state,CheckpointPurpose::ReuseAnchor,true}};
+    const auto limit=restorable_prefix_limit(prompt.size(),4165);
+    check(select_prefix_checkpoint(prompt,points,limit)==&terminal_state,
+        "complete native draft state permits the later terminal checkpoint");
+    check(select_prefix_checkpoint(prompt,points,restorable_prefix_limit(prompt.size(),4165))==&terminal_state,
+        "spec-off keeps its later exact terminal prefix");
+    points.pop_back();
+    check(select_prefix_checkpoint(prompt,points,limit)==&terminal_state,"restoring the actual terminal state does not require an earlier checkpoint");
+    check(retain_drafter_input_anchor(2048,2048,3638,2048,-1),
+        "first-pass natural input state before Query and its future checkpoint is reusable");
+    check(retain_drafter_input_anchor(2048,2048,3638,2048,3584),
+        "the 4K document anchor stays before its proven rewind boundary");
+    check(retain_drafter_input_anchor(10240,10240,11776,2048,-1),
+        "a 12K native input anchor may retain the accepted sparse history after Pressure");
+    check(retain_drafter_input_anchor(10240,10240,11776,2048,11520),
+        "a later Query replay cannot change the retained 12K input prefix");
+    check(retain_drafter_input_anchor(10240,10240,11776,2048,10240),
+        "a checkpoint exactly at the retained frontier preserves that state");
+    check(!retain_drafter_input_anchor(2048,2048,3638,0,-1),"this exception is only for a declared block drafter");
+    check(!retain_drafter_input_anchor(2048,-1,3638,2048,-1),"an unknown input boundary grants no checkpoint");
+    check(!retain_drafter_input_anchor(2047,2048,3638,2048,-1),"only the scheduler's exact natural anchor may be retained");
+    check(!retain_drafter_input_anchor(2048,2048,2047,2048,-1),"Query probe rows must not enter a retained input prefix");
+    check(!retain_drafter_input_anchor(2048,2048,-1,2048,-1),"a missing Query bound does not prove a safe probe anchor");
+    check(!retain_drafter_input_anchor(10240,10240,11776,2048,10239),"a rewind that crosses the anchor disqualifies retention");
+    check(!retain_drafter_input_anchor(2048,2048,3638,2048,-2),"an invalid checkpoint sentinel grants no retention");
+}
 struct FailingDirectory : std::deque<HandoffPoint> {
     bool fail=false;
     void push_back(HandoffPoint&& point) {
@@ -139,6 +199,7 @@ int main() {
     canonical_boundary_ignores_native_rounding();
     canonical_groups_require_complete_input();
     checkpoint_publication_preserves_ownership();
+    drafter_refill_limits_and_early_input_anchors();
     directory_commit_waits_for_native_completion();
     std::vector<int32_t> input(128);std::iota(input.begin(),input.end(),1000);
     auto terminal=input;terminal.insert(terminal.end(),{21,22,23,24});

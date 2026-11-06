@@ -1,5 +1,6 @@
 """Supervised local launch with unchanged capacity on Windows or Linux/WSL."""
 import argparse
+import copy
 import ctypes
 import hashlib
 import json
@@ -10,6 +11,8 @@ import subprocess
 import sys
 import time
 from platform_dispatch import select_platform
+from draft_control import declared_integer, resolve as resolve_drafter
+from inspect_rad import inspect
 
 GIB = 1024 ** 3
 WSL_RUNTIME_SHA256 = '2b2a082ede46324a5e3771b4b14f2850fdb9bd38348abfbeedee83966bbd6088'
@@ -24,6 +27,40 @@ def command_for(a, config):
             '--host', '127.0.0.1', '--port', str(a.port), '--served-model-name', 'radiance-local', *config['arguments']]
 
 
+def model_profile(a, config):
+    """Resolve the embedded plugin and drafter before loading any runtime library."""
+    container=inspect(a.model)
+    plugins={('qwen35','fp8_e4m3'):'qwen35_fp8',
+             ('qwen35','w8a8_fwht128'):'qwen35_w8a8',
+             ('qwen35',''):'qwen35_bf16',
+             ('qwen35moe','fp8_e4m3'):'qwen35moe_fp8'}
+    key=(container['arch_id'],container['quant'])
+    if key not in plugins:
+        raise ValueError(f'no supervised KVMem profile for architecture/quantization {key!r}')
+    mode=a.drafter
+    if mode=='auto':
+        meta=container['draft_metadata']
+        groups=container['entries_by_name_prefix']
+        if 'DFlash2' in str(meta.get('draft.architectures','')):
+            mode='dflash'
+        elif groups.get('mtp') and declared_integer(meta.get('qwen35.nextn_predict_layers',meta.get('mtp_num_hidden_layers',0)))>0:
+            mode='mtp'
+        else:
+            mode='off'
+    if mode=='dflash2':mode='dflash'
+    args=config['arguments']
+    at=args.index('--num-speculative-tokens')+1
+    depth=a.speculative_tokens
+    if depth is None and mode=='mtp':depth=int(args[at])
+    selected=resolve_drafter(a.model,mode,depth)
+    if selected['depth']>7:
+        raise ValueError('Radiance KVMem supports at most 7 speculative draft tokens')
+    resolved=copy.deepcopy(config)
+    resolved['arguments'][at]=str(selected['depth'])
+    resolved['arguments']+=['--kvmem-drafter',selected['expected_native']]
+    return resolved,plugins[key]
+
+
 def validate_runtime(directory):
     for name in ('librocdxg.so.1.2.0', 'librocdxg.so.1', 'librocdxg.so'):
         path = directory / name
@@ -31,10 +68,10 @@ def validate_runtime(directory):
             raise ValueError(f'{path}: expected the historically qualified scratch runtime and valid aliases; see wsl-runtime/README.md')
 
 
-def validate_inputs(a, host, wsl):
+def validate_inputs(a, host, wsl, architecture_plugin='qwen35_fp8'):
     suffix = 'dll' if host == 'windows' else 'so'
     required = [a.exe, a.model, a.home / 'kernels.rkb', a.home / f'kernels/libr4d.{suffix}',
-                a.home / f'architectures/qwen35_fp8.{suffix}']
+                a.home / f'architectures/{architecture_plugin}.{suffix}']
     required += ([a.rocm / 'bin/amdhip64_7.dll'] if host == 'windows' else
                  [a.rocm / 'lib/libamdhip64.so', a.rocm / 'lib/libhsa-runtime64.so'])
     for path in required:
@@ -144,6 +181,10 @@ def main(argv=None):
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--wsl-runtime-dir', type=Path)
     p.add_argument('--port', type=int, default=18380)
+    p.add_argument('--drafter', choices=('auto','off','mtp','dflash','dflash2'), default='auto',
+                   help='Embedded drafter, selected from container metadata by default')
+    p.add_argument('--speculative-tokens', type=int,
+                   help='Explicit depth; DFlash2 must match its trained block')
     p.add_argument('--print-command', '--dry-run', action='store_true')
     a = p.parse_args(argv)
     try:
@@ -151,8 +192,8 @@ def main(argv=None):
         if not 1 <= a.port <= 65535:
             raise ValueError('port must be in 1..65535')
         wsl = host == 'linux' and Path('/dev/dxg').exists()
-        validate_inputs(a, host, wsl)
-        config = profile()
+        config,architecture_plugin = model_profile(a,profile())
+        validate_inputs(a, host, wsl,architecture_plugin)
         env = child_environment(a, host, wsl, config)
         command = command_for(a, config)
         print(subprocess.list2cmdline(command) if host == 'windows' else shlex.join(command), flush=True)

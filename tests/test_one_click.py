@@ -1,5 +1,6 @@
 """Windows entry point checks; optional offline runtime/package integration."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,7 +23,7 @@ class OneClickTests(unittest.TestCase):
         self.source_tmp = tempfile.TemporaryDirectory(prefix='kvmem-console-source-')
         self.addCleanup(self.source_tmp.cleanup)
         self.source = Path(self.source_tmp.name)
-        for name in ('scripts', 'tools/polystrata', 'ui/monitor'):
+        for name in ('scripts', 'tools/polystrata', 'ui/monitor', 'backends/radiance/tools'):
             shutil.copytree(ROOT / name, self.source / name, ignore=shutil.ignore_patterns('__pycache__'))
         for name in ('START-HERE-CN.bat', 'START-HERE-EN.bat'):
             shutil.copy2(ROOT / name, self.source / name)
@@ -98,6 +99,22 @@ class OneClickTests(unittest.TestCase):
             self.assertEqual(manifest['python_archive_sha256'], digest)
             for name, expected in manifest['controller_files'].items():
                 self.assertEqual(hashlib.sha256((package / name).read_bytes()).hexdigest(), expected)
+            # Exercise the shipped helper with the bundled runtime, outside the
+            # source checkout. A plan-only check must not need a native worker.
+            fixture_spec = importlib.util.spec_from_file_location(
+                'radiance_fixture', ROOT / 'backends/radiance/tests/draft_control_test.py')
+            fixture = importlib.util.module_from_spec(fixture_spec)
+            fixture_spec.loader.exec_module(fixture)
+            model = Path(folder) / 'draft-model.RAD'
+            fixture.container(model, ['dflash.fc.weight'], [
+                ('draft.architectures', 'DFlash2Model'), ('draft.dflash_config.block_size', 8)])
+            draft = subprocess.run([str(package / 'runtime/python/python.exe'), '-I', '-c',
+                'import sys; sys.path.insert(0,sys.argv[1]); '
+                'from launcher.radiance import draft_selection; '
+                'print(draft_selection(sys.argv[2],"dflash2",None)["depth"])',
+                str(package / 'scripts'), str(model)], cwd=folder, capture_output=True, text=True, timeout=15)
+            self.assertEqual(draft.returncode, 0, draft.stdout + draft.stderr)
+            self.assertEqual(draft.stdout.strip(), '7')
             self.assertTrue((package / 'licenses/Python-LICENSE.txt').is_file())
             self.assertTrue((package / 'scripts/windows/select-model.ps1').is_file(),
                             'native file/folder/template picker must ship with the console')

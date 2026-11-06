@@ -28,7 +28,7 @@ class SourceIdentityTests(unittest.TestCase):
         (self.root/'extra.cpp').write_bytes(b'new source\n')
         with self.assertRaises(ValueError):source_revision(self.root)
     def test_old_patch_chain_refused(self):
-        self.manifest['patches']=self.manifest['patches'][:1];self.save()
+        self.manifest['patches']=['0'*64];self.save()
         with self.assertRaises(ValueError):source_revision(self.root)
     def test_path_escape_refused(self):
         self.manifest['files']={'../outside.cpp':'0'*64};self.save()

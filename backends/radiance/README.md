@@ -1,5 +1,7 @@
 # Radiance Windows / Linux AMD backend
 
+Radiance 1.17.0 / IQ3R-S v4 is qualified on Linux RX 9060 XT gfx1200 TP1/C1 with FP8 KV/F32 state for text, bounded RAM/SSD history and DFlash2 depth 7, including the 12K two-stage test. CPU PNG request/cache/placement checks pass; the original image suite is 21/22 because low-resolution OCR reads 5829 as 5029, also reproduced by ordinary native without the KVMem observer. The separate higher-resolution probe passes on both paths. JPEG model requests, Windows, TP2 and general-profile workloads remain unqualified. See the [integration record](../../docs/radiance-iqr-v4-integration-20261105.md) and [startup runbook](../../docs/radiance-iq3v4-runbook-20261105.md). The dated sections below describe earlier model/platform runs.
+
 Build and run with `tools/build.py --platform auto|windows|linux` and
 `tools/serve.py --platform auto|windows|linux` on the target OS.
 
@@ -10,10 +12,24 @@ replay, graph recall and LRFU. Prefill/decode Pressure selects resident history;
 ordinary tool continuation does not recall cold history.
 
 Cache ownership follows the common [checkpoint contract](../../docs/checkpoint-policy.md#shared-owners-in-ninfer-and-radiance).
+
+DFlash keeps at least its declared window in the recent selection. Accepted
+prefix and Query checkpoints carry an immutable copy of the native draft-window
+KV alongside recurrent state; RAM/SSD parking and forks include these bytes.
+Restoration publishes both at the saved frontier, without a fixed window-sized
+checkpoint setback. Native prefill alignment, Query boundaries and the final
+uncached token still constrain reuse. See the [conditioning validation](../../docs/radiance-dflash-conditioning-20261106.md).
+Recent also reserves partial-tail slack: a 2048-token draft window with
+128-token selection pages needs at least 2176 effective recent tokens. See the
+[merge audit](../../docs/radiance-v117-merge-audit-20261106.md) for the coverage,
+cache admission and DFlash7/MTP3 regression results.
 New user requests may discover exact prefixes across named or anonymous owners;
 native branches share sealed host/SSD records while keeping mutable state
 independent. Admission deducts only proven physical aliases. GPU page sharing
 and cache persistence are outside this implementation.
+
+The shared launcher and standalone profile default to a 256-token prefill chunk. Existing
+shared-launcher configurations with an explicit `Prefill` retain that value.
 
 The shared console launcher supports one or two AMD GPUs, up to eight concurrent text/image
 requests, fixed or native cost-adaptive MTP (up to seven drafts, default three), and process-local
@@ -35,9 +51,9 @@ On systems where HSA cannot confirm CPU access to the VRAM pool, AQL kernel
 argument rings and recorded tapes use the existing coherent host allocation.
 Model weights and KV payloads remain on their selected GPU devices.
 
-The native worker also rejects draft windows above seven before loading a model.
-This keeps the deployment within the existing fused GDN kernel's eight-position
-capacity (one target token plus up to seven drafts); no native kernel is changed.
+The native worker caps explicit and model-resolved draft depths at seven. The
+shared launcher checks embedded MTP/DFlash2 metadata and the trained depth before
+launch. The current profile uses a verify window of up to eight positions.
 
 Integration testing uses Linux, Radeon AI PRO R9700 (gfx1201), Qwen3.8-27B MXFP4
 and FP8 KV. Native still-image input requires a qwen35 container with vision

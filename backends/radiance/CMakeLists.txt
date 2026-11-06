@@ -123,6 +123,15 @@ if(TARGET rad_core)
     target_compile_definitions(kvmem_radiance_memory PRIVATE KVMEM_RADIANCE_UPSTREAM_REVISION="${rad_upstream_revision}")
     target_include_directories(kvmem_radiance_memory PRIVATE ${RADIANCE_SOURCE_DIR}/core)
     target_link_libraries(kvmem_radiance_memory PUBLIC kvmem_radiance_transfer kvmem_radiance_attention kvmem_radiance_query rad_core)
+    add_executable(radiance_gdn_materialize_gpu_test tests/gdn_materialize_gpu_test.cpp)
+    target_include_directories(radiance_gdn_materialize_gpu_test PRIVATE adapter ${CMAKE_CURRENT_SOURCE_DIR}/../../kvmem/include)
+    target_link_libraries(radiance_gdn_materialize_gpu_test PRIVATE rad_core)
+    set_target_properties(radiance_gdn_materialize_gpu_test PROPERTIES ENABLE_EXPORTS ON)
+    if(NOT WIN32)
+        set_target_properties(radiance_gdn_materialize_gpu_test PROPERTIES LINK_LIBRARY_OVERRIDE_rad_core WHOLE_ARCHIVE)
+    endif()
+    add_test(NAME radiance_gdn_materialize_gpu_test COMMAND radiance_gdn_materialize_gpu_test $<TARGET_FILE:libr4d>)
+    set_tests_properties(radiance_gdn_materialize_gpu_test PROPERTIES LABELS gpu TIMEOUT 60)
     add_executable(radiance_packed_kv_gpu_test tests/packed_kv_gpu_test.cpp)
     target_include_directories(radiance_packed_kv_gpu_test PRIVATE ${RADIANCE_SOURCE_DIR}/core)
     target_link_libraries(radiance_packed_kv_gpu_test PRIVATE kvmem_radiance_memory)
@@ -143,6 +152,23 @@ if(TARGET rad_core)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/launcher-capabilities.json" launcher_capabilities)
     string(JSON radiance_capabilities GET "${launcher_capabilities}" backends radiance)
     string(JSON radiance_mtp_max_draft_tokens GET "${radiance_capabilities}" speculative modes mtp max_draft_tokens)
+    if(R4D_PROFILE STREQUAL "qwen35-dense-tp1")
+        # The selected kernel closure serves one rank. Keep the common manifest
+        # usable by general builds and constrain this binary's advertised limits.
+        find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_capabilities.py")
+        execute_process(COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_capabilities.py"
+            --manifest "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/launcher-capabilities.json"
+            --kernel-profile "${R4D_PROFILE}"
+            OUTPUT_VARIABLE radiance_capabilities
+            ERROR_VARIABLE _radiance_caps_error
+            RESULT_VARIABLE _radiance_caps_status)
+        if(NOT _radiance_caps_status EQUAL 0)
+            message(FATAL_ERROR "Cannot construct Radiance profile capabilities: ${_radiance_caps_error}")
+        endif()
+    endif()
     if(NOT RAD_FFMPEG_FOUND)
         # A text-only build must not advertise image support from the shared
         # manifest. This probe runs without a model or a GPU.
@@ -150,6 +176,11 @@ if(TARGET rad_core)
         string(JSON radiance_capabilities SET "${radiance_capabilities}" supported_combinations images false)
     endif()
     configure_file(tools/radiance_capabilities.hpp.in radiance_capabilities.hpp @ONLY)
+    add_executable(radiance_argv_parse_test tools/observer_main.cpp)
+    target_compile_definitions(radiance_argv_parse_test PRIVATE KVMEM_RADIANCE_ARGV_PARSE_TEST=1)
+    target_include_directories(radiance_argv_parse_test PRIVATE adapter ${CMAKE_CURRENT_BINARY_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../kvmem/include)
+    target_link_libraries(radiance_argv_parse_test PRIVATE rad_core)
     add_executable(radiance-kvmem-server tools/observer_main.cpp)
     add_executable(radiance_storage_recovery_test tests/storage_recovery_test.cpp)
     target_include_directories(radiance_storage_recovery_test PRIVATE adapter ${RADIANCE_SOURCE_DIR}/core)

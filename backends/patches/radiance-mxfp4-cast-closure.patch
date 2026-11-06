@@ -1,0 +1,157 @@
+diff --git a/libr4d/CMakeLists.txt b/libr4d/CMakeLists.txt
+--- a/libr4d/CMakeLists.txt
++++ b/libr4d/CMakeLists.txt
+@@ -225,6 +225,9 @@
+   find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+   set(_r4d_profile_file "${CMAKE_CURRENT_SOURCE_DIR}/profiles/${R4D_PROFILE}.json")
+   file(READ "${_r4d_profile_file}" _r4d_profile_json)
++  # This tiny TU shares the encoder's exact BF16 -> F32 cast. The all profile
++  # already obtains its exports from r4d_encoder_bf16; never compile both.
++  list(APPEND R4D_UNITS "r4d_cast_widen|")
+   string(JSON _r4d_profile_count LENGTH "${_r4d_profile_json}" units)
+   math(EXPR _r4d_profile_last "${_r4d_profile_count} - 1")
+   set(_r4d_selected "")
+diff --git a/libr4d/profiles/qwen35-dense-tp1.json b/libr4d/profiles/qwen35-dense-tp1.json
+--- a/libr4d/profiles/qwen35-dense-tp1.json
++++ b/libr4d/profiles/qwen35-dense-tp1.json
+@@ -20,7 +20,7 @@
+     "r4d_quant_act_fp8", "r4d_fused_quant_fp8",
+     "r4d_qsa_block_key_bf16", "r4d_qsa_score_bf16", "r4d_qsa_select_bf16",
+     "r4d_qsa_tail_store_bf16", "r4d_qsa_work_bf16",
+-    "r4d_sample_chain_f32", "r4d_model_bf16", "r4d_sample_stages_f32", "r4d_sample_ngram_f32",
++    "r4d_sample_chain_f32", "r4d_model_bf16", "r4d_cast_widen", "r4d_sample_stages_f32", "r4d_sample_ngram_f32",
+     "r4d_quant_act_i8", "r4d_rmsnorm_quant_i8", "r4d_qkv_norm_rope",
+     "r4d_had_quant_act_i8", "r4d_rmsnorm_had_quant_i8", "r4d_gated_had_quant_i8",
+     "r4d_qk_norm_rope_gate", "r4d_gdn_gated_norm_had_quant_i8", "r4d_rowtopk_bf16",
+diff --git a/libr4d/r4d_cast_widen.hip b/libr4d/r4d_cast_widen.hip
+new file mode 100644
+--- /dev/null
++++ b/libr4d/r4d_cast_widen.hip
+@@ -0,0 +1,2 @@
++// Profile-only TU: the all profile obtains these exports from r4d_encoder_bf16.
++#include "r4d_cast_widen_body.h"
+diff --git a/libr4d/r4d_cast_widen_body.h b/libr4d/r4d_cast_widen_body.h
+new file mode 100644
+--- /dev/null
++++ b/libr4d/r4d_cast_widen_body.h
+@@ -0,0 +1,51 @@
++#pragma once
++// The encoder and the focused text profile share exactly the same widening
++// implementation. A BF16 vocabulary head (the legacy MXFP4 RAD) needs this
++// device cast even when the vision tower executes on the CPU.
++#include <hip/hip_runtime.h>
++#include "r4d.h"
++#include "r4d_args.h"
++
++namespace r4d_cast_widen_detail {
++constexpr uint32_t kThreads = 256;
++constexpr uint32_t kGridYMax = 65535;
++static inline uint32_t grid_rows(int64_t M) {
++    return (uint32_t)(M < (int64_t)kGridYMax ? M : (int64_t)kGridYMax);
++}
++__global__ __launch_bounds__(kThreads) void widen_kernel(
++    const uint16_t* __restrict__ x, float* __restrict__ y, uint32_t n, uint32_t x_ld,
++    uint32_t y_ld, uint32_t M) {
++    const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
++    if (i >= n) return;
++    for (uint32_t m = blockIdx.y; m < M; m += gridDim.y)
++        y[(size_t)m * y_ld + i] = __builtin_bit_cast(float, (uint32_t)x[(size_t)m * x_ld + i] << 16);
++}
++} // namespace r4d_cast_widen_detail
++
++extern "C" int r4d_widen_bf16_f32(long x, long y, int M, int n, int x_ld, int y_ld, long stream) {
++    if (!x || !y) return -1;
++    if (M <= 0 || n <= 0) return -2;
++    hipLaunchKernelGGL(r4d_cast_widen_detail::widen_kernel,
++                       dim3((uint32_t)((n + r4d_cast_widen_detail::kThreads - 1) / r4d_cast_widen_detail::kThreads),
++                            r4d_cast_widen_detail::grid_rows(M)),
++                       dim3(r4d_cast_widen_detail::kThreads), 0, (hipStream_t)stream, (const uint16_t*)x, (float*)y,
++                       (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M);
++    return hipGetLastError() == hipSuccess ? 0 : -4;
++}
++
++extern "C" int r4d_rad_cast_widen(const RadArgs* a, RadStream s) {
++    const RadTensor* x = r4d_opt(a, 0);
++    const RadTensor* y = r4d_opt(a, 1);
++    if (!x || !y) return R4D_NO(RAD_E_INVAL);
++    if (x->dtype != RAD_BF16 || y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
++    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
++    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
++    long long M = 0, Mx = 0;
++    const long long y_ld = r4d_rows_pitch(y, n, &M);
++    const long long x_ld = r4d_rows_pitch(x, n, &Mx);
++    if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
++    if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
++    const int rc = r4d_widen_bf16_f32(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld,
++                                    (int)y_ld, (long)(uintptr_t)s);
++    return rc == 0 ? RAD_OK : R4D_NO(rc == -4 ? RAD_E_DEVICE : RAD_E_SHAPE);
++}
+diff --git a/libr4d/r4d_encoder_bf16.hip b/libr4d/r4d_encoder_bf16.hip
+--- a/libr4d/r4d_encoder_bf16.hip
++++ b/libr4d/r4d_encoder_bf16.hip
+@@ -6,6 +6,7 @@
+ #include "r4d.h"
+ #include "r4d_args.h"
+ #include "r4d_common.h"
++#include "r4d_cast_widen_body.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -379,16 +380,6 @@
+     }
+ }
+ 
+-// ---------------------------------------------------------------------------- cast bf16 -> f32
+-__global__ __launch_bounds__(kThreads) void widen_kernel(
+-    const uint16_t* __restrict__ x, float* __restrict__ y, uint32_t n, uint32_t x_ld,
+-    uint32_t y_ld, uint32_t M) {
+-    const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
+-    if (i >= n) return;
+-    for (uint32_t m = blockIdx.y; m < M; m += gridDim.y)
+-        y[(size_t)m * y_ld + i] = bf2f(x[(size_t)m * x_ld + i]);
+-}
+-
+ // ---------------------------------------------------------------------------- cast bf16 -> f16
+ // ref_cast: the value rounded to nearest even once, so a bf16 value in f16's normal range is kept
+ // exactly and one past it becomes an infinity (rad_f32_to_f16).
+@@ -958,15 +949,6 @@
+                        dim3(kThreads), 0, (hipStream_t)stream, (const float*)x, (float*)y,
+                        (uint32_t)n, (uint32_t)freqs, (uint32_t)(pi != 0), (uint32_t)x_ld,
+                        (uint32_t)y_ld, (uint32_t)rows);
+-    return hipGetLastError() == hipSuccess ? 0 : -4;
+-}
+-
+-extern "C" int r4d_widen_bf16_f32(long x, long y, int M, int n, int x_ld, int y_ld, long stream) {
+-    if (!x || !y) return -1;
+-    if (M <= 0 || n <= 0) return -2;
+-    hipLaunchKernelGGL(widen_kernel, dim3((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M)),
+-                       dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)x, (float*)y,
+-                       (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M);
+     return hipGetLastError() == hipSuccess ? 0 : -4;
+ }
+ 
+@@ -1368,24 +1350,6 @@
+                                            (long)(uintptr_t)s));
+ }
+ 
+-/* ------------------------------------------------------------------ cast bf16 -> f32 */
+-extern "C" int r4d_rad_cast_widen(const RadArgs* a, RadStream s) {
+-    const RadTensor* x = r4d_opt(a, 0);
+-    const RadTensor* y = r4d_opt(a, 1);
+-    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+-    R4D_NEED(dt_bf16(x));
+-    if (y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+-    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+-    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+-    long long M = 0, Mx = 0;
+-    const long long y_ld = r4d_rows_pitch(y, n, &M);
+-    const long long x_ld = r4d_rows_pitch(x, n, &Mx);
+-    if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+-    if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
+-    return enc_status(r4d_widen_bf16_f32(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld,
+-                                         (int)y_ld, (long)(uintptr_t)s));
+-}
+-
+ /* ------------------------------------------------------------------ cast bf16 -> f16 */
+ extern "C" int r4d_rad_cast_f16(const RadArgs* a, RadStream s) {
+     const RadTensor* x = r4d_opt(a, 0);

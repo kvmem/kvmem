@@ -53,18 +53,24 @@ public:
     }
 };
 class RankCheckpoint {
-    struct Item {int device;RadStream stream;rad::KVManager* kv;StateCheckpoint state;};
+    struct Item {int device;RadStream stream;rad::KVManager* kv;StateCheckpoint state;WindowCheckpoint window;};
     std::vector<Item> ranks_;
 public:
-    void save_rank(rad::KVManager& kv,uint64_t sequence,int device,RadStream stream) {
-        Item item{device,stream,&kv,{}};item.state.save(kv,sequence,device,stream);ranks_.push_back(std::move(item));
+    void save_rank(rad::KVManager& kv,uint64_t sequence,int device,RadStream stream,int64_t frontier) {
+        Item item{device,stream,&kv,{},{}};
+        item.state.save(kv,sequence,device,stream);
+        item.window.save(kv,sequence,frontier,device,stream);
+        ranks_.push_back(std::move(item));
     }
     void restore(uint64_t sequence) const {
-        for(const auto& r:ranks_)r.state.restore(*r.kv,sequence,r.device,r.stream);
+        for(const auto& r:ranks_) {
+            r.state.restore(*r.kv,sequence,r.device,r.stream);
+            r.window.restore(*r.kv,sequence,r.device,r.stream);
+        }
     }
     uint64_t bytes() const {
         uint64_t total=0;for(const auto& r:ranks_) {
-            const auto bytes=r.state.bytes();if(bytes>UINT64_MAX-total)throw std::runtime_error("rank checkpoint size overflow");total+=bytes;
+            const auto bytes=r.state.bytes()+r.window.bytes();if(bytes>UINT64_MAX-total)throw std::runtime_error("rank checkpoint size overflow");total+=bytes;
         }return total;
     }
 };

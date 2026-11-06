@@ -5,8 +5,13 @@ Turning speculation off is max_spec=0, not RADIANCE_NO_DRAFT (which retains
 the weights and therefore cannot measure the memory saving).
 """
 import re
+import importlib.util
+from pathlib import Path
 
-from inspect_rad import inspect
+_spec = importlib.util.spec_from_file_location('radiance_rad_directory', Path(__file__).with_name('inspect_rad.py'))
+_reader = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_reader)
+inspect = _reader.inspect
 
 
 def declared_integer(value):
@@ -30,7 +35,7 @@ def resolve(model, mode, depth=None):
         if depth not in (None, 0):
             raise ValueError("--drafter off requires zero speculative tokens")
         return {"requested": mode, "depth": 0, "expected_native": "off"}
-    if not model.is_file() or model.suffix != ".rad":
+    if not model.is_file() or model.suffix.lower() != ".rad":
         raise ValueError("explicit drafter preflight currently requires a complete .rad container")
     container = inspect(model)
     if container["arch_id"] not in ("qwen35", "qwen35moe"):
