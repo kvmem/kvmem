@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-kvmem-hooks.h"
+#include "llama-kvmem-snapshot-stats.h"
 #include "llama-kvmem-execution.h"
 #include "kvmem/retrieval_options.hpp"
 #include "kvmem/launch_contract.hpp"
@@ -1606,6 +1607,11 @@ int main(int argc, char ** argv) {
                 state_bytes += lane->mm_checkpoint_accounting->live_bytes.load();
             usage["physical_checkpoint_bytes"] = state_bytes;
             usage["checkpoint_bytes_scope"] = "native_state_and_private_retrieval_metadata";
+            const auto captures = llama_kvmem_get_snapshot_stats();
+            usage["captured_packed_k_bytes"] = captures.packed_k_bytes;
+            usage["captured_packed_v_bytes"] = captures.packed_v_bytes;
+            usage["captured_native_state_bytes"] = captures.native_state_bytes;
+            usage["capture_scope"] = "process_successful_host_captures_target_and_draft; excludes_aliases_and_failed_transfers";
             data["kvmem"] = std::move(usage);
         }
         res.set_header("Cache-Control", "no-store");
@@ -2399,6 +2405,20 @@ int main(int argc, char ** argv) {
                         return true;
                     };
                     std::optional<ResponsesStreamOut> responses;
+                    const auto commit = [&](const std::vector<llama_token> & generated) {
+                        if (!stream_heartbeat(&io)) {
+                            llama_driver_finish(st);
+                            slot->unlock();
+                            sink.done();
+                            return false;
+                        }
+                        if (llama_driver_try_commit(st, toks, generated)) return true;
+                        send(json{{"error", st.mm_error}}.dump());
+                        sink.write("data: [DONE]\n\n", 14);
+                        slot->unlock();
+                        sink.done();
+                        return false;
+                    };
                     if (is_responses) {
                         responses.emplace(formatted, request_id);
                     }
@@ -2555,7 +2575,7 @@ int main(int argc, char ** argv) {
                                 }
                             }
                             emit_gen_wall((int) gen.size());
-                            llama_driver_commit(st, toks, gen);
+                            if (!commit(gen)) return true;
                             monitor.update(monitor_id, {{"finish_reason", !responses->prev.tool_calls.empty() ? "tool_calls" : (int)gen.size() >= max_tokens ? "length" : "stop"}});
                             for (const std::string & ev : kvmem_responses_stream_done(
                                          responses->state, responses->prev, request_id, st.model_name,
@@ -2583,7 +2603,7 @@ int main(int argc, char ** argv) {
                                 sco.prev.content.size(), sco.prev.reasoning_content.size());
                         llama_kvmem_decode_mean_flush();
                         emit_gen_wall((int) gen.size());
-                        llama_driver_commit(st, toks, gen);
+                        if (!commit(gen)) return true;
                         auto final_chunk = stream_choice_chunk(cid, st.model_name, created, json::object(), finish, include_usage ? nullptr : &*timings);
                         if (!include_usage && !request_metrics->stats.speculative.is_null())
                             final_chunk["kvmem"] = {{"speculative", request_metrics->stats.speculative}};
@@ -2616,7 +2636,7 @@ int main(int argc, char ** argv) {
                             }
                         }
                         emit_gen_wall((int) gen.size());
-                        llama_driver_commit(st, toks, gen);
+                        if (!commit(gen)) return true;
                         monitor.update(monitor_id, {{"finish_reason", !responses->prev.tool_calls.empty() ? "tool_calls" : (int)gen.size() >= max_tokens ? "length" : "stop"}});
                         for (const std::string & ev : kvmem_responses_stream_done(
                                      responses->state, responses->prev, request_id, st.model_name,
@@ -2643,7 +2663,7 @@ int main(int argc, char ** argv) {
                             sco.n_tc_delta, finish,
                             sco.prev.content.size(), sco.prev.reasoning_content.size());
                     emit_gen_wall((int) gen.size());
-                    llama_driver_commit(st, toks, gen);
+                    if (!commit(gen)) return true;
                     auto final_chunk = stream_choice_chunk(cid, st.model_name, created, json::object(), finish, include_usage ? nullptr : &*timings);
                     if (!include_usage && !request_metrics->stats.speculative.is_null())
                         final_chunk["kvmem"] = {{"speculative", request_metrics->stats.speculative}};
@@ -2672,6 +2692,13 @@ int main(int argc, char ** argv) {
             ~request_guard() { llama_driver_finish(st); }
         } guard {st};
         StreamIo io;
+        const auto commit = [&](const std::vector<llama_token> & generated) {
+            if (!stream_heartbeat(&io)) return false;
+            if (llama_driver_try_commit(st, toks, generated)) return true;
+            res.status = 500;
+            res.set_content(json{{"error", st.mm_error}}.dump(), "application/json");
+            return false;
+        };
         io.on_prefill = [&st, request_metrics](int rows, int remaining) {
             st.log.prefilled(rows, remaining);
             auto & partial = request_metrics->stats.native;
@@ -2721,7 +2748,7 @@ int main(int argc, char ** argv) {
             st.mm_live_row = gst.n_past;
             if (io.aborted) return;
             emit_gen_wall((int) gen.size());
-            llama_driver_commit(st, toks, gen);
+            if (!commit(gen)) return;
             emit_json(content, (int) gen.size(), (int) gen.size() >= cr.max_tokens);
             return;
         }
@@ -2790,8 +2817,8 @@ int main(int argc, char ** argv) {
         }
         llama_kvmem_decode_mean_flush();
         emit_gen_wall((int) gen.size());
-        llama_driver_commit(st, toks, gen);
         common_sampler_free(smpl);
+        if (!commit(gen)) return;
         emit_json(content, (int) gen.size(), !stopped && (int) gen.size() >= cr.max_tokens);
     };
 

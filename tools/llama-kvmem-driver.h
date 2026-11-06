@@ -260,6 +260,10 @@ void llama_driver_check_payload_budget(LlamaEngineState & st, const kvmem_prompt
 
 void llama_driver_commit(LlamaEngineState & st, const std::vector<llama_token> & prompt,
                           const std::vector<llama_token> & gen);
+// Report late checkpoint/admission failures through the request protocol after
+// rolling back the still-uncommitted native transaction.
+bool llama_driver_try_commit(LlamaEngineState & st, const std::vector<llama_token> & prompt,
+                             const std::vector<llama_token> & gen);
 
 bool llama_driver_prepare(LlamaEngineState & st, const std::vector<llama_token> & prompt,
                                  kvmem::RequestControl * io = nullptr, int * n_cache_hit = nullptr);

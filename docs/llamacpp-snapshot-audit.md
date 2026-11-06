@@ -261,3 +261,59 @@ independent `raw-kv-snapshot-prototype` worktree, branch
 not approved for direct integration or merging. The coordinator owns its audit,
 revision, public PR and merge. Its four focused host tests pass remotely (0.17 s).
 See that commit's `docs/raw-kv-snapshot-prototype.md` for exact semantics and gaps.
+
+## Capture instrumentation and baseline measurements
+
+Backend-private process counters now record successfully stored packed K/V bytes
+and published native checkpoint bytes. They include target and draft attention;
+references/forks do not increment them. Failed transfers and non-archive D2H
+remain separate transfer diagnostics. No new synchronization is introduced.
+The native boundary test additionally asserts that a repeated unchanged fork
+performs zero additional packed captures; both models pass all four cases.
+
+`tests/llamacpp-snapshot-benchmark.py` wraps the unchanged ordinary-request
+checkpoint workload with tracing disabled. It samples device framebuffer use
+and the existing monitor, and reads Windows process PeakWorkingSetSize plus
+native prefill/decode logs. Device peaks are sampled, not exact per-process
+high-water values. These are short outputs (2-24 tokens), not a sustained decode
+throughput qualification. Keep the monitor overhead/configuration identical in
+the future candidate comparison. The instrumented baseline includes the dense
+capacity repair, but no immutable snapshot integration.
+
+Three fresh-server runs per model, identical SSD configuration to the adequate
+budget baseline above, produced the following medians/totals:
+
+| Model | Total prefill ms (median) | Total decode ms (median) | Packed K bytes | Packed V bytes | Native state bytes | RSS peak bytes (median) | Sampled GPU MiB (median) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen3-0.6B | 1903.53 | 332.70 | 213918208 | 213918208 | 408 | 1084682240 | 669 |
+| Qwen3.5-4B | 4321.46 | 349.96 | 61685248 | 61685248 | 2687269544 | 3987767296 | 2541 |
+
+Capture counts were identical across all three runs. Dense SSD read/write totals
+were 178,884,832 / 273,690,480 bytes each run. Hybrid reads were 210,766,384 bytes;
+writes ranged from 1,666,993,940 to 1,673,285,396 bytes due to asynchronous tier
+placement. Source evidence: `perf-accounted-baseline-{dense,hybrid}-ssd-{1,2,3}`.
+These are baseline-only measurements; there is no optimization comparison yet.
+
+## MTP and failed-budget qualification
+
+The existing Qwen3.5-4B IQ3_XXS includes one native next-token layer. With draft
+MTP enabled, the ordinary document/Query/tool/branch/edit SSD baseline passed,
+including cold state loads on question, switch-away, middle edit and front edit.
+Evidence: `coverage-baseline-mtp-ssd`. This qualifies the default MTP state mode
+only; DFlash, explicit replay/snapshot alternatives and multi-GPU remain untested.
+
+A new inherited failure was found at Q=128 MiB: prefill could succeed, but the
+final native checkpoint failed admission. Native rollback succeeded, yet the
+exception escaped the HTTP handler as an empty 500 and bypassed sampler release.
+The server now catches commit failures through the driver, completes the existing
+rollback, emits a protocol error and releases the sampler. All streaming commit
+sites use the same failure boundary, and check cancellation before publication.
+No capture boundary or native restore ordering was moved to hide this failure.
+
+`llamacpp-checkpoint-failure-regression.py` passed JSON and SSE late-commit errors,
+rollback and repeated rejection with less than 4 KiB checkpoint state retained.
+At 128 MiB this model cannot fit even a short generation's necessary checkpoints;
+the original test's expectation of successful normal generation was incorrect
+and the failed evidence was preserved. At 192 MiB, the existing coverage test
+separately passed Query capacity rejection, rollback and subsequent normal
+generation. Evidence: `commit-failure-evidence-2` and `coverage-budget-reject-192`.

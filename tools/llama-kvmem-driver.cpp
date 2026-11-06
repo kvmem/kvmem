@@ -1,5 +1,6 @@
 #include "kvmem/query_policy.hpp"
 #include "llama-kvmem-driver.h"
+#include "llama-kvmem-snapshot-stats.h"
 #include "llama-kvmem-execution.h"
 #include "llama-kvmem-diag.h"
 #include "kvmem/session_memory.hpp"
@@ -801,6 +802,20 @@ void llama_driver_commit(LlamaEngineState & st, const std::vector<llama_token> &
             stored);
 }
 
+bool llama_driver_try_commit(LlamaEngineState & st, const std::vector<llama_token> & prompt,
+                             const std::vector<llama_token> & gen) {
+    try {
+        llama_driver_commit(st, prompt, gen);
+        return true;
+    } catch (const std::exception & error) {
+        const std::string message = error.what();
+        LOG_ERR("srv    KVMEM_TRACE checkpoint_commit_failed error=%s\n", message.c_str());
+        llama_driver_finish(st);
+        st.mm_error = message;
+        return false;
+    }
+}
+
 void llama_driver_validate_capacity(const LlamaEngineState & st, const kvmem_prompt & prompt, int end) {
     if (!st.kparams.enabled || !st.kparams.budget || !prompt.has_media()) return;
     const uint32_t block = st.kparams.block_tokens ? st.kparams.block_tokens : 32;
@@ -1014,6 +1029,8 @@ static MultimodalCheckpoint multimodal_checkpoint(LlamaEngineState & st, int row
         }
     }
     reservation.publish(data->bytes());
+    llama_kvmem_record_snapshot_capture(llama_kvmem_capture_plane::native_state,
+        data->recurrent.size() + data->draft_carry.size());
     data->accounting = st.mm_checkpoint_accounting;
     result.data = std::move(data);
     st.mm_live_checkpoint = result.data;

@@ -1,6 +1,7 @@
 #include "kvmem/query_policy.hpp"
 #include "llama-kvmem-diag.h"
 #include "llama-memory-kvmem.h"
+#include "llama-kvmem-snapshot-stats.h"
 #include "kvmem/retrieval_options.hpp"
 #include "llama-memory-kvmem-hybrid.h"
 #include "llama-memory-kvmem-mtp.h"
@@ -360,6 +361,16 @@ bool llama_memory_kvmem::gdn_replay_commit(llama_context * ctx, uint32_t n_keep)
 }
 static std::atomic<uint64_t> transfer_bytes[3]{};
 static std::atomic<uint64_t> transfer_calls[3]{};
+static std::atomic<uint64_t> snapshot_capture_bytes[3]{};
+
+void llama_kvmem_record_snapshot_capture(llama_kvmem_capture_plane plane, uint64_t bytes) {
+    snapshot_capture_bytes[static_cast<unsigned>(plane)].fetch_add(bytes, std::memory_order_relaxed);
+}
+llama_kvmem_snapshot_stats llama_kvmem_get_snapshot_stats() {
+    return {snapshot_capture_bytes[0].load(std::memory_order_relaxed),
+            snapshot_capture_bytes[1].load(std::memory_order_relaxed),
+            snapshot_capture_bytes[2].load(std::memory_order_relaxed)};
+}
 
 static bool transfer_stats_enabled() {
     static const bool enabled = [] {
@@ -3714,6 +3725,8 @@ void llama_memory_kvmem::harvest_write_batch() {
             } else {
                 raw_->write_layer_v_gpu(j.pos0, j.n, j.il, src);
             }
+            llama_kvmem_record_snapshot_capture(j.is_k ? llama_kvmem_capture_plane::packed_k :
+                llama_kvmem_capture_plane::packed_v, j.nbytes);
         };
         if (j.gpu_src &&
             kvmem_copy(packed.data(), j.gpu_src, j.nbytes,
@@ -3736,6 +3749,8 @@ void llama_memory_kvmem::harvest_write_batch() {
             } else {
                 raw_->write_layer_v_gpu(j.pos0, j.n, j.il, p);
             }
+            llama_kvmem_record_snapshot_capture(j.is_k ? llama_kvmem_capture_plane::packed_k :
+                llama_kvmem_capture_plane::packed_v, j.nbytes);
         } else {
             fallback(j);
         }
@@ -3831,6 +3846,8 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
             kvmem_tensor_get(t, packed.data(), toff, nbytes);
             if (is_k) raw_->write_layer_k_gpu(blk.orig_pos_start, nget, il, packed.data());
             else raw_->write_layer_v_gpu(blk.orig_pos_start, nget, il, packed.data());
+            llama_kvmem_record_snapshot_capture(is_k ? llama_kvmem_capture_plane::packed_k :
+                llama_kvmem_capture_plane::packed_v, nbytes);
             return;
         }
         uint8_t * base = kvmem_cuda_tensor_ptr(t);
@@ -3864,6 +3881,8 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
         } else {
             raw_->write_layer_v_gpu(blk.orig_pos_start, nget, il, packed.data());
         }
+        llama_kvmem_record_snapshot_capture(is_k ? llama_kvmem_capture_plane::packed_k :
+            llama_kvmem_capture_plane::packed_v, nbytes);
     };
     uint32_t n_ok = 0;
     uint32_t n_skip = 0;

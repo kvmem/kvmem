@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
+#include "llama-kvmem-snapshot-stats.h"
 #include "ggml-backend.h"
 
 #include <cstdio>
@@ -45,6 +46,14 @@ static void check(llama_model * model, int rows) {
     using Bundle = std::unique_ptr<llama_kvmem_store_bundle, decltype(&llama_kvmem_store_bundle_free)>;
     Bundle parent(llama_kvmem_store_bundle_fork(), llama_kvmem_store_bundle_free);
     require(bool(parent), "cannot preserve parent attention snapshot");
+    const auto captured = llama_kvmem_get_snapshot_stats();
+    {
+        Bundle unchanged(llama_kvmem_store_bundle_fork(), llama_kvmem_store_bundle_free);
+        const auto repeated = llama_kvmem_get_snapshot_stats();
+        require(repeated.packed_k_bytes == captured.packed_k_bytes &&
+                repeated.packed_v_bytes == captured.packed_v_bytes,
+                "unchanged fork recaptured existing packed KV");
+    }
     std::printf("CHECKPOINT_CAPTURE rows=%d full_state_bytes=%zu partial_state_bytes=%zu host_capacity_bytes=%llu\n",
             rows, before.size(), checkpoint.size(),
             static_cast<unsigned long long>(llama_kvmem_store_capacity(rows)));
