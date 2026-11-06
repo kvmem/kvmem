@@ -1,11 +1,12 @@
-# Pending coordination: packed RawKvStore snapshot prototype
+# Packed record exchange and state storage contracts
 
-This is a review prototype, not an approved interface or a backend integration.
-The NInfer coordinator owns revision, public PR, public tests and merge. It must
-land separately before llama.cpp consumes the final API. Base: PR #267 merge
-`f0a3d51f889d0100ae97bc43a46a398937ffb4b5`.
+This public change is coordinated separately from backend integrations. It
+extends existing storage and packed-record ownership without changing native
+scheduling, resource policy or legacy packed coverage queries. The initial
+prototype was supplied by the llama.cpp session; coordinator review added
+selected-record demotion and checkpoint-image transport compatibility.
 
-## Scope and proposed contract
+## Packed exchange contract
 
 `export_packed` accepts exact block/layer/valid-prefix selections. Both packed
 planes must exist with full allocation extent and independently proved valid
@@ -79,3 +80,52 @@ export/import without reads/writes/promotion. Deterministic cancellation midway
 through synchronous I/O and allocator-fault injection at every metadata step
 are not yet covered. GPU/native identity proof and backend model-state restoration
 remain separate llama.cpp integration tests.
+
+
+## Selected-record demotion
+
+The old native checkpoint scheduler chooses a specific eligible LRU state image;
+`hot_count` triggers background work, while required admission may force a
+migration below that threshold. Whole-account `trim` cannot preserve that object
+selection. `HostKvStorage::demote(record)` therefore reuses the existing eviction
+path with exactly one selected allocation. Foreign/empty records are rejected.
+It returns true for an already cold or successfully migrated record, and false
+for RAM-only, mutable, leased or busy records. It does not choose another victim.
+No separate pool, quota, scheduling thread or cancellation mechanism is added.
+
+The caller serializes the owner handle and submits work through its existing
+queue. The worker holds a strong record reference. Once physical I/O has started,
+cancellation does not interrupt it: caller publication remains conditional on
+its request/generation identity. A completed relocation changes only the physical
+tier of immutable bytes. Failed disk reservation/write leaves the resident copy
+valid and charged; unpublished disk extents are released. The account policy
+lock is released during physical I/O; the selected record remains locked.
+
+## Native checkpoint image transport
+
+`write_checkpoint_image(HostKvRecord&, ...)` and
+`read_checkpoint_image(HostKvRecord/HostKvLease, ...)` use the same format and
+identity, segment length, total length and checksum checks as the existing
+SpillExtent overloads. The writer owns a private record, completes all writes,
+seals it, then publishes. Read spans must point to private staging; exceptions
+may leave staging partially filled, and native restore must wait for successful
+validation. A cold lease reads without promoting the whole image into RAM.
+Native schema/frontier/recurrent/draft compatibility remains the backend's job.
+Existing KV H and state Q meanings are retained by callers; the state account is
+shared per execution and uses the existing shared D SpillFile, not per checkpoint.
+Image header/checksum bytes consume the same physical quota as the payload.
+
+## Coordinator validation on M16
+
+M16 Windows, MSVC19.44.35222, SDK26100, Release: focused build of the four required
+support units and five test units (9 C++ compiles,6 links,zero CUDA,8jobs).
+`packed_kv_snapshot_test`, `raw_kv_store_test`, `tiered_kv_storage_test`,
+`kv_snapshot_test`, `checkpoint_image_test` all pass. Added selected victim,
+pinned/mutable refusal, foreign account, shared ownership, disk quota failure,
+source-byte preservation, final charge release, hot/cold image read, source
+deletion, corrupt branch/identity/length rejection, and concurrent branch COW.
+These are host contracts, not native model or GPU restoration evidence. Existing
+Linux file-size write-failure injection is skipped on Windows; the Windows run
+does not claim OS write-failure coverage. Mid-I/O cancellation and exhaustive
+metadata allocator fault injection remain untested; cancellation is cooperative
+between synchronous operations, with no publication on a detected cancellation.

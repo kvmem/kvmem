@@ -33,7 +33,8 @@ struct RawKvStoreConfig {
     std::shared_ptr<HostKvStorage> payload_storage;
 };
 
-// PROTOTYPE: pending coordinator review; not an approved public contract.
+// Immutable packed-record exchange. Native layout/frontier proof remains with
+// the caller; this API proves stored row coverage and account ownership only.
 struct PackedKvSelection {
     uint32_t block = 0, layer = 0, valid_tokens = 0;
 };

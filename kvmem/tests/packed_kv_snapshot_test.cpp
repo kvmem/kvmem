@@ -1,4 +1,4 @@
-// PROTOTYPE contract evidence, pending coordinator review.
+// Packed record export/import contract evidence.
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/memory_contract.hpp"
 #include "kvmem/snapshot.hpp"
@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <random>
+#include <future>
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"failed line %d: %s\n",__LINE__,#x); std::abort(); } } while (0)
 using namespace kvmem;
@@ -171,7 +172,23 @@ static void ssd() {
     }
     CHECK(std::filesystem::is_empty(root)); std::filesystem::remove(root);
 }
+static void concurrent_branches() {
+    auto c=config(4096); RawKvStore source(c); write(source,0,4,0);
+    auto saved=source.export_packed({{0,0,4}});
+    auto left=source.fork_prefix(4), right=source.fork_prefix(4);
+    auto a=std::async(std::launch::async,[&]{
+        write(*left,0,4,0,21); return left->export_packed({{0,0,4}});
+    });
+    auto b=std::async(std::launch::async,[&]{
+        write(*right,0,4,0,22); return right->export_packed({{0,0,4}});
+    });
+    auto l=a.get(),r=b.get();
+    CHECK(read(saved.entries()[0].k)==std::vector<uint8_t>(16,7));
+    CHECK(read(l.entries()[0].k)==std::vector<uint8_t>(16,21));
+    CHECK(read(r.entries()[0].v)==std::vector<uint8_t>(16,22));
+    CHECK(l.entries()[0].k.storage_identity()!=r.entries()[0].k.storage_identity());
+}
 int main() {
-    coverage(); sharing_and_import(); failures_and_legacy(); ssd();
-    std::puts("PASS pending packed snapshot prototype");
+    coverage(); sharing_and_import(); failures_and_legacy(); ssd(); concurrent_branches();
+    std::puts("PASS packed snapshot contracts");
 }

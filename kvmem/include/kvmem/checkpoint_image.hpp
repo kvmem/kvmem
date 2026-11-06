@@ -1,5 +1,6 @@
 #pragma once
 #include "spill_io.hpp"
+#include "host_kv_storage.hpp"
 #include "snapshot.hpp"
 #include <limits>
 
@@ -13,7 +14,8 @@ inline uint64_t checkpoint_image_size(uint64_t payload, size_t segments) {
     if (payload > UINT64_MAX-header) throw std::overflow_error("checkpoint image size overflow");
     return header+payload;
 }
-inline void write_checkpoint_image(const SpillExtent & extent, uint64_t identity,
+namespace detail {
+template<class Storage> inline void write_checkpoint_image_to(Storage & extent, uint64_t identity,
                                   const std::vector<CheckpointWriteSpan> & spans) {
     uint64_t offset = 0;
     SnapshotWriter out([&](const void * p, size_t n) { extent.write(offset, p, n); offset += n; });
@@ -23,7 +25,7 @@ inline void write_checkpoint_image(const SpillExtent & extent, uint64_t identity
     if (offset+8 != extent.size()) throw std::runtime_error("checkpoint image length mismatch");
     const auto hash = out.hash(); extent.write(offset, &hash, 8);
 }
-inline void read_checkpoint_image(const SpillExtent & extent, uint64_t identity,
+template<class Storage> inline void read_checkpoint_image_from(const Storage & extent, uint64_t identity,
                                  const std::vector<CheckpointReadSpan> & spans) {
     uint64_t offset = 0;
     if (extent.size() < 32) throw SnapshotCorrupt("truncated checkpoint image");
@@ -33,5 +35,30 @@ inline void read_checkpoint_image(const SpillExtent & extent, uint64_t identity,
     if (offset+8 != extent.size()) throw SnapshotCorrupt("checkpoint image length mismatch");
     uint64_t hash = 0; extent.read(offset, &hash, 8);
     if (in.hash() != hash) throw SnapshotCorrupt("checkpoint image checksum mismatch");
+}
+} // namespace detail
+// The destination is private until writing succeeds. Record writes do not seal
+// or publish automatically; the caller completes capture, seals, then publishes.
+inline void write_checkpoint_image(const SpillExtent & extent, uint64_t identity,
+                                  const std::vector<CheckpointWriteSpan> & spans) {
+    detail::write_checkpoint_image_to(extent, identity, spans);
+}
+inline void write_checkpoint_image(HostKvRecord & record, uint64_t identity,
+                                  const std::vector<CheckpointWriteSpan> & spans) {
+    detail::write_checkpoint_image_to(record, identity, spans);
+}
+// Read spans are private staging: no native restore/publication before this
+// function returns successfully. Failure may have overwritten some staging.
+inline void read_checkpoint_image(const SpillExtent & extent, uint64_t identity,
+                                 const std::vector<CheckpointReadSpan> & spans) {
+    detail::read_checkpoint_image_from(extent, identity, spans);
+}
+inline void read_checkpoint_image(const HostKvLease & lease, uint64_t identity,
+                                 const std::vector<CheckpointReadSpan> & spans) {
+    detail::read_checkpoint_image_from(lease, identity, spans);
+}
+inline void read_checkpoint_image(const HostKvRecord & record, uint64_t identity,
+                                 const std::vector<CheckpointReadSpan> & spans) {
+    read_checkpoint_image(record.lease(), identity, spans);
 }
 } // namespace kvmem
