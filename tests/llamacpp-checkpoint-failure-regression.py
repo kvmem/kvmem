@@ -24,8 +24,11 @@ def main():
     cli.add_argument('--model',type=Path,required=True)
     cli.add_argument('--gpu',required=True)
     cli.add_argument('--out',type=Path,required=True)
-    cli.add_argument('--host-mib',type=int,default=128)
+    cli.add_argument('--host-mib',type=int)
+    cli.add_argument('--cancel',action='store_true',help='disconnect a continuation after real output, then restore its old parent')
+    cli.add_argument('--mtp',action='store_true',help='enable the model native MTP draft for cancellation qualification')
     args=cli.parse_args()
+    if args.host_mib is None:args.host_mib=1024 if args.cancel else 128
     args.out.mkdir(parents=True,exist_ok=False)
     processes=subprocess.check_output(['nvidia-smi','-i',args.gpu,'--query-compute-apps=pid,process_name','--format=csv,noheader'],text=True).strip()
     if processes:raise RuntimeError('GPU occupied: '+processes)
@@ -34,8 +37,9 @@ def main():
     if memory>256 or util>5:raise RuntimeError('GPU not idle: '+inventory)
     with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
     command=[str(args.exe.resolve()),'-m',str(args.model.resolve()),'-ngl','99','-c','8192','-b','128','-ub','128',
-             '--no-ui','--no-think','--kv-dtype','q8_0','--spec-type','none','--host','127.0.0.1','--port',str(port),
+             '--no-ui','--no-think','--kv-dtype','q8_0','--spec-type','draft-mtp' if args.mtp else 'none','--host','127.0.0.1','--port',str(port),
              '--kvmem-budget','1024','--kvmem-gen-reserve','256','--kvmem-host-mib','512','--kvmem-sessions','2','--kvmem-trace']
+    if args.mtp:command+=['--spec-draft-n-max','3']
     env={k:v for k,v in os.environ.items() if not k.startswith(('KVMEM_','GGML_','LLAMA_ARG_'))}
     env.update(CUDA_VISIBLE_DEVICES=args.gpu,KVMEM_CHECKPOINT_POLICY='spread',KVMEM_CHECKPOINT_INTERVAL='256',
                KVMEM_CHECKPOINT_COUNT='6',KVMEM_CHECKPOINT_HOT='1',KVMEM_CHECKPOINT_HOST_MIB=str(args.host_mib))
@@ -67,6 +71,57 @@ def main():
                 except OSError:
                     if time.monotonic()>deadline:raise TimeoutError('server startup')
                     time.sleep(.2)
+            if args.cancel:
+                status,raw=request('parent',messages)
+                assert status==200,raw
+                parent=json.loads(raw)
+                def usage():
+                    with opener.open(base+'/api/monitor/snapshot',timeout=5) as response:
+                        return json.load(response)['kvmem']
+                before=usage()
+                continuation=messages+[parent['choices'][0]['message'],{'role':'user','content':'List the integers from 1 to 1000, one per line. Continue without a summary.'}]
+                body={'model':'checkpoint-test','messages':continuation,'max_tokens':1024,'temperature':0,'seed':42,
+                      'enable_thinking':False,'stream':True,'kvmem':{'conversation_id':'failure-fixture'}}
+                (args.out/'cancel-request.json').write_text(json.dumps(body))
+                req=urllib.request.Request(base+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
+                offset=log_path.stat().st_size
+                received=[]
+                response=opener.open(req,timeout=120)
+                try:
+                    for line in response:
+                        received.append(line.decode())
+                        if not line.startswith(b'data: '):continue
+                        assert line.strip()!=b'data: [DONE]', 'request completed before cancellation'
+                        event=json.loads(line[6:])
+                        assert 'error' not in event,event
+                        if any(c.get('delta',{}).get('content') for c in event.get('choices',[])):
+                            # Close the actual connection after real generation,
+                            # rather than merely abandoning the Python reader.
+                            response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+                            break
+                    else:raise AssertionError('no generated output before disconnect')
+                finally:response.close()
+                (args.out/'cancel-received.txt').write_text(''.join(received))
+                deadline=time.monotonic()+15
+                while True:
+                    trace=log_path.read_bytes()[offset:].decode(errors='replace')
+                    after=usage()
+                    if 'KVMEM_CHECKPOINT_ROLLBACK' in trace and not after['active_sessions']:break
+                    if time.monotonic()>deadline:raise AssertionError('disconnect did not finish native rollback')
+                    time.sleep(.1)
+                assert 'multimodal_rollback_failed' not in trace
+                assert 'KVMEM_CHECKPOINT_COMMIT' not in trace,'cancelled continuation was published'
+                assert after['physical_checkpoint_bytes']<=before['physical_checkpoint_bytes']+16384,(before,after)
+                status,raw=request('parent-restored',messages)
+                assert status==200,raw
+                restored=json.loads(raw)
+                cached=restored['usage'].get('prompt_tokens_details',{}).get('cached_tokens',restored['usage'].get('prompt_cache_hit_tokens',0))
+                assert cached>=parent['usage']['prompt_tokens']-32,restored['usage']
+                assert restored['choices'][0]['message']==parent['choices'][0]['message']
+                (args.out/'result.json').write_text(json.dumps({'passed':True,'cancelled_after_output':True,
+                    'parent_cached_tokens':cached,'before':before,'after':after},indent=2))
+                print('PASS disconnect, native rollback, checkpoint release, old parent reuse',flush=True)
+                return
             for stream in (False,True):
                 name='stream' if stream else 'json'
                 offset=log_path.stat().st_size

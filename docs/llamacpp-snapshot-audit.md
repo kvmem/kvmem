@@ -317,3 +317,19 @@ the original test's expectation of successful normal generation was incorrect
 and the failed evidence was preserved. At 192 MiB, the existing coverage test
 separately passed Query capacity rejection, rollback and subsequent normal
 generation. Evidence: `commit-failure-evidence-2` and `coverage-budget-reject-192`.
+
+The same backend failure regression's `--cancel` case closes the real TCP
+connection after the first generated text delta of a continuation. It waits for
+native rollback and idle publication, verifies no cancelled checkpoint commit,
+checks temporary checkpoint bytes return within 16 KiB of the parent baseline,
+then repeats the old parent. Prefix reuse must cover all but at most one block,
+and the returned message must match the parent's original result. Hybrid with
+no draft and with native MTP both pass. Evidence: `cancel-parent-evidence` and
+`cancel-parent-mtp-evidence`. This is real decode cancellation, not a queued-only
+or synthetic cancellation flag test; mid-prefill and device-copy fault injection
+remain separate unqualified combinations.
+
+The inherited LNK4098 diagnostic was traced with library directives: the reused
+host/native libraries do not request LIBCMT; CUDA 13.2.2 `cudadevrt.lib` has one
+static-CRT default-library directive. No global linker suppression or other
+backend build-policy change was made. Final release linkage still needs review.
