@@ -420,6 +420,9 @@ HostKvRecord HostKvStorage::allocate(size_t bytes, const void * source) {
     return reserve(bytes).allocate(bytes, source);
 }
 uint64_t HostKvStorage::charged_bytes() const { return account_->usage(); }
+bool HostKvStorage::owns(const HostKvRecord & record) const noexcept {
+    return record.allocation_ && record.allocation_->account == account_;
+}
 uint64_t HostKvStorage::capacity_bytes() const noexcept { return account_->capacity; }
 uint64_t HostKvStorage::disk_bytes() const { return account_->spill ? account_->spill->charged_bytes() : 0; }
 uint64_t HostKvStorage::disk_capacity_bytes() const noexcept {

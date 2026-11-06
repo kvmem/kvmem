@@ -107,4 +107,5 @@ kvmem_add_test(graph_recall_test)
 kvmem_add_test(query_policy_test)
 kvmem_add_test(kvmem_runtime_test)
 kvmem_add_test(raw_kv_store_test)
+kvmem_add_test(packed_kv_snapshot_test) # Pending coordinator prototype review.
 kvmem_add_test(token_options_test)

@@ -90,6 +90,7 @@ public:
     void reset() noexcept { allocation_.reset(); }
 private:
     friend class HostKvReservation;
+    friend class HostKvStorage;
     explicit HostKvRecord(std::shared_ptr<detail::HostKvAllocation> allocation);
     std::shared_ptr<detail::HostKvAllocation> allocation_;
 };
@@ -119,6 +120,8 @@ public:
     HostKvStorage(uint64_t capacity_bytes, std::shared_ptr<SpillFile> spill);
     HostKvReservation reserve(uint64_t bytes);
     HostKvRecord allocate(size_t bytes, const void * source = nullptr);
+    // Account identity, not byte/content identity. Empty records are not owned.
+    bool owns(const HostKvRecord & record) const noexcept;
     uint64_t charged_bytes() const;
     uint64_t capacity_bytes() const noexcept;
     uint64_t disk_bytes() const;
