@@ -316,7 +316,15 @@ Pressure. Retained sessions counts idle histories only.
 Help appears from the small information buttons on hover or keyboard focus. Click to pin,
 press Escape or click elsewhere to dismiss; opening help does not move the form.
 
-Cache & history → Advanced exposes the Query scorer (page-softmax or Mean-Q
+Recall policy selects Legacy or the independent Layerwise current-layer-Q strategy.
+Layerwise exposes five finite activation/metadata accounts and requires an explicit
+history choice for OWN MTP. DFlash2 retains its full native window, while PolyStrata
+Gemma Guess uses SharedTarget and takes no OWN history policy. Each combination
+is checked against the selected binary's explicit strategy capabilities, including
+KV type, reserve floor and single/pipeline/tensor mode. See [Layerwise settings](../docs/layerwise-recall.md).
+The opt-in text/no-draft presets do not change existing recipes or saved profiles.
+
+In Legacy, Cache & history → Advanced exposes the Query scorer (page-softmax or Mean-Q
 cosine), GQA mean/max aggregation, graph strength, LRFU, and the Query/replay
 token limits. These controls are independent; selecting a scorer does not toggle
 graph propagation or history. Alpha zero disables propagation. The default C

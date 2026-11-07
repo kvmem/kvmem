@@ -20,6 +20,11 @@ struct DeviceBinding {
     explicit DeviceBinding(int device) { checked(cudaGetDevice(&previous)); checked(cudaSetDevice(device)); }
     ~DeviceBinding() { cudaSetDevice(previous); }
 };
+struct StreamDrain {
+    cudaStream_t stream;
+    bool armed = true;
+    ~StreamDrain() { if (armed) cudaStreamSynchronize(stream); }
+};
 struct Buffer {
     void* data = nullptr;
     size_t capacity = 0;
@@ -125,6 +130,26 @@ __global__ void accumulate_gqa_max(const float* logits, const float* norms, floa
         sum += logits[size_t(base)*blocks+page]*norms[2*base];
     }
     output[page] += sum*weight;
+}
+
+// Only operand transport/FP16 materialization is new. The page logits,
+// normalization and mean-head accumulation below reuse the qualified kernels.
+__global__ void pack_current_query(const unsigned char* input, half* output, unsigned* invalid,
+    uint32_t rows, uint32_t heads, uint32_t dim, size_t row_stride, size_t head_stride,
+    size_t dimension_stride, NativeQueryScalar scalar, bool finite_half_required) {
+    const size_t index = size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    const size_t count = size_t(rows)*heads*dim;
+    if (index >= count) return;
+    const auto d = index%dim, head = (index/dim)%heads, row = index/(size_t(dim)*heads);
+    const auto* source = input+row*row_stride+head*head_stride+d*dimension_stride;
+    float value;
+    if (scalar == NativeQueryScalar::Float32) value = *reinterpret_cast<const float*>(source);
+    else if (scalar == NativeQueryScalar::Float16) value = __half2float(*reinterpret_cast<const half*>(source));
+    else value = __uint_as_float(unsigned(*reinterpret_cast<const uint16_t*>(source))<<16);
+    const half represented = __float2half_rn(value);
+    if (!isfinite(value) || (finite_half_required && !isfinite(__half2float(represented))))
+        atomicExch(invalid,1u);
+    output[index] = represented;
 }
 } // namespace
 
@@ -251,6 +276,112 @@ std::vector<double> PageSoftmaxCuda::score(const RawKvStore& keys, PageQueryView
     checked(cudaMemcpyAsync(scores.data(),w.output.data,blocks*sizeof(float),cudaMemcpyDeviceToHost,w.stream));
     checked(cudaStreamSynchronize(w.stream));
     for(size_t j=0;j<blocks;++j) result[enabled[j]]=scores[j];
+    return result;
+}
+
+std::vector<double> PageSoftmaxCuda::score_current_layer(const RawKvStore& keys,
+    NativeCurrentLayerQuery q, const QueryScoreFrame& frame, void* producer_stream) {
+    validate_native_layer_query(q);
+    const auto n = frame.starts.size();
+    const auto block_tokens = keys.config().block_tokens;
+    if (q.layer >= keys.config().n_layer || !block_tokens ||
+        uint64_t(q.kv_heads)*q.head_dim != keys.config().n_embd_k ||
+        frame.counts.size()!=n || frame.score_mask.size()!=n || frame.transport_mask.size()!=n ||
+        uintptr_t(q.data)>UINTPTR_MAX-q.bytes)
+        throw std::invalid_argument("native CUDA Query or score frame geometry mismatch");
+    std::vector<size_t> enabled;
+    for (size_t i=0;i<n;++i) {
+        const auto start=frame.starts[i],count=uint64_t(frame.counts[i]);
+        if (!count || count>block_tokens || start%block_tokens || start>frame.accepted_through ||
+            count>frame.accepted_through-start || start/block_tokens>UINT32_MAX ||
+            keys.mean_k_tokens(uint32_t(start/block_tokens),q.layer)!=count)
+            throw std::invalid_argument("native CUDA target-layer Mean-K coverage differs from frozen frame");
+        if (frame.score_mask[i]) enabled.push_back(i);
+    }
+    if (enabled.size()>INT_MAX || q.query_heads>INT_MAX || q.head_dim>INT_MAX ||
+        uint64_t(q.query_heads)*std::min(q.rows,impl_->max_batch)>INT_MAX)
+        throw std::length_error("native CUDA Query exceeds launch addressing");
+    const size_t blocks=enabled.size(),kw=size_t(q.kv_heads)*q.head_dim,qw=size_t(q.query_heads)*q.head_dim;
+    if (qw>SIZE_MAX/sizeof(half)/impl_->max_batch || kw>SIZE_MAX/sizeof(half) ||
+        (blocks && blocks>logits_limit/sizeof(float)/q.query_heads))
+        throw std::length_error("native CUDA Query exceeds planned logits range");
+    auto& w=*impl_; DeviceBinding binding(w.device);
+    auto stream=static_cast<cudaStream_t>(producer_stream);
+    int stream_device=-1;
+    checked(cudaStreamGetDevice(stream,&stream_device));
+    if (stream_device!=w.device) throw std::invalid_argument("native Query stream belongs to a different device");
+    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+    checked(cudaStreamIsCapturing(stream,&capture));
+    if (capture!=cudaStreamCaptureStatusNone)
+        throw std::invalid_argument("native Query selection requires an eager CUDA boundary");
+    cudaPointerAttributes attributes{};
+    checked(cudaPointerGetAttributes(&attributes,q.data));
+    if (attributes.type!=cudaMemoryTypeDevice || attributes.device!=w.device)
+        throw std::invalid_argument("native Query is not stored on its scoring CUDA device");
+    // The same owner may use the legacy scorer between requests. Its private
+    // stream must relinquish the workspace before the native stream borrows it.
+    checked(cudaStreamSynchronize(w.stream));
+    const auto batch=blocks ? uint32_t(std::min<size_t>(w.max_batch,
+        logits_limit/(blocks*q.query_heads*sizeof(float)))) : w.max_batch;
+    w.queries.reserve(size_t(batch)*qw*sizeof(half));
+    w.norms.reserve(size_t(batch)*q.query_heads*2*sizeof(float));
+    if (blocks) {
+        w.means.reserve(blocks*kw*sizeof(half));
+        w.logits.reserve(size_t(batch)*blocks*q.query_heads*sizeof(float));
+        w.output.reserve(blocks*sizeof(float));
+    }
+    for (const auto* buffer:{&w.queries,&w.means,&w.logits,&w.norms,&w.output}) {
+        const auto base=uintptr_t(buffer->data),input=uintptr_t(q.data);
+        if (buffer->data && input<base+buffer->capacity && base<input+q.bytes)
+            throw std::invalid_argument("native Query aliases the scorer workspace");
+    }
+    std::vector<double> result(n,0);
+    std::vector<half> host_means(blocks*kw);
+    std::vector<float> key(kw),scores(blocks);
+    StreamDrain drain{stream}; // before host staging is released, including errors
+    if (blocks) {
+        for (size_t j=0;j<blocks;++j) {
+            keys.mean_k(uint32_t(frame.starts[enabled[j]]/block_tokens),q.layer,key.data());
+            for (size_t d=0;d<kw;++d) host_means[j*kw+d]=__float2half_rn(recall_fp16(key[d]));
+        }
+        checked(cudaMemcpyAsync(w.means.data,host_means.data(),blocks*kw*sizeof(half),cudaMemcpyHostToDevice,stream));
+        checked(cudaMemsetAsync(w.output.data,0,blocks*sizeof(float),stream));
+    }
+    for (uint32_t first=0;first<q.rows;) {
+        const auto rows=std::min(batch,q.rows-first);
+        // Norms are not live until after packing: use their first word as an
+        // operand error flag, and read it before the normalizer overwrites it.
+        checked(cudaMemsetAsync(w.norms.data,0,sizeof(unsigned),stream));
+        const auto count=size_t(rows)*qw;
+        if ((count+255)/256>UINT32_MAX) throw std::length_error("native Query pack launch exceeds grid range");
+        pack_current_query<<<unsigned((count+255)/256),256,0,stream>>>(
+            static_cast<const unsigned char*>(q.data)+size_t(first)*q.row_stride,
+            static_cast<half*>(w.queries.data),static_cast<unsigned*>(w.norms.data),
+            rows,q.query_heads,q.head_dim,q.row_stride,q.head_stride,q.dimension_stride,q.scalar,blocks!=0);
+        checked(cudaGetLastError());
+        unsigned invalid=0;
+        checked(cudaMemcpyAsync(&invalid,w.norms.data,sizeof(invalid),cudaMemcpyDeviceToHost,stream));
+        checked(cudaStreamSynchronize(stream));
+        if (invalid) throw std::invalid_argument("native Query contains a nonfinite or overflowing FP16 operand");
+        if (blocks) {
+            const auto distributions=int(rows*q.query_heads);
+            page_logits<<<dim3(unsigned((blocks+3)/4),unsigned(distributions)),128,0,stream>>>(
+                static_cast<half*>(w.queries.data),static_cast<half*>(w.means.data),
+                static_cast<float*>(w.logits.data),int(blocks),int(q.query_heads),int(q.kv_heads),int(q.head_dim),
+                q.attention_scale>0?q.attention_scale:1.f/std::sqrt(float(q.head_dim)));
+            normalize_pages<<<distributions,128,0,stream>>>(static_cast<float*>(w.logits.data),
+                static_cast<float*>(w.norms.data),int(blocks));
+            accumulate_pages<<<unsigned((blocks+127)/128),128,0,stream>>>(
+                static_cast<float*>(w.logits.data),static_cast<float*>(w.norms.data),
+                static_cast<float*>(w.output.data),int(blocks),distributions,1.f/q.query_heads);
+            checked(cudaGetLastError());
+        }
+        first+=rows;
+    }
+    if (blocks) checked(cudaMemcpyAsync(scores.data(),w.output.data,blocks*sizeof(float),cudaMemcpyDeviceToHost,stream));
+    checked(cudaStreamSynchronize(stream));
+    drain.armed=false;
+    for (size_t j=0;j<blocks;++j) result[enabled[j]]=scores[j];
     return result;
 }
 } // namespace kvmem

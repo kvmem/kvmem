@@ -69,11 +69,22 @@ function Resolve-KVMemTokenOverrides([string]$Backend, [string[]]$Arguments,
 
 # Resolve the public launch plan before either preview or process creation.
 function Resolve-KVMemTokenSettings([string]$Backend, [int]$BlockTokens,
-    [long]$Budget, [long]$Reserve, [long]$Prefill, [long]$SinkTokens, [long]$RecentTokens, [long]$Context) {
+    [long]$Budget, [long]$Reserve, [long]$Prefill, [long]$SinkTokens, [long]$RecentTokens, [long]$Context,
+    [string]$RecallStrategy='legacy', $ExplicitParameters=@{}) {
     $block = if ($Backend -eq 'ninfer') { 64 } else { $BlockTokens }
     $values = [ordered]@{Budget=$Budget; Reserve=$Reserve; SinkTokens=$SinkTokens; RecentTokens=$RecentTokens; Prefill=$Prefill; Context=$Context}
     $requested = [ordered]@{}; foreach ($key in $values.Keys) { $requested[$key]=$values[$key] }
     $adjustments = [Collections.Generic.List[object]]::new()
+    if($RecallStrategy -eq 'layerwise') {
+        if($Budget -le 0 -or $Budget % $block -or $Reserve -lt $block -or $Reserve % $block) {throw 'Layerwise Budget/Reserve require block alignment and Reserve >= one block'}
+        foreach($key in @('SinkTokens','RecentTokens')) {
+            if(!$ExplicitParameters.ContainsKey($key)) {$requested[$key]=$null;$values[$key]=$null}
+            elseif($values[$key] -lt 0 -or $values[$key] % $block) {throw "Layerwise $key requires block alignment; explicit zero is preserved"}
+        }
+        if($null -ne $values.SinkTokens -and $null -ne $values.RecentTokens -and $values.SinkTokens+$values.RecentTokens -gt $Budget) {throw 'SinkTokens + RecentTokens must fit layerwise startup Budget'}
+        if($Budget+$Reserve -gt $Context -or $Prefill -le 0) {throw 'Layerwise Budget + Reserve must fit Context and Prefill must be positive'}
+        return @{requested=$requested;effective=$values;block_tokens=$block;adjustments=@()}
+    }
     foreach ($key in @('Budget','Reserve','SinkTokens','RecentTokens')) {
         $minimum = switch ($key) {
             Budget { if ($Backend -eq 'llamacpp') { $block } else { 128 } }

@@ -33,8 +33,12 @@ def vision_geometry(model):
 
 def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     from .config import DEFAULTS, ENGINE_DEFAULTS
+    from .recall import strategy
     from .plan import token_settings, scoring_args, scoring_settings, _existing_file, _speculative
     p = dict(DEFAULTS, **ENGINE_DEFAULTS['radiance'])
+    if strategy(supplied) == 'layerwise':
+        for key in ('Budget', 'Reserve', 'HostMiB'):
+            p[key] = DEFAULTS[key]
     p.update(MtpDrafts=0, AdaptiveMtp=False, NgramDrafts=0, NgramMinMatch=12,
              DraftTokens=0, DraftPolicy='fixed')
     # The common legacy aliases retain their meaning when explicitly supplied.
@@ -71,12 +75,14 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     for key,low,high in [('CpuThreads',1,256),('VisionCacheMiB',0,65536),('Context',256,2147483647),('Budget',256,2147483647),('Reserve',256,2147483647),
         ('HostMiB',1,1048576),('Prefill',1,2147483647),('Concurrency',1,8),('RetainedSessions',0,1024),
         ('VramReserveMiB',256,65536)]:
+        if strategy(p) == 'layerwise' and key in ('Budget','Reserve'):
+            low = 128
         if not low<=p[key]<=high:raise ValueError(f'{key} must be in [{low},{high}]')
     if p.get('KvType') not in ('fp8','bf16','fp8_v4','k6_v4'):
         raise ValueError('Radiance KV format must be fp8, bf16, fp8_v4 or k6_v4')
     if p.get('StateCacheType','f32') not in ('f32','f16'):
         raise ValueError('Radiance recurrent state format must be f32 or f16')
-    tokens=token_settings('radiance',p);p.update(tokens['effective'])
+    tokens=token_settings('radiance',p,supplied=supplied);p.update(tokens['effective'])
     suffix='.exe' if platform=='windows' else ''
     p['Worker']=_existing_file(p['Worker'] or root/'workers/radiance'/('radiance-kvmem-server'+suffix),'Worker')
     p['Model']=_existing_file(p['Model'],'Model')
@@ -95,7 +101,8 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         raise ValueError('RadianceHome requires architectures/ and kernels/')
     p['RadianceHome']=str(home)
     argv=[p['Worker']]
-    def pair(flag,value):argv.extend((flag,str(value)))
+    def pair(flag,value):
+        if value is not None:argv.extend((flag,str(value)))
     for flag,key in [('--model','Model'),('--radiance-home','RadianceHome'),('--host','ListenHost'),('--port','Port'),
         ('--max-model-len','Context'),('--max-num-seqs','Concurrency'),('--max-num-batched-tokens','Prefill'),
         ('--kvmem-budget','Budget'),('--kvmem-gen-reserve','Reserve'),('--kvmem-host-mib','HostMiB'),
