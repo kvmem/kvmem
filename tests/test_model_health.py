@@ -197,6 +197,16 @@ class HealthTests(unittest.TestCase):
         second=self.root/'part.ninfer'; second.unlink()
         self.assertFalse(self.inspect(path,'ninfer')['can_start'])
 
+    def test_ninfer_exact_architecture_comes_from_packed_config(self):
+        path = self.root/'misleading-name.ninfer'
+        ninfer(path, mutate=lambda d: d['components']['text']['config'].update(
+            architectures=['ExactNativeArchitecture']))
+        result = self.inspect(path, 'ninfer', RecallStrategy='layerwise')
+        self.assertEqual(result['model']['architecture_id'], 'ExactNativeArchitecture')
+        for values in (None, [], ['First', 'Second'], 'ExactNativeArchitecture'):
+            ninfer(path, mutate=lambda d: d['components']['text']['config'].update(architectures=values))
+            self.assertNotIn('architecture_id', self.inspect(path,'ninfer')['model'])
+
     def test_isolated_inspector_reads_ninfer(self):
         path = self.root/'isolated.ninfer'
         ninfer(path, mutate=lambda d: d['components']['text']['config'].update(

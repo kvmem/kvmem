@@ -1,5 +1,6 @@
 #pragma once
 #include "graph_recall.hpp"
+#include "native_layer_query.hpp"
 #include <memory>
 
 namespace kvmem {
@@ -18,6 +19,12 @@ public:
     PageSoftmaxCuda(const PageSoftmaxCuda&) = delete;
     PageSoftmaxCuda& operator=(const PageSoftmaxCuda&) = delete;
     std::vector<double> score(const RawKvStore&, PageQueryView, const QueryScoreFrame&, GqaScoreAggregation = GqaScoreAggregation::Mean);
+    // Fresh single-layer native Q stays on its producing CUDA stream/device.
+    // Reuses the qualified page-softmax kernels and explicit FP16 boundary;
+    // transfers only canonical Mean-K operands and the resulting page masses.
+    // The borrowed stream must be eager and remains owned by the Program.
+    std::vector<double> score_current_layer(const RawKvStore&, NativeCurrentLayerQuery,
+                                          const QueryScoreFrame&, void* producer_stream);
     size_t device_bytes() const;
 private:
     struct Impl;

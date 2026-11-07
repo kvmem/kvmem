@@ -1,10 +1,41 @@
 """Read the worker contract without loading a model or initializing a GPU."""
+import copy
 import hashlib
 from functools import lru_cache
 import json
 import os
 from pathlib import Path
 import subprocess
+from .recall import require_recall_features, resource_defaults, token_constraints, mtp_history_default
+
+
+def strategy_profile(capabilities, selected):
+    """Return only an explicitly declared strategy, never a legacy substitute."""
+    if selected not in ('legacy', 'layerwise'):
+        raise ValueError('Unknown recall strategy')
+    profiles = capabilities.get('recall_strategies', {})
+    profile = profiles.get(selected) if isinstance(profiles, dict) else None
+    if selected == 'layerwise' and (type(capabilities.get('recall_strategy_revision')) is not int
+            or capabilities['recall_strategy_revision'] < 1 or not isinstance(profile, dict)
+            or profile.get('current_layer_q') is not True or profile.get('query_replay') is not False
+            or profile.get('position_policy') != 'original'):
+        return None
+    if selected == 'layerwise' and isinstance(profile, dict):
+        resource_defaults(profile)
+        token_constraints(profile)
+        specs = profile.get('speculative', {})
+        if isinstance(specs, dict):
+            for spec in specs.values():
+                if not isinstance(spec, dict):
+                    continue
+                token_constraints(profile, spec)
+                mtp_history_default(spec)
+                policies = spec.get('history_policy_caps', {})
+                if isinstance(policies, dict):
+                    for policy in policies.values():
+                        if isinstance(policy, dict):
+                            token_constraints(profile, policy)
+    return copy.deepcopy(profile) if isinstance(profile, dict) else None
 
 
 def _identity(path):
@@ -52,6 +83,7 @@ def probe_worker(worker, backend, environment=None):
 def require_launch_features(capabilities, parameters):
     if parameters.get('Lora') and capabilities.get('fixed_lora') is not True:
         raise ValueError('This worker does not support fixed LoRA; update the llama.cpp worker')
+    require_recall_features(capabilities, parameters)
     checkpoint_revision = capabilities.get('checkpoint_recompute_revision')
     if parameters.get('CheckpointExtraRecomputeTokens', 0) and (
             type(checkpoint_revision) is not int or checkpoint_revision < 1):

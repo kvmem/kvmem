@@ -1,5 +1,9 @@
 # Shared launch-time Query scoring contract; worker validates the same combinations.
+. (Join-Path $PSScriptRoot 'recall-strategy.ps1')
 function Get-KVMemQueryScoringArgs($Bound) {
+    $recall=@(Get-KVMemRecallArgs $Bound)
+    if($Bound.ContainsKey('RecallStrategy') -and $Bound.RecallStrategy -eq 'layerwise') {return $recall}
+    $recall
     $scorer = if ($Bound.ContainsKey('QueryScorer')) { $Bound['QueryScorer'] } else { 'page-softmax' }
     $cosine = $scorer -eq 'meanq-cosine'
     $agg = if ($Bound.ContainsKey('ScoreAggregation')) { $Bound['ScoreAggregation'] } elseif ($cosine) { 'max' } else { 'mean' }

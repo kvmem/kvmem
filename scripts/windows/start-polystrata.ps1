@@ -2,6 +2,8 @@
 param([Parameter(Mandatory)][System.Collections.IDictionary]$Parameters,
       [Parameter(Mandatory)][string]$Root,[string[]]$WorkerArgs=@(), [hashtable]$TokenPlan)
 $ErrorActionPreference='Stop'
+$recallBound=@{};foreach($key in $Parameters.Keys){$recallBound[$key]=$Parameters[$key]}
+$layerwise=$Parameters.ContainsKey('RecallStrategy') -and $Parameters.RecallStrategy -eq 'layerwise'
 if ($TokenPlan) {
     $copy=@{}; foreach ($key in $Parameters.Keys) { $copy[$key]=$Parameters[$key] }
     foreach ($key in $TokenPlan.effective.Keys) { $copy[$key]=$TokenPlan.effective[$key] }
@@ -20,9 +22,9 @@ foreach($name in @('StageLayers','TensorParallel','TensorSplit','FastPrefill','N
 if((Setting 'ReasoningEffort' '') -notin @('','none','low','medium','high','xhigh')) { throw 'PolyStrata reasoning effort must be none, low, medium or high' }
 if(((Setting 'ThinkingMode' 'default') -eq 'off' -and (Setting 'ReasoningEffort' '') -notin @('','none')) -or ((Setting 'ThinkingMode' 'default') -eq 'on' -and (Setting 'ReasoningEffort' '') -eq 'none')) { throw 'ThinkingMode conflicts with ReasoningEffort' }
 $mode=Setting 'SpeculativeMode' $(if((Setting 'MtpDrafts' 0) -gt 0){'mtp'}else{'none'})
-$count=Setting 'DraftTokens' (Setting 'MtpDrafts' $(if($mode -eq 'mtp'){2}else{0}))
+$count=Setting 'DraftTokens' (Setting 'MtpDrafts' $(if($mode -in @('mtp','guess')){2}else{0}))
 if($Parameters.ContainsKey('MtpDrafts') -and $Parameters.ContainsKey('DraftTokens') -and $Parameters.MtpDrafts -ne $count) { throw 'DraftTokens conflicts with MtpDrafts' }
-if($mode -notin @('none','mtp') -or ($mode -eq 'none' -and $count) -or ($mode -eq 'mtp' -and ($count -lt 1 -or $count -gt 3)) -or (Setting 'DraftPolicy' 'adaptive') -notin @('fixed','adaptive')) { throw 'PolyStrata supports native adaptive MTP with a 1..3 draft ceiling in solo execution; native batch uses ordinary decode' }
+if($mode -notin @('none','mtp','guess') -or ($mode -eq 'none' -and $count) -or ($mode -in @('mtp','guess') -and ($count -lt 1 -or $count -gt 3)) -or (Setting 'DraftPolicy' 'adaptive') -notin @('fixed','adaptive')) { throw 'PolyStrata supports native adaptive drafts with a 1..3 ceiling in solo execution; native batch uses ordinary decode' }
 $gpu=Setting 'Gpu' $env:CUDA_VISIBLE_DEVICES
 if($gpu -notmatch '^GPU-[0-9a-fA-F-]{8,64}$') { throw 'PolyStrata requires one GPU UUID' }
 $worker=Setting 'Worker' (Join-Path $Root 'workers/polystrata/strata-poly.exe')
@@ -55,12 +57,14 @@ $map=@{Host='ListenHost';Port='Port';Context='Context';Budget='Budget';Reserve='
 $defaults=@{ListenHost='127.0.0.1';Port=18200;Context=262144;Budget=32768;Reserve=1024;HostMiB=16384;Prefill=512;MaxTokens=1024;VramReserveMiB=256;SinkTokens=12288;RecentTokens=1024;RetainedSessions=[Math]::Max(4,1+[int](Setting 'Concurrency' 1));Concurrency=1;QueryMaxTokens=512;ReplayMaxTokens=2048}
 foreach($key in $map.Keys) {
     $name=$map[$key]
+    if($layerwise -and $name -in @('SinkTokens','RecentTokens') -and !$recallBound.ContainsKey($name)) {continue}
     if($Parameters.ContainsKey($name)) { $arguments+=@(('--'+$key.ToLowerInvariant()),[string]$Parameters[$name]) }
     elseif($defaults.ContainsKey($name)) { $arguments+=@(('--'+$key.ToLowerInvariant()),[string]$defaults[$name]) }
 }
 $kv=Setting 'KvType' 'f16'
 if($kv -notin @('f16','q8_0','int8','int8k')) { throw 'PolyStrata KV: Qwen supports f16/q8_0; Gemma supports f16/int8/int8k' }
 $arguments+=@('--kv-type',$kv,'--mtp-drafts',[string]$count)
+if($layerwise){$arguments+=@('--draft-method',$mode)}
 $draft=Setting 'DraftModel' ''
 if($draft) {
     if(!$count -or !(Test-Path -LiteralPath $draft -PathType Leaf) -or [IO.Path]::GetExtension($draft) -ne '.gguf') {throw 'DraftModel requires enabled MTP and an existing matching GGUF'}
@@ -92,6 +96,11 @@ if(Setting 'Vision' $false) {
     $arguments+=@('--vision-worker',$visionWorker,'--mmproj',$mmproj,'--vision-tokens',[string](Setting 'VisionTokens' 1024),'--vision-device',$(if((Setting 'VisionResidency' 'resident') -eq 'cpu'){'cpu'}else{'gpu'}))
 }
 if($WorkerArgs.Count) { $arguments+=@('--')+$WorkerArgs }
+$effective=@{};foreach($key in $Parameters.Keys){if($key -ne 'ApiKey'){$effective[$key]=$Parameters[$key]}}
+$effective.Backend='polystrata';$effective.Model=$model;$effective.Worker=$worker;$effective.Gpu=$gpu
+$effective.SpeculativeMode=$mode;$effective.DraftTokens=$count;$effective.DraftPolicy=if($count){'adaptive'}else{'fixed'}
+$effective.KvType=$kv;$effective.Concurrency=[int](Setting 'Concurrency' 1);$effective.BlockTokens=[int](Setting 'BlockTokens' 32)
+$effective.Reserve=[int](Setting 'Reserve' 1024);$effective.Vision=[bool](Setting 'Vision' $false)
 $environment=@{CUDA_DEVICE_ORDER='PCI_BUS_ID'}
 if(Setting 'ApiKey' '') { $environment.STRATA_API_KEY=$Parameters.ApiKey }
 if(Setting 'DryRun' $false) {
@@ -113,9 +122,10 @@ if(Setting 'DryRun' $false) {
         $safeEnv.STRATA_FATTN=$resolved.env.STRATA_FATTN
         $safeEnv.STRATA_FDEC=$resolved.env.STRATA_FDEC
     } finally { $check.Dispose() }
-    @{token_settings=$TokenPlan;effective_settings=@{block_tokens=[int](Setting 'BlockTokens' 32);draft_policy=$(if($count){'adaptive'}else{'fixed'});draft_tokens=$count;model_alias=$resolved.model_name;max_tokens=$resolved.kvmem_default_max_tokens;preserve_thinking=$resolved.preserve_thinking;vram_reserve_mib=$resolved.kvmem_vram_reserve_mib};backend='polystrata';native_argv=@($resolved.exe)+@($resolved.args);argv=@($python)+$arguments;environment=$safeEnv;capabilities=@{architectures=@('qwen35moe','gemma4');gpu_count=1;batch_mtp=$false;solo_mtp=($count -gt 0);concurrency=(Setting 'Concurrency' 1);kv_type=$kv;storage_quota='process'}} | ConvertTo-Json -Depth 8
+    @{token_settings=$TokenPlan;effective_parameters=$effective;effective_settings=@{block_tokens=[int](Setting 'BlockTokens' 32);draft_policy=$(if($count){'adaptive'}else{'fixed'});draft_tokens=$count;model_alias=$resolved.model_name;max_tokens=$resolved.kvmem_default_max_tokens;preserve_thinking=$resolved.preserve_thinking;vram_reserve_mib=$resolved.kvmem_vram_reserve_mib};backend='polystrata';native_argv=@($resolved.exe)+@($resolved.args);argv=@($python)+$arguments;environment=$safeEnv;capabilities=@{architectures=@('qwen35moe','gemma4');gpu_count=1;batch_mtp=$false;solo_mtp=($count -gt 0);concurrency=(Setting 'Concurrency' 1);kv_type=$kv;storage_quota='process'}} | ConvertTo-Json -Depth 8
     return
 }
+Invoke-KVMemRecallWorkerCheck $worker $effective $Root
 $info=New-KVMemProcessInfo $python $arguments
 foreach($key in $environment.Keys) { $info.EnvironmentVariables[$key]=$environment[$key] }
 $child=[Diagnostics.Process]::Start($info)

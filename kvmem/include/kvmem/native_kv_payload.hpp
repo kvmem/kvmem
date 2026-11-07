@@ -2,11 +2,46 @@
 #include "kvmem/memory_contract.hpp"
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <vector>
 
 namespace kvmem {
 class RawKvStore;
 struct RawKvStoreConfig;
+class HostKvSource;
+class HostKvLease;
+
+struct NativeKvRegion {
+    PayloadPlane plane;
+    uint64_t packed_offset = 0;
+};
+
+// Regions retain the original plane encoding, scales and head-shard identity.
+// Packed staging preserves plane alignment and zero-fills interplane padding.
+class NativeKvLayerRegions {
+public:
+    NativeKvLayerRegions(const PayloadLayout &, uint32_t layer,
+                         std::optional<uint32_t> rank = std::nullopt);
+    const std::vector<NativeKvRegion> & regions() const noexcept { return regions_; }
+    uint64_t packed_bytes() const noexcept { return packed_bytes_; }
+    uint64_t plane_bytes() const noexcept { return plane_bytes_; }
+    uint64_t record_bytes() const noexcept { return record_bytes_; }
+    // Only a complete layer is a standalone layout. Rank-filtered regions keep
+    // model-global head coordinates and must not pretend to be a full layer.
+    const PayloadLayout & packed_layout() const;
+    // Read any slice into caller-owned, disjoint staging. Each I/O is bounded;
+    // cold sources stay cold. The caller verifies catalog identity/version and
+    // publishes only after all reads succeed. Failed I/O may partially fill staging.
+    void read(const HostKvSource &, uint64_t packed_offset, void * destination,
+              size_t bytes, size_t max_read_bytes = 64u << 20) const;
+    void read(const HostKvLease &, uint64_t packed_offset, void * destination,
+              size_t bytes, size_t max_read_bytes = 64u << 20) const;
+private:
+    std::vector<NativeKvRegion> regions_;
+    PayloadLayout packed_layout_;
+    std::optional<uint32_t> rank_;
+    uint64_t packed_bytes_ = 0, plane_bytes_ = 0, record_bytes_ = 0;
+};
 
 // Opaque native bytes, including all declared scale planes and padding. This type
 // has no mean-K/Q statistics and never performs quantization or RoPE transforms.

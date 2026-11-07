@@ -23,6 +23,9 @@ def diagnose(log, parameters, token_settings):
         return None
     result = {'kind': 'gpu_memory', 'basis': 'native_planner', 'reason': '',
               'gpu': parameters.get('Gpu', ''), 'verified': False, 'options': []}
+    if parameters.get('RecallStrategy', 'legacy') == 'layerwise':
+        result['reason'] = 'layerwise_planning_unavailable'
+        return result
     if parameters.get('Backend') != 'ninfer' or ',' in parameters.get('Gpu', '') or parameters.get('TensorParallel'):
         result['reason'] = 'single_ninfer_only'
         return result

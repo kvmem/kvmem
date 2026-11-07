@@ -233,7 +233,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  assert.equal(await page.locator('[data-param=Model]').inputValue(),'C:/models/my-existing-model.ninfer');
  assert.ok(mutations.every(url=>new URL(url).pathname==='/api/launcher/inspect-model'),
   'select/undo may inspect the draft but must not mutate the server');
- assert.equal(await page.locator('[data-preset]').count(),2,'only the two NInfer templates');
+ assert.deepEqual(await page.locator('[data-preset]').evaluateAll(nodes=>nodes.map(n=>n.dataset.preset).sort()),['ninfer-layerwise','ninfer-quality','ninfer-speed']);
  await page.locator('[data-preset=ninfer-quality]').click();
  await page.getByRole('tab',{name:'服务与并发'}).click();
  assert.equal(await page.locator('[data-param=ListenHost]').isEnabled(),true);

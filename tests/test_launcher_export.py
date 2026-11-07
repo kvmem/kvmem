@@ -74,6 +74,41 @@ class ExportTest(unittest.TestCase):
     def test_exit_code_is_preserved(self):
         self.assertEqual(self.execute(self.export(), KVMEM_TEST_EXIT='42').returncode, 42)
 
+    def test_layerwise_export_executes_each_explicit_policy_with_exact_limits(self):
+        # Independent recording producer; this executable never loads model data.
+        capability = dict(schema_version=1, backend='ninfer', query_scoring_revision=2,
+            independent_graph_lrfu=True, signed_lrfu_hits=True, recall_strategy_revision=1,
+            recall_strategies={'layerwise': dict(available=True,current_layer_q=True,query_replay=False,
+                position_policy='original',minimum_reserve_blocks=1,max_devices=1,max_concurrency=1,
+                parallel_modes=['single'],kv_formats=['bf16'],vision_residency=[],speculative={
+                    'mtp': dict(available=True,history_policies=['upstream-global','first-layer'],
+                        state_modes=['native'],max_draft_tokens=3,adaptive=False,ngram=False)})})
+        old = "print(json.dumps(dict(schema_version=1, backend='ninfer', query_scoring_revision=2,\n                         independent_graph_lrfu=True, signed_lrfu_hits=True)))"
+        self.assertIn(old, WORKER)
+        self.worker.write_text(WORKER.replace(old, 'print(' + repr(json.dumps(capability)) + ')'), encoding='utf-8')
+        self.data['parameters'].update(RecallStrategy='layerwise',KvType='bf16',SpeculativeMode='mtp',
+            DraftTokens=3,DraftPolicy='fixed',SinkTokens=0,RecentTokens=0,
+            LayerwiseActivationRamMiB=0,LayerwiseActivationDiskMiB=128,LayerwiseStagingMiB=7,
+            DiskPath=str(self.directory/'activation'),DiskMiB=0,
+            LayerwiseMetadataMiB=11,LayerwiseActivationMetadataMiB=13)
+        for policy in ('upstream-global','first-layer'):
+            self.data['parameters']['LayerwiseMtpHistory'] = policy
+            exported = self.export()
+            directory, _, plan = read_revision(self.profiles,'test-model',exported['revision'])
+            saved = json.loads((directory/'profile.json').read_text(encoding='utf-8'))
+            self.assertEqual(saved['parameters']['LayerwiseMtpHistory'],policy)
+            run = self.execute(exported)
+            self.assertEqual(run.returncode,0,run.stderr)
+            argv = json.loads(self.output.read_text())['argv']
+            self.assertEqual(argv,plan['argv'])
+            for flag,value in (('--kvmem-recall-strategy','layerwise'),('--kvmem-layerwise-mtp-history',policy),
+                ('--kvmem-layerwise-activation-ram-mib','0'),('--kvmem-layerwise-activation-disk-mib','128'),
+                ('--kvmem-layerwise-staging-mib','7'),('--kvmem-layerwise-metadata-mib','11'),
+                ('--kvmem-layerwise-activation-metadata-mib','13'),('--kvmem-recent-tokens','0')):
+                self.assertEqual(argv.count(flag),1)
+                self.assertEqual(argv[argv.index(flag)+1],value)
+            self.assertNotIn('--kvmem-query-replay-max-tokens',argv)
+
     def test_no_ui_process_is_needed_and_lock_blocks_another_revision(self):
         first = self.export()
         second = self.export()

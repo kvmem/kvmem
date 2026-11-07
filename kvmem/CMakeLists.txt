@@ -4,6 +4,18 @@ add_library(kvmem
     src/host/raw_kv_store.cpp
     src/host/mean_key_retrieval.cpp
     src/host/graph_recall.cpp
+    src/host/layerwise_scoring.cpp
+    src/host/layerwise_query.cpp
+    src/host/layerwise_request.cpp
+    src/host/layerwise_selection.cpp
+    src/host/layerwise_probe_selection.cpp
+    src/host/layerwise_memory.cpp
+    src/host/layerwise_pressure.cpp
+    src/host/layerwise_output_scope.cpp
+    src/host/layerwise_window.cpp
+    src/host/layerwise_import.cpp
+    src/host/layerwise_options.cpp
+    src/host/query_projection_tape.cpp
     src/host/memory_contract.cpp
     src/host/kv_content.cpp
     src/host/native_kv_payload.cpp
@@ -104,6 +116,26 @@ target_link_libraries(content_cache_test PRIVATE Threads::Threads)
 target_link_libraries(kv_snapshot_test PRIVATE Threads::Threads)
 kvmem_add_test(mean_key_retrieval_test)
 kvmem_add_test(graph_recall_test)
+kvmem_add_test(layerwise_scoring_test)
+kvmem_add_test(layerwise_query_test)
+kvmem_add_test(layerwise_request_test)
+kvmem_add_test(layerwise_pressure_test)
+kvmem_add_test(layerwise_output_scope_test)
+kvmem_add_test(layerwise_window_test)
+kvmem_add_test(layerwise_import_test)
+target_compile_definitions(layerwise_import_test PRIVATE
+    KVMEM_IMPORT_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/layerwise_import_fixtures.tsv")
+add_executable(layerwise_keep_bands_test tests/layerwise_keep_bands_test.cpp tests/layerwise_keep_bands_oracle.cpp)
+target_link_libraries(layerwise_keep_bands_test PRIVATE kvmem)
+add_test(NAME layerwise_keep_bands_test COMMAND layerwise_keep_bands_test)
+target_compile_definitions(layerwise_window_test PRIVATE
+    KVMEM_WINDOW_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/layerwise_window_fixtures.tsv")
+kvmem_add_test(layer_payload_test)
+kvmem_add_test(layerwise_selection_test)
+kvmem_add_test(layerwise_probe_selection_test)
+target_sources(layerwise_selection_test PRIVATE tests/layerwise_keep_bands_oracle.cpp)
+kvmem_add_test(layerwise_memory_test)
+kvmem_add_test(query_projection_tape_test)
 kvmem_add_test(query_policy_test)
 kvmem_add_test(kvmem_runtime_test)
 kvmem_add_test(raw_kv_store_test)

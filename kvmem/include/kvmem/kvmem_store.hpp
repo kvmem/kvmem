@@ -499,6 +499,7 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> media_ranges_;
 public:
     void set_media_ranges(std::vector<std::pair<uint32_t, uint32_t>> ranges) { media_ranges_ = std::move(ranges); }
+    const std::vector<std::pair<uint32_t,uint32_t>> & media_ranges() const noexcept { return media_ranges_; }
     size_t allocated_bytes() const {
         return sizeof(*this) + blocks_.capacity()*sizeof(KvMemBlock) +
             history_.allocated_bytes() +
