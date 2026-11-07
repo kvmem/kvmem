@@ -55,9 +55,8 @@ struct GraphPartial {
     std::vector<GraphEdge> mass;
 };
 class GraphBudgetLease;
-// Conservative accounting: immutable chunks are shared, while each live snapshot
-// is charged its full logical footprint. Thus shared storage can never hide a
-// budget excess. Parent accounts bound all lanes and retained conversations.
+// Each snapshot charges its private state. Shared immutable allocations are
+// charged once in each budget that uses them, including common ancestors.
 class GraphStatisticsBudget : public std::enable_shared_from_this<GraphStatisticsBudget> {
 public:
     explicit GraphStatisticsBudget(size_t limit,std::shared_ptr<GraphStatisticsBudget> parent={})
