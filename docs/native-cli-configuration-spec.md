@@ -1,5 +1,13 @@
 # KVMem 原生命令行与公共配置规范
 
+## 独立分层策略
+
+新增 `RecallStrategy=legacy|layerwise` 和五个有限激活/metadata 资源字段；
+完整字段、原生 flag、显式 OWN MTP 双策略、Gemma Guess 与 DFlash2 窗口语义见
+[分层召回配置](layerwise-recall.md)。下文旧参数对齐、评分器和 Query replay 说明属于 Legacy。
+Layerwise 的显式块值不自动取整；sink/recent 空缺与显式 0 分开处理，
+每个 worker 用独立策略能力声明实际最低 G、KV、并行和草稿组合。Radiance 新 prefill 缺省为 256。
+
 ## 启动参数对齐（2026-10-27）
 
 llama.cpp 服务端与独立 CLI、PolyStrata 的默认 KV 管理块大小为 32；ninfer 仍为 64。

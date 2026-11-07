@@ -41,8 +41,9 @@ $files = @('START-HERE-CN.bat', 'START-HERE-EN.bat', 'scripts/local-console.py',
            'scripts/windows/native-process.ps1', 'scripts/windows/query-scoring.ps1', 'scripts/windows/token-settings.ps1', 'scripts/windows/select-model.ps1', 'scripts/speculative-capabilities.json')
 $files += 'scripts/model_health.py', 'scripts/console_hardware.py', 'scripts/console_memory.py', 'scripts/requirements-console.txt'
 $files += 'scripts/launcher-capabilities.json'
+$files += 'scripts/check-recall-worker.py', 'scripts/windows/recall-strategy.ps1'
 $files += 'backends/radiance/tools/inspect_rad.py', 'backends/radiance/tools/draft_control.py'
-foreach ($name in '__init__.py', 'config.py', 'plan.py', 'radiance.py', 'export.py', 'systemd.py', 'worker.py') {
+foreach ($name in '__init__.py', 'config.py', 'plan.py', 'radiance.py', 'export.py', 'systemd.py', 'worker.py', 'recall.py') {
     $files += 'scripts/launcher/' + $name
 }
 foreach ($name in '__init__.py', 'reader.py', 'schema.py', 'layouts.py', 'formats.py', 'framing.py', 'file_io.py', 'LICENSE', 'PROVENANCE.json') {

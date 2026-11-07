@@ -5,6 +5,7 @@ import os
 from pathlib import Path, PureWindowsPath
 
 from .config import DEFAULTS, SPECULATIVE_PROFILES, ROOT, normalize
+from .recall import LAYERWISE_RESOURCES, recall_args, strategy
 
 MANIFEST = ROOT / 'scripts/launcher-capabilities.json'
 NINFER_KV = ('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8')
@@ -36,6 +37,14 @@ def scoring_settings(argv):
     """Scoring metadata for UI and CLI consumers of the same native argv."""
     def value(flag, default):
         return argv[argv.index(flag) + 1] if flag in argv else default
+    if value('--kvmem-recall-strategy', 'legacy') == 'layerwise':
+        result = {'strategy': 'layerwise', 'current_layer_q': True, 'query_replay': False}
+        if '--kvmem-layerwise-mtp-history' in argv:
+            result['mtp_history'] = value('--kvmem-layerwise-mtp-history', None)
+        for _, (flag, _) in LAYERWISE_RESOURCES.items():
+            if flag in argv:
+                result[flag.removeprefix('--kvmem-layerwise-').replace('-', '_').replace('_mib', '_bytes')] = int(value(flag, None)) << 20
+        return result
     return {'scorer': value('--kvmem-query-scorer', 'page-softmax'),
             'agg': value('--kvmem-score-agg', 'mean'), 'lrfu': '--kvmem-lrfu' in argv,
             'lambda': float(value('--kvmem-lrfu-lambda', .5)),
@@ -45,11 +54,29 @@ def scoring_settings(argv):
             'query_replay_max_tokens': int(value('--kvmem-query-replay-max-tokens', 2048))}
 
 
-def token_settings(backend, values, block=32):
+def token_settings(backend, values, block=32, supplied=None):
     """Resolve token invariants; all consumers use the resulting effective values."""
     block = 128 if backend == 'radiance' else 64 if backend == 'ninfer' else block
     if block not in ((128,) if backend=='radiance' else (32,64)):
         raise ValueError('BlockTokens must be 32 or 64')
+    if strategy(values) == 'layerwise':
+        explicit = values if supplied is None else supplied
+        requested = {key: values[key] for key in ('Budget', 'Reserve', 'Prefill', 'Context')}
+        for key in ('SinkTokens', 'RecentTokens'):
+            requested[key] = explicit.get(key)
+        effective = dict(requested)
+        if requested['Budget'] <= 0 or requested['Budget'] % block or requested['Reserve'] % block or requested['Reserve'] < block:
+            raise ValueError('Layerwise Budget/Reserve require block alignment and Reserve >= one block')
+        for key in ('SinkTokens', 'RecentTokens'):
+            if requested[key] is not None and (requested[key] < 0 or requested[key] % block):
+                raise ValueError(f'Layerwise {key} requires block alignment; explicit zero is preserved')
+        if all(requested[key] is not None for key in ('SinkTokens', 'RecentTokens')) and requested['SinkTokens'] + requested['RecentTokens'] > requested['Budget']:
+            raise ValueError('SinkTokens + RecentTokens must fit layerwise startup Budget')
+        if requested['Budget'] + requested['Reserve'] > requested['Context']:
+            raise ValueError('Budget + Reserve must fit Context')
+        if requested['Prefill'] <= 0:
+            raise ValueError('Layerwise Prefill must be positive')
+        return dict(requested=requested, effective=effective, block_tokens=block, adjustments=[])
     requested = {k: values[k] for k in ('Budget', 'Reserve', 'SinkTokens', 'RecentTokens', 'Prefill', 'Context')}
     effective = dict(requested)
     minima = {'Budget': 2*block if backend=='radiance' else block if backend == 'llamacpp' else 128, 'Reserve': block,
@@ -81,6 +108,8 @@ def token_settings(backend, values, block=32):
 
 
 def scoring_args(p):
+    if strategy(p) == 'layerwise':
+        return recall_args(p)
     cosine = p.get('QueryScorer', 'page-softmax') == 'meanq-cosine'
     scorer = p.get('QueryScorer', 'page-softmax')
     aggregation = p.get('ScoreAggregation', 'max' if cosine else 'mean')
@@ -97,7 +126,7 @@ def scoring_args(p):
                       ('QueryReplayMaxTokens', '--kvmem-query-replay-max-tokens')]:
         if key in p:
             args += [flag, str(p[key])]
-    return args
+    return recall_args(p) + args
 
 
 def _existing_file(value, label):
@@ -116,6 +145,9 @@ def _speculative(p, supplied):
     if spec is None:
         raise ValueError('Unsupported SpeculativeMode')
     count = p.get('DraftTokens', p['MtpDrafts'])
+    if (strategy(p) == 'layerwise' and mode != 'none'
+            and 'DraftTokens' not in supplied and 'MtpDrafts' not in supplied):
+        raise ValueError('Layerwise speculative decoding requires an explicit draft width')
     if 'DraftTokens' not in supplied and mode != 'none' and not count:
         count = 5 if mode == 'dflash2' else 4
     adaptive = p.get('DraftPolicy', 'adaptive' if p['AdaptiveMtp'] else 'fixed') == 'adaptive'
@@ -175,6 +207,8 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
     if backend == 'polystrata':
         raise ValueError('Portable PolyStrata plan generation is not available yet; use the Windows launcher')
     for key, (low, high) in RANGES.items():
+        if strategy(p) == 'layerwise' and key == 'Budget':
+            low = 1  # The strategy-specific token check enforces native block alignment.
         if key in p and not low <= p[key] <= high:
             raise ValueError(f'{key} must be in [{low}, {high}]')
     if p['VisionResidency'] not in ('resident', 'cpu') or p['DeviceProfile'] not in ('off', 'auto'):
@@ -190,21 +224,25 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
         raise ValueError(f'{backend} requires a {caps[backend]["model_format"]} model')
     if os.name != 'nt' and platform == 'linux' and not os.access(p['Worker'], os.X_OK):
         raise ValueError('Worker is not executable')
-    if p.get('DiskPath') and not p['DiskMiB']:
+    activation_disk = strategy(p) == 'layerwise' and p.get('LayerwiseActivationDiskMiB', 0) > 0
+    if activation_disk and 'DiskMiB' not in supplied:
+        p['DiskMiB'] = 0
+    if p.get('DiskPath') and not p['DiskMiB'] and not activation_disk:
         raise ValueError('Omit DiskPath when DiskMiB is 0')
-    if ('DiskPath' in supplied or supplied.get('DiskMiB', 0) > 0) and not p.get('DiskPath', '').strip():
+    if ('DiskPath' in supplied or supplied.get('DiskMiB', 0) > 0 or activation_disk) and not p.get('DiskPath', '').strip():
         raise ValueError('SSD storage requires a nonempty DiskPath')
     if p.get('ChatTemplateFile'):
         p['ChatTemplateFile'] = _existing_file(p['ChatTemplateFile'], 'ChatTemplateFile')
     physical_prefill = p['Prefill']
-    tokens = token_settings(backend, p)
+    tokens = token_settings(backend, p, supplied=supplied)
     p.update(tokens['effective'])
     _speculative(p, supplied)
     p['KvType'] = p.get('KvType') or ('int8' if backend == 'ninfer' else 'q8_0')
     argv = [p['Worker']]
 
     def pair(flag, value):
-        argv.extend((flag, str(value)))
+        if value is not None:
+            argv.extend((flag, str(value)))
 
     if backend == 'ninfer':
         layers = p.get('StageLayers', [])
@@ -216,8 +254,10 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
             raise ValueError('Fast prefill requires INT8 or supported rotated KV')
         if p['VisionResidency'] == 'cpu' and not p['Vision']:
             raise ValueError('CPU Vision requires Vision')
-        p['NgramDrafts'] = min(p['NgramDrafts'], 15) if p['Concurrency'] > 1 else p['NgramDrafts']
-        if p['NgramDrafts'] and (not p['MtpDrafts'] or max(p['MtpDrafts'], p['NgramDrafts']) + p['MtpDrafts'] > p['Reserve']):
+        if strategy(p) != 'layerwise' and p['Concurrency'] > 1:
+            p['NgramDrafts'] = min(p['NgramDrafts'], 15)
+        if p['NgramDrafts'] and (not p['MtpDrafts'] or (strategy(p) != 'layerwise' and
+                max(p['MtpDrafts'], p['NgramDrafts']) + p['MtpDrafts'] > p['Reserve'])):
             raise ValueError('Ngram requires speculative decoding and enough Reserve')
         argv.append(p['Model'])
         for flag, key in [('--host', 'ListenHost'), ('--port', 'Port'), ('--max-context', 'Context'),
@@ -332,7 +372,10 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
     if p.get('DiskPath'):
         pair('--kvmem-disk-path', p['DiskPath'])
         pair('--kvmem-disk-mib', p['DiskMiB'])
-    argv += scoring_args(supplied) + p.get('WorkerArgs', [])
+    argv += scoring_args(supplied)
+    if backend == 'llamacpp' and strategy(p) == 'layerwise' and p['SpeculativeMode'] == 'mtp':
+        pair('--kvmem-mtp-state', 'replay')
+    argv += p.get('WorkerArgs', [])
     environment = {'CUDA_VISIBLE_DEVICES': p['Gpu'], 'CUDA_DEVICE_ORDER': 'PCI_BUS_ID'}
     if backend == 'ninfer':
         # Explicit zero keeps an inherited environment from enabling an unsaved policy.

@@ -37,6 +37,7 @@ def package(source, output, chat, wheel, expected, backend='ninfer'):
              'scripts/local-console.py', 'scripts/launcher-cli.py', 'scripts/console_chat.py', 'scripts/console_radiance.py',
              'scripts/console_hardware.py', 'scripts/console_memory.py', 'scripts/model_health.py', 'scripts/requirements-console.txt',
              'scripts/launcher-capabilities.json', 'scripts/speculative-capabilities.json',
+             'scripts/check-recall-worker.py',
              'docs/linux-launcher.md']
     if backend in ('radiance','all'):
         files.extend(('backends/radiance/tools/inspect_rad.py',
