@@ -29,6 +29,7 @@ static void check(llama_model * model, int rows) {
     memory.block_tokens = 32;
     memory.budget = 256;
     memory.gen_reserve = 128;
+    memory.payload_host_bytes = 32u << 20;
     memory.query_begin = memory.query_end = memory.force_pos = -1;
     llama_kvmem_set_params(&memory);
     auto params = llama_context_default_params();
@@ -62,6 +63,22 @@ static void check(llama_model * model, int rows) {
     const auto blocks = (rows + 31) / 32;
     const auto expected_shared = image->size() / blocks * (rows / 32);
     require(shared == expected_shared, "full blocks did not share, or partial tail was aliased");
+    if (rows == 65) {
+        bool rejected = false;
+        {
+            std::vector<std::shared_ptr<const llama_kvmem_checkpoint_snapshot>> pressure;
+            try {
+                for (int i = 0; i < 128; ++i) pressure.push_back(llama_kvmem_checkpoint_capture(rows));
+            } catch (const kvmem::MemoryError & error) {
+                require(error.code() == kvmem::MemoryErrorCode::BudgetExceeded, "unexpected capture failure");
+                rejected = true;
+            }
+        }
+        require(rejected, "private-tail pressure never reached the shared H limit");
+        require(image->read() == immutable_bytes, "failed capture damaged old source");
+        require(llama_kvmem_checkpoint_restore(*immutable), "cannot restore source after H rejection");
+        require(state(ctx.get()) == before, "H rejection changed native source state");
+    }
     const auto captured = llama_kvmem_get_snapshot_stats();
     {
         Bundle unchanged(llama_kvmem_store_bundle_fork(), llama_kvmem_store_bundle_free);

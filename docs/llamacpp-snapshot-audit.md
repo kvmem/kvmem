@@ -1,14 +1,13 @@
-# llama.cpp immutable snapshot adaptation: baseline audit
+# llama.cpp immutable snapshot adaptation: implementation audit
 
-Status: backend integration pending public-interface coordination. Source audit,
-five host tests and two native baseline models completed; no optimized candidate
-or performance comparison is claimed.
+Status: integrated against public PR271; final validation and controlled performance
+report are in progress. The first sections preserve the original baseline audit.
 
 Baseline KVMem: f0a3d51f889d0100ae97bc43a46a398937ffb4b5.
 Pinned llama.cpp: cd959bae99ff4bed22bef2604f45241c09bbb8c8.
 Ordered patches: kvmem, pq2, ptq1, ptq1-performance, checkpoint-policy.
 Expected prepared tree: 1a8155219356073fe1f8a3528d2c7f203521554b.
-Remote: XIAO / 5070TiM, GPU-940f1324-a09e-39f9-bd7f-ea87f1c12f8e.
+Remote: authorized 5070Ti Laptop test host, GPU-A.
 
 ## Existing paths
 
@@ -40,13 +39,13 @@ Remote: XIAO / 5070TiM, GPU-940f1324-a09e-39f9-bd7f-ea87f1c12f8e.
   SpillFile as KV, but the recurrent/carry vectors have a separate checkpoint
   host account. This is not yet unified HostKvStorage ownership.
 
-## Public capability request (pending coordination)
+## Historical public capability request (resolved by PR271)
 
 User identified `KVMEM缓存修复NInfer - M16 3080ti` as coordinator on
 2026-11-07. The four-part request below was delivered to that chat
 (`01a1b156-37cc-7a83-b3aa-f94c18a6a948`); integration awaits its coordinated API.
 The coordinator acknowledged the request and will publish design/PR/commit in
-`C:/Users/leyew/AppData/Local/KVMem/gpu-lab/shared-snapshot-coordination.md`.
+`$ARTIFACTS/gpu-lab/shared-snapshot-coordination.md`.
 Its initial direction retains full-record KvSnapshot coverage, sealed full-block
 references and private tails allocated through existing HostKvStorage.
 
@@ -382,4 +381,3 @@ A direct-producer/leased-view API proposal was sent to the public coordinator,
 who deferred any extension pending controlled measurements. No public code was
 duplicated or changed to bypass that decision. Final ABBA results and limitations
 remain to be added before PR readiness.
-

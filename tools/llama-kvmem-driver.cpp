@@ -854,6 +854,12 @@ static void checkpoint_tier(LlamaEngineState & st, bool drain, bool force) {
         auto & job = *st.mm_checkpoint_write;
         if (drain) { try { job.ticket.wait(); } catch (...) {} }
         if (!job.ticket.ready()) return;
+        if (job.ticket.status() == kvmem::StorageTaskStatus::Failed) {
+            try { job.ticket.wait(); }
+            catch (const std::exception & error) {
+                kvmem_diag("KVMEM_CHECKPOINT_TIER skipped=%s\n", error.what());
+            }
+        }
         const auto & source = job.source;
         if (source->native_image.resident_bytes()) source->residency = source->native_image.lease();
         else kvmem_diag("KVMEM_CHECKPOINT_TIER write_bytes=%zu cold=1\n", source->native_image.size());
