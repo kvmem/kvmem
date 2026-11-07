@@ -221,15 +221,16 @@ even when another checkout's launcher declares experimental engines. Unsupported
 are explicitly unavailable. Common controls include a single API key, served model name,
 log level, custom chat-template file, default thinking mode and concurrency. They map to
 each backend's existing native flags; NInfer's thinking-on override remains a chat-request
-setting. llama.cpp currently exposes concurrency 1–4 on one GPU, NInfer 1–8.
+setting. llama.cpp currently exposes concurrency 1–4, NInfer 1–8.
 Native options keep their original spellings, with a small
 allowlist of numeric thread/GPU-offload options; arbitrary shell text and duplicate common
 options are rejected. Both engines use the same GPU cards. Switching engines preserves the
-selected UUIDs and their order; it never silently chooses another card. Multi-GPU launch is
-currently exposed for NInfer layer splitting. When switching a multi-GPU selection to
-llama.cpp, the cards keep that selection and explain that this launcher currently requires
-one GPU for llama.cpp. Validation blocks preview/start until the user selects one card.
-This is a limit of the current launcher integration, not a claim that llama.cpp lacks multi-GPU support.
+selected UUIDs and their order; it never silently chooses another card. Multi-GPU launch
+covers NInfer layer splitting and llama.cpp layer offload: from two cards on, the launcher
+passes the device list, layer split mode and full offload, while the optional split weights
+become per-card proportions (for example `11,9`) instead of NInfer's per-device layer
+counts. llama.cpp DFlash2 still takes one card. Validation keeps a selection the chosen
+backend or draft method cannot serve and explains what to change.
 
 Common resource, cache and service settings follow the current edits when switching engines,
 including GPU selection, context/B/R/H, prefill/output budgets, port/listen address, concurrency,

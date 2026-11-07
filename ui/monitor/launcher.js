@@ -656,10 +656,11 @@
     const tensor=get('TensorParallel');
     dependency('TensorParallel',backend==='ninfer'&&gpuCount>1,tr('至少选择两张显卡后才能启用张量并行。','Select at least two GPUs to enable tensor parallelism.'));
     const heads=!!tensor?.checked&&!tensor.disabled;
-    dependency('StageLayers',gpuCount>1&&!heads,tr('层数分配用于非 TP 多卡模式。','Layer allocation applies to multiple GPUs without TP.'));
-    dependency('TensorSplit',heads,tr('先启用张量并行。','Enable tensor parallelism first.'));
+    const llamaSplit=backend==='llamacpp';
+    dependency('StageLayers',backend==='ninfer'&&gpuCount>1&&!heads,tr('层数分配用于非 TP 多卡模式。','Layer allocation applies to multiple GPUs without TP.'));
+    dependency('TensorSplit',heads||(llamaSplit&&gpuCount>1),heads||llamaSplit?tr('至少选择两张显卡后才能设置分卡权重。','Select at least two GPUs to set split weights.'):tr('先启用张量并行。','Enable tensor parallelism first.'));
     const weights=get('TensorSplit');
-    if(weights){const parts=weights.value.split(',');weights.setCustomValidity(heads&&weights.value.trim()&&(parts.length!==gpuCount||parts.some(x=>!x.trim()||!Number.isFinite(Number(x))||Number(x)<=0)||!Number.isFinite(parts.reduce((total,x)=>total+Number(x),0)))?tr('请按显卡顺序填写等量的正数权重，或留空自动分配。','Enter one positive weight per GPU in order, or leave empty for automatic allocation.'):'');}
+    if(weights){const parts=weights.value.split(',');weights.setCustomValidity((heads||llamaSplit)&&weights.value.trim()&&(parts.length!==gpuCount||parts.some(x=>!x.trim()||!Number.isFinite(Number(x))||Number(x)<=0)||!Number.isFinite(parts.reduce((total,x)=>total+Number(x),0)))?tr('请按显卡顺序填写等量的正数权重，或留空自动分配。','Enter one positive weight per GPU in order, or leave empty for automatic allocation.'):'');}
     const keyType=get('KvTypeK'),valueType=get('KvTypeV'),pairStatus=root.querySelector('[data-kv-pair-status]');
     if(keyType&&valueType){
       const quantized=['q8_0','q5_0','q4_0'],mixed=keyType.value&&valueType.value&&quantized.includes(keyType.value)!==quantized.includes(valueType.value);
@@ -990,7 +991,7 @@
         const validWeights=weights.length===order.length&&weights.every(x=>x&&Number.isFinite(Number(x))&&Number(x)>0)&&Number.isFinite(weights.reduce((total,x)=>total+Number(x),0));
         order.forEach((id,i)=>{
           const device=info.gpus.find(g=>g.uuid===id),row=make('div',{class:'l-gpu-order-row','data-ordered-gpu':id,tabindex:'-1'});
-          const allocation=rad?tr('张量并行','Tensor parallel'):heads?(validWeights?tr('权重 '+weights[i],'Weight '+weights[i]):split?.value.trim()?tr('待校验','Needs validation'):tr('自动分配','Automatic')):(valid?tr(layers[i]+' 层',layers[i]+' layers'):input?.value.trim()?tr('待校验','Needs validation'):tr('自动分配','Automatic'));
+          const allocation=rad?tr('张量并行','Tensor parallel'):heads||!split?.disabled?(validWeights?tr('权重 '+weights[i],'Weight '+weights[i]):split?.value.trim()?tr('待校验','Needs validation'):tr('自动分配','Automatic')):(valid?tr(layers[i]+' 层',layers[i]+' layers'):input?.value.trim()?tr('待校验','Needs validation'):tr('自动分配','Automatic'));
           row.append(make('span',{class:'l-gpu-position'},String(i+1)),make('span',{class:'l-gpu-order-name'},device.name.replace(/^NVIDIA GeForce /,'')+' · '+id.slice(-8)),make('small',{'data-gpu-layers':''},allocation));
           for(const [delta,zh,en] of [[-1,'前移','Move earlier'],[1,'后移','Move later']]){
             const move=make('button',{type:'button',class:'s-button','data-gpu-move':String(delta),'aria-label':tr(zh,en)+' · '+device.name+' · '+id.slice(-8)},tr(zh,en));
@@ -1002,7 +1003,7 @@
                 else{input.value='';message(tr('原层数分配不完整，已清空；请按新的显卡顺序重新设置。','Incomplete layer allocation cleared; configure it for the new GPU order.'));}
               }
               const split=root.querySelector('[data-param=TensorSplit]');
-              if(split?.value.trim()){const weights=split.value.split(',').map(x=>x.trim());if(weights.length===order.length&&weights.every(x=>x&&Number.isFinite(Number(x))&&Number(x)>0)){[weights[i],weights[target]]=[weights[target],weights[i]];split.value=weights.join(',');}else{split.value='';message(tr('原 TP 权重不完整，已清空，请重新设置。','Incomplete TP weights cleared; configure them again.'));}}
+              if(split?.value.trim()){const weights=split.value.split(',').map(x=>x.trim());if(weights.length===order.length&&weights.every(x=>x&&Number.isFinite(Number(x))&&Number(x)>0)){[weights[i],weights[target]]=[weights[target],weights[i]];split.value=weights.join(',');}else{split.value='';message(tr('原分卡权重不完整，已清空，请重新设置。','Incomplete split weights cleared; configure them again.'));}}
               [order[i],order[target]]=[order[target],order[i]];sync();gpu.dispatchEvent(new Event('input',{bubbles:true}));
               Array.from(ordered.querySelectorAll('[data-ordered-gpu]')).find(el=>el.dataset.orderedGpu===id)?.focus();
             };
@@ -1014,10 +1015,11 @@
       function sync(){
         for(const id of [...order,...info.gpus.map(g=>g.uuid).filter(id=>!order.includes(id))]){const option=options.get(id);gpu.append(option);option.selected=order.includes(id);}
         checks.forEach(check=>{check.checked=order.includes(check.dataset.gpuChoice);check.closest('label').classList.toggle('is-selected',check.checked);});
-        const maxDevices=rad?(info.backend_capabilities?.[b]?.supported_combinations?.text?.max_devices||1):(l||poly)?1:8;
+        const llamaDevices=l?(info.speculative_capabilities?.[b]?.[p.SpeculativeMode||'none']||{}).max_devices||8:0;
+        const maxDevices=rad?(info.backend_capabilities?.[b]?.supported_combinations?.text?.max_devices||1):llamaDevices||(poly?1:8);
         const tooMany=order.length>maxDevices;
         const foreignGpu=rad&&order.some(id=>{const vendor=info.gpus.find(g=>g.uuid===id)?.vendor;return vendor&&vendor.toLowerCase()!=='amd';});
-        const reason=tooMany?(rad?tr(`当前后端最多支持 ${maxDevices} 张显卡。请调整选择后启动。`,`This backend supports up to ${maxDevices} GPUs. Adjust the selection before starting.`):tr('当前后端仅接入单卡。已保留原选择，请只勾选一张显卡后再启动。','This backend currently exposes one GPU. Your selection is retained; select just one GPU before starting.')):foreignGpu?tr('Radiance 需要 AMD 显卡，请更改当前选择。','Radiance requires an AMD GPU; change the selected device.'):!order.length?tr('请至少选择一张显卡','Select at least one GPU'):'';
+        const reason=tooMany?(rad||maxDevices>1?tr(`当前后端最多支持 ${maxDevices} 张显卡。请调整选择后启动。`,`This backend supports up to ${maxDevices} GPUs. Adjust the selection before starting.`):l&&p.SpeculativeMode==='dflash2'?tr('当前草稿方式仅接入单卡。已保留原选择，请只勾选一张显卡后再启动。','This draft method exposes one GPU. Your selection is retained; select just one GPU before starting.'):tr('当前后端仅接入单卡。已保留原选择，请只勾选一张显卡后再启动。','This backend currently exposes one GPU. Your selection is retained; select just one GPU before starting.')):foreignGpu?tr('Radiance 需要 AMD 显卡，请更改当前选择。','Radiance requires an AMD GPU; change the selected device.'):!order.length?tr('请至少选择一张显卡','Select at least one GPU'):'';
         gpuLimit.textContent=reason;gpuLimit.hidden=!reason;gpuLimit.classList.toggle('l-error',tooMany||foreignGpu);
         checks[0].setCustomValidity(reason);choices.setAttribute('aria-invalid',String(!!reason));drawOrder();
       }
@@ -1135,8 +1137,9 @@
     if(poly||rad){const vram=field(panels[1],p,'VramReserveMiB','显存预留 · MiB','VRAM reserve · MiB','number',null,['原生引擎最低为 256 MiB；与生成追加空间的 token 预算分别设置。','Worker minimum: 256 MiB. Separate from the generation workspace measured in tokens.']);vram.min='256';vram.max='65536';}
     const tensor=field(panels[1],p,'TensorParallel','张量并行 · heads','Tensor parallelism · heads','checkbox',null,
       ['将每层计算分配到多张显卡。默认关闭；启用后只使用 heads 注意力。','Distribute each layer across GPUs. Off by default; uses heads attention.'],!n);
-    const tensorSplit=field(panels[1],{...p,TensorSplit:(p.TensorSplit||[]).join(',')},'TensorSplit','TP 权重（可选）','TP weights (optional)','text',null,
-      ['依次对应上方显卡，例如 3,1；留空由后端根据可用显存和连接情况分配。实际比例受 head 和量化分块约束。','In GPU order, e.g. 3,1. Empty lets the backend allocate using available memory and links. Heads and quantization constrain the actual split.'],!n);
+    const tensorSplit=field(panels[1],{...p,TensorSplit:(p.TensorSplit||[]).join(',')},'TensorSplit','分卡权重（可选）','Split weights (optional)','text',null,
+      l?['依次对应上方显卡的层驻留比例，例如 11,9；留空由后端按可用显存分配。llama.cpp 只按层切分，没有张量并行。','Layer residency proportions in GPU order, e.g. 11,9. Empty lets the backend split by available VRAM. llama.cpp splits by layer and has no tensor parallelism.']
+      :['依次对应上方显卡，例如 3,1；留空由后端根据可用显存和连接情况分配。实际比例受 head 和量化分块约束。','In GPU order, e.g. 3,1. Empty lets the backend allocate using available memory and links. Heads and quantization constrain the actual split.'],!(n||l));
     tensor.addEventListener('change',refreshGpuOrder);tensorSplit.addEventListener('input',refreshGpuOrder);
     const layerSplit=field(panels[1],{...p,StageLayers:(p.StageLayers||[]).join(',')},'StageLayers','多卡层数分配（可选）','Layer split (optional)','text',null,[n?'依次对应上方第 1、2…张显卡，用逗号分隔；留空由后端分配':'当前接入暂不支持设置多卡层数',n?'Comma-separated counts for GPU 1, 2, … above; empty uses backend allocation':'Layer assignment is unavailable in this integration'],!n);
     layerSplit.addEventListener('input',refreshGpuOrder);refreshGpuOrder();

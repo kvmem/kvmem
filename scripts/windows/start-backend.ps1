@@ -361,8 +361,21 @@ if ($Backend -eq 'ninfer') {
     if (($effectiveK -in $quantized) -ne ($effectiveV -in $quantized)) {
         throw 'llama.cpp cannot mix floating-point and quantized K/V; choose q8_0/q5_0/q4_0 for both, or f16/f32 for both'
     }
-    foreach ($name in @('StageLayers', 'TensorParallel', 'TensorSplit', 'FastPrefill', 'NgramDrafts', 'NgramMinMatch', 'DeviceProfile', 'CpuVisionIdleSeconds')) {
+    foreach ($name in @('StageLayers', 'TensorParallel', 'FastPrefill', 'NgramDrafts', 'NgramMinMatch', 'DeviceProfile', 'CpuVisionIdleSeconds')) {
         if ($PSBoundParameters.ContainsKey($name)) { throw "-$name configures ninfer; use llama native options in -WorkerArgs" }
+    }
+    $llamaGpuIds = @($Gpu.Split(',') | ForEach-Object { $_.Trim() })
+    if ($llamaGpuIds.Count -gt 8 -or @($llamaGpuIds | Where-Object { !$_ -or $_ -eq '-1' }).Count -or
+        @($llamaGpuIds | Select-Object -Unique).Count -ne $llamaGpuIds.Count) {
+        throw 'llama.cpp requires 1..8 distinct GPU UUIDs in -Gpu, in layer split order'
+    }
+    $Gpu = $llamaGpuIds -join ','
+    if ($TensorSplit.Count -and ($llamaGpuIds.Count -lt 2 -or $TensorSplit.Count -ne $llamaGpuIds.Count -or
+        @($TensorSplit | Where-Object { [double]::IsNaN($_) -or [double]::IsInfinity($_) -or $_ -le 0 }).Count)) {
+        throw 'llama.cpp TensorSplit requires at least two GPUs and one finite positive weight per GPU, in UUID order'
+    }
+    if (@($WorkerArgs | Where-Object { $_ -match '^--(device|split-mode|tensor-split|gpu-layers)(=|$)' }).Count) {
+        throw 'Use -Gpu and -TensorSplit to configure llama.cpp devices'
     }
     if ($SpeculativeMode -ne 'none') {
         $nativeArgsSpec = @('--spec-type', $(if ($SpeculativeMode -eq 'mtp') { 'draft-mtp' } else { 'draft-dflash' }), '--spec-draft-n-max', "$MtpDrafts")
@@ -372,6 +385,16 @@ if ($Backend -eq 'ninfer') {
         '-n', $(if ($MaxTokens -eq 0) { '-1' } else { "$MaxTokens" }), '--kvmem-budget', "$Budget", '--kvmem-gen-reserve', "$Reserve",
         '-b', "$Prefill", '-ub', "$llamaPhysicalPrefill",
         '--kvmem-sink-tokens', "$SinkTokens", '--kvmem-recent-tokens', "$RecentTokens")
+    if ($llamaGpuIds.Count -gt 1) {
+        # llama.cpp only offloads across devices with an explicit list and layer split mode;
+        # -TensorSplit carries the per-device weight proportions the worker expects.
+        $nativeArgs += @('--split-mode', 'layer', '--gpu-layers', 'all',
+                         '--device', ((0..($llamaGpuIds.Count - 1) | ForEach-Object { "CUDA$_" }) -join ','))
+        if ($TensorSplit.Count) {
+            $weights = @($TensorSplit | ForEach-Object { $_.ToString('G17', [Globalization.CultureInfo]::InvariantCulture) })
+            $nativeArgs += @('--tensor-split', ($weights -join ','))
+        }
+    }
     if ($separateKv) { $nativeArgs += @('--cache-type-k', $effectiveK, '--cache-type-v', $effectiveV) }
     else { $nativeArgs += @('--kv-dtype', $KvType) }
     $nativeArgs += @('--kvmem-host-mib', "$HostMiB", '--kvmem-sessions', "$RetainedSessions")
@@ -415,6 +438,11 @@ if ($Backend -eq 'llamacpp') { $nativeArgs += $nativeArgsSpec }
 if ($DiskPath) { $nativeArgs += @('--kvmem-disk-path', $DiskPath, '--kvmem-disk-mib', "$DiskMiB") }
 $nativeArgs += @(Get-KVMemQueryScoringArgs $PSBoundParameters)
 $nativeArgs = @(Remove-KVMemImplicitRecallBands $nativeArgs $PSBoundParameters)
+if ($Backend -eq 'llamacpp' -and $SpeculativeMode -eq 'mtp' -and @($Gpu.Split(',')).Count -gt 1 -and
+    -not (@($nativeArgs | Where-Object { $_ -eq '--kvmem-mtp-state' }).Count)) {
+    # The worker rejects auto MTP history when more than one device holds layers.
+    $nativeArgs += @('--kvmem-mtp-state', 'replay')
+}
 if($RecallStrategy -eq 'layerwise' -and @($WorkerArgs | Where-Object {$_ -match '^--(kvmem-mtp-state|spec[^=]*|draft[^=]*|mtp[^=]*|adaptive-mtp|ngram[^=]*)(=|$)'}).Count) {throw 'Use named layerwise speculative settings; WorkerArgs cannot override the qualified draft owner'}
 $nativeArgs += $WorkerArgs
 $effective=@{};foreach($entry in $PSBoundParameters.GetEnumerator()) {if($entry.Key -ne 'ApiKey'){$effective[$entry.Key]=$entry.Value}}

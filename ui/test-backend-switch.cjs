@@ -44,8 +44,8 @@ module.exports=async({browser,base,info})=>{
   assert.equal(await field('Context').inputValue(),'262144','first switch uses engine default');
   assert.equal(await field('Budget').inputValue(),'47104');assert.equal(await field('MaxTokens').inputValue(),'0');
   assert.equal(await field('Port').inputValue(),shared.Port);assert.deepEqual(await page.locator('[data-preset]').evaluateAll(nodes=>nodes.map(n=>n.dataset.preset).sort()),['llamacpp-default','llamacpp-layerwise']);
-  assert.ok((await page.locator('[data-gpu-limit]').textContent()).includes('已保留原选择'));
-  assert.equal(await page.locator('[data-gpu-choice]').first().evaluate(el=>el.checkValidity()),false);
+  assert.equal(await page.locator('[data-gpu-limit]').isVisible(),false,'llama.cpp keeps a two-GPU selection launchable');
+  assert.equal(await page.locator('[data-gpu-choice]').first().evaluate(el=>el.checkValidity()),true);
   assert.equal(await field('Model').inputValue(),'','model assets are backend-specific');
   assert.equal(await field('Worker').inputValue(),'');
   assert.equal(await field('KvTypeK').inputValue(),'q8_0','native KV names are backend-specific');
@@ -57,12 +57,11 @@ module.exports=async({browser,base,info})=>{
   await group(4);await field('Port').fill('18521');
   await page.locator('.l-service-fields').locator('..').locator('summary').click();await field('LogLevel').selectOption('trace');
   const changed=await values();
-  // A selection incompatible with the current integration stays visible and blocks launch.
+  // A multi-GPU llama.cpp selection is launchable; weights stay optional and are not sent.
   await page.locator('[data-action=preview]').click();
   await page.locator('[data-check-summary]').waitFor();
-  assert.equal(previews.length,0,'multi-GPU llama preview is blocked until the user chooses a single GPU');
-  assert.ok((await page.locator('[data-check-summary]').textContent()).includes('需要补全'));
-  await closeCheck();
+  assert.ok(!(await page.locator('[data-check-summary]').textContent()).includes('显卡'),'the GPU selection no longer blocks llama.cpp preview');
+  await closeCheck();previews.length=0;
   // Reordering keeps counts attached to their original physical GPU when returning.
   await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').click();
   await field('Backend').selectOption('ninfer');

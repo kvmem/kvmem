@@ -315,6 +315,13 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
             ('--kvmem-gen-reserve', p['Reserve']), ('-b', p['Prefill']), ('-ub', physical_prefill),
             ('--kvmem-sink-tokens', p['SinkTokens']), ('--kvmem-recent-tokens', p['RecentTokens'])]:
             pair(flag, value)
+        if len(gpu_ids) > 1:
+            # llama.cpp spreads layers by weight, so an explicit device list and layer
+            # split mode are mandatory; per-device counts stay a NInfer-only concept.
+            argv += ['--split-mode', 'layer', '--gpu-layers', 'all',
+                     '--device', ','.join('CUDA%d' % i for i in range(len(gpu_ids)))]
+            if p.get('TensorSplit'):
+                pair('--tensor-split', ','.join(format(x, '.17g') for x in p['TensorSplit']))
         if {'KvTypeK', 'KvTypeV'} & supplied.keys():
             pair('--cache-type-k', k)
             pair('--cache-type-v', v)
@@ -375,7 +382,9 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
         pair('--kvmem-disk-path', p['DiskPath'])
         pair('--kvmem-disk-mib', p['DiskMiB'])
     argv += scoring_args(supplied)
-    if backend == 'llamacpp' and strategy(p) == 'layerwise' and p['SpeculativeMode'] == 'mtp':
+    if backend == 'llamacpp' and p['SpeculativeMode'] == 'mtp' and (
+            strategy(p) == 'layerwise' or len(gpu_ids) > 1):
+        # The worker rejects auto MTP history when more than one device holds layers.
         pair('--kvmem-mtp-state', 'replay')
     argv += p.get('WorkerArgs', [])
     environment = {'CUDA_VISIBLE_DEVICES': p['Gpu'], 'CUDA_DEVICE_ORDER': 'PCI_BUS_ID'}

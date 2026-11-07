@@ -209,6 +209,34 @@ class PlanTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 build_plan(bad)
 
+    def test_llamacpp_multigpu_uses_native_layer_split(self):
+        ids = [GPU, 'GPU-00000000-0000-0000-0000-000000000002']
+        def build(**values):
+            data = self.config('llamacpp'); data['parameters'].update(**values)
+            return build_plan(data)
+        argv = build(Gpu=','.join(ids), SpeculativeMode='mtp', DraftTokens=3)['argv']
+        for flag, value in [('--split-mode', 'layer'), ('--gpu-layers', 'all'),
+                            ('--device', 'CUDA0,CUDA1'), ('--kvmem-mtp-state', 'replay')]:
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertNotIn('--tensor-split', argv)
+        self.assertNotIn('--devices', argv)
+        argv = build(Gpu=','.join([*ids, 'GPU-00000000-0000-0000-0000-000000000003']),
+                     TensorSplit=[11, 9, 2])['argv']
+        self.assertEqual(argv[argv.index('--tensor-split') + 1], '11,9,2')
+        self.assertEqual(argv[argv.index('--device') + 1], 'CUDA0,CUDA1,CUDA2')
+        self.assertNotIn('--kvmem-mtp-state', argv)
+        single = build(SpeculativeMode='mtp', DraftTokens=3)['argv']
+        self.assertNotIn('--split-mode', single)
+        self.assertNotIn('--kvmem-mtp-state', single)
+        for invalid in [dict(TensorSplit=[1, 1]),
+                        dict(Gpu=','.join(ids), TensorSplit=[11]),
+                        dict(Gpu=','.join(ids), TensorSplit=[11, 0]),
+                        dict(Gpu=','.join(ids), TensorSplit=[11, float('nan')]),
+                        dict(Gpu=','.join(ids), TensorSplit=[11, 9], StageLayers=[40, 24]),
+                        dict(Gpu=','.join(ids), TensorParallel=True)]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                build(**invalid)
+
     def test_heads_tensor_parallel_requires_explicit_worker_capability(self):
         for contract in [{}, *[{'heads_tensor_parallel_revision': value}
                 for value in (None, False, True, 0, -1, '1', 1.0)]]:
@@ -301,7 +329,10 @@ class PlanTest(unittest.TestCase):
                                  RecentTokens=64, Context=2048)),
                  ('llamacpp', dict(KvTypeK='q8_0', KvTypeV='q4_0', MaxTokens=0,
                                    ThinkingBudget=0, PreserveThinking=False, Concurrency=2)),
-                 ('llamacpp', dict(SpeculativeMode='mtp', DraftTokens=3, ReasoningEffort='high'))]
+                 ('llamacpp', dict(SpeculativeMode='mtp', DraftTokens=3, ReasoningEffort='high')),
+                 ('llamacpp', dict(Gpu=GPU+',GPU-00000000-0000-0000-0000-000000000002')),
+                 ('llamacpp', dict(Gpu=GPU+',GPU-00000000-0000-0000-0000-000000000002',
+                                   TensorSplit=[11.5, 9], SpeculativeMode='mtp', DraftTokens=3))]
         for backend, values in cases:
             with self.subTest(backend=backend, values=values):
                 data = self.config(backend)
