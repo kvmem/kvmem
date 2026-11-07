@@ -120,9 +120,21 @@ static void check_session_image(int rows, const char * mode, const char * path, 
     llama_kvmem_tail_mean_state after;
     require(llama_kvmem_get_tail_mean(rows,after) && after.values==before.values, "archive changed tail statistics");
     std::puts("PASS session read, native state and exact tail statistics");
-    std::fflush(stdout);
-    (void) llama_kvmem_checkpoint_capture(rows);
-    std::puts("PASS checkpoint after session read");
+    // RKV1 records the highest written row but omits per-plane coverage.
+    // A successful native restore cannot supply that missing proof.
+    bool missing_coverage = false;
+    try {
+        (void) llama_kvmem_checkpoint_capture(rows);
+    } catch (const kvmem::MemoryError & error) {
+        if (error.code() != kvmem::MemoryErrorCode::InvalidPlan ||
+                std::string(error.what()) != "packed selection lacks proved contiguous coverage") throw;
+        missing_coverage = true;
+    }
+    require(missing_coverage, "reopened RKV1 image authorized an unproved checkpoint");
+    require(state(ctx) == expected, "rejected RKV1 capture changed restored native state");
+    require(llama_kvmem_get_tail_mean(rows, after) && after.values == before.values,
+            "rejected RKV1 capture changed restored tail statistics");
+    std::puts("PASS reopened RKV1 refused unproved sharing and preserved the restored source");
 }
 
 static void check(llama_model * model, int rows, const char * mode=nullptr, const char * path=nullptr) {
@@ -287,6 +299,7 @@ int main(int argc, char ** argv) {
     if (argc != 2 && argc != 3 && argc != 4) return argc == 1 ? 77 : 1;
     try {
         check_packed_prefix();
+        if (argc == 2 && std::string(argv[1]) == "--packed-prefix") return 0;
         llama_backend_init();
         ggml_backend_load_all();
         auto params = llama_model_default_params();

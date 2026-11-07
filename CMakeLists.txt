@@ -425,6 +425,7 @@ if (KVMEM_BUILD_LLAMA)
     target_include_directories(kvmem-checkpoint-tail-test PRIVATE src/adapter)
     target_link_libraries(kvmem-checkpoint-tail-test PRIVATE llama kvmem)
     add_test(NAME kvmem-checkpoint-tail-test COMMAND kvmem-checkpoint-tail-test)
+    add_test(NAME kvmem-checkpoint-packed-prefix COMMAND kvmem-checkpoint-tail-test --packed-prefix)
     set_tests_properties(kvmem-checkpoint-tail-test PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(kvmem-gdn-replay-test tests/gdn-replay-test.cpp)

@@ -1,6 +1,6 @@
 # llama.cpp checkpointing with one MeanK owner
 
-The experimental adapter in `41a54d0` builds on the public API in master `35fe8e8`. Fresh checkpoints can use `fork_mean_prefix` and packed export/import without PR #280. Full session-file restore has a separate provenance limit. The coordinator retains the merge decision on #275 and #280.
+PR #275 uses the adapter measured at `41a54d0` and the public API in master `35fe8e8`. Fresh checkpoints use `fork_mean_prefix` and packed export/import. PR #280 supplied the comparison worker for this experiment. Full session-file restore has a separate provenance limit.
 
 ## State ownership and accepted boundary
 
@@ -23,7 +23,7 @@ A is the validated #280 worker from the [previous study](llamacpp-dense-checkpoi
 | hybrid / 128 | A | 182.9 | 4.474 | 0.318 | 133.73 | 201.002 / 1582.883 | 3758.7 / 2541 |
 | hybrid / 128 | B | 189.4 | 4.468 | 0.336 | 133.73 | 175.877 / 1588.008 | 3760.5 / 2541 |
 
-At H=1024 MiB both dense workers read 224 B and wrote 1,904 B. Dense reused 12,397 tokens and hybrid reused 13,038. Every message hash and per-request reuse count matched. Decode covered 75 dense or 26 hybrid tokens per run. The small prefill differences do not establish a speedup across workloads.
+At H=1024 MiB cumulative dense attention capture increased from 450.453 to 466.443 ms (+15.990 ms, +3.55%). Prefill moved from 2.467 to 2.471 s. Both workers read 224 B and wrote 1,904 B. Dense reused 12,397 tokens and hybrid reused 13,038. Every message hash and per-request reuse count matched. Decode covered 75 dense or 26 hybrid tokens per run. The small prefill differences do not establish a speedup across workloads.
 
 Six separate instrumented runs counted data at successful copy sites in packed export, raw import and the prefix fork functions. Each dense arm copied **48.40 MiB** of private packed tail data. Copied raw statistics/legacy vectors across forks and imports fell from **475.125 to 432.469 MiB**, with the 42.656 MiB import-side copy eliminated. Both H settings agreed. Hybrid copied **15.79 MiB** of packed tails per arm, with vector copies falling from **143.156 to 130.344 MiB**. The production timing runs used neither copy logging nor device readback probes. These counts exclude wrapper allocations, native recurrent bytes and unrelated process memory traffic.
 
