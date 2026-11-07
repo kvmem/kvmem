@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-kvmem-hooks.h"
+#include "llama-kvmem-snapshot-stats.h"
 #include "llama-kvmem-execution.h"
 #include "kvmem/retrieval_options.hpp"
 #include "kvmem/launch_contract.hpp"
@@ -1600,12 +1601,43 @@ int main(int argc, char ** argv) {
             usage["disk_reads"] = storage.reads; usage["disk_writes"] = storage.writes; usage["disk_errors"] = storage.errors;
             usage["history_evictions"] = usage["evictions"];
             usage["sampling_scope"] = "committed_owner_metadata_with_live_physical_account";
-            uint64_t state_bytes = 0;
+            uint64_t state_bytes = 0, native_state_bytes = 0, metadata_staging_bytes = 0;
+            json state_traffic = json::object();
+            const auto accumulate = [&](const char * key, const NativeStateTraffic & traffic) {
+                auto & total = state_traffic[key];
+                if (total.is_null()) total = {{"records", uint64_t{0}}, {"bytes", uint64_t{0}}};
+                total["records"] = total["records"].get<uint64_t>() + traffic.records.load();
+                total["bytes"] = total["bytes"].get<uint64_t>() + traffic.bytes.load();
+            };
             std::set<const MultimodalCheckpointAccounting*> accounts;
-            for (const auto* lane : lanes) if (accounts.insert(lane->mm_checkpoint_accounting.get()).second)
-                state_bytes += lane->mm_checkpoint_accounting->live_bytes.load();
+            for (const auto* lane : lanes) if (accounts.insert(lane->mm_checkpoint_accounting.get()).second) {
+                const auto account = lane->mm_checkpoint_accounting;
+                accumulate("created", account->created);
+                accumulate("spilled", account->spilled);
+                accumulate("hot_reads", account->hot_reads);
+                accumulate("cold_reads", account->cold_reads);
+                state_bytes += account->used();
+                metadata_staging_bytes += account->live_bytes.load();
+                if (const auto storage = account->storage()) native_state_bytes += storage->charged_bytes();
+            }
+            usage["native_state_traffic"] = std::move(state_traffic);
             usage["physical_checkpoint_bytes"] = state_bytes;
-            usage["checkpoint_bytes_scope"] = "native_state_and_private_retrieval_metadata";
+            usage["checkpoint_bytes_scope"] = "Q_native_record_ram_plus_metadata_and_transient_staging; excludes_KV_H; not_process_RSS";
+            usage["checkpoint_native_record_ram_bytes"] = native_state_bytes;
+            usage["checkpoint_metadata_staging_bytes"] = metadata_staging_bytes;
+            usage["checkpoint_component_scope"] = "subsets_of_physical_checkpoint_bytes; SSD_in_shared_D";
+            const auto captures = llama_kvmem_get_snapshot_stats();
+            usage["captured_packed_k_bytes"] = captures.packed_k_bytes;
+            usage["captured_packed_v_bytes"] = captures.packed_v_bytes;
+            usage["captured_native_state_bytes"] = captures.native_state_bytes;
+            usage["snapshot_attention_capture_us"] = captures.attention_capture_us;
+            usage["snapshot_native_capture_us"] = captures.native_capture_us;
+            usage["snapshot_image_allocate_us"] = captures.image_allocate_us;
+            usage["snapshot_image_write_us"] = captures.image_write_us;
+            usage["snapshot_image_read_us"] = captures.image_read_us;
+            usage["snapshot_attention_restore_us"] = captures.attention_restore_us;
+            usage["snapshot_timing_scope"] = "process_wall_us; image_write=worker_spill_frame; image_read=hot_borrow_or_validated_cold_read";
+            usage["capture_scope"] = "process_successful_host_captures_target_and_draft; excludes_aliases_and_failed_transfers";
             data["kvmem"] = std::move(usage);
         }
         res.set_header("Cache-Control", "no-store");
@@ -2399,6 +2431,20 @@ int main(int argc, char ** argv) {
                         return true;
                     };
                     std::optional<ResponsesStreamOut> responses;
+                    const auto commit = [&](const std::vector<llama_token> & generated) {
+                        if (!stream_heartbeat(&io)) {
+                            llama_driver_finish(st);
+                            slot->unlock();
+                            sink.done();
+                            return false;
+                        }
+                        if (llama_driver_try_commit(st, toks, generated)) return true;
+                        send(json{{"error", st.mm_error}}.dump());
+                        sink.write("data: [DONE]\n\n", 14);
+                        slot->unlock();
+                        sink.done();
+                        return false;
+                    };
                     if (is_responses) {
                         responses.emplace(formatted, request_id);
                     }
@@ -2555,7 +2601,7 @@ int main(int argc, char ** argv) {
                                 }
                             }
                             emit_gen_wall((int) gen.size());
-                            llama_driver_commit(st, toks, gen);
+                            if (!commit(gen)) return true;
                             monitor.update(monitor_id, {{"finish_reason", !responses->prev.tool_calls.empty() ? "tool_calls" : (int)gen.size() >= max_tokens ? "length" : "stop"}});
                             for (const std::string & ev : kvmem_responses_stream_done(
                                          responses->state, responses->prev, request_id, st.model_name,
@@ -2583,7 +2629,7 @@ int main(int argc, char ** argv) {
                                 sco.prev.content.size(), sco.prev.reasoning_content.size());
                         llama_kvmem_decode_mean_flush();
                         emit_gen_wall((int) gen.size());
-                        llama_driver_commit(st, toks, gen);
+                        if (!commit(gen)) return true;
                         auto final_chunk = stream_choice_chunk(cid, st.model_name, created, json::object(), finish, include_usage ? nullptr : &*timings);
                         if (!include_usage && !request_metrics->stats.speculative.is_null())
                             final_chunk["kvmem"] = {{"speculative", request_metrics->stats.speculative}};
@@ -2616,7 +2662,7 @@ int main(int argc, char ** argv) {
                             }
                         }
                         emit_gen_wall((int) gen.size());
-                        llama_driver_commit(st, toks, gen);
+                        if (!commit(gen)) return true;
                         monitor.update(monitor_id, {{"finish_reason", !responses->prev.tool_calls.empty() ? "tool_calls" : (int)gen.size() >= max_tokens ? "length" : "stop"}});
                         for (const std::string & ev : kvmem_responses_stream_done(
                                      responses->state, responses->prev, request_id, st.model_name,
@@ -2643,7 +2689,7 @@ int main(int argc, char ** argv) {
                             sco.n_tc_delta, finish,
                             sco.prev.content.size(), sco.prev.reasoning_content.size());
                     emit_gen_wall((int) gen.size());
-                    llama_driver_commit(st, toks, gen);
+                    if (!commit(gen)) return true;
                     auto final_chunk = stream_choice_chunk(cid, st.model_name, created, json::object(), finish, include_usage ? nullptr : &*timings);
                     if (!include_usage && !request_metrics->stats.speculative.is_null())
                         final_chunk["kvmem"] = {{"speculative", request_metrics->stats.speculative}};
@@ -2672,6 +2718,13 @@ int main(int argc, char ** argv) {
             ~request_guard() { llama_driver_finish(st); }
         } guard {st};
         StreamIo io;
+        const auto commit = [&](const std::vector<llama_token> & generated) {
+            if (!stream_heartbeat(&io)) return false;
+            if (llama_driver_try_commit(st, toks, generated)) return true;
+            res.status = 500;
+            res.set_content(json{{"error", st.mm_error}}.dump(), "application/json");
+            return false;
+        };
         io.on_prefill = [&st, request_metrics](int rows, int remaining) {
             st.log.prefilled(rows, remaining);
             auto & partial = request_metrics->stats.native;
@@ -2721,7 +2774,7 @@ int main(int argc, char ** argv) {
             st.mm_live_row = gst.n_past;
             if (io.aborted) return;
             emit_gen_wall((int) gen.size());
-            llama_driver_commit(st, toks, gen);
+            if (!commit(gen)) return;
             emit_json(content, (int) gen.size(), (int) gen.size() >= cr.max_tokens);
             return;
         }
@@ -2790,8 +2843,8 @@ int main(int argc, char ** argv) {
         }
         llama_kvmem_decode_mean_flush();
         emit_gen_wall((int) gen.size());
-        llama_driver_commit(st, toks, gen);
         common_sampler_free(smpl);
+        if (!commit(gen)) return;
         emit_json(content, (int) gen.size(), !stopped && (int) gen.size() >= cr.max_tokens);
     };
 

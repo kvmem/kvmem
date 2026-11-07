@@ -1,5 +1,6 @@
 #include "llama-kvmem-diag.h"
 #include "llama-memory-kvmem-mtp.h"
+#include "llama-kvmem-snapshot-stats.h"
 
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -393,6 +394,7 @@ void llama_memory_kvmem_mtp::harvest_k(uint32_t block_id) {
     std::vector<uint8_t> packed((size_t) nt * row);
     kvmem_tensor_get(kt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
     raw_->write_layer_k_gpu(blk.orig_pos_start, nt, 0, packed.data());
+    llama_kvmem_record_snapshot_capture(llama_kvmem_capture_plane::packed_k, packed.size());
 }
 
 void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
@@ -426,6 +428,7 @@ void llama_memory_kvmem_mtp::harvest_v(uint32_t block_id) {
     std::vector<uint8_t> packed((size_t) nt * row);
     kvmem_tensor_get(vt, packed.data(), (size_t) cell0 * row, (size_t) nt * row);
     raw_->write_layer_v_gpu(blk.orig_pos_start, nt, 0, packed.data());
+    llama_kvmem_record_snapshot_capture(llama_kvmem_capture_plane::packed_v, packed.size());
 }
 
 bool llama_memory_kvmem_mtp::slot_holds(int32_t slot, uint32_t orig_pos) const {

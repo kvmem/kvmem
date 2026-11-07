@@ -215,8 +215,8 @@ public:
     bool conv_swap_supported(std::string & reason) const;
     bool conv_compatible(const llama_memory_kvmem & other) const;
     std::unique_ptr<ConvStore> make_conv();
-    std::unique_ptr<ConvStore> fork_conv(ConvStore & source);
-    std::unique_ptr<ConvStore> fork_active_conv();
+    std::unique_ptr<ConvStore> fork_conv(ConvStore & source, bool checkpoint = false);
+    std::unique_ptr<ConvStore> fork_active_conv(llama_kvmem_checkpoint_snapshot * checkpoint = nullptr);
     // Exchange the per-conversation host state. Call only between requests,
     // under the server's request lock. `conv` must come from make_conv() or an
     // earlier swap_conv() on a compatible memory object; on return it holds the outgoing
@@ -233,6 +233,7 @@ public:
     // cannot be drained safely, or whose drain throws, is emptied rather than
     // kept, which the caller sees as its row count dropping to zero.
     bool swap_conv(std::unique_ptr<ConvStore> & conv);
+    bool restore_checkpoint_conv(std::unique_ptr<ConvStore> conv);
     uint32_t conv_n_tokens(const ConvStore & conv) const;
     uint64_t conv_host_bytes(const ConvStore & conv) const;
     uint64_t host_bytes() const;
@@ -435,6 +436,9 @@ private:
     kvmem::RawKvStoreConfig raw_cfg_{};
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;
+    // Absent only on a store loaded from the original combined disk format.
+    std::unique_ptr<kvmem::RawKvStore> means_;
+    kvmem::RawKvStore & statistics() { return means_ ? *means_ : *raw_; }
     std::unique_ptr<kvmem::KvContent> content_;
     std::vector<std::pair<uint32_t, uint32_t>> evaluation_queue_;
     size_t evaluation_cursor_ = 0;

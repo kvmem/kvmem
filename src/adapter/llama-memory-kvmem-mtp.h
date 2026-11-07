@@ -68,6 +68,8 @@ public:
     uint32_t harvest_perf_n_ubatch() const { return perf_n_ubatch_; }
     int64_t harvest_perf_sync_us() const { return perf_sync_us_; }
     void on_stage_out(uint32_t block_id);
+    // Fork/checkpoint capture must not remove the source's native draft cells.
+    void capture_checkpoint_block(uint32_t block_id) { harvest_k(block_id); harvest_v(block_id); }
     void harvest_resident_v();
     // A block with no packed draft K in the mirror is occupied anyway, which
     // is what the single-store server has always done: the cells hold this
@@ -134,6 +136,8 @@ public:
         harvest_flush();
         return raw_ ? raw_->fork_prefix(rows) : make_raw();
     }
+    // The target drains both harvest queues before checkpoint capture.
+    kvmem::RawKvStore * checkpoint_raw() { return raw_.get(); }
     uint64_t host_bytes() const { return raw_ ? raw_->allocated_bytes() : 0; }
     uint64_t payload_bytes(bool disk_only = false) const { return raw_ ? raw_->payload_bytes(disk_only) : 0; }
     uint64_t payload_capacity_bytes(uint32_t tokens) const { return raw_ ? raw_->payload_capacity_bytes(tokens) : 0; }

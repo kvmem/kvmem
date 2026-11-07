@@ -1,6 +1,7 @@
 #include "kvmem/query_policy.hpp"
 #include "llama-kvmem-diag.h"
 #include "llama-memory-kvmem.h"
+#include "llama-kvmem-snapshot-stats.h"
 #include "kvmem/retrieval_options.hpp"
 #include "llama-memory-kvmem-hybrid.h"
 #include "llama-memory-kvmem-mtp.h"
@@ -28,6 +29,7 @@
 
 #include "llama.h"
 #include "kvmem/snapshot.hpp"
+#include "kvmem/kv_snapshot.hpp"
 #include "kvmem/native_kv_payload.hpp"
 #include "kvmem/snapshot_buffer.hpp"
 #include "kvmem/spill_io.hpp"
@@ -84,7 +86,7 @@ struct llama_memory_kvmem::ConvStore {
     bool has_mtp = false;
     bool cold = false;
     std::unique_ptr<kvmem::KvMemRuntime> runtime;
-    std::unique_ptr<kvmem::RawKvStore>   raw;
+    std::unique_ptr<kvmem::RawKvStore>   raw, means;
     std::unique_ptr<kvmem::KvContent> content;
     std::vector<RowPosition>             row_positions;
     std::vector<std::vector<float>>      q_rows;
@@ -103,6 +105,14 @@ struct llama_memory_kvmem::ConvStore {
 
 struct llama_kvmem_store_bundle {
     std::unique_ptr<llama_memory_kvmem::ConvStore> store;
+};
+
+struct llama_kvmem_checkpoint_snapshot {
+    // Private native metadata/statistics; packed bindings are removed.
+    std::unique_ptr<llama_memory_kvmem::ConvStore> metadata;
+    std::unique_ptr<kvmem::PackedKvSnapshot> target, draft;
+    std::unique_ptr<kvmem::KvSnapshot> image;
+    uint64_t metadata_bytes = 0;
 };
 
 // Detached stores, keyed by an opaque handle. Handle 0 is the store the
@@ -360,6 +370,22 @@ bool llama_memory_kvmem::gdn_replay_commit(llama_context * ctx, uint32_t n_keep)
 }
 static std::atomic<uint64_t> transfer_bytes[3]{};
 static std::atomic<uint64_t> transfer_calls[3]{};
+static std::atomic<uint64_t> snapshot_capture_bytes[3]{};
+static std::atomic<uint64_t> snapshot_time_us[6]{};
+void llama_kvmem_record_snapshot_time(llama_kvmem_snapshot_phase phase, uint64_t microseconds) {
+    snapshot_time_us[static_cast<unsigned>(phase)].fetch_add(microseconds, std::memory_order_relaxed);
+}
+
+void llama_kvmem_record_snapshot_capture(llama_kvmem_capture_plane plane, uint64_t bytes) {
+    snapshot_capture_bytes[static_cast<unsigned>(plane)].fetch_add(bytes, std::memory_order_relaxed);
+}
+llama_kvmem_snapshot_stats llama_kvmem_get_snapshot_stats() {
+    return {snapshot_capture_bytes[0].load(std::memory_order_relaxed),
+            snapshot_capture_bytes[1].load(std::memory_order_relaxed),
+            snapshot_capture_bytes[2].load(std::memory_order_relaxed),
+            snapshot_time_us[0].load(), snapshot_time_us[1].load(), snapshot_time_us[2].load(),
+            snapshot_time_us[3].load(), snapshot_time_us[4].load(), snapshot_time_us[5].load()};
+}
 
 static bool transfer_stats_enabled() {
     static const bool enabled = [] {
@@ -1032,6 +1058,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     }
 
     raw_ = std::make_unique<kvmem::RawKvStore>(rcfg);
+    means_ = std::make_unique<kvmem::RawKvStore>(rcfg);
     content_ = std::make_unique<kvmem::KvContent>(block_tokens_);
     q_rows_.assign(n_layer_, std::vector<float>());
     q_count_.assign(n_layer_, 0);
@@ -1114,6 +1141,7 @@ void llama_memory_kvmem::reset_policy() {
     reset_query_acc();
     if (raw_) {
         raw_->clear();
+        if (means_) means_->clear();
     }
     if (runtime_) {
         runtime_->truncate_to(0);
@@ -1147,6 +1175,7 @@ void llama_memory_kvmem::truncate_cached(uint32_t n_past) {
     if (mtp_) mtp_->truncate_cached(n_past);
     if (raw_) {
         raw_->truncate_to(n_past);
+        if (means_) means_->truncate_to(n_past);
     }
     if (runtime_ && n_past < runtime_->store().total_tokens()) {
         runtime_->truncate_to(n_past);
@@ -1286,6 +1315,7 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::make_conv() {
     conv->has_mtp = mtp_ != nullptr;
     conv->runtime = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_);
     conv->raw = std::make_unique<kvmem::RawKvStore>(raw_cfg_);
+    conv->means = std::make_unique<kvmem::RawKvStore>(raw_cfg_);
     conv->content = std::make_unique<kvmem::KvContent>(block_tokens_);
     conv->q_rows.assign(n_layer_, std::vector<float>());
     conv->q_count.assign(n_layer_, 0);
@@ -1297,7 +1327,30 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::make_conv() {
     return conv;
 }
 
-std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_conv(ConvStore & source) {
+// Only the current accepted state may be forked. A reduced page sum cannot
+// reconstruct an earlier partial prefix after the live page has grown.
+static std::unique_ptr<kvmem::RawKvStore> fork_accepted_means(
+        const kvmem::RawKvStore & source, uint32_t rows) {
+    const auto width = source.config().block_tokens;
+    // Sparse/disabled statistics need no empty trailing block index.
+    while (rows) {
+        const auto page = (rows - 1) / width;
+        const auto valid = rows - page * width;
+        auto retained = source.n_tokens(page);
+        // restore_mean_checkpoint can restore a sum into an empty layer without
+        // advancing its raw-row high-water mark. Its own count is authoritative.
+        if (!retained || valid < width) {
+            for (uint32_t layer = 0; layer < source.config().n_layer; ++layer)
+                retained = std::max(retained, source.mean_k_tokens(page, layer));
+        }
+        if (retained > valid) throw std::runtime_error("mean-K extends past the accepted frontier");
+        if (retained) break;
+        rows = page * width;
+    }
+    return source.fork_mean_prefix(rows);
+}
+
+std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_conv(ConvStore & source, bool checkpoint) {
     if (source.cold || source.model != &model_ || source.type_k != kv_->type_k() || source.type_v != kv_->type_v() ||
         source.slots != n_slots_ || source.has_mtp != bool(mtp_) || !source.content || !source.content->stamp().valid)
         throw std::invalid_argument("incompatible native conversation fork");
@@ -1305,8 +1358,9 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_conv(Con
     const auto rows = source.runtime->store().total_tokens();
     if (source.content->stamp().frontier != rows) throw std::runtime_error("native fork has unaccepted rows");
     result->content = source.content->fork();
-    result->raw = source.raw->fork_prefix(rows);
-    if (source.mtp_raw) result->mtp_raw = source.mtp_raw->fork_prefix(rows);
+    result->means = source.means ? fork_accepted_means(*source.means, rows) : nullptr;
+    if (!checkpoint || !source.means) result->raw = source.raw->fork_prefix(rows);
+    if (!checkpoint && source.mtp_raw) result->mtp_raw = source.mtp_raw->fork_prefix(rows);
     result->runtime->store() = source.runtime->store();
     result->runtime->clone_cpu_tier_from(*source.runtime);
     result->runtime->store().restore_retrieval(source.runtime->store().retrieval_checkpoint());
@@ -1318,7 +1372,7 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_conv(Con
     return result;
 }
 
-std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_conv() {
+std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_conv(llama_kvmem_checkpoint_snapshot * checkpoint) {
     kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
     decode_mean_reset(); harvest_flush(); harvest_gpu_v_commit();
     const auto rows = runtime_->store().total_tokens();
@@ -1326,8 +1380,10 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_c
         throw std::runtime_error("active fork has unaccepted content");
     auto result = make_conv();
     for (const auto& block : runtime_->store().blocks()) if (block.gpu_slot >= 0) {
+        if (!gpu_kv_complete(block.block_id, kv_))
+            throw std::runtime_error("active fork has incomplete native target cells");
         harvest_gpu_v(block.block_id);
-        if (mtp_) mtp_->on_stage_out(block.block_id);
+        if (mtp_) mtp_->capture_checkpoint_block(block.block_id);
         result->resident.push_back(block.block_id);
     }
     harvest_gpu_v_commit();
@@ -1340,8 +1396,37 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_c
         }
     }
     result->content = content_->fork();
-    result->raw = raw_->fork_prefix(rows);
-    if (mtp_) result->mtp_raw = mtp_->fork_raw(rows);
+    result->means = means_ ? fork_accepted_means(*means_, rows) : nullptr;
+    if (checkpoint) {
+        // Both exports observe the same accepted frontier under this execution's
+        // exclusive owner. Publish only after every plane and statistic succeeds.
+        std::vector<kvmem::PackedKvSelection> target, draft;
+        auto * draft_raw = mtp_ ? mtp_->checkpoint_raw() : nullptr;
+        for (const auto & block : runtime_->store().blocks()) {
+            if (!block.n_tokens) continue;
+            for (uint32_t layer = 0; layer < n_layer_; ++layer) {
+                if (kvmem_cache_has_layer(kv_, int32_t(layer)))
+                    target.push_back({block.block_id, layer, block.n_tokens});
+            }
+            if (draft_raw && draft_raw->has_k_gpu(block.block_id, 0, block.n_tokens) &&
+                    draft_raw->has_v_gpu(block.block_id, 0, block.n_tokens))
+                draft.push_back({block.block_id, 0, block.n_tokens});
+        }
+        if (!means_) {
+            // Old combined archives retain their native statistics/legacy rows.
+            result->raw = raw_->fork_prefix(rows);
+            result->raw->import_packed(result->raw->export_packed({}));
+        }
+        checkpoint->target = std::make_unique<kvmem::PackedKvSnapshot>(raw_->export_packed(target));
+        if (mtp_) {
+            // A follower with no mirror still contributes a compatible empty image.
+            auto & mirror = draft_raw ? *draft_raw : *result->mtp_raw;
+            checkpoint->draft = std::make_unique<kvmem::PackedKvSnapshot>(mirror.export_packed(draft));
+        }
+    } else {
+        result->raw = raw_->fork_prefix(rows);
+        if (mtp_) result->mtp_raw = mtp_->fork_raw(rows);
+    }
     result->runtime->store() = runtime_->store();
     result->runtime->clone_cpu_tier_from(*runtime_);
     result->runtime->store().restore_retrieval(runtime_->store().retrieval_checkpoint());
@@ -1368,7 +1453,7 @@ uint64_t llama_memory_kvmem::conv_host_bytes(const ConvStore & conv) const {
     if (!conv.raw) {
         return 0;
     }
-    uint64_t bytes = conv.raw->allocated_bytes() + (conv.mtp_raw ? conv.mtp_raw->allocated_bytes() : 0);
+    uint64_t bytes = conv.raw->allocated_bytes() + (conv.means ? conv.means->allocated_bytes() : 0) + (conv.mtp_raw ? conv.mtp_raw->allocated_bytes() : 0);
     bytes += conv.content ? conv.content->allocated_bytes() : 0;
     bytes += conv.runtime->allocated_bytes() + conv.row_positions.capacity()*sizeof(RowPosition);
     bytes += conv.q_count.capacity()*sizeof(uint32_t) + conv.resident.capacity()*sizeof(uint32_t);
@@ -1382,7 +1467,7 @@ uint64_t llama_memory_kvmem::host_bytes() const {
     if (!raw_) {
         return 0;
     }
-    uint64_t bytes = raw_->allocated_bytes() + (mtp_ ? mtp_->host_bytes() : 0);
+    uint64_t bytes = raw_->allocated_bytes() + (means_ ? means_->allocated_bytes() : 0) + (mtp_ ? mtp_->host_bytes() : 0);
     bytes += content_ ? content_->allocated_bytes() : 0;
     bytes += evaluation_queue_.capacity()*sizeof(evaluation_queue_[0]);
     bytes += runtime_->allocated_bytes() + row_positions_.capacity()*sizeof(RowPosition);
@@ -1419,16 +1504,15 @@ uint64_t llama_memory_kvmem::host_capacity(uint32_t tokens) const {
     if (recr_) {
         for (const auto * list : { &recr_->r_l, &recr_->s_l, &recr_->p_l })
             for (const auto * t : *list) if (t) checkpoint += ggml_row_size(t->type, t->ne[0]);
-    } else {
-        // Dense memory does not implement PARTIAL_ONLY: its server checkpoint
-        // contains the attention working set and cell metadata.
-        for (const auto & buffer : kv_->memory_breakdown()) checkpoint += buffer.second;
-        checkpoint += uint64_t(kv_size_)*64;
     }
+    // The pinned native cache skips non-SWA attention for PARTIAL_ONLY.
+    // KVMem rejects SWA at construction, so dense checkpoints contain only
+    // native framing here; packed attention is already counted in raw_ below.
     checkpoint += uint64_t(n_layer_)*(n_embd_k_ + uint64_t(n_head_)*n_embd_head_)*sizeof(float);
     // MTP carry, token/prompt indexes, query state and bounded allocator slack.
     return 8*checkpoint + 8*1024*1024 + uint64_t(tokens)*64 +
-        raw_->capacity_bytes(tokens, uint32_t(kv_->get_layer_ids().size())) + (mtp_ ? mtp_->capacity_bytes(tokens) : 0) +
+        raw_->capacity_bytes(tokens, uint32_t(kv_->get_layer_ids().size())) +
+        (means_ ? means_->capacity_bytes(tokens, 0) : 0) + (mtp_ ? mtp_->capacity_bytes(tokens) : 0) +
         uint64_t(tokens)*sizeof(RowPosition)*2 +
         ((uint64_t(tokens)/block_tokens_) + 2)*(sizeof(kvmem::KvMemBlock) + sizeof(uint64_t))*2;
 }
@@ -1587,6 +1671,7 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::detach_conv()
     conv->has_mtp = mtp_ != nullptr;
     conv->runtime = std::move(runtime_);
     conv->raw = std::move(raw_);
+    conv->means = std::move(means_);
     conv->content = std::move(content_);
     // One statement after the trunk's own mirror, the way truncate_cached()
     // drives mtp_->truncate_cached(): the follower's packed draft K/V is keyed
@@ -1623,6 +1708,7 @@ bool llama_memory_kvmem::attach_conv(std::unique_ptr<ConvStore> conv) {
     // existed has none and gets a fresh one to rebuild at the next stage-out.
     runtime_ = std::move(conv->runtime);
     raw_ = std::move(conv->raw);
+    means_ = std::move(conv->means);
     content_ = std::move(conv->content);
     evaluation_queue_.clear();
     evaluation_cursor_ = 0;
@@ -1819,6 +1905,30 @@ void llama_memory_kvmem::conv_reset_to_empty(const char * what) noexcept {
         LLAMA_LOG_ERROR("%s: KVMem %s repair left the active store unreset; it is marked "
                 "host_mirror_stale, so the next switch clears it rather than carrying it\n",
                 __func__, what);
+    }
+}
+
+bool llama_memory_kvmem::restore_checkpoint_conv(std::unique_ptr<ConvStore> conv) {
+    // The checkpoint already owns the accepted source. Restoring it discards
+    // the outgoing execution, so harvesting that execution would add needless
+    // captures and could make rollback itself fail under an exhausted H/D.
+    // Finish DMA before discarding jobs; do not publish their rejected bytes.
+    kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
+    harvest_flush();
+    kvmem_stageout_wait(0, nullptr);
+    kvmem_stageout_wait(1, nullptr);
+    harvest_v_pending_.jobs.clear(); harvest_v_pending_.slot = -1;
+    harvest_v_jobs_.clear(); harvest_gpu_queued_.clear();
+    kvmem_stageout_clear();
+    decode_mean_discard();
+    set_replay(false);
+    clear(false);
+    if (mtp_) mtp_->clear(false);
+    try {
+        return attach_conv(std::move(conv));
+    } catch (...) {
+        conv_reset_to_empty("checkpoint attach");
+        throw;
     }
 }
 
@@ -3630,7 +3740,7 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
             bytes_to_f32_token_major(host, type, d, h, ntok, nb0, nb1, nb2, flat);
         }
         if (!flat.empty()) {
-            raw_->write_layer_mean_k(pos0, n, static_cast<uint32_t>(il), flat.data());
+            statistics().write_layer_mean_k(pos0, n, static_cast<uint32_t>(il), flat.data());
         }
     } else if (which == 'q') {
         std::vector<float> flat;
@@ -3672,7 +3782,7 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
     const uint32_t pos0 = static_cast<uint32_t>(cur_pos_[0]);
 
     if (which == 'k') {
-        raw_->write_layer_mean_k(pos0, n, static_cast<uint32_t>(il), flat.data());
+        statistics().write_layer_mean_k(pos0, n, static_cast<uint32_t>(il), flat.data());
         static bool dumped = false;
         if (!dumped && getenv("KVMEM_DUMP_CAPTURE") && il == 0) {
             dumped = true;
@@ -3716,6 +3826,8 @@ void llama_memory_kvmem::harvest_write_batch() {
             } else {
                 raw_->write_layer_v_gpu(j.pos0, j.n, j.il, src);
             }
+            llama_kvmem_record_snapshot_capture(j.is_k ? llama_kvmem_capture_plane::packed_k :
+                llama_kvmem_capture_plane::packed_v, j.nbytes);
         };
         if (j.gpu_src &&
             kvmem_copy(packed.data(), j.gpu_src, j.nbytes,
@@ -3738,6 +3850,8 @@ void llama_memory_kvmem::harvest_write_batch() {
             } else {
                 raw_->write_layer_v_gpu(j.pos0, j.n, j.il, p);
             }
+            llama_kvmem_record_snapshot_capture(j.is_k ? llama_kvmem_capture_plane::packed_k :
+                llama_kvmem_capture_plane::packed_v, j.nbytes);
         } else {
             fallback(j);
         }
@@ -3833,6 +3947,8 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
             kvmem_tensor_get(t, packed.data(), toff, nbytes);
             if (is_k) raw_->write_layer_k_gpu(blk.orig_pos_start, nget, il, packed.data());
             else raw_->write_layer_v_gpu(blk.orig_pos_start, nget, il, packed.data());
+            llama_kvmem_record_snapshot_capture(is_k ? llama_kvmem_capture_plane::packed_k :
+                llama_kvmem_capture_plane::packed_v, nbytes);
             return;
         }
         uint8_t * base = kvmem_cuda_tensor_ptr(t);
@@ -3866,6 +3982,8 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
         } else {
             raw_->write_layer_v_gpu(blk.orig_pos_start, nget, il, packed.data());
         }
+        llama_kvmem_record_snapshot_capture(is_k ? llama_kvmem_capture_plane::packed_k :
+            llama_kvmem_capture_plane::packed_v, nbytes);
     };
     uint32_t n_ok = 0;
     uint32_t n_skip = 0;
@@ -4228,7 +4346,7 @@ void llama_memory_kvmem::decode_mean_flush() {
         if (!got) {
             continue;
         }
-        raw_->write_layer_mean_sum(decode_mean_pos0_, decode_mean_n_, il, sum.data());
+        statistics().write_layer_mean_sum(decode_mean_pos0_, decode_mean_n_, il, sum.data());
         if (!multi_gpu_) kvmem_meank_zero(il);
         if (n_ok == 0 && n_embd_k_ > 0) {
             double acc = 0;
@@ -4433,12 +4551,12 @@ void llama_memory_kvmem::score_retrieval(const llama_kvmem_tail_mean_state* pref
     std::vector<double> scores;
     // Only the boundary page can have grown during the probe. Restore its
     // prefix mean temporarily; native KV and persistent statistics stay intact.
-    const auto previous = prefix ? raw_->mean_checkpoint(frontier) : std::vector<float>{};
-    if (prefix) raw_->restore_mean_checkpoint(frontier,prefix->values);
+    const auto previous = prefix ? statistics().mean_checkpoint(frontier) : std::vector<float>{};
+    if (prefix) statistics().restore_mean_checkpoint(frontier,prefix->values);
     try {
         const auto aggregation = score_agg_ ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean;
         if (query_meanq_cosine_) {
-            scores=kvmem::mean_query_cosine_scores(*raw_,query,uint32_t(frame.starts.size()),aggregation);
+            scores=kvmem::mean_query_cosine_scores(statistics(),query,uint32_t(frame.starts.size()),aggregation);
         } else {
 #ifdef KVMEM_PAGE_SOFTMAX_CUDA
             if(!query_scorer_) {
@@ -4446,18 +4564,18 @@ void llama_memory_kvmem::score_retrieval(const llama_kvmem_tail_mean_state* pref
                 if(cudaGetDevice(&device)!=cudaSuccess) throw std::runtime_error("KVMem Query CUDA device unavailable");
                 query_scorer_=std::make_unique<kvmem::PageSoftmaxCuda>(device);
             }
-            scores=query_scorer_->score(*raw_,query,frame,aggregation);
+            scores=query_scorer_->score(statistics(),query,frame,aggregation);
 #else
-            scores=kvmem::page_softmax_scores(*raw_,query,frame,aggregation);
+            scores=kvmem::page_softmax_scores(statistics(),query,frame,aggregation);
 #endif
         }
         if (graph_alpha_ > 0)
             scores=kvmem::propagate_query_scores(scores,frame,prefix ? prefix->graph : graph_,graph_alpha_);
     } catch (...) {
-        if (prefix) raw_->restore_mean_checkpoint(frontier,previous);
+        if (prefix) statistics().restore_mean_checkpoint(frontier,previous);
         throw;
     }
-    if (prefix) raw_->restore_mean_checkpoint(frontier,previous);
+    if (prefix) statistics().restore_mean_checkpoint(frontier,previous);
     runtime_->store().set_retrieval_scores(scores);
     kvmem_diag("KVMEM_QUERY scorer=%s agg=%s lrfu=%d graph_alpha=%.6g rows=%u blocks=%zu\n",
         query_meanq_cosine_ ? "meanq-cosine" : "page-softmax",score_agg_ ? "max" : "mean",
@@ -4768,7 +4886,7 @@ bool llama_memory_kvmem::get_tail_mean(uint32_t row, llama_kvmem_tail_mean_state
     if (!content_->stamp().valid || speculative_evaluation_ || row > content_->stamp().frontier) return false;
     state.row = row;
     state.prefix = content_->prefix(row);
-    state.values = raw_->mean_checkpoint(row);
+    state.values = statistics().mean_checkpoint(row);
     state.history = runtime_->store().retrieval_checkpoint();
     if(graph_.accepted_through!=row) return false;
     state.graph=graph_; state.feedback=feedback_.snapshot(); state.scope=attention_scope_;
@@ -4797,7 +4915,7 @@ bool llama_memory_kvmem::set_tail_mean(uint32_t row, const llama_kvmem_tail_mean
     harvest_flush();
     auto graph=state.graph;
     auto feedback=feedback_; feedback.restore(state.feedback);
-    raw_->restore_mean_checkpoint(row, state.values);
+    statistics().restore_mean_checkpoint(row, state.values);
     graph_=std::move(graph); ++graph_.epoch; feedback_=std::move(feedback);
     attention_scope_=state.scope; attention_output_begin_=state.output_begin;
     attention_think_open_=state.think_open; attention_think_close_=state.think_close;
@@ -5535,6 +5653,59 @@ llama_kvmem_store_bundle * llama_kvmem_store_bundle_fork(llama_kvmem_store_bundl
     return result.release();
 }
 
+std::shared_ptr<const llama_kvmem_checkpoint_snapshot> llama_kvmem_checkpoint_capture(uint32_t row) {
+    auto * mem = kvmem_capture_active();
+    if (!mem) return {};
+    std::string reason;
+    if (!mem->conv_swap_supported(reason)) return {}; // legacy non-flash path
+    if (mem->store_n_tokens() != row)
+        throw std::runtime_error("attention checkpoint is not the accepted frontier");
+    auto result = std::make_shared<llama_kvmem_checkpoint_snapshot>();
+    result->metadata = mem->fork_active_conv(result.get());
+    auto & state = *result->metadata;
+    std::vector<std::shared_ptr<kvmem::SealedKvBlock>> blocks;
+    std::vector<kvmem::KvSnapshot::Span> spans;
+    size_t bytes = 0;
+    const auto append = [&](const kvmem::PackedKvSnapshot & packed) {
+        for (const auto & entry : packed.entries()) for (const auto * record : {&entry.k, &entry.v}) {
+            spans.push_back({blocks.size(), 0, bytes, record->size()});
+            blocks.push_back(std::make_shared<kvmem::SealedKvBlock>(*record));
+            bytes += record->size();
+        }
+    };
+    append(*result->target);
+    if (result->draft) append(*result->draft);
+    if (bytes) result->image = std::make_unique<kvmem::KvSnapshot>(std::move(blocks), std::move(spans), bytes);
+    result->metadata_bytes = sizeof(*result) + mem->conv_host_bytes(state) + result->target->metadata_bytes();
+    if (result->draft) result->metadata_bytes += result->draft->metadata_bytes();
+    if (result->image) result->metadata_bytes += result->image->metadata_bytes();
+    return result;
+}
+
+bool llama_kvmem_checkpoint_restore(const llama_kvmem_checkpoint_snapshot & snapshot) {
+    auto * mem = kvmem_capture_active();
+    if (!mem || !snapshot.metadata || !snapshot.target)
+        throw std::invalid_argument("missing immutable attention checkpoint");
+    auto candidate = mem->fork_conv(*snapshot.metadata, true);
+    candidate->raw->import_packed(*snapshot.target);
+    if (snapshot.draft) candidate->mtp_raw->import_packed(*snapshot.draft);
+    // The rejected outgoing execution is discarded, not harvested again.
+    // Failure can affect the private candidate, never the immutable source.
+    const bool empty = snapshot.metadata->runtime->store().total_tokens() == 0;
+    const bool restored = mem->restore_checkpoint_conv(std::move(candidate));
+    return restored || (empty && mem->store_n_tokens() == 0);
+}
+uint64_t llama_kvmem_checkpoint_metadata_bytes(const llama_kvmem_checkpoint_snapshot & snapshot) {
+    return snapshot.metadata_bytes;
+}
+uint64_t llama_kvmem_checkpoint_payload_bytes(const llama_kvmem_checkpoint_snapshot & snapshot) {
+    return snapshot.image ? snapshot.image->size() : 0;
+}
+
+const kvmem::KvSnapshot * llama_kvmem_checkpoint_image(const llama_kvmem_checkpoint_snapshot & snapshot) {
+    return snapshot.image.get();
+}
+
 void llama_kvmem_store_bundle_free(llama_kvmem_store_bundle * bundle) {
     delete bundle;
 }
@@ -5557,6 +5728,7 @@ void llama_kvmem_store_bundle_reset(llama_kvmem_store_bundle * bundle) {
     auto & store = *bundle->store;
     store.runtime->truncate_to(0);
     store.raw->truncate_to(0);
+    if (store.means) store.means->truncate_to(0);
     store.content->reset();
     if (store.mtp_raw) store.mtp_raw->truncate_to(0);
     store.row_positions.clear();
@@ -5580,6 +5752,7 @@ uint64_t llama_kvmem_store_bundle_bytes(const llama_kvmem_store_bundle * bundle)
     const auto & store = *bundle->store;
     uint64_t bytes = store.runtime ? store.runtime->allocated_bytes() : 0;
     bytes += store.raw ? store.raw->allocated_bytes() : 0;
+    bytes += store.means ? store.means->allocated_bytes() : 0;
     bytes += store.mtp_raw ? store.mtp_raw->allocated_bytes() : 0;
     bytes += store.row_positions.capacity()*sizeof(store.row_positions.front());
     bytes += store.resident.capacity()*sizeof(uint32_t) + store.q_count.capacity()*sizeof(uint32_t);
@@ -5785,6 +5958,7 @@ static llama_memory_kvmem::ConvStore & kvmem_detached(int32_t id) {
 static void kvmem_freeze_store(llama_memory_kvmem::ConvStore & s, std::vector<kvmem::SnapshotBuffer> & buffers) {
     if (s.cold) throw std::runtime_error("session is already frozen");
     s.raw->snapshot_buffers(buffers);
+    if (s.means) s.means->snapshot_buffers(buffers);
     if (s.mtp_raw) s.mtp_raw->snapshot_buffers(buffers);
     s.cold = true; // partial stores must never be attached to inference
 }
@@ -5817,7 +5991,9 @@ void llama_kvmem_store_snapshot_write(int32_t id, kvmem::SnapshotWriter & out) {
     out.scalar(s.runtime->store().total_tokens());
     kvmem::write_lrfu(out, s.runtime->store().retrieval_checkpoint());
     s.raw->snapshot_write(out);
-    out.scalar(uint8_t(s.mtp_raw != nullptr));
+    // Values 0/1 identify the original combined image, with optional MTP.
+    out.scalar(uint8_t((s.means ? 2 : 0) | (s.mtp_raw ? 1 : 0)));
+    if (s.means) s.means->snapshot_write(out);
     if (s.mtp_raw) s.mtp_raw->snapshot_write(out);
 }
 
@@ -5825,6 +6001,7 @@ void llama_kvmem_store_release_payload(int32_t id) {
     auto & s = kvmem_detached(id);
     auto raw = std::make_unique<kvmem::RawKvStore>(s.raw->config());
     auto mtp = s.mtp_raw ? std::make_unique<kvmem::RawKvStore>(s.mtp_raw->config()) : nullptr;
+    s.means.reset();
     s.raw = std::move(raw); s.mtp_raw = std::move(mtp); s.cold = true;
 }
 
@@ -5835,10 +6012,15 @@ void llama_kvmem_store_snapshot_read(int32_t id, kvmem::SnapshotReader & in) {
     const auto history = kvmem::read_lrfu(in, s.runtime->store().block_count());
     auto raw = std::make_unique<kvmem::RawKvStore>(s.raw->config());
     raw->snapshot_read(in, s.runtime->store().block_count());
-    in.expect(uint8_t(s.mtp_raw != nullptr));
+    const auto flags = in.scalar<uint8_t>();
+    if (flags > 3 || bool(flags & 1) != bool(s.mtp_raw))
+        throw kvmem::SnapshotCorrupt("incompatible llama checkpoint planes");
+    auto means = (flags & 2) ? std::make_unique<kvmem::RawKvStore>(raw->config()) : nullptr;
+    if (means) means->snapshot_read(in, s.runtime->store().block_count());
     auto mtp = s.mtp_raw ? std::make_unique<kvmem::RawKvStore>(s.mtp_raw->config()) : nullptr;
     if (mtp) mtp->snapshot_read(in, s.runtime->store().block_count());
     s.runtime->store().restore_retrieval(history);
+    s.means = std::move(means);
     s.raw = std::move(raw); s.mtp_raw = std::move(mtp); s.cold = false;
 }
 

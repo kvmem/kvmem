@@ -206,7 +206,7 @@ LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t
 #include <memory>
 #include "kvmem/lrfu.hpp"
 #include "kvmem/graph_recall.hpp"
-namespace kvmem { class ContentPrefix; }
+namespace kvmem { class ContentPrefix; class KvSnapshot; }
 
 namespace kvmem { class SnapshotWriter; class SnapshotReader; struct SnapshotBuffer; }
 // Portable host bundle. The active bundle is borrowed by a lane; swapping
@@ -214,6 +214,14 @@ namespace kvmem { class SnapshotWriter; class SnapshotReader; struct SnapshotBuf
 // Startup-only: both execution domains must be quiescent.
 LLAMA_API bool llama_kvmem_store_compatible_with_execution(const llama_kvmem_execution_state * other);
 struct llama_kvmem_store_bundle;
+// Immutable accepted attention image. Capture and restore run on the execution
+// thread after producers drain; restoration builds a private native candidate.
+struct llama_kvmem_checkpoint_snapshot;
+LLAMA_API std::shared_ptr<const llama_kvmem_checkpoint_snapshot> llama_kvmem_checkpoint_capture(uint32_t row);
+LLAMA_API bool llama_kvmem_checkpoint_restore(const llama_kvmem_checkpoint_snapshot & snapshot);
+LLAMA_API uint64_t llama_kvmem_checkpoint_metadata_bytes(const llama_kvmem_checkpoint_snapshot & snapshot);
+LLAMA_API uint64_t llama_kvmem_checkpoint_payload_bytes(const llama_kvmem_checkpoint_snapshot & snapshot);
+LLAMA_API const kvmem::KvSnapshot * llama_kvmem_checkpoint_image(const llama_kvmem_checkpoint_snapshot & snapshot);
 LLAMA_API llama_kvmem_store_bundle * llama_kvmem_store_bundle_create();
 LLAMA_API llama_kvmem_store_bundle * llama_kvmem_store_bundle_fork(llama_kvmem_store_bundle * source = nullptr);
 LLAMA_API void llama_kvmem_store_bundle_free(llama_kvmem_store_bundle * bundle);

@@ -27,6 +27,7 @@ public:
     struct operation {
         int lane = -1, id = -1, outgoing = -1, source = -1;
         bool fresh = false, added = false, attached = false, ready = false, finished = false, source_reserved = false;
+        bool source_pinned = false; // parked parent of an executing private branch
         bool reuse_observed = false;
         bool resident_reuse = false;
         bool content_continuation = false;
@@ -119,7 +120,7 @@ public:
         if (!resident_reuse) {
             for (const auto & item : entries_) {
                 const auto & held = item.second;
-                if (held.committed.match.rows == 0 && eligible(held, busy)) {
+                if (held.committed.match.rows == 0 && !protected_entry(held) && eligible(held, busy)) {
                     // A resident target cannot be rebound on the source lane.
                     // When capacity permits, allocate a detached branch instead.
                     if (fork && held.lane >= 0 &&
@@ -133,7 +134,7 @@ public:
             // replans and media_ready() rechecks any evicted prefix. Reclaim
             // idle capacity without privileging any client-supplied label.
             if (id < 0) for (const auto& item : entries_) {
-                if (!eligible(item.second, busy) || (fork && item.first == source)) continue;
+                if (protected_entry(item.second) || !eligible(item.second, busy) || (fork && item.first == source)) continue;
                 if (prefer_victim(item.second,id<0?nullptr:&entries_.at(id))) id = item.first;
             }
             // An executing branch may temporarily exceed the idle directory
@@ -299,7 +300,16 @@ public:
         }
         if (op.fresh || op.source >= 0) ++forks_; else ++extends_;
         if(op.source>=0)++shared_forks_;
-        if (op.source_reserved) { entries_.at(op.source).switching = false; op.source_reserved = false; }
+        if (op.source_reserved) {
+            // Handover no longer needs exclusive access. Sibling requests may
+            // fork this source, but an executing branch must never evict its
+            // parked parent to pay for its own checkpoint or restore staging.
+            auto & source = entries_.at(op.source);
+            ++source.refs;
+            op.source_pinned = true;
+            source.switching = false;
+            op.source_reserved = false;
+        }
         arena_reservation.finish_locked();
         op.ready = true;
         kvmem_diag("KVMEM_LANE_STORE lane=%d out=%d in=%d fresh=%d restaged=%d stores=%zu\n",
@@ -348,7 +358,16 @@ public:
         op.finished = true;
         struct source_guard {
             kvmem_lane_conversations& owner; operation& op;
-            ~source_guard() { if(op.source_reserved) { std::lock_guard<std::mutex> lock(owner.mu_); auto it=owner.entries_.find(op.source); if(it!=owner.entries_.end())it->second.switching=false; op.source_reserved=false; } }
+            ~source_guard() {
+                if (!op.source_reserved && !op.source_pinned) return;
+                std::lock_guard<std::mutex> lock(owner.mu_);
+                const auto source = owner.entries_.find(op.source);
+                if (source != owner.entries_.end()) {
+                    if (op.source_reserved) source->second.switching = false;
+                    if (op.source_pinned) --source->second.refs;
+                }
+                op.source_reserved = op.source_pinned = false;
+            }
         } release_source{*this,op};
         try {
             kvmem_execution_scope execution(st.execution.get());
@@ -723,7 +742,7 @@ private:
             std::vector<std::unique_lock<std::mutex>> lane_locks;
             for(const auto& item:entries_) {
                 const auto& held=item.second;
-                bool pinned=held.busy || held.switching;
+                bool pinned=held.busy || held.switching || protected_entry(held);
                 if(item.first!=incoming_id && held.lane>=0 && held.lane!=finishing_lane && !pinned) {
                     std::unique_lock<std::mutex> candidate(lanes_[held.lane]->mu,std::try_to_lock);
                     if(!candidate.owns_lock())pinned=true;
@@ -757,7 +776,7 @@ private:
         }
         for (auto it = entries_.begin(); it != entries_.end();) {
             const auto & held = it->second;
-            if (held.lane < 0 && !held.busy && !held.switching && !held.committed.match.rows)
+            if (held.lane < 0 && !held.busy && !held.switching && !protected_entry(held) && !held.committed.match.rows)
                 it = entries_.erase(it);
             else ++it;
         }
@@ -784,7 +803,7 @@ private:
     }
     void reclaim_checkpoint_host(const std::shared_ptr<MultimodalCheckpointAccounting>& account,size_t bytes) {
         std::lock_guard<std::mutex> lock(mu_);
-        const auto fits=[&] { const auto used=account->live_bytes.load();
+        const auto fits=[&] { const auto used=account->used();
             return used<=account->limit && bytes<=account->limit-used; };
         const auto owns=[&](const auto& checkpoint) {
             return checkpoint && checkpoint->accounting==account && checkpoint->resident_bytes()!=0;
