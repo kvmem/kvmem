@@ -832,6 +832,65 @@ std::unique_ptr<RawKvStore> RawKvStore::fork_prefix(uint32_t token_pos) {
     return branch;
 }
 
+std::unique_ptr<RawKvStore> RawKvStore::fork_statistics_prefix(uint32_t token_pos,
+                                                               PackedKvOptions options) const {
+    packed_poll(options);
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!cfg_.block_tokens)
+        throw MemoryError(MemoryErrorCode::InvalidPlan, "invalid statistics block size");
+    const size_t count = (uint64_t(token_pos) + cfg_.block_tokens - 1) / cfg_.block_tokens;
+    if (count > blocks_.size())
+        throw MemoryError(MemoryErrorCode::InvalidPlan, "statistics fork exceeds the retained prefix");
+
+    size_t remaining = options.metadata_limit;
+    const auto charge = [&](size_t elements, size_t width) {
+        if (elements > remaining / width)
+            throw MemoryError(MemoryErrorCode::BudgetExceeded, "statistics fork exceeds metadata allowance");
+        remaining -= elements * width;
+    };
+    charge(1, sizeof(RawKvStore));
+    charge(count, sizeof(BlockRaw));
+    if (count && cfg_.n_layer > remaining / count / sizeof(LayerBlk))
+        throw MemoryError(MemoryErrorCode::BudgetExceeded, "statistics fork index exceeds metadata allowance");
+    auto branch = std::make_unique<RawKvStore>(cfg_);
+    branch->blocks_.resize(count);
+    charge(branch->blocks_.capacity() - count, sizeof(BlockRaw));
+
+    const auto copy_rows = [&](auto & dst, const auto & src) {
+        const size_t width = sizeof(*src.data());
+        charge(src.size(), width);
+        dst = src;
+        charge(dst.capacity() - src.size(), width);
+    };
+    const auto tail = token_pos % cfg_.block_tokens;
+    for (size_t b = 0; b < count; ++b) {
+        packed_poll(options);
+        auto & layers = branch->blocks_[b].layers;
+        charge(cfg_.n_layer, sizeof(LayerBlk));
+        layers.resize(cfg_.n_layer);
+        charge(layers.capacity() - layers.size(), sizeof(LayerBlk));
+        for (size_t i = 0; i < layers.size(); ++i) {
+            packed_poll(options);
+            auto & dest = layers[i];
+            const auto & source = blocks_[b].layers.at(i);
+            const auto limit = (b + 1 == count && tail) ? tail : cfg_.block_tokens;
+            dest.n_tokens = std::min(source.n_tokens, limit);
+            copy_rows(dest.k, source.k);
+            copy_rows(dest.v, source.v);
+            if (source.mean_tokens <= limit) {
+                dest.mean_tokens = source.mean_tokens;
+                copy_rows(dest.k_sum, source.k_sum);
+            } else if (dest.n_tokens && !dest.k.empty() && k_is_f16()) {
+                charge(cfg_.n_embd_k, sizeof(float));
+                capture_mean_f16(dest);
+                charge(dest.k_sum.capacity() - dest.k_sum.size(), sizeof(float));
+            }
+        }
+    }
+    packed_poll(options);
+    return branch;
+}
+
 PackedKvSnapshot RawKvStore::export_packed(const std::vector<PackedKvSelection> & selection,
                                           PackedKvOptions options) {
     packed_poll(options);

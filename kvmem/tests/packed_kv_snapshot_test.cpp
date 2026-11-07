@@ -4,6 +4,7 @@
 #include "kvmem/snapshot.hpp"
 #include "kvmem/spill_io.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -159,6 +160,8 @@ static void ssd() {
         c.payload_storage->trim(0);
         CHECK(c.payload_storage->charged_bytes()==0);
         const auto before=spill->stats();
+        auto stats = raw.fork_statistics_prefix(4);
+        CHECK(!stats->has_k_gpu(0, 0) && !stats->has_v_gpu(0, 0));
         auto again=raw.export_packed({{0,0,4}});
         dest.import_packed(again);
         CHECK(spill->stats().reads==before.reads && spill->stats().writes==before.writes);
@@ -188,7 +191,65 @@ static void concurrent_branches() {
     CHECK(read(r.entries()[0].v)==std::vector<uint8_t>(16,22));
     CHECK(l.entries()[0].k.storage_identity()!=r.entries()[0].k.storage_identity());
 }
+static void statistics_prefix() {
+    auto cfg = config();
+    RawKvStore source(cfg);
+    const uint16_t fp16[] = {0x3c00, 0x4000, 0x4000, 0x4200, 0x4200, 0x4400, 0x4400, 0x4500};
+    source.write_layer_tokens_f16(0, 4, 1, fp16, fp16);
+    write(source, 0, 4, 0);
+    write(source, 8, 4, 0); // sparse middle block
+    auto manifest = source.export_packed({{0, 0, 4}});
+    const auto charged = cfg.payload_storage->charged_bytes();
+    auto serialize = [](RawKvStore & store) {
+        std::vector<uint8_t> bytes;
+        SnapshotWriter writer([&](const void * data, size_t n) {
+            const auto * p = static_cast<const uint8_t *>(data);
+            if (n) bytes.insert(bytes.end(), p, p + n);
+        });
+        store.snapshot_write(writer);
+        return bytes;
+    };
+    for (uint32_t frontier : {0u, 2u, 4u, 9u}) {
+        auto old = source.fork_prefix(frontier);
+        old->import_packed(source.export_packed({}));
+        auto current = source.fork_statistics_prefix(frontier);
+        CHECK(current->config().payload_storage == cfg.payload_storage);
+        CHECK(serialize(*old) == serialize(*current));
+        CHECK(!current->has_k_gpu(0, 0) && !current->has_v_gpu(0, 0));
+    }
+    CHECK(cfg.payload_storage->charged_bytes() == charged);
+    std::atomic<bool> cancelled{true};
+    rejects([&] { source.fork_statistics_prefix(4, {SIZE_MAX, &cancelled}); });
+    rejects([&] { source.fork_statistics_prefix(4, {sizeof(RawKvStore), nullptr}); });
+    rejects([&] { source.fork_statistics_prefix(13); });
+    auto branch = source.fork_statistics_prefix(4);
+    branch->import_packed(manifest);
+    auto restored = branch->export_packed({{0, 0, 4}});
+    CHECK(restored.entries()[0].k.storage_identity() == manifest.entries()[0].k.storage_identity());
+    branch->write_layer_tokens_f16(0, 1, 1, fp16 + 4, fp16 + 4);
+    std::array<float, 2> parent_mean{}, branch_mean{};
+    source.mean_k(0, 1, parent_mean.data());
+    branch->mean_k(0, 1, branch_mean.data());
+    CHECK(parent_mean != branch_mean);
+
+    // A mean-only partial prefix has no F16 rows from which to recompute
+    // a shorter sum. Preserve the existing truncate-and-restore contract.
+    RawKvStore mean_only(cfg);
+    const float means[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    mean_only.write_layer_mean_k(0, 4, 0, means);
+    auto truncated = mean_only.fork_statistics_prefix(2);
+    auto expected = mean_only.fork_prefix(2);
+    CHECK(serialize(*truncated) == serialize(*expected));
+
+    auto empty_cfg = cfg;
+    empty_cfg.n_layer = 0;
+    RawKvStore no_layers(empty_cfg);
+    no_layers.ensure_blocks(1);
+    CHECK(serialize(*no_layers.fork_statistics_prefix(4)) == serialize(*no_layers.fork_prefix(4)));
+
+}
+
 int main() {
-    coverage(); sharing_and_import(); failures_and_legacy(); ssd(); concurrent_branches();
+    statistics_prefix(); coverage(); sharing_and_import(); failures_and_legacy(); ssd(); concurrent_branches();
     std::puts("PASS packed snapshot contracts");
 }

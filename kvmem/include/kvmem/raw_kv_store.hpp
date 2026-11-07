@@ -136,6 +136,14 @@ public:
     // sources; raw rows and mutable statistics remain private to the branch.
     std::unique_ptr<RawKvStore> fork_prefix(uint32_t token_pos);
 
+    // Copy private legacy rows and MeanK for the accepted prefix. Packed bindings
+    // and coverage are omitted. Drain writers and hold native lifecycle ownership
+    // across this call and export_packed; publish only after both succeed. The
+    // allowance covers this result's index and private vectors, separately from
+    // the manifest allowance. Both results retain the source payload account.
+    std::unique_ptr<RawKvStore> fork_statistics_prefix(uint32_t token_pos,
+                                                       PackedKvOptions options = {}) const;
+
     // PROTOTYPE: caller drains native writers and serializes store lifecycle.
     // Every selected layer requires both planes. Full records share storage;
     // partial records are private capacity-sized copies with zero padding.
