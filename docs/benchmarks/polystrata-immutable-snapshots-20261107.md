@@ -1,7 +1,7 @@
 # Paths and device identities anonymized; measurements unchanged.
 # PolyStrata immutable history snapshots — 2026-11-07
 
-This backend-only change uses the existing `SealedKvBlock`, `KvSnapshot`, `HostKvStorage`, `HostKvRecord`, and `StorageIoQueue`. It does not change the public snapshot/storage/resource-policy interfaces or contract tests. Integration is held for the coordinating session, after NInfer; this PR must not merge itself.
+This backend-only change uses the existing `SealedKvBlock`, `KvSnapshot`, `HostKvStorage`, `HostKvRecord`, and `StorageIoQueue`. It does not change the public snapshot/storage/resource-policy interfaces or contract tests. Integration initially waited for the coordinating session. After NInfer PR #272 merged, the user explicitly authorized auditing and merging this PR.
 
 ## Audit and implementation
 
@@ -66,3 +66,9 @@ Validated: one CUDA GPU, Qwen3.6 text, F16/Q8 KV byte restoration and MTP reques
 Build scope was audited before each compilation. Initial native class-layout changes required eleven host units; unchanged CUDA kernels and compatible core libraries were reused after source/header/toolchain checks. Later implementation-only changes compiled one host unit and relinked. Normal parallelism was eight. No existing Ninja metadata was fabricated or deleted. The inherited `LIBCMT` default-library warning was traced to CUDA's `cudadevrt.lib`; audited project objects use `/MD`.
 
 Full settings, executable hashes, responses, counters and memory results are in [the JSON report](polystrata-immutable-snapshots-20261107.json). Local raw fixtures, logs, dry runs and build scripts are retained in `poly-snapshot-lab-20261106`; source patch identity is pinned in `backends/versions.json`.
+
+## Pre-merge integration audit
+
+Synced main through `7f0bc56eee5951db33ae4b7a250360ef4fcada1e` (NInfer #272), including public storage contracts #271 and Radiance #270. The merge preserves each backend's manifest entry and introduces no PolyStrata native patch changes. Reviewed origin ownership and tail replacement, exact restore bindings, stale-completion checks, cancellation draining, shared-state reclamation, and physical accounting; no new blocking defect was identified.
+
+The added `HostKvStorage::owns/demote` API is not called by this adapter; existing eviction calls retain the unrestricted selection behavior. The `RawKvStore` packed-record API is not used for PolyStrata native KV, and its added coverage bookkeeping does not replace PolyStrata's mean-key checkpoint restoration. `SealedKvBlock/KvSnapshot` and the accepted native-state format are unchanged. Fresh integration CI compiles against the new public headers and implementation, rather than relying on the older locally linked core library. The real-model F16/Q8 and request evidence above remains evidence for the original tested core revision; this audit does not relabel it as a new GPU run against #271.
