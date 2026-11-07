@@ -245,7 +245,7 @@ if ($Backend -eq 'ninfer') {
     $manifest.backend_sources=@{ninfer=$manifest.backend_sources.ninfer}
 }
 $utf8 = [Text.UTF8Encoding]::new($false)
-[IO.File]::WriteAllText((Join-Path $OutputDir 'BUILD-INFO.json'), ($manifest | ConvertTo-Json -Depth 6), $utf8)
+[IO.File]::WriteAllText((Join-Path $OutputDir 'BUILD-INFO.json'), ($manifest | ConvertTo-Json -Depth 32), $utf8)
 $hashes = foreach ($file in Get-ChildItem -LiteralPath $OutputDir -Recurse -File | Sort-Object FullName) {
     (Get-FileHash -LiteralPath $file.FullName).Hash.ToLowerInvariant() + '  ' +
         $file.FullName.Substring($OutputDir.Length + 1).Replace('\', '/')

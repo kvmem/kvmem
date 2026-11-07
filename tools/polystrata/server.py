@@ -13,10 +13,24 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
+from launcher.recall import LAYERWISE_RESOURCES, recall_args, require_recall_features, validate_recall
+from launcher.worker import probe_worker
+
 
 def normalize_tokens(args, parser):
     block = args.kvmem_block_tokens
     changes = []
+    if args.recall_strategy == 'layerwise':
+        for key in ('budget', 'reserve', 'sink', 'recent'):
+            value = getattr(args, key)
+            if value is None and key in ('sink', 'recent'):
+                continue
+            if type(value) is not int or value < (block if key in ('budget', 'reserve') else 0) or value > 2147483647 or value % block:
+                parser.error(f'Layerwise {key} requires an exact native block-aligned value')
+        if not 1 <= args.prefill <= 2147483647:
+            parser.error('Prefill must be positive and <= 2147483647')
+        return changes
     for key, label, minimum in (('budget', 'Budget', 128), ('reserve', 'Reserve', block),
                                 ('sink', 'SinkTokens', 0), ('recent', 'RecentTokens', block)):
         requested = getattr(args, key)
@@ -57,7 +71,7 @@ def main():
     parser.add_argument("--kvmem-block-tokens", type=int, choices=(32, 64), default=32,
                         help="KVMem block size in tokens; fixed for this worker (default: 32)")
     parser.add_argument("--reserve", type=int, default=1024)
-    parser.add_argument("--host-mib", type=int, default=4096)
+    parser.add_argument("--host-mib", type=int)
     parser.add_argument("--disk-path", type=Path)
     parser.add_argument("--disk-mib", type=int, default=0)
     parser.add_argument("--verify-transfers", action="store_true", help="verify restored native KV and recurrent state bytes")
@@ -68,8 +82,13 @@ def main():
     parser.add_argument("--reasoning-effort", choices=("none", "low", "medium", "high"))
     parser.add_argument("--preserve-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--vram-reserve-mib", type=int, default=256)
-    parser.add_argument("--sink", type=int, default=64)
-    parser.add_argument("--recent", type=int, default=64)
+    parser.add_argument("--sink", type=int)
+    parser.add_argument("--recent", type=int)
+    parser.add_argument("--recall-strategy", choices=("legacy", "layerwise"), default="legacy")
+    parser.add_argument("--layerwise-mtp-history", choices=("upstream-global", "first-layer"))
+    parser.add_argument("--draft-method", choices=("none", "mtp", "guess"))
+    for key, (flag, default) in LAYERWISE_RESOURCES.items():
+        parser.add_argument(flag.replace('--kvmem-', '--'), type=int)
     parser.add_argument("--score-agg", choices=("mean", "max"), default=None)
     parser.add_argument("--query-scorer", choices=("page-softmax","meanq-cosine"), default="page-softmax")
     parser.add_argument("--graph-alpha", type=float)
@@ -96,6 +115,26 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("worker_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.host_mib is None:
+        args.host_mib = 16384 if args.recall_strategy == 'layerwise' else 4096
+    if args.recall_strategy == 'legacy':
+        if args.sink is None: args.sink = 64
+        if args.recent is None: args.recent = 64
+    draft_method = args.draft_method or ('mtp' if args.mtp_drafts else 'none')
+    if (draft_method == 'none') != (args.mtp_drafts == 0):
+        parser.error('draft method and physical draft count disagree')
+    recall_parameters = dict(Backend='polystrata', RecallStrategy=args.recall_strategy,
+        Model=str(args.model), Gpu=args.gpu, Concurrency=args.concurrency,
+        SpeculativeMode=draft_method, DraftTokens=args.mtp_drafts, DraftPolicy='adaptive',
+        KvType=args.kv_type, BlockTokens=args.kvmem_block_tokens, Reserve=args.reserve,
+        Vision=bool(args.vision_worker), VisionResidency='cpu' if args.vision_device == 'cpu' else 'resident')
+    if args.draft_model: recall_parameters['DraftModel'] = str(args.draft_model)
+    if args.layerwise_mtp_history: recall_parameters['LayerwiseMtpHistory'] = args.layerwise_mtp_history
+    for key, (flag, default) in LAYERWISE_RESOURCES.items():
+        value = getattr(args, flag.removeprefix('--kvmem-').replace('-', '_'))
+        if value is not None: recall_parameters[key] = value
+    try: validate_recall(recall_parameters)
+    except ValueError as error: parser.error(str(error))
     if args.thinking_budget is not None and not 0 <= args.thinking_budget <= 2147483647:
         parser.error("thinking budget must be a nonnegative integer")
     if (args.thinking_mode == "off" and args.reasoning_effort not in (None, "none")) or \
@@ -113,14 +152,14 @@ def main():
     block = args.kvmem_block_tokens
     token_adjustments = normalize_tokens(args, parser)
     checks = [
-        (128 <= args.budget <= 2147483647 and args.budget % block == 0, f"Budget must be >=128 and a multiple of {block}"),
+        ((block if args.recall_strategy=='layerwise' else 128) <= args.budget <= 2147483647 and args.budget % block == 0, f"Budget must fit native block size {block}"),
         (block <= args.reserve <= 2147483647 and args.reserve % block == 0, f"Reserve must be >={block} and a multiple of {block}"),
         (args.budget + args.reserve <= args.context <= 2147483647, "Context must be >= Budget + Reserve"),
-        (1 <= args.prefill <= args.reserve, "Prefill must be positive and <= Reserve"),
+        (1 <= args.prefill <= (2147483647 if args.recall_strategy=='layerwise' else args.reserve), "Prefill exceeds its admitted limit"),
         (0 <= args.max_tokens <= args.context, "MaxTokens must be 0 (unlimited) or positive and <= Context"),
-        (args.sink >= 0 and args.sink % block == 0, f"SinkTokens must be nonnegative and a multiple of {block}"),
-        (args.recent >= block and args.recent % block == 0, f"RecentTokens must be >={block} and a multiple of {block}"),
-        (args.sink + args.recent <= args.budget, "SinkTokens + RecentTokens must be <= Budget"),
+        (args.sink is None or args.sink >= 0 and args.sink % block == 0, f"SinkTokens must be nonnegative and a multiple of {block}"),
+        (args.recent is None or args.recent >= (0 if args.recall_strategy=='layerwise' else block) and args.recent % block == 0, f"RecentTokens must fit native block size {block}"),
+        (args.sink is None or args.recent is None or args.sink + args.recent <= args.budget, "SinkTokens + RecentTokens must be <= Budget"),
         (1 <= args.host_mib <= (1 << 24), "HostMiB is outside the supported range"),
         (1 <= args.port <= 65535, "Port must be 1..65535"),
         (256 <= args.vram_reserve_mib <= 65536, "VramReserveMiB must be 256..65536; the worker enforces a 256 MiB minimum"),
@@ -190,6 +229,24 @@ def main():
                    "--kvmem-query-max-tokens",str(args.query_max_tokens),
                    "--kvmem-query-replay-max-tokens",str(args.replay_max_tokens),
                    "--kv","fp16" if args.kv_type=="f16" else args.kv_type]
+    if args.recall_strategy == 'layerwise':
+        omitted = {'--kvmem-score-agg', '--kvmem-query-scorer', '--kvmem-graph-alpha',
+                   '--kvmem-query-max-tokens', '--kvmem-query-replay-max-tokens'}
+        if args.sink is None: omitted.add('--kvmem-sink-tokens')
+        if args.recent is None: omitted.add('--kvmem-recent-tokens')
+        filtered = []
+        index = 0
+        while index < len(worker_args):
+            if worker_args[index] in omitted:
+                index += 2
+            else:
+                filtered.append(worker_args[index]); index += 1
+        worker_args = filtered + recall_args(recall_parameters)
+        if any(re.match(r'^--(?:kvmem(?:$|-)|mtp|no-draft|draft-model|window|batch)', option) for option in extra):
+            parser.error('Use named layerwise settings; worker arguments cannot override the recall or draft owner')
+        if not args.dry_run:
+            try: require_recall_features(probe_worker(args.worker, 'polystrata'), recall_parameters)
+            except ValueError as error: parser.error(str(error))
     if args.concurrency>1:
         worker_args += ["--batch",str(args.concurrency)]
     worker_args += ["--kvmem-mtp"] if args.mtp_drafts else ["--no-draft"]
@@ -201,7 +258,9 @@ def main():
         worker_args += ['--draft-model', str(args.draft_model.resolve())]
     if args.disk_path:
         worker_args += ["--kvmem-disk-path",str(args.disk_path.resolve()),"--kvmem-disk-mib",str(args.disk_mib)]
-    if args.lrfu or (args.query_scorer=="meanq-cosine" and not args.no_lrfu):
+    if args.recall_strategy == 'layerwise':
+        pass
+    elif args.lrfu or (args.query_scorer=="meanq-cosine" and not args.no_lrfu):
         worker_args += ["--kvmem-lrfu", "--kvmem-lrfu-lambda", str(args.lrfu_lambda),
                         "--kvmem-lrfu-top-frac", str(args.lrfu_top_frac)]
     else:
@@ -284,10 +343,12 @@ def main():
                     continue
                 for line in lines:
                     marker = line.split(' ', 1)[0]
-                    if line.endswith('\n') and marker in {'KVMEM_SCORING', 'KVMEM_LIMITS', 'KVMEM_BLOCKS'} and marker not in seen:
+                    recall_report = marker == 'INFO' and 'recall_strategy=layerwise' in line
+                    if line.endswith('\n') and (marker in {'KVMEM_SCORING', 'KVMEM_LIMITS', 'KVMEM_BLOCKS'} or recall_report) and marker not in seen:
                         print(line.rstrip(), flush=True)
                         seen.add(marker)
-                if len(seen) == 3:
+                required = {'INFO', 'KVMEM_BLOCKS'} if args.recall_strategy == 'layerwise' else {'KVMEM_SCORING', 'KVMEM_LIMITS', 'KVMEM_BLOCKS'}
+                if required.issubset(seen):
                     return
         thread = threading.Thread(target=relay_scoring, daemon=True)
         thread.start()

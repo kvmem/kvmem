@@ -18,7 +18,8 @@ MAX_RESOURCE = 1024 * 1024
 MAX_TENSORS = 200000
 MAX_PARTS = 128
 FIELDS = {'Backend', 'Model', 'Worker', 'Vision', 'Mmproj', 'VisionWorker',
-          'Tokenizer', 'ChatTemplateFile', 'SpeculativeMode', 'MtpDrafts', 'DraftModel', 'KvType'}
+          'Tokenizer', 'ChatTemplateFile', 'SpeculativeMode', 'MtpDrafts', 'DraftModel', 'KvType',
+          'RecallStrategy'}
 
 
 class Incomplete(Exception):
@@ -266,7 +267,7 @@ class Inspection:
                 self.check('poly_kv', 'error', 'KV 格式与模型架构不兼容', 'KV format is incompatible with the model architecture', f'{arch}: {", ".join(sorted(allowed))}', 'config')
             if arch=='gemma4':
                 self.report['features']['mtp']='external'
-                if self.p.get('SpeculativeMode')=='mtp' or self.p.get('MtpDrafts',0)>0:
+                if self.p.get('SpeculativeMode') in ('mtp','guess') or self.p.get('MtpDrafts',0)>0:
                     draft=self.p.get('DraftModel')
                     if not draft:
                         self.check('gemma_assistant_missing','error','Gemma 4 MTP 需要匹配的 assistant GGUF','Gemma 4 MTP requires its matching assistant GGUF','DraftModel','config')
@@ -364,6 +365,13 @@ class Inspection:
                     tensors=sum(isinstance(o, TensorObject) for o in artifact.objects),
                     files=len(directory.files), bytes=artifact.file_bytes,
                     context=config.get('max_position_embeddings'), layers=config.get('num_hidden_layers'))
+                # Native binding reads one exact implementation name from this
+                # field. model_type is only a display label, never a substitute.
+                architectures = config.get('architectures')
+                if (isinstance(architectures, list) and len(architectures) == 1
+                        and isinstance(architectures[0], str) and architectures[0]
+                        and '\0' not in architectures[0] and len(architectures[0]) <= 160):
+                    self.report['model']['architecture_id'] = architectures[0]
                 if not self.report['model']['tensors']:
                     raise Invalid('NInfer model contains no tensors')
                 features = self.report['features']

@@ -16,6 +16,7 @@ try {
     foreach ($relative in 'scripts/local-console.py', 'scripts/console_chat.py', 'scripts/model_health.py', 'scripts/console_hardware.py', 'scripts/console_memory.py',
                           'scripts/launcher/__init__.py', 'scripts/launcher/config.py', 'scripts/launcher/plan.py',
                           'scripts/launcher/export.py', 'scripts/launcher/systemd.py', 'scripts/launcher/worker.py', 'scripts/launcher-capabilities.json',
+                          'scripts/launcher/recall.py', 'scripts/check-recall-worker.py', 'scripts/windows/recall-strategy.ps1',
                           'scripts/model_health_ninfer/__init__.py', 'scripts/model_health_ninfer/reader.py',
                           'scripts/model_health_ninfer/schema.py', 'scripts/model_health_ninfer/layouts.py',
                           'scripts/model_health_ninfer/formats.py', 'scripts/model_health_ninfer/framing.py',

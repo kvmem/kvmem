@@ -1,0 +1,249 @@
+diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
+index 859aff7..fffcd37 100644
+--- a/src/poly/kvmem.cpp
++++ b/src/poly/kvmem.cpp
+@@ -158,8 +158,7 @@ void KvmemMemory::ensure_staging(uint64_t out_rows,uint64_t in_rows) {
+     require(!transaction_ && out_rows<=uint64_t(capacity()) && in_rows<=uint64_t(capacity()),
+             "cannot resize active or oversized KVMem staging");
+     const auto grow=[&](uint64_t rows,std::unique_ptr<uint8_t,PinnedDelete>& owner,uint8_t*& pointer,size_t& allocated) {
+-        const uint64_t rounded=std::min<uint64_t>(capacity(),(rows+4095)/4096*4096);
+-        const size_t bytes=size_t(rounded)*size_t(descriptor_.layout.record_bytes/block_tokens);
++        const size_t bytes=size_t(rows)*size_t(descriptor_.layout.record_bytes/block_tokens);
+         if(bytes<=allocated)return;
+         uint8_t* replacement=nullptr;
+         ck(cudaMallocHost(reinterpret_cast<void**>(&replacement),bytes),"KVMem native transfer staging");
+@@ -167,8 +166,10 @@ void KvmemMemory::ensure_staging(uint64_t out_rows,uint64_t in_rows) {
+         // Allocation failure leaves the old storage and accepted KV intact.
+         owner.reset(replacement);pointer=replacement;allocated=bytes;
+     };
+-    grow(out_rows,out_owner_,out_,out_bytes_);
+-    grow(in_rows,in_owner_,in_,in_bytes_);
++    grow(std::min<uint64_t>(capacity(),(out_rows+4095)/4096*4096),out_owner_,out_,out_bytes_);
++    const uint64_t row_bytes = descriptor_.layout.record_bytes / block_tokens;
++    const auto limit = std::min<uint64_t>(capacity(),std::max<uint64_t>(1,restore_slice_bytes_/row_bytes));
++    grow(std::min(limit,((in_rows+255)/256)*256),in_owner_,in_,in_bytes_);
+ }
+ void KvmemMemory::rebind(std::vector<KvmemPlane> planes) {
+     require(!transaction_ && planes.size()==planes_.size(),"cannot rebind incompatible or busy KVMem planes");
+@@ -368,10 +369,11 @@ void KvmemMemory::save_view(uint8_t* dst) {
+     ck(cudaStreamSynchronize(cs(engine_.st_)), "KVMem spill");
+     view_download_dma.fetch_add(visible_*descriptor_.layout.record_bytes/block_tokens,std::memory_order_relaxed);
+ }
+-void KvmemMemory::restore_view(const uint8_t* src, uint64_t rows) {
++void KvmemMemory::restore_view(const uint8_t* src, uint64_t first, uint64_t rows) {
++    if (!rows) return;
+     for (size_t p=0;p<payload_.size();++p) {
+         const size_t bytes=size_t(rows)*descriptor_.layout.planes[p].token_stride;
+-        if (bytes) ck(cudaMemcpyAsync(payload_[p],src,bytes,cudaMemcpyHostToDevice,cs(engine_.st_)),"KVMem restore");
++        if (bytes) ck(cudaMemcpyAsync(payload_[p]+first*descriptor_.layout.planes[p].token_stride,src,bytes,cudaMemcpyHostToDevice,cs(engine_.st_)),"KVMem restore");
+         src+=bytes;
+     }
+     ck(cudaStreamSynchronize(cs(engine_.st_)), "KVMem restore");
+@@ -489,8 +491,14 @@ class KvmemTransfer final : public kvmem::MemoryTransfer {
+ public:
+     KvmemTransfer(KvmemMemory& owner, const kvmem::WorkingSetPlan& plan) : owner_(owner), plan_(plan) {
+         require(!owner.transaction_ && owner.stamp_ == plan.expected, "KVMem transfer has a stale owner");
+-        owner.ensure_staging(owner.options_.verify?std::max(owner.visible_,plan.next.visible_tokens):owner.visible_,
+-                             plan.next.visible_tokens);
++        const size_t row_bytes = owner.descriptor_.layout.record_bytes / owner.block_tokens;
++        max_rows_ = std::max<size_t>(1,owner.restore_slice_bytes_ / row_bytes);
++        owner.ensure_staging(owner.visible_,std::min(max_rows_,plan.next.visible_tokens));
++        uint64_t at = 0;
++        for (auto id : owner.resident_) {
++            old_.emplace(id,at);
++            at += owner.block(uint32_t(id)).valid_tokens;
++        }
+         const auto writes = owner.io_stats().written_bytes;
+         auto reservation = owner.storage_->reserve(uint64_t(plan.spill.size()) * owner.descriptor_.layout.record_bytes);
+         if (owner.io_stats().written_bytes > writes) owner.check_fault("disk_write");
+@@ -517,61 +525,88 @@ public:
+     kvmem::TransferPoll poll() override {
+         if (phase_ == 2) {
+             if (!read_.ready()) return {kvmem::TransferStatus::Pending,{}};
+-            read_.wait(); // CPU/file failure before any GPU publication
+-            finish_restore(); // engine thread alone owns CUDA and view publication
++            read_.wait(); // Surface read errors before writing this slice to the GPU.
++            upload_slice();
++            if (first_ < plan_.next.visible_tokens) {
++                queue_slice();
++                return {kvmem::TransferStatus::Pending,{}};
++            }
++            phase_ = 3;
+         }
+         return {phase_ ? kvmem::TransferStatus::Complete : kvmem::TransferStatus::Pending, {}};
+     }
+     void start_restore() override {
+         require(phase_ == 1 && !finished_, "KVMem restore started before spill completed");
+         if (owner_.io_queue_) {
+-            const uint64_t bytes=2*uint64_t(owner_.capacity())*owner_.descriptor_.layout.record_bytes/owner_.block_tokens;
+-            read_=owner_.io_queue_->submit(bytes,[this] { fill_restore(); });
+-            require(bool(read_),"KVMem cold-read queue exceeded its bounded capacity");
+-            phase_=2;
+-        } else { fill_restore(); finish_restore(); }
++            queue_slice();
++            phase_ = 2;
++        } else {
++            do {
++                fill_restore();
++                upload_slice();
++            } while (first_ < plan_.next.visible_tokens);
++            phase_ = 3;
++        }
++    }
++    uint64_t slice_rows() const {
++        return std::min(max_rows_,plan_.next.visible_tokens-first_);
++    }
++    void queue_slice() {
++        const uint64_t bytes = std::max<uint64_t>(1,owner_.out_bytes_ + owner_.in_bytes_);
++        read_ = owner_.io_queue_->submit(bytes,[this] { fill_restore(); });
++        require(bool(read_),"KVMem cold-read queue exceeded its bounded capacity");
+     }
+     void fill_restore() {
+-        std::unordered_map<uint64_t, uint64_t> old;
+-        uint64_t at = 0;
+-        for (auto id : owner_.resident_) { old.emplace(id, at); at += owner_.block(uint32_t(id)).valid_tokens; }
++        const auto rows = slice_rows();
+         for (const auto& chosen : plan_.next.blocks) {
+             const auto& b = chosen.block;
++            const uint64_t begin = std::max<uint64_t>(first_,chosen.compact_start);
++            const uint64_t end = std::min<uint64_t>(first_+rows,chosen.compact_start+b.valid_tokens);
++            if (begin >= end) continue;
++            const uint64_t block_row = begin-chosen.compact_start;
+             size_t offset=0;
+             for (size_t p = 0; p < owner_.descriptor_.layout.planes.size(); ++p) {
+                 const auto& plane=owner_.descriptor_.layout.planes[p];
+                 const size_t row=plane.token_stride;
+-                auto* dst = owner_.in_ + offset*plan_.next.visible_tokens + chosen.compact_start*row;
+-                const auto found = old.find(b.id);
+-                if (found != old.end())
+-                    std::memcpy(dst, owner_.out_ + offset*owner_.visible_ + found->second*row, size_t(b.valid_tokens)*row);
++                auto* dst = owner_.in_ + offset*rows + (begin-first_)*row;
++                const auto found = old_.find(b.id);
++                if (found != old_.end())
++                    std::memcpy(dst, owner_.out_ + offset*owner_.visible_ + (found->second+block_row)*row, size_t(end-begin)*row);
+                 else {
+                     if (!leases_.at(b.id).data()) owner_.check_fault("disk_read");
+-                    leases_.at(b.id).read(size_t(plane.offset),dst,size_t(b.valid_tokens)*row);
++                    leases_.at(b.id).read(size_t(plane.offset)+block_row*row,dst,size_t(end-begin)*row);
+                 }
+                 offset+=row;
+             }
+         }
+     }
+-    void finish_restore() {
++    void upload_slice() {
+         require(owner_.stamp_ == plan_.expected, "KVMem restore belongs to a stale session");
+         // Publish current Host sources before any destructive device writes.
+         for (auto& item : staged_) {
+             owner_.archive_[item.first] = std::move(item.second);
+             owner_.host_versions_[item.first] = owner_.versions_[item.first];
+         }
++        staged_.clear();
+         destructive_ = true;
+-        owner_.restore_view(owner_.in_, plan_.next.visible_tokens);
+-        owner_.check_fault("restore");
+-        if (owner_.options_.verify) {
+-            const uint64_t old_visible = owner_.visible_;
+-            owner_.visible_ = plan_.next.visible_tokens;
+-            try { owner_.save_view(owner_.out_); } catch (...) { owner_.visible_ = old_visible; throw; }
+-            owner_.visible_ = old_visible;
+-            require(std::memcmp(owner_.in_, owner_.out_, size_t(plan_.next.visible_tokens) * owner_.descriptor_.layout.record_bytes / owner_.block_tokens) == 0,
+-                    "KVMem restored native bytes differ");
++        const auto rows = slice_rows();
++        owner_.restore_view(owner_.in_,first_,rows);
++        if (owner_.options_.verify && rows) {
++            const uint8_t* expected = owner_.in_;
++            std::vector<uint8_t> plane_copy;
++            for (size_t p = 0; p < owner_.payload_.size(); ++p) {
++                const size_t stride = owner_.descriptor_.layout.planes[p].token_stride;
++                plane_copy.resize(rows*stride);
++                ck(cudaMemcpy(plane_copy.data(),owner_.payload_[p]+first_*stride,plane_copy.size(),
++                              cudaMemcpyDeviceToHost),"KVMem restore verification");
++                require(std::memcmp(expected,plane_copy.data(),plane_copy.size())==0,
++                        "KVMem restored native bytes differ");
++                view_download_dma.fetch_add(plane_copy.size(),std::memory_order_relaxed);
++                expected += plane_copy.size();
++            }
+         }
+-        phase_ = 3;
++        first_ += rows;
++        owner_.check_fault("restore");
+     }
+     void publish(const kvmem::ExecutionView& view) override {
+         require(phase_ == 3 && !finished_, "KVMem view published before restore completed");
+@@ -613,6 +648,8 @@ private:
+     kvmem::WorkingSetPlan plan_;
+     std::vector<std::pair<uint32_t, kvmem::HostKvRecord>> staged_;
+     std::unordered_map<uint64_t, kvmem::HostKvLease> leases_;
++    std::unordered_map<uint64_t,uint64_t> old_;
++    uint64_t max_rows_=0, first_=0;
+     kvmem::StorageTicket read_;
+     bool destructive_ = false, finished_ = false;
+     int phase_ = 0;
+@@ -1029,7 +1066,7 @@ void KvmemMemory::storage_metrics() const {
+     std::fprintf(stderr,"KVMEM_NATIVE_IO scope=process archive_d2h_bytes=%llu view_d2h_bytes=%llu view_h2d_bytes=%llu state_image_bytes=%llu\n",
+         (unsigned long long)archive_dma.load(),(unsigned long long)view_download_dma.load(),
+         (unsigned long long)view_upload_dma.load(),(unsigned long long)state_images.load());
+-    std::fprintf(stderr,"KVMEM_SNAPSHOT capture_bytes=%llu logical_view_bytes=%llu state_capture_bytes=%llu staging_bytes=%llu restore_staging=full_selected_view state_storage=%s\n",
++    std::fprintf(stderr,"KVMEM_SNAPSHOT capture_bytes=%llu logical_view_bytes=%llu state_capture_bytes=%llu staging_bytes=%llu restore_staging=bounded_rows state_storage=%s\n",
+         (unsigned long long)captured_bytes_,(unsigned long long)checkpoint_view_bytes_,
+         (unsigned long long)state_capture_bytes_,(unsigned long long)(out_bytes_+in_bytes_),tiered_state()?"tiered_record":"reserved_ram");
+     std::fprintf(stderr,"KVMEM_STORAGE host_bytes=%llu host_limit=%llu disk_bytes=%llu disk_limit=%llu read_bytes=%llu written_bytes=%llu errors=%llu\n",
+diff --git a/src/poly/kvmem.hpp b/src/poly/kvmem.hpp
+index 4536786..54ac613 100644
+--- a/src/poly/kvmem.hpp
++++ b/src/poly/kvmem.hpp
+@@ -183,7 +183,7 @@ private:
+     std::vector<uint64_t> mandatory() const;
+     void exchange(const std::vector<uint64_t>&);
+     void save_view(uint8_t* dst);
+-    void restore_view(const uint8_t* src, uint64_t rows);
++    void restore_view(const uint8_t* src, uint64_t first, uint64_t rows);
+     void copy_to_record(uint32_t id, kvmem::HostKvRecord&, const uint8_t* src, uint64_t rows, uint64_t first = 0);
+     void check_fault(const char* stage);
+     void rewind_state(const KvmemCheckpoint&);
+@@ -215,6 +215,7 @@ private:
+     bool tiered_state() const {
+         return disk_limit() && descriptor_.identity.state_schema == "qwen35-gdn-f32-v1";
+     }
++    size_t restore_slice_bytes_=8u << 20;
+     void ensure_staging(uint64_t out_rows,uint64_t in_rows);
+     int64_t query_begin_ = -1, query_end_ = -1;
+     bool query_capture_ = false, query_frozen_ = false, transaction_ = false;
+diff --git a/tools/poly_kvmem_snapshot_test.cpp b/tools/poly_kvmem_snapshot_test.cpp
+index aab467d..9cebb75 100644
+--- a/tools/poly_kvmem_snapshot_test.cpp
++++ b/tools/poly_kvmem_snapshot_test.cpp
+@@ -6,6 +6,18 @@ using namespace strata::poly;
+ namespace strata::poly { struct KvmemTestAccess {
+  static std::vector<uint8_t> kv(KvmemMemory& m){std::vector<uint8_t> b(m.visible_*m.descriptor_.layout.record_bytes/m.block_tokens);m.save_view(b.data());return b;}
+  static void sparse(KvmemMemory& m){m.exchange({0,3});}
++ static bool cancel_partial_restore(KvmemMemory& m) {
++    // Force a slice edge inside a native block as well as a boundary between blocks.
++    m.restore_slice_bytes_ = (m.block_tokens-1)*m.descriptor_.layout.record_bytes/m.block_tokens;
++    const auto before = m.restored_bytes_;
++    kvmem::MemorySession session(m.shared_from_this());
++    session.prepare(m.stamp_,m.resident_,m.mandatory(),
++                    {m.options_.budget,m.options_.reserve,uint64_t(m.capacity()),m.host_entitlement()});
++    while (m.restored_bytes_ == before) {
++        if (session.advance() == kvmem::MemoryPhase::Ready) return false;
++    }
++    return session.abort() == kvmem::AbortResult::SessionInvalidated && !m.stamp_.valid;
++ }
+  static void cancel(KvmemMemory& m){kvmem::MemorySession s(m.shared_from_this());s.prepare(m.stamp_,{0,2,3},m.mandatory(),{m.options_.budget,m.options_.reserve,uint64_t(m.capacity()),m.host_entitlement()});s.advance();s.advance();s.abort();}
+  static bool stale(KvmemMemory& m){
+   kvmem::MemorySession s(m.shared_from_this());
+@@ -76,6 +88,13 @@ int main(int argc,char** argv){try{
+     m.enter(std::move(next),cp);
+     check(KvmemTestAccess::kv(m)==bytes_a,"cold state retry differs");
+  }
++ check(KvmemTestAccess::cancel_partial_restore(m),"partial restore cancellation did not invalidate the view");
++ check(cp.kv->read()==saved,"partial restore cancellation changed the published source");
++ e->reset();
++ auto after_cancel=m.fork(parked);
++ cp.identity.stamp.session=after_cancel.identity.stamp.session;
++ m.enter(std::move(after_cancel),cp);
++ check(KvmemTestAccess::kv(m)==bytes_a,"retry after partial restore cancellation differs");
+  check(KvmemTestAccess::stale(m),"stale completion published");check(cp.kv->read()==saved,"stale completion changed source");
+  e->reset();auto fresh=m.fork(parked);cp.identity.stamp.session=fresh.identity.stamp.session;m.enter(std::move(fresh),cp);check(KvmemTestAccess::kv(m)==bytes_a,"stale completion lost recovery source");
+  std::cout<<"PASS complete origins, private tail, exact old-parent native KV, cold fork, branch edit; disk_reads="<<m.io_stats().read_bytes<<"\n";}check(weak.expired(),"origin remained alive");check(account->charged_bytes()==0 && account->disk_bytes()==0,"snapshot resources leaked");std::cout<<"PASS final resource release\n";return 0;

@@ -62,6 +62,13 @@ inline int kvmem_cli_gpu_layers(const char * option, const char * value) {
 }
 
 struct kvmem_server_options : kvmem::CliOptions {
+    void resolve() {
+        if (recall_strategy != kvmem::RecallStrategy::Legacy || layerwise_limits_set ||
+            layerwise_mtp_history != kvmem::LayerwiseMtpHistory::Unspecified)
+            throw std::invalid_argument("this llama.cpp worker does not implement layerwise recall");
+        kvmem::CliOptions::resolve();
+    }
+
     int parallel = 1;
     // Live host KV stores, time-multiplexed on one GPU working set. One
     // reproduces the single-store server, where a different conversation

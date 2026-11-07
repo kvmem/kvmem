@@ -20,7 +20,7 @@ param(
     [ValidateSet('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')][string]$ReasoningEffort,
     [switch]$PreserveThinking,
     [ValidateRange(256, 2147483647)][int]$Context = 204800,
-    [ValidateRange(128, 2147483647)][int]$Budget = 36864,
+    [ValidateRange(1, 2147483647)][int]$Budget = 36864,
     [ValidateRange(64, 2147483647)][int]$Reserve = 16384,
     [ValidateRange(1, 1048576)][int]$HostMiB = 12288,
     [ValidateRange(128, 2147483647)][int]$Prefill = 256,
@@ -45,7 +45,15 @@ param(
     [ValidateSet('off', 'auto')][string]$DeviceProfile = 'off',
     [ValidateRange(0, 2147483647)][int]$ThinkingBudget = 8192,
     [ValidateRange(0, 2147483647)][int]$SinkTokens = 12288,
-    [ValidateRange(64, 2147483647)][int]$RecentTokens = 1024,
+    [ValidateRange(0, 2147483647)][int]$RecentTokens = 1024,
+    [ValidateSet('legacy', 'layerwise')][string]$RecallStrategy = 'legacy',
+    [ValidateSet('upstream-global', 'first-layer')][string]$LayerwiseMtpHistory,
+    [ValidateRange(0, 2147483647)][int]$LayerwiseActivationRamMiB,
+    [ValidateRange(0, 2147483647)][int]$LayerwiseActivationDiskMiB,
+    [ValidateRange(1, 2147483647)][int]$LayerwiseStagingMiB,
+    [ValidateRange(1, 2147483647)][int]$LayerwiseMetadataMiB,
+    [ValidateRange(1, 2147483647)][int]$LayerwiseCheckpointTarget,
+    [ValidateRange(1, 2147483647)][int]$LayerwiseActivationMetadataMiB,
     [ValidateSet('page-softmax', 'meanq-cosine')][string]$QueryScorer = 'page-softmax',
     [ValidateRange(0.0, 1.0)][double]$GraphAlpha,
     [ValidateRange(1, 2147483647)][int]$QueryMaxTokens,
@@ -65,6 +73,21 @@ param(
     [Parameter(ValueFromRemainingArguments=$true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$WorkerArgsTail = @()
 )
 $ErrorActionPreference = 'Stop'
+if ($RecallStrategy -eq 'layerwise') {
+    # A new strategy starts with ordinary text generation. Preserve every
+    # explicitly supplied draft/vision choice for the actual worker gate.
+    foreach ($entry in @{MtpDrafts=0;AdaptiveMtp=$false;NgramDrafts=0;Vision=$false}.GetEnumerator()) {
+        if (!$PSBoundParameters.ContainsKey($entry.Key)) { Set-Variable -Name $entry.Key -Value $entry.Value }
+    }
+    $requestedMode = if ($SpeculativeMode) { $SpeculativeMode } elseif ($MtpDrafts -gt 0) { 'mtp' } else { 'none' }
+    if ($requestedMode -ne 'none') {
+        if (!$PSBoundParameters.ContainsKey('DraftTokens') -and !$PSBoundParameters.ContainsKey('MtpDrafts')) {
+            throw 'Layerwise speculative decoding requires an explicit draft width'
+        }
+        $requestedWidth = if ($PSBoundParameters.ContainsKey('DraftTokens')) { $DraftTokens } else { $MtpDrafts }
+        if ($requestedWidth -lt 1) { throw 'Layerwise speculative draft width must be positive' }
+    }
+}
 . (Join-Path $PSScriptRoot 'native-process.ps1')
 $resolvedArgs = Resolve-KVMemWorkerArgs $PSBoundParameters $WorkerArgsTail
 $forward = @{}
@@ -73,6 +96,8 @@ foreach ($name in @('WorkerArgs', 'WorkerArgsFile', 'WorkerArgsTail')) { $null =
 $forward['WorkerArgs'] = $resolvedArgs
 $forward['Backend'] = 'ninfer'
 foreach ($parameterName in @('Gpu', 'Context', 'Budget', 'Reserve', 'HostMiB', 'Prefill', 'MaxTokens', 'KvType', 'MtpDrafts', 'AdaptiveMtp', 'NgramDrafts', 'NgramMinMatch', 'Concurrency', 'RetainedSessions', 'Vision', 'VisionResidency', 'CpuVisionIdleSeconds', 'VisionTokens', 'DeviceProfile', 'ThinkingBudget', 'SinkTokens', 'RecentTokens')) {
+    if ($RecallStrategy -eq 'layerwise' -and !$PSBoundParameters.ContainsKey($parameterName) -and
+        $parameterName -in @('Budget','Reserve','HostMiB','SinkTokens','RecentTokens')) { continue }
     if (!$forward.ContainsKey($parameterName)) { $forward[$parameterName] = Get-Variable -Name $parameterName -ValueOnly }
 }
 $null = $forward.Remove('NoVision')

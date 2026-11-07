@@ -6,6 +6,7 @@
   let info, busy=false, activeTab=0, runtime=null, startPending=false, launchFailure="";
   let budgetPending=false, budgetAdjustment=null;
   let health=null, healthKey='', healthTimer=null, healthAbort=null, healthSequence=0, healthState='idle';
+  let workerContract=null, workerKey='', workerTimer=null, workerAbort=null, workerSequence=0, workerError='';
   // A running process owns the displayed configuration; browser drafts cannot replace it.
   let configLocked=false, configUncertain=false, runningParameters=null, pendingParameters=null, runningView='';
   const lockedControls=new WeakMap();
@@ -17,7 +18,7 @@
       else if(lockedControls.has(el)){el.disabled=lockedControls.get(el);lockedControls.delete(el);delete el.dataset.launchLocked;}
     });
     root.querySelectorAll('.l-draft-actions button').forEach(el=>el.disabled=locked||busy);
-    const start=root.querySelector('[data-action=start]'),stop=root.querySelector('[data-action=stop]'); if(start)start.disabled=locked||busy||runtime?.budget_planning||healthBlocks(); if(stop)stop.disabled=busy||!['starting','ready'].includes(runtime?.state);
+    const start=root.querySelector('[data-action=start]'),stop=root.querySelector('[data-action=stop]'); if(start)start.disabled=locked||busy||runtime?.budget_planning||healthBlocks()||workerBlocks(); if(stop)stop.disabled=busy||!['starting','ready'].includes(runtime?.state);
     const title=root.querySelector('.l-intro h1');if(title)title.textContent=locked?tr('当前启动参数','Current launch parameters'):tr('启动配置','Launch configuration');
     const healthBox=root.querySelector('[data-model-health]');if(healthBox)healthBox.hidden=locked;
     const key=root.querySelector('[data-param=ApiKey]');
@@ -44,6 +45,12 @@
     }else if(configLocked&&!startPending&&!busy&&!configUncertain){
       const parameters=runningParameters;configLocked=false;runningView='';runningParameters=null;
       render(parameters);scheduleSave();
+    }
+    if(running&&status.effective_scoring?.strategy==='layerwise'){
+      for(const [key,native] of Object.entries(layerwiseResources)){
+        const value=status.effective_scoring[native],input=root.querySelector(`[data-param=${key}]`);
+        if(input&&Number.isSafeInteger(value)&&value>=0&&value%1048576===0)input.value=String(value/1048576);
+      }
     }
     applyConfigurationLock();
   }
@@ -75,6 +82,15 @@
   }
   let selectedPreset = '', presetUndo = null;
   const DRAFT_KEY='kvmem-launch-draft-v2', TEMPLATE_KEY='kvmem-launch-templates-v1';
+  function mtpHistoryDefault(spec){const value=spec?.default_history_policy;return ['first-layer','upstream-global'].includes(value)&&Array.isArray(spec?.history_policies)&&spec.history_policies.includes(value)?value:null;}
+  const layerwiseResources={LayerwiseActivationRamMiB:'activation_ram_bytes',LayerwiseActivationDiskMiB:'activation_disk_bytes',LayerwiseStagingMiB:'staging_bytes',LayerwiseMetadataMiB:'metadata_bytes',LayerwiseActivationMetadataMiB:'activation_metadata_bytes'};
+  // Existing concrete recipes keep their explicit values. Recipes without
+  // resource overrides display the selected worker's native defaults.
+  const explicitLayerwiseRecipeResources={
+    llamacpp:{LayerwiseActivationRamMiB:256,LayerwiseActivationDiskMiB:0,LayerwiseStagingMiB:16,LayerwiseMetadataMiB:256,LayerwiseActivationMetadataMiB:128},
+    polystrata:{LayerwiseActivationRamMiB:256,LayerwiseActivationDiskMiB:0,LayerwiseStagingMiB:16,LayerwiseMetadataMiB:256,LayerwiseActivationMetadataMiB:128},
+    radiance:{LayerwiseActivationRamMiB:256,LayerwiseActivationDiskMiB:0,LayerwiseStagingMiB:16,LayerwiseMetadataMiB:256,LayerwiseActivationMetadataMiB:128}
+  };
   let saveTimer=null, dirty=false, saveError=false, templateTab='builtin';
   // Paths and physical GPU placement are local choices, never baked into recipes.
   const commonPreset={Context:262144,Budget:47104,Reserve:2048,HostMiB:12288,MaxTokens:0,
@@ -94,6 +110,15 @@
     {id:'polystrata-default',title:['PolyStrata · 默认模板','PolyStrata · Default template'],parameters:{...commonPreset,Backend:'polystrata',Budget:36*1024,Reserve:4*1024,ThinkingBudget:0,ThinkingMode:'on',KvType:'q8_0',Prefill:512,DraftTokens:2,DraftPolicy:'adaptive',Vision:false,RetainedSessions:2,VramReserveMiB:256,WorkerArgs:['--elastic-experts-headroom','--elastic-headroom-mib','128','--elastic-physical-reserve-mib','512']},
       note:['256K 上下文 · 36K 驻留 · 4K 生成预留 · 思考不限额','256K context · 36K resident · 4K reserve · no fixed thinking cap']},
     {id:'polystrata-gemma4',title:['PolyStrata · Gemma 4 26B-A4B','PolyStrata · Gemma 4 26B-A4B'],parameters:{...commonPreset,Backend:'polystrata',Budget:32768,Reserve:2048,KvType:'f16',Prefill:512,ThinkingMode:'on',ThinkingBudget:0,SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',ModelAlias:'kvmem-polystrata-gemma4',Vision:false,RetainedSessions:2,VramReserveMiB:512},note:['Gemma 4 26B-A4B；启用 MTP 时选择匹配的 assistant GGUF。','Gemma 4 26B-A4B; select its matching assistant GGUF to enable MTP.']},
+    ...['ninfer','llamacpp','polystrata','radiance'].map(backend=>({
+      id:backend+'-layerwise',title:[backend+' · 分层召回',backend+' · Layerwise'],
+      note:['文本、无草稿起点；仍需当前 worker 确认该组合。','Text without drafts; the selected worker must qualify this combination.'],
+      parameters:{Backend:backend,RecallStrategy:'layerwise',Context:262144,Budget:32768,Reserve:1024,HostMiB:16384,
+        Prefill:backend==='polystrata'?512:256,MaxTokens:1024,Concurrency:1,RetainedSessions:1,
+        SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',Vision:false,ThinkingMode:'default',
+        SinkTokens:'',RecentTokens:'',KvType:backend==='llamacpp'?'q8_0':backend==='polystrata'?'f16':'bf16',
+        ...(backend==='llamacpp'?{KvTypeK:'q8_0',KvTypeV:'q8_0'}:{}),...(explicitLayerwiseRecipeResources[backend]||{})}
+    })),
   ].map(p=>({...p,note:p.note||['256K 上下文 · 46K 驻留 · 2K 生成预留','256K context · 46K resident · 2K reserve']}));
   const enginePreset=backend=>structuredClone(presets.find(p=>p.parameters.Backend===backend).parameters);
   const BACKENDS_KEY='kvmem-launch-backends-v1';
@@ -106,7 +131,7 @@
   const make=(tag,attrs={},text)=>{const el=document.createElement(tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));if(text!==undefined)el.textContent=text;return el;};
   function healthParameters(){
     const parameters={};
-    for(const key of ['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftModel','KvType']){
+    for(const key of ['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftModel','KvType','RecallStrategy']){
       const el=root.querySelector(`[data-param=${key}]`);
       if(!el||el.disabled)continue;
       if(el.type==='checkbox')parameters[key]=el.checked;
@@ -115,6 +140,91 @@
     return parameters;
   }
   function healthBlocks(){return health?.can_start===false;}
+  function workerSelection(){return {Backend:root.querySelector('[data-param=Backend]')?.value,
+    Worker:root.querySelector('[data-param=Worker]')?.value||'',
+    RecallStrategy:root.querySelector('[data-param=RecallStrategy]')?.value||'legacy'};}
+  function currentWorkerProfile(){return workerKey===JSON.stringify(workerSelection())?workerContract?.profile:null;}
+  function workerTokenConstraints(profile,cap,concurrency){
+    const limit=(owner,key)=>{
+      if(!owner||!Object.hasOwn(owner,key))return null;
+      const value=owner[key];
+      if(!Number.isInteger(value)||value<1||value>2147483647)throw Error('Invalid worker token constraint: '+key);
+      return value;
+    };
+    const minimum=limit(profile,'minimum_window_tokens'),maximum=limit(cap,'max_ngram_draft_tokens'),concurrent=limit(cap,'max_ngram_draft_tokens_concurrent');
+    return {minimum,maximum:concurrency>1&&concurrent!==null?(maximum===null?concurrent:Math.min(maximum,concurrent)):maximum};
+  }
+  function syncWorkerTokenConstraints(profile,cap,layerwise,enabled){
+    const get=key=>root.querySelector(`[data-param=${key}]`),budget=get('Budget'),reserve=get('Reserve'),ngram=get('NgramDrafts');
+    let limits={minimum:null,maximum:null},error='';
+    if(layerwise){try{limits=workerTokenConstraints(profile,cap,Number(get('Concurrency')?.value||1));}catch(failure){error=failure.message;}}
+    const window=Number(budget?.value)+Number(reserve?.value);
+    budget?.setCustomValidity(error||(layerwise&&limits.minimum!==null&&budget?.value!==''&&reserve?.value!==''&&window<limits.minimum?
+      tr('此 worker 要求 Budget + Reserve 至少为 ','This worker requires Budget + Reserve of at least ')+limits.minimum+' tokens.':''));
+    if(ngram){
+      ngram.max=String(limits.maximum??63);
+      const requested=Number(ngram.value);
+      ngram.setCustomValidity(error||(layerwise&&enabled&&requested>0&&(cap.ngram!==true||limits.maximum!==null&&requested>limits.maximum)?
+        cap.ngram!==true?tr('此 worker 未验证 N-gram；当前选择已保留。','This worker does not qualify N-gram drafts; your selection is retained.'):
+        tr('此 worker 在所选并发下的 N-gram 上限为 ','This worker limits N-gram drafts at this concurrency to ')+limits.maximum+tr('；当前选择已保留。','; your selection is retained.'):''));
+    }
+  }
+  function workerResourceDefaults(profile){
+    const supplied=profile?.default_resources;
+    if(supplied===undefined)return {};
+    if(!supplied||typeof supplied!=='object'||Array.isArray(supplied))throw Error('Invalid worker resource defaults');
+    const values={};
+    for(const [key,native] of Object.entries(layerwiseResources)){
+      if(!Object.hasOwn(supplied,native))continue;
+      const value=supplied[native],zeroAllowed=['LayerwiseActivationRamMiB','LayerwiseActivationDiskMiB'].includes(key);
+      if(!Number.isSafeInteger(value)||value<0||value>2147483647*1048576||(!zeroAllowed&&value===0))throw Error('Invalid worker resource default: '+native);
+      if(value%1048576===0)values[key]=value/1048576;
+    }
+    return values;
+  }
+  function syncWorkerResourceDefaults(profile){
+    const key=JSON.stringify(workerSelection()),values=workerResourceDefaults(profile);
+    for(const name of Object.keys(layerwiseResources)){
+      const input=root.querySelector(`[data-param=${name}]`);if(!input)continue;
+      if(input.dataset.workerDefault!==undefined&&(!profile||input.dataset.defaultWorker!==key||!Object.hasOwn(values,name))){
+        if(input.value===input.dataset.workerDefault)input.value='';
+        delete input.dataset.workerDefault;delete input.dataset.defaultWorker;delete input.dataset.uiOnly;
+      }
+      input.placeholder=tr('使用后端默认值','Use backend default');
+      if(input.value===''&&Object.hasOwn(values,name)){
+        input.value=String(values[name]);input.dataset.workerDefault=input.value;input.dataset.defaultWorker=key;input.dataset.uiOnly='true';
+      }else if(input.dataset.workerDefault!==undefined&&input.value===input.dataset.workerDefault&&Object.hasOwn(values,name)){
+        input.value=String(values[name]);input.dataset.workerDefault=input.value;
+      }
+    }
+  }
+  function resourceOverride(input){return input.dataset.workerDefault===undefined||input.value!==input.dataset.workerDefault;}
+  function workerBlocks(){return workerSelection().RecallStrategy==='layerwise'&&currentWorkerProfile()?.available!==true;}
+  function scheduleWorkerCapabilities(force=false){
+    if(!info||configurationLocked())return;
+    const parameters=workerSelection(),key=JSON.stringify(parameters);
+    if(!force&&key===workerKey)return;
+    workerKey=key;workerContract=null;workerError='';clearTimeout(workerTimer);workerAbort?.abort();
+    syncWorkerResourceDefaults(null);
+    const sequence=++workerSequence;
+    if(parameters.RecallStrategy!=='layerwise')return;
+    if(info.worker_capabilities_version!==1){workerError=tr('请更新控制台以读取当前 worker 能力。','Update the console to read the selected worker capabilities.');return;}
+    workerTimer=setTimeout(async()=>{
+      const controller=new AbortController();workerAbort=controller;
+      const timeout=setTimeout(()=>controller.abort(),12000);
+      try{
+        const response=await fetch('/api/launcher/worker-capabilities',{method:'POST',headers:{'Content-Type':'application/json','X-KVMem-Token':info.token},body:JSON.stringify({schema_version:1,parameters}),signal:controller.signal});
+        const result=await response.json();
+        if(!response.ok)throw Error(result.error||'Worker capability check failed');
+        if(result.schema_version!==1||result.backend!==parameters.Backend||result.strategy!==parameters.RecallStrategy||result.requested_worker!==parameters.Worker||!result.worker?.executable_sha256)throw Error('Worker capability response mismatch');
+        if(sequence!==workerSequence||key!==JSON.stringify(workerSelection()))return;
+        workerContract=result;
+        syncWorkerResourceDefaults(result.profile);
+        if(result.profile?.available!==true)workerError=tr('此 worker 未声明支持所选召回策略。','This worker does not declare the selected recall strategy.');
+      }catch(error){if(sequence!==workerSequence||key!==JSON.stringify(workerSelection()))return;workerContract=null;workerError=error.message;}
+      finally{clearTimeout(timeout);if(sequence===workerSequence&&!configurationLocked()){syncDependencies();updateStatus(runtime);}}
+    },force?0:250);
+  }
   function scheduleHealth(force=false){
     if(!info||configurationLocked())return;
     const parameters=healthParameters(),key=JSON.stringify(parameters);
@@ -227,6 +337,8 @@
     const parameters={};
     root.querySelectorAll('[data-param]').forEach(el=>{
       if((el.disabled&&el.dataset.keepDraft!=='true')||el.dataset.secret==='true')return;
+      if(el.dataset.param==='LayerwiseCheckpointTarget'&&el.value==='')return;
+      if(Object.hasOwn(layerwiseResources,el.dataset.param)&&(el.value===''||!resourceOverride(el)))return;
       const value=el.dataset.booleanSelect==='true'?el.value==='true':el.type==='checkbox'?(el.dataset.inverted==='true'?!el.checked:el.checked):el.multiple?Array.from(el.selectedOptions).map(x=>x.value).join(','):(el.type==='number'||el.dataset.valueType==='number')&&el.value!==''?Number(el.value):el.value;
       parameters[el.dataset.param]=el.dataset.idleSessions==='true'&&value!==''?Number(value)+1:value;
     });
@@ -262,8 +374,9 @@
     if(draft.raw){const weights=root.querySelector('[data-param=TensorSplit]');if(weights&&typeof draft.raw.TensorSplit==='string'){weights.value=draft.raw.TensorSplit;weights.dispatchEvent(new Event('input'));}const layers=root.querySelector('[data-param=StageLayers]');if(layers&&typeof draft.raw.StageLayers==='string'){layers.value=draft.raw.StageLayers;layers.dispatchEvent(new Event('input'));}const native=root.querySelector('[data-native]');if(native&&typeof draft.raw.WorkerArgs==='string'){native.value=draft.raw.WorkerArgs;native.dispatchEvent(new Event('input'));}}
     draftStatus();
   }
-  root.addEventListener('input',event=>{if(!configurationLocked()&&event.target.matches('[data-param], [data-native]')){if(!budgetPending)budgetAdjustment=null;syncDependencies();scheduleSave();scheduleHealth();renderBudgetAdjustment();}});
-  root.addEventListener('change',event=>{if(!configurationLocked()&&event.target.matches('[data-param], [data-native]')){if(!budgetPending)budgetAdjustment=null;syncDependencies();scheduleSave();scheduleHealth();renderBudgetAdjustment();}});
+  function markResourceEdit(event){if(Object.hasOwn(layerwiseResources,event.target.dataset.param)){delete event.target.dataset.workerDefault;delete event.target.dataset.defaultWorker;delete event.target.dataset.uiOnly;}}
+  root.addEventListener('input',event=>{if(!configurationLocked()&&event.target.matches('[data-param], [data-native]')){markResourceEdit(event);if(!budgetPending)budgetAdjustment=null;syncDependencies();scheduleSave();scheduleHealth();renderBudgetAdjustment();}});
+  root.addEventListener('change',event=>{if(!configurationLocked()&&event.target.matches('[data-param], [data-native]')){markResourceEdit(event);if(!budgetPending)budgetAdjustment=null;syncDependencies();scheduleSave();scheduleHealth();renderBudgetAdjustment();}});
   window.addEventListener('pagehide',saveEditing);
   function readTemplates(){
     const values=JSON.parse(localStorage.getItem(TEMPLATE_KEY)||'[]');
@@ -310,12 +423,17 @@
   }
   function launchData(){
     const data=collect(),p=data.parameters;
+    if(p.RecallStrategy==='layerwise'&&info.recall_strategy_version!==1)throw Error(tr('请更新完整控制台以使用分层召回。','Update the complete console to use layerwise recall.'));
     if(info.query_scoring_version!==2)throw Error(tr('启动配置已更新，请完整更新并重启控制台，再刷新页面。','Launch settings changed. Update and restart the complete console, then refresh.'));
     if(p.Backend==='llamacpp'&&info.kv_cache_version!==1)throw Error(tr('K/V 独立格式设置已更新，请先关闭原启动窗口并重新启动控制台，然后刷新页面。','Independent K/V settings have been updated. Close the original startup window, restart the console, then refresh this page.'));
     const disk=root.querySelector('[data-param=DiskEnabled]');
+    const activationDisk=p.RecallStrategy==='layerwise'&&p.LayerwiseActivationDiskMiB>0;
     if(disk?.checked&&!disk.disabled){
       if(!p.DiskPath?.trim())throw Error(tr('启用 SSD 缓存后，请填写 SSD 缓存目录。','Enter an SSD cache directory when SSD cache is enabled.'));
       if(p.DiskMiB!==undefined&&p.DiskMiB<=0)throw Error(tr('启用 SSD 缓存后，SSD 缓存预算必须大于 0。','The SSD cache budget must be positive when SSD cache is enabled.'));
+    }else if(activationDisk){
+      if(!p.DiskPath?.trim())throw Error(tr('前向暂存 SSD 需要存储目录。','Forward storage SSD requires a storage directory.'));
+      p.DiskMiB=0;
     }else{delete p.DiskPath;delete p.DiskMiB;}
     if(!p.Vision){delete p.VisionResidency;delete p.VisionTokens;}
     return data;
@@ -470,10 +588,13 @@
     const get=key=>root.querySelector(`[data-param=${key}]`);
     if(!get('Backend'))return;
     dependency('LoraScale',!!get('Lora')?.value.trim(),tr('先选择 LoRA 适配器。','Select a LoRA adapter first.'));
+    scheduleWorkerCapabilities();
     dependency('DiskEnabled',true,'');
     const disk=!!get('DiskEnabled')?.checked&&!get('DiskEnabled').disabled,vision=!!get('Vision')?.checked;
-    for(const key of ['DiskPath','DiskMiB'])dependency(key,disk,tr('先开启 SSD 缓存。','Enable SSD cache first.'));
-    if(get('DiskPath'))get('DiskPath').required=disk;
+    const activationDisk=get('RecallStrategy')?.value==='layerwise'&&Number(get('LayerwiseActivationDiskMiB')?.value)>0;
+    dependency('DiskPath',disk||activationDisk,tr('先开启 canonical 或前向暂存 SSD。','Enable canonical or forward storage SSD first.'));
+    dependency('DiskMiB',disk,tr('先开启 canonical SSD 缓存。','Enable canonical SSD cache first.'));
+    if(get('DiskPath'))get('DiskPath').required=disk||activationDisk;
     for(const key of ['VisionTokens','VisionResidency'])dependency(key,vision,tr('先开启图像输入。','Enable vision input first.'));
     dependency('ThinkingBudget',get('ThinkingMode')?.value!=='off',tr('默认思考模式已关闭；重新开启或选择默认后可设置预算。','Default thinking is off. Select on or default to set a budget.'));
     for(const option of get('ReasoningEffort')?.options||[])if(option.value==='none'&&get('Backend').value==='polystrata')option.disabled=get('ThinkingMode')?.value!=='off';
@@ -482,20 +603,54 @@
     for(const key of ['LrfuLambda','LrfuTopFraction'])dependency(key,history,tr('先开启历史累计。','Enable LRFU history first.'));
     const fraction=get('LrfuTopFraction');if(fraction)fraction.setCustomValidity(fraction.value!==''&&Number(fraction.value)<=0?tr('候选比例必须大于 0。','The reward fraction must be greater than 0.'): '');
     const backend=get('Backend').value,mode=get('SpeculativeMode')?.value||'none';
-    const profiles=info.speculative_capabilities?.[backend]||{none:{},...(backend==='ninfer'?{mtp:{max_draft_tokens:15,adaptive:true,ngram:true,max_concurrency:8,max_devices:8}}:{})};
-    const cap=profiles[mode]||{},enabled=mode!=='none';
+    const layerwise=get('RecallStrategy')?.value==='layerwise';
+    const layerwiseSection=root.querySelector('[data-layerwise-budgets]');if(layerwiseSection)layerwiseSection.hidden=!layerwise;
+    for(const key of ['QueryScorer','ScoreAggregation','GraphAlpha','Lrfu','LrfuLambda','LrfuTopFraction','QueryMaxTokens','QueryReplayMaxTokens']){
+      dependency(key,!layerwise&&(key!=='LrfuLambda'&&key!=='LrfuTopFraction'||history),tr('这些设置仅用于 Legacy 召回。','These settings apply to Legacy recall.'));
+      const label=get(key)?.closest('label');if(label)label.hidden=layerwise;
+    }
+    for(const key of Object.keys(layerwiseResources))dependency(key,layerwise,tr('先选择分层召回。','Select layerwise recall first.'));
+    get('LayerwiseActivationRamMiB')?.setCustomValidity(layerwise&&get('LayerwiseActivationRamMiB')?.value==='0'&&get('LayerwiseActivationDiskMiB')?.value==='0'?tr('前向暂存 RAM 或 SSD 预算必须大于 0。','Forward storage RAM or SSD budget must be positive.'):'');
+    dependency('LayerwiseMtpHistory',layerwise&&mode==='mtp',tr('仅分层召回的 OWN MTP 使用此选择。','Applies only to layerwise OWN MTP.'));
+    for(const key of ['SinkTokens','RecentTokens']){const el=get(key);if(el){el.dataset.legacyRequired??=String(el.required);el.required=layerwise?false:el.dataset.legacyRequired==='true';el.placeholder=layerwise?tr('自动','Auto'):'';}}
+    const note=root.querySelector('[data-layerwise-draft-note]');if(note){note.hidden=!layerwise;note.textContent=mode==='dflash2'?tr('DFlash2 保留独立、完整的原生滑窗，不按目标层选页裁剪。','DFlash2 keeps its independent complete native sliding window; target selections do not trim it.'):mode==='guess'?tr('Gemma Guess 使用原生 SharedTarget/SWA 视图，不使用 OWN MTP 历史策略。','Gemma Guess uses its native SharedTarget/SWA view, without an OWN MTP history policy.'):tr('主模型逐层使用当前 Q。MTP 历史来源留空使用 worker 声明的默认值；未声明默认时必须选择。','The target uses current Q at each layer. Omit MTP history to use the worker-declared default; an explicit choice is required when none is declared.');}
+    const profile=currentWorkerProfile();
+    const retention=profile?.checkpoint_retention,target=get('LayerwiseCheckpointTarget');
+    if(target){
+      const available=Number.isInteger(retention?.max_target);
+      const show=layerwise&&(available||target.value!=='');
+      target.closest('label').hidden=!show;
+      dependency('LayerwiseCheckpointTarget',show,tr('所选 worker 需支持实例级保留目标。','Requires worker support for a checkpoint target.'));
+      target.placeholder=available&&Number.isInteger(retention.default_target)?String(retention.default_target):'';
+      target.max=available?String(retention.max_target):'';
+      target.setCustomValidity(show&&!available?tr('所选 worker 未声明检查点目标。','This worker does not declare checkpoint retention.'):'');
+      const metadata=get('LayerwiseMetadataMiB');
+      if(metadata)metadata.placeholder=retention?.metadata_default==='auto'?tr('自动','Auto'):'';
+    }
+    const profiles=layerwise?(profile?.speculative||{}):(info.speculative_capabilities?.[backend]||{none:{},...(backend==='ninfer'?{mtp:{max_draft_tokens:15,adaptive:true,ngram:true,max_concurrency:8,max_devices:8}}:{})});
+    const baseCap=profiles[mode]||{},historyDefault=mtpHistoryDefault(baseCap),selectedHistory=get('LayerwiseMtpHistory')?.value||historyDefault;
+    const historyInput=get('LayerwiseMtpHistory');if(historyInput){historyInput.required=layerwise&&mode==='mtp'&&!historyDefault;const blank=[...historyInput.options].find(option=>!option.value);if(blank)blank.textContent=historyDefault?tr('后端默认：','Worker default: ')+historyDefault:tr('请选择，无默认值','Choose; no default');}
+    const policyCap=mode==='mtp'?baseCap.history_policy_caps?.[selectedHistory]:null;
+    const cap=policyCap?{...baseCap,...policyCap}:baseCap,enabled=mode!=='none';
     dependency('DraftTokens',enabled,tr('先选择草稿方式。','Select a draft method first.'));
-    if(get('DraftTokens')){get('DraftTokens').required=enabled;get('DraftTokens').max=String(cap.max_draft_tokens||15);}
-    dependency('DraftPolicy',enabled&&!!cap.adaptive,tr('所选后端或草稿方式仅支持固定长度。','The selected backend or draft method supports fixed length only.'));
-    dependency('NgramDrafts',enabled&&!!cap.ngram,tr('所选后端或草稿方式不支持 N-gram。','The selected backend or draft method does not support N-gram.'));
+    if(get('DraftTokens')){get('DraftTokens').required=enabled;if(layerwise&&!Number.isInteger(cap.max_draft_tokens))get('DraftTokens').removeAttribute('max');else get('DraftTokens').max=String(cap.max_draft_tokens||15);}
+    dependency('DraftPolicy',enabled&&(layerwise||!!cap.adaptive),tr('所选后端或草稿方式仅支持固定长度。','The selected backend or draft method supports fixed length only.'));
+    get('DraftPolicy')?.setCustomValidity(layerwise&&enabled&&get('DraftPolicy').value==='adaptive'&&cap.adaptive!==true?tr('此 worker 未验证所选方式的自动草稿长度；当前选择已保留。','This worker does not qualify adaptive drafts for this mode; your selection is retained.'):'');
+    dependency('NgramDrafts',enabled&&(!!cap.ngram||layerwise&&Number(get('NgramDrafts')?.value)>0),tr('所选后端或草稿方式不支持 N-gram。','The selected backend or draft method does not support N-gram.'));
+    syncWorkerTokenConstraints(profile,cap,layerwise,enabled);
     dependency('NgramMinMatch',enabled&&!!cap.ngram&&Number(get('NgramDrafts')?.value)>0,tr('先启用 N-gram 草稿。','Enable N-gram drafts first.'));
     dependency('DraftModel',enabled&&['llamacpp','polystrata'].includes(backend),tr('NInfer 使用模型内置草稿组件；llama.cpp 需先选择草稿方式。','NInfer uses an embedded draft component. Select a draft method for llama.cpp first.'));
     if(get('DraftModel'))get('DraftModel').required=enabled&&cap.draft_asset==='required_gguf';
     const selectedGpu=get('Gpu'),selectedCount=selectedGpu?.multiple?selectedGpu.selectedOptions.length:(selectedGpu?.value||'').split(',').filter(Boolean).length;
-    const specReason=enabled&&(!profiles[mode]||Number(get('Concurrency')?.value||1)>(cap.max_concurrency||1)||selectedCount>(cap.max_devices||1))?
+    const specReason=(layerwise&&(workerBlocks()||cap.available!==true))?(workerError||tr('正在读取所选 worker 的实际能力…','Reading the selected worker capabilities…')):enabled&&(!profiles[mode]||Number(get('Concurrency')?.value||1)>(cap.max_concurrency||profile?.max_concurrency||1)||selectedCount>(cap.max_devices||profile?.max_devices||1))?
       tr('当前草稿方式不支持所选并发或显卡数量。','The selected draft method does not support this concurrency or GPU count.'):'';
     get('SpeculativeMode')?.setCustomValidity(specReason);
-    for(const option of get('SpeculativeMode')?.options||[]){const c=profiles[option.value];option.disabled=!c||(option.value!=='none'&&(Number(get('Concurrency')?.value||1)>c.max_concurrency||selectedCount>c.max_devices));}
+    for(const option of get('SpeculativeMode')?.options||[]){const c=profiles[option.value];option.disabled=!c||layerwise&&c.available!==true||(option.value==='guess'&&!layerwise)||(option.value!=='none'&&(Number(get('Concurrency')?.value||1)>(c.max_concurrency||profile?.max_concurrency||1)||selectedCount>(c.max_devices||profile?.max_devices||1)));}
+    const historyChoice=get('LayerwiseMtpHistory');
+    historyChoice?.setCustomValidity(layerwise&&mode==='mtp'&&historyChoice.value&&!baseCap.history_policies?.includes(historyChoice.value)?tr('此 worker 未验证所选 MTP 历史策略；当前选择已保留。','This worker does not qualify the selected MTP history policy; your selection is retained.'):'');
+    for(const option of historyChoice?.options||[])option.disabled=layerwise&&mode==='mtp'&&!!option.value&&!baseCap.history_policies?.includes(option.value);
+    const workerNote=root.querySelector('[data-worker-capability-note]');
+    if(workerNote){workerNote.hidden=!layerwise;workerNote.textContent=layerwise?(workerError||(!workerContract?tr('正在读取所选 worker 的实际能力…','Reading the selected worker capabilities…'):tr('已读取 worker 能力：','Worker capabilities: ')+workerContract.worker.path+' · '+workerContract.worker.executable_sha256.slice(0,12))):'';}
     dependency('FastPrefill',['int8','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'].includes(get('KvType')?.value),tr('当前 KV 格式不支持快速预填充。','The current KV format does not support fast prefill.'));
     const gpu=get('Gpu'),gpuCount=gpu?.multiple?gpu.selectedOptions.length:(gpu?.value||'').split(',').filter(Boolean).length;
     const tensor=get('TensorParallel');
@@ -767,7 +922,7 @@
     if(configLocked&&runningParameters)p=runningParameters;
     // Migrate old templates in memory; only canonical fields are submitted.
     p={...p,SpeculativeMode:p.SpeculativeMode??(p.MtpEnabled===false?'none':Number(p.MtpDrafts)>0?'mtp':'none'),
-      DraftTokens:p.DraftTokens??p.MtpDrafts??(p.Backend==='polystrata'?2:4),DraftPolicy:p.DraftPolicy??(p.AdaptiveMtp?'adaptive':'fixed')};
+      DraftTokens:p.DraftTokens??p.MtpDrafts??(p.RecallStrategy==='layerwise'?undefined:p.Backend==='polystrata'?2:4),DraftPolicy:p.DraftPolicy??(p.AdaptiveMtp?'adaptive':'fixed')};
     const legacyScoring=!p.QueryScorer&&('NoLrfu' in p||'LrfuLambda' in p||'LrfuTopFraction' in p);
     const scorer=p.QueryScorer||(legacyScoring&&(!p.NoLrfu||p.ScoreAggregation==='max'||'LrfuLambda' in p||'LrfuTopFraction' in p)?'meanq-cosine':'page-softmax');
     p={...p,QueryScorer:scorer,ScoreAggregation:p.ScoreAggregation??(scorer==='meanq-cosine'?'max':'mean'),
@@ -777,14 +932,14 @@
     const b=p.Backend,n=b==='ninfer',l=b==='llamacpp',poly=b==='polystrata',rad=b==='radiance';
     if(n)p.CheckpointExtraRecomputeTokens??=0;
     // Resolve the launcher's omitted values before rendering; keep explicit 0/false.
-    const concreteDefaults={Prefill:poly?512:defaults.Prefill,ThinkingBudget:0,Concurrency:1,VisionTokens:1024,NgramDrafts:0,NgramMinMatch:12,
+    const concreteDefaults={Prefill:rad?256:poly?512:defaults.Prefill,ThinkingBudget:0,Concurrency:1,VisionTokens:1024,NgramDrafts:0,NgramMinMatch:12,
       DeviceProfile:'off',LogLevel:'info',QueryMaxTokens:512,ReplayMaxTokens:2048};
     for(const [key,value] of Object.entries(concreteDefaults))if(p[key]===undefined||p[key]===null||p[key]==='')p[key]=value;
     if(p.RetainedSessions===undefined||p.RetainedSessions===null||p.RetainedSessions==='')p.RetainedSessions=poly?Math.max(4,Number(p.Concurrency)+1):4;
     if(!p.ThinkingMode||p.ThinkingMode==='default')p.ThinkingMode=(n||rad)?'default':poly?(p.ReasoningEffort==='none'?'off':'on'):'off';
     if(poly&&!p.ReasoningEffort)p.ReasoningEffort='medium';
     if(poly&&p.ReasoningEffort==='high')p.ReasoningEffort='xhigh';
-    if(poly&&p.SpeculativeMode==='mtp')p.DraftPolicy='adaptive';
+    if(poly&&['mtp','guess'].includes(p.SpeculativeMode))p.DraftPolicy='adaptive';
     if(poly&&p.PreserveThinking===undefined)p.PreserveThinking=true;
     if(poly&&p.BlockTokens===undefined)p.BlockTokens=32;
     if(poly&&p.VramReserveMiB===undefined)p.VramReserveMiB=256;
@@ -921,9 +1076,9 @@
     }
     if(rad)field(panels[0],{...p,StateCacheType:p.StateCacheType||'f32'},'StateCacheType','循环状态缓存格式','Recurrent state cache format','text',[['f32','FP32'],['f16','FP16']],['FP16 可减少循环状态缓存显存，可能改变模型输出。','FP16 reduces recurrent-state memory and may change model output.']);
     // UI state only: the worker still receives the existing path/budget pair.
-    const diskEnabled=field(panels[0],{DiskEnabled:typeof p.DiskEnabled==='boolean'?p.DiskEnabled:!!p.DiskPath?.trim()&&p.DiskMiB!==0},'DiskEnabled','启用 SSD 缓存','Enable SSD cache','checkbox',null,['关闭后不传 SSD 参数；目录与预算仍保存在草稿和模板中，重新开启时可继续使用。','When off, no SSD arguments are passed. The directory and budget stay in drafts and templates for later reuse.']);
+    const diskEnabled=field(panels[0],{DiskEnabled:typeof p.DiskEnabled==='boolean'?p.DiskEnabled:!!p.DiskPath?.trim()&&p.DiskMiB!==0},'DiskEnabled','启用 canonical SSD 缓存','Enable canonical SSD cache','checkbox',null,['关闭仅停用 canonical SSD；前向暂存 SSD 可独立使用下方目录。目录与预算仍保存在草稿和模板中。','Off disables canonical SSD only. Forward storage SSD can independently use the directory below. The directory and budget stay in drafts and templates.']);
     diskEnabled.dataset.uiOnly='true';diskEnabled.closest('label').classList.add('l-wide');
-    field(panels[0],p,'DiskPath','SSD 缓存目录','SSD cache directory','text',null,['开启 SSD 缓存时必填；配合正的 SSD 缓存预算使用。','Required when SSD cache is enabled, together with a positive SSD cache budget.']);
+    field(panels[0],p,'DiskPath','SSD 存储目录','SSD storage directory','text',null,['canonical 或前向暂存 SSD 任一启用时必填；两者配额分别计费。','Required when either canonical or forward storage SSD is enabled; their quotas remain separate.']);
     const diskBudget=field(panels[0],{DiskMiB:4096,...p},'DiskMiB','SSD 缓存预算 · MiB','SSD cache budget · MiB','number');
     diskBudget.min='1';
     field(panels[0],p,'SinkTokens','保留开头 · tokens','Keep prefix · tokens','number');field(panels[0],p,'RecentTokens','保留最近 · tokens','Keep recent · tokens','number');
@@ -940,6 +1095,29 @@
       '按当前问题召回相关历史。评分、图传播与历史累计决定历史内容的相关性。',
       'Recall history relevant to the current question. Scoring, graph propagation and accumulated history determine relevance.');
     scoring.parentElement.setAttribute('data-graph-recall','');
+    field(scoring,{RecallStrategy:'legacy',...p},'RecallStrategy','召回执行策略','Recall strategy','text',[
+      ['legacy','Legacy'],['layerwise',tr('分层 · 当前层 Q','Layerwise · current-layer Q')]
+    ],['分层召回使用当前前向的各层 Q；需要所选 worker 明确支持。旧配置保持 Legacy。','Layerwise recall uses each layer\'s Q from the current forward and requires explicit worker support. Existing configurations remain Legacy.']);
+    scoring.append(make('p',{class:'l-muted l-wide','data-worker-capability-note':'',role:'status'}));
+    const refreshWorker=make('button',{type:'button',class:'s-button l-secondary','data-worker-capability-refresh':''},tr('刷新 worker 能力','Refresh worker capabilities'));
+    refreshWorker.onclick=()=>{scheduleWorkerCapabilities(true);syncDependencies();updateStatus(runtime);};scoring.append(refreshWorker);
+    const layerwise=recallSection('分层召回预算','Layerwise recall budgets','独立预算','Separate budgets',
+      '这些有限预算分别约束前向暂存、传输与状态元数据，不占用原生 KV 历史预算。',
+      'Finite limits for forward storage, transfers and state metadata, separate from the native KV history budget.');
+    layerwise.parentElement.setAttribute('data-layerwise-budgets','');
+    for(const [key,zh,en] of [
+      ['LayerwiseActivationRamMiB','前向暂存 RAM · MiB','Forward storage RAM · MiB'],
+      ['LayerwiseActivationDiskMiB','前向暂存 SSD · MiB','Forward storage SSD · MiB'],
+      ['LayerwiseStagingMiB','传输暂存 · MiB','Transfer staging · MiB'],
+      ['LayerwiseMetadataMiB','历史状态与索引 · MiB','History state and index · MiB'],
+      ['LayerwiseActivationMetadataMiB','前向描述信息 · MiB','Forward descriptors · MiB']
+    ]){const input=field(layerwise,p,key,zh,en,'number',null,['留空使用所选 worker 的原生默认值；填写数值才覆盖，已保存的数值保持不变。','Leave blank for the selected worker default. Enter a value to override; saved explicit values are preserved.']);input.min=key==='LayerwiseActivationRamMiB'||key==='LayerwiseActivationDiskMiB'?'0':'1';input.max='2147483647';input.required=false;}
+    const target=field(layerwise,p,'LayerwiseCheckpointTarget','实例热检查点目标','Hot checkpoints per instance','number');
+    target.min='1';target.required=false;
+    field(layerwise,p,'LayerwiseMtpHistory','MTP 历史来源','MTP history','text',[
+      ['',tr('请选择，无默认值','Choose; no default')],['upstream-global',tr('上游全局 · 私有探测','Upstream global · private probe')],['first-layer',tr('首个目标层 · fresh Q','First target layer · fresh Q')]
+    ],['两者的主模型均使用 fresh-Q 分层召回，此选项只决定草稿 OWN KV 的历史 ID。NInfer 默认 first-layer；留空使用所选 worker 的默认，显式值保持不变。','Both target paths use fresh-Q layerwise recall. This choice controls history IDs in draft-owned KV; NInfer defaults to first-layer. Leave blank for the selected worker default; explicit choices are preserved.']);
+    layerwise.append(make('p',{class:'l-muted l-wide','data-layerwise-draft-note':''}));
     const retention=recallSection('驻留与会话保留','Resident & session retention','注意力保留','Attention retention',
       '空间不足时，按累计注意力保留驻留内容；开头与最近内容按下方预算保护。空闲会话保留还受共享内存预算限制。',
       'Under memory pressure, retain resident content by accumulated attention. Protect the prefix and recent tokens using the budgets below. Idle sessions also share the memory budget.');
@@ -964,13 +1142,13 @@
     layerSplit.addEventListener('input',refreshGpuOrder);refreshGpuOrder();
     const specModes=info.speculative_capabilities?.[b]||{none:{},...(n?{mtp:{max_draft_tokens:15,adaptive:true,ngram:true,max_concurrency:8,max_devices:8,draft_asset:'embedded'}}:{})};
     const specMode=field(panels[1],p,'SpeculativeMode','草稿方式','Draft method','text',[
-      ['none',tr('关闭','Off')],['mtp','MTP'],['dflash2','DFlash2']
+      ['none',tr('关闭','Off')],['mtp','MTP'],['dflash2','DFlash2'],...(poly?[['guess','Gemma SharedTarget Guess']]:[])
     ],poly?['单请求执行可使用 MTP；进入批处理时使用普通生成。','MTP is available in solo execution; batches use ordinary decode.']:['需要模型支持。可用选项取决于后端、并发和显卡数量。','Requires model support. Availability depends on backend, concurrency and GPU count.']);
     for(const option of specMode.options)option.disabled=!specModes[option.value];
     const draftTokens=field(panels[1],p,'DraftTokens','草稿长度 · tokens','Draft length · tokens','number',null,
-      rad?['DFlash2 长度必须匹配容器训练块，Qwen3.8-27B 为 7。','DFlash2 depth must match the trained block in the container. Qwen3.8-27B uses 7.']:['主模型会验证草稿；实际长度还受草稿模型限制。DFlash2 首次选择使用 5。','The target verifies the drafts. The draft model can impose a smaller limit. DFlash2 starts at 5.']);
+      ['主模型会验证草稿；分层模式须显式填写当前 worker 支持的长度。Radiance DFlash2 长度须匹配容器训练块。','The target verifies the drafts. Layerwise mode requires an explicit width qualified by the selected worker. Radiance DFlash2 depth must match the trained container block.']);
     draftTokens.min='1';
-    specMode.addEventListener('change',()=>{if(specMode.value==='dflash2')draftTokens.value=String(rad?7:5);else if(specMode.value!=='none'&&Number(draftTokens.value)<=0)draftTokens.value=String(rad?3:poly?2:4);});
+    specMode.addEventListener('change',()=>{if(root.querySelector('[data-param=RecallStrategy]')?.value==='layerwise')return;if(specMode.value==='dflash2')draftTokens.value=String(rad?7:5);else if(specMode.value!=='none'&&Number(draftTokens.value)<=0)draftTokens.value=String(rad?3:poly?2:4);});
     field(panels[1],p,'DraftPolicy','草稿长度策略','Draft length policy','text',[
       ['fixed',tr('固定','Fixed')],['adaptive',tr('自动调整','Adaptive')]
     ],['自动调整仅在后端和所选草稿方式支持时生效。','Adaptive mode applies only when supported by the backend and draft method.']);
@@ -999,7 +1177,7 @@
     field(serviceFields,p,'ModelAlias','对外模型名（可选）','Served model name (optional)','text',null,poly?['供 API 客户端使用；留空使用 kvmem-polystrata-qwen35。','API model name; empty uses kvmem-polystrata-qwen35.']:['供 API 客户端使用的稳定名称；留空沿用模型名称。','A stable name for API clients; leave empty to inherit the model name.']);
     field(serviceFields,p,'LogLevel','日志级别','Log level','text',[['info','Info'],['debug','Debug'],['trace','Trace'],['warning','Warning'],['error','Error'],['off',tr('关闭日志','Off')]],['通常使用 Info；排查问题时可临时选择 Debug。','Use Info normally; select Debug temporarily for troubleshooting.']);
     if(n){
-      const ngram=field(panels[1],p,'NgramDrafts','N-gram 推测 token 数','N-gram draft tokens','number',null,['依赖支持 N-gram 的草稿方式；0 或留空关闭，1–63 启用。并发时后端可能缩小实际推测宽度。','Requires a draft method supporting N-gram. 0 or empty disables it; 1–63 enables it. The backend may reduce its width under concurrency.']);ngram.max='63';
+      const ngram=field(panels[1],p,'NgramDrafts','N-gram 推测 token 数','N-gram draft tokens','number',null,['依赖支持 N-gram 的草稿方式；0 或留空关闭。Layerwise 的宽度及并发上限来自当前 worker，超限保留原值并拒绝启动。','Requires a draft method supporting N-gram. 0 or empty disables it. Layerwise width and concurrency limits come from the selected worker; an excessive value is retained and blocks launch.']);ngram.max='63';
       const minMatch=field(panels[1],p,'NgramMinMatch','N-gram 最短匹配','N-gram minimum match','number',null,['启用 N-gram 时生效，范围 4–64。','Applies when N-gram is enabled; range 4–64.']);minMatch.min='4';minMatch.max='64';
       field(panels[1],p,'DeviceProfile','设备性能配置','Device profile','text',[['off',tr('关闭','Off')],['auto',tr('自动','Auto')]]);
 
@@ -1124,19 +1302,20 @@
     if(poly){
       for(const key of ['LogLevel']){const input=root.querySelector(`[data-param=${key}]`);if(input){input.disabled=true;input.dataset.backendSupported='false';}}
     }
-    syncDependencies();
+    syncWorkerResourceDefaults(currentWorkerProfile());syncDependencies();
     scheduleHealth(true);
     updateStatus(runtime);
     draftStatus();
   }
-  function updateStatus(status,confirmed=false){runtime=status;if(!status)return;if(confirmed)configUncertain=false;syncRunningConfiguration(status);window.dispatchEvent(new CustomEvent('kvmem-runtime-status',{detail:status}));const running=['starting','ready'].includes(status.state);const label=root.querySelector('[data-runtime-state]');if(!label)return;const translations={stopped:['未启动','Stopped'],starting:['正在加载模型','Loading model'],ready:['服务已就绪','Ready'],exited:['进程已退出','Process exited']};label.textContent=tr(...(translations[status.state]||translations.stopped));label.dataset.state=status.state;const dl=root.querySelector('[data-runtime-details]');dl.replaceChildren();const p=status.active_config?.parameters,o=status.effective_scoring;for(const [zh,en,value] of [['引擎','Backend',p?names[p.Backend]:null],['模型','Model',p?.Model],['监听地址','Listen address',p?p.ListenHost||'127.0.0.1':null],['本机地址','Local URL',status.url],['进程','PID',status.pid],['退出码','Exit code',status.exit_code],['KV 块大小','KV block size',o?.block_tokens],['评分器','Query scorer',o?.scorer],['聚合','Aggregation',o?.agg],['图传播强度','Graph strength',o?.graph_alpha],['历史累计','LRFU',o?.lrfu===undefined?null:o.lrfu?tr('开启','On'):tr('关闭','Off')],['问题／回放上限','Query / replay limits',o?.query_max_tokens===undefined?null:`${o.query_max_tokens} / ${o.query_replay_max_tokens??'—'}`],['配置确认','Configuration',p?(status.scoring_confirmed?tr('服务已确认','Confirmed by service'):status.scoring_mismatch?tr('与启动计划不一致','Differs from launch plan'):tr('等待完整服务报告','Awaiting full service report')):null],['程序校验值','Worker SHA-256',status.worker?.executable_sha256?.slice(0,12)]]){if(value!==null&&value!==undefined){dl.append(make('dt',{},tr(zh,en)),make('dd',{title:String(value)},zh==='模型'?String(value).split(/[\\/]/).pop():String(value)));}}root.querySelector('[data-action=start]').disabled=busy||running||status.budget_planning||configurationLocked()||healthBlocks();root.querySelector('[data-action=stop]').disabled=busy||!running;const chat=document.querySelector('[data-chat-link]');if(info){chat.hidden=false;chat.href='/chat/';chat.removeAttribute('aria-disabled');}renderLaunchProgress();renderMemoryRecovery();renderBudgetAdjustment();}
+  function updateStatus(status,confirmed=false){runtime=status;if(!status)return;if(confirmed)configUncertain=false;syncRunningConfiguration(status);window.dispatchEvent(new CustomEvent('kvmem-runtime-status',{detail:status}));const running=['starting','ready'].includes(status.state);const label=root.querySelector('[data-runtime-state]');if(!label)return;const translations={stopped:['未启动','Stopped'],starting:['正在加载模型','Loading model'],ready:['服务已就绪','Ready'],exited:['进程已退出','Process exited']};label.textContent=tr(...(translations[status.state]||translations.stopped));label.dataset.state=status.state;const dl=root.querySelector('[data-runtime-details]');dl.replaceChildren();const p=status.active_config?.parameters,o=status.effective_scoring;for(const [zh,en,value] of [['召回策略','Recall strategy',o?.strategy??(p?p.RecallStrategy||'legacy':null)],['MTP 历史来源','MTP history',o?.mtp_history??p?.LayerwiseMtpHistory],['当前层 Q','Current-layer Q',o?.current_layer_q===undefined?null:o.current_layer_q?tr('开启','On'):tr('关闭','Off')],['Query 回放','Query replay',o?.query_replay===undefined?null:o.query_replay?tr('开启','On'):tr('关闭','Off')],['引擎','Backend',p?names[p.Backend]:null],['模型','Model',p?.Model],['监听地址','Listen address',p?p.ListenHost||'127.0.0.1':null],['本机地址','Local URL',status.url],['进程','PID',status.pid],['退出码','Exit code',status.exit_code],['KV 块大小','KV block size',o?.block_tokens],['评分器','Query scorer',o?.scorer],['聚合','Aggregation',o?.agg],['图传播强度','Graph strength',o?.graph_alpha],['历史累计','LRFU',o?.lrfu===undefined?null:o.lrfu?tr('开启','On'):tr('关闭','Off')],['问题／回放上限','Query / replay limits',o?.query_max_tokens===undefined?null:`${o.query_max_tokens} / ${o.query_replay_max_tokens??'—'}`],['配置确认','Configuration',p?(status.scoring_confirmed?tr('服务已确认','Confirmed by service'):status.scoring_mismatch?tr('与启动计划不一致','Differs from launch plan'):tr('等待完整服务报告','Awaiting full service report')):null],['程序校验值','Worker SHA-256',status.worker?.executable_sha256?.slice(0,12)]]){if(value!==null&&value!==undefined){dl.append(make('dt',{},tr(zh,en)),make('dd',{title:String(value)},zh==='模型'?String(value).split(/[\\/]/).pop():String(value)));}}root.querySelector('[data-action=start]').disabled=busy||running||status.budget_planning||configurationLocked()||healthBlocks()||workerBlocks();root.querySelector('[data-action=stop]').disabled=busy||!running;const chat=document.querySelector('[data-chat-link]');if(info){chat.hidden=false;chat.href='/chat/';chat.removeAttribute('aria-disabled');}renderLaunchProgress();renderMemoryRecovery();renderBudgetAdjustment();}
   function renderBudgetAdjustment(){
     const button=root.querySelector('[data-budget-auto]'),status=root.querySelector('[data-budget-status]');if(!button||!status)return;
     const gpu=root.querySelector('[data-param=Gpu]'),selection=gpu?.multiple?Array.from(gpu.selectedOptions).map(x=>x.value):(gpu?.value||'').split(',').filter(Boolean);
     const tensor=root.querySelector('[data-param=TensorParallel]');
-    const unavailable=selection.length!==1||(tensor?.checked&&!tensor.disabled);
+    const layerwise=root.querySelector('[data-param=RecallStrategy]')?.value==='layerwise';
+    const unavailable=layerwise||selection.length!==1||(tensor?.checked&&!tensor.disabled);
     button.disabled=busy||configurationLocked()||runtime?.budget_planning||unavailable;
-    button.dataset.disabledReason=unavailable?tr('请选择一张显卡；自动调整暂支持 NInfer 单卡。','Select one GPU; automatic adjustment currently supports single-GPU NInfer.'):'';
+    button.dataset.disabledReason=layerwise?tr('分层召回需手动设置预算；尚无独立自动预算报告。','Set the layerwise budget explicitly; its automatic budget report is not qualified.'):unavailable?tr('请选择一张显卡；自动调整暂支持 NInfer 单卡。','Select one GPU; automatic adjustment currently supports single-GPU NInfer.'):'';
     button.textContent=budgetPending?tr('测算中…','Planning…'):tr('自动调整','Auto adjust');
     status.hidden=!budgetAdjustment;status.classList.toggle('l-error',budgetAdjustment?.kind==='error');
     if(!budgetAdjustment)return;
@@ -1184,7 +1363,7 @@
         make('p',{},trial.startup_verified?tr('推荐方案已通过启动验证；推理峰值显存尚未验证。','Recommendation passed startup validation; peak inference memory remains unverified.'):runtime.state==='exited'?tr('推荐方案的进程已退出，请检查日志。','The recommended launch exited; check the log.'):tr('正在验证推荐方案，等待服务就绪。','Validating recommendation; waiting for readiness.')));return;
     }
     box.append(make('h2',{class:'s-title'},tr('启动时显存不足','Insufficient GPU memory at startup')));
-    const reasons={single_ninfer_only:['暂仅支持 NInfer 单卡推荐。','Recommendations currently support single-GPU NInfer.'],missing_native_plan:['此次失败未生成后端内存规划，暂无法给出可靠的推荐参数。','No native memory plan was produced for this failure; reliable settings are unavailable.'],invalid_native_plan:['后端规划报告与本次启动参数不一致，无法使用该建议。','The native plan does not match this launch; its recommendations cannot be used.']};
+    const reasons={layerwise_planning_unavailable:['分层召回尚无独立预算推荐；请保留 KV 格式并手动调整预算。','Layerwise budget recommendations are not qualified; retain the KV format and adjust its budget explicitly.'],single_ninfer_only:['暂仅支持 NInfer 单卡推荐。','Recommendations currently support single-GPU NInfer.'],missing_native_plan:['此次失败未生成后端内存规划，暂无法给出可靠的推荐参数。','No native memory plan was produced for this failure; reliable settings are unavailable.'],invalid_native_plan:['后端规划报告与本次启动参数不一致，无法使用该建议。','The native plan does not match this launch; its recommendations cannot be used.']};
     if(diagnosis.reason){box.append(make('p',{},tr(...(reasons[diagnosis.reason]||reasons.missing_native_plan))));return;}
     const mib=n=>`${Math.ceil(n/1048576).toLocaleString()} MiB`;
     box.append(make('p',{},tr(`后端需要 ${mib(diagnosis.required_bytes)}；模型加载后可用 ${mib(diagnosis.available_bytes)}。`,`Runtime requires ${mib(diagnosis.required_bytes)}; ${mib(diagnosis.available_bytes)} available after model loading.`)),

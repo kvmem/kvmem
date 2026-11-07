@@ -1,0 +1,467 @@
+diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
+index e34f1cd..859aff7 100644
+--- a/src/poly/kvmem.cpp
++++ b/src/poly/kvmem.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cmath>
+ #include <cstring>
+ #include <cstdlib>
+@@ -681,6 +682,8 @@ KvmemCheckpoint KvmemMemory::checkpoint() {
+             engine_.pos_ == int64_t(stamp_.frontier), "cannot checkpoint incomplete KVMem execution");
+     archive_resident();
+     KvmemCheckpoint cp;
++    const bool trace_cost = std::getenv("KVMEM_POLY_STORAGE_METRICS") != nullptr;
++    const auto manifest_start = trace_cost ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     cp.identity = {descriptor_.identity, descriptor_.layout, stamp_};
+     // Published history retains its exact immutable physical sources, including
+     // cold blocks. Numeric versions alone cannot prove identity after a branch.
+@@ -705,25 +708,40 @@ KvmemCheckpoint KvmemMemory::checkpoint() {
+         (unsigned long long)stamp_.frontier, (unsigned long long)engine_.state_bytes());
+     // Keep the already-admitted native exchange margin available after capture.
+     auto checkpoint_headroom=storage_->reserve(checkpoint_ram_required()-checkpoint_charge());
+-    if (engine_.state_bytes())
+-        cp.state_reservation=std::make_shared<kvmem::HostKvReservation>(storage_->reserve(engine_.state_bytes()));
+-    cp.state.resize(engine_.state_bytes());
+-    if (cp.state.size() == engine_.state_n_ * sizeof(float)) {
+-        ck(cudaMemcpyAsync(cp.state.data(), engine_.state_, cp.state.size(), cudaMemcpyDeviceToHost, cs(engine_.st_)),
++    const auto state_start = trace_cost ? std::chrono::steady_clock::now() : manifest_start;
++    const size_t bytes = engine_.state_bytes();
++    uint8_t* destination = nullptr;
++    if (bytes && tiered_state()) {
++        cp.state_record = storage_->allocate(bytes);
++        destination = cp.state_record.writable_data();
++    } else if (bytes) {
++        cp.state_reservation = std::make_shared<kvmem::HostKvReservation>(storage_->reserve(bytes));
++        cp.state.resize(bytes);
++        destination = cp.state.data();
++    }
++    if (bytes && bytes == engine_.state_n_ * sizeof(float)) {
++        ck(cudaMemcpyAsync(destination, engine_.state_, bytes, cudaMemcpyDeviceToHost, cs(engine_.st_)),
+            "KVMem recurrent checkpoint");
+         ck(cudaStreamSynchronize(cs(engine_.st_)), "KVMem recurrent checkpoint");
+-    } else {
++    } else if (bytes) {
+         // Window rings are native state too. save_state() fences the stream
+         // and serializes them in chronological order at the accepted frontier.
+-        engine_.save_state(cp.state.data());
++        engine_.save_state(destination);
+     }
+-    if (options_.verify) {
+-        std::vector<uint8_t> reference(cp.native_state().size());
++    if (options_.verify && bytes) {
++        std::vector<uint8_t> reference(cp.state_size());
+         engine_.save_state(reference.data());
+-        require(reference == cp.state, "KVMem contiguous checkpoint differs from native layer checkpoints");
++        require(std::memcmp(reference.data(),destination,bytes)==0, "KVMem contiguous checkpoint differs from native layer checkpoints");
+     }
+-    state_capture_bytes_+=cp.state.size();
+-    state_images.fetch_add(cp.state.size(),std::memory_order_relaxed);
++    if (cp.state_record) cp.state_record.seal();
++    state_capture_bytes_+=bytes;
++    if (trace_cost) {
++        const auto micros = [](auto elapsed) { return std::chrono::duration<double,std::micro>(elapsed).count(); };
++        std::fprintf(stderr,"KVMEM_CHECKPOINT_COST frontier=%llu versions=%zu manifest=%zu manifest_admission_us=%.2f state=%zu capture_us=%.2f out=%zu in=%zu\n",
++            (unsigned long long)stamp_.frontier,versions_.size()*sizeof(uint64_t),cp.kv?cp.kv->manifest_bytes():0,
++            micros(state_start-manifest_start),bytes,micros(std::chrono::steady_clock::now()-state_start),out_bytes_,in_bytes_);
++    }
++    state_images.fetch_add(bytes,std::memory_order_relaxed);
+     cp.mean_tail = statistics_->mean_checkpoint(uint32_t(stamp_.frontier));
+     cp.retrieval = selector_->retrieval_checkpoint();
+     cp.transfers = transfers_;
+@@ -735,7 +753,7 @@ bool KvmemMemory::freeze_and_rewind(const KvmemCheckpoint& cp,uint64_t prompt_en
+             "KVMem Query probe is incomplete");
+     require(cp.identity.stamp==query_base_stamp_ && cp.identity.backend==descriptor_.identity &&
+             cp.identity.layout==descriptor_.layout && cp.identity.stamp.session==stamp_.session &&
+-            cp.identity.stamp.frontier==uint64_t(query_begin_) && cp.native_state().size()==engine_.state_bytes(),
++            cp.identity.stamp.frontier==uint64_t(query_begin_) && cp.state_size()==engine_.state_bytes(),
+             "KVMem Query checkpoint identity mismatch");
+     query_capture_=false;
+     if (!prompt_end) prompt_end=uint64_t(query_end_);
+@@ -750,10 +768,15 @@ bool KvmemMemory::freeze_and_rewind(const KvmemCheckpoint& cp,uint64_t prompt_en
+     }
+     // Freeze scores over the exact pre-Query prefix, including its partial
+     // Mean-K page. No probe suffix becomes a historical recall candidate.
+-    rewind_state(cp);
+-    selector_->begin_retrieval_round();
+-    query_frozen_=true;
+-    exchange(select(true));
++    try {
++        rewind_state(cp);
++        selector_->begin_retrieval_round();
++        query_frozen_=true;
++        exchange(select(true));
++    } catch (...) {
++        invalidate();
++        throw;
++    }
+     replaying_=true;
+     std::fprintf(stderr,"KVMEM_QUERY replay=1 reason=%s begin=%llu end=%llu\n",plan.reason,
+         (unsigned long long)plan.begin,(unsigned long long)plan.end);
+@@ -764,7 +787,7 @@ void KvmemMemory::restore_prefix(const KvmemCheckpoint& cp) {
+     require(stamp_.valid && !transaction_ && cp.identity.stamp.valid &&
+             cp.identity.backend == descriptor_.identity && cp.identity.layout == descriptor_.layout &&
+             cp.identity.stamp.session == stamp_.session && cp.identity.stamp.frontier <= stamp_.frontier &&
+-            cp.native_state().size() == engine_.state_bytes(), "KVMem history checkpoint identity mismatch");
++            cp.state_size() == engine_.state_bytes(), "KVMem history checkpoint identity mismatch");
+     // The caller proved an identical token prefix and discarded checkpoints
+     // after a fork. Later appends never change the KV bytes before this point.
+     start_request();
+@@ -789,11 +812,31 @@ void KvmemMemory::restore_prefix(const KvmemCheckpoint& cp) {
+ void KvmemMemory::rewind_state(const KvmemCheckpoint& cp) {
+     archive_resident();
+     truncate_catalog(cp);
+-    engine_.load_state(cp.native_state().data(), int64_t(stamp_.frontier));
+-    if (options_.verify) {
+-        std::vector<uint8_t> restored(engine_.state_bytes());
+-        engine_.save_state(restored.data());
+-        require(restored == cp.native_state(), "KVMem recurrent checkpoint bytes differ after restore");
++    const auto& root = cp.state_root();
++    const auto restore = [&](const uint8_t* bytes) {
++        engine_.load_state(bytes, int64_t(stamp_.frontier));
++        if (options_.verify && cp.state_size()) {
++            std::vector<uint8_t> restored(engine_.state_bytes());
++            engine_.save_state(restored.data());
++            require(std::memcmp(restored.data(),bytes,restored.size())==0,
++                    "KVMem recurrent checkpoint bytes differ after restore");
++        }
++    };
++    if (root.state_record) {
++        const auto lease = root.state_record.lease();
++        if (const auto* resident = lease.data()) {
++            restore(resident);
++        } else {
++            // Finish the cold read into admitted private RAM before loading
++            // native model state. The immutable source survives read failure.
++            auto staging = storage_->allocate(root.state_record.size());
++            auto* bytes = staging.writable_data();
++            check_fault("state_read");
++            lease.read(0,bytes,staging.size());
++            restore(bytes);
++        }
++    } else {
++        restore(root.state.data());
+     }
+ }
+ void KvmemMemory::truncate_catalog(const KvmemCheckpoint& cp) {
+@@ -834,7 +877,7 @@ void KvmemMemory::truncate_catalog(const KvmemCheckpoint& cp) {
+ KvmemParked KvmemMemory::park(const KvmemCheckpoint& cp) {
+     require(stamp_.valid && !transaction_ && !engine_.memory_window_ && !engine_.memory_drafting_ && cp.identity.backend == descriptor_.identity &&
+             cp.identity.layout == descriptor_.layout && cp.identity.stamp.session == stamp_.session &&
+-            cp.identity.stamp.frontier <= stamp_.frontier && cp.native_state().size() == engine_.state_bytes(),
++            cp.identity.stamp.frontier <= stamp_.frontier && cp.state_size() == engine_.state_bytes(),
+             "KVMem parked checkpoint identity mismatch");
+     // Allocate the empty next catalog before detaching any authoritative data.
+     auto fresh_statistics = std::make_unique<kvmem::RawKvStore>(statistics_->config());
+@@ -986,9 +1029,9 @@ void KvmemMemory::storage_metrics() const {
+     std::fprintf(stderr,"KVMEM_NATIVE_IO scope=process archive_d2h_bytes=%llu view_d2h_bytes=%llu view_h2d_bytes=%llu state_image_bytes=%llu\n",
+         (unsigned long long)archive_dma.load(),(unsigned long long)view_download_dma.load(),
+         (unsigned long long)view_upload_dma.load(),(unsigned long long)state_images.load());
+-    std::fprintf(stderr,"KVMEM_SNAPSHOT capture_bytes=%llu logical_view_bytes=%llu state_capture_bytes=%llu staging_bytes=%llu restore_staging=full_selected_view state_storage=reserved_ram\n",
++    std::fprintf(stderr,"KVMEM_SNAPSHOT capture_bytes=%llu logical_view_bytes=%llu state_capture_bytes=%llu staging_bytes=%llu restore_staging=full_selected_view state_storage=%s\n",
+         (unsigned long long)captured_bytes_,(unsigned long long)checkpoint_view_bytes_,
+-        (unsigned long long)state_capture_bytes_,(unsigned long long)(out_bytes_+in_bytes_));
++        (unsigned long long)state_capture_bytes_,(unsigned long long)(out_bytes_+in_bytes_),tiered_state()?"tiered_record":"reserved_ram");
+     std::fprintf(stderr,"KVMEM_STORAGE host_bytes=%llu host_limit=%llu disk_bytes=%llu disk_limit=%llu read_bytes=%llu written_bytes=%llu errors=%llu\n",
+         (unsigned long long)host_bytes(),(unsigned long long)host_limit(),(unsigned long long)disk_bytes(),
+         (unsigned long long)disk_limit(),(unsigned long long)io.read_bytes,(unsigned long long)io.written_bytes,(unsigned long long)io.errors);
+diff --git a/src/poly/kvmem.hpp b/src/poly/kvmem.hpp
+index aa3bd70..4536786 100644
+--- a/src/poly/kvmem.hpp
++++ b/src/poly/kvmem.hpp
+@@ -62,12 +62,17 @@ struct KvmemCheckpoint {
+     std::shared_ptr<kvmem::HostKvReservation> metadata_reservation;
+     std::shared_ptr<const kvmem::KvSnapshot> kv;
+     std::shared_ptr<const std::vector<uint64_t>> kv_versions;
+-    // Gemma's large window image uses the same hard RAM quota as native KV.
+-    // A shared reservation charges its vector once without duplicating bytes.
++    // RAM-only captures own a reserved vector. Tiered captures write directly
++    // into a private record and seal it after the engine stream has drained.
+     std::shared_ptr<kvmem::HostKvReservation> state_reservation;
+     std::vector<uint8_t> state;
++    kvmem::HostKvRecord state_record;
+     std::shared_ptr<const KvmemCheckpoint> shared_state;
+-    const std::vector<uint8_t>& native_state() const { return shared_state ? shared_state->state : state; }
++    const KvmemCheckpoint& state_root() const { return shared_state ? *shared_state : *this; }
++    size_t state_size() const {
++        const auto& root = state_root();
++        return root.state_record ? root.state_record.size() : root.state.size();
++    }
+     std::vector<float> mean_tail;
+     kvmem::LrfuState retrieval;
+     uint64_t transfers = 0;
+@@ -207,6 +212,9 @@ private:
+     struct PinnedDelete { void operator()(uint8_t*) const noexcept; };
+     std::unique_ptr<uint8_t,PinnedDelete> out_owner_,in_owner_;
+     size_t out_bytes_=0,in_bytes_=0;
++    bool tiered_state() const {
++        return disk_limit() && descriptor_.identity.state_schema == "qwen35-gdn-f32-v1";
++    }
+     void ensure_staging(uint64_t out_rows,uint64_t in_rows);
+     int64_t query_begin_ = -1, query_end_ = -1;
+     bool query_capture_ = false, query_frozen_ = false, transaction_ = false;
+diff --git a/src/poly/kvmem_history.hpp b/src/poly/kvmem_history.hpp
+index 9dd2537..d3b8601 100644
+--- a/src/poly/kvmem_history.hpp
++++ b/src/poly/kvmem_history.hpp
+@@ -89,7 +89,7 @@ class KvmemHistory {
+         std::shared_ptr<const KvmemCheckpoint> data;
+         kvmem::CheckpointInfo checkpoint_info() const {
+             return {data->identity.stamp.frontier, purposes, data.get(),
+-                    data->native_state().size() + data->mean_tail.size() * sizeof(float) +
++                    data->state_size() + data->mean_tail.size() * sizeof(float) +
+                     data->resident.capacity()*sizeof(uint64_t) + data->graph.bytes() + data->feedback.bytes()};
+         }
+     };
+@@ -102,12 +102,12 @@ public:
+     // Reclaim oldest unshared images only when that can satisfy the allocation.
+     // Removing a mark held by an in-flight Query would free no RAM and would
+     // unnecessarily discard the next request's prefix restore point.
+-    bool reclaim_state(uint64_t bytes, kvmem::CheckpointPurpose purpose = kvmem::CheckpointPurpose::None) {
++    bool reclaim_state(uint64_t bytes, kvmem::CheckpointPurpose purpose = kvmem::CheckpointPurpose::None, bool resident_only = false) {
+         const auto state_owner = [](const Mark& mark) {
+             return mark.data->shared_state ? mark.data->shared_state.get() : mark.data.get();
+         };
+         const auto eligible = [&](const Mark& mark) {
+-            if (mark.data.use_count() != 1 || !state_owner(mark)->state_reservation) return false;
++            if (mark.data.use_count() != 1 || (!state_owner(mark)->state_reservation && !state_owner(mark)->state_record)) return false;
+             // A private fork can become the last owner after its directory root
+             // is retired. Reclaim it only when no published/in-flight reader
+             // still owns that immutable state root.
+@@ -119,15 +119,19 @@ public:
+                 {uint64_t(tokens_.size()), purpose, this, 0}}, kvmem::CheckpointLimits{1});
+             return !keep.empty() && keep.front() == 1;
+         };
++        const auto releasable = [&](const Mark& mark) {
++            const auto* root = state_owner(mark);
++            return root->state_record && resident_only ? root->state_record.resident_bytes() : uint64_t(root->state_size());
++        };
+         uint64_t available = 0;
+         for (const auto& mark : marks_)
+             if (eligible(mark))
+-                available += state_owner(mark)->state.size();
++                available += releasable(mark);
+         if (available < bytes) return false;
+         kvmem::CheckpointCatalog<Mark> keep{kvmem::CheckpointLimits{3}};
+         for (auto& mark : marks_) {
+-            if (bytes && eligible(mark)) {
+-                bytes -= std::min<uint64_t>(bytes, state_owner(mark)->state.size());
++            if (bytes && eligible(mark) && releasable(mark)) {
++                bytes -= std::min<uint64_t>(bytes, releasable(mark));
+                 mark.data.reset();
+             } else keep.remember(std::move(mark));
+         }
+@@ -163,10 +167,10 @@ public:
+     size_t size() const noexcept { return tokens_.size(); }
+     const std::vector<int32_t>& tokens() const noexcept { return tokens_; }
+     size_t marks() const noexcept { return marks_.size(); }
+-    void state_records(std::vector<std::pair<const void*, uint64_t>>& records) const {
++    void state_records(std::vector<const KvmemCheckpoint*>& records) const {
+         for (const auto& mark : marks_) {
+             const auto root = mark.data->shared_state ? mark.data->shared_state.get() : mark.data.get();
+-            if (!root->state.empty()) records.emplace_back(root,root->state.size());
++            if (root->state_size()) records.push_back(root);
+         }
+     }
+     std::shared_ptr<const KvmemCheckpoint> latest() const { return marks_.empty() ? nullptr : marks_.back().data; }
+diff --git a/src/poly/kvmem_sessions.cpp b/src/poly/kvmem_sessions.cpp
+index 605befa..b6c87ac 100644
+--- a/src/poly/kvmem_sessions.cpp
++++ b/src/poly/kvmem_sessions.cpp
+@@ -30,7 +30,7 @@ std::shared_ptr<KvmemCheckpoint> KvmemSessions::checkpoint(KvmemMemory& memory,
+     if (required) purpose = kvmem::CheckpointPurpose::None;
+     if (make_state_room(memory, history, total_tokens, purpose)) {
+         // With SSD enabled, aggregate space alone does not guarantee RAM for
+-        // the non-spillable state. Reclaim optional marks on reserve failure.
++        // the next capture and its exchange margin. Retry after reclaiming optional marks.
+         for (int attempt = 0; attempt != 2; ++attempt) {
+             try { return std::make_shared<KvmemCheckpoint>(memory.checkpoint()); }
+             catch (const kvmem::MemoryError& error) {
+@@ -41,7 +41,7 @@ std::shared_ptr<KvmemCheckpoint> KvmemSessions::checkpoint(KvmemMemory& memory,
+                         (unsigned long long)memory.host_bytes(),(unsigned long long)memory.checkpoint_charge(),(unsigned long long)memory.host_limit(),entries_.size());
+                 while (evict_one()) {}
+                 const auto free = memory.host_limit() - memory.host_bytes();
+-                if (free < memory.checkpoint_ram_required()) history.reclaim_state(memory.checkpoint_ram_required() - free, purpose);
++                if (free < memory.checkpoint_ram_required()) history.reclaim_state(memory.checkpoint_ram_required() - free, purpose, true);
+             }
+         }
+     }
+@@ -150,19 +150,23 @@ void KvmemSessions::metrics(const KvmemMemory& memory, const KvmemHistory* activ
+         parked(), groups(), evictions(), restores(), skipped(), (unsigned long long)memory.host_bytes(),
+         (unsigned long long)memory.host_limit(), (unsigned long long)memory.stamp().session.id,
+         (unsigned long long)memory.stamp().session.incarnation);
+-    std::vector<std::pair<const void*,uint64_t>> states;
++    std::vector<const KvmemCheckpoint*> states;
+     for (const auto& entry : entries_) entry.value->history.state_records(states);
+     if (active) active->state_records(states);
+     for(const auto* history:others)if(history)history->state_records(states);
+     std::set<const void*> unique;
+-    uint64_t logical_state=0, physical_state=0;
++    uint64_t logical_state=0, physical_state=0, resident_state=0;
+     for (const auto& state : states) {
+-        logical_state+=state.second;
+-        if(unique.insert(state.first).second)physical_state+=state.second;
++        logical_state += state->state_size();
++        if (unique.insert(state).second) {
++            physical_state += state->state_size();
++            resident_state += state->state_record ? state->state_record.resident_bytes() : state->state.size();
++        }
+     }
+-    std::fprintf(stderr,"KVMEM_SHARED scope_version=2 logical_state_bytes=%llu physical_state_bytes=%llu state_sharing_credit_bytes=%llu state_references=%zu\n",
++    std::fprintf(stderr,"KVMEM_SHARED scope_version=2 logical_state_bytes=%llu physical_state_bytes=%llu state_sharing_credit_bytes=%llu state_references=%zu state_resident_bytes=%llu state_cold_bytes=%llu\n",
+         (unsigned long long)logical_state,(unsigned long long)physical_state,
+-        (unsigned long long)(logical_state-physical_state),states.size());
++        (unsigned long long)(logical_state-physical_state),states.size(),
++        (unsigned long long)resident_state,(unsigned long long)(physical_state-resident_state));
+     const auto logical = payload_bytes()+(logical_active==UINT64_MAX ? memory.active_host_bytes() : logical_active), physical = memory.payload_bytes();
+     std::fprintf(stderr,"KVMEM_SHARED logical_payload_bytes=%llu physical_payload_bytes=%llu sharing_credit_bytes=%llu shared_forks=%llu\n",
+         (unsigned long long)logical, (unsigned long long)physical,
+diff --git a/tools/poly_kvmem_mtp_test.cpp b/tools/poly_kvmem_mtp_test.cpp
+index 567bcd8..e95787e 100644
+--- a/tools/poly_kvmem_mtp_test.cpp
++++ b/tools/poly_kvmem_mtp_test.cpp
+@@ -92,6 +92,14 @@ std::vector<float> floats(const std::vector<uint8_t>& bytes) {
+     std::memcpy(result.data(),bytes.data(),bytes.size());
+     return result;
+ }
++static std::vector<uint8_t> checkpoint_bytes(const strata::poly::KvmemCheckpoint& checkpoint) {
++    const auto& root = checkpoint.state_root();
++    if (!root.state_record) return root.state;
++    std::vector<uint8_t> bytes(root.state_size());
++    root.state_record.read(0,bytes.data(),bytes.size());
++    return bytes;
++}
++
+ int main(int argc,char** argv) {
+     try {
+         if (argc < 2) throw std::runtime_error(
+@@ -219,7 +227,7 @@ int main(int argc,char** argv) {
+             const auto serial_kv=KvmemTestAccess::kv(engine->memory());
+             if(kv!=serial_kv)KvmemTestAccess::diagnose(engine->memory(),kv,serial_kv);
+             check(kv == serial_kv,"accepted native K/V differs from serial evaluation");
+-            close(floats(speculative.state),floats(serial.state),"recurrent_and_draft_hidden");
++            close(floats(checkpoint_bytes(speculative)),floats(checkpoint_bytes(serial)),"recurrent_and_draft_hidden");
+             close(means,KvmemTestAccess::means(engine->memory()),"accepted_mean_keys");
+             if (opt.memory.disk_mib) {
+                 const auto before_io=engine->memory().io_stats();
+@@ -229,7 +237,7 @@ int main(int argc,char** argv) {
+                 check(engine->memory().disk_bytes() > 0,"cold parked history wrote no SSD payload");
+                 engine->memory().enter(std::move(parked),serial);
+                 const auto restored=engine->memory().checkpoint();
+-                check(restored.state == serial.state,"cold restore changed recurrent checkpoint bytes");
++                check(checkpoint_bytes(restored) == checkpoint_bytes(serial),"cold restore changed recurrent checkpoint bytes");
+                 const auto after_io=engine->memory().io_stats();
+                 check(after_io.written_bytes > before_io.written_bytes,"cold transition performed no SSD write");
+                 check(after_io.read_bytes > before_io.read_bytes,"cold transition performed no SSD read");
+@@ -310,11 +318,11 @@ int main(int argc,char** argv) {
+                 const auto cp=engine->memory().checkpoint();const auto kv=KvmemTestAccess::kv(engine->memory());
+                 if(!lending) {
+                     reference_logits=logits;reference_probs=probs;reference_guesses=guesses;
+-                    reference_state=cp.state;reference_kv=kv;
++                    reference_state=checkpoint_bytes(cp);reference_kv=kv;
+                 } else {
+                     check(logits==reference_logits && probs==reference_probs && guesses==reference_guesses,
+                           "full/narrow MTP logits or draft guesses/probabilities differ");
+-                    check(cp.state==reference_state && kv==reference_kv,"full/narrow MTP accepted state differs");
++                    check(checkpoint_bytes(cp)==reference_state && kv==reference_kv,"full/narrow MTP accepted state differs");
+                 }
+             }
+             std::cout<<"PASS full_narrow_mtp_exact_logits_draft_probabilities_and_native_state\n";
+diff --git a/tools/poly_kvmem_sessions_test.cpp b/tools/poly_kvmem_sessions_test.cpp
+index ed178ef..ada16a8 100644
+--- a/tools/poly_kvmem_sessions_test.cpp
++++ b/tools/poly_kvmem_sessions_test.cpp
+@@ -145,11 +145,11 @@ int main() {
+         owned->history.latest();
+         auto stamp = owned->memory.identity.stamp; stamp.session.id = 19;
+         auto forked = owned->history.fork(stamp);
+-        check(forked.latest()->native_state().data()==owned->history.latest()->native_state().data(), "fork duplicated sealed recurrent state");
++        check(forked.latest()->state_root().state.data()==owned->history.latest()->state_root().state.data(), "fork duplicated sealed recurrent state");
+         check(forked.choose(prompt(9000),128,stamp).at == 128, "fork lost its rebound native checkpoint");
+         owned->history.truncate(0);
+         check(forked.size()==128 && forked.latest()->identity.stamp.session.id==19, "parent edit changed child history");
+-        check(forked.latest()->native_state().size()==16 && forked.latest()->native_state()[0]==7, "parent edit released child state");
++        check(forked.latest()->state_root().state.size()==16 && forked.latest()->state_root().state[0]==7, "parent edit released child state");
+         owned->history = forked.fork(owned->memory.identity.stamp);
+         cache.save(std::move(owned));
+         auto foreign=cache.choose(prompt(9000),128,"different",true);
+@@ -164,7 +164,7 @@ int main() {
+             auto reader=snapshots.lease(0);
+             snapshots.save(entry(account,102,13000));
+             check(reader->history.size()==128 && account.charged_bytes()==128,"directory replacement consumed a leased snapshot");
+-            check(reader->history.latest()->native_state()[0]==7,"leased native checkpoint changed after publication");
++            check(reader->history.latest()->state_root().state[0]==7,"leased native checkpoint changed after publication");
+             reader.reset();check(account.charged_bytes()==64,"last reader did not release its physical charge");
+             snapshots.configure(0);check(account.charged_bytes()==0,"snapshot directory cleanup leaked payload");
+         }
+diff --git a/tools/poly_kvmem_snapshot_test.cpp b/tools/poly_kvmem_snapshot_test.cpp
+index fbd6df1..aab467d 100644
+--- a/tools/poly_kvmem_snapshot_test.cpp
++++ b/tools/poly_kvmem_snapshot_test.cpp
+@@ -14,7 +14,7 @@ namespace strata::poly { struct KvmemTestAccess {
+   try {while(s.advance()!=kvmem::MemoryPhase::Ready){}s.publish();}catch(const kvmem::MemoryError&){s.abort();return true;}
+   return false;
+  }
+- static void fail(KvmemMemory& m){m.fault_="history_restore";m.fault_used_=false;}
++ static void fail(KvmemMemory& m,const char* stage="history_restore"){m.fault_=stage;m.fault_used_=false;}
+  static auto account(KvmemMemory& m){return m.storage_;}
+  static void cold(KvmemMemory& m){m.storage_->trim(0);}
+ }; }
+@@ -26,6 +26,17 @@ int main(int argc,char** argv){try{
+  auto e=Engine::open(o);auto& m=e->memory();account=KvmemTestAccess::account(m);std::vector<int32_t> tokens(97,100);
+  check(e->read(tokens.data(),64),"read 64");auto a=m.checkpoint();auto bytes_a=KvmemTestAccess::kv(m);auto saved=a.kv->read();weak=a.kv->blocks()[0];
+  check(e->read(tokens.data()+64,17),"read 17");auto b=m.checkpoint();
++ {
++    const auto lhs = a.state_record.lease();
++    const auto rhs = b.state_record.lease();
++    check(lhs.data() && rhs.data(), "expected resident native state before trim");
++    size_t unchanged = 0;
++    for (size_t offset = 0; offset < a.state_size(); offset += 4096) {
++        const auto bytes = std::min<size_t>(4096, a.state_size() - offset);
++        if (std::memcmp(lhs.data()+offset,rhs.data()+offset,bytes)==0) unchanged += bytes;
++    }
++    std::cout << "STATE_APPEND_PROBE bytes=" << a.state_size() << " identical_4k_bytes=" << unchanged << "\n";
++ }
+  check(a.kv->blocks()[0]==b.kv->blocks()[0] && a.kv->blocks()[1]==b.kv->blocks()[1],"complete origins not shared");
+  check(e->read(tokens.data()+81,16),"read 16");auto c=m.checkpoint();
+  check(b.kv->blocks()[2]!=c.kv->blocks()[2],"growing tail shared");check(a.kv->read()==saved,"old source mutated");
+@@ -36,11 +47,35 @@ int main(int argc,char** argv){try{
+  m.restore_prefix(a);check(KvmemTestAccess::kv(m)==bytes_a,"old parent native KV differs");
+  auto parked=m.park(a);auto branch=m.fork(parked);KvmemCheckpoint cp;cp.identity=a.identity;cp.identity.stamp.session=branch.identity.stamp.session;
+  cp.kv=a.kv;cp.kv_versions=a.kv_versions;cp.mean_tail=a.mean_tail;cp.retrieval=a.retrieval;cp.resident=a.resident;cp.graph=a.graph;cp.feedback=a.feedback;cp.output_samples=a.output_samples;cp.shared_state=std::make_shared<KvmemCheckpoint>(std::move(a));
+- KvmemTestAccess::cold(m);m.enter(std::move(branch),cp);check(KvmemTestAccess::kv(m)==bytes_a,"cold fork native bytes differ");
++ KvmemTestAccess::cold(m);
++ check(cp.state_size() && cp.state_root().state_record.resident_bytes()==0, "native state failed to migrate to SSD");
++ m.enter(std::move(branch),cp);check(KvmemTestAccess::kv(m)==bytes_a,"cold fork native bytes differ");
+  check(e->read(tokens.data(),17),"branch append");auto changed=m.checkpoint();check(cp.kv->read()==saved,"branch changed source");
+  auto leaving=m.park(changed);auto again=m.fork(parked);cp.identity.stamp.session=again.identity.stamp.session;m.enter(std::move(again),cp);check(KvmemTestAccess::kv(m)==bytes_a,"old parent after edit differs");
+  KvmemTestAccess::fail(m);bool failed=false;try{m.restore_prefix(cp);}catch(const kvmem::MemoryError&){failed=true;}check(failed,"fault not injected");check(cp.kv->read()==saved,"failed restore changed source");
+  e->reset();auto retry=m.fork(parked);cp.identity.stamp.session=retry.identity.stamp.session;m.enter(std::move(retry),cp);check(KvmemTestAccess::kv(m)==bytes_a,"restore retry differs");
++ for (bool pressure : {false,true}) {
++    KvmemTestAccess::cold(m);
++    check(cp.state_root().state_record.resident_bytes()==0,"expected cold state for failure test");
++    bool rejected = false;
++    {
++        auto remaining = account->capacity_bytes()-account->charged_bytes();
++        auto reservation = account->reserve(pressure ? remaining : 0);
++        if (!pressure) KvmemTestAccess::fail(m,"state_read");
++        try { m.restore_prefix(cp); }
++        catch (const kvmem::MemoryError& error) {
++            rejected = pressure ? error.code()==kvmem::MemoryErrorCode::BudgetExceeded :
++                                  std::string(error.what()).find("state_read")!=std::string::npos;
++        }
++    }
++    check(rejected && !m.stamp().valid,"cold restore failure was not isolated");
++    check(cp.kv->read()==saved,"cold restore failure changed the published source");
++    e->reset();
++    auto next=m.fork(parked);
++    cp.identity.stamp.session=next.identity.stamp.session;
++    m.enter(std::move(next),cp);
++    check(KvmemTestAccess::kv(m)==bytes_a,"cold state retry differs");
++ }
+  check(KvmemTestAccess::stale(m),"stale completion published");check(cp.kv->read()==saved,"stale completion changed source");
+  e->reset();auto fresh=m.fork(parked);cp.identity.stamp.session=fresh.identity.stamp.session;m.enter(std::move(fresh),cp);check(KvmemTestAccess::kv(m)==bytes_a,"stale completion lost recovery source");
+  std::cout<<"PASS complete origins, private tail, exact old-parent native KV, cold fork, branch edit; disk_reads="<<m.io_stats().read_bytes<<"\n";}check(weak.expired(),"origin remained alive");check(account->charged_bytes()==0 && account->disk_bytes()==0,"snapshot resources leaked");std::cout<<"PASS final resource release\n";return 0;

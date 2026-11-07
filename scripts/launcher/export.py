@@ -120,7 +120,7 @@ def export_profile(data, backend_root, profiles_root, profile_id, *,
         raise ValueError('A Linux plan is required')
     if _validated_plan is None:
         plan['worker'] = probe_worker(plan['argv'][0], plan['backend'], plan['environment'])
-        require_launch_features(plan['worker'], data['parameters'])
+        require_launch_features(plan['worker'], plan['effective_parameters'])
     revision = uuid.uuid4().hex
     target = revisions / revision
     secret_ref = None

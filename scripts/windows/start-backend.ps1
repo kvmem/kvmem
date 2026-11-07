@@ -27,7 +27,7 @@ param(
     [ValidateSet('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')][string]$ReasoningEffort,
     [switch]$PreserveThinking,
     [ValidateRange(256, 2147483647)][int]$Context = 262144,
-    [ValidateRange(128, 2147483647)][int]$Budget = 32768,
+    [ValidateRange(1, 2147483647)][int]$Budget = 32768,
     [ValidateSet(32,64)][int]$BlockTokens = 32,
     [ValidateRange(32, 2147483647)][int]$Reserve = 1024,
     [ValidateRange(1, 1048576)][int]$HostMiB = 16384,
@@ -38,7 +38,7 @@ param(
     [string]$KvTypeV,
     [ValidateRange(0, 15)][int]$MtpDrafts = 0,
     [switch]$AdaptiveMtp,
-    [ValidateSet('none', 'mtp', 'dflash2')][string]$SpeculativeMode,
+    [ValidateSet('none', 'mtp', 'dflash2', 'guess')][string]$SpeculativeMode,
     [ValidateRange(0, 15)][int]$DraftTokens,
     [ValidateSet('fixed', 'adaptive')][string]$DraftPolicy,
     [string]$DraftModel,
@@ -55,6 +55,14 @@ param(
     [ValidateRange(0, 2147483647)][int]$ThinkingBudget = 0,
     [ValidateRange(0, 2147483647)][int]$SinkTokens = 12288,
     [ValidateRange(0, 2147483647)][int]$RecentTokens = 1024,
+    [ValidateSet('legacy', 'layerwise')][string]$RecallStrategy = 'legacy',
+    [ValidateSet('upstream-global', 'first-layer')][string]$LayerwiseMtpHistory,
+    [ValidateRange(0, 2147483647)][int]$LayerwiseActivationRamMiB,
+    [ValidateRange(0, 2147483647)][int]$LayerwiseActivationDiskMiB,
+    [ValidateRange(1, 2147483647)][int]$LayerwiseStagingMiB,
+    [ValidateRange(1, 2147483647)][int]$LayerwiseMetadataMiB,
+    [ValidateRange(1, 2147483647)][int]$LayerwiseCheckpointTarget,
+    [ValidateRange(1, 2147483647)][int]$LayerwiseActivationMetadataMiB,
     [ValidateSet('page-softmax', 'meanq-cosine')][string]$QueryScorer = 'page-softmax',
     [ValidateRange(0.0, 1.0)][double]$GraphAlpha,
     [ValidateRange(1, 2147483647)][int]$QueryMaxTokens,
@@ -137,16 +145,18 @@ $resolvedBlock = if ($Backend -eq 'llamacpp') { 32 } else { $BlockTokens }
 # A native logical-batch override must not change the independently emitted ubatch.
 $llamaPhysicalPrefill=$Prefill
 $tokenInputs = Resolve-KVMemTokenOverrides $Backend $WorkerArgs $Context $Prefill $resolvedBlock
+if($RecallStrategy -ne 'layerwise' -and $Budget -lt 128) {throw 'Legacy Budget must be at least 128 tokens'}
 $WorkerArgs = @($tokenInputs.WorkerArgs)
 $resolvedBlock = $tokenInputs.BlockTokens
 $resolvedContext = $tokenInputs.Context
-$tokenPlan = Resolve-KVMemTokenSettings $Backend $resolvedBlock $Budget $Reserve $tokenInputs.Prefill $SinkTokens $RecentTokens $resolvedContext
+$tokenPlan = Resolve-KVMemTokenSettings $Backend $resolvedBlock $Budget $Reserve $tokenInputs.Prefill $SinkTokens $RecentTokens $resolvedContext $RecallStrategy $PSBoundParameters
 $Budget=[int]$tokenPlan.effective.Budget; $Reserve=[int]$tokenPlan.effective.Reserve
 $Prefill=[int]$tokenPlan.effective.Prefill; $SinkTokens=[int]$tokenPlan.effective.SinkTokens; $RecentTokens=[int]$tokenPlan.effective.RecentTokens
 foreach ($change in $tokenPlan.adjustments) {
     Write-Warning "KVMEM_CONFIG $($change.parameter): $($change.requested) -> $($change.effective) tokens ($($change.reason))"
 }
 if ($Backend -eq 'polystrata') {
+    $null=@(Get-KVMemRecallArgs $PSBoundParameters)
     & (Join-Path $PSScriptRoot 'start-polystrata.ps1') -Parameters $PSBoundParameters -Root $root -WorkerArgs $WorkerArgs -TokenPlan $tokenPlan
     return
 }
@@ -181,11 +191,13 @@ if (@('SpeculativeMode','DraftTokens','DraftPolicy','DraftModel') | Where-Object
 if (@($WorkerArgs | Where-Object { $_ -match '^--kvmem-disk-(path|mib)(=|$)' }).Count) {
     throw 'Use -DiskPath and -DiskMiB to configure shared active/idle SSD storage'
 }
-if (($PSBoundParameters.ContainsKey('DiskPath') -or ($PSBoundParameters.ContainsKey('DiskMiB') -and $DiskMiB -gt 0)) -and
+$activationDisk = $RecallStrategy -eq 'layerwise' -and $LayerwiseActivationDiskMiB -gt 0
+if ($activationDisk -and !$PSBoundParameters.ContainsKey('DiskMiB')) { $DiskMiB = 0 }
+if (($activationDisk -or $PSBoundParameters.ContainsKey('DiskPath') -or ($PSBoundParameters.ContainsKey('DiskMiB') -and $DiskMiB -gt 0)) -and
     [string]::IsNullOrWhiteSpace($DiskPath)) {
     throw 'SSD storage requires a nonempty -DiskPath'
 }
-if ($DiskPath -and $DiskMiB -eq 0) { throw 'Omit -DiskPath when -DiskMiB is 0 (SSD disabled)' }
+if ($DiskPath -and $DiskMiB -eq 0 -and !$activationDisk) { throw 'Omit -DiskPath when both canonical and activation SSD are disabled' }
 if (@('KvType', 'KvTypeK', 'KvTypeV') | Where-Object { $PSBoundParameters.ContainsKey($_) }) {
     if (@($WorkerArgs | Where-Object { $_ -match '^(--kv-dtype|--cache-type-[kv]|-ct[kv])(=|$)' }).Count) {
         throw 'Use -KvType/-KvTypeK/-KvTypeV without conflicting KV options in WorkerArgs'
@@ -229,7 +241,7 @@ if ($Backend -eq 'ninfer' -and $ThinkingMode -eq 'off' -and
     ($ReasoningEffort -or @($WorkerArgs | Where-Object { $_ -match '^--default-reasoning-effort(=|$)' }).Count)) {
     throw 'ReasoningEffort conflicts with ThinkingMode off'
 }
-if (@($WorkerArgs | Where-Object { $_ -match '^--(no-)?kvmem($|-(budget|gen-reserve|host-mib|sessions|sink-tokens|recent-tokens|lrfu|lrfu-lambda|lrfu-top-frac|score-agg|query-scorer|graph-alpha)(=|$))' }).Count) {
+if (@($WorkerArgs | Where-Object { $_ -match '^--(no-)?kvmem($|-(budget|gen-reserve|host-mib|sessions|sink-tokens|recent-tokens|lrfu|lrfu-lambda|lrfu-top-frac|score-agg|query-scorer|graph-alpha|recall-strategy|layerwise-[a-z-]+)(=|$))' }).Count) {
     throw 'KVMem common options are owned by the launcher; use its named parameters instead of WorkerArgs'
 }
 if (!$Worker) {
@@ -281,7 +293,7 @@ if ($Backend -eq 'ninfer') {
         throw 'KvTypeK and KvTypeV configure llama.cpp only; use KvType for ninfer'
     }
     $requestedNgramDrafts = $NgramDrafts
-    if ($Concurrency -gt 1 -and $NgramDrafts -gt 15) { $NgramDrafts = 15 }
+    if ($RecallStrategy -ne 'layerwise' -and $Concurrency -gt 1 -and $NgramDrafts -gt 15) { $NgramDrafts = 15 }
     if ($KvType -notin @('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8')) {
         throw 'ninfer KvType must be bf16/int8/fp8/nvfp4/k8v4/rk8v4/rk4v4/rk4v4-e8/rk2v4-e8'
     }
@@ -292,13 +304,15 @@ if ($Backend -eq 'ninfer') {
         throw 'Fast prefill requires INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8'
     }
     if ($VisionResidency -ne 'resident' -and !$Vision) { throw 'CPU Vision requires -Vision' }
-    if ($RecentTokens -lt 64) { throw 'ninfer -RecentTokens must be at least 64 to keep the newest append page' }
-    $sinkBlocks = if ($SinkTokens -lt 64) { 1 } else { [int][Math]::Floor($SinkTokens / 64) }
-    $recentBlocks = [int][Math]::Floor($RecentTokens / 64)
-    if (($sinkBlocks + $recentBlocks) * 64 -gt $Budget) {
-        throw 'ninfer sink and recent tokens exceed -Budget after rounding down to 64-token pages'
+    if ($RecallStrategy -ne 'layerwise') {
+        if ($RecentTokens -lt 64) { throw 'ninfer -RecentTokens must be at least 64 to keep the newest append page' }
+        $sinkBlocks = if ($SinkTokens -lt 64) { 1 } else { [int][Math]::Floor($SinkTokens / 64) }
+        $recentBlocks = [int][Math]::Floor($RecentTokens / 64)
+        if (($sinkBlocks + $recentBlocks) * 64 -gt $Budget) {
+            throw 'ninfer sink and recent tokens exceed -Budget after rounding down to 64-token pages'
+        }
     }
-    if ($NgramDrafts -and (!$MtpDrafts -or
+    if ($RecallStrategy -ne 'layerwise' -and $NgramDrafts -and (!$MtpDrafts -or
         ([Math]::Max($MtpDrafts, $NgramDrafts) + $MtpDrafts) -gt $Reserve)) {
         throw 'ngram requires MTP and reserve >= max(MTP drafts, effective ngram drafts) + MTP drafts'
     }
@@ -400,7 +414,15 @@ if ($Backend -eq 'llamacpp') { $nativeArgs += @('--kvmem-block-tokens', "$resolv
 if ($Backend -eq 'llamacpp') { $nativeArgs += $nativeArgsSpec }
 if ($DiskPath) { $nativeArgs += @('--kvmem-disk-path', $DiskPath, '--kvmem-disk-mib', "$DiskMiB") }
 $nativeArgs += @(Get-KVMemQueryScoringArgs $PSBoundParameters)
+$nativeArgs = @(Remove-KVMemImplicitRecallBands $nativeArgs $PSBoundParameters)
+if($RecallStrategy -eq 'layerwise' -and @($WorkerArgs | Where-Object {$_ -match '^--(kvmem-mtp-state|spec[^=]*|draft[^=]*|mtp[^=]*|adaptive-mtp|ngram[^=]*)(=|$)'}).Count) {throw 'Use named layerwise speculative settings; WorkerArgs cannot override the qualified draft owner'}
 $nativeArgs += $WorkerArgs
+$effective=@{};foreach($entry in $PSBoundParameters.GetEnumerator()) {if($entry.Key -ne 'ApiKey'){$effective[$entry.Key]=$entry.Value}}
+foreach($name in @('Backend','Model','Worker','Gpu','Concurrency','KvType','Budget','Reserve','HostMiB','RetainedSessions','MaxTokens','Context','Prefill','Vision','VisionResidency','NgramDrafts','TensorParallel')) {$effective[$name]=Get-Variable -Name $name -ValueOnly}
+$effective.BlockTokens=$resolvedBlock;$effective.SpeculativeMode=$SpeculativeMode;$effective.DraftTokens=$MtpDrafts
+$effective.DraftPolicy=if($AdaptiveMtp){'adaptive'}else{'fixed'}
+$effective.Vision=[bool]$Vision;$effective.TensorParallel=[bool]$TensorParallel;$effective.AdaptiveMtp=[bool]$AdaptiveMtp
+if ($DiskPath) { $effective.DiskPath=$DiskPath; $effective.DiskMiB=$DiskMiB }
 $launchEnvironment = @{ CUDA_VISIBLE_DEVICES = $Gpu; CUDA_DEVICE_ORDER = 'PCI_BUS_ID' }
 if ($Backend -eq 'ninfer') {
     $launchEnvironment['KVMEM_CHECKPOINT_EXTRA_RECOMPUTE_TOKENS'] = "$CheckpointExtraRecomputeTokens"
@@ -413,11 +435,13 @@ if ($DryRun) {
         } elseif ($displayArgs[$i] -match '^--api-key=') { $displayArgs[$i] = '--api-key=<redacted>' }
     }
     @{ backend = $Backend; argv = @($Worker) + $displayArgs; capabilities = $capabilities
+       effective_parameters = $effective
        token_settings = $tokenPlan
        environment = $launchEnvironment } |
         ConvertTo-Json -Depth 6
     return
 }
+Invoke-KVMemRecallWorkerCheck $Worker $effective $root
 if ($Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0) {
     $probeInfo = New-KVMemProcessInfo $Worker @('--kvmem-capabilities')
     $probeInfo.RedirectStandardOutput = $true

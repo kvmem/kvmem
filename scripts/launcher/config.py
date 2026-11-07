@@ -4,6 +4,7 @@ import json
 import math
 import re
 from pathlib import Path
+from .recall import LAYERWISE_RESOURCES, validate_recall
 
 ROOT = Path(__file__).resolve().parents[2]
 SPECULATIVE_PROFILES = json.loads((ROOT / 'scripts/speculative-capabilities.json').read_text(encoding='utf-8-sig'))
@@ -123,6 +124,9 @@ INTEGERS = {'CpuThreads', 'VisionCacheMiB', 'BlockTokens', 'VramReserveMiB', 'Co
             'QueryMaxTokens', 'QueryReplayMaxTokens', 'ReplayMaxTokens', 'CheckpointExtraRecomputeTokens'}
 BOOLEANS = {'AdaptiveMtp', 'FastPrefill', 'Vision', 'NoLrfu', 'Lrfu', 'PreserveThinking', 'TensorParallel'}
 DECIMALS = {'LrfuLambda', 'LrfuTopFraction', 'GraphAlpha'}
+STRINGS.update(('RecallStrategy', 'LayerwiseMtpHistory'))
+INTEGERS.add("LayerwiseCheckpointTarget")
+INTEGERS.update(LAYERWISE_RESOURCES)
 # Deliberately limited native escape hatch. Common options must not be duplicated.
 NATIVE = {'llamacpp': {'--threads', '--threads-batch', '--n-gpu-layers'},
           'radiance': {'--http-threads'}, 'ninfer': {'--threads'}, 'polystrata': {'--threads', '--elastic-headroom-mib', '--elastic-physical-reserve-mib'}}
@@ -227,7 +231,10 @@ def normalize(data, backends):
         profile = SPECULATIVE_PROFILES[p['Backend']].get(mode)
         if profile is None:
             raise ValueError('Unsupported SpeculativeMode')
-        count = p.get('DraftTokens', p.get('MtpDrafts', 5 if mode == 'dflash2' else (3 if p['Backend']=='radiance' else 4) if mode == 'mtp' else 0))
+        count = p.get('DraftTokens', p.get('MtpDrafts', 2 if mode == 'guess' else 5 if mode == 'dflash2' else (3 if p['Backend']=='radiance' else 4) if mode == 'mtp' else 0))
+        if (p.get('RecallStrategy') == 'layerwise' and mode != 'none'
+                and 'DraftTokens' not in p and 'MtpDrafts' not in p):
+            raise ValueError('Layerwise speculative decoding requires an explicit draft width')
         policy = p.get('DraftPolicy', 'adaptive' if p.get('AdaptiveMtp') else 'fixed')
         if policy not in {'fixed', 'adaptive'}:
             raise ValueError('DraftPolicy must be fixed or adaptive')
@@ -235,7 +242,7 @@ def normalize(data, backends):
             raise ValueError('DraftTokens conflicts with MtpDrafts')
         if 'DraftPolicy' in p and 'AdaptiveMtp' in p and (policy == 'adaptive') != p['AdaptiveMtp']:
             raise ValueError('DraftPolicy conflicts with AdaptiveMtp')
-        if p['Backend'] == 'polystrata' and mode == 'mtp':
+        if p['Backend'] == 'polystrata' and mode in ('mtp', 'guess'):
             policy = 'adaptive'
             p['DraftPolicy'] = policy
             p.pop('AdaptiveMtp', None)
@@ -257,7 +264,7 @@ def normalize(data, backends):
             if profile['draft_asset'] == 'embedded' and draft:
                 raise ValueError('NInfer uses an embedded draft component')
             if profile['draft_asset'] == 'required_gguf' and not draft:
-                raise ValueError('DFlash2 requires DraftModel with a compatible GGUF')
+                raise ValueError(f'{mode} requires DraftModel with a compatible GGUF')
             if draft and (Path(draft).suffix.lower() != '.gguf' or not Path(draft).is_file()):
                 raise ValueError('DraftModel must be an existing GGUF file')
     if p['Backend']=='polystrata':
@@ -310,4 +317,5 @@ def normalize(data, backends):
         if flag == '--elastic-physical-reserve-mib' and not 256 <= int(args[index]) <= 4096:
             raise ValueError('Elastic physical reserve must be 256..4096 MiB')
         index += 1
+    validate_recall(p)
     return {'schema_version': 1, 'parameters': p}
