@@ -1,7 +1,6 @@
 # llama.cpp immutable snapshot adaptation: implementation audit
 
-Status: integrated against public PR271; final validation and controlled performance
-report are in progress. The first sections preserve the original baseline audit.
+Status: integrated against merged public PR271. See the [final controlled measurements and qualification](benchmarks/llamacpp-shared-snapshots-20261107.md). The first sections preserve the original baseline audit.
 
 Baseline KVMem: f0a3d51f889d0100ae97bc43a46a398937ffb4b5.
 Pinned llama.cpp: cd959bae99ff4bed22bef2604f45241c09bbb8c8.
@@ -367,8 +366,7 @@ sharing, private tails, immutable-byte checks after native ID reuse and repeated
 old-parent restore. HTTP attention and native-state SSD runs passed the ordinary
 document/Query/tools/branch/edit workload. The MTP real-disconnect regression
 passed after the source-cell repair. The five merged public dependency tests
-also pass on the remote host. Final qualification after the discard/metadata
-admission changes is still pending; these statements are not a final test matrix.
+also pass on the remote host. The linked final report supersedes these intermediate results.
 
 There is a measured cost to the current public state-image transport: it copies
 native capture vectors into a framed record and verifies/copies that image into
@@ -379,5 +377,13 @@ endpoint. Capture/allocation/image-write/image-read/attention-restore phase
 timings are exposed; image read/write include copy, framing and checksum together.
 A direct-producer/leased-view API proposal was sent to the public coordinator,
 who deferred any extension pending controlled measurements. No public code was
-duplicated or changed to bypass that decision. Final ABBA results and limitations
-remain to be added before PR readiness.
+duplicated or changed to bypass that decision. The final ABBA measurements and limits are in the linked report.
+
+The final budget run exposed a separate catalog defect: once handover finished,
+the branch could reclaim its parked parent to fund staging. Output still matched
+but parent restore recomputed 520 rows. Handover now exchanges its exclusive
+source reservation for a counted read pin until request finish. Siblings can
+fork concurrently; selection, capacity reclaim and publication respect every
+outstanding pin. On the same fixture the restored parent recomputed zero rows.
+Native restore staging charges the reader's execution Q, and directory reclaim
+includes the actual charged native records. No other backend policy changed.
