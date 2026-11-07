@@ -1,0 +1,53 @@
+diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
+--- a/src/poly/kvmem.cpp
++++ b/src/poly/kvmem.cpp
+@@ -17,6 +17,7 @@
+ namespace strata::poly {
+ namespace {
+ std::atomic<uint64_t> next_session{1};
++std::atomic<uint64_t> archive_dma{0},view_download_dma{0},view_upload_dma{0},state_images{0};
+ void require(bool ok, const char* message) {
+     if (!ok) throw kvmem::MemoryError(kvmem::MemoryErrorCode::InvalidPlan, message);
+ }
+@@ -364,6 +365,7 @@
+         dst+=bytes;
+     }
+     ck(cudaStreamSynchronize(cs(engine_.st_)), "KVMem spill");
++    view_download_dma.fetch_add(visible_*descriptor_.layout.record_bytes/block_tokens,std::memory_order_relaxed);
+ }
+ void KvmemMemory::restore_view(const uint8_t* src, uint64_t rows) {
+     for (size_t p=0;p<payload_.size();++p) {
+@@ -372,6 +374,7 @@
+         src+=bytes;
+     }
+     ck(cudaStreamSynchronize(cs(engine_.st_)), "KVMem restore");
++    view_upload_dma.fetch_add(rows*descriptor_.layout.record_bytes/block_tokens,std::memory_order_relaxed);
+     restored_bytes_ += rows * descriptor_.layout.record_bytes / block_tokens;
+ }
+ void KvmemMemory::copy_to_record(uint32_t id, kvmem::HostKvRecord& record, const uint8_t* src, uint64_t rows, uint64_t first) {
+@@ -438,6 +441,7 @@
+                 const uint64_t begin=std::max(first,range->first),end=std::min(first+rows,range->first+range->second);
+                 ck(cudaMemcpyAsync(dst+(begin-first)*row,payload_[p]+begin*row,(end-begin)*row,
+                     cudaMemcpyDeviceToHost,cs(engine_.st_)),"KVMem dirty archive");
++                archive_dma.fetch_add((end-begin)*row,std::memory_order_relaxed);
+             }
+             dst+=size_t(rows)*row;
+         }
+@@ -692,6 +696,7 @@
+         engine_.save_state(reference.data());
+         require(reference == cp.state, "KVMem contiguous checkpoint differs from native layer checkpoints");
+     }
++    state_images.fetch_add(cp.state.size(),std::memory_order_relaxed);
+     cp.mean_tail = statistics_->mean_checkpoint(uint32_t(stamp_.frontier));
+     cp.retrieval = selector_->retrieval_checkpoint();
+     cp.transfers = transfers_;
+@@ -932,6 +937,9 @@
+ void KvmemMemory::storage_metrics() const {
+     if (!std::getenv("KVMEM_POLY_STORAGE_METRICS")) return;
+     const auto io=io_stats();
++    std::fprintf(stderr,"KVMEM_NATIVE_IO scope=process archive_d2h_bytes=%llu view_d2h_bytes=%llu view_h2d_bytes=%llu state_image_bytes=%llu\n",
++        (unsigned long long)archive_dma.load(),(unsigned long long)view_download_dma.load(),
++        (unsigned long long)view_upload_dma.load(),(unsigned long long)state_images.load());
+     std::fprintf(stderr,"KVMEM_STORAGE host_bytes=%llu host_limit=%llu disk_bytes=%llu disk_limit=%llu read_bytes=%llu written_bytes=%llu errors=%llu\n",
+         (unsigned long long)host_bytes(),(unsigned long long)host_limit(),(unsigned long long)disk_bytes(),
+         (unsigned long long)disk_limit(),(unsigned long long)io.read_bytes,(unsigned long long)io.written_bytes,(unsigned long long)io.errors);
