@@ -403,9 +403,45 @@ static void selected_demotion(const std::filesystem::path & directory) {
     CHECK(storage.charged_bytes()==0 && disk->charged_bytes()==0);
 }
 
+static void full_overwrite(const std::filesystem::path & directory) {
+    constexpr std::array<uint8_t, 4> original{{1, 2, 3, 4}}, updated{{9, 8, 7, 6}};
+    auto spill = std::make_shared<SpillFile>(directory, original.size());
+    HostKvStorage storage(original.size(), spill);
+    auto parent = storage.allocate(original.size(), original.data());
+    parent.seal();
+    auto child = parent.fork();
+    CHECK(storage.demote(parent));
+    auto reader = parent.lease();
+    auto blocker = storage.allocate(original.size());
+    rejects(MemoryErrorCode::BudgetExceeded, [&] { child.write(0, updated.data(), updated.size()); });
+    CHECK(parent.storage_identity() == child.storage_identity());
+    blocker.reset();
+    const auto reads = spill->stats().read_bytes;
+    child.write(0, updated.data(), updated.size());
+    CHECK(spill->stats().read_bytes == reads);
+    CHECK(parent.storage_identity() != child.storage_identity());
+    std::array<uint8_t, 4> got{};
+    child.read(0, got.data(), got.size());
+    CHECK(got == updated);
+    reader.read(0, got.data(), got.size());
+    CHECK(got == original);
+    child.reset();
+    auto partial = parent.fork();
+    partial.write(1, updated.data(), 1);
+    partial.read(0, got.data(), got.size());
+    CHECK((got == std::array<uint8_t, 4>{{1, 9, 3, 4}}));
+    parent.read(0, got.data(), got.size());
+    CHECK(got == original);
+    partial.reset();
+    reader = {};
+    parent.reset();
+    CHECK(storage.charged_bytes() == 0 && spill->charged_bytes() == 0);
+}
+
 int main() {
     const auto directory = std::filesystem::temp_directory_path() /
         ("kvmem-tiered-test-" + std::to_string(std::random_device{}()));
+    full_overwrite(directory);
     selected_demotion(directory);
     pressure(directory); limits(directory); queued_read(directory);
     shared_owners(directory); write_failure(directory);
