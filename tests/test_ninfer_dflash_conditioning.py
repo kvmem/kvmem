@@ -14,6 +14,7 @@ def main():
     parser.add_argument('--build', type=Path, required=True)
     args = parser.parse_args()
     source, build = args.source.resolve(), args.build.resolve()
+    shared_include = Path(__file__).resolve().parents[1] / 'kvmem/include'
     compiler = shutil.which('cl' if os.name == 'nt' else 'c++')
     if not compiler:
         parser.error('a C++ compiler environment is required')
@@ -39,7 +40,7 @@ def main():
         'target_link_libraries(ninfer_dflash_conditioning_host PRIVATE Threads::Threads)\n'
         'target_compile_features(ninfer_dflash_conditioning_host PRIVATE cxx_std_20)\n'
         'target_include_directories(ninfer_dflash_conditioning_host PRIVATE "' +
-        (source / 'include').as_posix() + '" "' + (source / 'src').as_posix() + '")\n',
+        (source / 'include').as_posix() + '" "' + (source / 'src').as_posix() + '" "' + shared_include.as_posix() + '")\n',
         encoding='utf-8')
     subprocess.run(['cmake', '-S', str(project), '-B', str(build), '-G', 'Ninja',
                     '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_MAKE_PROGRAM=' + ninja,
@@ -48,7 +49,7 @@ def main():
         # Some localized CMake installations misdecode cl's /showIncludes prefix. Derive the
         # actual bytes before building; correct the rule, never fabricate dependency records.
         command = [compiler, '/nologo', '/std:c++20', '/EHsc', '/Zs', '/showIncludes',
-                   '/I' + str(source / 'include'), '/I' + str(source / 'src'), str(test)]
+                   '/I' + str(source / 'include'), '/I' + str(source / 'src'), '/I' + str(shared_include), str(test)]
         probe = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
         line = next(line for line in probe.stdout.splitlines() if b'dflash_conditioning.h' in line)
         path = re.search(rb'[A-Za-z]:[/\\]', line)

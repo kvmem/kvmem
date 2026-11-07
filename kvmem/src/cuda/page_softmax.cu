@@ -308,15 +308,25 @@ std::vector<double> PageSoftmaxCuda::score_current_layer(const RawKvStore& keys,
     auto& w=*impl_; DeviceBinding binding(w.device);
     auto stream=static_cast<cudaStream_t>(producer_stream);
     int stream_device=-1;
+#if defined(__HIP_PLATFORM_AMD__)
+    checked(hipStreamGetDevice(stream,&stream_device));
+#else
     checked(cudaStreamGetDevice(stream,&stream_device));
+#endif
     if (stream_device!=w.device) throw std::invalid_argument("native Query stream belongs to a different device");
     cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
     checked(cudaStreamIsCapturing(stream,&capture));
     if (capture!=cudaStreamCaptureStatusNone)
         throw std::invalid_argument("native Query selection requires an eager CUDA boundary");
+#if defined(__HIP_PLATFORM_AMD__)
+    hipPointerAttribute_t attributes{};
+    checked(hipPointerGetAttributes(&attributes,q.data));
+    if (attributes.type!=hipMemoryTypeDevice || attributes.device!=w.device)
+#else
     cudaPointerAttributes attributes{};
     checked(cudaPointerGetAttributes(&attributes,q.data));
     if (attributes.type!=cudaMemoryTypeDevice || attributes.device!=w.device)
+#endif
         throw std::invalid_argument("native Query is not stored on its scoring CUDA device");
     // The same owner may use the legacy scorer between requests. Its private
     // stream must relinquish the workspace before the native stream borrows it.
