@@ -14124,7 +14124,7 @@ index 09f0a99918900c9b0fea1bd98e5a5560645fa885..3594cb3a5b31535f5e4c5f795c779c77
      // As on Chat Completions, an omitted, null or empty model names the default model.
      if (present(body, "model")) {
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 9d89cd83ca874168d95e8d4f155709230358ea32..bcdac42bb784ce1135da3b98e8db9e1e131898c2 100644
+index 9d89cd83ca874168d95e8d4f155709230358ea32..cc40156223ed73b27e2171dd42c6157a3d686d1f 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -116,6 +116,29 @@ ninfer_stage_runtime_dlls(ninfer_memory_statistics_layout)
@@ -14132,7 +14132,7 @@ index 9d89cd83ca874168d95e8d4f155709230358ea32..bcdac42bb784ce1135da3b98e8db9e1e
    SOURCES models/qwen3_5/test_memory_statistics_budget.cpp LIBRARIES ninfer_core kvmem)
  ninfer_stage_runtime_dlls(ninfer_memory_statistics_budget_test)
 +ninfer_add_test(ninfer_layerwise_multiowner_test STANDALONE
-+  SOURCES models/qwen3_5/test_layerwise_multiowner.cpp LIBRARIES kvmem)
++  SOURCES models/qwen3_5/test_layerwise_multiowner.cpp LIBRARIES kvmem ninfer::json)
 +ninfer_stage_runtime_dlls(ninfer_layerwise_multiowner_test)
 +ninfer_add_test(ninfer_layerwise_checkpoint_payload_test STANDALONE
 +  SOURCES models/qwen3_5/test_layerwise_checkpoint_payload.cpp LIBRARIES kvmem)
@@ -14159,10 +14159,10 @@ index 9d89cd83ca874168d95e8d4f155709230358ea32..bcdac42bb784ce1135da3b98e8db9e1e
  # there once so they resolve their imports (the Windows loader only searches the executable's own
 diff --git a/tests/experimental/layerwise_graph_feedback_plan.cpp b/tests/experimental/layerwise_graph_feedback_plan.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c3d826484c691cdf30460ed284108ca1d76012bf
+index 0000000000000000000000000000000000000000..8b5c315113a8ef8ee785f9d8cc66738851239a89
 --- /dev/null
 +++ b/tests/experimental/layerwise_graph_feedback_plan.cpp
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,147 @@
 +#include "ninfer/kv_cache_storage.h"
 +#include "ninfer/ops/softmax_attention.h"
 +#include "models/qwen3_5/execution/layerwise_graph_capture.h"
@@ -14176,15 +14176,16 @@ index 0000000000000000000000000000000000000000..c3d826484c691cdf30460ed284108ca1
 +#include <iostream>
 +#include <limits>
 +#include <stdexcept>
++#include <source_location>
 +#include <vector>
 +
 +using namespace ninfer;
 +using namespace ninfer::models::qwen3_5;
 +using namespace ninfer::models::qwen3_5::detail;
-+void require(bool value) {if (!value) throw std::runtime_error("graph feedback Host contract failed");}
++void require(bool value,std::source_location at=std::source_location::current()) {if (!value) throw std::runtime_error("graph feedback Host contract failed at line "+std::to_string(at.line()));}
 +template<class F> void rejects(F&& f) {bool threw=false;try {f();} catch(const std::exception&) {threw=true;} require(threw);}
 +
-+int main() {
++int main() try {
 +    // Native layout recipe, with exact payload sizes independently counted.
 +    MemoryStatisticsPlanning plan{.capacity=4096,.window_tokens=384,.prefill_chunk=128,
 +        .verify_window=63,.max_concurrency=1,.layerwise_graph_capture=true};
@@ -14260,7 +14261,7 @@ index 0000000000000000000000000000000000000000..c3d826484c691cdf30460ed284108ca1
 +    view.max_batch_size=UINT32_MAX;rejects([&]{view.validate();});view.max_batch_size=1;
 +    // Dual-capacity and unequal-head routes cover every Main frontier, without
 +    // pretending that Own is bounded by Main C at a final AR step.
-+    const std::array<ops::AttentionHeadGeometry,2> heads{{{256,2,1},{256,4,2}}};
++    const std::array<ops::AttentionHeadGeometry,2> heads{{{256,4,1},{256,8,2}}};
 +    for (auto storage:{KvCacheStorage::BFloat16,KvCacheStorage::Int8Group64}) for (std::uint32_t batch=1;batch<=8;++batch) {
 +        const auto ordinary=layerwise_ordinary_graph_profiles(384,batch,heads,storage);
 +        require(!ordinary.empty() && ordinary.front().min==0 && ordinary.back().max==383);
@@ -14280,7 +14281,7 @@ index 0000000000000000000000000000000000000000..c3d826484c691cdf30460ed284108ca1
 +            for (std::size_t j=0;j<i;++j) if (ordinary[j].topology_class==ordinary[i].topology_class)
 +                require(ordinary_signature(ordinary[j].max)==expected);
 +        }
-+        const auto profiles=layerwise_mtp_graph_profiles({384,448},63,15,heads,{256,6,3},storage,batch);
++        const auto profiles=layerwise_mtp_graph_profiles({384,448},63,15,heads,{256,12,3},storage,batch);
 +        require(!profiles.empty() && profiles.front().min==0 && profiles.back().max==383);
 +        const auto signature=[&](std::uint32_t frontier) {
 +            std::vector<int> result;
@@ -14290,8 +14291,8 @@ index 0000000000000000000000000000000000000000..c3d826484c691cdf30460ed284108ca1
 +                result.push_back(ops::causal_softmax_attention_small_t_launches(a,storage,e,static_cast<std::int32_t>(batch),width));
 +            };
 +            for (const auto a:heads) call(a,64,std::min(384U,frontier+64));
-+            call({256,6,3},64,std::min(448U,frontier+64));
-+            for (std::uint32_t step=0;step<14;++step) call({256,6,3},1,std::min(448U,frontier+65+step));
++            call({256,12,3},64,std::min(448U,frontier+64));
++            for (std::uint32_t step=0;step<14;++step) call({256,12,3},1,std::min(448U,frontier+65+step));
 +            return result;
 +        };
 +        for (std::size_t i=0;i<profiles.size();++i) {
@@ -14303,8 +14304,11 @@ index 0000000000000000000000000000000000000000..c3d826484c691cdf30460ed284108ca1
 +                require(signature(profiles[j].max)==expected);
 +        }
 +    }
-+    rejects([&]{layerwise_mtp_graph_profiles({384,320},3,3,heads,{256,6,3},KvCacheStorage::BFloat16);});
++    rejects([&]{layerwise_mtp_graph_profiles({384,320},3,3,heads,{256,12,3},KvCacheStorage::BFloat16);});
 +    std::cout<<"layerwise graph descriptor/layout/frame plan passed (Host only; no graph execution)\n";
++    return 0;
++} catch (const std::exception& error) {
++    std::cerr<<error.what()<<'\n';return 1;
 +}
 diff --git a/tests/experimental/layerwise_multimodal_plan.cpp b/tests/experimental/layerwise_multimodal_plan.cpp
 new file mode 100644
@@ -14644,10 +14648,10 @@ index 0000000000000000000000000000000000000000..c4bc60df848f40354285b441d285946a
 +} // namespace ninfer::test::layerwise_fixture
 diff --git a/tests/models/qwen3_5/test_layerwise_attention.cpp b/tests/models/qwen3_5/test_layerwise_attention.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..d154641b1312d2c8dca1fac2ae9d2c8054e2dfb2
+index 0000000000000000000000000000000000000000..9c40a4393a6df25e214ad77536239949be4c3abf
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_layerwise_attention.cpp
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,512 @@
 +#include "artifact/binder.h"
 +#include "artifact/fixture.h"
 +#include "artifact/formats.h"
@@ -14687,7 +14691,14 @@ index 0000000000000000000000000000000000000000..d154641b1312d2c8dca1fac2ae9d2c80
 +}
 +double bf16(double value) { return bf16_to_f32(f32_to_bf16(float(value))); }
 +double input(int token, int dim) { return double((token * 7 + dim * 3) % 17 - 8) / 16; }
-+std::vector<double> fetch(const Tensor& t) { return ninfer::test::from_device_bf16(t.data, size_t(t.numel())); }
++std::vector<double> fetch(const Tensor& t) {
++    if (t.dtype==DType::FP32) {
++        const auto f=ninfer::test::from_device<float>(t.data,size_t(t.numel()));
++        return {f.begin(),f.end()};
++    }
++    check(t.dtype==DType::BF16,"oracle expected BF16 or FP32 native output");
++    return ninfer::test::from_device_bf16(t.data,size_t(t.numel()));
++}
 +void check_near(const char* label, const std::vector<double>& got, const std::vector<double>& expected,
 +           int ulps = 3, double absolute = 1e-5) {
 +    check(got.size() == expected.size(), "oracle extent mismatch");
@@ -15062,8 +15073,8 @@ index 0000000000000000000000000000000000000000..d154641b1312d2c8dca1fac2ae9d2c80
 +    context.query_final_norm(staged.storage.residual,hidden);
 +    device.synchronize();
 +    check_near("layer-major native post-mixer/final hidden",fetch(hidden),normalized(oracle.output,H),5);
-+    auto logits_buffer=ninfer::test::to_device_bf16(std::vector<float>(272*T));
-+    Tensor staged_logits(logits_buffer.p,DType::BF16,{272,T});
++    auto logits_buffer=ninfer::test::to_device_f32(std::vector<float>(272*T));
++    Tensor staged_logits(logits_buffer.p,DType::FP32,{272,T});
 +    context.query_head(hidden,staged_logits);
 +    device.synchronize();
 +    check_near("layer-major native head",fetch(staged_logits),std::vector<double>(272*T),0);
@@ -15239,7 +15250,7 @@ index 0000000000000000000000000000000000000000..75e3504b244ad04c2d6b65f4e60be27c
 +}
 diff --git a/tests/models/qwen3_5/test_layerwise_dflash_checkpoint.cpp b/tests/models/qwen3_5/test_layerwise_dflash_checkpoint.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..da3e85520eaf3af98b8e57a877b89ee015fa4f95
+index 0000000000000000000000000000000000000000..2b9cf93748d7a71ddd3b4166935a583210dd315f
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_layerwise_dflash_checkpoint.cpp
 @@ -0,0 +1,275 @@
@@ -15290,7 +15301,7 @@ index 0000000000000000000000000000000000000000..da3e85520eaf3af98b8e57a877b89ee0
 +        options.context_cache.max_long_anchors_per_continuation=0;
 +        auto planner=make_sequence_planner_impl(parameters,device,options,0);
 +        auto plan=finalize_sequence_plan_impl(std::move(planner),12);
-+        ProgramImpl program(parameters,*plan,device,{},{});auto& sequence=program.continuation_states[0];sequence.lane=0;
++        ProgramImpl program(parameters,*plan,device,{},{},nullptr);auto& sequence=program.continuation_states[0];sequence.lane=0;
 +        const auto state=program.state_store->reserve_reset(program.compute_streams);
 +        const auto address=program.text_kv_addresses->create_active(12,0,program.compute_streams);
 +        check(bool(state)&&bool(address),"DFlash CP fixture could not reserve native state/address");
@@ -16698,10 +16709,10 @@ index 0000000000000000000000000000000000000000..5041852d0b5d031d88d355541d3d81b8
 +}
 diff --git a/tests/models/qwen3_5/test_layerwise_program_query.cpp b/tests/models/qwen3_5/test_layerwise_program_query.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63bc808bbd
+index 0000000000000000000000000000000000000000..42252128b8be4585a31e7bf64632563639408bd4
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_layerwise_program_query.cpp
-@@ -0,0 +1,1409 @@
+@@ -0,0 +1,1452 @@
 +#include "models/qwen3_5/layerwise_attention_fixture.h"
 +#include "models/qwen3_5/load.h"
 +#include "models/qwen3_5/program/program_impl.h"
@@ -16820,13 +16831,15 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +        options.max_concurrency=2;
 +        options.kv_capacity=KvCapacityPolicy::explicit_capacity(512);options.use_cuda_graph=false;
 +        options.kvmem.selected_tokens=192;options.kvmem.reserve_tokens=192;options.kvmem.graph_alpha=0;
++        options.kvmem.recall_strategy=kvmem::RecallStrategy::Layerwise;
++        options.kvmem.layerwise_sink_tokens=64;options.kvmem.layerwise_recent_tokens=64;
 +        options.kvmem.host_bytes=16u<<20;options.kvmem.disk_bytes=16u<<20;options.kvmem.disk_path=artifact.file.directory;
 +        options.context_cache.device_state_slots=1;options.context_cache.host_state_slots=0;
 +        options.context_cache.host_kv_capacity_bytes=0;options.context_cache.max_private_continuations=2;
 +        options.context_cache.max_shared_prefixes=0;options.context_cache.max_long_anchors_per_continuation=0;
 +        auto planner=make_sequence_planner_impl(parameters,device,options,0);
 +        auto plan=finalize_sequence_plan_impl(std::move(planner),8);
-+        ProgramImpl program(parameters,*plan,device,{},{});
++        ProgramImpl program(parameters,*plan,device,{},{},nullptr);
 +        auto& sequence=program.continuation_states[0];sequence.lane=0;
 +        const auto state=program.state_store->reserve_reset(program.compute_streams);
 +        const auto address=program.text_kv_addresses->create_active(6,0,program.compute_streams);
@@ -16844,7 +16857,12 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +        staged.prompt.memory_query=TokenSpan{Prefix,QueryRows};
 +        sequence.ledger=staged.prompt.token_ids;sequence.prefix_identity.assign(staged.prompt);
 +        sequence.prefix_digests.assign(staged.prompt);
-+        program.prepare_memory_statistics(sequence,Prefix,End,End);
++        // Seed canonical data with ordinary native Layerwise prefill.
++        auto question=std::move(staged.prompt);staged.prompt={};
++        staged.prompt.token_ids.assign(question.token_ids.begin(),question.token_ids.begin()+Prefix);
++        staged.prompt.token_types.resize(Prefix);staged.prompt.positions.resize(3*Prefix);
++        for (unsigned axis=0;axis<3;++axis) std::copy_n(question.positions.begin()+axis*End,Prefix,staged.prompt.positions.begin()+axis*Prefix);
++        staged.prompt_tokens=Prefix;program.activate_layerwise_request(sequence,request,0);
 +        const auto slot=program.state_store->physical_slot(*state);
 +        execution::ExecutionCore core{device,parameters,program.work,program.state_images->linear(0),nullptr,
 +            program.io,program.prefill_hidden,program.prefill_chunk,ProposalHead::Full};
@@ -16857,15 +16875,18 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +            // Source setup uses64-token accepted tiles, independently of its
 +            //128-token workspace and the complete Query's192-token reserve.
 +            const auto count=std::min<std::uint32_t>(64,Prefix-begin);
++            auto& seed=*sequence.window.layerwise_request;
++            check(seed.admit_prefill(count)==count,"seed admission split source tile");
++            seed.prepare_prefill(begin,count);
 +            check(program.prepare_window(sequence,begin,begin+count,false,false),"ordinary prefix preparation did not finish");
 +            program.bind_sequence_kv(sequence);context.text_kv=program.text_kv_view(sequence);
 +            context.text_kv_base=begin;context.cache_position_shift=sequence.window.removed_tokens;
 +            program.set_device_i32(program.io.rope_delta,sequence.window.removed_tokens);
-+            const auto result=execution::prefill_text_chunk(context,staged.prompt.token_ids,count,{},false);
++            const auto result=execution::prefill_text_chunk(context,staged.prompt.token_ids,count,{},false,&seed.boundary());
 +            check(result.processed_tokens==count,"ordinary native prefix skipped rows");
 +            program.commit_memory_statistics(sequence,begin,begin+count);
-+            begin+=count;staged.cursor=begin;sequence.text_kv_valid=begin;
-+            program.commit_sequence_kv(sequence,begin,0);
++            begin+=count;staged.cursor=begin;sequence.text_kv_valid=sequence.execution_frontier=begin;
++            program.commit_sequence_kv(sequence,begin,0);seed.accept_prefill(begin-count,begin);
 +            program.copy_tail(sequence,program.prefill_hidden.slice(1,static_cast<std::int32_t>(count)-1,1));
 +        }
 +        sequence.execution_frontier=Prefix;
@@ -16873,10 +16894,16 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +        compare_gdn_conv(program.state_images->linear(0).conv_slot(0,slot),tags.back());
 +        // A deterministic resident-only recency source makes page1 cold before
 +        // the new Query; no cached Query score is manufactured for this setup.
-+        sequence.window.feedback.restore({});
-+        check(program.prepare_window(sequence,Prefix,Prefix,true,false,kvmem::SelectionReason::PrefillPressure),"source Pressure failed");
-+        program.archive_memory_window(sequence);
-+        check(sequence.window.pages==std::vector<std::uint32_t>({0,3,4}),"source fixture failed to make the selected cold page absent");
++        (void)program.layerwise_catalog(sequence);
++        kvmem::LayerwisePressureChoice choice;choice.model_layer=1;choice.candidates=program.layerwise_catalog(sequence).snapshot(1).resident;choice.selected={0,3,4};
++        program.compact_layerwise_pressure(sequence,{choice});
++        sequence.window.layerwise_request->retire();sequence.window.layerwise_request.reset();
++        // This isolated numerical oracle starts with zero previous feedback;
++        // keep the real prefix's native KV, GDN and represented Mean-K.
++        sequence.window.layer_views.feedback.reset();
++        staged.prompt=std::move(question);staged.prompt_tokens=End;
++        sequence.window.query_begin=Prefix;sequence.window.query_end=End;
++        check(sequence.window.layer_views.layer(1).pages==std::vector<std::uint32_t>({0,3,4}),"source fixture failed to make the selected cold page absent");
 +        std::shared_ptr<KvmemPrefixCheckpoint> checkpoint=program.capture_memory_checkpoint(sequence);
 +        std::vector<float> mean(fixture::K*fixture::D);sequence.window.statistics->mean_k(1,0,mean.data());
 +        const auto expected_key=operand(tags[1],true);
@@ -16892,6 +16919,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +        resources.envelope.query=kvmem::QueryRange{Prefix,End};resources.envelope.reserve_query_output=true;
 +        resources.activation={8u<<20,32u<<10,1u<<20,artifact.file.directory};
 +        resources.frozen_index_host_bytes=1u<<20;resources.transfer_staging_host_bytes=4u<<20;
++        resources.source_versions_host_bytes=program.layerwise_source_account->limit();
 +        resources.selected_tokens=192;resources.sink_blocks=resources.recent_blocks=1;
 +        for (bool wrong_endpoint:{false,true}) {
 +            auto refused=resources;
@@ -16904,7 +16932,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +                program.text_kv_addresses->committed_frontier(*address)==192,
 +                "unproved full request/output envelope mutated the accepted native source");
 +        }
-+        NativeLayerwiseRequestOptions request_options;request_options.prefill={64,192,192};
++        NativeLayerwiseRequestOptions request_options;request_options.prefill={64,192,192};request_options.feedback_host_bytes=program.layerwise_feedback_account->limit();
 +        request_options.output.scope=kvmem::LayerwiseOutputScope::NonThinking;
 +        request_options.sink_blocks=request_options.recent_blocks=1;request_options.query=resources;
 +        program.begin_layerwise_request(sequence,request,44,resources.envelope,request_options);
@@ -17061,7 +17089,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +        options.context_cache.device_state_slots=1;options.context_cache.host_state_slots=0;options.context_cache.host_kv_capacity_bytes=0;
 +        options.context_cache.max_private_continuations=2;options.context_cache.max_shared_prefixes=0;options.context_cache.max_long_anchors_per_continuation=0;
 +        auto planner=make_sequence_planner_impl(parameters,device,options,0);auto plan=finalize_sequence_plan_impl(std::move(planner),capacity/64);
-+        ProgramImpl program(parameters,*plan,device,{},{});auto& sequence=program.continuation_states[0];sequence.lane=0;
++        ProgramImpl program(parameters,*plan,device,{},{},nullptr);auto& sequence=program.continuation_states[0];sequence.lane=0;
 +        auto frontend=qwen::make_frontend(model->resources(),{.vision_enabled=false,.max_context=512});
 +        const auto message=[](ChatRole role,std::string text) {
 +            ChatMessage value;value.role=role;value.parts.push_back({.text=std::move(text)});return value;
@@ -17094,23 +17122,33 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +        staged.prompt_tokens=end;staged.prompt=PreparedPromptAccess::take(std::move(prepared));sequence.ledger=staged.prompt.token_ids;
 +        sequence.prefix_identity.assign(staged.prompt);sequence.prefix_digests.assign(staged.prompt);
 +        staged.prompt.memory_query=TokenSpan{0,end};bool refused=false;
-+        try {(void)program.layerwise_envelope(staged.prompt,0);} catch (const std::length_error&) {refused=true;}
++        try {(void)program.layerwise_envelope(staged.prompt,0);} catch (const RequestError& error) {refused=error.kind()==RequestErrorKind::ContextLengthExceeded;}
 +        check(refused && sequence.text_kv_valid==0,"explicit oversized public Query was truncated or changed native history");
 +        staged.prompt.memory_query_inferred=true;staged.prompt.memory_query_has_history=false;
 +        check(!program.layerwise_envelope(staged.prompt,0).query,"first document inference was treated as explicit oversized Query");
 +        staged.prompt.memory_query=TokenSpan{prefix,query_rows};staged.prompt.memory_query_has_history=true;
-+        program.prepare_memory_statistics(sequence,prefix,end,end);const auto slot=program.state_store->physical_slot(*state);
++        // The seeded prefix is an ordinary (no-Query) layerwise forward. Its
++        // accepted statistics must never enter the legacy three-layer reader.
++        auto question_prompt=std::move(staged.prompt);staged.prompt={};
++        staged.prompt.token_ids.assign(question_prompt.token_ids.begin(),question_prompt.token_ids.begin()+prefix);
++        staged.prompt.token_types.resize(prefix);staged.prompt.positions.resize(3*prefix);
++        for (unsigned axis=0;axis<3;++axis) std::copy_n(question_prompt.positions.begin()+axis*end,prefix,staged.prompt.positions.begin()+axis*prefix);
++        staged.prompt_tokens=prefix;program.activate_layerwise_request(sequence,request,0);
++        const auto slot=program.state_store->physical_slot(*state);
 +        execution::ExecutionCore core{device,parameters,program.work,program.state_images->linear(0),nullptr,program.io,program.prefill_hidden,program.prefill_chunk,ProposalHead::Full};
 +        core.memory_statistics=&*program.memory_statistics;
 +        execution::PrefillContext context{core,{}, {},program.decoder->text_kv,nullptr,nullptr,0,nullptr,nullptr,slot,slot};
 +        context.sampling=static_cast<const ops::SamplingConfig*>(program.sampling_config.slice(1,0,1).data);
 +        for (std::uint32_t begin=0;begin<prefix;begin+=64) {
++            auto& owner=*sequence.window.layerwise_request;
++            check(owner.admit_prefill(64)==64,"prefix bootstrap did not admit a complete block");owner.prepare_prefill(begin,64);
 +            check(program.prepare_window(sequence,begin,begin+64,false,false),"public source native preparation failed");
 +            program.bind_sequence_kv(sequence);context.text_kv=program.text_kv_view(sequence);context.text_kv_base=begin;
 +            context.cache_position_shift=sequence.window.removed_tokens;program.set_device_i32(program.io.rope_delta,sequence.window.removed_tokens);
-+            const auto result=execution::prefill_text_chunk(context,staged.prompt.token_ids,64,{},false);
++            const auto result=execution::prefill_text_chunk(context,staged.prompt.token_ids,64,{},false,&owner.boundary());
 +            check(result.processed_tokens==64,"public native source lost rows");program.commit_memory_statistics(sequence,begin,begin+64);
-+            sequence.text_kv_valid=staged.cursor=begin+64;program.commit_sequence_kv(sequence,begin+64,0);
++            sequence.text_kv_valid=sequence.execution_frontier=staged.cursor=begin+64;program.commit_sequence_kv(sequence,begin+64,0);
++            owner.accept_prefill(begin,begin+64);
 +            program.copy_tail(sequence,program.prefill_hidden.slice(1,63,1));
 +        }
 +        (void)program.layerwise_catalog(sequence);std::vector<kvmem::LayerwisePressureChoice> choices;
@@ -17120,6 +17158,14 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +        program.compact_layerwise_pressure(sequence,choices);sequence.execution_frontier=prefix;staged.base=prefix;
 +        std::shared_ptr<KvmemPrefixCheckpoint> checkpoint=program.capture_memory_checkpoint(sequence);
 +        program.memory_checkpoint_slot(sequence.window,KvmemCheckpointKind::PromptTail)=checkpoint;
++        sequence.window.layerwise_request->retire();sequence.window.layerwise_request.reset();
++        staged.prompt=std::move(question_prompt);staged.prompt_tokens=end;
++        // This in-lane fixture retains the address. As at history activation,
++        // bind the next request's native Query span before enabling its owner.
++        const auto bound_query=program.memory_query_span(staged.prompt);
++        sequence.window.query_begin=bound_query.begin;sequence.window.query_end=bound_query.begin+bound_query.count;
++        const auto prefix_chunks=sequence.window.layer_views.feedback->prefill.layers[0].chunks;
++        const auto prefix_samples=sequence.window.layer_views.feedback->prefill.layers[0].samples;
 +        program.memory_payload_storage.trim(0);program.activate_layerwise_request(sequence,request,0);
 +        check(sequence.window.layerwise_request->options().query.borrow_program_buffers && !sequence.window.query_capture,
 +            "public layerwise activation used legacy probe or request-local GPU allocation");
@@ -17131,11 +17177,13 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +                scored=std::max(scored,query.scored_rows());}
 +            (void)program.advance_prefill(sequence,request,nullptr);
 +        }
-+        check(projected==2*query_rows && attended==2*query_rows && scored==2*query_rows && sequence.text_kv_valid==end &&
-+            sequence.window.layer_views.feedback->prefill.layers[0].chunks==1 &&
-+            sequence.window.layer_views.feedback->prefill.layers[0].samples==(query_rows+31)/32 &&
-+            sequence.window.layer_views.feedback->output->accepted_end==end && !sequence.window.query_tokens,
-+            "actual public Program repeated Query, published tile feedback or retained legacy Q");
++        check(projected==2*query_rows && attended==2*query_rows && scored==2*query_rows,
++            "public Program did not evaluate the Query exactly once per target layer");
++        check(sequence.text_kv_valid==end && sequence.window.layer_views.feedback->output->accepted_end==end &&
++            !sequence.window.query_tokens,"public Program lost the accepted frontier or retained legacy Q");
++        for (const auto& layer:sequence.window.layer_views.feedback->prefill.layers)
++            check(layer.chunks==prefix_chunks+1 && layer.samples==prefix_samples+(query_rows+31)/32 &&
++                layer.end==end,"public Program did not publish exactly one complete Query feedback frame");
 +        std::cout<<"metadata phase: public forward accepted\n"<<std::flush;
 +        {
 +            auto policy=sequence.window.coverage.policy();policy.enabled=true;policy.host_bytes=16u<<20;
@@ -17163,16 +17211,19 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +            check(source_account && feedback_account && sequence.window.source_versions==source_account,
 +                "native history did not bind its Program's fixed metadata partitions");
 +            const auto source_before=source_account->charged_bytes();
-+            {auto fork=program.fork_memory_history(sequence.window,prefix);
++            {check(checkpoint && checkpoint->prefix.size()==prefix,"fork fixture lost its exact prefix checkpoint");
++                auto fork=program.fork_memory_history(sequence.window,*checkpoint);
 +                check(fork->source_versions==source_account && source_account->charged_bytes()>source_before,
 +                    "native fork acquired an independent full metadata allowance");}
 +            check(source_account->charged_bytes()==source_before,"native fork retained its private index/CP metadata after release");
 +            const auto saved_feedback=sequence.window.layer_views.feedback;
++            check(saved_feedback->metadata.account()==source_account,"retirement left immutable feedback on the runtime account");
 +            const auto feedback_before=feedback_account->charged_bytes();
-+            {auto alias=saved_feedback;check(feedback_account->charged_bytes()==feedback_before,
++            {auto alias=saved_feedback;check(source_account->charged_bytes()==source_before && feedback_account->charged_bytes()==feedback_before,
 +                "native feedback alias multiplied its shared metadata charge");}
 +            auto retained_feedback=saved_feedback->fork({saved_feedback->prefill.session.id+1000,1});
-+            check(feedback_account->charged_bytes()>feedback_before,"native feedback deep fork escaped retained metadata accounting");
++            check(source_account->charged_bytes()==source_before+retained_feedback->metadata.bytes() &&
++                feedback_account->charged_bytes()==feedback_before,"native feedback deep fork escaped retained metadata accounting");
 +            auto retained_cp=program.memory_checkpoint_slot(sequence.window,KvmemCheckpointKind::PromptTail);
 +            check(retained_cp && retained_cp->metadata_charge,"native checkpoint omitted its retained metadata lease");
 +            program.memory_histories[0]=std::move(sequence.window);sequence.window={};
@@ -17190,7 +17241,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +            {
 +                auto full=source_account->reserve(source_account->limit()-source_account->charged_bytes());
 +                bool rejected=false;try {program.activate_layerwise_request(sequence,request,0);}
-+                catch (const std::length_error&) {rejected=true;}
++                catch (const kvmem::MemoryError& error) {rejected=error.code()==kvmem::MemoryErrorCode::BudgetExceeded;}
 +                check(rejected && !sequence.window.layerwise_request && sequence.text_kv_valid==0 &&
 +                    source_account->charged_bytes()==source_account->limit() && retained_cp->state,
 +                    "fresh history escaped the Program's exhausted source quota or damaged its retained CP");
@@ -17199,17 +17250,20 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +            std::cout<<"metadata phase: new history owner active\n"<<std::flush;
 +            check(sequence.window.source_versions==source_account && program.layerwise_feedback_account==feedback_account,
 +                "new history multiplied the Program metadata envelope");
-+            const auto charged=feedback_account->charged_bytes();bool rejected=false;
-+            try {(void)saved_feedback->fork({saved_feedback->prefill.session.id+2000,1});}
-+            catch (const std::length_error&) {rejected=true;}
-+            check(rejected && feedback_account->charged_bytes()==charged,
-+                "feedback fork escaped an active Program's admitted private/retained quota");
-+            sequence.window.layerwise_request->retire();sequence.window.layerwise_request.reset();request.retire();
++            {
++                auto full=source_account->reserve(source_account->limit()-source_account->charged_bytes());
++                const auto runtime_charge=feedback_account->charged_bytes();bool rejected=false;
++                try {(void)saved_feedback->fork({saved_feedback->prefill.session.id+2000,1});}
++                catch (const std::length_error&) {rejected=true;}
++                check(rejected && source_account->charged_bytes()==source_account->limit() &&
++                    feedback_account->charged_bytes()==runtime_charge,"retained fork escaped its exhausted source quota");
++            }
 +            auto retry=saved_feedback->fork({saved_feedback->prefill.session.id+2000,1});
-+            check(retry->metadata.account()==feedback_account,"released runtime feedback capacity could not be reused by a real retained copy");
++            check(retry->metadata.account()==source_account,"released retained capacity could not fund a feedback copy");
++            sequence.window.layerwise_request->retire();sequence.window.layerwise_request.reset();request.retire();
 +            program.memory_histories[0].reset();
-+            check(retained_cp->state && retained_feedback->metadata.account()==feedback_account &&
-+                source_account->charged_bytes()>=program.memory_checkpoint_pool->allocated_bytes(),
++            check(retained_cp->state && retained_feedback->metadata.account()==source_account &&
++                source_account->charged_bytes()>=retained_cp->metadata_charge->bytes()+retained_feedback->metadata.bytes()+retry->metadata.bytes(),
 +                "clearing a history released metadata still held by native CP/feedback leases");
 +            check(program.text_kv_addresses->release_after_deactivate(*fresh_address),"quota retry leaked its fresh native address");sequence.kv.reset();
 +            check(program.state_store->release(*fresh_state),"quota retry leaked its fresh StateImage");sequence.state={};
@@ -17268,7 +17322,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +            options.context_cache.device_state_slots=1;options.context_cache.host_state_slots=0;options.context_cache.host_kv_capacity_bytes=0;
 +            options.context_cache.max_private_continuations=1;options.context_cache.max_shared_prefixes=0;options.context_cache.max_long_anchors_per_continuation=0;
 +            auto planner=make_sequence_planner_impl(parameters,device,options,0);auto plan=finalize_sequence_plan_impl(std::move(planner),capacity/64);
-+            ProgramImpl program(parameters,*plan,device,{},{});auto& sequence=program.continuation_states[0];sequence.lane=0;
++            ProgramImpl program(parameters,*plan,device,{},{},nullptr);auto& sequence=program.continuation_states[0];sequence.lane=0;
 +            const auto state=program.state_store->reserve_reset(program.compute_streams);
 +            const auto address=program.text_kv_addresses->create_active(capacity/64,0,program.compute_streams);
 +            const auto auxiliary=program.backend_kv_addresses->create_active(capacity/64,0,program.compute_streams);
@@ -17704,7 +17758,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +            options.context_cache.device_state_slots=1;options.context_cache.host_state_slots=0;options.context_cache.host_kv_capacity_bytes=0;
 +            options.context_cache.max_private_continuations=2;options.context_cache.max_shared_prefixes=0;options.context_cache.max_long_anchors_per_continuation=0;
 +            auto planner=make_sequence_planner_impl(parameters,device,options,0);auto plan=finalize_sequence_plan_impl(std::move(planner),12);
-+            ProgramImpl program(parameters,*plan,device,{},{});
++            ProgramImpl program(parameters,*plan,device,{},{},nullptr);
 +            auto frontend=qwen::make_frontend(model->resources(),{.vision_enabled=false,.max_context=2048});
 +            std::vector<TokenId> next_prompt(635,0);
 +            const auto message=[](ChatRole role,std::string body) {ChatMessage value;value.role=role;value.parts.push_back({.text=std::move(body)});return value;};
@@ -17722,7 +17776,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +                if (!real_chat && turn==1) {
 +                    prompt.memory_query=TokenSpan{640,81};prompt.memory_query_inferred=false;
 +                    auto oversized=prompt;oversized.memory_query=TokenSpan{0,next_prompt.size()};bool refused=false;
-+                    try {(void)program.layerwise_envelope(oversized,0);}catch(const std::length_error&) {refused=true;}
++                    try {(void)program.layerwise_envelope(oversized,0);}catch(const RequestError& e) {refused=e.kind()==RequestErrorKind::ContextLengthExceeded;}
 +                    check(refused,"explicit raw Query overG was silently treated as inferred ordinary input");
 +                }
 +                const auto expected=program.layerwise_envelope(prompt,0);
@@ -17822,7 +17876,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +            options.context_cache.device_state_slots=1;options.context_cache.host_state_slots=0;options.context_cache.host_kv_capacity_bytes=0;
 +            options.context_cache.max_private_continuations=2;options.context_cache.max_shared_prefixes=0;options.context_cache.max_long_anchors_per_continuation=0;
 +            auto planner=make_sequence_planner_impl(parameters,device,options,0);auto plan=finalize_sequence_plan_impl(std::move(planner),8);
-+            ProgramImpl program(parameters,*plan,device,{},{});auto& sequence=program.continuation_states[0];sequence.lane=0;
++            ProgramImpl program(parameters,*plan,device,{},{},nullptr);auto& sequence=program.continuation_states[0];sequence.lane=0;
 +            const auto state=program.state_store->reserve_reset(program.compute_streams);
 +            const auto address=program.text_kv_addresses->create_active(6,0,program.compute_streams);
 +            check(bool(state)&&bool(address),"no-refresh fixture could not admit native state/address");
@@ -17925,7 +17979,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +        options.context_cache.device_state_slots=1;options.context_cache.host_state_slots=0;options.context_cache.host_kv_capacity_bytes=0;
 +        options.context_cache.max_private_continuations=2;options.context_cache.max_shared_prefixes=0;options.context_cache.max_long_anchors_per_continuation=0;
 +        auto planner=make_sequence_planner_impl(parameters,device,options,0);auto plan=finalize_sequence_plan_impl(std::move(planner),8);
-+        ProgramImpl program(parameters,*plan,device,{},{});auto& sequence=program.continuation_states[0];sequence.lane=0;
++        ProgramImpl program(parameters,*plan,device,{},{},nullptr);auto& sequence=program.continuation_states[0];sequence.lane=0;
 +        const auto state=program.state_store->reserve_reset(program.compute_streams);
 +        const auto address=program.text_kv_addresses->create_active(6,0,program.compute_streams);
 +        check(bool(state)&&bool(address),"two-layer branch fixture could not admit native state/address");
@@ -17995,7 +18049,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +        // Force the precise metadata/index account rejection before any new
 +        // immutable source can publish; the accepted native window survives.
 +        {auto held=sequence.window.source_versions->reserve(sequence.window.source_versions->limit()-sequence.window.source_versions->charged_bytes());
-+            bool refused=false;try {(void)program.capture_memory_checkpoint(sequence);} catch (const std::length_error&) {refused=true;}
++            bool refused=false;try {(void)program.capture_memory_checkpoint(sequence);} catch (const kvmem::MemoryError& e) {refused=e.code()==kvmem::MemoryErrorCode::BudgetExceeded;}
 +            check(refused && sequence.window.stamp.valid && sequence.text_kv_valid==New,"source quota failure changed accepted native history");}
 +        auto branch=program.capture_memory_checkpoint(sequence);std::vector<std::byte> after(before.size());branch->canonical_source->records[5].read(0,after.data(),after.size());
 +        const auto& descriptor=old->canonical_source->descriptor;
@@ -18113,7 +18167,7 @@ index 0000000000000000000000000000000000000000..5517d8e7aa8e636ff95dd367cf861b63
 +}
 diff --git a/tests/models/qwen3_5/test_layerwise_query_output_keys.cpp b/tests/models/qwen3_5/test_layerwise_query_output_keys.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e20a9e9f9a72e4d0418511fec6a444c1e40d0ab8
+index 0000000000000000000000000000000000000000..82974761ade7059fd8e1b13263503559eecef1e1
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_layerwise_query_output_keys.cpp
 @@ -0,0 +1,222 @@
@@ -18211,7 +18265,7 @@ index 0000000000000000000000000000000000000000..e20a9e9f9a72e4d0418511fec6a444c1
 +        options.context_cache.max_long_anchors_per_continuation=0;
 +        auto planner=make_sequence_planner_impl(parameters,device,options,0);
 +        auto plan=finalize_sequence_plan_impl(std::move(planner),C/64);
-+        ProgramImpl p(parameters,*plan,device,{},{});auto& sequence=p.continuation_states[0];sequence.lane=0;
++        ProgramImpl p(parameters,*plan,device,{},{},nullptr);auto& sequence=p.continuation_states[0];sequence.lane=0;
 +        auto& request=p.requests[0];const auto state=p.state_store->reserve_reset(p.compute_streams);
 +        const auto address=p.text_kv_addresses->create_active(C/64,0,p.compute_streams);
 +        const auto auxiliary=mtp?p.backend_kv_addresses->create_active(C/64+1,0,p.compute_streams):
@@ -18377,7 +18431,7 @@ index b8fcea4609a59f3d5383ffbc11fea9c101ec3dce..22ceb71b34a3a5327c128d4d63457297
      const auto mean_budget=memory_statistics_budget(mean,2,1024,4096,16,4,256);
      expect(mean_budget.divided==12959744 && mean_budget.first==2304,
 diff --git a/tests/models/qwen3_5/tests.cmake b/tests/models/qwen3_5/tests.cmake
-index e83b0a544266046e7aaceb8c5603fa07fb8799d2..2172400affef7498c86d789283292999a3d22d51 100644
+index e83b0a544266046e7aaceb8c5603fa07fb8799d2..1bb2af2559eaab33a8275218a14f7113b8c6e577 100644
 --- a/tests/models/qwen3_5/tests.cmake
 +++ b/tests/models/qwen3_5/tests.cmake
 @@ -2,6 +2,23 @@ ninfer_add_test(ninfer_ngram_proposer_test
@@ -18389,7 +18443,7 @@ index e83b0a544266046e7aaceb8c5603fa07fb8799d2..2172400affef7498c86d789283292999
 +foreach(fixture layerwise_attention layerwise_program_query layerwise_kv_transfer layerwise_kv_write layerwise_dflash_features layerwise_dflash_checkpoint)
 +  ninfer_add_test(ninfer_qwen3_5_${fixture}_test STANDALONE
 +    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${fixture}.cpp"
-+    LIBRARIES ninfer_model_runtime ninfer_core ninfer_ops)
++    LIBRARIES ninfer_model_runtime ninfer_core ninfer_ops ninfer::json)
 +  target_compile_features(ninfer_qwen3_5_${fixture}_test PRIVATE cxx_std_20)
 +  set_tests_properties(ninfer_qwen3_5_${fixture}_test PROPERTIES SKIP_RETURN_CODE 77)
 +  ninfer_stage_runtime_dlls(ninfer_qwen3_5_${fixture}_test)

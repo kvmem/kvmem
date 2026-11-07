@@ -2,7 +2,7 @@
 
 Candidate reviewed over `a8cca288b5106870b3388f674c5dbdbbf11cd67a`. The NInfer recipe is based on native tree
 `56e5e7e6a1240249ba1d7569f67bbf7cb26d23c7` and reconstructs
-`ec75007811561b333ccb4209fdf256fc068451cd` exactly. The patch roundtrip passed.
+`acc9ca65933888488c3ee71b962a3f45093d3838` exactly. The patch roundtrip passed.
 Algorithm reference: kvmem-vllm `72a81cc99aa78d85004ecf1364fc9f3094db8816`,
 still its main branch head when rechecked on November 7.
 
@@ -62,6 +62,18 @@ with the MTP history flag omitted and has zero probes. Upstream-global explicitl
 selects that policy; probe costs are 257.124 ms and 328.201 ms, both restored.
 These two functional observations do not replace the earlier controlled 30-run
 policy comparison and are not a new speed/acceptance ranking.
+
+## Follow-up validation
+
+The final native patch differs from the model-qualified tree only under `tests/`.
+Four additional CPU and five single-GPU fixture executables passed. They cover
+budget ownership, graph feedback layout, physical output, attention against an
+independent reference, KV transfer/write, DFlash features and the Program Query
+lifecycle. Prefix feedback and Query feedback are counted separately; retired
+immutable feedback is charged to the retained-source account. The public model
+worker hash is unchanged. The shared HIP source uses the ROCm runtime names;
+the CUDA branch remains identical to the source used for the real-model runs.
+The standalone conditioning host build and Windows browser launcher also passed.
 
 ## Limits and bounded behavior
 
