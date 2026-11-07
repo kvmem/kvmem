@@ -284,18 +284,25 @@ def normalize(data, backends):
         raise ValueError('TensorSplit must contain finite positive weights')
     if not math.isfinite(sum(float(x) for x in split)):
         raise ValueError('TensorSplit total weight must be finite')
-    if p['Backend'] != 'ninfer' and ({'TensorParallel', 'TensorSplit'} & p.keys()):
-        raise ValueError('TensorParallel and TensorSplit configure NInfer only')
+    if p['Backend'] not in ('ninfer', 'llamacpp') and ({'TensorParallel', 'TensorSplit'} & p.keys()):
+        raise ValueError('TensorParallel and TensorSplit configure NInfer and llama.cpp only')
+    if p.get('TensorParallel') and p['Backend'] != 'ninfer':
+        raise ValueError('TensorParallel configures NInfer only')
+    devices = gpu.split(',') if gpu else []
     if p.get('TensorParallel'):
-        ids = gpu.split(',') if gpu else []
-        if not 2 <= len(ids) <= 8 or len(set(ids)) != len(ids):
+        if not 2 <= len(devices) <= 8 or len(set(devices)) != len(devices):
             raise ValueError('TensorParallel requires 2..8 distinct GPU UUIDs')
         if layers:
             raise ValueError('TensorParallel cannot be combined with StageLayers')
-        if split and len(split) != len(ids):
+        if split and len(split) != len(devices):
             raise ValueError('TensorSplit requires one weight per GPU, in UUID order')
     elif split:
-        raise ValueError('TensorSplit requires TensorParallel')
+        if p['Backend'] != 'llamacpp':
+            raise ValueError('TensorSplit requires TensorParallel')
+        if not 2 <= len(devices) <= 8 or len(set(devices)) != len(devices):
+            raise ValueError('llama.cpp layer weights require 2..8 distinct GPU UUIDs')
+        if len(split) != len(devices):
+            raise ValueError('TensorSplit requires one weight per GPU, in UUID order')
     args = p.get('WorkerArgs', [])
     if not isinstance(args, list) or len(args) > 20 or any(not isinstance(x, str) for x in args):
         raise ValueError('Native arguments must be an array of strings')

@@ -180,6 +180,43 @@ try {
         catch { $rejected = $_.Exception.Message -match 'one positive layer count per GPU' }
         if (!$rejected) { throw 'Invalid stage layer counts accepted' }
     }
+    $llamaModel = Join-Path $testDir 'model.gguf'
+    $llamaDual = & $launcher @dualArgs -Backend llamacpp -Model $llamaModel -MtpDrafts 3 -TensorSplit 11,9 | ConvertFrom-Json
+    if ($llamaDual.environment.CUDA_VISIBLE_DEVICES -ne 'GPU-second,GPU-first' -or
+        $llamaDual.argv[[array]::IndexOf($llamaDual.argv, '--split-mode') + 1] -ne 'layer' -or
+        $llamaDual.argv[[array]::IndexOf($llamaDual.argv, '--gpu-layers') + 1] -ne 'all' -or
+        $llamaDual.argv[[array]::IndexOf($llamaDual.argv, '--device') + 1] -ne 'CUDA0,CUDA1' -or
+        $llamaDual.argv[[array]::IndexOf($llamaDual.argv, '--tensor-split') + 1] -ne '11,9' -or
+        $llamaDual.argv[[array]::IndexOf($llamaDual.argv, '--kvmem-mtp-state') + 1] -ne 'replay' -or
+        $llamaDual.argv -contains '--devices' -or $llamaDual.argv -contains '--stage-layers') {
+        throw 'llama.cpp layer split lost UUID order, weights or MTP history'
+    }
+    $llamaAuto = & $launcher @dualArgs -Backend llamacpp -Model $llamaModel | ConvertFrom-Json
+    if ($llamaAuto.argv -contains '--tensor-split' -or $llamaAuto.argv -contains '--kvmem-mtp-state') {
+        throw 'Automatic llama.cpp split weights and unused MTP history must be omitted'
+    }
+    $llamaSingle = & $launcher @common -Backend llamacpp -Model $llamaModel -MtpDrafts 3 | ConvertFrom-Json
+    if ($llamaSingle.argv -contains '--split-mode' -or $llamaSingle.argv -contains '--device' -or
+        $llamaSingle.argv -contains '--kvmem-mtp-state') {
+        throw 'Single-GPU llama.cpp must keep its native device defaults'
+    }
+    foreach ($badLlama in @(
+        @{Gpu='GPU-first'; TensorSplit=@(11)}, @{Gpu='GPU-first'; TensorSplit=@(11,9)},
+        @{TensorSplit=@(11)}, @{TensorSplit=@(11,0)}, @{TensorSplit=@([double]::NaN,1)},
+        @{TensorSplit=@(11,9); TensorParallel=$true}, @{TensorSplit=@(11,9); StageLayers=@(40,24)}
+    )) {
+        $argsBad = $dualArgs.Clone(); $rejected = $false
+        if ($badLlama.ContainsKey('Gpu')) { $argsBad.Gpu = $badLlama.Gpu; $badLlama.Remove('Gpu') | Out-Null }
+        try { $null = & $launcher @argsBad -Backend llamacpp -Model $llamaModel @badLlama }
+        catch { $rejected = $_.Exception.Message -match 'llama\.cpp TensorSplit|configures ninfer' }
+        if (!$rejected) { throw "Invalid llama.cpp split configuration accepted: $($badLlama | Out-String)" }
+    }
+    foreach ($nativeDevice in @(@('--device', 'CUDA1'), @('--split-mode=layer'), @('--gpu-layers', 'all'), @('--tensor-split', '11,9'))) {
+        $rejected = $false
+        try { $null = & $launcher @dualArgs -Backend llamacpp -Model $llamaModel -WorkerArgs $nativeDevice }
+        catch { $rejected = $_.Exception.Message -match 'Use -Gpu and -TensorSplit' }
+        if (!$rejected) { throw 'Native arguments bypassed the llama.cpp device controls' }
+    }
     foreach ($diskCase in @(
         @{DiskPath=''}, @{DiskMiB=4096},
         @{WorkerArgs=@('--kvmem-disk-path', 'cache')},

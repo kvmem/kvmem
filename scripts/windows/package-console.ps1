@@ -138,9 +138,11 @@ Filter results by name or path, then select a model. This does not start inferen
 If the Windows folder picker is unavailable, paste a full folder path instead.
 Both engines use the same GPU cards. Switching engines preserves common resource,
 cache and service settings; model assets, KV formats and native options remain separate.
-This launcher currently exposes single-GPU llama.cpp and multi-GPU NInfer configuration.
-A multi-GPU selection is preserved on switch to llama.cpp, with guidance to choose one
-GPU before launching. The launcher does not silently choose a different card.
+This launcher exposes single-GPU llama.cpp, multi-GPU layer offload for llama.cpp and
+multi-GPU NInfer configuration. A multi-GPU selection is preserved on switch between
+engines. The launcher does not silently choose a different card.
+For llama.cpp, multiple GPUs use native layer split; Split weights (optional) sets the
+relative number of layers each GPU takes, in GPU order.
 For llama.cpp, Cache & history provides independent K and V cache format selectors.
 Quantized q8_0/q5_0/q4_0 types can be combined, as can f16/f32 types. Float/quantized
 mixing is rejected. Existing combined KV selections initialize both selectors.

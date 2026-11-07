@@ -82,6 +82,15 @@ llama.cpp 示例：
 
 已有的 llama.cpp 可执行文件、`start-server.ps1`、IQ3/IQ4 启动脚本仍可使用。原生参数通过 `-WorkerArgs @('--flag', 'value')` 传入，例如 llama 的 MTP、mmproj 和会话配置。后端参数保留各自含义；`.gguf` 与 `.ninfer` 不互换，也不迁移跨引擎 KV。当前源码的 `-HostMiB` 对应两个后端共用的原生 KV payload RAM 预算；llama 仅在显式指定或启用 SSD 时传入，保持未配置时的行为。
 
+llama.cpp 多卡使用原生 layer 切分，不引入 ninfer 的 stage 概念。`-Gpu 'GPU-a,GPU-b'` 从两张卡起，启动器按 UUID 顺序自动补 `--split-mode layer`、`--gpu-layers all` 和 `--device CUDA0,CUDA1…`；`-TensorSplit 11,9` 是各卡承担层数的相对权重（不是每卡绝对层数），省略时由 llama.cpp 自行分配。MTP 与多卡同时使用时启动器补 `--kvmem-mtp-state replay`（worker 在该组合下不接受 auto），DFlash2 仍限单卡。控制台选中多张显卡后行为相同，权重写在“硬件与加速”的“分卡权重（可选）”。多卡用于扩展容量，本轮结论来自 5070 Ti＋Tesla T10 的双卡加载与长上下文运行，不承诺跨架构加速。
+
+```powershell
+./scripts/windows/start-backend.ps1 -Backend llamacpp `
+  -Model 'D:/models/model-mtp.gguf' -Gpu 'GPU-first-uuid,GPU-second-uuid' `
+  -TensorSplit 11,9 -SpeculativeMode mtp `
+  -Budget 32768 -Reserve 16384 -KvType q8_0 -SinkTokens 128 -RecentTokens 0
+```
+
 ## ninfer 功能与组合
 
 当前源码的召回传输保留 64 MiB 目标分批中转，并在批内合并连续物理页；可用默认关闭的
