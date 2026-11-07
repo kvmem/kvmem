@@ -322,15 +322,14 @@ int main() {
         std::filesystem::create_directories(folder);
         auto disk=std::make_shared<kvmem::SpillFile>(folder,4096);
         auto account=std::make_shared<MultimodalCheckpointAccounting>();
-        auto storage=std::make_shared<kvmem::HostKvStorage>(4096,disk);
+        auto storage=std::make_shared<kvmem::HostKvStorage>(4096);
         std::atomic_store(&account->storage_owner,storage);
         const auto make_state=[&](size_t n,uint8_t value) {
             auto data=std::make_shared<MultimodalCheckpointData>();
             const std::vector<uint8_t> payload(n,value);
-            data->native_image=storage->allocate(kvmem::checkpoint_image_size(n,2));
-            kvmem::write_checkpoint_image(data->native_image,uint64_t(reinterpret_cast<uintptr_t>(data.get())),
-                {{payload.data(),n},{nullptr,0}});
-            data->native_image.seal();data->residency=data->native_image.lease();data->recurrent_bytes=n;
+            auto image=std::make_shared<LlamaCheckpointBacking>();
+            image->hot=storage->allocate(n,payload.data());
+            image->hot.seal();data->backing=image;data->recurrent_bytes=n;
             return data;
         };
         kvmem_conversation parent;
@@ -353,7 +352,8 @@ int main() {
         parent.mm_checkpoints.clear();shared.reset();cp.data.reset();
         LlamaEngineState reader;
         const auto read=llama_driver_read_checkpoint(reader,child.mm_checkpoints.back().data);
-        assert(read->recurrent==std::vector<uint8_t>(128,7));
+        assert(read->borrowed.size()==128 && read->recurrent.empty());
+        assert(std::all_of(read->recurrent_data(),read->recurrent_data()+128,[](uint8_t v){return v==7;}));
     }
     {
         // Concurrent readers own separate execution-local Q staging. Neither
@@ -362,19 +362,35 @@ int main() {
         std::filesystem::create_directories(folder);
         auto disk=std::make_shared<kvmem::SpillFile>(folder,4096);
         auto account=std::make_shared<MultimodalCheckpointAccounting>();
-        auto storage=std::make_shared<kvmem::HostKvStorage>(4096,disk);
+        auto storage=std::make_shared<kvmem::HostKvStorage>(4096);
         std::atomic_store(&account->storage_owner,storage);
         const std::vector<uint8_t> recurrent(128,7),carry(16,9);
         const auto make_state=[&] {
             auto data=std::make_shared<MultimodalCheckpointData>();
-            data->native_image=storage->allocate(kvmem::checkpoint_image_size(144,2));
-            kvmem::write_checkpoint_image(data->native_image,uint64_t(reinterpret_cast<uintptr_t>(data.get())),
-                {{recurrent.data(),recurrent.size()},{carry.data(),carry.size()}});
-            data->native_image.seal();data->recurrent_bytes=128;data->carry_bytes=16;
+            auto image=std::make_shared<LlamaCheckpointBacking>();
+            image->hot=storage->allocate(144);
+            image->hot.write(0,recurrent.data(),128);image->hot.write(128,carry.data(),16);
+            image->hot.seal();data->backing=image;data->recurrent_bytes=128;data->carry_bytes=16;
             data->accounting=account;account->add(data->metadata_bytes());
             return data;
         };
-        auto source=make_state();assert(storage->demote(source->native_image));
+        auto demote=[&](const std::shared_ptr<MultimodalCheckpointData>& data) {
+            auto cold=std::make_shared<LlamaCheckpointBacking>();
+            cold->cold=disk->reserve(kvmem::checkpoint_image_size(144,2));
+            data->write_cold(*data->backing,cold->cold);
+            data->backing=cold;
+            return cold;
+        };
+        auto source=make_state();
+        LlamaEngineState hot_reader;
+        {
+            auto hot=llama_driver_read_checkpoint(hot_reader,source);
+            assert(hot->recurrent_data()==source->backing->hot.lease().data());
+            assert(hot->carry==carry && hot_reader.mm_checkpoint_accounting->used()==16);
+            demote(source);
+            assert(storage->charged_bytes()==144 && hot->recurrent_data()[127]==7);
+        }
+        assert(!storage->charged_bytes() && !hot_reader.mm_checkpoint_accounting->used());
         const auto charge=account->used(),disk_charge=disk->charged_bytes();
         LlamaEngineState a,b;
         kvmem::CheckpointPolicy policy;policy.enabled=true;policy.host_bytes=4096;
@@ -386,18 +402,18 @@ int main() {
         std::thread two([&]{try{second=llama_driver_read_checkpoint(b,source);}catch(...){error_b=std::current_exception();}});
         one.join();two.join();assert(!error_a && !error_b);
         assert(first.get()!=second.get() && first->recurrent==recurrent && second->carry==carry);
-        assert(!source->native_image.resident_bytes() && disk->charged_bytes()==disk_charge && account->used()==charge);
+        assert(!source->hot_bytes() && disk->charged_bytes()==disk_charge && account->used()==charge);
         assert(a.mm_checkpoint_accounting->used()==144 && b.mm_checkpoint_accounting->used()==144);
         first.reset();second.reset();
         assert(!a.mm_checkpoint_accounting->used() && !b.mm_checkpoint_accounting->used());
         // Fault injection changes a private image, not the retained source.
-        auto corrupt=make_state();const uint8_t bad=8;corrupt->native_image.write(40,&bad,1);corrupt->native_image.seal();
+        auto corrupt=make_state();const uint8_t bad=8;demote(corrupt)->cold.write(40,&bad,1);
         bool rejected=false;
         try{auto invalid=llama_driver_read_checkpoint(a,corrupt);(void)invalid;}catch(const kvmem::SnapshotCorrupt&){rejected=true;}
         assert(rejected && !a.mm_checkpoint_accounting->used());
         corrupt.reset();assert(account->used()==charge);
         auto recovered=llama_driver_read_checkpoint(a,source);
-        assert(recovered->recurrent==recurrent && !source->native_image.resident_bytes() && disk->charged_bytes()==disk_charge);
+        assert(recovered->recurrent==recurrent && !source->hot_bytes() && disk->charged_bytes()==disk_charge);
         recovered.reset();
         policy.host_bytes=128;a.mm_archive=kvmem::CheckpointArchive<MultimodalCheckpoint>(policy);
         rejected=false;

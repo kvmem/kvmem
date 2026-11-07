@@ -23,7 +23,16 @@
 #include <string>
 #include <vector>
 
+struct NativeStateTraffic {
+    std::atomic<uint64_t> records{0}, bytes{0};
+    void record(size_t n) {
+        records.fetch_add(1, std::memory_order_relaxed);
+        bytes.fetch_add(n, std::memory_order_relaxed);
+    }
+};
+
 struct MultimodalCheckpointAccounting {
+    NativeStateTraffic created, spilled, hot_reads, cold_reads;
     size_t limit = [] { const auto p=kvmem::CheckpointPolicy::environment(); return p.enabled ? p.host_bytes : SIZE_MAX; }();
     // Metadata and transient native staging; immutable native payload is
     // charged only by storage, under this execution's existing Q allowance.
@@ -54,6 +63,13 @@ struct LlamaEngineState;
 std::vector<kvmem::GraphMessageSpan> llama_driver_graph_messages(const LlamaEngineState&,
     const common_chat_templates_inputs&,const common_chat_params&,const kvmem_prompt&);
 
+// An immutable native state has one current backing. Readers retain the
+// observed backing while the lane publishes a completed spill.
+struct LlamaCheckpointBacking {
+    kvmem::HostKvRecord hot;
+    kvmem::SpillExtent cold;
+};
+
 struct MultimodalCheckpointData {
     MultimodalCheckpointData() = default;
     MultimodalCheckpointData(const MultimodalCheckpointData &) = delete;
@@ -61,17 +77,19 @@ struct MultimodalCheckpointData {
     ~MultimodalCheckpointData() { if (accounting) accounting->live_bytes -= metadata_bytes(); }
     std::shared_ptr<const llama_kvmem_checkpoint_snapshot> attention;
     size_t attention_metadata = 0;
-    kvmem::HostKvRecord native_image;
-    // Keeps hot records ineligible for automatic eviction. Only the existing
-    // checkpoint victim selection releases this lease for targeted demotion.
-    mutable kvmem::HostKvLease residency;
+    mutable std::shared_ptr<const LlamaCheckpointBacking> backing;
+    size_t hot_bytes() const {
+        const auto image = std::atomic_load(&backing);
+        return image ? image->hot.size() : 0;
+    }
+    void write_cold(const LlamaCheckpointBacking & image, const kvmem::SpillExtent & extent) const;
     size_t recurrent_bytes = 0, carry_bytes = 0;
     mutable std::atomic<bool> shared{false};
     llama_kvmem_tail_mean_state tail_mean;
     std::shared_ptr<MultimodalCheckpointAccounting> accounting;
     size_t metadata_bytes() const { return attention_metadata + tail_mean.values.size()*sizeof(float) + tail_mean.history.scores->size()*sizeof(double) + tail_mean.graph.bytes() + tail_mean.feedback.bytes(); }
-    size_t resident_bytes() const { return metadata_bytes() + native_image.resident_bytes(); }
-    size_t bytes() const { return metadata_bytes() + native_image.size(); }
+    size_t resident_bytes() const { return metadata_bytes() + hot_bytes(); }
+    size_t bytes() const { return metadata_bytes() + recurrent_bytes + carry_bytes; }
 };
 
 // Engine-private validated native staging. The reader's execution owns this
@@ -79,7 +97,9 @@ struct MultimodalCheckpointData {
 struct CheckpointRead {
     std::shared_ptr<MultimodalCheckpointAccounting> account;
     size_t bytes;
+    kvmem::HostKvLease borrowed;
     std::vector<uint8_t> recurrent, carry;
+    const uint8_t * recurrent_data() const { return borrowed ? borrowed.data() : recurrent.data(); }
     CheckpointRead(std::shared_ptr<MultimodalCheckpointAccounting> owner, size_t n, size_t limit)
         : account(std::move(owner)), bytes(n) {
         if (!account->reserve(bytes,limit)) throw std::runtime_error("checkpoint Host reservation exceeded budget");
@@ -221,6 +241,7 @@ struct LlamaEngineState {
     struct CheckpointWrite {
         std::shared_ptr<const MultimodalCheckpointData> source;
         kvmem::StorageTicket ticket;
+        std::shared_ptr<const LlamaCheckpointBacking> destination;
     };
     std::unique_ptr<CheckpointWrite> mm_checkpoint_write;
     std::unique_ptr<kvmem::StorageIoQueue> mm_checkpoint_io;

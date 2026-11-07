@@ -1,7 +1,7 @@
 """Native hybrid commit-budget failure: JSON/SSE errors and bounded rollback.
 
 Requires a dedicated GPU and a hybrid model whose native state exercises the
-specified checkpoint budget. The default 192 MiB fixture is qualified with
+specified checkpoint budget. The default 128 MiB fixture is qualified with
 Qwen3.5-4B IQ3_XXS; it cannot fit even a short generation's required checkpoints.
 Normal generation after a rejected Query is separately covered by the existing
 checkpoint coverage regression with --host-mib 256 --expect-capacity-error.
@@ -28,8 +28,12 @@ def main():
     cli.add_argument('--ssd-budget',action='store_true',help='fill shared SSD/Q, then recover an earlier successful parent')
     cli.add_argument('--cancel',action='store_true',help='disconnect a continuation after real output, then restore its old parent')
     cli.add_argument('--mtp',action='store_true',help='enable the model native MTP draft for cancellation qualification')
+    cli.add_argument('--expect-commit',action='store_true',help='verify JSON and SSE commit within the given native state budget')
     args=cli.parse_args()
-    if args.host_mib is None:args.host_mib=256 if args.ssd_budget else 1024 if args.cancel else 192
+    if sum((args.ssd_budget, args.cancel, args.expect_commit)) > 1:
+        cli.error('select one checkpoint scenario')
+    if args.host_mib is None:
+        args.host_mib = 256 if args.ssd_budget else 1024 if args.cancel else 192 if args.expect_commit else 128
     args.out.mkdir(parents=True,exist_ok=False)
     processes=subprocess.check_output(['nvidia-smi','-i',args.gpu,'--query-compute-apps=pid,process_name','--format=csv,noheader'],text=True).strip()
     if processes:raise RuntimeError('GPU occupied: '+processes)
@@ -164,6 +168,18 @@ def main():
                 offset=log_path.stat().st_size
                 status,raw=request(name,messages,stream,True)
                 trace=log_path.read_bytes()[offset:].decode(errors='replace')
+                if args.expect_commit:
+                    assert status == 200 and 'KVMEM_CHECKPOINT_COMMIT' in trace, (status, raw)
+                    assert 'checkpoint_commit_failed' not in trace and 'KVMEM_CHECKPOINT_ROLLBACK' not in trace
+                    if stream:
+                        lines = raw.decode().splitlines()
+                        events = [json.loads(line[6:]) for line in lines if line.startswith('data: ') and line != 'data: [DONE]']
+                        assert 'data: [DONE]' in lines and not any('error' in event for event in events)
+                        assert any(choice.get('finish_reason') for event in events for choice in event.get('choices', []))
+                    else:
+                        assert json.loads(raw)['choices'][0]['finish_reason']
+                    print('PASS', name, 'committed within native state budget', flush=True)
+                    continue
                 assert 'checkpoint_commit_failed' in trace, 'fixture did not reach late commit failure'
                 assert 'KVMEM_CHECKPOINT_ROLLBACK' in trace and 'multimodal_rollback_failed' not in trace
                 if stream:

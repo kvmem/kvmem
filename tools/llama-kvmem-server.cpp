@@ -1602,13 +1602,25 @@ int main(int argc, char ** argv) {
             usage["history_evictions"] = usage["evictions"];
             usage["sampling_scope"] = "committed_owner_metadata_with_live_physical_account";
             uint64_t state_bytes = 0, native_state_bytes = 0, metadata_staging_bytes = 0;
+            json state_traffic = json::object();
+            const auto accumulate = [&](const char * key, const NativeStateTraffic & traffic) {
+                auto & total = state_traffic[key];
+                if (total.is_null()) total = {{"records", uint64_t{0}}, {"bytes", uint64_t{0}}};
+                total["records"] = total["records"].get<uint64_t>() + traffic.records.load();
+                total["bytes"] = total["bytes"].get<uint64_t>() + traffic.bytes.load();
+            };
             std::set<const MultimodalCheckpointAccounting*> accounts;
             for (const auto* lane : lanes) if (accounts.insert(lane->mm_checkpoint_accounting.get()).second) {
                 const auto account = lane->mm_checkpoint_accounting;
+                accumulate("created", account->created);
+                accumulate("spilled", account->spilled);
+                accumulate("hot_reads", account->hot_reads);
+                accumulate("cold_reads", account->cold_reads);
                 state_bytes += account->used();
                 metadata_staging_bytes += account->live_bytes.load();
                 if (const auto storage = account->storage()) native_state_bytes += storage->charged_bytes();
             }
+            usage["native_state_traffic"] = std::move(state_traffic);
             usage["physical_checkpoint_bytes"] = state_bytes;
             usage["checkpoint_bytes_scope"] = "Q_native_record_ram_plus_metadata_and_transient_staging; excludes_KV_H; not_process_RSS";
             usage["checkpoint_native_record_ram_bytes"] = native_state_bytes;
@@ -1624,7 +1636,7 @@ int main(int argc, char ** argv) {
             usage["snapshot_image_write_us"] = captures.image_write_us;
             usage["snapshot_image_read_us"] = captures.image_read_us;
             usage["snapshot_attention_restore_us"] = captures.attention_restore_us;
-            usage["snapshot_timing_scope"] = "process_wall_us; image_write/read_combine_copy_framing_checksum";
+            usage["snapshot_timing_scope"] = "process_wall_us; image_write=worker_spill_frame; image_read=hot_borrow_or_validated_cold_read";
             usage["capture_scope"] = "process_successful_host_captures_target_and_draft; excludes_aliases_and_failed_transfers";
             data["kvmem"] = std::move(usage);
         }

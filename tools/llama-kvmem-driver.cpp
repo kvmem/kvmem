@@ -861,35 +861,39 @@ static void checkpoint_tier(LlamaEngineState & st, bool drain, bool force) {
             }
         }
         const auto & source = job.source;
-        if (source->native_image.resident_bytes()) source->residency = source->native_image.lease();
-        else kvmem_diag("KVMEM_CHECKPOINT_TIER write_bytes=%zu cold=1\n", source->native_image.size());
+        if (job.ticket.status() == kvmem::StorageTaskStatus::Complete) {
+            std::atomic_store(&source->backing, job.destination);
+            source->accounting->spilled.record(source->recurrent_bytes + source->carry_bytes);
+            kvmem_diag("KVMEM_CHECKPOINT_TIER write_bytes=%zu cold=1\n", source->recurrent_bytes + source->carry_bytes);
+        }
         st.mm_checkpoint_write.reset();
     }
     if (drain) return;
     const auto spill = kvmem_execution_spill_file(st.execution.get());
     if (!spill) return;
     std::set<const MultimodalCheckpointData *> hot;
-    for (const auto & cp : st.mm_checkpoints) if (cp.data && cp.data->native_image.resident_bytes()) hot.insert(cp.data.get());
+    for (const auto & cp : st.mm_checkpoints) if (cp.data && cp.data->hot_bytes()) hot.insert(cp.data.get());
     const kvmem::CheckpointArchive<MultimodalCheckpoint>::Entry * victim = nullptr;
-    for (const auto & e : st.mm_archive) if (e.info.identity && e.record.data->native_image.resident_bytes()) {
+    for (const auto & e : st.mm_archive) if (e.info.identity && e.record.data->hot_bytes()) {
         hot.insert(e.record.data.get());
         if (!e.record.data->shared.load() && !checkpoint_execution_held(st, e.record.data.get()) && (!victim || e.info.used < victim->info.used)) victim = &e;
     }
     if (!victim || (!force && hot.size() <= st.mm_archive.policy().hot_count)) return;
     const auto source = victim->record.data;
     try {
-        const auto n = source->native_image.size();
-        const auto storage = source->accounting->storage();
-        if (!storage || !storage->spill_file()) return;
+        const auto hot = std::atomic_load(&source->backing);
+        const auto n = hot->hot.size();
+        auto cold = std::make_shared<LlamaCheckpointBacking>();
+        cold->cold = spill->reserve(kvmem::checkpoint_image_size(n, 2));
         if (!st.mm_checkpoint_io) st.mm_checkpoint_io = std::make_unique<kvmem::StorageIoQueue>(1, st.mm_archive.policy().host_bytes);
-        source->residency = {};
-        auto ticket = st.mm_checkpoint_io->submit(n, [source, storage] {
-            storage->demote(source->native_image);
+        auto job = std::make_unique<LlamaEngineState::CheckpointWrite>();
+        job->source = source;
+        job->destination = cold;
+        job->ticket = st.mm_checkpoint_io->submit(n, [source, hot, cold] {
+            source->write_cold(*hot, cold->cold);
         });
-        if (ticket) st.mm_checkpoint_write = std::make_unique<LlamaEngineState::CheckpointWrite>(LlamaEngineState::CheckpointWrite{source, ticket});
-        else source->residency = source->native_image.lease();
+        if (job->ticket) st.mm_checkpoint_write = std::move(job);
     } catch (const std::exception & error) {
-        source->residency = source->native_image.lease();
         kvmem_diag("KVMEM_CHECKPOINT_TIER skipped=%s\n", error.what());
     }
 }
@@ -976,18 +980,42 @@ struct SnapshotPhaseTimer {
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count()); }
 };
 
+void MultimodalCheckpointData::write_cold(const LlamaCheckpointBacking & image,
+                                          const kvmem::SpillExtent & extent) const {
+    const auto lease = image.hot.lease();
+    if (!lease.data() || lease.size() != recurrent_bytes + carry_bytes)
+        throw std::logic_error("invalid hot native checkpoint");
+    SnapshotPhaseTimer timer{llama_kvmem_snapshot_phase::image_write};
+    kvmem::write_checkpoint_image(extent, uint64_t(reinterpret_cast<uintptr_t>(this)),
+        {{lease.data(), recurrent_bytes}, {lease.data() + recurrent_bytes, carry_bytes}});
+}
+
 std::unique_ptr<CheckpointRead> llama_driver_read_checkpoint(
         LlamaEngineState & st, const std::shared_ptr<const MultimodalCheckpointData> & saved) {
     const auto bytes = saved->recurrent_bytes + saved->carry_bytes;
-    checkpoint_make_room(st, bytes);
-    auto result = std::make_unique<CheckpointRead>(st.mm_checkpoint_accounting, bytes,
+    const auto image = std::atomic_load(&saved->backing);
+    if (!image || (!image->cold && image->hot.size() != bytes))
+        throw std::runtime_error("invalid native checkpoint backing");
+    // llama's recurrent setter accepts borrowed bytes. The speculative setter
+    // still needs a vector, independently admitted to the reader's account.
+    const size_t staging = image->cold ? bytes : saved->carry_bytes;
+    checkpoint_make_room(st, staging);
+    auto result = std::make_unique<CheckpointRead>(st.mm_checkpoint_accounting, staging,
         st.mm_archive.policy().enabled ? st.mm_archive.policy().host_bytes : SIZE_MAX);
-    result->recurrent.resize(saved->recurrent_bytes); result->carry.resize(saved->carry_bytes);
-    const auto lease = saved->native_image.lease();
+    result->carry.resize(saved->carry_bytes);
     SnapshotPhaseTimer timer{llama_kvmem_snapshot_phase::image_read};
-    kvmem::read_checkpoint_image(lease, uint64_t(reinterpret_cast<uintptr_t>(saved.get())),
-        {{result->recurrent.data(), result->recurrent.size()}, {result->carry.data(), result->carry.size()}});
-    if (!lease.data()) kvmem_diag("KVMEM_CHECKPOINT_TIER read_bytes=%zu cold=1\n", bytes);
+    if (image->cold) {
+        result->recurrent.resize(saved->recurrent_bytes);
+        kvmem::read_checkpoint_image(image->cold, uint64_t(reinterpret_cast<uintptr_t>(saved.get())),
+            {{result->recurrent.data(), result->recurrent.size()}, {result->carry.data(), result->carry.size()}});
+        st.mm_checkpoint_accounting->cold_reads.record(bytes);
+        kvmem_diag("KVMEM_CHECKPOINT_TIER read_bytes=%zu cold=1\n", bytes);
+    } else {
+        result->borrowed = image->hot.lease();
+        if (saved->carry_bytes)
+            std::memcpy(result->carry.data(), result->borrowed.data()+saved->recurrent_bytes, saved->carry_bytes);
+        st.mm_checkpoint_accounting->hot_reads.record(bytes);
+    }
     return result;
 }
 
@@ -1018,42 +1046,49 @@ static MultimodalCheckpoint multimodal_checkpoint(LlamaEngineState & st, int row
     const auto carry_bytes = st.spec.ok ? common_speculative_state_size(st.spec.spec, 0) : 0;
     auto storage = st.mm_checkpoint_accounting->storage();
     if (!storage) {
+        // Raw hot bytes must only spill through checkpoint_tier, which frames
+        // the chosen record into the execution's existing shared SSD file.
         storage = std::make_shared<kvmem::HostKvStorage>(
-            st.mm_archive.policy().enabled ? st.mm_archive.policy().host_bytes : UINT64_MAX,
-            kvmem_execution_spill_file(st.execution.get()));
+            st.mm_archive.policy().enabled ? st.mm_archive.policy().host_bytes : UINT64_MAX);
         std::atomic_store(&st.mm_checkpoint_accounting->storage_owner, storage);
     }
-    const auto image_bytes = kvmem::checkpoint_image_size(size + carry_bytes, 2);
-    const auto reserve = size + data->metadata_bytes() + carry_bytes;
-    checkpoint_make_room(st, optional ? 2*(reserve+image_bytes) : reserve+image_bytes, optional);
-    CheckpointHostReservation reservation(st.mm_checkpoint_accounting, reserve,
+    const size_t metadata = data->metadata_bytes();
+    if (carry_bytes > SIZE_MAX-size || carry_bytes > SIZE_MAX-metadata)
+        throw std::overflow_error("native checkpoint size overflow");
+    const size_t payload = size + carry_bytes;
+    const size_t staging = metadata + carry_bytes;
+    if (staging > SIZE_MAX-payload) throw std::overflow_error("native checkpoint admission overflow");
+    const size_t needed = payload + staging;
+    if (optional && needed > SIZE_MAX/2) throw std::overflow_error("optional native checkpoint admission overflow");
+    checkpoint_make_room(st, optional ? 2*needed : needed, optional);
+    CheckpointHostReservation reservation(st.mm_checkpoint_accounting, staging,
         st.mm_archive.policy().enabled ? st.mm_archive.policy().host_bytes : SIZE_MAX);
-    std::vector<uint8_t> recurrent(size), carry;
-    {
-        SnapshotPhaseTimer timer{llama_kvmem_snapshot_phase::native_capture};
-        if (llama_state_seq_get_data_ext(st.ctx, recurrent.data(), size, 0, flags) != size)
-            throw std::runtime_error("multimodal recurrent checkpoint failed");
-        {
-            kvmem_scoped_ms carry_timer(st.mm_perf.carry_ms);
-            if (st.spec.ok && !common_speculative_get_state(st.spec.spec, 0, carry, carry_bytes))
-                throw std::runtime_error("MTP carry checkpoint failed");
-        }
-    }
+    auto image = std::make_shared<LlamaCheckpointBacking>();
     {
         SnapshotPhaseTimer timer{llama_kvmem_snapshot_phase::image_allocate};
-        data->native_image = storage->allocate(image_bytes);
+        image->hot = storage->allocate(payload);
     }
-    {
-        SnapshotPhaseTimer timer{llama_kvmem_snapshot_phase::image_write};
-        kvmem::write_checkpoint_image(data->native_image, uint64_t(reinterpret_cast<uintptr_t>(data.get())),
-            {{recurrent.data(), recurrent.size()}, {carry.data(), carry.size()}});
-    }
-    data->native_image.seal();
-    data->residency = data->native_image.lease();
-    data->recurrent_bytes = recurrent.size(); data->carry_bytes = carry.size();
     st.mm_checkpoint_accounting->observe();
+    {
+        SnapshotPhaseTimer timer{llama_kvmem_snapshot_phase::native_capture};
+        auto * target = payload ? image->hot.writable_data() : nullptr;
+        if (llama_state_seq_get_data_ext(st.ctx, target, size, 0, flags) != size)
+            throw std::runtime_error("multimodal recurrent checkpoint failed");
+        if (st.spec.ok) {
+            kvmem_scoped_ms carry_timer(st.mm_perf.carry_ms);
+            std::vector<uint8_t> carry;
+            if (!common_speculative_get_state(st.spec.spec, 0, carry, carry_bytes) || carry.size() != carry_bytes)
+                throw std::runtime_error("MTP carry checkpoint failed");
+            if (carry_bytes) std::memcpy(target+size, carry.data(), carry_bytes);
+        }
+    }
+    image->hot.seal();
+    data->backing = std::move(image);
+    data->recurrent_bytes = size;
+    data->carry_bytes = carry_bytes;
     reservation.publish(data->metadata_bytes());
-    llama_kvmem_record_snapshot_capture(llama_kvmem_capture_plane::native_state, recurrent.size()+carry.size());
+    st.mm_checkpoint_accounting->created.record(payload);
+    llama_kvmem_record_snapshot_capture(llama_kvmem_capture_plane::native_state, payload);
     data->accounting = st.mm_checkpoint_accounting;
     result.data = std::move(data);
     st.mm_live_checkpoint = result.data;
@@ -1107,8 +1142,8 @@ static void multimodal_restore(LlamaEngineState & st, const MultimodalCheckpoint
             throw std::runtime_error("immutable attention checkpoint restore failed");
     }
     const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    if (!live && llama_state_seq_set_data_ext(st.ctx, restore_data->recurrent.data(),
-            restore_data->recurrent.size(), 0, flags) != restore_data->recurrent.size()) {
+    if (!live && llama_state_seq_set_data_ext(st.ctx, restore_data->recurrent_data(),
+            checkpoint.data->recurrent_bytes, 0, flags) != checkpoint.data->recurrent_bytes) {
         throw std::runtime_error("multimodal recurrent restore failed");
     }
     if (!llama_kvmem_remove_logical(st.ctx, checkpoint.row, -1)) {
@@ -1610,7 +1645,7 @@ static void multimodal_commit(LlamaEngineState & st, const std::vector<llama_tok
         const auto report = [&](const MultimodalCheckpoint& cp) {
             if (cp.data && seen.insert(cp.data.get()).second)
                 kvmem_diag("KVMEM_CHECKPOINT_DIRECTORY frontier=%d cold=%d bytes=%zu identity=%p\n",
-                    cp.row, int(cp.data->native_image.resident_bytes() == 0), cp.data->bytes(), (const void*)cp.data.get());
+                    cp.row, int(cp.data->hot_bytes() == 0), cp.data->bytes(), (const void*)cp.data.get());
         };
         for (const auto& cp:st.mm_checkpoints) report(cp);
         for (const auto& entry:st.mm_archive) if(entry.info.identity) report(entry.record);
