@@ -263,10 +263,51 @@ void statistics_budget() {
         const auto before=global->used();
         rejects([&]{b.set_messages(spans);});
         require(global->used()==before && !b.messages,"failed global admission changed its snapshot");
-        rejects([&]{auto copy=a;});
-        require(global->used()==before,"failed snapshot allocation leaked a budget lease");
+        auto copy = a;
+        require(copy.messages == a.messages && global->used() == before + sizeof(copy),
+            "a fork charged its shared messages twice");
+        copy.include_feedback(128);
+        require(global->used() == before + sizeof(copy) + 128, "private feedback lost its charge");
+        auto tight = std::make_shared<kvmem::GraphStatisticsBudget>(1024, global);
+        const auto charged = global->used();
+        rejects([&]{copy.set_budget(tight);});
+        require(!tight->used() && global->used() == charged && copy.budget() == first,
+            "failed rebind leaked an ancestor charge or changed the published owner");
+        copy.set_budget(second);
+        b.set_messages(a.messages);
+        require(global->used() == before + sizeof(copy) + 128, "sibling budgets duplicated the parent charge");
+        a.set_budget({});
+        require(first->used() == 0 && second->used() == global->used(),
+            "rebind retained the old budget or released the last shared charge");
+        const auto held = global->used();
+        rejects([&]{copy.include_feedback(40000);});
+        require(global->used() == held && copy.messages == b.messages, "failed private growth changed shared state");
     }
     require(!global->used() && !first->used() && !second->used(),"retired graph snapshots retained budget charges");
+}
+void forked_graph_budget() {
+    auto budget = std::make_shared<kvmem::GraphStatisticsBudget>(32u << 20);
+    {
+        kvmem::GraphSnapshot source;
+        source.set_budget(budget);
+        source.block_tokens = 1;
+        source.set_messages(std::vector<kvmem::GraphMessageSpan>(262144));
+        source = kvmem::prepare_graph_accept(source, 0, 2, {{1, {{0, 1.0}}}}, 32u << 20);
+        const auto before = budget->used();
+        std::vector<kvmem::GraphSnapshot> branches(8, source);
+        require(budget->used() - before < 8192, "forks duplicated the shared history charge");
+        auto& branch = branches.front();
+        require(branch.chunks.front() == source.chunks.front(), "fork copied an immutable chunk");
+        auto held = budget->used();
+        branch = kvmem::prepare_graph_accept(branch, 2, 3, {{2, {{0, 1.0}}}}, 32u << 20);
+        require(source.chunks.front()->size() == 1 && branch.chunks.front()->size() == 2 &&
+            branch.chunks.front() != source.chunks.front() && budget->used() > held,
+            "copy-on-write tail was not charged independently");
+        rejects([&]{branch.set_messages(std::vector<kvmem::GraphMessageSpan>(1200000));});
+        require(branch.messages == source.messages && source.accepted_through == 2,
+            "rejected allocation damaged a published branch");
+    }
+    require(budget->used() == 0, "fork retirement leaked graph budget");
 }
 void message_locality() {
     kvmem::GraphSnapshot graph;graph.block_tokens=64;
@@ -282,7 +323,7 @@ void message_locality() {
 } // namespace
 int main() {
     try {
-        frames_and_scores(); gqa_and_large_domain(); scorer_variants(); graph_lifecycle(); orthogonal_query_scoring(); feedback_and_pressure(); accepted_sampling(); fixed_picker(); statistics_budget(); message_locality();
+        frames_and_scores(); gqa_and_large_domain(); scorer_variants(); graph_lifecycle(); orthogonal_query_scoring(); feedback_and_pressure(); accepted_sampling(); fixed_picker(); statistics_budget(); forked_graph_budget(); message_locality();
         std::cout << "graph recall numerical and accepted-state checks passed\n";
         return 0;
     } catch (const std::exception& e) {

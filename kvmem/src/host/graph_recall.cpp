@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
@@ -23,7 +24,43 @@ public:
     explicit GraphBudgetLease(std::shared_ptr<GraphStatisticsBudget> budget):budget_(std::move(budget)) {
         if(budget_->parent_) parent_=std::make_unique<GraphBudgetLease>(budget_->parent_);
     }
-    ~GraphBudgetLease(){budget_->release(bytes_);}
+    ~GraphBudgetLease() {
+        if (!allocation_) {
+            budget_->release(bytes_);
+            return;
+        }
+        auto& book = registry();
+        std::lock_guard lock(book.mutex);
+        auto it = book.refs.find({budget_.get(), allocation_});
+        if (--it->second == 0) {
+            budget_->release(bytes_);
+            book.refs.erase(it);
+        }
+    }
+
+    // One charge per immutable allocation at each level of the budget tree.
+    // A newly allocated vector may already have a private reservation.
+    void seal(const void* allocation, size_t bytes) {
+        if (parent_) parent_->seal(allocation, bytes);
+        auto& book = registry();
+        std::lock_guard lock(book.mutex);
+        auto [it, inserted] = book.refs.try_emplace({budget_.get(), allocation}, 0);
+        if (inserted) {
+            try {
+                if (bytes > bytes_) budget_->acquire(bytes - bytes_);
+                else budget_->release(bytes_ - bytes);
+            } catch (...) {
+                book.refs.erase(it);
+                throw;
+            }
+        } else {
+            budget_->release(bytes_);
+        }
+        ++it->second;
+        allocation_ = allocation;
+        bytes_ = bytes;
+    }
+    const auto& budget() const { return budget_; }
     void resize(size_t bytes) {
         const auto old=bytes_;
         if(bytes>old) {
@@ -37,18 +74,70 @@ public:
         bytes_=bytes;
     }
 private:
+    struct Registry {
+        std::mutex mutex;
+        std::map<std::pair<const GraphStatisticsBudget*, const void*>, size_t> refs;
+    };
+    static Registry& registry() {
+        // Budgeted snapshots may also live in objects with static lifetime.
+        static auto* book = new Registry;
+        return *book;
+    }
+    const void* allocation_ = nullptr;
     std::shared_ptr<GraphStatisticsBudget> budget_;
     std::unique_ptr<GraphBudgetLease> parent_;
     size_t bytes_=0;
 };
+namespace {
+size_t checked_sum(size_t a, size_t b) {
+    if (b > SIZE_MAX - a) throw std::length_error("graph accounting overflow");
+    return a + b;
+}
+size_t private_bytes(const GraphSnapshot& graph) {
+    return sizeof(graph) + graph.chunks.capacity() * sizeof(graph.chunks[0]) +
+        graph.partial.mass.capacity() * sizeof(GraphEdge);
+}
+size_t payload_bytes(const std::vector<GraphMessageSpan>& spans) {
+    return sizeof(spans) + spans.capacity() * sizeof(GraphMessageSpan);
+}
+size_t payload_bytes(const std::vector<GraphRow>& chunk) {
+    size_t bytes = sizeof(chunk) + chunk.capacity() * sizeof(GraphRow);
+    for (const auto& row : chunk) bytes = checked_sum(bytes, row.edges.capacity() * sizeof(GraphEdge));
+    return bytes;
+}
+// Keep the original shared owner and the charge together. Rebinding to a
+// sibling budget reuses the underlying allocation and its ancestor charge.
+template<class T> struct PayloadOwner {
+    std::shared_ptr<GraphBudgetLease> charge;
+    std::shared_ptr<const T> storage;
+    void operator()(const T*) noexcept { charge.reset(); storage.reset(); }
+};
+template<class T>
+std::shared_ptr<const T> bind_payload(std::shared_ptr<const T> data,
+    const std::shared_ptr<GraphStatisticsBudget>& budget, std::shared_ptr<GraphBudgetLease> prepaid = {}) {
+    if (!data) return {};
+    if (auto* owner = std::get_deleter<PayloadOwner<T>>(data)) {
+        if (owner->charge->budget() == budget) return data;
+        auto storage = owner->storage;
+        data = std::move(storage);
+    }
+    if (!budget) return data;
+    auto charge = prepaid ? std::move(prepaid) : std::make_shared<GraphBudgetLease>(budget);
+    charge->seal(data.get(), payload_bytes(*data));
+    const auto* ptr = data.get();
+    return std::shared_ptr<const T>(ptr, PayloadOwner<T>{std::move(charge), std::move(data)});
+}
+} // namespace
 GraphSnapshot::GraphSnapshot(const GraphSnapshot& other):budget_(other.budget_),feedback_bytes_(other.feedback_bytes_) {
     if(budget_) {
         lease_=std::make_shared<GraphBudgetLease>(budget_);
-        lease_->resize(other.bytes()+feedback_bytes_);
+        lease_->resize(checked_sum(sizeof(*this) + other.chunks.size()*sizeof(chunks[0]) +
+            other.partial.mass.size()*sizeof(GraphEdge), feedback_bytes_));
     }
     accepted_through=other.accepted_through;completed_through=other.completed_through;
     revision=other.revision;epoch=other.epoch;block_tokens=other.block_tokens;
     chunks=other.chunks;partial=other.partial;messages=other.messages;
+    reserve_extra(0);
 }
 GraphSnapshot& GraphSnapshot::operator=(GraphSnapshot&& other) noexcept {
     if(this==&other) return *this;
@@ -61,30 +150,39 @@ GraphSnapshot& GraphSnapshot::operator=(GraphSnapshot&& other) noexcept {
     return *this;
 }
 void GraphSnapshot::set_budget(std::shared_ptr<GraphStatisticsBudget> budget) {
-    if(!budget) {lease_.reset();budget_.reset();return;}
-    auto lease=std::make_shared<GraphBudgetLease>(budget);
-    lease->resize(bytes()+feedback_bytes_);
-    budget_=std::move(budget);lease_=std::move(lease);
+    if (budget == budget_) return;
+    std::shared_ptr<GraphBudgetLease> lease;
+    if (budget) {
+        lease = std::make_shared<GraphBudgetLease>(budget);
+        lease->resize(checked_sum(private_bytes(*this), feedback_bytes_));
+    }
+    auto rebound = chunks;
+    for (auto& chunk : rebound) chunk = bind_payload(chunk, budget);
+    auto spans = bind_payload(messages, budget);
+    // Preserve the existing pointer-vector capacity covered by the private lease.
+    std::move(rebound.begin(), rebound.end(), chunks.begin());
+    messages = std::move(spans);
+    budget_ = std::move(budget);
+    lease_ = std::move(lease);
 }
 void GraphSnapshot::reserve_extra(size_t bytes) {
-    if(lease_) {
-        if(bytes>SIZE_MAX-this->bytes()-feedback_bytes_) throw std::length_error("graph accounting overflow");
-        lease_->resize(this->bytes()+feedback_bytes_+bytes);
-    }
+    if (lease_) lease_->resize(checked_sum(checked_sum(private_bytes(*this), feedback_bytes_), bytes));
 }
 void GraphSnapshot::include_feedback(size_t bytes) {
-    if(lease_) lease_->resize(this->bytes()+bytes);
-    feedback_bytes_=bytes;
+    if (lease_) lease_->resize(checked_sum(private_bytes(*this), bytes));
+    feedback_bytes_ = bytes;
 }
 void GraphSnapshot::set_messages(const std::vector<GraphMessageSpan>& spans) {
-    reserve_extra(sizeof(spans)+spans.size()*sizeof(GraphMessageSpan));
-    messages=std::make_shared<const std::vector<GraphMessageSpan>>(spans);
-    reserve_extra(0);
+    std::shared_ptr<GraphBudgetLease> prepaid;
+    if (budget_) {
+        prepaid = std::make_shared<GraphBudgetLease>(budget_);
+        prepaid->resize(sizeof(spans) + spans.size() * sizeof(GraphMessageSpan));
+    }
+    auto data = std::make_shared<const std::vector<GraphMessageSpan>>(spans);
+    messages = bind_payload(std::move(data), budget_, std::move(prepaid));
 }
 void GraphSnapshot::set_messages(std::shared_ptr<const std::vector<GraphMessageSpan>> spans) {
-    if(messages==spans) return;
-    reserve_extra(spans ? sizeof(*spans)+spans->capacity()*sizeof(GraphMessageSpan) : 0);
-    messages=std::move(spans);reserve_extra(0);
+    if (messages != spans) messages = bind_payload(std::move(spans), budget_);
 }
 namespace {
 void check(bool ok, const char* message) {
@@ -119,7 +217,7 @@ void append_row(GraphSnapshot& next, GraphRow row) {
         next.chunks.pop_back();
     }
     chunk.push_back(std::move(row));
-    next.chunks.push_back(std::make_shared<const std::vector<GraphRow>>(std::move(chunk)));
+    next.chunks.push_back(bind_payload(std::make_shared<const std::vector<GraphRow>>(std::move(chunk)), next.budget()));
 }
 void seal(GraphSnapshot& next, uint32_t topk) {
     if (next.partial.samples) {
@@ -316,13 +414,9 @@ std::vector<double> mean_query_cosine_scores(const RawKvStore& keys, PageQueryVi
 }
 
 size_t GraphSnapshot::bytes() const {
-    size_t total = sizeof(*this) + chunks.capacity()*sizeof(chunks[0]) +
-        partial.mass.capacity()*sizeof(GraphEdge) +
-        (messages ? sizeof(*messages)+messages->capacity()*sizeof(GraphMessageSpan) : 0);
-    for (const auto& chunk : chunks) {
-        total += sizeof(*chunk) + chunk->capacity()*sizeof(GraphRow);
-        for (const auto& row : *chunk) total += row.edges.capacity()*sizeof(GraphEdge);
-    }
+    size_t total = private_bytes(*this);
+    if (messages) total = checked_sum(total, payload_bytes(*messages));
+    for (const auto& chunk : chunks) total = checked_sum(total, payload_bytes(*chunk));
     return total;
 }
 
