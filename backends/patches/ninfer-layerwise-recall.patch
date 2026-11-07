@@ -8753,7 +8753,7 @@ index 9c69887501be5ead088a9a3ed4a0d4ac4e614b37..da53dd933c0d9c3b0eed37001be8eb2f
          }
          memory.host_payload_bytes = memory_payload_storage.charged_bytes();
 diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
-index 06388327c1f504b93265632b5a5b2ba7b61a63b3..627b22fc37bbdedbf12e4ec877486dbcba5877fd 100644
+index 06388327c1f504b93265632b5a5b2ba7b61a63b3..df46bb53d97f283eaf2a752db1515a2d9ea61b61 100644
 --- a/src/models/qwen3_5/program/program_impl.h
 +++ b/src/models/qwen3_5/program/program_impl.h
 @@ -1,3 +1,5 @@
@@ -8950,7 +8950,7 @@ index 06388327c1f504b93265632b5a5b2ba7b61a63b3..627b22fc37bbdedbf12e4ec877486dbc
      bool memory_query_probe(const SequenceState& sequence, std::uint32_t prompt_tokens) const;
      [[nodiscard]] std::uint32_t memory_checkpoint_frontier(const SequenceState& sequence,
          std::uint32_t prompt_tokens, bool allow_reuse) const;
-@@ -2169,6 +2241,11 @@ private:
+@@ -2169,11 +2241,17 @@ private:
      bool complete_memory_checkpoint(const SequenceState& sequence, const KvmemPrefixCheckpoint& checkpoint) const;
      void prune_completed_memory_checkpoints(SequenceState& sequence);
      std::unique_ptr<KvmemPrefixCheckpoint> capture_memory_checkpoint(SequenceState& sequence, bool optional = false);
@@ -8962,7 +8962,13 @@ index 06388327c1f504b93265632b5a5b2ba7b61a63b3..627b22fc37bbdedbf12e4ec877486dbc
      void capture_memory_coverage(SequenceState& sequence, uint32_t chunk_tokens) noexcept;
      bool skip_memory_coverage(const SequenceState& sequence) const;
      void progress_checkpoint_coverage(KvmemWindowState& window, bool force = false);
-@@ -2185,6 +2262,11 @@ private:
+     void checkpoint_memory_room(KvmemWindowState& window, size_t bytes, bool optional = false);
+     std::unique_ptr<KvmemCoverageTransfer> memory_coverage_transfer;
++    bool reclaim_endpoint_metadata(std::uint64_t shortfall);
+     void capture_memory_endpoint(SequenceState& sequence, const RequestControl& request) noexcept;
+     void capture_memory_rewrite(SequenceState& sequence, KvmemCheckpointKind kind) noexcept;
+     void capture_memory_reconstruction_if_ready(SequenceState& sequence);
+@@ -2185,6 +2263,11 @@ private:
      bool rewind_memory_query(SequenceState& sequence);
      void restore_memory_prefix(SequenceState& sequence, const KvmemPrefixCheckpoint& checkpoint,
                                 bool preserve_view = false, bool allow_pending = false, bool resident_native = false);
@@ -9320,7 +9326,7 @@ index dabe058a05fc33ab390c1a3703dd68399926ed09..570dca8e2ad19a742355d3fa5670df7b
 +}
  } // namespace ninfer::models::qwen3_5
 diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
-index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33d7c56ed5 100644
+index 7033de726d4c32e201246deb80e65ad7b0fa22e2..135c865ab0ed1f0af8f8687a80ca09781959b181 100644
 --- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
 +++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 @@ -1,13 +1,26 @@
@@ -10877,7 +10883,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
          window.graph.accepted_through!=frontier ||
          !sequence.tail_hidden_valid || sequence.state.fork_pending ||
          (backend_kv_pages && sequence.mtp_kv_valid != frontier)) {
-@@ -1360,14 +2451,54 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
+@@ -1360,14 +2451,57 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
      const auto& statistics = window.statistics->config();
      const auto mean_bytes = frontier % statistics.block_tokens
          ? size_t(statistics.n_layer) * (size_t(statistics.n_embd_k) + 1) * sizeof(float) : 0;
@@ -10907,8 +10913,11 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
 +        const auto feedback_bytes=window.layer_views.feedback->allocated_bytes();
 +        if (credit && feedback_bytes>credit->feedback_bound)
 +            throw std::logic_error("native checkpoint feedback exceeds its Waiting snapshot bound");
-+        auto feedback_charge=credit?credit->metadata.split(feedback_bytes):
-+            reserve_native_source_feedback(layerwise_source_account,feedback_bytes);
++        NativeSourceVersionCharge feedback_charge;
++        if (credit) feedback_charge=credit->metadata.split(feedback_bytes);
++        else if (role==NativeLayerwiseCheckpointRole::Endpoint && layerwise_source_account)
++            feedback_charge=layerwise_source_account->reserve(feedback_bytes);
++        else feedback_charge=reserve_native_source_feedback(layerwise_source_account,feedback_bytes);
 +        checkpoint_feedback=window.layer_views.feedback->funded_copy(std::move(feedback_charge));
 +    }
 +    NativeSourceVersionCharge admitted_index;
@@ -10934,7 +10943,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      auto checkpoint = std::make_unique<KvmemPrefixCheckpoint>();
      checkpoint->immutable_origin=next_checkpoint_origin.fetch_add(1);
      checkpoint->identity = std::move(identity);
-@@ -1380,9 +2511,30 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
+@@ -1380,9 +2514,30 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
      checkpoint->graph=window.graph;
      checkpoint->feedback=window.feedback.snapshot();
      checkpoint->attention_scope=window.attention_scope;
@@ -10965,7 +10974,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      archive_memory_window(sequence);
      std::shared_ptr<const kvmem::KvSnapshot> previous;
      for (const auto kind : checkpoint_kinds(window)) {
-@@ -1418,7 +2570,6 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
+@@ -1418,7 +2573,6 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
          });
          return added_metadata;
      };
@@ -10973,7 +10982,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      do {
          added_metadata = incremental_metadata();
          checkpoint_memory_room(window,(optional ? 2*bytes : bytes)+added_metadata,optional);
-@@ -1426,12 +2577,13 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
+@@ -1426,12 +2580,13 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
          // Re-evaluate the candidate's incremental metadata after that reclamation.
      } while (incremental_metadata() > added_metadata);
      checkpoint->state = memory_checkpoint_pool->acquire(bytes);
@@ -10988,7 +10997,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      if (kvmem_options.verify_transfers) {
          std::fprintf(stderr, "KVMEM_PREFIX_CHECKPOINT frontier=%u state_bytes=%zu metadata_bytes=%llu admitted_metadata_bytes=%zu\n",
              frontier, bytes, (unsigned long long)checkpoint->metadata_bytes(), added_metadata);
-@@ -1444,6 +2596,8 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
+@@ -1444,6 +2599,8 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
                  (unsigned long long)charged, (unsigned long long)(window.coverage.policy().host_bytes*max_concurrency));
          }
      }
@@ -10997,7 +11006,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      return checkpoint;
  }
  
-@@ -1505,7 +2659,9 @@ std::uint32_t ProgramImpl::memory_reuse_anchor(const PreparedPromptData& prompt,
+@@ -1505,7 +2662,9 @@ std::uint32_t ProgramImpl::memory_reuse_anchor(const PreparedPromptData& prompt,
                                               std::uint32_t observed) const {
      const auto end = prompt.token_ids.size() > 0 ? prompt.token_ids.size() - 1 : 0;
      const auto workspace=backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0;
@@ -11008,7 +11017,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
          ? std::max<std::size_t>(base, memory_query_span(prompt).begin) : std::max<std::size_t>(base, end);
      std::vector<kvmem::PrefixRange> groups;
      for (const auto& item : prompt.vision_items) {
-@@ -1515,7 +2671,10 @@ std::uint32_t ProgramImpl::memory_reuse_anchor(const PreparedPromptData& prompt,
+@@ -1515,7 +2674,10 @@ std::uint32_t ProgramImpl::memory_reuse_anchor(const PreparedPromptData& prompt,
              groups.push_back({first.begin, last.begin + last.count});
          }
      }
@@ -11020,9 +11029,47 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
  }
  
  void ProgramImpl::capture_memory_anchor(SequenceState& sequence, std::uint32_t chunk_tokens) noexcept {
-@@ -1549,6 +2708,10 @@ void ProgramImpl::capture_memory_anchor(SequenceState& sequence, std::uint32_t c
+@@ -1548,7 +2710,48 @@ void ProgramImpl::capture_memory_anchor(SequenceState& sequence, std::uint32_t c
+     }
  }
  
++bool ProgramImpl::reclaim_endpoint_metadata(std::uint64_t shortfall) {
++    // Capture has unwound. Aliases can keep a removed history's bytes live.
++    const auto& account=layerwise_source_account;
++    const auto before=account->charged_bytes();
++    if (shortfall>before) return false;
++    const auto target=before-shortfall;
++    memory_checkpoint_pool->trim();
++    while (account->charged_bytes()>target) {
++        const auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_);
++        std::vector<kvmem::ContentCacheSlot> slots(memory_histories.size());
++        for (std::size_t i=0;i<memory_histories.size();++i) {
++            const auto& history=memory_histories[i];
++            if (!history) continue;
++            const auto generation=history->stamp.session.id;
++            bool pinned=std::any_of(requests.begin(),requests.end(),[&](const auto& active) {
++                return active.prefill && active.prefill->memory_restore_generation==generation;
++            });
++            pinned|=transaction && transaction->memory_history &&
++                    transaction->memory_history->generation==generation;
++            pinned|=memory_idle_transfer && memory_idle_transfer->history==i;
++            if (memory_coverage_transfer) visit_memory_checkpoints(*history,[&](const auto& cp) {
++                pinned|=&cp==memory_coverage_transfer->checkpoint.get();
++            });
++            slots[i]={true,pinned,history->publication_order,&*history,history->cache_group};
++        }
++        const auto victim=kvmem::select_content_eviction(slots);
++        if (!victim) return false;
++        memory_histories[*victim].reset();
++        ++memory_history_evictions;
++        memory_checkpoint_pool->trim();
++        if (kvmem_options.verify_transfers) std::fprintf(stderr,
++            "KVMEM_ENDPOINT eviction slot=%zu source_used=%llu target=%llu\n",*victim,
++            (unsigned long long)account->charged_bytes(),(unsigned long long)target);
++    }
++    return true;
++}
++
  void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const RequestControl& request) noexcept {
 +    if (sequence.window.layerwise_request) {
 +        try {sequence.window.layerwise_request->retire();sequence.window.layerwise_request.reset();}
@@ -11031,7 +11078,26 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      if (!kvmem_window_tokens || !request.allow_memory_reuse || !sequence.window.statistics ||
          request.lifecycle != Lifecycle::Finishable) return;
      try {
-@@ -1588,6 +2751,12 @@ void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const Request
+@@ -1575,7 +2778,17 @@ void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const Request
+             checkpoint && checkpoint->prefix.size() == frontier) return;
+     try {
+         const auto started = Clock::now();
+-        sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::Endpoint).data = capture_memory_checkpoint(sequence);
++        for (;;) {
++            try {
++                auto checkpoint=capture_memory_checkpoint(sequence,NativeLayerwiseCheckpointRole::Endpoint,false);
++                memory_checkpoint_slot(sequence.window,KvmemCheckpointKind::Endpoint)=std::move(checkpoint);
++                break;
++            } catch (const NativeSourceQuotaExceeded& failure) {
++                if (!layerwise_source_account || failure.account!=layerwise_source_account.get() ||
++                    failure.growth>layerwise_source_account->limit() || !reclaim_endpoint_metadata(failure.shortfall))
++                    throw;
++            }
++        }
+         sequence.window.coverage.remember(sequence.window.checkpoints.slot(kvmem::CheckpointPurpose::Endpoint),kvmem::CoveragePurpose::Endpoint);
+         progress_checkpoint_coverage(sequence.window);
+         if (kvmem_options.verify_transfers)
+@@ -1588,6 +2801,12 @@ void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const Request
  
  bool ProgramImpl::memory_user_already_evaluated(const PreparedPromptData& prompt,
                                                 std::uint32_t frontier) const {
@@ -11044,7 +11110,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      if (!prompt.memory_query) return false;
      const auto query = memory_query_span(prompt);
      // Caller proved the complete token/position prefix. Continuation is an
-@@ -1683,27 +2852,74 @@ bool ProgramImpl::rewind_memory_query(SequenceState& sequence) {
+@@ -1683,27 +2902,74 @@ bool ProgramImpl::rewind_memory_query(SequenceState& sequence) {
  
  void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPrefixCheckpoint& checkpoint,
                                          bool preserve_view, bool allow_pending, bool resident_native) {
@@ -11122,7 +11188,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
                                             : fork_kvmem_snapshot(*checkpoint.kv_snapshot);
      if (resident_native) {
          if (window.archive.size() < pages || window.host_versions.size() < pages)
-@@ -1712,6 +2928,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
+@@ -1712,6 +2978,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
              if (!window.archive[id] || window.host_versions[id] != valid_columns(id, frontier))
                  throw std::logic_error("KVMem prepared checkpoint has an incomplete native prefix");
      }
@@ -11130,7 +11196,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      if(checkpoint.graph.accepted_through!=frontier || checkpoint.graph.block_tokens!=page_tokens)
          throw std::logic_error("KVMem checkpoint graph has a different accepted prefix");
      if (!checkpoint.state) {
-@@ -1726,8 +2943,13 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
+@@ -1726,8 +2993,13 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
      restored_graph.set_messages(window.request_messages);
      auto restored_feedback=window.feedback;
      restored_feedback.restore(checkpoint.feedback);
@@ -11146,7 +11212,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      window.selector->truncate_to(frontier);
      if (preserve_view) window.selector->restore_retrieval(checkpoint.history);
      window.graph=std::move(restored_graph);
-@@ -1737,7 +2959,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
+@@ -1737,7 +3009,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
      // generation parser state. A resumed native continuation restores its own.
      if(preserve_view) window.attention_scope=checkpoint.attention_scope;
      window.statistics_frontier = frontier;
@@ -11155,7 +11221,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      window.archive.resize(pages);
      window.host_versions.resize(pages);
      for (uint32_t page = 0; page < pages; ++page)
-@@ -1754,7 +2976,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
+@@ -1754,7 +3026,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
      if (speculative_backend == SpeculativeBackend::DFlash2) {
          sequence.dflash_context_frontier = frontier;
          const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
@@ -11164,7 +11230,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
              ? static_cast<std::uint32_t>(frontier - recent) : 0U;
          runtime::clamp_dflash_context_floor(sequence.dflash_context_floor,
                                              sequence.dflash_context_frontier);
-@@ -1777,7 +2999,92 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
+@@ -1777,7 +3049,92 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
              throw std::logic_error("KVMem query StateImage restore changed native bytes");
          }
      }
@@ -11258,7 +11324,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
          auto restored = std::make_shared<WindowMemoryBackend>(*this, sequence, frontier, resident_native);
          kvmem::MemorySession session(restored);
          // A checkpoint includes already appended reserve rows. Restore its exact
-@@ -1791,6 +3098,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
+@@ -1791,6 +3148,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
                  memory_io->wait_for_completion(epoch, std::chrono::milliseconds(1));
          }
          session.publish();
@@ -11266,7 +11332,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      } else {
          prepare_window(sequence, frontier, frontier, true, allow_pending,kvmem::SelectionReason::Query);
      }
-@@ -1817,7 +3125,8 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+@@ -1817,7 +3175,8 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
      PrefixShortlistDigests incoming;
      std::optional<KvmemHistoryMatch> best;
      bool fork=false;
@@ -11276,7 +11342,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      {
          std::vector<Candidate> candidates;
          for (size_t index=0; index<memory_histories.size(); ++index) {
-@@ -1851,8 +3160,8 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+@@ -1851,8 +3210,8 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
                  }
                  uint64_t cold=cp->state ? 0 : cp->state_bytes();
                  for(const auto page:cp->resident_pages) {
@@ -11287,7 +11353,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
                      if(!record) { cold=UINT64_MAX; break; }
                      if(!record.resident_bytes()) cold+=record.size();
                  }
-@@ -1875,12 +3184,18 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+@@ -1875,12 +3234,18 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
              const auto& checkpoint=*candidate.checkpoint;
              const auto& history=*memory_histories[candidate.match.history];
              const auto frontier=candidate.match.frontier;
@@ -11307,7 +11373,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
                      text_host_kv_page_stride + backend_host_kv_page_stride);
              for(const auto page:checkpoint.resident_pages) complete=complete && page<pages;
              if(!complete) { ++incomplete; continue; }
-@@ -1890,6 +3205,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+@@ -1890,6 +3255,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
                  ++prefix_rejected; continue;
              }
              if(!checkpoint.prefix_identity.matches(prompt,frontier)) { ++identity_rejected; continue; }
@@ -11315,7 +11381,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
              const auto query=memory_query_span(prompt);
              const auto workspace=backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0;
              const auto admission=kvmem::query_replay_plan({query.begin,query.begin+query.count},query.begin,
-@@ -1900,6 +3216,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+@@ -1900,6 +3266,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
                  prompt.token_ids.size()+workspace>kvmem_window_tokens;
              if(admission.admitted && needs_recall && prompt.memory_query && frontier>query.begin &&
                 !memory_user_already_evaluated(prompt,frontier)) { ++query_rejected; continue; }
@@ -11323,7 +11389,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
              best=candidate.match; fork=true; break;
          }
      }
-@@ -1914,7 +3231,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+@@ -1914,7 +3281,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
  std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
      const KvmemWindowState& source, const KvmemPrefixCheckpoint& checkpoint) {
      const auto frontier = static_cast<uint32_t>(checkpoint.prefix.size());
@@ -11332,7 +11398,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      const auto started=Clock::now();
      const auto pages=kv_pages_for_tokens(frontier);
      std::unordered_map<const KvmemPrefixCheckpoint*,std::shared_ptr<KvmemPrefixCheckpoint>> copies;
-@@ -1926,6 +3243,11 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+@@ -1926,6 +3293,11 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
      }
      // Optional optimization: never evict the source to make room for its fork.
      checkpoint_memory_room(const_cast<KvmemWindowState&>(source),metadata,true);
@@ -11344,7 +11410,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      auto child=std::make_unique<KvmemWindowState>();
      child->cache_group=source.cache_group;
      child->stamp=source.stamp;
-@@ -1933,7 +3255,14 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+@@ -1933,7 +3305,14 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
      child->stamp.frontier=frontier;
      child->stamp.history_revision=1;
      child->stamp.execution_history=1;
@@ -11360,7 +11426,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      child->statistics_frontier=frontier;
      child->selector=std::make_unique<kvmem::KvMemStore>(*source.selector);
      child->selector->truncate_to(frontier);
-@@ -1945,8 +3274,18 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+@@ -1945,8 +3324,18 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
      child->coverage.truncate(frontier);
      child->checkpoints=source.checkpoints;
      for(auto& [original,copy]:copies) {
@@ -11379,7 +11445,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      }
      for(const auto kind:kKvmemCheckpointKinds) {
          auto& cp=memory_checkpoint_slot(*child,kind);
-@@ -1958,10 +3297,10 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+@@ -1958,10 +3347,10 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
          entry.info.bytes=entry.record.checkpoint_info().bytes;
      }
      child->host_versions.resize(pages);
@@ -11392,7 +11458,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      if(kvmem_options.verify_transfers) std::fprintf(stderr,
          "KVMEM_HISTORY_FORK frontier=%u shared_kv_bytes=%llu metadata_bytes=%zu statistics_bytes=%zu fork_us=%.3f\n",
          frontier,(unsigned long long)child->payload_bytes,metadata,child->statistics->allocated_bytes(),
-@@ -1969,8 +3308,197 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+@@ -1969,8 +3358,197 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
      return child;
  }
  
@@ -11590,7 +11656,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
      if(!staged.memory_restore_frontier || !staged.memory_restore_generation) return true;
      auto& pending=transaction.memory_history;
      try {
-@@ -1990,8 +3518,8 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+@@ -1990,8 +3568,8 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
                  for(const auto& active:requests) required+=active.memory_payload_reservation;
                  const auto* checkpoint=memory_checkpoint(source,match->kind);
                  const auto full_pages=match->frontier/page_tokens;
@@ -11601,7 +11667,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
                      const bool selected=std::find(checkpoint->resident_pages.begin(),checkpoint->resident_pages.end(),page)!=checkpoint->resident_pages.end();
                      const bool shared=page<full_pages && page!=(match->frontier-1)/page_tokens &&
                          (!selected || record.resident_bytes());
-@@ -2093,6 +3621,77 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+@@ -2093,6 +3671,77 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
          pending.reset(); staged.memory_restore_generation=0;
          return true;
      }
@@ -11679,7 +11745,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
  }
  
  bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl::Prefill& staged) {
-@@ -2141,8 +3740,13 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
+@@ -2141,8 +3790,13 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
      auto* materialization = std::get_if<MaterializationTransaction>(&context_transaction_);
      const bool resident_native = materialization && materialization->memory_history &&
          materialization->memory_history->native_ready;
@@ -11695,7 +11761,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
  
      // A pre-Query checkpoint already owns an uncommitted round whose scores
      // are the preceding committed history. Reuse it when editing that Query.
-@@ -2150,7 +3754,7 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
+@@ -2150,7 +3804,7 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
      const auto restored_history=window.selector->retrieval_checkpoint();
      if (!restored_history.round || restored_history.committed)
          window.selector->begin_retrieval_round();
@@ -11704,7 +11770,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
          // An MTP row combines target hidden at i with the embedding of token i+1.
          // Prefix identity proves only [0,frontier), so its last MTP row must be
          // rebuilt using this request's first suffix token before it is trusted.
-@@ -2227,14 +3831,14 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
+@@ -2227,14 +3881,14 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
              active_payloads.insert(record.storage_identity());
      for (const auto& lane : continuation_states) if (lane.window.statistics)
          visit_memory_checkpoints(lane.window, [&](const KvmemPrefixCheckpoint& cp) {
@@ -11722,7 +11788,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
              if (active_payloads.insert(identity).second) reserved += bytes;
          });
      if (reserved > memory_retained_budget) {
-@@ -2261,7 +3865,7 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
+@@ -2261,7 +3915,7 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
              for (const auto kind : checkpoint_kinds(*history))
                  if (const auto* checkpoint = memory_checkpoint(*history, kind);
                      checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
@@ -11731,7 +11797,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
                          if (payloads.insert(identity).second) cached_bytes += bytes;
                      });
                      if(checkpoint->cold_state && cold.insert(checkpoint->cold_state.storage_identity()).second)
-@@ -2284,7 +3888,12 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+@@ -2284,7 +3938,12 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
      // move a transaction whose backend still addresses the active sequence.
      sequence.window.pending_window.reset();
      sequence.window.pending_append.reset();
@@ -11745,7 +11811,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
          (sequence.window.checkpoints.empty() && sequence.window.coverage.size()==0)) return;
      auto& window = sequence.window;
      if (!window.update_session_index) return;
-@@ -2383,8 +3992,7 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+@@ -2383,8 +4042,7 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
          if (covered) visit_memory_checkpoints(*history, [&](const KvmemPrefixCheckpoint& old) {
              bool found = false;
              visit_memory_checkpoints(window, [&](const KvmemPrefixCheckpoint& next) {
@@ -11755,7 +11821,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
              });
              covered &= found;
          });
-@@ -2485,7 +4093,7 @@ bool ProgramImpl::progress_memory_storage() {
+@@ -2485,7 +4143,7 @@ bool ProgramImpl::progress_memory_storage() {
          for(const auto& record:lane.window.archive) if(record) payloads.insert(record.storage_identity());
      for (const auto& lane : continuation_states) if (lane.window.statistics)
          visit_memory_checkpoints(lane.window, [&](const KvmemPrefixCheckpoint& cp) {
@@ -11764,7 +11830,7 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
                  if (payloads.insert(identity).second) used += bytes;
              });
              if (cp.cold_state && cold.insert(cp.cold_state.storage_identity()).second)
-@@ -2499,7 +4107,7 @@ bool ProgramImpl::progress_memory_storage() {
+@@ -2499,7 +4157,7 @@ bool ProgramImpl::progress_memory_storage() {
          for (const auto kind : checkpoint_kinds(*history))
              if (const auto* checkpoint = memory_checkpoint(*history, kind);
                  checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
@@ -11775,10 +11841,10 @@ index 7033de726d4c32e201246deb80e65ad7b0fa22e2..ad56fe851ce7de635b9b62eac4049e33
                  if(checkpoint->cold_state && cold.insert(checkpoint->cold_state.storage_identity()).second)
 diff --git a/src/models/qwen3_5/program/storage/layerwise_admission.h b/src/models/qwen3_5/program/storage/layerwise_admission.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..f2c07c8420566be32ec1ab2e97a796a2c2fc3b2e
+index 0000000000000000000000000000000000000000..b5099852324a70092ce8ee4b482e110a30f9a1fd
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/layerwise_admission.h
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,161 @@
 +#pragma once
 +
 +#include "models/qwen3_5/program/storage/checkpoint_buffer_pool.h"
@@ -11797,6 +11863,7 @@ index 0000000000000000000000000000000000000000..f2c07c8420566be32ec1ab2e97a796a2
 +    QueryBoundary,
 +    ProbeResident,
 +    PrefillBoundary,
++    Endpoint,
 +};
 +
 +struct NativeLayerwiseCheckpointCredit {
@@ -12706,10 +12773,10 @@ index 0000000000000000000000000000000000000000..8e84b189f056e25d6fc30f4087655467
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/layerwise_source.h b/src/models/qwen3_5/program/storage/layerwise_source.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..c36c786b3ee955a418ce1c6e24e95a03173fb3ca
+index 0000000000000000000000000000000000000000..a3d58f49fbd9dd7a6968e4376da4cef6f59d96fb
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/layerwise_source.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,137 @@
 +#pragma once
 +
 +#include "kvmem/host_kv_storage.hpp"
@@ -12724,6 +12791,14 @@ index 0000000000000000000000000000000000000000..c36c786b3ee955a418ce1c6e24e95a03
 +
 +namespace ninfer::models::qwen3_5::detail {
 +class NativeSourceVersionAccount;
++class NativeSourceQuotaExceeded final : public std::length_error {
++public:
++    NativeSourceQuotaExceeded(const char* message, const NativeSourceVersionAccount* owner,
++                              std::uint64_t requested, std::uint64_t available)
++        : std::length_error(message), account(owner), growth(requested), shortfall(requested-available) {}
++    const NativeSourceVersionAccount* const account;
++    const std::uint64_t growth, shortfall;
++};
 +class NativeSourceVersionCharge {
 +public:
 +    NativeSourceVersionCharge()=default;
@@ -12759,7 +12834,9 @@ index 0000000000000000000000000000000000000000..c36c786b3ee955a418ce1c6e24e95a03
 +    NativeSourceVersionCharge reserve(std::uint64_t bytes) {
 +        auto owner=shared_from_this();
 +        std::lock_guard lock(mutex_);
-+        if (used_>limit_ || bytes>limit_-used_) throw std::length_error("native immutable source index/metadata account exhausted");
++        if (used_>limit_) throw std::logic_error("native source account exceeds its limit");
++        if (bytes>limit_-used_) throw NativeSourceQuotaExceeded(
++            "native immutable source index/metadata account exhausted",this,bytes,limit_-used_);
 +        used_+=bytes;return {std::move(owner),bytes};
 +    }
 +    std::uint64_t limit() const noexcept {return limit_;}
@@ -12784,8 +12861,9 @@ index 0000000000000000000000000000000000000000..c36c786b3ee955a418ce1c6e24e95a03
 +    if (!account_) throw std::logic_error("native metadata growth has no owning account");
 +    std::lock_guard lock(account_->mutex_);
 +    const auto growth=bytes-bytes_;
-+    if (account_->used_>account_->limit_ || growth>account_->limit_-account_->used_)
-+        throw std::length_error("native shared metadata account exhausted");
++    if (account_->used_>account_->limit_) throw std::logic_error("native source account exceeds its limit");
++    if (growth>account_->limit_-account_->used_) throw NativeSourceQuotaExceeded(
++        "native shared metadata account exhausted",account_.get(),growth,account_->limit_-account_->used_);
 +    account_->used_+=growth;bytes_=bytes;
 +}
 +inline NativeSourceVersionCharge NativeSourceVersionCharge::split(std::uint64_t bytes) {
@@ -16709,10 +16787,10 @@ index 0000000000000000000000000000000000000000..5041852d0b5d031d88d355541d3d81b8
 +}
 diff --git a/tests/models/qwen3_5/test_layerwise_program_query.cpp b/tests/models/qwen3_5/test_layerwise_program_query.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..42252128b8be4585a31e7bf64632563639408bd4
+index 0000000000000000000000000000000000000000..7e71c8c9fe77337ae8ea5e72347c7682e0a3e14e
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_layerwise_program_query.cpp
-@@ -0,0 +1,1452 @@
+@@ -0,0 +1,1486 @@
 +#include "models/qwen3_5/layerwise_attention_fixture.h"
 +#include "models/qwen3_5/load.h"
 +#include "models/qwen3_5/program/program_impl.h"
@@ -17202,6 +17280,40 @@ index 0000000000000000000000000000000000000000..42252128b8be4585a31e7bf646325636
 +            policy.host_bytes=16u<<20;sequence.window.coverage=kvmem::CheckpointArchive<KvmemCheckpointRecord>(policy);
 +        }
 +        sequence.window.layerwise_request->retire();sequence.window.layerwise_request.reset();request.retire();
++        if (minimal_budget) {
++            // The fixture drives prefill directly. Complete the scheduler's
++            // transition at the independently verified accepted KV/state frontier.
++            check(sequence.text_kv_valid==end && sequence.window.stamp.frontier==end &&
++                sequence.tail_hidden_valid,"endpoint fixture did not reach the accepted boundary");
++            sequence.execution_frontier=end;
++            for (auto kind:checkpoint_kinds(sequence.window))
++                if (auto& cp=program.memory_checkpoint_slot(sequence.window,kind);cp && cp->prefix.size()==end)
++                    cp.reset(); // Exercise capture rather than the same-frontier fast path.
++            request.lifecycle=Lifecycle::Finishable;
++            request.allow_memory_reuse=true;
++            auto& account=program.layerwise_source_account;
++            program.memory_checkpoint_pool->trim();
++            auto& idle=program.memory_histories[0];
++            idle.emplace();
++            idle->stamp.session.id=901;
++            idle->source_versions=account;
++            idle->statistics_metadata=account->reserve(4u<<20);
++            auto held=account->reserve(account->limit()-account->charged_bytes());
++            request.prefill.emplace();
++            request.prefill->memory_restore_generation=idle->stamp.session.id;
++            const auto count=program.memory_history_evictions;
++            program.capture_memory_endpoint(sequence,request);
++            check(idle && program.memory_history_evictions==count &&
++                !program.memory_checkpoint(sequence.window,KvmemCheckpointKind::Endpoint),
++                "endpoint evicted a protected restore or published a partial checkpoint");
++            request.prefill.reset();
++            program.capture_memory_endpoint(sequence,request);
++            const auto* endpoint=program.memory_checkpoint(sequence.window,KvmemCheckpointKind::Endpoint);
++            check(!idle && program.memory_history_evictions==count+1 && endpoint &&
++                endpoint->prefix.size()==end && endpoint->state && endpoint->canonical_source &&
++                sequence.window.stamp.valid,"endpoint did not reclaim an idle history and publish the accepted state");
++            request.retire();
++        }
 +        check(program.text_kv_addresses->release_after_deactivate(*address),"public owner leaked native address");sequence.kv.reset();
 +        check(program.state_store->release(*state),"public owner leaked native StateImage");sequence.state={};
 +        if (!minimal_budget) {

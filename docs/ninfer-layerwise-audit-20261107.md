@@ -2,7 +2,7 @@
 
 Candidate reviewed over `a8cca288b5106870b3388f674c5dbdbbf11cd67a`. The NInfer recipe is based on native tree
 `56e5e7e6a1240249ba1d7569f67bbf7cb26d23c7` and reconstructs
-`acc9ca65933888488c3ee71b962a3f45093d3838` exactly. The patch roundtrip passed.
+`082a7fe73dc848c6d0d9b0029dc62a43a690692a` exactly. The patch roundtrip passed.
 Algorithm reference: kvmem-vllm `72a81cc99aa78d85004ecf1364fc9f3094db8816`,
 still its main branch head when rechecked on November 7.
 
@@ -32,7 +32,7 @@ rejected for Layerwise until their layer-major execution is implemented.
 
 ## Validation
 
-All GPU work used RTX 5060 Ti
+The integration runs below used RTX 5060 Ti
 `GPU-A` (public alias), after occupancy checks.
 Model SHA-256 `46bb5c800b0284377c47c97f3d334331b984f2fa9c55624b9eb4d65d5aeb9b03`;
 worker SHA-256 `9e6a99432429afcdda0edf653f4fc2c6e5b9c70bebfcb2ddb242bd2037d3fe32`. Source/image/model pins were checked
@@ -65,23 +65,31 @@ policy comparison and are not a new speed/acceptance ranking.
 
 ## Follow-up validation
 
-The final native patch differs from the model-qualified tree only under `tests/`.
+Before the endpoint eviction fix, the follow-up patch differed from the model-qualified tree only under `tests/`.
 Four additional CPU and five single-GPU fixture executables passed. They cover
 budget ownership, graph feedback layout, physical output, attention against an
 independent reference, KV transfer/write, DFlash features and the Program Query
 lifecycle. Prefix feedback and Query feedback are counted separately; retired
-immutable feedback is charged to the retained-source account. The public model
-worker hash is unchanged. The shared HIP source uses the ROCm runtime names;
+immutable feedback is charged to the retained-source account. Those fixture changes preserved the public model worker hash. The shared HIP source uses the ROCm runtime names;
 the CUDA branch remains identical to the source used for the real-model runs.
 The standalone conditioning host build and Windows browser launcher also passed.
 
 ## Limits and bounded behavior
 
-The source-preserving content cache now forks retained histories. At the fixed
-metadata budget, both functional runs skip the optional third-turn endpoint
-checkpoint with an explicit exhaustion log. Requests and existing prefix reuse
-still succeed; no quota is silently increased. This remains an optimization
-limit to consider in longer multi-branch workloads.
+The initial three-turn runs skipped the third endpoint because the shared source
+account could reject image growth without reclaiming idle histories. On that
+specific quota failure the worker now trims free buffers, uses the existing
+group-aware eviction order for idle histories, and retries after sufficient
+bytes are released. Restore sources and pending transfers are protected.
+The native regression checks that an all-protected cache preserves its source
+and that releasing the protection allows the endpoint to be published.
+
+The fixed worker repeated both policies on the same 27B and 5060 Ti with the
+original 1 GiB metadata limit. All four turns published endpoints in each run.
+The third and fourth turns each evicted one history. Turn four reused 12,275
+tokens. Its aligned Query boundary preceded the third endpoint, so the worker
+restored the matching older endpoint. Results and worker identity are in the
+[endpoint eviction regression](benchmarks/ninfer-endpoint-eviction-20261107.json).
 
 The Windows launcher aggregate has 31 passes, 43 platform skips and one
 Linux-only `fcntl` import error; it is not reported as an all-platform pass.
