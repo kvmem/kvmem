@@ -215,9 +215,8 @@ public:
     bool conv_swap_supported(std::string & reason) const;
     bool conv_compatible(const llama_memory_kvmem & other) const;
     std::unique_ptr<ConvStore> make_conv();
-    std::unique_ptr<ConvStore> fork_conv(ConvStore & source);
-    std::unique_ptr<ConvStore> fork_active_conv();
-    bool checkpoint_layer(uint32_t layer) const;
+    std::unique_ptr<ConvStore> fork_conv(ConvStore & source, bool checkpoint = false);
+    std::unique_ptr<ConvStore> fork_active_conv(llama_kvmem_checkpoint_snapshot * checkpoint = nullptr);
     // Exchange the per-conversation host state. Call only between requests,
     // under the server's request lock. `conv` must come from make_conv() or an
     // earlier swap_conv() on a compatible memory object; on return it holds the outgoing
@@ -437,6 +436,9 @@ private:
     kvmem::RawKvStoreConfig raw_cfg_{};
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;
+    // Absent only on a store loaded from the original combined disk format.
+    std::unique_ptr<kvmem::RawKvStore> means_;
+    kvmem::RawKvStore & statistics() { return means_ ? *means_ : *raw_; }
     std::unique_ptr<kvmem::KvContent> content_;
     std::vector<std::pair<uint32_t, uint32_t>> evaluation_queue_;
     size_t evaluation_cursor_ = 0;
