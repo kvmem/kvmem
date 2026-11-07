@@ -1344,7 +1344,7 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_conv(Con
     return result;
 }
 
-std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_conv() {
+std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_conv(llama_kvmem_checkpoint_snapshot * checkpoint) {
     kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
     decode_mean_reset(); harvest_flush(); harvest_gpu_v_commit();
     const auto rows = runtime_->store().total_tokens();
@@ -1368,8 +1368,33 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_c
         }
     }
     result->content = content_->fork();
-    result->raw = raw_->fork_prefix(rows);
-    if (mtp_) result->mtp_raw = mtp_->fork_raw(rows);
+    if (checkpoint) {
+        // Both exports observe the same accepted frontier under this execution's
+        // exclusive owner. Publish only after every plane and statistic succeeds.
+        std::vector<kvmem::PackedKvSelection> target, draft;
+        auto * draft_raw = mtp_ ? mtp_->checkpoint_raw() : nullptr;
+        for (const auto & block : runtime_->store().blocks()) {
+            if (!block.n_tokens) continue;
+            for (uint32_t layer = 0; layer < n_layer_; ++layer) {
+                if (kvmem_cache_has_layer(kv_, int32_t(layer)))
+                    target.push_back({block.block_id, layer, block.n_tokens});
+            }
+            if (draft_raw && draft_raw->has_k_gpu(block.block_id, 0, block.n_tokens) &&
+                    draft_raw->has_v_gpu(block.block_id, 0, block.n_tokens))
+                draft.push_back({block.block_id, 0, block.n_tokens});
+        }
+        result->raw = raw_->fork_statistics_prefix(rows);
+        checkpoint->target = std::make_unique<kvmem::PackedKvSnapshot>(raw_->export_packed(target));
+        if (draft_raw) result->mtp_raw = draft_raw->fork_statistics_prefix(rows);
+        if (mtp_) {
+            // A follower with no mirror still contributes a compatible empty image.
+            auto & mirror = draft_raw ? *draft_raw : *result->mtp_raw;
+            checkpoint->draft = std::make_unique<kvmem::PackedKvSnapshot>(mirror.export_packed(draft));
+        }
+    } else {
+        result->raw = raw_->fork_prefix(rows);
+        if (mtp_) result->mtp_raw = mtp_->fork_raw(rows);
+    }
     result->runtime->store() = runtime_->store();
     result->runtime->clone_cpu_tier_from(*runtime_);
     result->runtime->store().restore_retrieval(runtime_->store().retrieval_checkpoint());
@@ -5593,34 +5618,16 @@ llama_kvmem_store_bundle * llama_kvmem_store_bundle_fork(llama_kvmem_store_bundl
     return result.release();
 }
 
-bool llama_memory_kvmem::checkpoint_layer(uint32_t layer) const {
-    return kvmem_cache_has_layer(kv_, int32_t(layer));
-}
-
 std::shared_ptr<const llama_kvmem_checkpoint_snapshot> llama_kvmem_checkpoint_capture(uint32_t row) {
     auto * mem = kvmem_capture_active();
     if (!mem) return {};
     std::string reason;
     if (!mem->conv_swap_supported(reason)) return {}; // legacy non-flash path
-    auto result = std::make_shared<llama_kvmem_checkpoint_snapshot>();
-    result->metadata = mem->fork_active_conv(); // drains accepted producers
-    auto & state = *result->metadata;
-    if (state.runtime->store().total_tokens() != row)
+    if (mem->store_n_tokens() != row)
         throw std::runtime_error("attention checkpoint is not the accepted frontier");
-    std::vector<kvmem::PackedKvSelection> target, draft;
-    for (const auto & b : state.runtime->store().blocks()) if (b.n_tokens) {
-        for (uint32_t layer = 0; layer < state.raw->config().n_layer; ++layer)
-            if (mem->checkpoint_layer(layer))
-                target.push_back({b.block_id, layer, b.n_tokens});
-        // The follower is an optional mirror; its existing missing-history
-        // semantics remain native. Every included plane requires coverage proof.
-        if (state.mtp_raw && state.mtp_raw->has_k_gpu(b.block_id, 0, b.n_tokens) &&
-                state.mtp_raw->has_v_gpu(b.block_id, 0, b.n_tokens))
-            draft.push_back({b.block_id, 0, b.n_tokens});
-    }
-    result->target = std::make_unique<kvmem::PackedKvSnapshot>(state.raw->export_packed(target));
-    if (state.mtp_raw)
-        result->draft = std::make_unique<kvmem::PackedKvSnapshot>(state.mtp_raw->export_packed(draft));
+    auto result = std::make_shared<llama_kvmem_checkpoint_snapshot>();
+    result->metadata = mem->fork_active_conv(result.get());
+    auto & state = *result->metadata;
     std::vector<std::shared_ptr<kvmem::SealedKvBlock>> blocks;
     std::vector<kvmem::KvSnapshot::Span> spans;
     size_t bytes = 0;
@@ -5634,10 +5641,6 @@ std::shared_ptr<const llama_kvmem_checkpoint_snapshot> llama_kvmem_checkpoint_ca
     append(*result->target);
     if (result->draft) append(*result->draft);
     if (bytes) result->image = std::make_unique<kvmem::KvSnapshot>(std::move(blocks), std::move(spans), bytes);
-    // Preserve the complete MeanK/raw-statistics version. The public manifest
-    // alone owns the packed planes; this metadata package has none.
-    state.raw->import_packed(state.raw->export_packed({}));
-    if (state.mtp_raw) state.mtp_raw->import_packed(state.mtp_raw->export_packed({}));
     result->metadata_bytes = sizeof(*result) + mem->conv_host_bytes(state) + result->target->metadata_bytes();
     if (result->draft) result->metadata_bytes += result->draft->metadata_bytes();
     if (result->image) result->metadata_bytes += result->image->metadata_bytes();

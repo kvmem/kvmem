@@ -48,6 +48,17 @@ static void check(llama_model * model, int rows) {
     llama_synchronize(ctx.get());
     const auto before = state(ctx.get());
     const auto checkpoint = state(ctx.get(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const auto preflight = llama_kvmem_get_snapshot_stats();
+    bool wrong_frontier = false;
+    try {
+        (void) llama_kvmem_checkpoint_capture(rows - 1);
+    } catch (const std::runtime_error &) {
+        wrong_frontier = true;
+    }
+    const auto rejected = llama_kvmem_get_snapshot_stats();
+    require(wrong_frontier && rejected.packed_k_bytes == preflight.packed_k_bytes &&
+            rejected.packed_v_bytes == preflight.packed_v_bytes, "wrong-frontier capture touched packed KV");
+    require(state(ctx.get()) == before, "wrong-frontier capture changed native state");
     using Bundle = std::unique_ptr<llama_kvmem_store_bundle, decltype(&llama_kvmem_store_bundle_free)>;
     Bundle parent(llama_kvmem_store_bundle_fork(), llama_kvmem_store_bundle_free);
     require(bool(parent), "cannot preserve parent attention snapshot");

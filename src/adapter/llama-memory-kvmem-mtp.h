@@ -136,6 +136,8 @@ public:
         harvest_flush();
         return raw_ ? raw_->fork_prefix(rows) : make_raw();
     }
+    // The target drains both harvest queues before checkpoint capture.
+    kvmem::RawKvStore * checkpoint_raw() { return raw_.get(); }
     uint64_t host_bytes() const { return raw_ ? raw_->allocated_bytes() : 0; }
     uint64_t payload_bytes(bool disk_only = false) const { return raw_ ? raw_->payload_bytes(disk_only) : 0; }
     uint64_t payload_capacity_bytes(uint32_t tokens) const { return raw_ ? raw_->payload_capacity_bytes(tokens) : 0; }
