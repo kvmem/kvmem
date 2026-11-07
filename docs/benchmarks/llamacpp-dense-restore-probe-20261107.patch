@@ -1,0 +1,56 @@
+diff --git a/src/adapter/llama-memory-kvmem.cpp b/src/adapter/llama-memory-kvmem.cpp
+--- a/src/adapter/llama-memory-kvmem.cpp
++++ b/src/adapter/llama-memory-kvmem.cpp
+@@ -1860,6 +1860,52 @@
+     harvest_v_pending_.jobs.clear(); harvest_v_pending_.slot = -1;
+     harvest_v_jobs_.clear(); harvest_gpu_queued_.clear();
+     kvmem_stageout_clear();
++    // Independent dense-only byte oracle in the diagnostic binary.
++    if (!mtp_ && !v_trans_ && !multi_gpu_) {
++        const auto view = attention_view(true);
++        const auto & desired = conv->runtime->store();
++        uint64_t total = 0, matched = 0;
++        unsigned matched_blocks = 0, matched_slots = 0;
++        const size_t krow = ggml_row_size(type_k_, n_embd_k_);
++        const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
++        for (size_t slot = 0; slot < conv->resident.size(); ++slot) {
++            const auto id = conv->resident[slot];
++            const auto & saved = desired.blocks()[id];
++            const auto n = saved.n_tokens;
++            const auto bytes = uint64_t(n) * (krow + vrow) * kv_->get_layer_ids().size();
++            total += bytes;
++            if (id >= store().block_count()) continue;
++            const auto & live = store().blocks()[id];
++            if (live.gpu_slot != int32_t(slot) || live.n_tokens != n ||
++                    live.orig_pos_start != saved.orig_pos_start || !gpu_kv_complete(id, kv_)) continue;
++            bool same = true;
++            for (uint32_t i = 0; i < n; ++i) {
++                const auto row = saved.orig_pos_start+i;
++                const auto & a=row_positions_.at(row), & b=conv->row_positions.at(row);
++                if (a.pos != b.pos || a.spatial != b.spatial || a.token != b.token) same=false;
++            }
++            if (!same) continue;
++            ++matched_slots;
++            for (uint32_t layer = 0; layer < n_layer_ && same; ++layer) {
++                if (!kvmem_cache_has_layer(kv_, int32_t(layer))) continue;
++                for (bool key : {true,false}) {
++                    const auto stride = key ? krow : vrow;
++                    std::vector<uint8_t> expected(stride*n), device(stride*n);
++                    const bool present = key ? conv->raw->copy_k_gpu(id,layer,expected.data(),n)
++                                             : conv->raw->copy_v_gpu(id,layer,expected.data(),n);
++                    if (!present) {same=false;break;}
++                    auto * tensor = key ? kv_->get_k_storage(layer) : kv_->get_v_storage(layer);
++                    kvmem_tensor_get(tensor, device.data(), slot*block_tokens_*stride, device.size());
++                    if (device != expected) {same=false;break;}
++                }
++            }
++            if (same) {matched+=bytes;++matched_blocks;}
++        }
++        fprintf(stderr, "DENSERESTORE saved=%u active=%u blocks=%zu cells=%u matched_slots=%u matched_blocks=%u bytes=%llu matched_bytes=%llu whole=%d\n",
++            desired.total_tokens(),store_n_tokens(),conv->resident.size(),unsigned(kv_->get_cells(0).get_used()),
++            matched_slots,matched_blocks,(unsigned long long)total,(unsigned long long)matched,
++            int(total && view.valid && view.blocks==conv->resident && matched_blocks==conv->resident.size()));
++    }
+     decode_mean_discard();
+     set_replay(false);
+     clear(false);
