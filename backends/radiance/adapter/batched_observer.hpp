@@ -150,7 +150,7 @@ public:
             auto pending=std::move(*it);it=cache_->parking.erase(it);updated=true;
             const auto bytes=pending->saved.bytes;
             try {
-                pending->ticket.wait();pending->saved.prefix=std::move(pending->work->prefix);
+                pending->ticket.wait();pending->work->prefix->finish_park();pending->saved.prefix=std::move(pending->work->prefix);
                 const auto session=pending->saved.session.id;
                 if(!cache_->publish(std::move(pending->saved),options_.cache_sessions,options_.effective_cache_records(),true)) {
                     if(cache_->bytes<bytes)throw std::runtime_error("invalid pending cache charge");

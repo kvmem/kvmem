@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace kvmem::radiance {
@@ -22,27 +23,33 @@ struct AcceptedStatistics {
 // TP shards own consecutive head ranges. Concatenate each ROW, never complete
 // flattened rank buffers. Query token counts describe the same logical rows on
 // every rank and must agree; summing them would count one Query multiple times.
-inline AcceptedStatistics merge_rank_statistics(const std::vector<AcceptedStatistics>& ranks) {
+namespace detail {
+inline AcceptedStatistics merge_rank_statistics(const std::vector<AcceptedStatistics>& ranks,
+                                                std::vector<AcceptedStatistics>* consume) {
     auto check=[](bool ok){if(!ok)throw std::runtime_error("inconsistent accepted rank statistics");};
     check(!ranks.empty());
     AcceptedStatistics out;
     out.session=ranks[0].session;out.first=ranks[0].first;out.rows=ranks[0].rows;
-    out.layers=ranks[0].layers;out.query.token_counts=ranks[0].query.token_counts;
-    const auto layers=out.layers.size();check(layers>0 && out.query.token_counts.size()==layers);
+    const auto& first=ranks[0];
+    const auto layers=first.layers.size();check(layers>0 && first.query.token_counts.size()==layers);
     for(const auto& r:ranks) {
-        check(r.session==out.session && r.first==out.first && r.rows==out.rows && r.layers==out.layers &&
+        check(r.session==out.session && r.first==out.first && r.rows==out.rows && r.layers==first.layers &&
             r.key_width && r.query_width && r.keys.size()==layers && r.query.tokens.size()==layers &&
-            r.query.token_counts==out.query.token_counts && r.query.sums.size()==layers*uint64_t(r.query_width));
+            r.query.token_counts==first.query.token_counts && r.query.sums.size()==layers*uint64_t(r.query_width));
         check(r.key_width<=UINT32_MAX-out.key_width && r.query_width<=UINT32_MAX-out.query_width);
         out.key_width+=r.key_width;out.query_width+=r.query_width;
         for(size_t l=0;l<layers;++l) {
             check(r.keys[l].size()==uint64_t(out.rows)*r.key_width &&
-                r.query.tokens[l].size()==uint64_t(out.query.token_counts[l])*r.query_width);
+                r.query.tokens[l].size()==uint64_t(first.query.token_counts[l])*r.query_width);
             for(float v:r.keys[l])check(std::isfinite(v));
             for(float v:r.query.tokens[l])check(std::isfinite(v));
         }
         for(float v:r.query.sums)check(std::isfinite(v));
     }
+    // Validate before transferring ownership, including nonfinite/shape errors.
+    // The single-rank result already has the requested row/head layout.
+    if(consume && ranks.size()==1)return std::move(consume->front());
+    out.layers=first.layers;out.query.token_counts=first.query.token_counts;
     out.keys.resize(layers);out.query.tokens.resize(layers);out.query.sums.reserve(layers*uint64_t(out.query_width));
     for(size_t l=0;l<layers;++l) {
         auto& keys=out.keys[l];keys.reserve(uint64_t(out.rows)*out.key_width);
@@ -61,6 +68,13 @@ inline AcceptedStatistics merge_rank_statistics(const std::vector<AcceptedStatis
         }
     }
     return out;
+}
+} // namespace detail
+inline AcceptedStatistics merge_rank_statistics(const std::vector<AcceptedStatistics>& ranks) {
+    return detail::merge_rank_statistics(ranks,nullptr);
+}
+inline AcceptedStatistics merge_rank_statistics(std::vector<AcceptedStatistics>&& ranks) {
+    return detail::merge_rank_statistics(ranks,&ranks);
 }
 // Native attention capture already averages its local heads. Weight by the
 // actual local head count to recover one global average, preserving page IDs.
@@ -85,5 +99,23 @@ inline std::vector<AcceptedAttentionRow> merge_rank_attention(
         }
     }
     return out;
+}
+inline std::vector<AcceptedAttentionRow> merge_rank_attention(
+    std::vector<std::vector<AcceptedAttentionRow>>&& ranks,const std::vector<uint32_t>& heads) {
+    if(ranks.size()!=1)return merge_rank_attention(
+        static_cast<const std::vector<std::vector<AcceptedAttentionRow>>&>(ranks),heads);
+    if(heads.size()!=1 || !heads[0])throw std::runtime_error("inconsistent accepted rank attention");
+    for(const auto& row:ranks.front()) {
+        double sum=0;
+        for(const auto& mass:row.mass) {
+            if(!std::isfinite(mass.mass) || mass.mass<0)
+                throw std::runtime_error("inconsistent accepted rank attention");
+            sum+=mass.mass;
+        }
+        if(!(std::abs(sum-1)<1e-4))throw std::runtime_error("inconsistent accepted rank attention");
+    }
+    // The weighted merge starts from +0, including when a captured mass is -0.
+    for(auto& row:ranks.front())for(auto& mass:row.mass)if(mass.mass==0)mass.mass=0;
+    return std::move(ranks.front());
 }
 } // namespace kvmem::radiance

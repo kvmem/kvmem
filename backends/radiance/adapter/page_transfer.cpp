@@ -66,11 +66,12 @@ PageTransfer::~PageTransfer() = default;
 
 void PageTransfer::begin(bool out, const std::vector<CopySpan>& spans,
                          const std::vector<GroupPool>& pools, RadStream compute,
-                         const std::vector<uint8_t>* payload) {
+                         std::span<const uint8_t> payload) {
     auto& s = *state_;
-    if (s.started || s.failed)
-        throw MemoryError(MemoryErrorCode::InvalidPlan, "transfer handles are single-use");
-    if (!compute || (!out && (!payload || payload->size() != s.bytes)) || spans.empty())
+    if (s.failed || (s.started && (out || s.out || !s.complete)))
+        throw MemoryError(MemoryErrorCode::InvalidPlan, "transfer is not reusable");
+    const uint64_t bytes=out ? s.bytes : payload.size();
+    if (!compute || !bytes || bytes>s.bytes || spans.empty())
         throw MemoryError(MemoryErrorCode::InvalidPlan, "invalid transfer input");
     // Validate the whole batch before a fence or copy can be enqueued.
     std::map<int32_t, GroupPool> by_group;
@@ -84,8 +85,8 @@ void PageTransfer::begin(bool out, const std::vector<CopySpan>& spans,
     std::map<int32_t, std::vector<std::pair<uint64_t, uint64_t>>> device_ranges;
     for (auto span : spans) {
         auto p = by_group.find(span.group);
-        if (p == by_group.end() || !span.bytes || span.record_offset > s.bytes ||
-            span.bytes > s.bytes - span.record_offset || span.pool_offset > p->second.bytes ||
+        if (p == by_group.end() || !span.bytes || span.record_offset > bytes ||
+            span.bytes > bytes - span.record_offset || span.pool_offset > p->second.bytes ||
             span.bytes > p->second.bytes - span.pool_offset)
             throw MemoryError(MemoryErrorCode::InvalidPlan, "transfer span outside pool or record");
         ranges.emplace_back(span.record_offset, span.record_offset + span.bytes);
@@ -98,7 +99,7 @@ void PageTransfer::begin(bool out, const std::vector<CopySpan>& spans,
             throw MemoryError(MemoryErrorCode::InvalidPlan, "record has overlapping or missing bytes");
         end = r.second;
     }
-    if (end != s.bytes) throw MemoryError(MemoryErrorCode::InvalidPlan, "incomplete native record");
+    if (end != bytes) throw MemoryError(MemoryErrorCode::InvalidPlan, "incomplete native record");
     for (auto& item : device_ranges) {
         auto& rs = item.second;
         std::sort(rs.begin(), rs.end());
@@ -106,8 +107,9 @@ void PageTransfer::begin(bool out, const std::vector<CopySpan>& spans,
             throw MemoryError(MemoryErrorCode::InvalidPlan, "overlapping physical transfer spans");
     }
     require_ok(rad_dev_set(s.device), "select transfer device");
-    if (!out) std::memcpy(s.host, payload->data(), size_t(s.bytes));
+    if (!out) std::memcpy(s.host, payload.data(), size_t(bytes));
     s.started = true; s.complete = false; s.out = out; s.compute = compute;
+    s.event_armed = false; // a prior chunk's completed event cannot fence this one
     try {
         if (s.stream != compute) {
             require_ok(rad_event_record(s.ready, compute), "record compute fence");
@@ -126,10 +128,10 @@ void PageTransfer::begin(bool out, const std::vector<CopySpan>& spans,
     } catch (...) { s.failed = true; throw; }
 }
 void PageTransfer::spill(const std::vector<CopySpan>& spans, const std::vector<GroupPool>& pools,
-                         RadStream compute) { begin(true, spans, pools, compute, nullptr); }
+                         RadStream compute) { begin(true, spans, pools, compute, {}); }
 void PageTransfer::restore(const std::vector<CopySpan>& spans, const std::vector<GroupPool>& pools,
-                           RadStream compute, const std::vector<uint8_t>& payload) {
-    begin(false, spans, pools, compute, &payload);
+                           RadStream compute, std::span<const uint8_t> payload) {
+    begin(false, spans, pools, compute, payload);
 }
 TransferPoll PageTransfer::poll() {
     auto& s = *state_;

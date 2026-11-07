@@ -104,6 +104,26 @@ int main() {
         for (size_t i = 0; i < pool.size(); ++i)
             CHECK(pool[i] == (i < 8 ? 0x17 : i >= 48 && i < 56 ? 0x29 : 0xcd));
     }
+    // One allocation/events serves multiple restore chunks, including a short
+    // final chunk. Refuse reuse while a copy is in flight or after any failure.
+    {
+        PageTransfer t(2,16,&compute);
+        t.restore(spans,pools,&compute,payload);
+        rejects([&]{t.restore(spans,pools,&compute,payload);});
+        CHECK(t.drain());
+        CHECK(host_allocs==1 && events==2);
+        const std::vector<CopySpan> tail{{0,20,0,3}};
+        t.restore(tail,pools,&compute,std::span<const uint8_t>(payload).first(3));
+        CHECK(t.drain());
+        CHECK(pool[20]==0x17 && pool[22]==0x17 && host_allocs==1 && events==2);
+        // A failed second enqueue cannot wait on the preceding completed event.
+        const auto syncs=host_syncs;
+        fail_record=event_records+1;
+        rejects([&]{t.restore(tail,pools,&compute,std::span<const uint8_t>(payload).first(3));});
+        CHECK(t.drain() && host_syncs>syncs && compute.queue.empty());
+        rejects([&]{t.restore(tail,pools,&compute,std::span<const uint8_t>(payload).first(3));});
+        fail_record=-1;
+    }
     // Enqueue failure after a successful copy must drain before freeing staging.
     {
         PageTransfer t(2, 16);
