@@ -1,10 +1,10 @@
 """Native hybrid commit-budget failure: JSON/SSE errors and bounded rollback.
 
 Requires a dedicated GPU and a hybrid model whose native state exercises the
-specified checkpoint budget. The default 128 MiB fixture is qualified with
+specified checkpoint budget. The default 192 MiB fixture is qualified with
 Qwen3.5-4B IQ3_XXS; it cannot fit even a short generation's required checkpoints.
 Normal generation after a rejected Query is separately covered by the existing
-checkpoint coverage regression with --host-mib 192 --expect-capacity-error.
+checkpoint coverage regression with --host-mib 256 --expect-capacity-error.
 """
 import argparse
 import json
@@ -25,10 +25,11 @@ def main():
     cli.add_argument('--gpu',required=True)
     cli.add_argument('--out',type=Path,required=True)
     cli.add_argument('--host-mib',type=int)
+    cli.add_argument('--ssd-budget',action='store_true',help='fill shared SSD/Q, then recover an earlier successful parent')
     cli.add_argument('--cancel',action='store_true',help='disconnect a continuation after real output, then restore its old parent')
     cli.add_argument('--mtp',action='store_true',help='enable the model native MTP draft for cancellation qualification')
     args=cli.parse_args()
-    if args.host_mib is None:args.host_mib=1024 if args.cancel else 128
+    if args.host_mib is None:args.host_mib=256 if args.ssd_budget else 1024 if args.cancel else 192
     args.out.mkdir(parents=True,exist_ok=False)
     processes=subprocess.check_output(['nvidia-smi','-i',args.gpu,'--query-compute-apps=pid,process_name','--format=csv,noheader'],text=True).strip()
     if processes:raise RuntimeError('GPU occupied: '+processes)
@@ -39,6 +40,7 @@ def main():
     command=[str(args.exe.resolve()),'-m',str(args.model.resolve()),'-ngl','99','-c','8192','-b','128','-ub','128',
              '--no-ui','--no-think','--kv-dtype','q8_0','--spec-type','draft-mtp' if args.mtp else 'none','--host','127.0.0.1','--port',str(port),
              '--kvmem-budget','1024','--kvmem-gen-reserve','256','--kvmem-host-mib','512','--kvmem-sessions','2','--kvmem-trace']
+    if args.ssd_budget:command+=['--kvmem-disk-mib','64','--kvmem-disk-path',str(args.out/'spill')]
     if args.mtp:command+=['--spec-draft-n-max','3']
     env={k:v for k,v in os.environ.items() if not k.startswith(('KVMEM_','GGML_','LLAMA_ARG_'))}
     env.update(CUDA_VISIBLE_DEVICES=args.gpu,KVMEM_CHECKPOINT_POLICY='spread',KVMEM_CHECKPOINT_INTERVAL='256',
@@ -71,6 +73,41 @@ def main():
                 except OSError:
                     if time.monotonic()>deadline:raise TimeoutError('server startup')
                     time.sleep(.2)
+            if args.ssd_budget:
+                status,raw=request('source',messages)
+                assert status==200,raw
+                parent=json.loads(raw)
+                offset=log_path.stat().st_size
+                rejected=False
+                for i in range(8):
+                    branch=messages+[parent['choices'][0]['message'],
+                        {'role':'user','content':f'From the notes, explain record {i:04d} in one sentence.'}]
+                    status,raw=request(f'branch-{i}',branch)
+                    if status!=200:
+                        assert status==500 and ('capacity exhausted' in raw.decode() or 'budget exhausted' in raw.decode()),raw
+                        rejected=True
+                        break
+                assert rejected,'fixture did not exhaust shared capacity'
+                trace=log_path.read_bytes()[offset:].decode(errors='replace')
+                assert 'KVMEM_CHECKPOINT_ROLLBACK' in trace and 'multimodal_rollback_failed' not in trace,trace[-4000:]
+                offset=log_path.stat().st_size
+                status,raw=request('source-restored',messages)
+                recovery=log_path.read_bytes()[offset:].decode(errors='replace')
+                rows=re.findall(r'multimodal_prefill .*?prefix_hit_rows=(\d+).*?new_text_rows=(\d+).*?replayed_rows=(\d+)',recovery)
+                assert rows and int(rows[-1][0])>=parent['usage']['prompt_tokens']-32,recovery[-4000:]
+                assert int(rows[-1][1])==0 and int(rows[-1][2])==0,'source recovery used recomputation'
+                assert 'multimodal_rollback_failed' not in recovery and 'checkpoint_restore_fallback' not in recovery
+                if status==200:
+                    assert json.loads(raw)['choices'][0]['message']==parent['choices'][0]['message']
+                else:
+                    # Q=256 can restore the old source but cannot always retain
+                    # a further generation endpoint. Verify that precise boundary.
+                    assert status==500 and 'checkpoint Host budget exhausted' in raw.decode(),raw
+                    assert 'checkpoint_commit_failed' in recovery and 'KVMEM_CHECKPOINT_ROLLBACK' in recovery
+                (args.out/'result.json').write_text(json.dumps({'passed':True,'capacity_rejected':True,
+                    'source_reused_rows':int(rows[-1][0]),'source_recomputed_rows':0,'new_generation_status':status}))
+                print('PASS capacity rejection and source restore without recomputation; new generation status',status,flush=True)
+                return
             if args.cancel:
                 status,raw=request('parent',messages)
                 assert status==200,raw

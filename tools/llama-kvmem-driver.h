@@ -25,20 +25,29 @@
 
 struct MultimodalCheckpointAccounting {
     size_t limit = [] { const auto p=kvmem::CheckpointPolicy::environment(); return p.enabled ? p.host_bytes : SIZE_MAX; }();
+    // Metadata and transient native staging; immutable native payload is
+    // charged only by storage, under this execution's existing Q allowance.
+    std::shared_ptr<kvmem::HostKvStorage> storage_owner;
+    std::shared_ptr<kvmem::HostKvStorage> storage() const { return std::atomic_load(&storage_owner); }
+    size_t used() const { const auto s=storage(); return live_bytes.load() + (s ? s->charged_bytes() : 0); }
+    void observe() {
+        const auto n=used(); size_t peak=peak_bytes.load();
+        while(peak<n && !peak_bytes.compare_exchange_weak(peak,n)) {}
+    }
     std::atomic<size_t> live_bytes {0};
     std::atomic<size_t> peak_bytes {0};
     bool reserve(size_t bytes, size_t limit) {
         size_t live = live_bytes.load();
-        do { if (live > limit || bytes > limit-live) return false; }
+        do { const auto s=storage(); const auto payload=s ? s->charged_bytes() : 0;
+            if (payload > limit || live > limit-payload || bytes > limit-payload-live) return false; }
         while (!live_bytes.compare_exchange_weak(live,live+bytes));
         size_t peak=peak_bytes.load();
-        while(peak<live+bytes && !peak_bytes.compare_exchange_weak(peak,live+bytes)) {}
+        while(peak<used() && !peak_bytes.compare_exchange_weak(peak,used())) {}
         return true;
     }
     void add(size_t bytes) {
-        const size_t live = live_bytes.fetch_add(bytes) + bytes;
-        size_t peak = peak_bytes.load();
-        while (peak < live && !peak_bytes.compare_exchange_weak(peak, live)) {}
+        live_bytes.fetch_add(bytes);
+        observe();
     }
 };
 struct LlamaEngineState;
@@ -49,17 +58,20 @@ struct MultimodalCheckpointData {
     MultimodalCheckpointData() = default;
     MultimodalCheckpointData(const MultimodalCheckpointData &) = delete;
     MultimodalCheckpointData & operator=(const MultimodalCheckpointData &) = delete;
-    ~MultimodalCheckpointData() { if (accounting) accounting->live_bytes -= resident_bytes(); }
-    std::vector<uint8_t> recurrent;
-    std::vector<uint8_t> draft_carry;
-    kvmem::SpillExtent cold;
-    size_t cold_recurrent = 0, cold_carry = 0;
-    uint64_t cold_identity = 0;
+    ~MultimodalCheckpointData() { if (accounting) accounting->live_bytes -= metadata_bytes(); }
+    std::shared_ptr<const llama_kvmem_checkpoint_snapshot> attention;
+    size_t attention_metadata = 0;
+    kvmem::HostKvRecord native_image;
+    // Keeps hot records ineligible for automatic eviction. Only the existing
+    // checkpoint victim selection releases this lease for targeted demotion.
+    mutable kvmem::HostKvLease residency;
+    size_t recurrent_bytes = 0, carry_bytes = 0;
     mutable std::atomic<bool> shared{false};
     llama_kvmem_tail_mean_state tail_mean;
     std::shared_ptr<MultimodalCheckpointAccounting> accounting;
-    size_t resident_bytes() const { return recurrent.size() + draft_carry.size() + tail_mean.values.size()*sizeof(float) + tail_mean.history.scores->size()*sizeof(double) + tail_mean.graph.bytes() + tail_mean.feedback.bytes(); }
-    size_t bytes() const { return resident_bytes() + (cold ? cold_recurrent + cold_carry : 0); }
+    size_t metadata_bytes() const { return attention_metadata + tail_mean.values.size()*sizeof(float) + tail_mean.history.scores->size()*sizeof(double) + tail_mean.graph.bytes() + tail_mean.feedback.bytes(); }
+    size_t resident_bytes() const { return metadata_bytes() + native_image.resident_bytes(); }
+    size_t bytes() const { return metadata_bytes() + native_image.size(); }
 };
 
 struct MultimodalCheckpoint {
@@ -70,11 +82,6 @@ struct MultimodalCheckpoint {
         return {uint64_t(row), purposes, data.get(), data ? data->bytes() : 0};
     }
 };
-
-// Engine-private restore entry: shared cold state materializes into a private
-// result. The caller must retain that result through restore and rollback.
-[[nodiscard]] std::shared_ptr<const MultimodalCheckpointData> llama_driver_materialize_checkpoint(
-    LlamaEngineState &, const std::shared_ptr<const MultimodalCheckpointData> &);
 
 struct MultimodalQuery {
     int begin = -1, end = -1, force = -1;
@@ -196,7 +203,6 @@ struct LlamaEngineState {
     uint64_t mm_root_boundary = 0, mm_tail_boundary = 0;
     struct CheckpointWrite {
         std::shared_ptr<const MultimodalCheckpointData> source;
-        kvmem::SpillExtent destination;
         kvmem::StorageTicket ticket;
     };
     std::unique_ptr<CheckpointWrite> mm_checkpoint_write;

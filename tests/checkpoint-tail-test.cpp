@@ -2,6 +2,8 @@
 #include "llama-kvmem-hooks.h"
 #include "llama-kvmem-snapshot-stats.h"
 #include "ggml-backend.h"
+#include "kvmem/kv_snapshot.hpp"
+#include <set>
 
 #include <cstdio>
 #include <memory>
@@ -46,6 +48,20 @@ static void check(llama_model * model, int rows) {
     using Bundle = std::unique_ptr<llama_kvmem_store_bundle, decltype(&llama_kvmem_store_bundle_free)>;
     Bundle parent(llama_kvmem_store_bundle_fork(), llama_kvmem_store_bundle_free);
     require(bool(parent), "cannot preserve parent attention snapshot");
+    const auto immutable = llama_kvmem_checkpoint_capture(rows);
+    require(bool(immutable), "immutable attention capture missing");
+    const auto * image = llama_kvmem_checkpoint_image(*immutable);
+    require(image && image->ready(), "immutable image is incomplete");
+    const auto immutable_bytes = image->read();
+    const auto repeated_image = llama_kvmem_checkpoint_capture(rows);
+    const auto * repeated = llama_kvmem_checkpoint_image(*repeated_image);
+    std::set<const void *> origins;
+    image->account([&](const void * id, size_t) { origins.insert(id); });
+    size_t shared = 0;
+    repeated->account([&](const void * id, size_t bytes) { if (origins.count(id)) shared += bytes; });
+    const auto blocks = (rows + 31) / 32;
+    const auto expected_shared = image->size() / blocks * (rows / 32);
+    require(shared == expected_shared, "full blocks did not share, or partial tail was aliased");
     const auto captured = llama_kvmem_get_snapshot_stats();
     {
         Bundle unchanged(llama_kvmem_store_bundle_fork(), llama_kvmem_store_bundle_free);
@@ -100,6 +116,14 @@ static void check(llama_model * model, int rows) {
     const auto branch_state = state(ctx.get());
     const auto branch_checkpoint = state(ctx.get(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     Bundle branch(llama_kvmem_store_bundle_fork(), llama_kvmem_store_bundle_free);
+    require(image->read() == immutable_bytes, "old immutable snapshot changed after native ID reuse");
+    require(llama_kvmem_checkpoint_restore(*immutable), "immutable parent attention restore failed");
+    require(llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0,
+            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint.size(), "immutable parent model restore failed");
+    llama_kvmem_apply_selection(llama_kvmem_preview_retrieval());
+    require(state(ctx.get()) == before, "immutable restored parent differs");
+    require(llama_kvmem_checkpoint_restore(*immutable), "repeated immutable restore failed");
+    require(image->read() == immutable_bytes, "restore mutated source snapshot");
     require(llama_kvmem_store_bundle_swap(parent.get()), "old parent attention restore failed");
     require(llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0,
             LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint.size(), "old parent model-state restore failed");

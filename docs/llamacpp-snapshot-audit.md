@@ -333,3 +333,53 @@ The inherited LNK4098 diagnostic was traced with library directives: the reused
 host/native libraries do not request LIBCMT; CUDA 13.2.2 `cudadevrt.lib` has one
 static-CRT default-library directive. No global linker suppression or other
 backend build-policy change was made. Final release linkage still needs review.
+
+## Public-interface integration (2026-11-07, validation in progress)
+
+The backend now consumes merged public PR271. A checkpoint drains accepted native
+producers, forks private native metadata (including every MeanK block, original
+positions, retrieval state and the resident selection), and exports the proved
+packed target/draft planes. Complete records share their live allocations;
+partial tails get private capacity-sized records. SealedKvBlock/KvSnapshot
+describes the same records, without another payload allocation. The metadata
+package drops its packed bindings. Restore imports the manifest into a private
+native candidate. It does not identify bytes by token hash, block ID or GPU slot.
+
+Normal restore reinstalls the checkpoint's native layout. Query replay retains
+the newly selected working set and restores only the existing native model/state
+boundary, preserving its attention semantics. Native recurrent/draft state uses
+one HostKvStorage per existing checkpoint account Q and the same SpillFile D as
+KV H. Fixed/execution-held records stay leased; the existing victim selection
+alone releases a record for queued targeted demotion. State checksum validation
+finishes before any native setter runs. Native restore vectors and candidate
+metadata are temporary admitted staging; they are not retained as new checkpoint
+copies. Monitor component metrics explicitly mark subsets and exclude process RSS.
+
+Two integration defects were found and fixed before delivery:
+- Active fork had called MTP stage-out, which also removed the source sequence
+  cells. Checkpoint capture now mirrors draft bytes without removing cells.
+- Restoring through ordinary bundle swap tried to harvest the rejected outgoing
+  execution. Full SSD capacity could then prevent rollback. Checkpoint restore
+  waits for in-flight DMA, discards the outgoing capture jobs/execution and
+  attaches its private saved candidate without archiving that rejected branch.
+
+The two-model 64/65/95/96-row native suite passed full allocation identity
+sharing, private tails, immutable-byte checks after native ID reuse and repeated
+old-parent restore. HTTP attention and native-state SSD runs passed the ordinary
+document/Query/tools/branch/edit workload. The MTP real-disconnect regression
+passed after the source-cell repair. The five merged public dependency tests
+also pass on the remote host. Final qualification after the discard/metadata
+admission changes is still pending; these statements are not a final test matrix.
+
+There is a measured cost to the current public state-image transport: it copies
+native capture vectors into a framed record and verifies/copies that image into
+private vectors on restore. The default late-commit failure fixture therefore
+uses Q=192 MiB; Q=128 MiB rejects earlier. A 256 MiB source-recovery case distinguishes
+successful zero-recompute native restore from admission of a further generation
+endpoint. Capture/allocation/image-write/image-read/attention-restore phase
+timings are exposed; image read/write include copy, framing and checksum together.
+A direct-producer/leased-view API proposal was sent to the public coordinator,
+who deferred any extension pending controlled measurements. No public code was
+duplicated or changed to bypass that decision. Final ABBA results and limitations
+remain to be added before PR readiness.
+

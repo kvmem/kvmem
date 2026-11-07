@@ -1601,16 +1601,30 @@ int main(int argc, char ** argv) {
             usage["disk_reads"] = storage.reads; usage["disk_writes"] = storage.writes; usage["disk_errors"] = storage.errors;
             usage["history_evictions"] = usage["evictions"];
             usage["sampling_scope"] = "committed_owner_metadata_with_live_physical_account";
-            uint64_t state_bytes = 0;
+            uint64_t state_bytes = 0, native_state_bytes = 0, metadata_staging_bytes = 0;
             std::set<const MultimodalCheckpointAccounting*> accounts;
-            for (const auto* lane : lanes) if (accounts.insert(lane->mm_checkpoint_accounting.get()).second)
-                state_bytes += lane->mm_checkpoint_accounting->live_bytes.load();
+            for (const auto* lane : lanes) if (accounts.insert(lane->mm_checkpoint_accounting.get()).second) {
+                const auto account = lane->mm_checkpoint_accounting;
+                state_bytes += account->used();
+                metadata_staging_bytes += account->live_bytes.load();
+                if (const auto storage = account->storage()) native_state_bytes += storage->charged_bytes();
+            }
             usage["physical_checkpoint_bytes"] = state_bytes;
-            usage["checkpoint_bytes_scope"] = "native_state_and_private_retrieval_metadata";
+            usage["checkpoint_bytes_scope"] = "Q_native_record_ram_plus_metadata_and_transient_staging; excludes_KV_H; not_process_RSS";
+            usage["checkpoint_native_record_ram_bytes"] = native_state_bytes;
+            usage["checkpoint_metadata_staging_bytes"] = metadata_staging_bytes;
+            usage["checkpoint_component_scope"] = "subsets_of_physical_checkpoint_bytes; SSD_in_shared_D";
             const auto captures = llama_kvmem_get_snapshot_stats();
             usage["captured_packed_k_bytes"] = captures.packed_k_bytes;
             usage["captured_packed_v_bytes"] = captures.packed_v_bytes;
             usage["captured_native_state_bytes"] = captures.native_state_bytes;
+            usage["snapshot_attention_capture_us"] = captures.attention_capture_us;
+            usage["snapshot_native_capture_us"] = captures.native_capture_us;
+            usage["snapshot_image_allocate_us"] = captures.image_allocate_us;
+            usage["snapshot_image_write_us"] = captures.image_write_us;
+            usage["snapshot_image_read_us"] = captures.image_read_us;
+            usage["snapshot_attention_restore_us"] = captures.attention_restore_us;
+            usage["snapshot_timing_scope"] = "process_wall_us; image_write/read_combine_copy_framing_checksum";
             usage["capture_scope"] = "process_successful_host_captures_target_and_draft; excludes_aliases_and_failed_transfers";
             data["kvmem"] = std::move(usage);
         }

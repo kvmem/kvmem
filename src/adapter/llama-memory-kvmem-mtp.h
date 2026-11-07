@@ -68,6 +68,8 @@ public:
     uint32_t harvest_perf_n_ubatch() const { return perf_n_ubatch_; }
     int64_t harvest_perf_sync_us() const { return perf_sync_us_; }
     void on_stage_out(uint32_t block_id);
+    // Fork/checkpoint capture must not remove the source's native draft cells.
+    void capture_checkpoint_block(uint32_t block_id) { harvest_k(block_id); harvest_v(block_id); }
     void harvest_resident_v();
     // A block with no packed draft K in the mirror is occupied anyway, which
     // is what the single-store server has always done: the cells hold this

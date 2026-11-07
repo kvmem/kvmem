@@ -217,6 +217,7 @@ public:
     std::unique_ptr<ConvStore> make_conv();
     std::unique_ptr<ConvStore> fork_conv(ConvStore & source);
     std::unique_ptr<ConvStore> fork_active_conv();
+    bool checkpoint_layer(uint32_t layer) const;
     // Exchange the per-conversation host state. Call only between requests,
     // under the server's request lock. `conv` must come from make_conv() or an
     // earlier swap_conv() on a compatible memory object; on return it holds the outgoing
@@ -233,6 +234,7 @@ public:
     // cannot be drained safely, or whose drain throws, is emptied rather than
     // kept, which the caller sees as its row count dropping to zero.
     bool swap_conv(std::unique_ptr<ConvStore> & conv);
+    bool restore_checkpoint_conv(std::unique_ptr<ConvStore> conv);
     uint32_t conv_n_tokens(const ConvStore & conv) const;
     uint64_t conv_host_bytes(const ConvStore & conv) const;
     uint64_t host_bytes() const;

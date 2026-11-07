@@ -29,6 +29,7 @@
 
 #include "llama.h"
 #include "kvmem/snapshot.hpp"
+#include "kvmem/kv_snapshot.hpp"
 #include "kvmem/native_kv_payload.hpp"
 #include "kvmem/snapshot_buffer.hpp"
 #include "kvmem/spill_io.hpp"
@@ -104,6 +105,14 @@ struct llama_memory_kvmem::ConvStore {
 
 struct llama_kvmem_store_bundle {
     std::unique_ptr<llama_memory_kvmem::ConvStore> store;
+};
+
+struct llama_kvmem_checkpoint_snapshot {
+    // Private native metadata/statistics; packed bindings are removed.
+    std::unique_ptr<llama_memory_kvmem::ConvStore> metadata;
+    std::unique_ptr<kvmem::PackedKvSnapshot> target, draft;
+    std::unique_ptr<kvmem::KvSnapshot> image;
+    uint64_t metadata_bytes = 0;
 };
 
 // Detached stores, keyed by an opaque handle. Handle 0 is the store the
@@ -362,6 +371,10 @@ bool llama_memory_kvmem::gdn_replay_commit(llama_context * ctx, uint32_t n_keep)
 static std::atomic<uint64_t> transfer_bytes[3]{};
 static std::atomic<uint64_t> transfer_calls[3]{};
 static std::atomic<uint64_t> snapshot_capture_bytes[3]{};
+static std::atomic<uint64_t> snapshot_time_us[6]{};
+void llama_kvmem_record_snapshot_time(llama_kvmem_snapshot_phase phase, uint64_t microseconds) {
+    snapshot_time_us[static_cast<unsigned>(phase)].fetch_add(microseconds, std::memory_order_relaxed);
+}
 
 void llama_kvmem_record_snapshot_capture(llama_kvmem_capture_plane plane, uint64_t bytes) {
     snapshot_capture_bytes[static_cast<unsigned>(plane)].fetch_add(bytes, std::memory_order_relaxed);
@@ -369,7 +382,9 @@ void llama_kvmem_record_snapshot_capture(llama_kvmem_capture_plane plane, uint64
 llama_kvmem_snapshot_stats llama_kvmem_get_snapshot_stats() {
     return {snapshot_capture_bytes[0].load(std::memory_order_relaxed),
             snapshot_capture_bytes[1].load(std::memory_order_relaxed),
-            snapshot_capture_bytes[2].load(std::memory_order_relaxed)};
+            snapshot_capture_bytes[2].load(std::memory_order_relaxed),
+            snapshot_time_us[0].load(), snapshot_time_us[1].load(), snapshot_time_us[2].load(),
+            snapshot_time_us[3].load(), snapshot_time_us[4].load(), snapshot_time_us[5].load()};
 }
 
 static bool transfer_stats_enabled() {
@@ -1337,8 +1352,10 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::fork_active_c
         throw std::runtime_error("active fork has unaccepted content");
     auto result = make_conv();
     for (const auto& block : runtime_->store().blocks()) if (block.gpu_slot >= 0) {
+        if (!gpu_kv_complete(block.block_id, kv_))
+            throw std::runtime_error("active fork has incomplete native target cells");
         harvest_gpu_v(block.block_id);
-        if (mtp_) mtp_->on_stage_out(block.block_id);
+        if (mtp_) mtp_->capture_checkpoint_block(block.block_id);
         result->resident.push_back(block.block_id);
     }
     harvest_gpu_v_commit();
@@ -1828,6 +1845,30 @@ void llama_memory_kvmem::conv_reset_to_empty(const char * what) noexcept {
         LLAMA_LOG_ERROR("%s: KVMem %s repair left the active store unreset; it is marked "
                 "host_mirror_stale, so the next switch clears it rather than carrying it\n",
                 __func__, what);
+    }
+}
+
+bool llama_memory_kvmem::restore_checkpoint_conv(std::unique_ptr<ConvStore> conv) {
+    // The checkpoint already owns the accepted source. Restoring it discards
+    // the outgoing execution, so harvesting that execution would add needless
+    // captures and could make rollback itself fail under an exhausted H/D.
+    // Finish DMA before discarding jobs; do not publish their rejected bytes.
+    kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
+    harvest_flush();
+    kvmem_stageout_wait(0, nullptr);
+    kvmem_stageout_wait(1, nullptr);
+    harvest_v_pending_.jobs.clear(); harvest_v_pending_.slot = -1;
+    harvest_v_jobs_.clear(); harvest_gpu_queued_.clear();
+    kvmem_stageout_clear();
+    decode_mean_discard();
+    set_replay(false);
+    clear(false);
+    if (mtp_) mtp_->clear(false);
+    try {
+        return attach_conv(std::move(conv));
+    } catch (...) {
+        conv_reset_to_empty("checkpoint attach");
+        throw;
     }
 }
 
@@ -5550,6 +5591,79 @@ llama_kvmem_store_bundle * llama_kvmem_store_bundle_fork(llama_kvmem_store_bundl
         result->store = mem->fork_active_conv();
     }
     return result.release();
+}
+
+bool llama_memory_kvmem::checkpoint_layer(uint32_t layer) const {
+    return kvmem_cache_has_layer(kv_, int32_t(layer));
+}
+
+std::shared_ptr<const llama_kvmem_checkpoint_snapshot> llama_kvmem_checkpoint_capture(uint32_t row) {
+    auto * mem = kvmem_capture_active();
+    if (!mem || !row) return {};
+    std::string reason;
+    if (!mem->conv_swap_supported(reason)) return {}; // legacy non-flash path
+    auto result = std::make_shared<llama_kvmem_checkpoint_snapshot>();
+    result->metadata = mem->fork_active_conv(); // drains accepted producers
+    auto & state = *result->metadata;
+    if (state.runtime->store().total_tokens() != row)
+        throw std::runtime_error("attention checkpoint is not the accepted frontier");
+    std::vector<kvmem::PackedKvSelection> target, draft;
+    for (const auto & b : state.runtime->store().blocks()) if (b.n_tokens) {
+        for (uint32_t layer = 0; layer < state.raw->config().n_layer; ++layer)
+            if (mem->checkpoint_layer(layer))
+                target.push_back({b.block_id, layer, b.n_tokens});
+        // The follower is an optional mirror; its existing missing-history
+        // semantics remain native. Every included plane requires coverage proof.
+        if (state.mtp_raw && state.mtp_raw->has_k_gpu(b.block_id, 0, b.n_tokens) &&
+                state.mtp_raw->has_v_gpu(b.block_id, 0, b.n_tokens))
+            draft.push_back({b.block_id, 0, b.n_tokens});
+    }
+    result->target = std::make_unique<kvmem::PackedKvSnapshot>(state.raw->export_packed(target));
+    if (state.mtp_raw)
+        result->draft = std::make_unique<kvmem::PackedKvSnapshot>(state.mtp_raw->export_packed(draft));
+    std::vector<std::shared_ptr<kvmem::SealedKvBlock>> blocks;
+    std::vector<kvmem::KvSnapshot::Span> spans;
+    size_t bytes = 0;
+    const auto append = [&](const kvmem::PackedKvSnapshot & packed) {
+        for (const auto & entry : packed.entries()) for (const auto * record : {&entry.k, &entry.v}) {
+            spans.push_back({blocks.size(), 0, bytes, record->size()});
+            blocks.push_back(std::make_shared<kvmem::SealedKvBlock>(*record));
+            bytes += record->size();
+        }
+    };
+    append(*result->target);
+    if (result->draft) append(*result->draft);
+    if (bytes) result->image = std::make_unique<kvmem::KvSnapshot>(std::move(blocks), std::move(spans), bytes);
+    // Preserve the complete MeanK/raw-statistics version. The public manifest
+    // alone owns the packed planes; this metadata package has none.
+    state.raw->import_packed(state.raw->export_packed({}));
+    if (state.mtp_raw) state.mtp_raw->import_packed(state.mtp_raw->export_packed({}));
+    result->metadata_bytes = sizeof(*result) + mem->conv_host_bytes(state) + result->target->metadata_bytes();
+    if (result->draft) result->metadata_bytes += result->draft->metadata_bytes();
+    if (result->image) result->metadata_bytes += result->image->metadata_bytes();
+    return result;
+}
+
+bool llama_kvmem_checkpoint_restore(const llama_kvmem_checkpoint_snapshot & snapshot) {
+    auto * mem = kvmem_capture_active();
+    if (!mem || !snapshot.metadata || !snapshot.target)
+        throw std::invalid_argument("missing immutable attention checkpoint");
+    auto candidate = mem->fork_conv(*snapshot.metadata);
+    candidate->raw->import_packed(*snapshot.target);
+    if (snapshot.draft) candidate->mtp_raw->import_packed(*snapshot.draft);
+    // The rejected outgoing execution is discarded, not harvested again.
+    // Failure can affect the private candidate, never the immutable source.
+    return mem->restore_checkpoint_conv(std::move(candidate));
+}
+uint64_t llama_kvmem_checkpoint_metadata_bytes(const llama_kvmem_checkpoint_snapshot & snapshot) {
+    return snapshot.metadata_bytes;
+}
+uint64_t llama_kvmem_checkpoint_payload_bytes(const llama_kvmem_checkpoint_snapshot & snapshot) {
+    return snapshot.image ? snapshot.image->size() : 0;
+}
+
+const kvmem::KvSnapshot * llama_kvmem_checkpoint_image(const llama_kvmem_checkpoint_snapshot & snapshot) {
+    return snapshot.image.get();
 }
 
 void llama_kvmem_store_bundle_free(llama_kvmem_store_bundle * bundle) {
