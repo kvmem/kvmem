@@ -1,5 +1,7 @@
 # llama.cpp immutable KV checkpoints on RTX 5070 Ti Laptop, 2026-11-07
 
+The [hot native state follow-up](llamacpp-hot-native-state-20261107.md) supersedes the native-state transport and performance results below. The original measurements describe the earlier worker.
+
 The candidate restores immutable parent snapshots through dense and hybrid branch, replay, cancellation and capacity-failure paths. It does **not** improve the performance of this workload. Actual packed K/V capture and prefill time increased on both models. The instrumented baseline already skips ordinary attention KV in native PARTIAL_ONLY checkpoints; eliminating a dense full-KV export was never the opportunity here.
 
 ## Controlled performance comparison

@@ -1,5 +1,7 @@
 # llama.cpp immutable snapshot adaptation: implementation audit
 
+The [hot native state follow-up](benchmarks/llamacpp-hot-native-state-20261107.md) supersedes the native-state transport and performance results below. The original measurements describe the earlier worker.
+
 Status: integrated against merged public PR271. See the [final controlled measurements and qualification](benchmarks/llamacpp-shared-snapshots-20261107.md). The first sections preserve the original baseline audit.
 
 Baseline KVMem: f0a3d51f889d0100ae97bc43a46a398937ffb4b5.
