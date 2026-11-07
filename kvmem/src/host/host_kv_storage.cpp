@@ -360,7 +360,17 @@ void HostKvRecord::read(size_t offset, void * destination, size_t bytes) const {
 }
 void HostKvRecord::write(size_t offset, const void * source, size_t bytes) {
     check_range(size(), offset, source, bytes);
-    if (bytes) std::memcpy(writable_data() + offset, source, bytes);
+    if (!bytes) return;
+    if (bytes == size() && allocation_->forked.load(std::memory_order_acquire)
+        && allocation_.use_count() > 1) {
+        // A full replacement needs none of the old payload. Keep the original
+        // owner until the new bytes have been admitted and initialized.
+        HostKvStorage storage(allocation_->account);
+        auto replacement = storage.allocate(bytes, source);
+        allocation_ = std::move(replacement.allocation_);
+        return;
+    }
+    std::memcpy(writable_data() + offset, source, bytes);
 }
 void HostKvRecord::seal() {
     if (!allocation_) return;
