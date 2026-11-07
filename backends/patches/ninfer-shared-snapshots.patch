@@ -1,0 +1,807 @@
+diff --git a/include/ninfer/observability/resources.h b/include/ninfer/observability/resources.h
+index 4c445141..2ec16ddf 100644
+--- a/include/ninfer/observability/resources.h
++++ b/include/ninfer/observability/resources.h
+@@ -124,6 +124,13 @@ struct KvmemMemorySummary {
+     std::uint64_t payload_references = 0, unique_payload_records = 0;
+     std::uint64_t logical_state_bytes = 0, physical_state_bytes = 0, state_sharing_credit_bytes = 0;
+     std::uint64_t state_references = 0;
++    // Program-lifetime complete KV record bytes captured from Device (including
++    // pressure captures and batches followed by publication failure), snapshot
++    // view bytes, and private tail Host-copy bytes. Excludes StateImage/verification
++    // traffic; record padding is included, so these are not DMA bus-byte counters.
++    std::uint64_t snapshot_capture_bytes=0, snapshot_view_bytes=0, snapshot_tail_copy_bytes=0;
++    // Current distinct manifests and their deduplicated metadata footprint.
++    std::uint64_t snapshot_count=0, snapshot_metadata_bytes=0;
+ };
+ 
+ struct TensorRankSummary {
+diff --git a/src/models/qwen3_5/program/prefill.cpp b/src/models/qwen3_5/program/prefill.cpp
+index 90af5577..9a78695c 100644
+--- a/src/models/qwen3_5/program/prefill.cpp
++++ b/src/models/qwen3_5/program/prefill.cpp
+@@ -800,7 +800,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
+             sequence.window.think_open=staged.prompt.memory_think_open;
+             sequence.window.think_close=staged.prompt.memory_think_close;
+             sequence.window.attention_scope={staged.prompt.starts_in_reasoning,0};
+-            reserve_memory_history(sequence, request, staged.prompt);
++            reserve_memory_history(sequence, request);
+         }
+         if (staged.disk_restore_frontier != 0) {
+             bool restored = false;
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index b53aeeec..9c698875 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -1228,9 +1228,29 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+         memory.disk_payload_budget_bytes = kvmem_options.disk_bytes;
+         memory.retained_payload_budget_bytes = memory_retained_budget;
+         for (const auto& request : requests) memory.active_payload_reservation_bytes += request.memory_payload_reservation;
++        memory.snapshot_capture_bytes=memory_snapshot_capture_bytes;
++        memory.snapshot_view_bytes=memory_snapshot_view_bytes;
++        memory.snapshot_tail_copy_bytes=memory_snapshot_tail_copy_bytes;
+         std::vector<const KvmemPrefixCheckpoint*> seen;
+-        std::unordered_set<const void*> payload_records, state_records;
++        std::unordered_set<const void*> payload_records, state_records, snapshot_metadata;
++        const auto metadata_bytes = [&](const KvmemPrefixCheckpoint& checkpoint) {
++            auto bytes=checkpoint.metadata_bytes();
++            if (checkpoint.kv_snapshot) {
++                bytes-=checkpoint.kv_snapshot->metadata_bytes();
++                if(!snapshot_metadata.count(checkpoint.kv_snapshot.get())) ++memory.snapshot_count;
++                checkpoint.kv_snapshot->account_metadata([&](const void* identity,size_t size) {
++                    if(snapshot_metadata.insert(identity).second) {
++                        bytes+=size; memory.snapshot_metadata_bytes+=size;
++                    }
++                });
++            }
++            return bytes;
++        };
+         const auto collect_state = [&](const KvmemPrefixCheckpoint& checkpoint) {
++            if(checkpoint.kv_snapshot) checkpoint.kv_snapshot->account([&](const void* identity,size_t bytes) {
++                memory.logical_payload_bytes+=bytes; ++memory.payload_references;
++                payload_records.insert(identity);
++            });
+             const auto* identity = checkpoint.state ? static_cast<const void*>(checkpoint.state.get())
+                                                    : checkpoint.cold_state.storage_identity();
+             if (!identity) return;
+@@ -1259,7 +1279,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+                 if (const auto* checkpoint = memory_checkpoint(window, kind);
+                     checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
+                     seen.push_back(checkpoint);
+-                    memory.checkpoint_bytes += checkpoint->metadata_bytes();
++                    memory.checkpoint_bytes += metadata_bytes(*checkpoint);
+                     memory.checkpoint_tokens = std::max(memory.checkpoint_tokens,
+                         static_cast<std::uint32_t>(checkpoint->prefix.size()));
+                 }
+@@ -1279,8 +1299,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+         if(const auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_);
+            transaction && transaction->memory_history && transaction->memory_history->fork)
+             collect(*transaction->memory_history->fork);
+-        if(memory_coverage_transfer && std::find(seen.begin(),seen.end(),memory_coverage_transfer->checkpoint.get())==seen.end())
+-            memory.checkpoint_bytes+=memory_coverage_transfer->checkpoint->metadata_bytes();
++        if(memory_coverage_transfer && std::find(seen.begin(),seen.end(),memory_coverage_transfer->checkpoint.get())==seen.end()) {
++            memory.checkpoint_bytes+=metadata_bytes(*memory_coverage_transfer->checkpoint);
++            collect_state(*memory_coverage_transfer->checkpoint);
++        }
+         memory.host_payload_bytes = memory_payload_storage.charged_bytes();
+         memory.physical_payload_bytes = memory.host_payload_bytes + memory.disk_payload_bytes;
+         memory.unique_payload_records = payload_records.size();
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index 55667e8e..06388327 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include "models/qwen3_5/program/storage/kvmem_snapshot.h"
+ #include "kvmem/query_policy.hpp"
+ #include "runtime/contract/grammar_masks.h"
+ #include "runtime/contract/mtp_adaptive.h"
+@@ -519,6 +520,7 @@ struct KvmemPrefixCheckpoint {
+     // A capture origin denotes the entire sealed recovery point, including
+     // its native/policy state. Forks preserve it; a new capture gets a new one.
+     std::uint64_t immutable_origin = 0;
++    std::shared_ptr<const kvmem::KvSnapshot> kv_snapshot;
+     kvmem::LrfuState history;
+     kvmem::GraphSnapshot graph;
+     kvmem::AttentionFeedbackSnapshot feedback;
+@@ -540,7 +542,8 @@ struct KvmemPrefixCheckpoint {
+             value.layout.format.capacity() + 5 + value.layout.planes.capacity()*sizeof(kvmem::PayloadPlane);
+     }
+     std::uint64_t metadata_bytes() const noexcept {
+-        return sizeof(*this) + identity_bytes(identity) + prefix_identity.allocated_bytes() +
++        return sizeof(*this) + (kv_snapshot ? kv_snapshot->metadata_bytes() : 0) +
++            identity_bytes(identity) + prefix_identity.allocated_bytes() +
+             prefix.capacity()*sizeof(TokenId) + resident_pages.capacity()*sizeof(uint64_t) +
+             mean_tail.capacity()*sizeof(float) + history.scores->capacity()*sizeof(double) + graph.bytes() + feedback.bytes();
+     }
+@@ -1152,6 +1155,8 @@ public:
+     const std::uint32_t kvmem_window_tokens;
+     const KvmemOptions kvmem_options;
+     kvmem::HostKvStorage memory_payload_storage;
++    uint64_t memory_snapshot_capture_bytes=0, memory_snapshot_view_bytes=0;
++    uint64_t memory_snapshot_tail_copy_bytes=0;
+     kvmem::HostKvStorage memory_transfer_storage; // bounded CPU scratch through GPU publication
+     kvmem::HostKvStorage memory_state_staging; // one admitted state-image read at a time
+     // Declared before the queue: shutdown joins workers before freeing their
+@@ -2186,13 +2191,13 @@ private:
+     std::optional<KvmemHistoryMatch> memory_restorable_history(const PreparedPromptData& prompt,
+         const qwen3_5::detail::PrefixShortlistDigests* digests = nullptr) const;
+     std::unique_ptr<KvmemWindowState> fork_memory_history(const KvmemWindowState& source,
+-                                                        std::uint32_t frontier);
++                                                        const KvmemPrefixCheckpoint& checkpoint);
+     std::uint32_t memory_observed_prefix(const PreparedPromptData& prompt) const;
+     std::uint32_t memory_reuse_anchor(const PreparedPromptData& prompt, std::uint32_t base,
+                                      std::uint32_t observed) const;
+     void capture_memory_anchor(SequenceState& sequence, std::uint32_t chunk_tokens) noexcept;
+     void reserve_memory_history(SequenceState& sequence, RequestControl& request,
+-                                const PreparedPromptData& prompt);
++                                uint64_t additional = 0, bool optional = false);
+     bool restore_memory_history(SequenceState& sequence, RequestControl::Prefill& staged);
+     void retain_memory_history(SequenceState& sequence, const RequestControl& request,
+                                bool completed = false) noexcept;
+diff --git a/src/models/qwen3_5/program/storage/kvmem_snapshot.h b/src/models/qwen3_5/program/storage/kvmem_snapshot.h
+new file mode 100644
+index 00000000..dabe058a
+--- /dev/null
++++ b/src/models/qwen3_5/program/storage/kvmem_snapshot.h
+@@ -0,0 +1,75 @@
++#pragma once
++#include "kvmem/kv_snapshot.hpp"
++#include <unordered_map>
++
++namespace ninfer::models::qwen3_5 {
++// The native manifest is one complete, sealed record per logical page. Check
++// this without allocating owner handles, reading SSD, or promoting cold data.
++inline bool kvmem_snapshot_covers(const std::shared_ptr<const kvmem::KvSnapshot>& snapshot,
++                                  size_t pages, size_t stride) {
++    if (!snapshot || !pages || !stride || pages > SIZE_MAX / stride ||
++        snapshot->size() != pages * stride || snapshot->blocks().size() != pages ||
++        snapshot->spans().size() != pages) return false;
++    for (size_t page = 0; page < pages; ++page) {
++        const auto& block = snapshot->blocks()[page];
++        const auto& span = snapshot->spans()[page];
++        if (block->size() != stride || !block->ready() || span.block != page ||
++            span.source || span.destination != page * stride || span.bytes != stride) return false;
++    }
++    return true;
++}
++
++// Called after native accepted-boundary capture. Archive records include all
++// attention/scale/MTP planes. Only live allocation identity proves reuse.
++inline std::shared_ptr<const kvmem::KvSnapshot> capture_kvmem_snapshot(
++    const std::vector<kvmem::HostKvRecord>& archive, size_t pages, bool partial_tail,
++    kvmem::HostKvStorage& storage,
++    const std::shared_ptr<const kvmem::KvSnapshot>& previous = {}) {
++    if (!pages || pages > archive.size())
++        throw std::logic_error("NInfer snapshot has incomplete archive coverage");
++    std::unordered_map<const void*, std::shared_ptr<kvmem::SealedKvBlock>> inherited;
++    if (previous) for (const auto& origin : previous->blocks()) {
++        auto record = origin->record();
++        if (record) inherited.emplace(record.storage_identity(), origin);
++    }
++    std::vector<std::shared_ptr<kvmem::SealedKvBlock>> blocks;
++    std::vector<kvmem::KvSnapshot::Span> spans;
++    blocks.reserve(pages); spans.reserve(pages);
++    size_t bytes = 0;
++    for (size_t page = 0; page < pages; ++page) {
++        const auto& record = archive[page];
++        if (!record || record.size() > SIZE_MAX - bytes)
++            throw std::logic_error("NInfer snapshot has invalid native record");
++        std::shared_ptr<kvmem::SealedKvBlock> origin;
++        if (!(partial_tail && page + 1 == pages)) {
++            auto found = inherited.find(record.storage_identity());
++            if (found != inherited.end()) origin = found->second;
++        }
++        if (partial_tail && page + 1 == pages) {
++            // Pay for the private tail now, not during the next append. The
++            // active archive keeps its independent mutable allocation.
++            auto source=record.lease();
++            auto tail=storage.allocate(record.size());
++            source.read(0,tail.writable_data(),tail.size());
++            tail.seal();
++            origin=std::make_shared<kvmem::SealedKvBlock>(tail);
++        } else if (!origin) origin = std::make_shared<kvmem::SealedKvBlock>(record);
++        blocks.push_back(std::move(origin));
++        spans.push_back({page, 0, bytes, record.size()});
++        bytes += record.size();
++    }
++    return std::make_shared<kvmem::KvSnapshot>(std::move(blocks), std::move(spans), bytes);
++}
++
++// Prepare private owner handles before publication; cold records stay cold.
++inline std::vector<kvmem::HostKvRecord> fork_kvmem_snapshot(const kvmem::KvSnapshot& snapshot) {
++    std::vector<kvmem::HostKvRecord> result;
++    result.reserve(snapshot.blocks().size());
++    for (const auto& block : snapshot.blocks()) {
++        auto record = block->record();
++        if (!record) throw std::logic_error("NInfer snapshot is not sealed");
++        result.push_back(std::move(record));
++    }
++    return result;
++}
++} // namespace ninfer::models::qwen3_5
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index d55d3b07..7033de72 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -27,6 +27,16 @@ std::uint32_t valid_columns(std::uint32_t logical_page, std::uint32_t frontier)
+     return std::min(page_tokens, frontier - logical_page * page_tokens);
+ }
+ 
++// Enumerate backend-owned checkpoint attachments into the existing physical
++// identity accounts. Repeated slots are intentional; callers deduplicate the
++// public allocation identity, including records shared with the active archive.
++template<class Visitor>
++void visit_memory_checkpoints(const KvmemWindowState& window, Visitor&& visitor) {
++    for (const auto& entry : window.checkpoints) if (entry.data) visitor(*entry.data);
++    for (const auto& entry : window.coverage)
++        if (entry.info.identity && entry.record.data) visitor(*entry.record.data);
++}
++
+ struct CanonicalSnapshotInput {
+     std::size_t frontier = 0;
+     const KvmemPrefixCheckpoint* checkpoint = nullptr;
+@@ -57,10 +67,7 @@ CanonicalSnapshotInput canonical_snapshot_input(const KvmemWindowState& window,
+             cp.state_bytes() != image_bytes || cp.prefix_identity.size() < end ||
+             cp.graph.accepted_through != end || cp.graph.block_tokens != page_tokens) return;
+         const auto pages = (end + page_tokens - 1) / page_tokens;
+-        if (window.archive.size() < pages || window.host_versions.size() < pages) return;
+-        for (std::size_t page = 0; page < pages; ++page)
+-            if (!window.archive[page] || window.host_versions[page] < valid_columns(
+-                    static_cast<std::uint32_t>(page), static_cast<std::uint32_t>(end))) return;
++        if (!kvmem_snapshot_covers(cp.kv_snapshot, pages, cp.identity.layout.record_bytes)) return;
+         if (!std::all_of(cp.resident_pages.begin(), cp.resident_pages.end(),
+                         [pages](auto page) { return page < pages; })) return;
+         if (!latest || end > latest->prefix.size()) latest = &cp;
+@@ -433,6 +440,7 @@ public:
+             }
+             trace.end_copy();
+             p.device.synchronize();
++            p.memory_snapshot_capture_bytes += count * backend.page_bytes;
+             trace.batch_complete();
+             for (std::size_t i = 0; i < count; ++i) {
+                 const auto index = begin + i;
+@@ -1189,9 +1197,8 @@ bool ProgramImpl::complete_memory_checkpoint(const SequenceState& sequence,
+         !std::equal(checkpoint.prefix.begin(), checkpoint.prefix.end(), sequence.ledger.begin()) ||
+         !checkpoint.prefix_identity.prefix_equals(sequence.prefix_identity, frontier)) return false;
+     const auto pages = kv_pages_for_tokens(static_cast<std::uint32_t>(frontier));
+-    if (window.archive.size() < pages || window.host_versions.size() < pages) return false;
+-    for (std::uint32_t page = 0; page < pages; ++page)
+-        if (!window.archive[page] || window.host_versions[page] < valid_columns(page, frontier)) return false;
++    if (!kvmem_snapshot_covers(checkpoint.kv_snapshot, pages,
++            text_host_kv_page_stride + backend_host_kv_page_stride)) return false;
+     return std::all_of(checkpoint.resident_pages.begin(), checkpoint.resident_pages.end(),
+                        [pages](auto page) { return page < pages; });
+ }
+@@ -1376,23 +1383,63 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
+     checkpoint->resident_pages.reserve(window.pages.size());
+     const auto pages = kv_pages_for_tokens(frontier);
+     for (auto id : window.pages) if (id < pages) checkpoint->resident_pages.push_back(id);
+-    if (checkpoint->metadata_bytes() > metadata)
+-        throw std::logic_error("checkpoint metadata exceeded admission");
++    archive_memory_window(sequence);
++    std::shared_ptr<const kvmem::KvSnapshot> previous;
++    for (const auto kind : checkpoint_kinds(window)) {
++        const auto* saved = memory_checkpoint(window,kind);
++        if (saved && saved->kv_snapshot && saved->prefix.size() <= frontier &&
++            (!previous || saved->kv_snapshot->size() > previous->size())) previous=saved->kv_snapshot;
++    }
++    for (uint32_t page=0;page<frontier/page_tokens;++page) window.archive.at(page).seal();
++    reserve_memory_history(sequence, requests.at(sequence.lane),
++        frontier % page_tokens ? backend.page_bytes : 0, optional);
++    checkpoint->kv_snapshot=capture_kvmem_snapshot(window.archive,pages,frontier%page_tokens,memory_payload_storage,previous);
++    if (frontier % page_tokens) memory_snapshot_tail_copy_bytes += backend.page_bytes;
++    // Manifest allocation is transient metadata, not a second payload account.
++    // Admit its actual footprint before publishing or allocating native state.
++    const auto incremental_metadata = [&] {
++        std::unordered_set<const void*> retained_metadata;
++        const auto remember_metadata = [&](const KvmemPrefixCheckpoint& cp) {
++            if (cp.kv_snapshot) cp.kv_snapshot->account_metadata([&](const void* id, size_t) {
++                retained_metadata.insert(id);
++            });
++        };
++        for (const auto& lane : continuation_states)
++            if (lane.window.statistics) visit_memory_checkpoints(lane.window, remember_metadata);
++        for (const auto& owner : memory_histories)
++            if (owner) visit_memory_checkpoints(*owner, remember_metadata);
++        if (const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
++            transaction && transaction->memory_history && transaction->memory_history->fork)
++            visit_memory_checkpoints(*transaction->memory_history->fork, remember_metadata);
++        if (memory_coverage_transfer) remember_metadata(*memory_coverage_transfer->checkpoint);
++        auto added_metadata = checkpoint->metadata_bytes() - checkpoint->kv_snapshot->metadata_bytes();
++        checkpoint->kv_snapshot->account_metadata([&](const void* id, size_t size) {
++            if (retained_metadata.insert(id).second) added_metadata += size;
++        });
++        return added_metadata;
++    };
++    size_t added_metadata = 0;
++    do {
++        added_metadata = incremental_metadata();
++        checkpoint_memory_room(window,(optional ? 2*bytes : bytes)+added_metadata,optional);
++        // Admission can evict the last published owner of an inherited origin.
++        // Re-evaluate the candidate's incremental metadata after that reclamation.
++    } while (incremental_metadata() > added_metadata);
+     checkpoint->state = memory_checkpoint_pool->acquire(bytes);
+     std::memset(checkpoint->state->data(), 0, bytes);
+-    archive_memory_window(sequence);
+     std::array<std::byte*, 1> host{static_cast<std::byte*>(checkpoint->state->data())};
+     state_images->copy_to_host_segments(state_store->physical_slot(sequence.state.write),
+         host, bytes, compute_streams);
+     device.synchronize();
++    memory_snapshot_view_bytes+=checkpoint->kv_snapshot->size();
+     if (kvmem_options.verify_transfers) {
+         std::fprintf(stderr, "KVMEM_PREFIX_CHECKPOINT frontier=%u state_bytes=%zu metadata_bytes=%llu admitted_metadata_bytes=%zu\n",
+-            frontier, bytes, (unsigned long long)checkpoint->metadata_bytes(), metadata);
++            frontier, bytes, (unsigned long long)checkpoint->metadata_bytes(), added_metadata);
+         if (window.coverage.policy().enabled) {
+             const auto staging = kvmem_options.disk_bytes ? bytes : 0;
+             // The image is already in the pool; its unpublished metadata is not
+             // yet reachable through the retained/active checkpoint directories.
+-            const auto charged = memory_summary().kvmem.checkpoint_bytes + checkpoint->metadata_bytes() + staging;
++            const auto charged = memory_summary().kvmem.checkpoint_bytes + added_metadata + staging;
+             std::fprintf(stderr, "KVMEM_CHECKPOINT_HOST charged_bytes=%llu budget_bytes=%llu\n",
+                 (unsigned long long)charged, (unsigned long long)(window.coverage.policy().host_bytes*max_concurrency));
+         }
+@@ -1652,11 +1699,18 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
+     // All prefix records were made durable at capture. Query appends cannot alter
+     // native values/scales in earlier rows; the partial page is explicitly clipped.
+     const auto pages = kv_pages_for_tokens(frontier);
+-    if (window.archive.size() < pages) throw std::logic_error("KVMem checkpoint lost Host prefix");
+-    for (std::uint32_t id = 0; id < pages; ++id) {
+-        if (!window.archive[id] || window.host_versions[id] < valid_columns(id, frontier)) {
+-            throw std::logic_error("KVMem checkpoint has an incomplete native prefix");
+-        }
++    if (!kvmem_snapshot_covers(checkpoint.kv_snapshot, pages, backend.page_bytes))
++        throw std::logic_error("KVMem checkpoint lost sealed native prefix");
++    // A materialization transaction has already prepared private resident copies
++    // from this exact snapshot. In-lane Query rewind instead stages new handles.
++    auto restored_archive = resident_native ? std::vector<KvmemHostRecord>{}
++                                           : fork_kvmem_snapshot(*checkpoint.kv_snapshot);
++    if (resident_native) {
++        if (window.archive.size() < pages || window.host_versions.size() < pages)
++            throw std::logic_error("KVMem prepared checkpoint lost native prefix");
++        for (std::uint32_t id = 0; id < pages; ++id)
++            if (!window.archive[id] || window.host_versions[id] != valid_columns(id, frontier))
++                throw std::logic_error("KVMem prepared checkpoint has an incomplete native prefix");
+     }
+     if(checkpoint.graph.accepted_through!=frontier || checkpoint.graph.block_tokens!=page_tokens)
+         throw std::logic_error("KVMem checkpoint graph has a different accepted prefix");
+@@ -1683,10 +1737,12 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
+     // generation parser state. A resumed native continuation restores its own.
+     if(preserve_view) window.attention_scope=checkpoint.attention_scope;
+     window.statistics_frontier = frontier;
++    if (!resident_native) window.archive=std::move(restored_archive);
+     window.archive.resize(pages);
+     window.host_versions.resize(pages);
++    for (uint32_t page = 0; page < pages; ++page)
++        window.host_versions[page] = valid_columns(page, frontier);
+     window.payload_bytes = pages * backend.page_bytes;
+-    if (frontier % page_tokens) window.host_versions.back() = frontier % page_tokens;
+     // A consumed history has one archive. Rewinding explicitly revokes later states
+     // before their payload/statistics can be overwritten; no full-history COW is needed.
+     window.coverage.truncate(frontier);
+@@ -1795,8 +1851,9 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+                 }
+                 uint64_t cold=cp->state ? 0 : cp->state_bytes();
+                 for(const auto page:cp->resident_pages) {
+-                    if(page>=history->archive.size()) { cold=UINT64_MAX; break; }
+-                    const auto& record=history->archive[page];
++                    if(!cp->kv_snapshot || page>=cp->kv_snapshot->blocks().size()) { cold=UINT64_MAX; break; }
++                    const auto record=cp->kv_snapshot->blocks()[page]->record();
++                    if(!record) { cold=UINT64_MAX; break; }
+                     if(!record.resident_bytes()) cold+=record.size();
+                 }
+                 candidates.push_back({{index,kind,static_cast<uint32_t>(cp->prefix.size()),true},cp,cold,order});
+@@ -1822,9 +1879,10 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+             bool complete=checkpoint.state_bytes()==state_images->host_layout().image_bytes &&
+                 frontier==checkpoint.identity.stamp.frontier && history.statistics && history.selector &&
+                 checkpoint.identity.stamp.session==history.stamp.session &&
+-                history.statistics_frontier>=frontier && history.archive.size()>=pages && history.host_versions.size()>=pages;
+-            for(uint32_t page=0;complete && page<pages;++page)
+-                complete=history.archive[page] && history.host_versions[page]>=valid_columns(page,frontier);
++                history.statistics_frontier>=frontier &&
++                kvmem_snapshot_covers(checkpoint.kv_snapshot, pages,
++                    text_host_kv_page_stride + backend_host_kv_page_stride);
++            for(const auto page:checkpoint.resident_pages) complete=complete && page<pages;
+             if(!complete) { ++incomplete; continue; }
+             ++exact_checks; compared_tokens+=frontier;
+             if(frontier>=prompt.token_ids.size() ||
+@@ -1854,14 +1912,17 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+ }
+ 
+ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+-    const KvmemWindowState& source, uint32_t frontier) {
++    const KvmemWindowState& source, const KvmemPrefixCheckpoint& checkpoint) {
++    const auto frontier = static_cast<uint32_t>(checkpoint.prefix.size());
++    if (!checkpoint.kv_snapshot) throw std::logic_error("missing sealed NInfer checkpoint");
+     const auto started=Clock::now();
+     const auto pages=kv_pages_for_tokens(frontier);
+     std::unordered_map<const KvmemPrefixCheckpoint*,std::shared_ptr<KvmemPrefixCheckpoint>> copies;
+     size_t metadata=0;
+     for(const auto kind:checkpoint_kinds(source)) {
+         const auto* cp=memory_checkpoint(source,kind);
+-        if(cp && cp->prefix.size()<=frontier && copies.emplace(cp,nullptr).second) metadata+=cp->metadata_bytes();
++        if(cp && cp->prefix.size()<=frontier && copies.emplace(cp,nullptr).second)
++            metadata+=cp->metadata_bytes()-(cp->kv_snapshot ? cp->kv_snapshot->metadata_bytes() : 0);
+     }
+     // Optional optimization: never evict the source to make room for its fork.
+     checkpoint_memory_room(const_cast<KvmemWindowState&>(source),metadata,true);
+@@ -1896,10 +1957,11 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+         entry.info.identity=entry.record.data.get();
+         entry.info.bytes=entry.record.checkpoint_info().bytes;
+     }
+-    child->archive.reserve(pages);
+-    child->host_versions.assign(source.host_versions.begin(),source.host_versions.begin()+pages);
+-    for(uint32_t page=0;page<pages;++page) child->archive.push_back(source.archive[page].fork());
+-    child->payload_bytes=pages ? pages*source.archive.front().size() : 0;
++    child->host_versions.resize(pages);
++    child->archive = fork_kvmem_snapshot(*checkpoint.kv_snapshot);
++    if (child->archive.size() != pages) throw std::logic_error("NInfer snapshot frontier mismatch");
++    for (uint32_t page=0;page<pages;++page) child->host_versions[page]=valid_columns(page,frontier);
++    child->payload_bytes=checkpoint.kv_snapshot->size();
+     if(kvmem_options.verify_transfers) std::fprintf(stderr,
+         "KVMEM_HISTORY_FORK frontier=%u shared_kv_bytes=%llu metadata_bytes=%zu statistics_bytes=%zu fork_us=%.3f\n",
+         frontier,(unsigned long long)child->payload_bytes,metadata,child->statistics->allocated_bytes(),
+@@ -1928,11 +1990,12 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+                 for(const auto& active:requests) required+=active.memory_payload_reservation;
+                 const auto* checkpoint=memory_checkpoint(source,match->kind);
+                 const auto full_pages=match->frontier/page_tokens;
+-                for(size_t page=0;page<source.archive.size();++page) {
++                for(size_t page=0;page<checkpoint->kv_snapshot->blocks().size();++page) {
++                    const auto record=checkpoint->kv_snapshot->blocks()[page]->record();
+                     const bool selected=std::find(checkpoint->resident_pages.begin(),checkpoint->resident_pages.end(),page)!=checkpoint->resident_pages.end();
+                     const bool shared=page<full_pages && page!=(match->frontier-1)/page_tokens &&
+-                        (!selected || source.archive[page].resident_bytes());
+-                    if(!shared) required+=source.archive[page].size();
++                        (!selected || record.resident_bytes());
++                    if(!shared) required+=record.size();
+                 }
+                 std::unordered_set<const void*> cold;
+                 for(const auto kind:checkpoint_kinds(source)) if(const auto* cp=memory_checkpoint(source,kind);
+@@ -1940,7 +2003,7 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+                     required+=cp->cold_state.size();
+                 if(required>memory_retained_budget)
+                     throw std::runtime_error("fork cannot retain its source within the payload budget");
+-                pending->fork=fork_memory_history(source,match->frontier);
++                pending->fork=fork_memory_history(source,*checkpoint);
+                 const auto input = canonical_snapshot_input(source, state_images->host_layout().image_bytes);
+                 if (!snapshot_input_matches(input, staged.prompt))
+                     pending->fork->cache_group=0;
+@@ -2048,7 +2111,7 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
+         // A directory hit never consumes its source, including a continuation.
+         // Normally preparation already owns the fork; retain this invariant on
+         // the synchronous fallback path as well.
+-        sequence.window=std::move(*fork_memory_history(*history,*frontier));
++        sequence.window=std::move(*fork_memory_history(*history,*memory_checkpoint(*history,kind)));
+     }
+     auto& window = sequence.window;
+     const bool same_query = memory_user_already_evaluated(staged.prompt, *frontier);
+@@ -2151,25 +2214,40 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
+ }
+ 
+ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl& request,
+-                                         const PreparedPromptData& prompt) {
+-    (void)prompt;
++                                         uint64_t additional, bool optional) {
+     if(!sequence.window.cache_group) sequence.window.cache_group=next_snapshot_group.fetch_add(1);
+     if (!sequence.window.statistics) ++memory_history_misses;
+     // Read/write permission belongs to this request; a fresh request never
+     // invalidates other independently published content snapshots.
+-    std::uint64_t reserved = 0;
++    std::uint64_t reserved = additional;
+     for (const auto& active : requests) reserved += active.memory_payload_reservation;
++    std::unordered_set<const void*> active_payloads, active_cold;
++    for (const auto& lane : continuation_states) if (lane.window.statistics)
++        for (const auto& record : lane.window.archive) if (record)
++            active_payloads.insert(record.storage_identity());
++    for (const auto& lane : continuation_states) if (lane.window.statistics)
++        visit_memory_checkpoints(lane.window, [&](const KvmemPrefixCheckpoint& cp) {
++            if (cp.kv_snapshot) cp.kv_snapshot->account([&](const void* identity, size_t bytes) {
++                if (active_payloads.insert(identity).second) reserved += bytes;
++            });
++            if (cp.cold_state && active_cold.insert(cp.cold_state.storage_identity()).second)
++                reserved += cp.cold_state.size();
++        });
++    if (memory_coverage_transfer && memory_coverage_transfer->checkpoint->kv_snapshot)
++        memory_coverage_transfer->checkpoint->kv_snapshot->account([&](const void* identity, size_t bytes) {
++            if (active_payloads.insert(identity).second) reserved += bytes;
++        });
+     if (reserved > memory_retained_budget) {
+-        throw std::logic_error("KVMem active payload reservations exceed admission capacity");
++        throw std::runtime_error("KVMem retained snapshot payload budget exhausted");
+     }
+     auto available = memory_retained_budget - reserved;
+     for (;;) {
+         std::uint64_t cached_bytes = memory_idle_transfer ? memory_idle_transfer->work->destination.size() : 0;
+         std::vector<kvmem::ContentCacheSlot> slots;
+-        std::unordered_set<const void*> payloads,cold;
+-        // Active reservations already include the shared physical prefix.
+-        for(const auto& lane:continuation_states) if(lane.window.statistics)
+-            for(const auto& record:lane.window.archive) if(record) payloads.insert(record.storage_identity());
++        auto payloads = active_payloads;
++        auto cold = active_cold;
++        // Active reservations cover archive records; retained private versions
++        // have been added above. Shared identities receive credit exactly once.
+         const auto protected_source=request.prefill ? request.prefill->memory_restore_generation : 0;
+         for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+             const auto& history = memory_histories[index];
+@@ -2183,12 +2261,16 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
+             for (const auto kind : checkpoint_kinds(*history))
+                 if (const auto* checkpoint = memory_checkpoint(*history, kind);
+                     checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
++                    if (checkpoint->kv_snapshot) checkpoint->kv_snapshot->account([&](const void* identity, size_t bytes) {
++                        if (payloads.insert(identity).second) cached_bytes += bytes;
++                    });
+                     if(checkpoint->cold_state && cold.insert(checkpoint->cold_state.storage_identity()).second)
+                         cached_bytes += checkpoint->cold_state.size();
+                     seen.push_back(checkpoint);
+                 }
+         }
+         if (cached_bytes <= available) break;
++        if (optional) throw std::runtime_error("optional snapshot exceeds retained payload budget");
+         const auto victim=kvmem::select_content_eviction(slots);
+         if (!victim) throw std::logic_error("KVMem retained Host accounting has no victim");
+         memory_histories[*victim].reset();
+@@ -2268,7 +2350,7 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+     if (!pages || pages > window.archive.size() || pages > window.host_versions.size() ||
+         !window.archive.front()) return;
+     const auto page_bytes = window.archive.front().size();
+-    // All slots share one archive through the latest complete checkpoint.
++    // Trim the latest active archive; each checkpoint owns its exact manifest.
+     // Uncommitted/cancelled rows past that frontier are never retained.
+     window.archive.resize(pages);
+     window.host_versions.resize(pages);
+@@ -2296,13 +2378,16 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+     for (size_t index=0;index<memory_histories.size();++index) {
+         const auto& history=memory_histories[index];
+         bool covered=history && kvmem::content_snapshot_covers(incoming_origins,origins(*history));
+-        // A checkpoint origin alone does not prove an archive that has since
+-        // been replayed. Compact groups only when their native KV allocations
+-        // are also still the exact immutable sources. COW tails are retained
+-        // conservatively until a native byte-range proof is available.
+-        for(size_t page=0;covered && page<history->archive.size();++page)
+-            covered=page<window.archive.size() &&
+-                history->archive[page].storage_identity()==window.archive[page].storage_identity();
++        // State-origin numbers alone do not prove KV. Compaction additionally
++        // requires the same strongly owned immutable manifest for every source.
++        if (covered) visit_memory_checkpoints(*history, [&](const KvmemPrefixCheckpoint& old) {
++            bool found = false;
++            visit_memory_checkpoints(window, [&](const KvmemPrefixCheckpoint& next) {
++                found |= old.immutable_origin == next.immutable_origin && old.kv_snapshot &&
++                    old.kv_snapshot == next.kv_snapshot;
++            });
++            covered &= found;
++        });
+         if(covered) superseded.push_back(index);
+         slots.push_back({bool(history) && !covered, false, history ? history->publication_order : 0,
+                          history ? static_cast<const void*>(&*history) : nullptr,
+@@ -2398,6 +2483,14 @@ bool ProgramImpl::progress_memory_storage() {
+     std::unordered_set<const void*> payloads,cold;
+     for(const auto& lane:continuation_states) if(lane.window.statistics)
+         for(const auto& record:lane.window.archive) if(record) payloads.insert(record.storage_identity());
++    for (const auto& lane : continuation_states) if (lane.window.statistics)
++        visit_memory_checkpoints(lane.window, [&](const KvmemPrefixCheckpoint& cp) {
++            if (cp.kv_snapshot) cp.kv_snapshot->account([&](const void* identity, size_t bytes) {
++                if (payloads.insert(identity).second) used += bytes;
++            });
++            if (cp.cold_state && cold.insert(cp.cold_state.storage_identity()).second)
++                used += cp.cold_state.size();
++        });
+     for (const auto& history : memory_histories) {
+         if (!history) continue;
+         for(const auto& record:history->archive)
+@@ -2406,6 +2499,9 @@ bool ProgramImpl::progress_memory_storage() {
+         for (const auto kind : checkpoint_kinds(*history))
+             if (const auto* checkpoint = memory_checkpoint(*history, kind);
+                 checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
++                if (checkpoint->kv_snapshot) checkpoint->kv_snapshot->account([&](const void* identity, size_t bytes) {
++                    if (payloads.insert(identity).second) used += bytes;
++                });
+                 if(checkpoint->cold_state && cold.insert(checkpoint->cold_state.storage_identity()).second)
+                     used += checkpoint->cold_state.size();
+                 seen.push_back(checkpoint);
+diff --git a/src/serve/kvmem_status_json.h b/src/serve/kvmem_status_json.h
+index 205046ae..fa15d16a 100644
+--- a/src/serve/kvmem_status_json.h
++++ b/src/serve/kvmem_status_json.h
+@@ -30,6 +30,11 @@ inline nlohmann::json kvmem_status_json(const KvmemMemorySummary& m) {
+         {"sharing_credit_bytes", m.sharing_credit_bytes}, {"payload_references", m.payload_references},
+         {"unique_payload_records", m.unique_payload_records}, {"logical_state_bytes", m.logical_state_bytes},
+         {"physical_state_bytes", m.physical_state_bytes}, {"state_sharing_credit_bytes", m.state_sharing_credit_bytes},
+-        {"state_references", m.state_references}};
++        {"state_references", m.state_references},
++        {"snapshot_capture_bytes",m.snapshot_capture_bytes}, {"snapshot_view_bytes",m.snapshot_view_bytes},
++        {"snapshot_tail_copy_bytes",m.snapshot_tail_copy_bytes},
++        {"snapshot_count",m.snapshot_count}, {"snapshot_metadata_bytes",m.snapshot_metadata_bytes},
++        {"checkpoint_kv_storage","common_sealed_snapshot"},
++        {"restore_staging","bounded_gpu_batch_full_selected_host"}};
+ }
+ } // namespace ninfer::serve
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 81c734f2..9d89cd83 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -270,3 +270,12 @@ ninfer_stage_runtime_dlls(ninfer_ptq1_tests)
+ set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_monitor_tests_PROGRAMS ninfer_openai_schema_test)
+ ninfer_finalize_bundle(ninfer_monitor_tests)
+ ninfer_stage_runtime_dlls(ninfer_monitor_tests)
++
++# Backend manifest/storage invariants; deliberately no model or CUDA dependency.
++ninfer_add_test(ninfer_kvmem_snapshot_test STANDALONE
++  SOURCES test_kvmem_snapshot.cpp
++    ${NINFER_KVMEM_SOURCE_DIR}/src/host/host_kv_storage.cpp
++    ${NINFER_KVMEM_SOURCE_DIR}/src/host/spill_io.cpp
++  LIBRARIES Threads::Threads)
++target_include_directories(ninfer_kvmem_snapshot_test PRIVATE ${NINFER_KVMEM_SOURCE_DIR}/include)
++target_compile_features(ninfer_kvmem_snapshot_test PRIVATE cxx_std_17)
+diff --git a/tests/experimental/memory_disk.cpp b/tests/experimental/memory_disk.cpp
+index 51c7aef3..a8999d37 100644
+--- a/tests/experimental/memory_disk.cpp
++++ b/tests/experimental/memory_disk.cpp
+@@ -126,9 +126,12 @@ int main(int argc, char** argv) {
+             ninfer::Engine reference(options);
+             run(reference, options, "ram-sizing", false);
+             const auto memory = reference.memory_summary().kvmem;
+-            const auto pages = (memory.checkpoint_tokens + 63ULL) / 64;
++            // Private checkpoint tails are separate physical records. Logical
++            // frontier pages no longer equal the number of retained allocations.
++            const auto pages = memory.unique_payload_records;
+             history_bytes = memory.host_payload_bytes;
+-            require(pages > 10 && history_bytes && history_bytes % pages == 0,
++            require((memory.checkpoint_tokens + 63ULL) / 64 > 10 && pages &&
++                    history_bytes && history_bytes % pages == 0,
+                     "cannot derive native record size from the RAM fixture");
+             record_bytes = history_bytes / pages;
+         }
+@@ -148,8 +151,10 @@ int main(int argc, char** argv) {
+             run(engine, options, "reuse", true);
+             run(engine, options, "cancel", true, true, true);
+             run(engine, options, "resume", true);
+-            run(engine, options, "clear", false, false);
+-            run(engine, options, "after-clear", false);
++            // Read permission belongs to this request. A cold request must not
++            // revoke another owner's already published immutable source.
++            run(engine, options, "read-disabled", false, false);
++            run(engine, options, "source-preserved", true);
+             const auto memory = engine.memory_summary().kvmem;
+             require(memory.disk_read_bytes > 0 && memory.disk_written_bytes > 0 && memory.disk_payload_bytes > 0,
+                     "fixture did not exercise live SSD reads and writes");
+diff --git a/tests/experimental/ssd_failure.cpp b/tests/experimental/ssd_failure.cpp
+index 34d782ba..62d3e3f3 100644
+--- a/tests/experimental/ssd_failure.cpp
++++ b/tests/experimental/ssd_failure.cpp
+@@ -338,8 +338,16 @@ void checkpoint_fork(const char* artifact) {
+         require(!changed.reused_prompt_tokens,"different prefix incorrectly reused history");
+         auto no_update=question; no_update.context_cache.session_key="no-update";
+         no_update.context_cache.update_session_index=false;
+-        require(!engine.submit(engine.prepare(no_update),request(4)).wait().reused_prompt_tokens,
+-                "no-update request consumed named history");
++        // update_session_index controls publication, not read permission.
++        // The exact frozen baseline also reuses here; preserve that contract.
++        const auto before_read_only=engine.memory_summary().kvmem;
++        const auto read_only=engine.submit(engine.prepare(no_update),request(4)).wait();
++        const auto after_read_only=engine.memory_summary().kvmem;
++        require(read_only.materialization.actual_reused_prompt_tokens.value_or(0)>0,
++                "read-only request failed to use the retained source");
++        require(after_read_only.retained_sessions==before_read_only.retained_sessions &&
++                after_read_only.history_evictions==before_read_only.history_evictions,
++                "read-only request published or evicted a source group");
+         run("parent");
+         std::cout<<"FORK_STORAGE observed_max_payload="<<observed_disk_payload
+                  <<" quota="<<options.kvmem.disk_bytes<<std::endl;
+@@ -370,12 +378,24 @@ int main(int argc, char** argv) {
+             .host_bytes = 512ULL << 20, .retained_sessions = 2, .verify_transfers = true};
+         options.context_cache.enabled = false;
+         std::vector<std::int32_t> reference;
++        std::uint64_t native_page_bytes = 0;
+         {
+             ninfer::Engine engine(options);
+             const auto result = engine.submit(engine.prepare(prompt(false)), request(256)).wait();
+             reference.assign(result.generated_token_ids.begin(), result.generated_token_ids.end());
++            const auto memory = engine.memory_summary().kvmem;
++            require(memory.unique_payload_records && memory.host_payload_bytes &&
++                    memory.host_payload_bytes % memory.unique_payload_records == 0,
++                    "fault fixture cannot derive physical native page size");
++            native_page_bytes = memory.host_payload_bytes / memory.unique_payload_records;
+         }
+-        options.kvmem.host_bytes = 48ULL << 20;
++        // Two native B+R windows plus one window of headroom. The old fixed
++        // 48 MiB holds the whole 4B cold prompt, so no KV write is injected.
++        // Physical records (including private tails), not frontier page numbers,
++        // establish the record size for this model.
++        options.kvmem.host_bytes = 3 * (512 / 64) * native_page_bytes;
++        std::cout << "FAULT_FIXTURE page_bytes=" << native_page_bytes
++                  << " host_bytes=" << options.kvmem.host_bytes << std::endl;
+         options.kvmem.disk_bytes = 1024ULL << 20;
+         options.kvmem.disk_path = std::filesystem::temp_directory_path() /
+             ("ninfer-ssd-failure-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+diff --git a/tests/test_kvmem_snapshot.cpp b/tests/test_kvmem_snapshot.cpp
+new file mode 100644
+index 00000000..a7157b29
+--- /dev/null
++++ b/tests/test_kvmem_snapshot.cpp
+@@ -0,0 +1,84 @@
++#include "models/qwen3_5/program/storage/kvmem_snapshot.h"
++#include "kvmem/spill_io.hpp"
++#include <array>
++#include <iostream>
++#include <thread>
++#include <stdexcept>
++#include <future>
++#include <atomic>
++using namespace kvmem;
++using namespace ninfer::models::qwen3_5;
++void require(bool ok) { if (!ok) throw std::runtime_error("snapshot invariant failed"); }
++int main() {
++    HostKvStorage storage(4096);
++    {
++        std::array<uint8_t,16> bytes{}; bytes.fill(7);
++        std::vector<HostKvRecord> archive;
++        for (int i=0;i<3;++i) { archive.push_back(storage.allocate(16,bytes.data())); archive.back().seal(); }
++        auto a=capture_kvmem_snapshot(archive,3,true,storage);
++        require(kvmem_snapshot_covers(a,3,16));
++        require(!kvmem_snapshot_covers(a,2,24) && !kvmem_snapshot_covers(a,4,16));
++        require(!kvmem_snapshot_covers({},3,16) && !kvmem_snapshot_covers(a,SIZE_MAX,16));
++        auto old=a->read();
++        auto b=capture_kvmem_snapshot(archive,3,true,storage,a);
++        require(a->blocks()[0]==b->blocks()[0] && a->blocks()[1]==b->blocks()[1]);
++        require(a->blocks()[2]!=b->blocks()[2]);
++        require(storage.charged_bytes()==80);
++        uint8_t changed=99; archive[2].write(3,&changed,1); archive[2].seal();
++        auto c=capture_kvmem_snapshot(archive,3,true,storage,b);
++        require(a->read()==old && b->read()==old && c->read()!=old);
++        require(storage.charged_bytes()==96);
++        // Same logical page index after replay is a new allocation/version.
++        archive[0]=storage.allocate(16,bytes.data()); archive[0].seal();
++        auto replay=capture_kvmem_snapshot(archive,3,true,storage,c);
++        require(replay->blocks()[0]!=c->blocks()[0]);
++        // Independent branches can mutate while their retained source is read.
++        auto left=fork_kvmem_snapshot(*a), right=fork_kvmem_snapshot(*a);
++        std::thread l([&]{uint8_t v=31;left[0].write(0,&v,1);});
++        std::thread r([&]{uint8_t v=32;right[0].write(0,&v,1);});
++        l.join();r.join();require(a->read()==old);
++        require(left[0].data()[0]==31 && right[0].data()[0]==32);
++    }
++    require(storage.charged_bytes()==0);
++    {
++        HostKvStorage tight(16); std::array<uint8_t,16> bytes{};
++        std::vector<HostKvRecord> records; records.push_back(tight.allocate(16,bytes.data()));records[0].seal();
++        bool capture_failed=false;
++        try { capture_kvmem_snapshot(records,1,true,tight); }
++        catch(const MemoryError& e){capture_failed=e.code()==MemoryErrorCode::BudgetExceeded;}
++        require(capture_failed && tight.charged_bytes()==16);
++        auto snapshot=capture_kvmem_snapshot(records,1,false,tight);
++        uint8_t v=1;bool failed=false;
++        try {records[0].write(0,&v,1);} catch(const MemoryError& e){failed=e.code()==MemoryErrorCode::BudgetExceeded;}
++        require(failed && snapshot->read()==std::vector<uint8_t>(16) && tight.charged_bytes()==16);
++    }
++    {
++        auto disk=std::make_shared<SpillFile>(std::filesystem::temp_directory_path(),4096);
++        HostKvStorage cold(32,disk);std::array<uint8_t,16> bytes{};bytes.fill(23);
++        std::vector<HostKvRecord> records;
++        for(int i=0;i<2;++i){records.push_back(cold.allocate(16,bytes.data()));records.back().seal();}
++        auto snapshot=capture_kvmem_snapshot(records,2,false,cold);
++        auto expected=snapshot->read();records.clear();cold.trim(0);
++        require(cold.charged_bytes()==0 && disk->charged_bytes()==32);
++        auto owners=fork_kvmem_snapshot(*snapshot);
++        require(snapshot->read()==expected && cold.charged_bytes()==0);
++        require(disk->stats().read_bytes>=32 && disk->stats().written_bytes==32);
++        owners.clear();snapshot.reset();require(disk->charged_bytes()==0);
++    }
++    {
++        // Cancellation cannot publish queued work or release a running lease.
++        HostKvStorage held(16);std::array<uint8_t,16> bytes{};
++        std::vector<HostKvRecord> records;records.push_back(held.allocate(16,bytes.data()));records[0].seal();
++        auto snapshot=capture_kvmem_snapshot(records,1,false,held);records.clear();
++        StorageIoQueue queue(2,32,1);std::promise<void> started,release;
++        auto gate=release.get_future().share();std::atomic<bool> published{false};
++        auto running=queue.submit(16,[snapshot,&started,gate]{started.set_value();gate.wait();require(snapshot->read().size()==16);});
++        started.get_future().wait();
++        auto queued=queue.submit(16,[snapshot,&published]{published=true;});
++        require(queued.cancel());snapshot.reset();
++        require(held.charged_bytes()==16);
++        release.set_value();running.wait();try{queued.wait();}catch(const std::exception&){}
++        require(!published && held.charged_bytes()==0 && queue.pinned_bytes()==0);
++    }
++    std::cout << "NInfer snapshot host invariants passed (RAM, SSD, cancellation)\n";
++}

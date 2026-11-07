@@ -1097,8 +1097,6 @@ int StatisticsObserver::collect(const rad::StepPlan& plan, const rad::Scheduler:
         // The native block drafter may reserve a full verify block ahead of
         // the next trunk step. A final PREFILL chunk can be shorter than that
         // block too; allocated lookahead is not evaluated/accepted history.
-        if (!(serial_drafter_ && entry.is_prefill))
-            rollback_ranks(entry.seq,entry.ctx_len+rows,"rollback unaccepted native KV before publishing statistics");
         std::vector<AcceptedStatistics> shards;
         for(auto& rank:ranks_)shards.push_back(rank->capture->take(session_, rows,
             query_begin_ < 0 || query_frozen_ ? UINT32_MAX : uint32_t(query_begin_),
@@ -1143,6 +1141,11 @@ int StatisticsObserver::collect(const rad::StepPlan& plan, const rad::Scheduler:
             exposed.erase(std::remove_if(exposed.begin(),exposed.end(),[&](auto p){return p>=uint64_t(frontier_)+rows;}),exposed.end());
             recall_->accept(frontier_,rows,entry.is_prefill,observations,exposed,output);
         }
+        // Readback and CPU statistics may overlap draft work. No page ownership,
+        // native table, checkpoint or recurrent state changes before this fence.
+        if (early_statistics_collection()) drain_ranks("drain drafter before publishing accepted KV");
+        if (!(serial_drafter_ && entry.is_prefill))
+            rollback_ranks(entry.seq,entry.ctx_len+rows,"rollback unaccepted native KV before publishing statistics");
         frontier_ += rows;
         if (!query_frozen_ && query_begin_ >= 0 && frontier_ >= uint32_t(query_end_)) {
             for (auto n : query_counts_) require(n == uint32_t(query_end_ - query_begin_), "query span coverage incomplete");
@@ -1175,7 +1178,16 @@ int StatisticsObserver::collect(const rad::StepPlan& plan, const rad::Scheduler:
         }
         prefill_collected_ = entry.is_prefill;
         return RAD_OK;
-    } catch (const std::exception& e) { return failure("collect", e); }
+    } catch (const std::exception& e) {
+        // Batched collection can isolate a capacity/storage error and immediately
+        // clear this session. It must not release native resources while a draft
+        // is still in flight, even when CPU statistics failed before the fence.
+        if (early_statistics_collection()) {
+            try { drain_ranks("drain failed early collection"); }
+            catch (const std::exception& fence) { return failure("collect fence", fence); }
+        }
+        return failure("collect", e);
+    }
 }
 void StatisticsObserver::sync_memory() {
     const uint32_t block = store_config_.block_tokens;
@@ -1484,6 +1496,9 @@ void StatisticsObserver::retire(uint64_t id) noexcept {
             RAD_INFO("KVMEM_PAGE_REUSE transactions=%llu pages=%llu journal_peak_bytes=%llu rollbacks=%llu",
                 (unsigned long long)reuse.transactions, (unsigned long long)reuse.recycled_pages,
                 (unsigned long long)reuse.journal_bytes_peak, (unsigned long long)reuse.rollbacks);
+            RAD_INFO("KVMEM_SPILL_COPY session=%llu avoided_bytes=%llu avoided_staging_peak_bytes=%llu",
+                (unsigned long long)session_.id,(unsigned long long)reuse.spill_copy_bytes_avoided,
+                (unsigned long long)reuse.spill_staging_bytes_avoided_peak);
         }
     } catch (const std::exception& e) { failure("retire", e); }
     if(!prefix_ && (input_ || fallback_)) {

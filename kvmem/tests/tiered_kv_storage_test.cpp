@@ -378,9 +378,35 @@ static void batched_shared_owners(const std::filesystem::path & directory) {
     CHECK(storage.charged_bytes() == 0 && storage.disk_bytes() == 0);
 }
 
+static void selected_demotion(const std::filesystem::path & directory) {
+    auto disk=std::make_shared<SpillFile>(directory,16);
+    HostKvStorage storage(32,disk), foreign(32);
+    const std::array<uint8_t,8> bytes{{1,2,3,4,5,6,7,8}};
+    auto first=storage.allocate(8,bytes.data()); first.seal();
+    auto selected=storage.allocate(8,bytes.data()); selected.seal();
+    auto mutable_record=storage.allocate(8,bytes.data());
+    CHECK(!storage.demote(mutable_record));
+    rejects(MemoryErrorCode::InvalidPlan,[&]{foreign.demote(selected);});
+    { auto lease=selected.lease(); CHECK(!storage.demote(selected)); }
+    auto owner=selected.fork();
+    CHECK(storage.demote(selected));
+    CHECK(first.resident_bytes()==8 && selected.resident_bytes()==0);
+    const auto writes=disk->stats().writes;
+    CHECK(storage.demote(owner) && disk->stats().writes==writes);
+    std::array<uint8_t,8> got{}; owner.read(0,got.data(),8); CHECK(got==bytes);
+    CHECK(storage.demote(first));
+    mutable_record.seal();
+    rejects(MemoryErrorCode::BudgetExceeded,[&]{storage.demote(mutable_record);});
+    mutable_record.read(0,got.data(),8); CHECK(got==bytes && mutable_record.resident_bytes()==8);
+    CHECK(storage.charged_bytes()==8 && disk->charged_bytes()==16);
+    first.reset(); selected.reset(); owner.reset(); mutable_record.reset();
+    CHECK(storage.charged_bytes()==0 && disk->charged_bytes()==0);
+}
+
 int main() {
     const auto directory = std::filesystem::temp_directory_path() /
         ("kvmem-tiered-test-" + std::to_string(std::random_device{}()));
+    selected_demotion(directory);
     pressure(directory); limits(directory); queued_read(directory);
     shared_owners(directory); write_failure(directory);
     packed_store(directory);

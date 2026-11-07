@@ -17,19 +17,21 @@ struct AttentionCapture::State {
     int device;
     uint32_t max_rows, max_pages, first = 0;
     RadStream stream = nullptr;
-    bool active = false;
+    bool active = false, event_armed = false;
+    RadEvent done = nullptr;
     std::vector<StatisticsLayer> layers;
     std::vector<uint32_t> rows;
     std::vector<AttentionPage> pages;
     std::vector<bool> seen;
     std::unique_ptr<Allocation> host_rows, device_rows, host_pages, device_pages, scratch;
     std::vector<std::unique_ptr<Allocation>> device_masses, host_masses;
-    ~State() { (void)rad_dev_set(device); if (stream) (void)rad_stream_sync(stream); }
+    ~State() { (void)rad_dev_set(device); if (stream) (void)rad_stream_sync(stream); if (done) rad_event_destroy(done); }
 };
 AttentionCapture::AttentionCapture(int device, std::vector<StatisticsLayer> layers, uint32_t rows, uint32_t pages)
     : state_(std::make_unique<State>()) {
     auto& s = *state_; s.device = device; s.max_rows = rows; s.max_pages = pages;
     check(!layers.empty() && rows && pages && rad_dev_set(device) >= 0, "invalid attention capture geometry");
+    check(rad_event_create(&s.done)>=0,"create attention completion event");
     std::vector<size_t> selected{0, layers.size()/2, layers.size()-1};
     selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
     for (auto i : selected) s.layers.push_back(layers[i]);
@@ -62,7 +64,7 @@ void AttentionCapture::begin(uint32_t first, const std::vector<uint32_t>& rows,
         check(page.count && page.start >= end && page.compact == compact, "invalid logical attention page map");
         end = page.start + page.count; compact += page.count;
     }
-    s.first = first; s.rows = rows; s.pages = pages; s.stream = stream; s.active = true;
+    s.first = first; s.rows = rows; s.pages = pages; s.stream = stream; s.active = true; s.event_armed = false;
     std::fill(s.seen.begin(),s.seen.end(),false);
     if (rows.empty()) return;
     std::memcpy(s.host_rows->p,rows.data(),rows.size()*sizeof(uint32_t));
@@ -90,15 +92,24 @@ int AttentionCapture::observe(int layer, rad_kvgroup group, int64_t hd, const Ra
         it->query_heads,it->head_dim,s.first,static_cast<float*>(s.scratch->p),static_cast<float*>(s.device_masses[i]->p),it->packing};
     const int rc=attention_page_masses(a,stream);
     if (rc<0) return rc;
+    const int copy_rc = rad_memcpy_async(s.host_masses[i]->p,s.device_masses[i]->p,
+                                        s.rows.size()*s.pages.size()*sizeof(float),stream);
+    if (copy_rc < 0) return copy_rc;
     s.seen[i]=true;
-    return rad_memcpy_async(s.host_masses[i]->p,s.device_masses[i]->p,
-                            s.rows.size()*s.pages.size()*sizeof(float),stream);
+    if (std::all_of(s.seen.begin(),s.seen.end(),[](bool v){return v;})) {
+        const int event_rc = rad_event_record(s.done, stream);
+        if (event_rc < 0) return event_rc;
+        s.event_armed = true;
+    }
+    return RAD_OK;
 }
 std::vector<AcceptedAttentionRow> AttentionCapture::collect(uint32_t accepted, const std::vector<uint32_t>& samples) {
     auto& s=*state_; check(s.active,"no attention frame");
     check(rad_dev_set(s.device)>=0,"select attention collection device");
-    check(rad_stream_sync(s.stream)>=0,"attention producer synchronization failed");
-    if (!s.rows.empty()) check(std::all_of(s.seen.begin(),s.seen.end(),[](bool v){return v;}),"missing native attention sample layer");
+    if (!s.rows.empty()) {
+        check(s.event_armed,"missing native attention sample layer");
+        check(rad_event_sync(s.done)>=0,"attention producer synchronization failed");
+    }
     std::vector<AcceptedAttentionRow> result;
     for (auto row : samples) {
         check(row<accepted,"unaccepted attention sample");

@@ -50,7 +50,8 @@ struct HostKvAccount {
     uint64_t usage() {
         std::lock_guard<std::mutex> lock(mutex); return charged;
     }
-    bool evict_batch(std::unique_lock<std::mutex> & policy_lock, const HostKvAllocation * exclude);
+    bool evict_batch(std::unique_lock<std::mutex> & policy_lock, const HostKvAllocation * exclude,
+                     const HostKvAllocation * only = nullptr);
     void reserve_locked(std::unique_lock<std::mutex> & policy_lock, uint64_t bytes,
                         const HostKvAllocation * exclude = nullptr) {
         if (bytes > capacity)
@@ -95,7 +96,8 @@ struct HostKvAllocation {
         if (account && resident) account->release(size);
     }
 };
-bool HostKvAccount::evict_batch(std::unique_lock<std::mutex> & policy_lock, const HostKvAllocation * exclude) {
+bool HostKvAccount::evict_batch(std::unique_lock<std::mutex> & policy_lock, const HostKvAllocation * exclude,
+                               const HostKvAllocation * only) {
     if (!spill) return false;
     struct Candidate {
         std::shared_ptr<HostKvAllocation> record;
@@ -112,7 +114,7 @@ bool HostKvAccount::evict_batch(std::unique_lock<std::mutex> & policy_lock, cons
         auto position = residents.begin();
         auto record = position->lock();
         if (!record) { residents.erase(position); continue; }
-        if (record.get() == exclude || record->relocating) {
+        if (record.get() == exclude || (only && record.get() != only) || record->relocating) {
             residents.splice(residents.end(), residents, position); continue;
         }
         std::unique_lock<std::mutex> lock(record->mutex, std::try_to_lock);
@@ -138,7 +140,7 @@ bool HostKvAccount::evict_batch(std::unique_lock<std::mutex> & policy_lock, cons
         residents.splice(residents.end(), residents, position);
         // A large record or exhausted scratch space keeps the existing direct
         // write path. Also bound the number of simultaneously held record locks.
-        if (total >= scratch_limit || batch.size() == 64) break;
+        if (only || total >= scratch_limit || batch.size() == 64) break;
     }
     if (batch.empty()) {
         if (capacity_error && !relocating) std::rethrow_exception(capacity_error);
@@ -420,6 +422,9 @@ HostKvRecord HostKvStorage::allocate(size_t bytes, const void * source) {
     return reserve(bytes).allocate(bytes, source);
 }
 uint64_t HostKvStorage::charged_bytes() const { return account_->usage(); }
+bool HostKvStorage::owns(const HostKvRecord & record) const noexcept {
+    return record.allocation_ && record.allocation_->account == account_;
+}
 uint64_t HostKvStorage::capacity_bytes() const noexcept { return account_->capacity; }
 uint64_t HostKvStorage::disk_bytes() const { return account_->spill ? account_->spill->charged_bytes() : 0; }
 uint64_t HostKvStorage::disk_capacity_bytes() const noexcept {
@@ -429,6 +434,14 @@ SpillIoStats HostKvStorage::io_stats() const noexcept {
     return account_->spill ? account_->spill->stats() : SpillIoStats{};
 }
 std::shared_ptr<SpillFile> HostKvStorage::spill_file() const noexcept { return account_->spill; }
+bool HostKvStorage::demote(const HostKvRecord & record) {
+    if (!owns(record))
+        throw MemoryError(MemoryErrorCode::InvalidPlan, "cannot demote a foreign or empty KV record");
+    if (!account_->spill) return false;
+    std::unique_lock<std::mutex> policy(account_->policy);
+    if (!record.resident_bytes()) return true;
+    return account_->evict_batch(policy, nullptr, record.allocation_.get());
+}
 void HostKvStorage::trim(uint64_t resident_target) {
     if (!account_->spill) return;
     std::unique_lock<std::mutex> policy(account_->policy);

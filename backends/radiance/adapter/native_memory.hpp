@@ -32,6 +32,7 @@ class NativeMemory final : public MemoryBackend {
 public:
     struct ReuseStats {
         uint64_t transactions = 0, recycled_pages = 0, journal_bytes_peak = 0, rollbacks = 0;
+        uint64_t spill_copy_bytes_avoided = 0, spill_staging_bytes_avoided_peak = 0;
     };
     NativeMemory(MemoryBinding, const std::vector<rad::KVGroupInfo>&,
                  BackendIdentity, MemoryStamp, const std::vector<BlockDescriptor>&,

@@ -1,6 +1,7 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/snapshot.hpp"
 #include "kvmem/snapshot_buffer.hpp"
+#include "kvmem/memory_contract.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -11,6 +12,33 @@
 
 namespace kvmem {
 namespace {
+
+void coverage_prepare(std::vector<uint64_t> & bits, uint32_t tokens) {
+    bits.resize((uint64_t(tokens) + 63) / 64, 0);
+}
+void coverage_mark(std::vector<uint64_t> & bits, uint32_t start, uint32_t count) {
+    for (uint64_t i = start; i < uint64_t(start) + count; ++i) bits[i / 64] |= uint64_t(1) << (i % 64);
+}
+void coverage_clip(std::vector<uint64_t> & bits, uint32_t keep) {
+    for (size_t word = keep / 64; word < bits.size(); ++word) {
+        const auto count = word == keep / 64 ? keep % 64 : 0;
+        bits[word] &= count ? (uint64_t(1) << count) - 1 : 0;
+    }
+}
+bool coverage_prefix(const std::vector<uint64_t> & bits, uint32_t count) {
+    if (bits.size() < (uint64_t(count) + 63) / 64) return false;
+    for (uint32_t i = 0; i < count; ++i) if (!(bits[i / 64] & (uint64_t(1) << (i % 64)))) return false;
+    return true;
+}
+void packed_poll(const PackedKvOptions & options) {
+    if (options.cancelled && options.cancelled->load())
+        throw MemoryError(MemoryErrorCode::Disconnected, "packed snapshot cancelled");
+}
+size_t packed_extent(uint32_t tokens, uint64_t row) {
+    if (!tokens || !row || row > SIZE_MAX / tokens)
+        throw MemoryError(MemoryErrorCode::InvalidPlan, "invalid packed snapshot extent");
+    return size_t(tokens * row);
+}
 
 uint16_t f32_to_f16(float f) {
     uint32_t x;
@@ -90,7 +118,10 @@ void unpack_f16(const uint16_t * src, float * dst, size_t n) {
 } // namespace
 
 RawKvStore::RawKvStore(RawKvStoreConfig cfg) : cfg_(std::move(cfg)),
-    payload_storage_(cfg_.payload_storage ? cfg_.payload_storage : std::make_shared<HostKvStorage>()) {}
+    payload_storage_(cfg_.payload_storage ? cfg_.payload_storage : std::make_shared<HostKvStorage>()) {
+    // Forks of an implicit RAM store must inherit its actual account too.
+    cfg_.payload_storage = payload_storage_;
+}
 
 RawKvStore::~RawKvStore() = default;
 
@@ -182,6 +213,7 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
 
         LayerBlk & lb = blocks_[bid].layers[il];
         if (k && k_is_f16()) {
+            coverage_clip(lb.k_coverage, off);
             const uint64_t row = k_row_bytes();
             const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
             if (lb.k.size() < need) {
@@ -196,6 +228,7 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
         }
         if (v) {
             lb.v_gpu.reset();
+            lb.v_coverage.clear();
 
             const size_t need = static_cast<size_t>(bt) * cfg_.n_embd_v;
             if (lb.v.size() < need) {
@@ -230,6 +263,7 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
 
         LayerBlk & lb = blocks_[bid].layers[il];
         if (k && k_is_f16()) {
+            coverage_clip(lb.k_coverage, off);
             const uint64_t row = k_row_bytes();
             const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
             if (lb.k.size() < need) {
@@ -242,6 +276,7 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
         }
         if (v) {
             lb.v_gpu.reset();
+            lb.v_coverage.clear();
 
             const size_t need = static_cast<size_t>(bt) * cfg_.n_embd_v;
             if (lb.v.size() < need) {
@@ -285,6 +320,7 @@ void RawKvStore::write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
             lb.k.assign(need, 0);
 
         }
+        coverage_clip(lb.k_coverage, off);
         std::memcpy(lb.k.data() + static_cast<size_t>(off) * static_cast<size_t>(row),
                     k + static_cast<size_t>(done) * static_cast<size_t>(row),
                     static_cast<size_t>(take) * static_cast<size_t>(row));
@@ -316,6 +352,7 @@ void RawKvStore::write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il,
 
         LayerBlk & lb = blocks_[bid].layers[il];
         lb.v.clear();
+        coverage_prepare(lb.v_coverage, bt);
         const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
         const size_t nbytes = static_cast<size_t>(take) * static_cast<size_t>(row);
         const uint8_t * src = v + static_cast<size_t>(done) * static_cast<size_t>(row);
@@ -327,11 +364,13 @@ void RawKvStore::write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il,
             if (lb.v_gpu.size() < need) {
 
                 lb.v_gpu = payload_storage_->allocate(need);
+                std::fill(lb.v_coverage.begin(), lb.v_coverage.end(), 0);
 
             }
             std::memcpy(lb.v_gpu.writable_data() + static_cast<size_t>(off) * row, src, nbytes);
         }
         lb.v_gpu_fmt = true;
+        coverage_mark(lb.v_coverage, off, take);
         lb.v_gpu_tokens = std::max(lb.v_gpu_tokens, off + take);
         lb.n_tokens = std::max(lb.n_tokens, off + take);
         if (lb.v_gpu_tokens == bt) lb.v_gpu.seal();
@@ -357,6 +396,7 @@ void RawKvStore::write_layer_k_gpu(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
         LayerBlk & lb = blocks_[bid].layers[il];
+        coverage_prepare(lb.k_coverage, bt);
         const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
         const size_t nbytes = static_cast<size_t>(take) * static_cast<size_t>(row);
         const uint8_t * src = k + static_cast<size_t>(done) * static_cast<size_t>(row);
@@ -366,10 +406,12 @@ void RawKvStore::write_layer_k_gpu(uint32_t pos0, uint32_t n, uint32_t il,
         } else {
             if (lb.k_gpu.size() < need) {
                 lb.k_gpu = payload_storage_->allocate(need);
+                std::fill(lb.k_coverage.begin(), lb.k_coverage.end(), 0);
             }
             std::memcpy(lb.k_gpu.writable_data() + static_cast<size_t>(off) * row, src, nbytes);
         }
         lb.k_gpu_fmt = true;
+        coverage_mark(lb.k_coverage, off, take);
         lb.k_gpu_tokens = std::max(lb.k_gpu_tokens, off + take);
         lb.n_tokens = std::max(lb.n_tokens, off + take);
         if (lb.k_gpu_tokens == bt) lb.k_gpu.seal();
@@ -616,6 +658,8 @@ void RawKvStore::truncate_to(uint32_t token_pos) {
             lb.n_tokens = std::min(lb.n_tokens, tail);
             lb.k_gpu_tokens = std::min(lb.k_gpu_tokens, tail);
             lb.v_gpu_tokens = std::min(lb.v_gpu_tokens, tail);
+            coverage_clip(lb.k_coverage, tail);
+            coverage_clip(lb.v_coverage, tail);
             if (lb.mean_tokens > tail) {
                 lb.k_sum.clear();
                 lb.mean_tokens = 0;
@@ -635,6 +679,8 @@ void RawKvStore::invalidate_packed_from(uint32_t token_pos) {
         for (auto & lb : blocks_[bid].layers) {
             lb.k_gpu_tokens = std::min(lb.k_gpu_tokens, keep);
             lb.v_gpu_tokens = std::min(lb.v_gpu_tokens, keep);
+            coverage_clip(lb.k_coverage, keep);
+            coverage_clip(lb.v_coverage, keep);
         }
     }
 }
@@ -689,6 +735,7 @@ size_t RawKvStore::allocated_bytes() const {
         for (const auto & l : b.layers) {
             bytes += l.k.capacity() + l.v.capacity()*2 + l.k_gpu.resident_bytes() + l.v_gpu.resident_bytes();
             bytes += l.k_sum.capacity()*sizeof(float);
+            bytes += (l.k_coverage.capacity() + l.v_coverage.capacity()) * sizeof(uint64_t);
         }
     }
     return bytes;
@@ -697,7 +744,8 @@ size_t RawKvStore::allocated_bytes() const {
 uint64_t RawKvStore::capacity_bytes(uint32_t tokens, uint32_t populated_layers) const {
     const uint64_t blocks = (uint64_t(tokens) + cfg_.block_tokens - 1) / cfg_.block_tokens + 1;
     return sizeof(*this) + blocks * (2*sizeof(BlockRaw) + cfg_.n_layer*sizeof(LayerBlk) +
-        std::min(populated_layers, cfg_.n_layer) * (cfg_.n_embd_k*sizeof(float) + uint64_t(cfg_.block_tokens) *
+        std::min(populated_layers, cfg_.n_layer) * (cfg_.n_embd_k*sizeof(float) +
+         2 * ((uint64_t(cfg_.block_tokens) + 63) / 64) * sizeof(uint64_t) + uint64_t(cfg_.block_tokens) *
          (cfg_.k_gpu_row_bytes + cfg_.v_gpu_row_bytes)));
 }
 uint64_t RawKvStore::payload_bytes(bool disk_only) const {
@@ -774,6 +822,7 @@ std::unique_ptr<RawKvStore> RawKvStore::fork_prefix(uint32_t token_pos) {
             dest.mean_tokens = source.mean_tokens;
             dest.k = source.k; dest.v = source.v; dest.k_sum = source.k_sum;
             dest.k_gpu_fmt = source.k_gpu_fmt; dest.v_gpu_fmt = source.v_gpu_fmt;
+            dest.k_coverage = source.k_coverage; dest.v_coverage = source.v_coverage;
             dest.k_gpu = source.k_gpu.fork(); dest.v_gpu = source.v_gpu.fork();
         }
     }
@@ -781,6 +830,130 @@ std::unique_ptr<RawKvStore> RawKvStore::fork_prefix(uint32_t token_pos) {
     // Truncation only changes the branch; its first packed write detaches.
     branch->truncate_to(token_pos);
     return branch;
+}
+
+PackedKvSnapshot RawKvStore::export_packed(const std::vector<PackedKvSelection> & selection,
+                                          PackedKvOptions options) {
+    packed_poll(options);
+    const auto kbytes = packed_extent(cfg_.block_tokens, cfg_.k_gpu_row_bytes);
+    const auto vbytes = packed_extent(cfg_.block_tokens, cfg_.v_gpu_row_bytes);
+    if (options.metadata_limit < sizeof(PackedKvSnapshot) || selection.size() >
+            (options.metadata_limit - sizeof(PackedKvSnapshot)) / sizeof(PackedKvSnapshot::Entry))
+        throw MemoryError(MemoryErrorCode::BudgetExceeded, "packed snapshot metadata allowance exhausted");
+    PackedKvSnapshot result;
+    result.config_ = cfg_;
+    result.config_.payload_storage = payload_storage_;
+    result.entries_.resize(selection.size());
+    for (size_t i = 0; i < selection.size(); ++i) result.entries_[i].selection = selection[i];
+    if (result.metadata_bytes() > options.metadata_limit)
+        throw MemoryError(MemoryErrorCode::BudgetExceeded, "packed snapshot metadata capacity exceeds allowance");
+    std::sort(result.entries_.begin(), result.entries_.end(), [](const auto & a, const auto & b) {
+        return std::make_pair(a.selection.block, a.selection.layer) < std::make_pair(b.selection.block, b.selection.layer);
+    });
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        // Complete validation precedes sealing. No payload read/allocation here.
+        for (size_t i = 0; i < result.entries_.size(); ++i) {
+            const auto & s = result.entries_[i].selection;
+            if (!s.valid_tokens || s.valid_tokens > cfg_.block_tokens || s.layer >= cfg_.n_layer ||
+                    s.block >= blocks_.size() || (i && s.block == result.entries_[i-1].selection.block &&
+                    s.layer == result.entries_[i-1].selection.layer))
+                throw MemoryError(MemoryErrorCode::InvalidPlan, "invalid or duplicate packed selection");
+            const auto & l = blocks_[s.block].layers[s.layer];
+            if (!l.k_gpu_fmt || !l.v_gpu_fmt || l.k_gpu.size() != kbytes || l.v_gpu.size() != vbytes ||
+                    !payload_storage_->owns(l.k_gpu) || !payload_storage_->owns(l.v_gpu) ||
+                    !coverage_prefix(l.k_coverage, s.valid_tokens) || !coverage_prefix(l.v_coverage, s.valid_tokens))
+                throw MemoryError(MemoryErrorCode::InvalidPlan, "packed selection lacks proved contiguous coverage");
+        }
+        packed_poll(options);
+        for (auto & entry : result.entries_) {
+            auto & l = blocks_[entry.selection.block].layers[entry.selection.layer];
+            l.k_gpu.seal(); l.v_gpu.seal();
+            entry.k = l.k_gpu.fork(); entry.v = l.v_gpu.fork();
+        }
+    }
+    for (auto & entry : result.entries_) {
+        packed_poll(options);
+        if (entry.selection.valid_tokens == cfg_.block_tokens) continue;
+        const auto copy_tail = [&](HostKvRecord & source, uint64_t row) {
+            auto private_tail = payload_storage_->allocate(source.size()); // zero-initialized padding
+            source.read(0, private_tail.writable_data(), packed_extent(entry.selection.valid_tokens, row));
+            private_tail.seal();
+            packed_poll(options);
+            source = std::move(private_tail);
+        };
+        copy_tail(entry.k, cfg_.k_gpu_row_bytes);
+        copy_tail(entry.v, cfg_.v_gpu_row_bytes);
+    }
+    packed_poll(options);
+    return result;
+}
+
+void RawKvStore::import_packed(const PackedKvSnapshot & snapshot, PackedKvOptions options) {
+    packed_poll(options);
+    const auto & c = snapshot.config_;
+    if (c.n_layer != cfg_.n_layer || c.n_embd_k != cfg_.n_embd_k || c.n_embd_v != cfg_.n_embd_v ||
+            c.block_tokens != cfg_.block_tokens || c.k_row_bytes != cfg_.k_row_bytes ||
+            c.k_gpu_row_bytes != cfg_.k_gpu_row_bytes || c.v_gpu_row_bytes != cfg_.v_gpu_row_bytes)
+        throw MemoryError(MemoryErrorCode::InvalidPlan, "incompatible packed snapshot configuration");
+    const auto kbytes = packed_extent(cfg_.block_tokens, cfg_.k_gpu_row_bytes);
+    const auto vbytes = packed_extent(cfg_.block_tokens, cfg_.v_gpu_row_bytes);
+    size_t count = 0;
+    for (const auto & e : snapshot.entries_) {
+        const auto & s = e.selection;
+        if (s.block == UINT32_MAX || s.layer >= cfg_.n_layer || !s.valid_tokens || s.valid_tokens > cfg_.block_tokens ||
+                e.k.size() != kbytes || e.v.size() != vbytes ||
+                !payload_storage_->owns(e.k) || !payload_storage_->owns(e.v))
+            throw MemoryError(MemoryErrorCode::InvalidPlan, "invalid or foreign-account packed snapshot");
+        count = std::max(count, size_t(s.block) + 1);
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    count = std::max(count, blocks_.size());
+    const auto budget = [&](size_t bytes) {
+        if (bytes > options.metadata_limit)
+            throw MemoryError(MemoryErrorCode::BudgetExceeded, "packed import metadata allowance exhausted");
+    };
+    // Cheap lower bound rejects oversized sparse indices before allocating.
+    const uint64_t stride = sizeof(BlockRaw) + uint64_t(cfg_.n_layer) * sizeof(LayerBlk);
+    if (options.metadata_limit < sizeof(*this) ||
+            count > (options.metadata_limit - sizeof(*this)) / stride)
+        throw MemoryError(MemoryErrorCode::BudgetExceeded, "packed import index exceeds metadata allowance");
+    std::vector<BlockRaw> next(count);
+    size_t metadata = sizeof(*this) + next.capacity() * sizeof(BlockRaw);
+    for (size_t b = 0; b < next.size(); ++b) {
+        next[b].layers.resize(cfg_.n_layer);
+        metadata += next[b].layers.capacity() * sizeof(LayerBlk);
+        budget(metadata);
+        if (b >= blocks_.size()) continue;
+        for (size_t i = 0; i < cfg_.n_layer; ++i) {
+            const auto & old = blocks_[b].layers[i];
+            auto & dst = next[b].layers[i];
+            // Legacy row buffers and MeanK are explicitly outside this image.
+            budget(metadata + old.k.size() + old.v.size()*sizeof(uint16_t) + old.k_sum.size()*sizeof(float));
+            dst.n_tokens = old.n_tokens; dst.mean_tokens = old.mean_tokens;
+            dst.k = old.k; dst.v = old.v; dst.k_sum = old.k_sum;
+            metadata += dst.k.capacity() + dst.v.capacity()*sizeof(uint16_t) + dst.k_sum.capacity()*sizeof(float);
+            budget(metadata);
+        }
+    }
+    for (const auto & e : snapshot.entries_) {
+        packed_poll(options);
+        const auto & s = e.selection;
+        auto & dst = next[s.block].layers[s.layer];
+        if (dst.k_gpu || dst.v_gpu) throw MemoryError(MemoryErrorCode::InvalidPlan, "duplicate packed import mapping");
+        const size_t proof_bytes = ((uint64_t(cfg_.block_tokens) + 63) / 64) * sizeof(uint64_t) * 2;
+        budget(metadata + proof_bytes);
+        coverage_prepare(dst.k_coverage, cfg_.block_tokens); coverage_prepare(dst.v_coverage, cfg_.block_tokens);
+        coverage_mark(dst.k_coverage, 0, s.valid_tokens); coverage_mark(dst.v_coverage, 0, s.valid_tokens);
+        metadata += (dst.k_coverage.capacity() + dst.v_coverage.capacity()) * sizeof(uint64_t);
+        budget(metadata);
+        dst.k_gpu = e.k.fork(); dst.v_gpu = e.v.fork();
+        dst.k_gpu_fmt = dst.v_gpu_fmt = true;
+        dst.k_gpu_tokens = dst.v_gpu_tokens = s.valid_tokens;
+        dst.n_tokens = std::max(dst.n_tokens, s.valid_tokens);
+    }
+    packed_poll(options);
+    blocks_.swap(next);
 }
 
 void RawKvStore::snapshot_write(SnapshotWriter & out) {

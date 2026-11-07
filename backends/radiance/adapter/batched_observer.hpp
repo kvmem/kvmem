@@ -1,4 +1,5 @@
 #pragma once
+#include "execution_options.hpp"
 #include "statistics_observer.hpp"
 #include "observation_slice.hpp"
 #include "request_monitor.hpp"
@@ -74,6 +75,23 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
                 {"accounted_cache_bytes",cache_->bytes+cache_->active_archive_bytes+cache_->active_checkpoint_bytes-sharing_credit},
                 {"reserve_tokens",options_.replay_tokens},{"max_concurrency",slots_.size()}});
             value->update(runtime_);
+            int64_t played=0,recorded=0,audited=0,unkeyed=0,refused=0;
+            bool tape_enabled=false;
+            // Each slot references the same rank Ctxs. Count each rank once.
+            if (!slots_.empty()) for (const auto& rank:slots_.front().observer->ranks_) {
+                const auto* ctx=rank->resources.ctx;
+                if (!ctx) continue;
+                const auto counts=ctx->pass_counts();
+                played+=counts.played;recorded+=counts.recorded;audited+=counts.audited;
+                unkeyed+=counts.issued_unkeyed;refused+=counts.issued_refused;
+                tape_enabled=tape_enabled || ctx->records_passes();
+            }
+            (*value)["execution"]={{"revision",1},{"tape_enabled",tape_enabled},
+                {"passes_played",played},{"passes_recorded",recorded},{"passes_audited",audited},
+                {"passes_unkeyed",unkeyed},{"passes_refused",refused},
+                {"early_statistics_collection",early_statistics_collection()},
+                {"cross_step_run_ahead",false},{"transfer_completion_fence","event"},
+                {"borrowed_spill_capture",borrow_spill_capture()}};
             std::atomic_store(&cache_snapshot_,std::shared_ptr<const nlohmann::json>(std::move(value)));
         } catch(...) { RAD_ERR("KVMem cache monitor metadata allocation failed"); }
     }
@@ -118,6 +136,7 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
         } catch (const std::exception& error) { RAD_ERR("KVMem batch capture: %s",error.what()); return RAD_E_STATE; }
     }
 public:
+    bool early_collect() const noexcept override { return early_statistics_collection(); }
     explicit BatchedStatisticsObserver(SelectionOptions options={}) : options_(options) {}
     bool holds_sequence(uint64_t request) const noexcept override {
         for(const auto& slot:slots_)if(slot.request==request)return slot.observer->pending_io();

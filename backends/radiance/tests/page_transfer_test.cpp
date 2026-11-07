@@ -19,6 +19,8 @@ struct Stream { std::deque<std::function<void()>> queue; };
 struct Event { bool done = false; Stream* stream = nullptr; };
 static int copies = 0, fail_copy = -1, host_allocs = 0, streams = 0, events = 0;
 static bool fail_wait = false;
+static int host_syncs = 0, event_syncs = 0, event_records = 0, event_waits = 0;
+static int fail_record = -1;
 static void flush(Stream* s) {
     while (!s->queue.empty()) { auto f = std::move(s->queue.front()); s->queue.pop_front(); f(); }
 }
@@ -30,18 +32,28 @@ void* rad_dev_alloc(int64_t n, int kind) {
 }
 void rad_dev_free(void* p, int) { --host_allocs; std::free(p); }
 int rad_stream_create(RadStream* out, int) { ++streams; *out = new Stream; return 0; }
-int rad_stream_sync(RadStream s) { flush(static_cast<Stream*>(s)); return 0; }
+int rad_stream_sync(RadStream s) { ++host_syncs; flush(static_cast<Stream*>(s)); return 0; }
 void rad_stream_destroy(RadStream s) { CHECK(static_cast<Stream*>(s)->queue.empty()); --streams; delete static_cast<Stream*>(s); }
 int rad_event_create(RadEvent* e) { ++events; *e = new Event; return 0; }
 void rad_event_destroy(RadEvent e) { --events; delete static_cast<Event*>(e); }
 int rad_event_record(RadEvent e, RadStream stream) {
+    if (++event_records == fail_record) return -1;
     auto* ev = static_cast<Event*>(e); auto* s = static_cast<Stream*>(stream);
     ev->stream = s; ev->done = false; s->queue.push_back([ev] { ev->done = true; }); return 0;
 }
+int rad_event_sync(RadEvent e) {
+    ++event_syncs;
+    auto* ev = static_cast<Event*>(e);
+    while (!ev->done && !ev->stream->queue.empty()) {
+        auto f=std::move(ev->stream->queue.front());ev->stream->queue.pop_front();f();
+    }
+    return ev->done ? 0 : -1;
+}
 int rad_event_wait(RadStream stream, RadEvent e) {
+    ++event_waits;
     if (fail_wait) return -1;
     auto* ev = static_cast<Event*>(e);
-    static_cast<Stream*>(stream)->queue.push_back([ev] { flush(ev->stream); CHECK(ev->done); }); return 0;
+    static_cast<Stream*>(stream)->queue.push_back([ev] { CHECK(rad_event_sync(ev)==0); }); return 0;
 }
 int rad_event_query(RadEvent e) { return static_cast<Event*>(e)->done ? 1 : 0; }
 int rad_memcpy_async(void* d, const void* s, int64_t n, RadStream stream) {
@@ -69,9 +81,13 @@ int main() {
         t.spill(spans, pools, &compute);
         CHECK(t.poll().status == TransferStatus::Pending);
         rejects([&] { t.payload(); });
+        rejects([&] { t.payload_view(); });
         CHECK(t.drain());
         CHECK(t.poll().status == TransferStatus::Complete);
         payload = t.payload();
+        const auto view=t.payload_view();
+        CHECK(view.size()==payload.size() && std::equal(view.begin(),view.end(),payload.begin()));
+        CHECK(view.data()==t.payload_view().data()); // stable borrowed storage, no new allocation
         CHECK(std::all_of(payload.begin(), payload.begin() + 8, [](auto x) { return x == 0x17; }));
         CHECK(std::all_of(payload.begin() + 8, payload.end(), [](auto x) { return x == 0x29; }));
         rejects([&] { t.spill(spans, pools, &compute); });
@@ -118,5 +134,26 @@ int main() {
         CHECK(streams == 0);
     }
     CHECK(host_allocs == 0 && streams == 0 && events == 0 && compute.queue.empty());
+    // A successful borrowed-stream transaction waits only for its own event.
+    // Destruction must not drain later, unrelated compute queued on that lane.
+    const int before_syncs=host_syncs, before_waits=event_waits;
+    bool later=false;
+    {
+        PageTransfer t(2,16,&compute);
+        t.restore(spans,pools,&compute,payload);
+        compute.queue.push_back([&]{later=true;});
+        CHECK(t.drain());CHECK(!later);
+        CHECK(t.poll().status==TransferStatus::Complete);
+    }
+    CHECK(!later && host_syncs==before_syncs && event_waits==before_waits);
+    flush(&compute);CHECK(later);
+    // A failed completion event cannot substitute for a full cleanup fence.
+    {
+        PageTransfer t(2,16,&compute);
+        fail_record=event_records+1;
+        rejects([&]{t.restore(spans,pools,&compute,payload);});
+        CHECK(t.poll().status==TransferStatus::Failed);
+    }
+    CHECK(compute.queue.empty() && host_allocs==0 && events==0);
     std::cout << "Radiance transfer ordering, pending state and failure cleanup: PASS\n";
 }
