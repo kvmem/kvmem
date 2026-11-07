@@ -79,6 +79,12 @@ if($child.ExitCode){throw $errors};$output;$child.Dispose()
             with self.assertRaises(ValueError):
                 require_launch_features(contract(),plan['effective_parameters'])
 
+    def test_checkpoint_target_and_manual_cap_reach_recording_worker(self):
+        argv = self.record(self.plan('-RecallStrategy','layerwise','-LayerwiseCheckpointTarget','3',
+                                     '-LayerwiseMetadataMiB','1024'))
+        self.assertEqual(argv[argv.index('--kvmem-layerwise-checkpoint-target')+1], '3')
+        self.assertEqual(argv[argv.index('--kvmem-layerwise-metadata-mib')+1], '1024')
+
     def test_history_omission_is_preserved_and_worker_owns_default(self):
         plan = self.plan('-RecallStrategy','layerwise','-SpeculativeMode','mtp','-DraftTokens','3')
         argv = self.record(plan)

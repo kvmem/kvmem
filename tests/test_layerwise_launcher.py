@@ -63,6 +63,22 @@ class LayerwiseLauncherTest(unittest.TestCase):
         self.assertIn('--kvmem-query-replay-max-tokens', argv)
         require_launch_features({}, old['parameters'])
 
+    def test_hot_checkpoint_target_is_a_count_and_requires_worker_support(self):
+        flag = '--kvmem-layerwise-checkpoint-target'
+        self.assertNotIn(flag, build_plan(self.config())['argv'])
+        plan = build_plan(self.config(LayerwiseCheckpointTarget=10, LayerwiseMetadataMiB=1024))
+        self.assertEqual(plan['argv'][plan['argv'].index(flag) + 1], '10')
+        self.assertEqual(plan['resolved_scoring']['checkpoint_target'], 10)
+        self.assertEqual(plan['resolved_scoring']['metadata_bytes'], 1024 << 20)
+        p = plan['effective_parameters']
+        require_launch_features(contract(checkpoint_retention={'max_target': 256}), p)
+        for cap in (contract(), contract(checkpoint_retention={'max_target': 3})):
+            with self.assertRaisesRegex(ValueError, 'checkpoint target'):
+                require_launch_features(cap, p)
+        for invalid in (0, False, 'auto'):
+            with self.assertRaises(ValueError):
+                build_plan(self.config(LayerwiseCheckpointTarget=invalid))
+
     def test_omitted_resources_preserve_backend_defaults_and_explicit_values(self):
         missing = self.config()
         normalized = normalize(missing, ['ninfer'])['parameters']

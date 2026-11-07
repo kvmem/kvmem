@@ -15,6 +15,9 @@ function Get-KVMemRecallArgs($Bound, [string]$Backend = '', [string]$Mode = '') 
     $history=if($Bound.ContainsKey('LayerwiseMtpHistory')){$Bound.LayerwiseMtpHistory}else{''}
     if ($history -and ($history -notin @('upstream-global','first-layer') -or $strategy -ne 'layerwise' -or $Mode -ne 'mtp')) {throw 'LayerwiseMtpHistory requires layerwise recall and OWN MTP'}
     if ($Mode -eq 'guess' -and ($strategy -ne 'layerwise' -or $Backend -ne 'polystrata')) {throw 'Guess is the layerwise PolyStrata Gemma shared-target mode'}
+    if ($Bound.ContainsKey('LayerwiseCheckpointTarget') -and $strategy -ne 'layerwise') {
+        throw 'LayerwiseCheckpointTarget requires layerwise recall'
+    }
     if ($strategy -eq 'legacy') {
         foreach($key in $resources.Keys) {if($Bound.ContainsKey($key)){throw 'Layerwise resource limits require RecallStrategy=layerwise'}}
         return
@@ -30,6 +33,7 @@ function Get-KVMemRecallArgs($Bound, [string]$Backend = '', [string]$Mode = '') 
         !$values.LayerwiseActivationRamMiB -and !$values.LayerwiseActivationDiskMiB) {throw 'Layerwise activation RAM or SSD budget must be positive'}
     @('--kvmem-recall-strategy','layerwise')
     foreach($key in $resources.Keys) {if($values.ContainsKey($key)){@($resources[$key][0],[string]$values[$key])}}
+    if($Bound.ContainsKey('LayerwiseCheckpointTarget')) {@('--kvmem-layerwise-checkpoint-target',[string]$Bound.LayerwiseCheckpointTarget)}
     if($history) {@('--kvmem-layerwise-mtp-history',$history)}
     if($Backend -eq 'llamacpp' -and $Mode -eq 'mtp') {@('--kvmem-mtp-state','replay')}
 }
