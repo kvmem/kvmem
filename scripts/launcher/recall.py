@@ -78,6 +78,10 @@ def validate_recall(parameters):
     selected = strategy(parameters)
     if selected not in ('legacy', 'layerwise'):
         raise ValueError('RecallStrategy must be legacy or layerwise')
+    if 'LayerwiseCheckpointTarget' in parameters:
+        target = parameters['LayerwiseCheckpointTarget']
+        if selected != 'layerwise' or type(target) is not int or not 1 <= target <= 2147483647:
+            raise ValueError('LayerwiseCheckpointTarget requires layerwise recall and a positive integer')
     history = parameters.get('LayerwiseMtpHistory')
     if speculative_mode(parameters) == 'guess' and (selected != 'layerwise' or parameters.get('Backend') != 'polystrata'):
         raise ValueError('Guess is the layerwise PolyStrata Gemma shared-target draft mode')
@@ -108,6 +112,8 @@ def recall_args(parameters):
     for key, (flag, _) in LAYERWISE_RESOURCES.items():
         if key in parameters:
             args.extend((flag, str(parameters[key])))
+    if 'LayerwiseCheckpointTarget' in parameters:
+        args.extend(('--kvmem-layerwise-checkpoint-target', str(parameters['LayerwiseCheckpointTarget'])))
     if 'LayerwiseMtpHistory' in parameters:
         args.extend(('--kvmem-layerwise-mtp-history', parameters['LayerwiseMtpHistory']))
     return args
@@ -125,6 +131,11 @@ def require_recall_features(capabilities, parameters):
             or profile.get('available') is not True or profile.get('current_layer_q') is not True
             or profile.get('query_replay') is not False or profile.get('position_policy') != 'original'):
         raise ValueError('This worker has no qualified layerwise recall contract; update the complete backend package')
+    if 'LayerwiseCheckpointTarget' in parameters:
+        retention = profile.get('checkpoint_retention')
+        maximum = retention.get('max_target') if isinstance(retention, dict) else None
+        if type(maximum) is not int or not 1 <= parameters['LayerwiseCheckpointTarget'] <= maximum:
+            raise ValueError('The selected worker does not support the requested checkpoint target')
     defaults = resource_defaults(profile)
     minimum_window, _ = token_constraints(profile)
     if minimum_window is not None:

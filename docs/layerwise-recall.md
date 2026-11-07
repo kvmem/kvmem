@@ -25,7 +25,8 @@ Legacy 的评分器、聚合、graph alpha、LRFU 和 Query/replay 上限保存�
 | `LayerwiseActivationRamMiB` | `--kvmem-layerwise-activation-ram-mib` | 所选后端的原生默认值 |
 | `LayerwiseActivationDiskMiB` | `--kvmem-layerwise-activation-disk-mib` | 所选后端的原生默认值 |
 | `LayerwiseStagingMiB` | `--kvmem-layerwise-staging-mib` | 所选后端的原生默认值 |
-| `LayerwiseMetadataMiB` | `--kvmem-layerwise-metadata-mib` | 所选后端的原生默认值 |
+| `LayerwiseCheckpointTarget` | `--kvmem-layerwise-checkpoint-target N` | 支持该选项的 NInfer worker 默认保留 10 个热检查点，可设为 1–256 |
+| `LayerwiseMetadataMiB` | `--kvmem-layerwise-metadata-mib auto\|N` | 新版 NInfer 根据模型自动计算，显式 MiB 数值是硬上限 |
 | `LayerwiseActivationMetadataMiB` | `--kvmem-layerwise-activation-metadata-mib` | 所选后端的原生默认值 |
 
 未填写的资源字段不生成对应原生 flag，Windows、配置预览与 Linux 导出均保留此语义。
@@ -38,6 +39,14 @@ Legacy 的评分器、聚合、graph alpha、LRFU 和 Query/replay 上限保存�
 激活 RAM 与 SSD 至少一项为正；staging、召回 metadata 和激活 metadata 必须为正。
 这些是独立有限限额，不隐式借用 `HostMiB` 的 canonical KV 历史配额。界面显示的 configured bytes
 是限额，不是实时用量。后端仍检查真实峰值、磁盘位置及可用空间。
+
+**NInfer 检查点保留。** 只想保留最近约 10 个恢复点时，将元数据预算留空即可。数量按整个模型实例计算。多个分支共享同一次捕获只计一个，只有原生状态图像仍在主机内存中的恢复点计入热目标。`RetainedSessions` 单独限制内容组数，同一组可以有多个恢复点。
+
+自动模式按加载模型的原生状态图像、上下文上限下的索引及反馈大小估算单点成本，并为每个并发执行槽留下恢复和捕获重叠空间。额度按需使用。填写 `LayerwiseMetadataMiB` 后，实际分配必须服从这个字节上限，空间紧张时实际可保留数可能低于目标。总额度中的 3/4 用于历史状态和索引，两个 1/8 分别供运行中反馈与冻结索引使用。
+
+到达数量目标后，优先回收最近最少使用的空闲恢复点。有 SSD 空间时可异步转冷，写入完成前热数可能暂时超过目标。正在恢复或写入的状态受保护。旧分支的所有合格恢复点都被回收后，再次请求该前缀会重新预填充。运行中可从 `/props` 的 `kvmem.usage.checkpoint_retention` 查看数量目标、实际热数、仅 SSD 数量、稳态容量估算、有效字节上限和淘汰计数。
+
+在 dense 27B、上下文 16,384、并发 1 的 5060 Ti 验证中，10 个热检查点对应的自动额度为 3,382 MiB。第 6 轮达到 10 个，后续连续请求与分支均保持 10 个。显式限制为 1,024 MiB 时，同一配置实测保留 4 个。[逐轮验证记录](benchmarks/ninfer-checkpoint-retention-27b.json)
 
 Layerwise 起点使用历史预算 K=32768、追加预留 G=1024、canonical RAM 16384 MiB；
 显式参数优先。Radiance 新启动的 prefill 缺省为 256；显式 512 和历史比较协议不变。

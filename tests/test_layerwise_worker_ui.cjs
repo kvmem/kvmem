@@ -6,6 +6,7 @@ const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '..');
 const gpu = 'GPU-00000000-0000-0000-0000-000000000001';
 const profile = {available:true,current_layer_q:true,query_replay:false,position_policy:'original',
+  checkpoint_retention:{default_target:10,max_target:256,metadata_default:'auto'},
   minimum_reserve_blocks:3,max_devices:2,max_concurrency:1,parallel_modes:['single','pipeline','tensor'],
   kv_formats:['bf16'],vision_residency:[],speculative:{none:{available:true},
     mtp:{available:true,max_draft_tokens:3,adaptive:false,ngram:false,
@@ -62,6 +63,9 @@ async function main(){
     });
     await page.goto('http://kvmem-ui.test/');
     await page.waitForFunction(()=>document.querySelector('[data-param=DraftTokens]')?.max==='3');
+    assert.equal(await page.getAttribute(selector('LayerwiseCheckpointTarget'),'placeholder'),'10');
+    assert.equal(await page.inputValue(selector('LayerwiseCheckpointTarget')),'');
+    assert.equal(await page.getAttribute(selector('LayerwiseMetadataMiB'),'placeholder'),'Auto');
     assert.equal(await page.inputValue(selector('DraftTokens')),'5');
     assert.equal(await page.inputValue(selector('DraftPolicy')),'adaptive');
     assert.equal(await page.inputValue(selector('NgramDrafts')),'7');
@@ -95,6 +99,7 @@ async function main(){
     assert.equal(await page.locator(selector('DiskMiB')).isDisabled(),true);
     await fill('DiskPath','/tmp/activation-only');
     await fill('DraftTokens','1');
+    await fill('LayerwiseCheckpointTarget','3');
     await page.selectOption(selector('LayerwiseMtpHistory'),'first-layer',{force:true});
     await page.locator('[data-action=preview]').click({force:true});
     for(let attempt=0;!previews.length&&attempt<40;attempt++)await page.waitForTimeout(25);
@@ -102,6 +107,8 @@ async function main(){
     assert.equal(previews[0].parameters.DiskMiB,0);
     assert.equal(previews[0].parameters.DiskPath,'/tmp/activation-only');
     assert.equal(previews[0].parameters.LayerwiseActivationDiskMiB,64);
+    assert.equal(previews[0].parameters.LayerwiseCheckpointTarget,3);
+    assert.equal(previews[0].parameters.LayerwiseMetadataMiB,undefined);
     checks.push('activation-only SSD enables shared directory without canonical quota');
     await page.selectOption(selector('RecallStrategy'),'legacy',{force:true});
     await page.selectOption(selector('SpeculativeMode'),'dflash2',{force:true});

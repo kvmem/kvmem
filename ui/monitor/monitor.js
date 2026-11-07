@@ -747,7 +747,19 @@
     row('cache','RetainedSessions',['额外保留空闲会话','Idle sessions to retain'],retained,
       backend==='polystrata'&&number(config.RetainedSessions)?Math.max(0,config.RetainedSessions-1):config.RetainedSessions,{optional:true});
     row('cache','RecallStrategy',['召回策略','Recall strategy'],scoring.strategy,config.RecallStrategy||'legacy');
-    if(scoring.strategy==='layerwise'||config.RecallStrategy==='layerwise'){
+    const retention=k.usage?.checkpoint_retention;
+    if(retention||scoring.strategy==='layerwise'||config.RecallStrategy==='layerwise'){
+      if(retention){
+        row('cache','LayerwiseCheckpointTarget',['热检查点目标','Hot checkpoint target'],retention.target,config.LayerwiseCheckpointTarget);
+        row('cache','retained_hot',['实际热检查点','Retained hot checkpoints'],retention.retained_hot);
+        row('cache','retained_cold',['仅在 SSD 的检查点','SSD-only checkpoints'],retention.retained_cold);
+        row('cache','estimated_hot_capacity',['预算预计可保留','Estimated within budget'],retention.estimated_hot_capacity);
+        row('cache','metadata_mode',['元数据预算模式','Metadata budget mode'],retention.metadata_mode,undefined,
+          {format:v=>v==='auto'?tr('自动','Auto'):tr('手动','Manual')});
+        row('cache','count_evictions',['数量淘汰次数','Count evictions'],retention.count_evictions);
+        row('cache','count_demotions',['因数量转入 SSD','Demotions to SSD'],retention.count_demotions);
+        row('cache','metadata_evictions',['元数据额度淘汰次数','Metadata evictions'],retention.metadata_evictions);
+      }
       row('cache','LayerwiseMtpHistory',['MTP 历史来源','MTP history'],scoring.mtp_history,config.LayerwiseMtpHistory,{optional:true});
       for(const [key,name,label] of [
         ['LayerwiseActivationRamMiB','activation_ram_bytes',['前向暂存 RAM','Forward storage RAM']],
@@ -755,7 +767,7 @@
         ['LayerwiseStagingMiB','staging_bytes',['传输暂存','Transfer staging']],
         ['LayerwiseMetadataMiB','metadata_bytes',['历史状态与索引','History state and index']],
         ['LayerwiseActivationMetadataMiB','activation_metadata_bytes',['前向描述信息','Forward descriptors']]
-      ])row('cache',key,label,scoring[name],number(config[key])?config[key]*MiB:undefined,{format:memory});
+      ])row('cache',key,label,name==='metadata_bytes'?first(retention?.metadata_bytes,scoring[name]):scoring[name],number(config[key])?config[key]*MiB:undefined,{format:memory});
     }else{
       row('cache','QueryScorer',['召回评分','Recall scorer'],first(scoring.scorer,k.query_scorer),config.QueryScorer);
       row('cache','ScoreAggregation',['GQA 聚合','GQA aggregation'],scoring.agg,config.ScoreAggregation,{optional:true});

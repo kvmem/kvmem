@@ -52,6 +52,7 @@ param(
     [ValidateRange(0, 2147483647)][int]$LayerwiseActivationDiskMiB,
     [ValidateRange(1, 2147483647)][int]$LayerwiseStagingMiB,
     [ValidateRange(1, 2147483647)][int]$LayerwiseMetadataMiB,
+    [ValidateRange(1, 2147483647)][int]$LayerwiseCheckpointTarget,
     [ValidateRange(1, 2147483647)][int]$LayerwiseActivationMetadataMiB,
     [ValidateSet('page-softmax', 'meanq-cosine')][string]$QueryScorer = 'page-softmax',
     [ValidateRange(0.0, 1.0)][double]$GraphAlpha,

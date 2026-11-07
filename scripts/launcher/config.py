@@ -125,6 +125,7 @@ INTEGERS = {'CpuThreads', 'VisionCacheMiB', 'BlockTokens', 'VramReserveMiB', 'Co
 BOOLEANS = {'AdaptiveMtp', 'FastPrefill', 'Vision', 'NoLrfu', 'Lrfu', 'PreserveThinking', 'TensorParallel'}
 DECIMALS = {'LrfuLambda', 'LrfuTopFraction', 'GraphAlpha'}
 STRINGS.update(('RecallStrategy', 'LayerwiseMtpHistory'))
+INTEGERS.add("LayerwiseCheckpointTarget")
 INTEGERS.update(LAYERWISE_RESOURCES)
 # Deliberately limited native escape hatch. Common options must not be duplicated.
 NATIVE = {'llamacpp': {'--threads', '--threads-batch', '--n-gpu-layers'},

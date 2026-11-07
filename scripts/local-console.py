@@ -287,13 +287,15 @@ class Controller:
 
     def parse_scoring(self, lines):
         for line in lines:
-            for marker in ('KVMEM_SCORING ', 'KVMEM_LIMITS ', 'KVMEM_BLOCKS ', 'KVMEM_RECALL ', 'KVMEM_RECALL_STRATEGY ', 'INFO '):
+            for marker in ('KVMEM_SCORING ', 'KVMEM_LIMITS ', 'KVMEM_BLOCKS ', 'KVMEM_RECALL ', 'KVMEM_RECALL_STRATEGY ', 'KVMEM_CHECKPOINT_RETENTION ', 'INFO '):
                 if marker not in line:
                     continue
                 if marker == 'INFO ' and 'recall_strategy=layerwise' not in line:
                     continue
                 for key, value in re.findall(r'(\w+)=([^\s]+)', line.split(marker, 1)[1]):
                     key = {'recall_strategy': 'strategy', 'current_layer_query': 'current_layer_q'}.get(key, key)
+                    if marker == 'KVMEM_CHECKPOINT_RETENTION ' and key == 'target':
+                        key = 'checkpoint_target'
                     if key.startswith('layerwise_'):
                         key = key.removeprefix('layerwise_')
                     if key in {'scorer', 'agg', 'strategy', 'mtp_history', 'position_policy', 'native_draft_kind'}:
@@ -302,7 +304,7 @@ class Controller:
                         self.observed_scoring[key] = value == '1'
                     elif key in {'lambda', 'top_frac', 'graph_alpha'}:
                         self.observed_scoring[key] = float(value)
-                    elif key in {'query_max_tokens', 'query_replay_max_tokens', 'block_tokens', 'activation_ram_bytes',
+                    elif key in {'query_max_tokens', 'query_replay_max_tokens', 'block_tokens', 'checkpoint_target', 'activation_ram_bytes',
                                  'activation_disk_bytes', 'staging_bytes', 'metadata_bytes', 'activation_metadata_bytes'}:
                         self.observed_scoring[key] = int(value)
 

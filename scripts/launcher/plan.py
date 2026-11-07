@@ -39,6 +39,8 @@ def scoring_settings(argv):
         return argv[argv.index(flag) + 1] if flag in argv else default
     if value('--kvmem-recall-strategy', 'legacy') == 'layerwise':
         result = {'strategy': 'layerwise', 'current_layer_q': True, 'query_replay': False}
+        if '--kvmem-layerwise-checkpoint-target' in argv:
+            result['checkpoint_target'] = int(value('--kvmem-layerwise-checkpoint-target', None))
         if '--kvmem-layerwise-mtp-history' in argv:
             result['mtp_history'] = value('--kvmem-layerwise-mtp-history', None)
         for _, (flag, _) in LAYERWISE_RESOURCES.items():

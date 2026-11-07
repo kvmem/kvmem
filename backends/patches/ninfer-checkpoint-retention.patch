@@ -1,0 +1,885 @@
+diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
+index f96a7e147e506cc3e2472e64a85387bc5e1c0da1..9bbd294325b87b5aa582c3aebbc25aeec063e082 100644
+--- a/apps/cli/options.cpp
++++ b/apps/cli/options.cpp
+@@ -176,7 +176,8 @@ std::string usage_text(const char* argv0) {
+            "  --kvmem-layerwise-activation-ram-mib N   Query tape RAM (default 256)\n"
+            "  --kvmem-layerwise-activation-disk-mib N  Query tape SSD (default 0)\n"
+            "  --kvmem-layerwise-staging-mib N          bounded transfer staging (default 16)\n"
+-           "  --kvmem-layerwise-metadata-mib N         retained native metadata (default 1024)\n"
++           "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
++           "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+            "  --kvmem-layerwise-activation-metadata-mib N tape descriptors (default 128)\n"
+            "  --kvmem-host-mib N            canonical native KV RAM quota (default 16384)\n"
+            "  --kvmem-disk-path PATH        native KV/activation spill directory\n"
+@@ -423,9 +424,7 @@ Options parse_options(int argc, char** argv) {
+     std::optional<std::size_t> kv_headroom_mib;
+     const char* unsupported_prefix_flag = nullptr;
+     kvmem::CliOptions memory;
+-    // Seed before parsing. An explicit --kvmem-layerwise-metadata-mib 256
+-    // remains 256; the shared parser never guesses whether a value was default.
+-    memory.layerwise.metadata_bytes=kDefaultLayerwiseMetadataBytes;
++    product::NativeRetentionOptions retention;
+     std::optional<std::uint64_t> query_begin,query_end;
+ 
+     for (int i = 2; i < argc; ++i) {
+@@ -439,7 +438,7 @@ Options parse_options(int argc, char** argv) {
+                 arg, [&]() -> const char* { return value(arg); }, options.steering)) {
+             continue;
+         }
+-        if (memory.parse(std::string(arg),value)) continue;
++        if (retention.parse(std::string(arg),value, memory) || memory.parse(std::string(arg),value)) continue;
+         if (arg == "--kvmem-reselect") {
+             const std::string_view mode(value(arg));
+             const auto policy = mode=="auto" ? KvmemReselect::Auto :
+@@ -770,6 +769,8 @@ Options parse_options(int argc, char** argv) {
+         }
+     }
+     product::apply_kvmem_cli_options(memory,options.kvmem);
++    options.kvmem.layerwise.metadata_bytes = retention.metadata_bytes;
++    options.kvmem.checkpoint_target = retention.target;
+     if (memory.enabled) {
+         const auto window=options.kvmem.device_tokens();
+         if (window>options.max_context || window>std::numeric_limits<std::uint32_t>::max() ||
+diff --git a/apps/serve/main.cpp b/apps/serve/main.cpp
+index b2adaf0095b66f773d94f13692b6d5f913fcf00c..7f429f1608fb1fccc1fa5921f248926492f7d5ee 100644
+--- a/apps/serve/main.cpp
++++ b/apps/serve/main.cpp
+@@ -238,11 +238,12 @@ int main(int argc, char** argv) {
+                 {"kv_formats", {"bf16", "int8", "fp8", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8", "nvfp4", "k8v4"}}, {"vision_residency", {"resident", "cpu"}},
+                 {"model_architectures", {"Qwen3_5ForCausalLM"}},
+                 {"retained_metadata_scope", "program"},
++                {"checkpoint_retention", {{"default_target", ninfer::kDefaultLayerwiseCheckpointTarget},
++                    {"max_target", ninfer::kMaxLayerwiseCheckpointTarget}, {"metadata_default", "auto"}}},
+                 {"default_resources", {
+                     {"activation_ram_bytes", layerwise_defaults.activation_ram_bytes},
+                     {"activation_disk_bytes", layerwise_defaults.activation_disk_bytes},
+                     {"staging_bytes", layerwise_defaults.staging_bytes},
+-                    {"metadata_bytes", layerwise_defaults.metadata_bytes},
+                     {"activation_metadata_bytes", layerwise_defaults.activation_metadata_bytes}
+                 }},
+                 {"speculative", {
+diff --git a/include/ninfer/engine_options.h b/include/ninfer/engine_options.h
+index 4b359cbc1b047cfbda2926a7d331173f1ee543b5..d3deced009bc5251b698e5c9371fe1494b4710bc 100644
+--- a/include/ninfer/engine_options.h
++++ b/include/ninfer/engine_options.h
+@@ -458,16 +458,18 @@ enum class CudaMemoryPolicy : std::uint8_t {
+ // Host retains native page records, including quantization scale planes.
+ // NInfer owns this backend default. Shared LayerwiseOptions and other
+ // backends keep their existing defaults; every explicit native value wins.
+-inline constexpr std::uint64_t kDefaultLayerwiseMetadataBytes = std::uint64_t{1} << 30;
++inline constexpr std::uint32_t kDefaultLayerwiseCheckpointTarget = 10;
++inline constexpr std::uint32_t kMaxLayerwiseCheckpointTarget = 256;
+ inline kvmem::LayerwiseOptions native_layerwise_defaults() noexcept {
+     kvmem::LayerwiseOptions result;
+-    result.metadata_bytes=kDefaultLayerwiseMetadataBytes;
++    result.metadata_bytes=0; // Resolve auto after the model StateImage layout is known.
+     return result;
+ }
+ 
+ struct KvmemOptions {
+     kvmem::RecallStrategy recall_strategy = kvmem::RecallStrategy::Legacy;
+     kvmem::LayerwiseOptions layerwise=native_layerwise_defaults();
++    std::uint32_t checkpoint_target = kDefaultLayerwiseCheckpointTarget;
+     // No default has been selected for layerwise native MTP. Its draft owns
+     // independent K/V for these original historical IDs; target selection is
+     // fresh and per layer under either explicit experimental alternative.
+diff --git a/include/ninfer/observability/resources.h b/include/ninfer/observability/resources.h
+index d3e787cfe5e6c3668000ddc115bafa2ab3537d5a..3ea6efa7796760384e3178c9cfccdfcce1d45322 100644
+--- a/include/ninfer/observability/resources.h
++++ b/include/ninfer/observability/resources.h
+@@ -131,6 +131,9 @@ struct KvmemMemorySummary {
+     std::uint64_t snapshot_capture_bytes=0, snapshot_view_bytes=0, snapshot_tail_copy_bytes=0;
+     // Current distinct manifests and their deduplicated metadata footprint.
+     // Layerwise canonical versions also include their exact Mean-K index.
++    bool checkpoint_budget_auto = false;
++    std::uint32_t checkpoint_target = 0, estimated_hot_capacity = 0, retained_hot = 0, retained_cold = 0;
++    std::uint64_t checkpoint_metadata_limit = 0, count_evictions = 0, count_demotions = 0, metadata_evictions = 0;
+     std::uint64_t snapshot_count=0, snapshot_metadata_bytes=0;
+ };
+ 
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.cpp b/src/models/qwen3_5/program/native_layerwise_request.cpp
+index 3ea8aa4f59fe531daf449b55ae5c94580dc2b8cd..ad44f073a35b9eadfdf34263e690acc27724d4c9 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_request.cpp
+@@ -196,9 +196,7 @@ struct NativeLayerwiseRequest::Impl {
+                 transfers>p.kvmem_options.layerwise.staging_bytes-fixed)
+                 throw std::length_error("native request duplicated fixed graph control staging");
+         }
+-        const auto entitlement=plan_native_feedback_workspace(window.envelope(),p.capacity,
+-            config.full_attention_layers,static_cast<std::uint32_t>(p.device.size()),64U,
+-            options.prefill,sizeof(Impl));
++        const auto entitlement=NativeLayerwiseRequest::feedback_plan(p,window.envelope(),options.prefill);
+         // Protect one shared Query-only feedback supplement BEFORE reserving
+         // this new owner's Active workspace. A later owner cannot steal an
+         // existing owner's already admitted Query capacity.
+@@ -722,6 +720,12 @@ std::unique_ptr<NativeLayerwiseCheckpointCredit> NativeLayerwiseRequest::take_ch
+     }
+     return std::make_unique<NativeLayerwiseCheckpointCredit>(q.admission->take(role,frontier,bytes));
+ }
++NativeFeedbackWorkspacePlan NativeLayerwiseRequest::feedback_plan(const ProgramImpl& p,
++    const kvmem::LayerwiseRequestEnvelope& envelope,const kvmem::LayerwisePrefillOptions& pf) {
++    return plan_native_feedback_workspace(envelope,p.capacity,p.parameters.model.config().text.full_attention_layers,
++        static_cast<std::uint32_t>(p.device.size()),64U,pf,sizeof(Impl));
++}
++
+ void NativeLayerwiseRequest::prepare_feedback_admission(ProgramImpl& p,NativeLayerwiseAdmission& admission,
+     const kvmem::LayerwiseRequestEnvelope& envelope,const kvmem::LayerwisePrefillOptions& pf) {
+     const auto parent_limit=p.kvmem_options.layerwise.metadata_bytes/8;
+@@ -732,9 +736,7 @@ void NativeLayerwiseRequest::prepare_feedback_admission(ProgramImpl& p,NativeLay
+     if (p.layerwise_feedback_account->limit()!=parent_limit || admission.feedback_runtime_account ||
+         admission.retained_feedback_credit.account() || admission.query_feedback_growth.account())
+         throw std::logic_error("native Waiting feedback duplicated or changed its Program account");
+-    const auto entitlement=plan_native_feedback_workspace(envelope,p.capacity,
+-        p.parameters.model.config().text.full_attention_layers,static_cast<std::uint32_t>(p.device.size()),
+-        64U,pf,sizeof(Impl));
++    const auto entitlement=feedback_plan(p,envelope,pf);
+     admission.feedback_workspace_bytes=entitlement.workspace_bytes;
+     admission.feedback_query_extra_bytes=entitlement.query_extra_bytes;
+     admission.feedback_snapshot_bytes=entitlement.snapshot_bytes;
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.h b/src/models/qwen3_5/program/native_layerwise_request.h
+index 85bcdc2e3fdb4c31d4b31d1a2f2d49d41453e4f0..19cffba6f58d80159efffd72deff38923f08d21d 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.h
++++ b/src/models/qwen3_5/program/native_layerwise_request.h
+@@ -7,6 +7,7 @@
+ namespace ninfer::models::qwen3_5::execution { struct CurrentLayerAttentionFrame; }
+ 
+ namespace ninfer::models::qwen3_5::detail {
++struct NativeFeedbackWorkspacePlan;
+ struct NativeLayerwiseBatchRow;
+ class NativeLayerwiseGraphFeedbackStorage;
+ struct DecodeGraphProfile;
+@@ -37,6 +38,8 @@ public:
+     NativeLayerwiseRequest(ProgramImpl&,SequenceState&,RequestControl&,
+         std::uint64_t request_id,kvmem::LayerwiseRequestEnvelope,NativeLayerwiseRequestOptions,
+         std::shared_ptr<NativeLayerwiseAdmission>);
++    static NativeFeedbackWorkspacePlan feedback_plan(const ProgramImpl&,const kvmem::LayerwiseRequestEnvelope&,
++        const kvmem::LayerwisePrefillOptions&);
+     static void prepare_feedback_admission(ProgramImpl&,NativeLayerwiseAdmission&,
+         const kvmem::LayerwiseRequestEnvelope&,const kvmem::LayerwisePrefillOptions&);
+     std::uint64_t checkpoint_metadata_reserved() const noexcept;
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index da53dd933c0d9c3b0eed37001be8eb2fb053f65f..98a40e7a609f2b4bfbb981c2c76a6bbf66a85747 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -1,4 +1,6 @@
+ #include <unordered_set>
++#include "models/qwen3_5/program/native_feedback_workspace.h"
++#include "models/qwen3_5/program/storage/layerwise_statistics_admission.h"
+ #include "kvmem/spill_io.hpp"
+ #include "models/qwen3_5/program/structured_round.h"
+ #include "models/qwen3_5/program/program_impl.h"
+@@ -542,6 +544,48 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+     }
+     if (kvmem_window_tokens) {
+         if (kvmem_options.recall_strategy==kvmem::RecallStrategy::Layerwise) {
++            const auto target = kvmem_options.checkpoint_target;
++            if (!target || target > kMaxLayerwiseCheckpointTarget)
++                throw std::invalid_argument("layerwise checkpoint target must be in 1..256");
++            memory_histories.resize(std::max<std::size_t>(16, target + 1));
++            const auto& text = parameters.model.config().text;
++            kvmem::RawKvStoreConfig shape;
++            shape.n_layer = text.full_attention_layers;
++            shape.n_embd_k = text.attention->key_width();
++            shape.block_tokens = 64;
++            const kvmem::RawKvStore mean(shape);
++            const auto mutable_history = native_layerwise_mutable_metadata_bound(
++                capacity, kvmem_window_tokens, mean, shape.n_layer, shape.n_layer);
++            // Price an unshared canonical index and its mutable history for each
++            // retained point. Up to three additional capture credits per lane
++            // overlap the protected restore, as in native Waiting admission.
++            const auto image = std::uint64_t(state_images->host_layout().image_bytes);
++            const auto index = mean.capacity_bytes(capacity);
++            kvmem::LayerwiseRequestEnvelope full_context;
++            full_context.prompt_end = capacity;
++            const auto feedback = NativeLayerwiseRequest::feedback_plan(*this, full_context,
++                {64, kvmem_options.selected_tokens, kvmem_options.reserve_tokens});
++            const auto descriptor = feedback_add(sizeof(KvmemPrefixCheckpoint),
++                feedback_mul(capacity, 2 * sizeof(TokenId)));
++            const auto unit = feedback_add(feedback_add(image, index),
++                feedback_add(mutable_history, feedback_add(descriptor, feedback.snapshot_bytes)));
++            constexpr std::uint64_t mib = 1ULL << 20;
++            auto& bytes = kvmem_options.layerwise.metadata_bytes;
++            automatic_checkpoint_budget = bytes == 0;
++            if (automatic_checkpoint_budget) {
++                const auto source = feedback_mul(unit, target + 4ULL * max_concurrency);
++                const auto active = feedback_add(native_output_fixed_metadata_bytes,
++                    feedback_mul(max_concurrency, feedback_add(feedback.workspace_bytes, feedback.query_extra_bytes)));
++                // Source receives 3/4, live feedback 1/8 and frozen index 1/8.
++                const auto minimum = std::max({feedback_add(feedback_mul(4, source), 2) / 3,
++                    feedback_mul(8, active), feedback_mul(8, index)});
++                bytes = (feedback_add(minimum, mib - 1) / mib) * mib;
++            }
++            const auto source_slots = (bytes - 2 * (bytes / 8)) / unit;
++            estimated_hot_capacity = static_cast<std::uint32_t>(std::min<std::uint64_t>(target, source_slots));
++            std::fprintf(stderr, "KVMEM_CHECKPOINT_RETENTION mode=%s target=%u estimated=%u metadata_bytes=%llu unit_bytes=%llu state_bytes=%llu\n",
++                automatic_checkpoint_budget ? "auto" : "manual", target, estimated_hot_capacity,
++                (unsigned long long)bytes, (unsigned long long)unit, (unsigned long long)image);
+             kvmem::validate_layerwise_options(kvmem_options.layerwise);
+             const auto part=kvmem_options.layerwise.metadata_bytes/8;
+             if (!part) throw std::length_error("native Program metadata partition is too small");
+@@ -1368,6 +1412,16 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+             }
+         };
+         for (const auto& sequence : continuation_states) collect(sequence.window);
++        std::unordered_set<std::uint64_t> retained_hot, retained_cold;
++        if (layerwise_source_account) {
++            memory.checkpoint_budget_auto = automatic_checkpoint_budget;
++            memory.checkpoint_target = kvmem_options.checkpoint_target;
++            memory.estimated_hot_capacity = estimated_hot_capacity;
++            memory.checkpoint_metadata_limit = kvmem_options.layerwise.metadata_bytes;
++            memory.count_evictions = count_evictions;
++            memory.count_demotions = count_demotions;
++            memory.metadata_evictions = metadata_evictions;
++        }
+         std::array<uint64_t,16> retained_groups{};
+         size_t group_count=0;
+         for (const auto& history : memory_histories) {
+@@ -1375,8 +1429,17 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+             const auto group=history->cache_group ? history->cache_group : history->stamp.session.id;
+             if(std::find(retained_groups.begin(),retained_groups.begin()+group_count,group)==retained_groups.begin()+group_count)
+                 retained_groups[group_count++]=group;
++            if (layerwise_source_account) for (const auto kind : checkpoint_kinds(*history)) {
++                if (const auto* cp = memory_checkpoint(*history, kind)) {
++                    if (cp->state) retained_hot.insert(cp->immutable_origin);
++                    else if (cp->cold_state) retained_cold.insert(cp->immutable_origin);
++                }
++            }
+             collect(*history);
+         }
++        for (const auto id : retained_hot) retained_cold.erase(id);
++        memory.retained_cold = static_cast<std::uint32_t>(retained_cold.size());
++        memory.retained_hot = static_cast<std::uint32_t>(retained_hot.size());
+         memory.retained_sessions=group_count;
+         if(const auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_);
+            transaction && transaction->memory_history && transaction->memory_history->fork)
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index df46bb53d97f283eaf2a752db1515a2d9ea61b61..779861456daca5e6ab22d076781971c1b60d3557 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -525,7 +525,7 @@ struct DecodeGraphFamily {
+ struct KvmemPrefixCheckpoint {
+     // A capture origin denotes the entire sealed recovery point, including
+     // its native/policy state. Forks preserve it; a new capture gets a new one.
+-    std::uint64_t immutable_origin = 0;
++    std::uint64_t immutable_origin = 0, last_used = 0;
+     std::shared_ptr<const kvmem::KvSnapshot> kv_snapshot;
+     kvmem::LrfuState history;
+     kvmem::GraphSnapshot graph;
+@@ -1194,7 +1194,10 @@ public:
+     const std::uint32_t capacity;
+     const std::uint32_t kv_capacity;
+     const std::uint32_t kvmem_window_tokens;
+-    const KvmemOptions kvmem_options;
++    KvmemOptions kvmem_options;
++    std::uint32_t estimated_hot_capacity = 0;
++    bool automatic_checkpoint_budget = false;
++    std::uint64_t count_evictions = 0, count_demotions = 0, metadata_evictions = 0;
+     const kvmem::LayerwiseKeepBands layerwise_keep_bands;
+     std::optional<Tensor> layerwise_query_storage;
+     std::vector<Tensor> layerwise_query_extra_storage;
+@@ -1344,7 +1347,7 @@ public:
+     std::unique_ptr<NativeLayerwiseGraphFeedbackStorage> layerwise_graph_feedback;
+         // Inactive sealed Host snapshots. Exact content and native checkpoint
+     // identity decide reuse; client affinity keys never identify these entries.
+-    std::array<std::optional<KvmemWindowState>, 16> memory_histories;
++    std::vector<std::optional<KvmemWindowState>> memory_histories{16};
+     std::uint64_t memory_history_hits = 0, memory_history_misses = 0, memory_history_evictions = 0;
+ 
+     std::optional<Tensor> score_hidden;
+@@ -2251,7 +2254,11 @@ private:
+     void progress_checkpoint_coverage(KvmemWindowState& window, bool force = false);
+     void checkpoint_memory_room(KvmemWindowState& window, size_t bytes, bool optional = false);
+     std::unique_ptr<KvmemCoverageTransfer> memory_coverage_transfer;
+-    bool reclaim_endpoint_metadata(std::uint64_t shortfall);
++    bool retained_history_pinned(std::size_t slot) const;
++    std::optional<std::uint64_t> oldest_retained_checkpoint(std::optional<std::uint32_t> hot_limit) const;
++    bool evict_retained_checkpoint(std::optional<std::uint32_t> hot_limit);
++    void trim_hot_checkpoints();
++    bool reclaim_idle_metadata(std::uint64_t shortfall);
+     void capture_memory_endpoint(SequenceState& sequence, const RequestControl& request) noexcept;
+     void capture_memory_rewrite(SequenceState& sequence, KvmemCheckpointKind kind) noexcept;
+     void capture_memory_reconstruction_if_ready(SequenceState& sequence);
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index 135c865ab0ed1f0af8f8687a80ca09781959b181..b75720093a93bf0382c2711e676335096175726c 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -106,11 +106,10 @@ bool snapshot_inputs_comparable(const CanonicalSnapshotInput& left, const Canoni
+         left.checkpoint->prefix_identity.prefix_equals(right.checkpoint->prefix_identity, common);
+ }
+ 
+-template<std::size_t Count>
+ std::uint64_t snapshot_content_group(const CanonicalSnapshotInput& input, std::uint64_t previous,
+-        const std::array<std::optional<KvmemWindowState>, Count>& histories, std::size_t image_bytes) {
++        const std::vector<std::optional<KvmemWindowState>>& histories, std::size_t image_bytes) {
+     if (!input) return next_snapshot_group.fetch_add(1);
+-    std::array<std::uint64_t, Count> checked{};
++    std::vector<std::uint64_t> checked(histories.size());
+     std::size_t count = 0, deepest = 0;
+     std::uint64_t selected = 0;
+     for (const auto& history : histories) {
+@@ -2166,10 +2165,12 @@ void ProgramImpl::checkpoint_memory_room(KvmemWindowState& window,size_t bytes,b
+         // The currently admitted restore source remains protected until publish.
+         while(!fits()) {
+             std::vector<kvmem::ContentCacheSlot> slots;
+-            for(const auto& history:memory_histories)
+-                slots.push_back({bool(history),history && history->stamp.session.id==restoring,
++            for(std::size_t i=0; i<memory_histories.size(); ++i) {
++                const auto& history=memory_histories[i];
++                slots.push_back({bool(history),history && (history->stamp.session.id==restoring || retained_history_pinned(i)),
+                     history ? history->publication_order : 0,
+                     history ? static_cast<const void*>(&*history) : nullptr,history ? history->cache_group : 0});
++            }
+             const auto victim=kvmem::select_content_eviction(slots);
+             if(!victim) break;
+             memory_histories[*victim].reset(); ++memory_history_evictions;
+@@ -2504,6 +2505,7 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
+     } else if (layerwise_source_account) metadata_admission=layerwise_source_account->reserve(metadata+64);
+     auto checkpoint = std::make_unique<KvmemPrefixCheckpoint>();
+     checkpoint->immutable_origin=next_checkpoint_origin.fetch_add(1);
++    checkpoint->last_used=next_history_access.fetch_add(1);
+     checkpoint->identity = std::move(identity);
+     checkpoint->prefix.assign(sequence.ledger.begin(), sequence.ledger.begin() + frontier);
+     checkpoint->prefix_identity = sequence.prefix_identity;
+@@ -2710,7 +2712,81 @@ void ProgramImpl::capture_memory_anchor(SequenceState& sequence, std::uint32_t c
+     }
+ }
+ 
+-bool ProgramImpl::reclaim_endpoint_metadata(std::uint64_t shortfall) {
++bool ProgramImpl::retained_history_pinned(std::size_t slot) const {
++    const auto& history = *memory_histories[slot];
++    const auto generation = history.stamp.session.id;
++    const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
++    if ((memory_idle_transfer && memory_idle_transfer->history == slot) ||
++        (transaction && transaction->memory_history && transaction->memory_history->generation == generation) ||
++        std::any_of(requests.begin(), requests.end(), [&](const auto& req) {
++            return req.prefill && req.prefill->memory_restore_generation == generation;
++        })) return true;
++    bool transferring = false;
++    if (memory_coverage_transfer) visit_memory_checkpoints(history, [&](const auto& cp) {
++        transferring |= &cp == memory_coverage_transfer->checkpoint.get();
++    });
++    return transferring;
++}
++
++std::optional<std::uint64_t> ProgramImpl::oldest_retained_checkpoint(std::optional<std::uint32_t> hot_limit) const {
++    struct Point { std::uint64_t used = 0; bool pinned = false; };
++    std::unordered_map<std::uint64_t, Point> points;
++    for (std::size_t i = 0; i < memory_histories.size(); ++i) {
++        if (!memory_histories[i]) continue;
++        const bool pinned = retained_history_pinned(i);
++        visit_memory_checkpoints(*memory_histories[i], [&](const auto& cp) {
++            // Byte pressure can reclaim an old cold manifest before a newer hot
++            // point. An explicit count limit applies only to hot native images.
++            if (!cp.state && (hot_limit || !cp.cold_state)) return;
++            auto& point = points[cp.immutable_origin];
++            point.used = std::max(point.used, cp.last_used);
++            point.pinned |= pinned;
++        });
++    }
++    if (points.size() <= hot_limit.value_or(0)) return {};
++    auto oldest = points.end();
++    for (auto it = points.begin(); it != points.end(); ++it)
++        if (!it->second.pinned && (oldest == points.end() ||
++            std::tie(it->second.used, it->first) < std::tie(oldest->second.used, oldest->first))) oldest = it;
++    if (oldest == points.end()) return {};
++    return oldest->first;
++}
++
++bool ProgramImpl::evict_retained_checkpoint(std::optional<std::uint32_t> hot_limit) {
++    const auto victim = oldest_retained_checkpoint(hot_limit);
++    if (!victim) return false;
++    if (kvmem_options.verify_transfers)
++        std::fprintf(stderr, "KVMEM_CHECKPOINT_EVICT reason=%s origin=%llu\n",
++            hot_limit ? "count" : "metadata", (unsigned long long)*victim);
++    const auto matches = [&](const auto& cp) {
++        return cp && (!hot_limit || cp->state) && cp->immutable_origin == *victim;
++    };
++    for (auto& history : memory_histories) if (history) {
++        bool removed = false;
++        for (auto& record : history->checkpoints) if (matches(record.data)) {
++            record.data.reset();
++            removed = true;
++        }
++        for (auto& entry : history->coverage) if (entry.info.identity && matches(entry.record.data)) {
++            entry = {};
++            removed = true;
++        }
++        if (removed) {
++            bool remaining = false;
++            visit_memory_checkpoints(*history, [&](const auto&) { remaining = true; });
++            if (!remaining) { history.reset(); ++memory_history_evictions; }
++        }
++    }
++    return true;
++}
++
++void ProgramImpl::trim_hot_checkpoints() {
++    const auto before = count_evictions;
++    while (evict_retained_checkpoint(kvmem_options.checkpoint_target)) ++count_evictions;
++    if (count_evictions != before) memory_checkpoint_pool->trim();
++}
++
++bool ProgramImpl::reclaim_idle_metadata(std::uint64_t shortfall) {
+     // Capture has unwound. Aliases can keep a removed history's bytes live.
+     const auto& account=layerwise_source_account;
+     const auto before=account->charged_bytes();
+@@ -2718,31 +2794,9 @@ bool ProgramImpl::reclaim_endpoint_metadata(std::uint64_t shortfall) {
+     const auto target=before-shortfall;
+     memory_checkpoint_pool->trim();
+     while (account->charged_bytes()>target) {
+-        const auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_);
+-        std::vector<kvmem::ContentCacheSlot> slots(memory_histories.size());
+-        for (std::size_t i=0;i<memory_histories.size();++i) {
+-            const auto& history=memory_histories[i];
+-            if (!history) continue;
+-            const auto generation=history->stamp.session.id;
+-            bool pinned=std::any_of(requests.begin(),requests.end(),[&](const auto& active) {
+-                return active.prefill && active.prefill->memory_restore_generation==generation;
+-            });
+-            pinned|=transaction && transaction->memory_history &&
+-                    transaction->memory_history->generation==generation;
+-            pinned|=memory_idle_transfer && memory_idle_transfer->history==i;
+-            if (memory_coverage_transfer) visit_memory_checkpoints(*history,[&](const auto& cp) {
+-                pinned|=&cp==memory_coverage_transfer->checkpoint.get();
+-            });
+-            slots[i]={true,pinned,history->publication_order,&*history,history->cache_group};
+-        }
+-        const auto victim=kvmem::select_content_eviction(slots);
+-        if (!victim) return false;
+-        memory_histories[*victim].reset();
+-        ++memory_history_evictions;
++        if (!evict_retained_checkpoint(std::nullopt)) return false;
++        ++metadata_evictions;
+         memory_checkpoint_pool->trim();
+-        if (kvmem_options.verify_transfers) std::fprintf(stderr,
+-            "KVMEM_ENDPOINT eviction slot=%zu source_used=%llu target=%llu\n",*victim,
+-            (unsigned long long)account->charged_bytes(),(unsigned long long)target);
+     }
+     return true;
+ }
+@@ -2785,7 +2839,7 @@ void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const Request
+                 break;
+             } catch (const NativeSourceQuotaExceeded& failure) {
+                 if (!layerwise_source_account || failure.account!=layerwise_source_account.get() ||
+-                    failure.growth>layerwise_source_account->limit() || !reclaim_endpoint_metadata(failure.shortfall))
++                    failure.growth>layerwise_source_account->limit() || !reclaim_idle_metadata(failure.shortfall))
+                     throw;
+             }
+         }
+@@ -3518,7 +3572,12 @@ void ProgramImpl::prepare_layerwise_admission(MaterializationTransaction& transa
+     std::shared_ptr<NativeLayerwiseAdmission> owner;
+     for (unsigned attempt=0;;++attempt) {
+         try {owner=build();break;}
+-        catch (const std::length_error&) {
++        catch (const NativeSourceQuotaExceeded& error) {
++            if (error.account==layerwise_source_account.get() && error.growth<=layerwise_source_account->limit() &&
++                reclaim_idle_metadata(error.shortfall)) continue;
++            log("denied",phases.checkpoint_count);
++            throw ContextCacheExhausted("native Waiting cannot admit the required metadata after idle reclamation");
++        } catch (const std::length_error&) {
+             if (!attempt && memory_checkpoint_pool->idle_bytes()) {memory_checkpoint_pool->trim();continue;}
+             log("denied",phases.checkpoint_count);
+             throw ContextCacheExhausted("native Waiting cannot hold its complete Query/feedback/checkpoint metadata peak");
+@@ -3563,6 +3622,8 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+             pending->history=match->history;
+             pending->generation=source.stamp.session.id;
+             pending->selected=match->kind;
++            memory_checkpoint_slot(*memory_histories[match->history], match->kind)->last_used =
++                next_history_access.fetch_add(1);
+             if(match->fork) {
+                 uint64_t required=transaction.plan->impl_->memory_payload_reservation;
+                 for(const auto& active:requests) required+=active.memory_payload_reservation;
+@@ -3581,7 +3642,13 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+                     required+=cp->cold_state.size();
+                 if(required>memory_retained_budget)
+                     throw std::runtime_error("fork cannot retain its source within the payload budget");
+-                pending->fork=fork_memory_history(source,*checkpoint);
++                for (;;) {
++                    try { pending->fork=fork_memory_history(source,*checkpoint); break; }
++                    catch (const NativeSourceQuotaExceeded& error) {
++                        if (error.account!=layerwise_source_account.get() || error.growth>layerwise_source_account->limit() ||
++                            !reclaim_idle_metadata(error.shortfall)) throw;
++                    }
++                }
+                 const auto input = canonical_snapshot_input(source, state_images->host_layout().image_bytes);
+                 if (!snapshot_input_matches(input, staged.prompt))
+                     pending->fork->cache_group=0;
+@@ -3714,15 +3781,12 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+                 if (copy_bytes>UINT64_MAX-work_bytes)
+                     throw ContextCacheExhausted("native Waiting restore metadata bound overflows");
+                 NativeSourceVersionCharge admission;
+-                try {admission=source.charge.account()->reserve(copy_bytes+work_bytes);}
+-                catch (const std::length_error&) {
+-                    if (memory_checkpoint_pool->idle_bytes()) {
+-                        memory_checkpoint_pool->trim();
+-                        try {admission=source.charge.account()->reserve(copy_bytes+work_bytes);}
+-                        catch (const std::length_error&) {
++                for (;;) {
++                    try { admission=source.charge.account()->reserve(copy_bytes+work_bytes); break; }
++                    catch (const NativeSourceQuotaExceeded& error) {
++                        if (error.growth>layerwise_source_account->limit() || !reclaim_idle_metadata(error.shortfall))
+                             throw ContextCacheExhausted("native layerwise source metadata cannot admit the complete checkpoint restore");
+-                        }
+-                    } else throw ContextCacheExhausted("native layerwise source metadata cannot admit the complete checkpoint restore");
++                    }
+                 }
+                 // The charge covers Work/control metadata before allocation.
+                 if (!pending.work) pending.work=std::make_shared<KvmemHistoryPreparation::Work>();
+@@ -3905,7 +3969,7 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
+         const auto protected_source=request.prefill ? request.prefill->memory_restore_generation : 0;
+         for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+             const auto& history = memory_histories[index];
+-            slots.push_back({bool(history),history && history->stamp.session.id==protected_source,
++            slots.push_back({bool(history),history && (history->stamp.session.id==protected_source || retained_history_pinned(index)),
+                 history ? history->publication_order : 0,
+                 history ? static_cast<const void*>(&*history) : nullptr,history ? history->cache_group : 0});
+             if (!history) continue;
+@@ -4036,7 +4100,8 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+     slots.reserve(memory_histories.size());
+     for (size_t index=0;index<memory_histories.size();++index) {
+         const auto& history=memory_histories[index];
+-        bool covered=history && kvmem::content_snapshot_covers(incoming_origins,origins(*history));
++        const bool pinned=history && retained_history_pinned(index);
++        bool covered=history && !pinned && kvmem::content_snapshot_covers(incoming_origins,origins(*history));
+         // State-origin numbers alone do not prove KV. Compaction additionally
+         // requires the same strongly owned immutable manifest for every source.
+         if (covered) visit_memory_checkpoints(*history, [&](const KvmemPrefixCheckpoint& old) {
+@@ -4047,12 +4112,12 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+             covered &= found;
+         });
+         if(covered) superseded.push_back(index);
+-        slots.push_back({bool(history) && !covered, false, history ? history->publication_order : 0,
++        slots.push_back({bool(history) && !covered, pinned, history ? history->publication_order : 0,
+                          history ? static_cast<const void*>(&*history) : nullptr,
+                          history ? history->cache_group : 0});
+     }
+     const auto destination=kvmem::plan_content_group_publication(slots,
+-        std::min<size_t>(memory_histories.size(),kvmem_options.retained_sessions),
++        layerwise_source_account ? memory_histories.size() : std::min<size_t>(memory_histories.size(),kvmem_options.retained_sessions),
+         kvmem_options.retained_sessions,window.cache_group);
+     if (!destination) {
+         if(kvmem_options.verify_transfers) std::fprintf(stderr,"KVMEM_SNAPSHOT_PUBLISH admitted=0 reason=%u\n",unsigned(destination.reason));
+@@ -4079,7 +4144,10 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+     }
+     if(kvmem_options.verify_transfers) std::fprintf(stderr,"KVMEM_SNAPSHOT_PUBLISH admitted=1 reason=%u slot=%zu group=%llu\n",
+         unsigned(destination.reason),*destination,(unsigned long long)memory_histories[*destination]->cache_group);
+-    if (memory_io && memory_payload_storage.disk_bytes()) memory_idle_requested = true;
++    if (layerwise_source_account && memory_io && memory_payload_storage.spill_file())
++        memory_idle_requested = true; // Demote the oldest excess hot point in the existing idle writer.
++    else if (layerwise_source_account) trim_hot_checkpoints();
++    else if (memory_io && memory_payload_storage.disk_bytes()) memory_idle_requested = true;
+     } catch(const std::exception& error) {
+         std::fprintf(stderr,"KVMEM_SNAPSHOT_PUBLISH admitted=0 reason=allocation_failed error=%s\n",error.what());
+     }
+@@ -4105,14 +4173,19 @@ bool ProgramImpl::progress_memory_storage() {
+         return prefill && prefill->memory_restore_frontier && prefill->memory_restore_generation == generation;
+     };
+     if (memory_idle_transfer) {
+-        auto& pending = *memory_idle_transfer;
+-        if (!pending.ticket.ready()) return false;
++        if (!memory_idle_transfer->ticket.ready()) return false;
++        auto completed = std::move(memory_idle_transfer);
++        auto& pending = *completed;
+         try {
+             pending.ticket.wait();
+             auto& history = memory_histories.at(pending.history);
+             if (history && history->stamp.session.id == pending.generation && !being_restored(pending.generation)) {
+                 auto& checkpoint = memory_checkpoint_slot(*history, pending.kind);
+-                if (checkpoint && checkpoint->state == pending.source && !checkpoint->cold_state.size()) {
++                // Reads and publication can change LRU while the asynchronous write is in flight.
++                const bool eligible = !layerwise_source_account || (checkpoint &&
++                    oldest_retained_checkpoint(kvmem_options.checkpoint_target) == checkpoint->immutable_origin);
++                if (eligible && checkpoint && checkpoint->state == pending.source && !checkpoint->cold_state.size()) {
++                    if (layerwise_source_account) ++count_demotions;
+                     // Fork metadata has its own lifetime, but an immutable native
+                     // image gets one SSD extent even when several owners retain it.
+                     for(auto& owner:memory_histories) if(owner && !being_restored(owner->stamp.session.id))
+@@ -4130,12 +4203,16 @@ bool ProgramImpl::progress_memory_storage() {
+             std::fprintf(stderr, "KVMEM_IDLE state spill retained RAM: %s\n", error.what());
+             memory_idle_requested = false; // retry on a subsequent retention boundary
+         }
+-        memory_idle_transfer.reset(); // pinned owner is released on this engine thread
++        completed.reset(); // release the writer's pinned image on the engine thread
++        if (layerwise_source_account && !memory_idle_requested) trim_hot_checkpoints();
+         changed = true;
+     }
+     if (!memory_idle_requested || has_context_transaction()) return changed;
+     memory_idle_requested = false;
+     const auto disk = memory_payload_storage.spill_file();
++    const auto victim = layerwise_source_account ? oldest_retained_checkpoint(kvmem_options.checkpoint_target) :
++        std::optional<std::uint64_t>{};
++    if (layerwise_source_account && !victim) return changed;
+     std::uint64_t used = 0;
+     for (const auto& active : requests) used += active.memory_payload_reservation;
+     std::unordered_set<const void*> payloads,cold;
+@@ -4172,7 +4249,8 @@ bool ProgramImpl::progress_memory_storage() {
+         if (!history) continue;
+         for (const auto kind : checkpoint_kinds(*history)) {
+             const auto* checkpoint = memory_checkpoint(*history, kind);
+-            if (!checkpoint || !checkpoint->state || checkpoint->cold_state.size()) continue;
++            if (!checkpoint || !checkpoint->state || checkpoint->cold_state.size() ||
++                (victim && checkpoint->immutable_origin != *victim)) continue;
+             const auto bytes = checkpoint->state->size();
+             const auto disk_bytes = history->coverage.policy().enabled ? kvmem::checkpoint_image_size(bytes,1) : bytes;
+             if (used > memory_retained_budget || disk_bytes > memory_retained_budget - used ||
+@@ -4197,10 +4275,14 @@ bool ProgramImpl::progress_memory_storage() {
+                 return true;
+             } catch (const std::exception& error) {
+                 std::fprintf(stderr, "KVMEM_IDLE state spill retained RAM: %s\n", error.what());
++                if (layerwise_source_account) trim_hot_checkpoints();
+                 return changed;
+             }
+         }
+     }
++    // No SSD or retained-payload room for the selected victim. Keep the hot
++    // bound effective even when an optional spill cannot be admitted.
++    if (layerwise_source_account) trim_hot_checkpoints();
+     return changed;
+ }
+ 
+diff --git a/src/product/kvmem_cli_options.h b/src/product/kvmem_cli_options.h
+index 53a9e136f23be344048b40ba94a1f233dbc75cf6..f3d225c4e2c230c85cdbbbccf7aaf012a4f1fe6e 100644
+--- a/src/product/kvmem_cli_options.h
++++ b/src/product/kvmem_cli_options.h
+@@ -7,6 +7,27 @@
+ 
+ namespace ninfer::product {
+ 
++// The shared parser validates finite worker-independent resource values. Resolve
++// NInfer's model-dependent auto setting separately after parsing all arguments.
++struct NativeRetentionOptions {
++    std::uint64_t metadata_bytes = 0;
++    std::uint32_t target = kDefaultLayerwiseCheckpointTarget;
++
++    template<class Need>
++    bool parse(const std::string& arg, const Need& need, kvmem::CliOptions& memory) {
++        if (arg == "--kvmem-layerwise-checkpoint-target") {
++            target = memory.integer(arg, need(arg.c_str()), 1);
++            if (target > kMaxLayerwiseCheckpointTarget)
++                throw std::invalid_argument("checkpoint target exceeds 256");
++        } else if (arg == "--kvmem-layerwise-metadata-mib") {
++            const std::string value(need(arg.c_str()));
++            metadata_bytes = value == "auto" ? 0 : std::uint64_t(memory.integer(arg, value.c_str(), 1)) << 20;
++        } else return false;
++        memory.layerwise_limits_set = memory.auxiliary_set = true;
++        return true;
++    }
++};
++
+ // Product adapters share the public spelling and defaults, then let the
+ // native Engine validate its actual page, execution and resource geometry.
+ inline void apply_kvmem_cli_options(const kvmem::CliOptions& source,KvmemOptions& target) {
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index 08c897dcbd9b59fba573947d3bb09b7fdea44b90..61015071510a72fe32f76c60bd8f54921ccdcb2f 100644
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -341,7 +341,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+         }
+     }
+     if (options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise) {
+-        kvmem::validate_layerwise_options(options.kvmem.layerwise);
++        auto limits = options.kvmem.layerwise;
++        // The exact automatic limit is validated again with the loaded StateImage.
++        if (!limits.metadata_bytes) limits.metadata_bytes = 1;
++        kvmem::validate_layerwise_options(limits);
++        if (!options.kvmem.checkpoint_target || options.kvmem.checkpoint_target > kMaxLayerwiseCheckpointTarget)
++            throw std::invalid_argument("layerwise checkpoint target must be in 1..256");
+         const bool native_mtp=options.speculative.backend==SpeculativeBackend::Mtp;
+         const bool native_dflash2=options.speculative.backend==SpeculativeBackend::DFlash2;
+         if (!options.kvmem.selected_tokens || options.kvmem.reserve_tokens<64u ||
+@@ -384,7 +389,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+         publish_diagnostic(options.diagnostic_observer,DiagnosticLevel::Info,
+             "KVMEM_RECALL strategy=layerwise current_layer_q=1 query_replay=0 mtp_history=%s "
+             "activation_ram_bytes=%llu activation_disk_bytes=%llu staging_bytes=%llu "
+-            "metadata_bytes=%llu activation_metadata_bytes=%llu",
++            "requested_metadata_bytes=%llu (0=auto) activation_metadata_bytes=%llu",
+             kvmem::layerwise_mtp_history_name(options.kvmem.layerwise_mtp_history),
+             static_cast<unsigned long long>(limits.activation_ram_bytes),
+             static_cast<unsigned long long>(limits.activation_disk_bytes),
+diff --git a/src/serve/kvmem_status_json.h b/src/serve/kvmem_status_json.h
+index fa15d16aa0dee08d148be186ac62cd53b7d51daf..89bf6256d6dda9572c5d77f76b20c81ffe16c688 100644
+--- a/src/serve/kvmem_status_json.h
++++ b/src/serve/kvmem_status_json.h
+@@ -5,10 +5,10 @@
+ 
+ namespace ninfer::serve {
+ inline nlohmann::json kvmem_status_json(const KvmemMemorySummary& m) {
+-    return {{"enabled", m.enabled}, {"cache_semantics_revision",2},
++    nlohmann::json result = {{"enabled", m.enabled}, {"cache_semantics_revision",2},
+         {"retained_sessions_unit","internal_content_groups"},
+         {"retained_groups",m.retained_sessions}, {"retained_groups_limit",m.retained_sessions_limit},
+-        {"retained_snapshot_limit",std::min<uint64_t>(16,m.retained_sessions_limit)}, {"selected_tokens", m.selected_tokens},
++        {"retained_snapshot_limit",m.checkpoint_target ? std::max<uint64_t>(16,m.checkpoint_target+1) : std::min<uint64_t>(16,m.retained_sessions_limit)}, {"selected_tokens", m.selected_tokens},
+         {"reserve_tokens", m.reserve_tokens}, {"host_payload_budget_bytes", m.host_payload_budget_bytes},
+         {"host_payload_bytes", m.host_payload_bytes}, {"statistics_bytes", m.statistics_bytes},
+         {"disk_payload_budget_bytes", m.disk_payload_budget_bytes}, {"disk_payload_bytes", m.disk_payload_bytes},
+@@ -36,5 +36,11 @@ inline nlohmann::json kvmem_status_json(const KvmemMemorySummary& m) {
+         {"snapshot_count",m.snapshot_count}, {"snapshot_metadata_bytes",m.snapshot_metadata_bytes},
+         {"checkpoint_kv_storage","common_sealed_snapshot"},
+         {"restore_staging","bounded_gpu_batch_full_selected_host"}};
++    if (m.checkpoint_target)
++        result["checkpoint_retention"] = {{"target",m.checkpoint_target}, {"retained_hot",m.retained_hot}, {"retained_cold",m.retained_cold},
++            {"estimated_hot_capacity",m.estimated_hot_capacity}, {"metadata_bytes",m.checkpoint_metadata_limit},
++            {"metadata_mode",m.checkpoint_budget_auto ? "auto" : "manual"}, {"count_evictions",m.count_evictions},
++            {"count_demotions",m.count_demotions}, {"metadata_evictions",m.metadata_evictions}};
++    return result;
+ }
+ } // namespace ninfer::serve
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 64ef9256646b2a183e7c62f121b27d77cab515e9..5be3a34d69bf70f10b4fbaee7b8030403602c63f 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -127,7 +127,8 @@ std::string serve_usage_text(const char* argv0) {
+            "  --kvmem-layerwise-activation-ram-mib N  bounded Query activation RAM (default 256)\n"
+            "  --kvmem-layerwise-activation-disk-mib N bounded Query activation SSD (default 0)\n"
+            "  --kvmem-layerwise-staging-mib N bounded Query/KV transfer staging (default 16)\n"
+-           "  --kvmem-layerwise-metadata-mib N bounded retained index/metadata (default 1024)\n"
++           "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
++           "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+            "  --kvmem-layerwise-activation-metadata-mib N bounded tape descriptors (default 128)\n"
+            "  --kvmem-query-replay-max-tokens N  bound complete Query replay (default 2048)\n"
+             "  --kvmem-query-scorer NAME    page-softmax (default) | meanq-cosine\n"
+@@ -681,9 +682,7 @@ std::vector<std::uint32_t> parse_stage_layers(std::string_view text) {
+ ServeOptions parse_serve_options(int argc, char** argv) {
+     ServeOptions options;
+     kvmem::CliOptions memory;
+-    // Seed before parsing. An explicit --kvmem-layerwise-metadata-mib 256
+-    // remains 256; the shared parser never guesses whether a value was default.
+-    memory.layerwise.metadata_bytes=kDefaultLayerwiseMetadataBytes;
++    product::NativeRetentionOptions retention;
+     options.startup_argv.reserve(static_cast<std::size_t>(argc));
+     bool redact_next = false;
+     for (int i = 0; i < argc; ++i) {
+@@ -788,7 +787,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+             options.kvmem.query_max_tokens=kvmem::CliOptions::integer(arg,require_value(arg.c_str()),1);
+             continue;
+         }
+-        if (memory.parse(arg, require_value)) continue;
++        if (retention.parse(arg, require_value, memory) || memory.parse(arg, require_value)) continue;
+         if (arg == "--kvmem-verify-transfers") {
+             options.kvmem.verify_transfers = true;
+             continue;
+@@ -1826,6 +1825,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+         memory.layerwise_mtp_history==kvmem::LayerwiseMtpHistory::Unspecified)
+         memory.layerwise_mtp_history=kvmem::LayerwiseMtpHistory::FirstLayer;
+     product::apply_kvmem_cli_options(memory, options.kvmem);
++    options.kvmem.layerwise.metadata_bytes = retention.metadata_bytes;
++    options.kvmem.checkpoint_target = retention.target;
+     kvmem::validate_layerwise_mtp_history(memory.recall_strategy,
+         options.speculative.backend==SpeculativeBackend::Mtp,memory.layerwise_mtp_history);
+     if (options.kvmem.selected_tokens != 0 &&
+diff --git a/tests/models/qwen3_5/test_layerwise_physical_native.cpp b/tests/models/qwen3_5/test_layerwise_physical_native.cpp
+index 5041852d0b5d031d88d355541d3d81b8f784037a..4d77f2f8eec301e2f2e423e3b2324ea97e34a546 100644
+--- a/tests/models/qwen3_5/test_layerwise_physical_native.cpp
++++ b/tests/models/qwen3_5/test_layerwise_physical_native.cpp
+@@ -53,6 +53,43 @@ public:
+         // Host records do not add native page references. Own has C+one block.
+         auto plan=finalize_sequence_plan_impl(std::move(planner),C/64);
+         ProgramImpl program(parameters,*plan,device,{},{},nullptr);
++        if (test=="retention") {
++            // Exercise the real Program directory and writer/restore guards. Two
++            // fork descriptors refer to the same immutable origin and native image.
++            auto& histories=program.memory_histories;
++            const auto add=[&](std::size_t slot,std::uint64_t origin,std::uint64_t used) {
++                histories[slot].emplace();
++                histories[slot]->stamp.session={100+slot,1};
++                auto cp=std::make_shared<KvmemPrefixCheckpoint>();
++                cp->immutable_origin=origin; cp->last_used=used;
++                cp->state=std::make_shared<PinnedHostBuffer>(64);
++                program.memory_checkpoint_slot(*histories[slot],KvmemCheckpointKind::Endpoint)=cp;
++                return cp;
++            };
++            auto a=add(0,1,10),alias=add(1,1,12),b=add(2,2,20),c=add(3,3,30);
++            alias->state=a->state;
++            kvmem::SpillFile spill(std::filesystem::temp_directory_path(),4096);
++            auto cold=add(4,4,5);
++            cold->cold_state=spill.reserve(64);
++            cold->state.reset();
++            check(!program.evict_retained_checkpoint(3),"fork alias or cold-only image counted as another hot point");
++            check(program.evict_retained_checkpoint(std::nullopt) && !histories[4] && histories[0] && histories[3],
++                "byte pressure discarded a newer hot point before an older cold manifest");
++            program.requests[0].prefill.emplace();
++            program.requests[0].prefill->memory_restore_generation=histories[1]->stamp.session.id;
++            program.memory_idle_transfer=std::make_unique<KvmemIdleTransfer>();
++            program.memory_idle_transfer->history=2;
++            check(program.evict_retained_checkpoint(2) && !histories[3] && histories[0] && histories[1] && histories[2],
++                "eviction lost a restore source, its alias, or an in-flight writer");
++            check(!program.evict_retained_checkpoint(std::nullopt),"evicted an all-pinned directory");
++            program.requests[0].prefill.reset();
++            check(program.evict_retained_checkpoint(1) && !histories[0] && !histories[1] && histories[2],
++                "released aliases did not leave together");
++            program.memory_idle_transfer.reset();
++            check(program.evict_retained_checkpoint(std::nullopt) && !histories[2],"released writer never became evictable");
++            std::cout<<"PASS unique hot origins, restore and I/O pins, and oldest eligible eviction\n";
++            return;
++        }
+         check(plan->prefill_chunk==64 && program.prefill_chunk==64 && program.prefill_hidden.ne[1]==64,
+             "actual Native planner or allocated Prefill rows differ from semantic64; no hidden128 capacity is allowed");
+         auto& sequence=program.continuation_states[0];sequence.lane=0;
+@@ -427,7 +464,7 @@ int main(int argc,char** argv) {
+     if (argc!=4) return 77;
+     const std::string_view mode=argv[2],test=argv[3];
+     if ((mode!="first-layer"&&mode!="upstream-global"&&mode!="dflash2") ||
+-        (test!="positive"&&test!="cancel"&&test!="pre-forward"&&test!="post-forward")) return 77;
++        (test!="positive"&&test!="cancel"&&test!="pre-forward"&&test!="post-forward"&&test!="retention")) return 77;
+     try {int devices=0;const auto status=cudaGetDeviceCount(&devices);
+         if (ninfer::test::cuda_unavailable(status)||(status==cudaSuccess&&!devices)) return 77;
+         CUDA_CHECK(status);ninfer::models::qwen3_5::detail::NativeLayerwiseQueryFixture::run(argv[1],mode,test);return 0;
+diff --git a/tests/test_cli_options.cpp b/tests/test_cli_options.cpp
+index 694ea263be6c098a81f88173de2d569fcb55d47e..d6ecf2432e928c931238da0c57281e5a1639304b 100644
+--- a/tests/test_cli_options.cpp
++++ b/tests/test_cli_options.cpp
+@@ -93,6 +93,14 @@ int run_tests() {
+             memory.layerwise_mtp_history==kvmem::LayerwiseMtpHistory::Unspecified,
+             "Layerwise CLI invented a neural drafter/history or implicit copy drafts");
+     }
++    {
++        auto args=layerwise_args();args.insert(args.end(),{"--spec","mtp","--draft-tokens","3",
++            "--kvmem-layerwise-checkpoint-target","3","--kvmem-layerwise-metadata-mib","auto"});
++        const auto parsed=parse(args);
++        failures+=check(parsed.kvmem.checkpoint_target==3 && parsed.kvmem.layerwise.metadata_bytes==0 &&
++            parsed.kvmem.layerwise_mtp_history==kvmem::LayerwiseMtpHistory::FirstLayer,
++            "CLI lost explicit auto retention or the worker's first-layer default");
++    }
+     for (const auto * policy:{"first-layer","upstream-global"}) {
+         auto args=layerwise_args();args.insert(args.end(),{"--spec","mtp","--draft-tokens","3",
+             "--kvmem-layerwise-mtp-history",policy});
+@@ -104,8 +112,8 @@ int run_tests() {
+             "CLI did not preserve the explicit OWN history policy");
+     }
+     for (const std::vector<std::string> tail:{
+-            std::vector<std::string>{"--spec","mtp","--draft-tokens","3"},
+-            {"--kvmem-layerwise-mtp-history","first-layer"},
++            std::vector<std::string>{"--kvmem-layerwise-mtp-history","first-layer"},
++            {"--kvmem-layerwise-checkpoint-target","0"},
+             {"--kv-capacity","512"},{"--kvmem-budget","129"},
+             {"--kvmem-disk-path","unused-directory"},
+             {"--kvmem-layerwise-staging-mib","0"},{"--use-alt-prefix-caching"}}) {
+diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
+index 7b517d6a6421023a14e50676466a64f1078bad44..0c3b6e91aece697b3b09067e27e3a6e9bf5399b1 100644
+--- a/tests/test_serve_options.cpp
++++ b/tests/test_serve_options.cpp
+@@ -235,6 +235,22 @@ int run_serve_option_tests() {
+         auto base=memory_args;
+         base.insert(base.end(),{"--kvmem-recall-strategy","layerwise","--kvmem-gen-reserve","256",
+             "--kvmem-sink-tokens","0","--kvmem-recent-tokens","0"});
++        const auto automatic=make_engine_options(parse(base)).kvmem;
++        failures+=check(automatic.layerwise.metadata_bytes==0 && automatic.checkpoint_target==10,
++            "omitted retention limits must use model-sized auto and ten hot points");
++        auto args=base;
++        args.insert(args.end(),{"--kvmem-layerwise-metadata-mib","1024","--kvmem-layerwise-checkpoint-target","3"});
++        const auto manual=make_engine_options(parse(args)).kvmem;
++        failures+=check(manual.layerwise.metadata_bytes==(1024ULL<<20) && manual.checkpoint_target==3,
++            "manual metadata cap or hot target lost");
++        args.insert(args.end(),{"--kvmem-layerwise-metadata-mib","auto"});
++        failures+=check(make_engine_options(parse(args)).kvmem.layerwise.metadata_bytes==0,
++            "explicit auto did not reset the earlier manual cap");
++        for (const char* invalid:{"0","257","-1","2.5"}) {
++            auto wrong=base; wrong.insert(wrong.end(),{"--kvmem-layerwise-checkpoint-target",invalid});
++            bool rejected=false; try { (void)parse(wrong); } catch (const std::invalid_argument&) { rejected=true; }
++            failures+=check(rejected,"accepted invalid layerwise checkpoint target");
++        }
+         for (const char* history:{"upstream-global","first-layer"}) {
+             auto args=base;args.insert(args.end(),{"--spec","mtp","--draft-tokens","1",
+                 "--kvmem-layerwise-mtp-history",history});

@@ -337,6 +337,7 @@
     const parameters={};
     root.querySelectorAll('[data-param]').forEach(el=>{
       if((el.disabled&&el.dataset.keepDraft!=='true')||el.dataset.secret==='true')return;
+      if(el.dataset.param==='LayerwiseCheckpointTarget'&&el.value==='')return;
       if(Object.hasOwn(layerwiseResources,el.dataset.param)&&(el.value===''||!resourceOverride(el)))return;
       const value=el.dataset.booleanSelect==='true'?el.value==='true':el.type==='checkbox'?(el.dataset.inverted==='true'?!el.checked:el.checked):el.multiple?Array.from(el.selectedOptions).map(x=>x.value).join(','):(el.type==='number'||el.dataset.valueType==='number')&&el.value!==''?Number(el.value):el.value;
       parameters[el.dataset.param]=el.dataset.idleSessions==='true'&&value!==''?Number(value)+1:value;
@@ -614,6 +615,18 @@
     for(const key of ['SinkTokens','RecentTokens']){const el=get(key);if(el){el.dataset.legacyRequired??=String(el.required);el.required=layerwise?false:el.dataset.legacyRequired==='true';el.placeholder=layerwise?tr('自动','Auto'):'';}}
     const note=root.querySelector('[data-layerwise-draft-note]');if(note){note.hidden=!layerwise;note.textContent=mode==='dflash2'?tr('DFlash2 保留独立、完整的原生滑窗，不按目标层选页裁剪。','DFlash2 keeps its independent complete native sliding window; target selections do not trim it.'):mode==='guess'?tr('Gemma Guess 使用原生 SharedTarget/SWA 视图，不使用 OWN MTP 历史策略。','Gemma Guess uses its native SharedTarget/SWA view, without an OWN MTP history policy.'):tr('主模型逐层使用当前 Q。MTP 历史来源留空使用 worker 声明的默认值；未声明默认时必须选择。','The target uses current Q at each layer. Omit MTP history to use the worker-declared default; an explicit choice is required when none is declared.');}
     const profile=currentWorkerProfile();
+    const retention=profile?.checkpoint_retention,target=get('LayerwiseCheckpointTarget');
+    if(target){
+      const available=Number.isInteger(retention?.max_target);
+      const show=layerwise&&(available||target.value!=='');
+      target.closest('label').hidden=!show;
+      dependency('LayerwiseCheckpointTarget',show,tr('所选 worker 需支持实例级保留目标。','Requires worker support for a checkpoint target.'));
+      target.placeholder=available&&Number.isInteger(retention.default_target)?String(retention.default_target):'';
+      target.max=available?String(retention.max_target):'';
+      target.setCustomValidity(show&&!available?tr('所选 worker 未声明检查点目标。','This worker does not declare checkpoint retention.'):'');
+      const metadata=get('LayerwiseMetadataMiB');
+      if(metadata)metadata.placeholder=retention?.metadata_default==='auto'?tr('自动','Auto'):'';
+    }
     const profiles=layerwise?(profile?.speculative||{}):(info.speculative_capabilities?.[backend]||{none:{},...(backend==='ninfer'?{mtp:{max_draft_tokens:15,adaptive:true,ngram:true,max_concurrency:8,max_devices:8}}:{})});
     const baseCap=profiles[mode]||{},historyDefault=mtpHistoryDefault(baseCap),selectedHistory=get('LayerwiseMtpHistory')?.value||historyDefault;
     const historyInput=get('LayerwiseMtpHistory');if(historyInput){historyInput.required=layerwise&&mode==='mtp'&&!historyDefault;const blank=[...historyInput.options].find(option=>!option.value);if(blank)blank.textContent=historyDefault?tr('后端默认：','Worker default: ')+historyDefault:tr('请选择，无默认值','Choose; no default');}
@@ -1099,6 +1112,8 @@
       ['LayerwiseMetadataMiB','历史状态与索引 · MiB','History state and index · MiB'],
       ['LayerwiseActivationMetadataMiB','前向描述信息 · MiB','Forward descriptors · MiB']
     ]){const input=field(layerwise,p,key,zh,en,'number',null,['留空使用所选 worker 的原生默认值；填写数值才覆盖，已保存的数值保持不变。','Leave blank for the selected worker default. Enter a value to override; saved explicit values are preserved.']);input.min=key==='LayerwiseActivationRamMiB'||key==='LayerwiseActivationDiskMiB'?'0':'1';input.max='2147483647';input.required=false;}
+    const target=field(layerwise,p,'LayerwiseCheckpointTarget','实例热检查点目标','Hot checkpoints per instance','number');
+    target.min='1';target.required=false;
     field(layerwise,p,'LayerwiseMtpHistory','MTP 历史来源','MTP history','text',[
       ['',tr('请选择，无默认值','Choose; no default')],['upstream-global',tr('上游全局 · 私有探测','Upstream global · private probe')],['first-layer',tr('首个目标层 · fresh Q','First target layer · fresh Q')]
     ],['两者的主模型均使用 fresh-Q 分层召回，此选项只决定草稿 OWN KV 的历史 ID。NInfer 默认 first-layer；留空使用所选 worker 的默认，显式值保持不变。','Both target paths use fresh-Q layerwise recall. This choice controls history IDs in draft-owned KV; NInfer defaults to first-layer. Leave blank for the selected worker default; explicit choices are preserved.']);
