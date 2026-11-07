@@ -554,6 +554,28 @@ int main() {
         assert(!access::entry(catalog, 2).busy);
         assert(access::entry(catalog, 2).committed.match.rows == 0);
     }
+    for (bool fail : {false, true}) {
+        ServerState a, b;
+        kvmem_lane_conversations catalog({&a, &b}, 8, 0);
+        auto op = access::handover(catalog);
+        const auto account = a.mm_checkpoint_accounting;
+        access::seed_checkpoint(catalog, 0, 1, 1, account);
+        account->limit = account->used();
+        auto & parent = access::entry(catalog, 0);
+        // Model the two read pins after successful handovers. Finishing one
+        // branch, including an exceptional finish, cannot release its sibling.
+        parent.refs = 2; op.source = 0; op.source_pinned = true;
+        a.mm_checkpoint_reclaim(account, 1);
+        assert(access::exists(catalog, 0));
+        a.fail_finish = fail;
+        catalog.finish(op, a);
+        assert(!op.source_pinned && parent.refs == 1);
+        catalog.finish(op, a);
+        assert(parent.refs == 1);
+        --parent.refs;
+        a.mm_checkpoint_reclaim(account, 1);
+        assert(!access::exists(catalog, 0));
+    }
     for(int protection=0;protection<3;++protection) {
         ServerState a, b;
         const auto account=a.mm_checkpoint_accounting;
