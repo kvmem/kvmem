@@ -791,7 +791,18 @@ int main(int argc, char** argv) {
             catch(const std::exception&){wrong_owner=true;}
             CHECK(wrong_owner && kv.seq_tokens(17)==128);
             auto prefix=std::make_unique<PrefixLease>(branched,kv,17,prompt,device,branched->stream,AcceptedState{},&capture);
-            prefix->demote(device,branched->stream,1024*1024);prefix->park(storage,shared_io);
+            prefix->demote(device,branched->stream,1024*1024);
+            CHECK(prefix->capture_staging_bytes()==(borrow_prefix_capture() ? prefix->copied_bytes() : 0));
+            const auto staging=prefix->staging_bytes();
+            bool early_finish_refused=false;
+            try {prefix->finish_park();}catch(const std::exception&){early_finish_refused=true;}
+            CHECK(early_finish_refused);
+            // Exercise the real ownership split: no device calls in park, then
+            // scheduler-side staging disposal after the worker has returned.
+            auto parking=std::async(std::launch::async,[&]{prefix->park(storage,{});});
+            parking.get();
+            CHECK(prefix->staging_bytes()==(borrow_prefix_capture() ? staging : prefix->state_bytes()));
+            prefix->finish_park();CHECK(prefix->capture_staging_bytes()==0);
             root->refresh_captured();root->retain_view();
             const auto original_prefix_bytes=prefix->load_cpu().kv;
             const auto charged=storage->charged_bytes()+storage->disk_bytes();
@@ -814,8 +825,21 @@ int main(int argc, char** argv) {
             try {pa->restore(kv,29,prompt,device,branched->stream,&truncated);}
             catch(const std::exception&){refused=true;}
             CHECK(refused && kv.seq_tokens(29)==1);
-            pa->restore(kv,29,prompt,device,branched->stream,&prepared);a->rebind_sequence(29,true);
+            // Force boundaries through native pages/layers and a short final
+            // chunk. The sibling restores the same bytes in one large batch.
+            pa->restore(kv,29,prompt,device,branched->stream,&prepared,37);a->rebind_sequence(29,true);
+            const auto restore_capacity=bounded_prefix_restore() ? size_t(37) : pa->host_bytes();
+            CHECK(pa->restore_staging_bytes()==restore_capacity);
+            CHECK(pa->restore_batches()==(pa->host_bytes()+restore_capacity-1)/restore_capacity);
             pc->restore(kv,41,prompt,device,branched->stream);c->rebind_sequence(41,true);
+            {
+                // Read the actual GPU view back through the independent legacy
+                // capture path; storage equality alone would miss a bad chunk
+                // offset in the destination page table.
+                PrefixLease image(branched,kv,29,std::vector<int32_t>(128,7),device,branched->stream);
+                image.demote(device,branched->stream,1024*1024);
+                CHECK(image.load_cpu().kv==prepared.kv);
+            }
             a->refresh_captured();c->refresh_captured();
             pa.reset();pc.reset();
             for(int g=1;g<=2;++g)for(auto page:kv.block_table(29,g))
@@ -842,6 +866,7 @@ int main(int argc, char** argv) {
             auto oracle=std::make_unique<PrefixLease>(branched,kv,29,terminal_tokens,device,branched->stream);
             oracle->demote(device,branched->stream,1024*1024);
             a->retain_view();terminal->demote(device,branched->stream,1024*1024);terminal->park(storage,shared_io);
+            terminal->finish_park();
             CHECK(terminal->copied_bytes()==fresh_bytes && fresh_bytes<terminal->page_bytes());
             CHECK(terminal->load_cpu().kv==oracle->load_cpu().kv);
             CHECK(prefix->load_cpu().kv==original_prefix_bytes);oracle.reset();

@@ -25,7 +25,9 @@ public:
     PageTransfer& operator=(const PageTransfer&) = delete;
     void spill(const std::vector<CopySpan>&, const std::vector<GroupPool>&, RadStream compute);
     void restore(const std::vector<CopySpan>&, const std::vector<GroupPool>&,
-                 RadStream compute, const std::vector<uint8_t>& payload);
+                 RadStream compute, std::span<const uint8_t> payload);
+    // A completed successful restore may reuse its allocation/events for the
+    // next chunk (up to the original capacity). Spill handles stay single-use.
     TransferPoll poll();
     std::vector<uint8_t> payload(); // completed spill only
     // Immutable CPU view, after the completion event. Valid until this transfer
@@ -39,6 +41,6 @@ private:
     struct State;
     std::unique_ptr<State> state_;
     void begin(bool out, const std::vector<CopySpan>&, const std::vector<GroupPool>&,
-               RadStream compute, const std::vector<uint8_t>* payload);
+               RadStream compute, std::span<const uint8_t> payload);
 };
 } // namespace kvmem::radiance

@@ -31,5 +31,27 @@ int main() {
     right=left;right[0].mass[0].target=1;rejects([&]{merge_rank_attention({left,right},{1,1});});
     right=left;right[0].mass[0].mass=.5;rejects([&]{merge_rank_attention({left,right},{1,1});});
     rejects([&]{merge_rank_attention({left},{0});});
+    // Consuming TP1 preserves allocations and all validation. A rejected frame
+    // has not been moved from; a const caller still gets an independent copy.
+    std::vector<AcceptedStatistics> single{a};
+    const auto* keys=single[0].keys[0].data();const auto* tokens=single[0].query.tokens[1].data();
+    const auto* sums=single[0].query.sums.data();
+    const auto copied=merge_rank_statistics(single);CHECK(copied.keys[0].data()!=keys);
+    const auto moved=merge_rank_statistics(std::move(single));
+    CHECK(moved.keys==a.keys && moved.query.tokens==a.query.tokens && moved.query.sums==a.query.sums);
+    CHECK(moved.keys[0].data()==keys && moved.query.tokens[1].data()==tokens && moved.query.sums.data()==sums);
+    single={a};single[0].keys[0][0]=std::numeric_limits<float>::quiet_NaN();keys=single[0].keys[0].data();
+    rejects([&]{merge_rank_statistics(std::move(single));});CHECK(single[0].keys[0].data()==keys);
+    single={a};single[0].query.tokens[0].pop_back();rejects([&]{merge_rank_statistics(std::move(single));});
+    single={a};single[0].query.sums.pop_back();rejects([&]{merge_rank_statistics(std::move(single));});
+    std::vector<std::vector<AcceptedAttentionRow>> one{left};const auto* masses=one[0][0].mass.data();
+    const auto moved_attention=merge_rank_attention(std::move(one),{1});CHECK(moved_attention[0].mass.data()==masses);
+    CHECK(moved_attention[0].mass[0].mass==left[0].mass[0].mass);
+    one={left};one[0][0].mass[0].mass=std::numeric_limits<double>::quiet_NaN();masses=one[0][0].mass.data();
+    rejects([&]{merge_rank_attention(std::move(one),{1});});CHECK(one[0][0].mass.data()==masses);
+    one={left};one[0][0].mass[0].mass=.1;rejects([&]{merge_rank_attention(std::move(one),{1});});
+    one={left};rejects([&]{merge_rank_attention(std::move(one),{});});
+    one={{{95,{{0,-0.0},{64,1.0}}}}};
+    CHECK(!std::signbit(merge_rank_attention(std::move(one),{1})[0].mass[0].mass));
     std::cout<<"rank statistics: row/head order, logical Query counts, acceptance identity, finite masses PASS\n";
 }

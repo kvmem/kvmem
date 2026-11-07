@@ -442,15 +442,16 @@ void StatisticsObserver::capture_input(std::shared_ptr<const CachedIdentity> ide
     const auto copied=saved->prefix->copied_bytes()-copied_before;
     cache_->capture_bytes+=copied;
     if(capture_needed)cache_->capture_logical_bytes+=saved->prefix->page_bytes();
-    RAD_INFO("KVMEM_PREFIX_CAPTURE frontier=%u logical_bytes=%llu copied_bytes=%llu",frontier_,
-        (unsigned long long)(capture_needed ? saved->prefix->page_bytes() : 0),(unsigned long long)copied);
+    RAD_INFO("KVMEM_PREFIX_CAPTURE frontier=%u logical_bytes=%llu copied_bytes=%llu borrowed_bytes=%llu",frontier_,
+        (unsigned long long)(capture_needed ? saved->prefix->page_bytes() : 0),(unsigned long long)copied,
+        (unsigned long long)saved->prefix->capture_staging_bytes());
     if(asynchronous_ && cache_->payload && cache_->io) {
         input_parking_=std::make_unique<PendingPark>();
         input_parking_->work=std::make_shared<ParkWork>();input_parking_->work->storage=cache_->payload;
         input_parking_->work->prefix=std::move(saved->prefix);
         input_parking_->saved=std::move(*saved);
     } else {
-        if(cache_->payload)saved->prefix->park(cache_->payload,cache_->io);
+        if(cache_->payload){saved->prefix->park(cache_->payload,cache_->io);saved->prefix->finish_park();}
         (saved->identity->fallback ? fallback_ : input_)=std::move(saved);
     }
     update_input_charge(input_extra_bytes());
@@ -479,7 +480,7 @@ bool StatisticsObserver::poll_input() {
             pending.ticket=cache_->io->submit(work->prefix->staging_bytes(),[work]{work->run();});
         }
         if(!pending.ticket.ready())return false;
-        pending.ticket.wait();pending.saved.prefix=std::move(pending.work->prefix);
+        pending.ticket.wait();pending.work->prefix->finish_park();pending.saved.prefix=std::move(pending.work->prefix);
         const auto ready_frontier=pending.saved.identity->tokens.size();
         auto ready=std::make_unique<RetainedSession>(std::move(pending.saved));
         publish_retained_checkpoint(std::move(ready),input_,fallback_);
@@ -623,8 +624,9 @@ void StatisticsObserver::park_session() {
     const auto copied=prefix_->copied_bytes()-copied_before;
     cache_->capture_bytes+=copied;
     if(capture_needed)cache_->capture_logical_bytes+=pages;
-    RAD_INFO("KVMEM_PREFIX_CAPTURE frontier=%u logical_bytes=%llu copied_bytes=%llu",frontier_,
-        (unsigned long long)(capture_needed ? pages : 0),(unsigned long long)copied);
+    RAD_INFO("KVMEM_PREFIX_CAPTURE frontier=%u logical_bytes=%llu copied_bytes=%llu borrowed_bytes=%llu",frontier_,
+        (unsigned long long)(capture_needed ? pages : 0),(unsigned long long)copied,
+        (unsigned long long)prefix_->capture_staging_bytes());
     std::unique_ptr<PendingPark> parking;
     if(asynchronous_ && cache_->payload && cache_->io) {
         parking=std::make_unique<PendingPark>();parking->id=finishing_id_ ? finishing_id_ : cache_->next_park++;
@@ -638,7 +640,7 @@ void StatisticsObserver::park_session() {
             RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=io_queue_capacity",(unsigned long long)session_.id);
             clear_session();return;
         }
-    } else if(cache_->payload)prefix_->park(cache_->payload,cache_->io);
+    } else if(cache_->payload){prefix_->park(cache_->payload,cache_->io);prefix_->finish_park();}
     RetainedSession saved;
     saved.session=session_; saved.content_version=content_version_; saved.bytes=bytes; saved.identity=identity;saved.group=cache_group_;
     saved.prefix=std::move(prefix_); saved.mean=std::move(prefix_mean_); saved.store=std::move(store_);
@@ -782,6 +784,9 @@ int StatisticsObserver::resume(const rad::StepPlan& plan, int64_t* resumed, std:
                 if(!poll_prefix()){*resumed=0;return RAD_OK;} // retire this unissued plan and wait
             }
             prefix_->restore(e.seq,e.req->prompt,prefix_payload_.get());
+            RAD_INFO("KVMEM_PREFIX_RESTORE bytes=%llu kv_staging_bytes=%llu batches=%llu",
+                (unsigned long long)prefix_->host_bytes(),(unsigned long long)prefix_->restore_staging_bytes(),
+                (unsigned long long)prefix_->restore_batches());
             verify_rank_view(e.seq);
             prefix_payload_.reset();
             memory_->rebind_sequence(e.seq, prefix_->host_bytes() != 0);
@@ -1101,7 +1106,7 @@ int StatisticsObserver::collect(const rad::StepPlan& plan, const rad::Scheduler:
         for(auto& rank:ranks_)shards.push_back(rank->capture->take(session_, rows,
             query_begin_ < 0 || query_frozen_ ? UINT32_MAX : uint32_t(query_begin_),
             query_end_ < 0 || query_frozen_ ? UINT32_MAX : uint32_t(query_end_)));
-        auto frame=merge_rank_statistics(shards);
+        auto frame=move_single_rank_statistics() ? merge_rank_statistics(std::move(shards)) : merge_rank_statistics(shards);
         require(frame.key_width==store_config_.n_embd_k && frame.query_width==query_heads_*head_dim_,
             "assembled rank head geometry changed");
         for(size_t l=0;l<frame.keys.size();++l)
@@ -1136,7 +1141,8 @@ int StatisticsObserver::collect(const rad::StepPlan& plan, const rad::Scheduler:
             for(auto& rank:ranks_) {
                 rank_attention.push_back(rank->attention->collect(rows,samples));rank_heads.push_back(rank->query_heads);
             }
-            const auto observations=merge_rank_attention(rank_attention,rank_heads);
+            const auto observations=move_single_rank_statistics() ? merge_rank_attention(std::move(rank_attention),rank_heads) :
+                merge_rank_attention(rank_attention,rank_heads);
             auto exposed = exposed_;
             exposed.erase(std::remove_if(exposed.begin(),exposed.end(),[&](auto p){return p>=uint64_t(frontier_)+rows;}),exposed.end());
             recall_->accept(frontier_,rows,entry.is_prefill,observations,exposed,output);

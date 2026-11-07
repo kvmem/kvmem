@@ -2,6 +2,7 @@
 #include "state_checkpoint.hpp"
 #include "window_checkpoint.hpp"
 #include "prefix_capture.hpp"
+#include "execution_options.hpp"
 #include <algorithm>
 #include <memory>
 #include <map>
@@ -25,12 +26,18 @@ class PrefixLease {
     WindowCheckpoint window_;
     int64_t visible_ = -1;
     std::vector<uint8_t> host_;
+    // Created/drained on the scheduler thread. A storage worker only reads the
+    // completed span; finish_park (or destruction after ticket.wait) frees it on
+    // the scheduler thread, never inside the CPU storage callback.
+    std::unique_ptr<PageTransfer> capture_staging_;
+    std::span<const uint8_t> capture_view_;
     std::unique_ptr<TieredBuffer> parked_host_;
     std::shared_ptr<const KvSnapshot> snapshot_;
     std::vector<std::vector<CopySpan>> snapshot_spans_;
     std::vector<std::pair<size_t,size_t>> captured_; // block index, staging offset
     bool demoted_=false;
     uint64_t copied_bytes_=0;
+    mutable size_t restore_staging_bytes_=0,restore_batches_=0;
     std::shared_ptr<StorageIoQueue> io_;
     std::shared_ptr<const int> payload_identity_=std::make_shared<const int>(0);
     struct ForkTag {};
@@ -160,7 +167,10 @@ public:
     size_t frontier() const noexcept { return tokens_.size(); }
     size_t host_bytes() const noexcept { return snapshot_ ? (demoted_ ? snapshot_->size() : 0) : parked_host_ ? parked_host_->size() : host_.size(); }
     size_t metadata_bytes() const noexcept {return snapshot_ ? snapshot_->metadata_bytes() : 0;}
-    size_t staging_bytes() const noexcept {return host_.size()+state_bytes();}
+    size_t staging_bytes() const noexcept {return host_.size()+capture_view_.size()+state_bytes();}
+    size_t capture_staging_bytes() const noexcept {return capture_view_.size();}
+    size_t restore_staging_bytes() const noexcept {return restore_staging_bytes_;}
+    size_t restore_batches() const noexcept {return restore_batches_;}
     uint64_t copied_bytes() const noexcept {return copied_bytes_;}
     size_t state_bytes() const noexcept { return state_.bytes() + window_.bytes(); }
     uint64_t page_bytes() const { return snapshot_ ? snapshot_->size() : host_bytes() ? host_bytes() : copies(tables_).bytes; }
@@ -183,11 +193,16 @@ public:
                 bytes+=snapshot_->blocks()[i]->size();
             }
             std::vector<uint8_t> payload;
+            std::unique_ptr<PageTransfer> staging;
+            std::span<const uint8_t> view;
             if(bytes) {
-                PageTransfer copy(device,bytes,stream);copy.spill(spans,batch.pools,stream);
-                if(!copy.drain())throw std::runtime_error("incremental prefix capture failed");
-                payload=copy.payload();
+                staging=std::make_unique<PageTransfer>(device,bytes,stream);
+                staging->spill(spans,batch.pools,stream);
+                if(!staging->drain())throw std::runtime_error("incremental prefix capture failed");
+                if(borrow_prefix_capture())view=staging->payload_view();
+                else {payload=staging->payload();staging.reset();}
             }
+            capture_staging_=std::move(staging);capture_view_=view;
             host_.swap(payload);captured_.swap(missing);copied_bytes_=bytes;demoted_=true;
             release();decltype(snapshot_spans_)().swap(snapshot_spans_);
             return;
@@ -204,10 +219,11 @@ public:
         if(!refs_.empty() || !host_bytes())throw std::runtime_error("prefix must be demoted before tiering");
         state_.park(storage,io);window_.park(storage,io);
         if(snapshot_) {
-            complete_storage(io,host_.size(),[&]{
+            const auto bytes=capture_staging_ ? capture_view_ : std::span<const uint8_t>(host_);
+            complete_storage(io,bytes.size(),[&]{
                 for(const auto& [index,offset]:captured_) {
                     const auto& block=snapshot_->blocks()[index];
-                    block->seal(*storage,host_.data()+offset,block->size());
+                    block->seal(*storage,bytes.data()+offset,block->size());
                 }
             });
             if(!snapshot_->ready())throw std::runtime_error("snapshot publication missing captured blocks");
@@ -215,9 +231,16 @@ public:
         }
         park_buffer(host_,parked_host_,storage,io);io_=io;
     }
+    // Scheduler-only, after the CPU park callback has completed. PendingPark
+    // holds the prefix until its ticket has released all callback captures.
+    void finish_park() {
+        if(!captured_.empty())throw std::runtime_error("prefix park is incomplete");
+        capture_view_={};capture_staging_.reset();
+    }
     void restore(rad::KVManager& kv, uint64_t destination, const std::vector<int32_t>& prompt,
-                 int device, RadStream stream,const Payload* prepared=nullptr) const {
+                 int device, RadStream stream,const Payload* prepared=nullptr,size_t staging_limit=16u<<20) const {
         if (&kv != owner_ || !matches(prompt)) throw std::runtime_error("prefix identity mismatch");
+        if(!staging_limit)throw std::runtime_error("empty prefix restore staging");
         if(prepared && (prepared->identity_!=payload_identity_ || prepared->kv.size()!=host_bytes() ||
             prepared->state.size()!=state_.bytes() || prepared->window.size()!=window_.bytes()))
             throw std::runtime_error("prepared prefix payload size mismatch");
@@ -251,10 +274,29 @@ public:
                 }
                 const auto batch = copies(tables);
                 if (batch.bytes != payload.size()) throw std::runtime_error("prefix restore payload geometry changed");
-                PageTransfer copy(device, payload.size(), stream);
+                const auto capacity=bounded_prefix_restore() ? std::min({size_t(16u<<20),staging_limit,payload.size()}) : payload.size();
+                PageTransfer copy(device, capacity, stream);
+                restore_staging_bytes_=capacity;restore_batches_=0;
                 try {
-                    copy.restore(batch.spans, batch.pools, stream, payload);
-                    if (!copy.drain()) throw std::runtime_error("prefix restore copy failed");
+                    // copies() produces a complete, ordered, non-aliasing native
+                    // image. A chunk can split a layer/page; only the isolated
+                    // destination pages are written until every chunk completes.
+                    size_t first=0;
+                    for(size_t offset=0;offset<payload.size();) {
+                        const auto bytes=std::min(capacity,payload.size()-offset);
+                        std::vector<CopySpan> spans;
+                        for(size_t i=first;i<batch.spans.size();++i) {
+                            const auto& span=batch.spans[i];
+                            if(span.record_offset>=offset+bytes)break;
+                            const auto start=std::max<uint64_t>(offset,span.record_offset);
+                            const auto end=std::min<uint64_t>(offset+bytes,span.record_offset+span.bytes);
+                            spans.push_back({span.group,span.pool_offset+start-span.record_offset,start-offset,end-start});
+                            if(end==span.record_offset+span.bytes)first=i+1;
+                        }
+                        copy.restore(spans,batch.pools,stream,std::span<const uint8_t>(payload).subspan(offset,bytes));
+                        if (!copy.drain()) throw std::runtime_error("prefix restore copy failed");
+                        ++restore_batches_;offset+=bytes;
+                    }
                 } catch (...) {
                     if (!copy.drain()) reserved.clear(); // fatal runtime: never recycle in-flight IDs
                     throw;

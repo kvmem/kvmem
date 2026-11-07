@@ -32,6 +32,9 @@ public:
     uint64_t state_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->state_bytes());return n;}
     uint64_t metadata_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->metadata_bytes());return n;}
     uint64_t staging_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->staging_bytes());return n;}
+    uint64_t capture_staging_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->capture_staging_bytes());return n;}
+    uint64_t restore_staging_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=std::max<uint64_t>(n,r.lease->restore_staging_bytes());return n;}
+    uint64_t restore_batches() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->restore_batches());return n;}
     uint64_t copied_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->copied_bytes());return n;}
     uint64_t page_bytes() const {uint64_t n=0;for(const auto& r:ranks_)n=add(n,r.lease->page_bytes());return n;}
     Payload load_cpu() const {
@@ -44,6 +47,7 @@ public:
     void park(const std::shared_ptr<HostKvStorage>& storage,const std::shared_ptr<StorageIoQueue>& io) {
         for(auto& r:ranks_)r.lease->park(storage,io);
     }
+    void finish_park() {for(auto& r:ranks_)r.lease->finish_park();}
     void restore(uint64_t sequence,const std::vector<int32_t>& prompt,const Payload* prepared=nullptr) const {
         if(ranks_.empty() || (prepared && prepared->ranks.size()!=ranks_.size()))throw std::runtime_error("rank prefix payload count mismatch");
         for(const auto& r:ranks_)if(!r.lease->matches(prompt))throw std::runtime_error("rank prefix token identity mismatch");
