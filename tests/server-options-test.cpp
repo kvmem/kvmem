@@ -11,6 +11,15 @@ static void rejects(const std::function<void()> & fn) {
     throw std::runtime_error("expected invalid_argument");
 }
 int main() {
+    // Shared option syntax must not silently enable an unfinished backend.
+    for (const auto flag : {"--kvmem-recall-strategy", "--kvmem-layerwise-mtp-history",
+                           "--kvmem-layerwise-metadata-mib"}) {
+        kvmem_server_options unsupported;
+        const char* value = std::string(flag) == "--kvmem-recall-strategy" ? "layerwise" :
+            std::string(flag) == "--kvmem-layerwise-mtp-history" ? "first-layer" : "256";
+        check(unsupported.parse(flag, [&](const char*) { return value; }));
+        rejects([&] { unsupported.resolve(); });
+    }
     // Both EXEs use this resolver; omission, zero, disable conflicts and
     // overrides are part of the public contract, independent of GPU geometry.
     {

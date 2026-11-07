@@ -224,6 +224,22 @@ class ConsoleTests(unittest.TestCase):
         self.controller.active_plan['resolved_scoring'] = dict(planned, graph_alpha=.5)
         self.assertTrue(self.controller.status()['scoring_mismatch'])
 
+    def test_layerwise_omitted_limits_wait_for_complete_native_report(self):
+        planned=self.controller.scoring_from_argv(['worker','--kvmem-recall-strategy','layerwise'])
+        self.controller.active=self.config
+        self.controller.active_plan={'resolved_scoring':planned}
+        self.controller.log_path.write_text('KVMEM_RECALL strategy=layerwise current_layer_q=1 query_replay=0\n',encoding='utf-8')
+        status=self.controller.status()
+        self.assertFalse(status['scoring_confirmed'])
+        self.assertFalse(status['scoring_mismatch'])
+        with self.controller.log_path.open('a',encoding='utf-8') as stream:
+            stream.write('KVMEM_RECALL activation_ram_bytes=268435456 activation_disk_bytes=0 staging_bytes=16777216 metadata_bytes=1073741824 activation_metadata_bytes=134217728\n')
+        status=self.controller.status()
+        self.assertTrue(status['scoring_confirmed'])
+        self.assertEqual(status['effective_scoring']['metadata_bytes'],1<<30)
+        self.controller.active_plan['resolved_scoring']=dict(planned,metadata_bytes=256<<20)
+        self.assertTrue(self.controller.status()['scoring_mismatch'])
+
     def test_mixed_package_components_are_rejected(self):
         package = Path(self.tmp.name) / 'mixed-package'; package.mkdir()
         asset = package / 'launcher.js'; asset.write_text('original', encoding='utf-8')

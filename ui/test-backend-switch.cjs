@@ -43,7 +43,7 @@ module.exports=async({browser,base,info})=>{
   assert.deepEqual(await order(),originalOrder,'switching must not replace a multi-GPU selection with the first GPU');
   assert.equal(await field('Context').inputValue(),'262144','first switch uses engine default');
   assert.equal(await field('Budget').inputValue(),'47104');assert.equal(await field('MaxTokens').inputValue(),'0');
-  assert.equal(await field('Port').inputValue(),shared.Port);assert.equal(await page.locator('[data-preset]').count(),1);assert.equal(await page.locator('[data-preset]').getAttribute('data-preset'),'llamacpp-default');
+  assert.equal(await field('Port').inputValue(),shared.Port);assert.deepEqual(await page.locator('[data-preset]').evaluateAll(nodes=>nodes.map(n=>n.dataset.preset).sort()),['llamacpp-default','llamacpp-layerwise']);
   assert.ok((await page.locator('[data-gpu-limit]').textContent()).includes('已保留原选择'));
   assert.equal(await page.locator('[data-gpu-choice]').first().evaluate(el=>el.checkValidity()),false);
   assert.equal(await field('Model').inputValue(),'','model assets are backend-specific');

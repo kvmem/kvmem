@@ -1,6 +1,8 @@
 #pragma once
 
 #include "kvmem/retrieval_options.hpp"
+#include "kvmem/layerwise_options.hpp"
+#include "kvmem/layerwise_mtp.hpp"
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -31,6 +33,10 @@ struct CliOptions {
     double lrfu_lambda = 0.5, lrfu_top_fraction = 0.9;
     int score_agg = 0;
     QueryScorer query_scorer = QueryScorer::PageSoftmax;
+    RecallStrategy recall_strategy = RecallStrategy::Legacy;
+    LayerwiseOptions layerwise;
+    bool layerwise_limits_set = false;
+    bool sink_tokens_set = false, recent_tokens_set = false;
     double graph_alpha = 0.2;
     bool score_agg_set = false, lrfu_set = false, graph_alpha_set = false, lrfu_tuning_set = false;
 
@@ -44,6 +50,7 @@ struct CliOptions {
             throw std::invalid_argument("LRFU tuning requires enabled LRFU");
     }
     bool budget_set = false, sessions_set = false, auxiliary_set = false;
+    LayerwiseMtpHistory layerwise_mtp_history = LayerwiseMtpHistory::Unspecified;
 
     static uint32_t integer(const std::string & name, const char * value, uint32_t minimum) {
         const std::string text(value);
@@ -70,9 +77,23 @@ struct CliOptions {
             budget_set = true;
             return true;
         }
-        if (arg == "--kvmem-gen-reserve") gen_reserve = integer(arg, need(arg.c_str()), 1);
-        else if (arg == "--kvmem-sink-tokens") sink_tokens = integer(arg, need(arg.c_str()), 0);
-        else if (arg == "--kvmem-recent-tokens") recent_tokens = integer(arg, need(arg.c_str()), 0);
+        if (arg == "--kvmem-recall-strategy") recall_strategy = parse_recall_strategy(need(arg.c_str()));
+        else if (arg == "--kvmem-layerwise-mtp-history") layerwise_mtp_history = parse_layerwise_mtp_history(need(arg.c_str()));
+        else if (arg == "--kvmem-layerwise-activation-ram-mib" || arg == "--kvmem-layerwise-activation-disk-mib" ||
+                 arg == "--kvmem-layerwise-staging-mib" || arg == "--kvmem-layerwise-metadata-mib" ||
+                 arg == "--kvmem-layerwise-activation-metadata-mib") {
+            const auto bytes=uint64_t(integer(arg,need(arg.c_str()),
+                arg=="--kvmem-layerwise-activation-ram-mib" || arg=="--kvmem-layerwise-activation-disk-mib" ? 0:1))<<20;
+            if (arg=="--kvmem-layerwise-activation-ram-mib") layerwise.activation_ram_bytes=bytes;
+            else if (arg=="--kvmem-layerwise-activation-disk-mib") layerwise.activation_disk_bytes=bytes;
+            else if (arg=="--kvmem-layerwise-staging-mib") layerwise.staging_bytes=bytes;
+            else if (arg=="--kvmem-layerwise-metadata-mib") layerwise.metadata_bytes=bytes;
+            else layerwise.activation_metadata_bytes=bytes;
+            layerwise_limits_set=true;
+        }
+        else if (arg == "--kvmem-gen-reserve") gen_reserve = integer(arg, need(arg.c_str()), 1);
+        else if (arg == "--kvmem-sink-tokens") {sink_tokens = integer(arg, need(arg.c_str()), 0);sink_tokens_set=true;}
+        else if (arg == "--kvmem-recent-tokens") {recent_tokens = integer(arg, need(arg.c_str()), 0);recent_tokens_set=true;}
         else if (arg == "--kvmem-sessions") {
             sessions = integer(arg, need(arg.c_str()), 1);
             sessions_set = true;
@@ -105,9 +126,16 @@ struct CliOptions {
         enabled = enabled_override < 0 ? budget_set : enabled_override != 0;
         if (!enabled && (budget_set || auxiliary_set || payload_disk_bytes || lrfu))
             throw std::invalid_argument("KVMem settings require --kvmem (or a positive --kvmem-budget); remove --no-kvmem");
-        if (payload_disk_dir.empty() != (payload_disk_bytes == 0))
-            throw std::invalid_argument("KVMem SSD requires a positive --kvmem-disk-mib and --kvmem-disk-path together; omit the path when disabled");
+        const bool uses_disk = payload_disk_bytes ||
+            (recall_strategy==RecallStrategy::Layerwise && layerwise.activation_disk_bytes);
+        if (payload_disk_dir.empty() == uses_disk)
+            throw std::invalid_argument("KVMem SSD requires --kvmem-disk-path with a positive canonical or layerwise activation SSD quota; omit the path when both are disabled");
         if (!enabled) return;
+        if (layerwise_limits_set && recall_strategy!=RecallStrategy::Layerwise)
+            throw std::invalid_argument("layerwise limits require --kvmem-recall-strategy layerwise");
+        if (layerwise_mtp_history!=LayerwiseMtpHistory::Unspecified && recall_strategy!=RecallStrategy::Layerwise)
+            throw std::invalid_argument("MTP history policy requires --kvmem-recall-strategy layerwise");
+        if (recall_strategy==RecallStrategy::Layerwise) validate_layerwise_options(layerwise);
         resolve_query_scoring();
         if (!budget) budget = default_budget;
         if (!gen_reserve) gen_reserve = default_reserve;

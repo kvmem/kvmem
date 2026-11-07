@@ -1,5 +1,8 @@
 #include "kvmem/native_kv_payload.hpp"
 #include "kvmem/raw_kv_store.hpp"
+#include "kvmem/host_kv_storage.hpp"
+#include <algorithm>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <utility>
@@ -37,6 +40,77 @@ void validate_raw(const RawKvStoreConfig & cfg, const PayloadLayout & layout, co
     }
 }
 } // namespace
+
+NativeKvLayerRegions::NativeKvLayerRegions(const PayloadLayout & layout, uint32_t layer,
+                                         std::optional<uint32_t> rank) : rank_(rank) {
+    layout.validate();
+    if (layout.record_bytes > std::numeric_limits<size_t>::max())
+        invalid("native payload regions exceed host address space");
+    record_bytes_ = layout.record_bytes;
+    packed_layout_ = layout;
+    packed_layout_.planes.clear();
+    for (const auto & plane : layout.planes) {
+        if (plane.layer != layer || (rank && plane.rank != *rank)) continue;
+        const auto padding = (plane.alignment - packed_bytes_ % plane.alignment) % plane.alignment;
+        if (padding > std::numeric_limits<size_t>::max() - packed_bytes_ ||
+            plane.bytes > std::numeric_limits<size_t>::max() - packed_bytes_ - padding)
+            invalid("native packed layer exceeds host address space");
+        packed_bytes_ += padding;
+        regions_.push_back({plane, packed_bytes_});
+        auto packed_plane = plane;
+        packed_plane.offset = packed_bytes_;
+        packed_layout_.planes.push_back(packed_plane);
+        packed_bytes_ += plane.bytes;
+        plane_bytes_ += plane.bytes;
+    }
+    if (regions_.empty()) invalid("native payload has no requested model layer or rank");
+    const auto padding = (layout.alignment - packed_bytes_ % layout.alignment) % layout.alignment;
+    if (padding > std::numeric_limits<size_t>::max() - packed_bytes_)
+        invalid("native packed layer padding exceeds host address space");
+    packed_bytes_ += padding;
+    packed_layout_.record_bytes = packed_bytes_;
+    if (!rank_) packed_layout_.validate();
+}
+const PayloadLayout & NativeKvLayerRegions::packed_layout() const {
+    if (rank_) throw MemoryError(MemoryErrorCode::Unsupported, "a rank-filtered region view is not a complete layer layout");
+    return packed_layout_;
+}
+void NativeKvLayerRegions::read(const HostKvSource & source, uint64_t packed_offset,
+                               void * destination, size_t bytes, size_t max_read_bytes) const {
+    read(source.lease(), packed_offset, destination, bytes, max_read_bytes);
+}
+void NativeKvLayerRegions::read(const HostKvLease & source, uint64_t packed_offset,
+                               void * destination, size_t bytes, size_t max_read_bytes) const {
+    if (!source || source.size() != record_bytes_ || !max_read_bytes ||
+        packed_offset > packed_bytes_ || bytes > packed_bytes_ - packed_offset ||
+        (bytes && !destination))
+        invalid("native payload region read has an invalid source, range or buffer");
+    if (!bytes) return;
+    if (source.data()) {
+        const auto src = reinterpret_cast<uintptr_t>(source.data());
+        const auto dst = reinterpret_cast<uintptr_t>(destination);
+        if (dst >= src ? dst - src < source.size() : src - dst < bytes)
+            invalid("native payload region staging overlaps its source");
+    }
+    auto * output = static_cast<uint8_t *>(destination);
+    const auto requested_end = packed_offset + bytes;
+    std::memset(output, 0, bytes);
+    for (const auto & region : regions_) {
+        const auto begin = std::max(packed_offset, region.packed_offset);
+        const auto end = std::min(requested_end, region.packed_offset + region.plane.bytes);
+        if (begin >= end) continue;
+        uint64_t offset = region.plane.offset + begin - region.packed_offset;
+        uint64_t remaining = end - begin;
+        auto written = static_cast<size_t>(begin - packed_offset);
+        while (remaining) {
+            const auto take = static_cast<size_t>(std::min<uint64_t>(remaining, max_read_bytes));
+            source.read(static_cast<size_t>(offset), output + written, take);
+            offset += take;
+            remaining -= take;
+            written += take;
+        }
+    }
+}
 
 NativeKvPayload::NativeKvPayload(BackendIdentity backend, PayloadLayout layout, BlockDescriptor block,
                                  std::vector<uint8_t> bytes)

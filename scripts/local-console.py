@@ -62,7 +62,7 @@ from launcher.config import (SPECULATIVE_PROFILES, DEFAULTS, ENGINE_DEFAULTS,
     without_secrets, normalize)
 from launcher.plan import build_plan, capabilities as launcher_capabilities, scoring_settings
 from launcher.export import export_profile, read_revision
-from launcher.worker import require_launch_features
+from launcher.worker import require_launch_features, strategy_profile
 
 
 def private_log(path, *, truncate=False):
@@ -244,6 +244,23 @@ class Controller:
         self.worker_cache = {key: value}
         return copy.deepcopy(value)
 
+    def selected_worker_capabilities(self, data):
+        parameters = request_parameters(data)
+        backend = parameters['Backend']
+        if backend not in self.backends:
+            raise ValueError('Backend is not installed')
+        selected = parameters.get('RecallStrategy', 'legacy')
+        if selected not in ('legacy', 'layerwise'):
+            raise ValueError('Unknown recall strategy')
+        requested_worker = parameters.get('Worker', '')
+        parameters = self.prefer_packaged_worker(parameters)
+        worker = parameters.get('Worker') or self.worker_defaults()[backend]['path']
+        value = self.worker_capabilities(worker, backend)
+        return dict(schema_version=1, backend=backend, strategy=selected,
+                    requested_worker=requested_worker,
+                    worker=dict(path=value['path'], executable_sha256=value['executable_sha256']),
+                    profile=strategy_profile(value, selected))
+
     @staticmethod
     def scoring_from_argv(argv):
         return scoring_settings(argv)
@@ -270,17 +287,23 @@ class Controller:
 
     def parse_scoring(self, lines):
         for line in lines:
-            for marker in ('KVMEM_SCORING ', 'KVMEM_LIMITS ', 'KVMEM_BLOCKS '):
+            for marker in ('KVMEM_SCORING ', 'KVMEM_LIMITS ', 'KVMEM_BLOCKS ', 'KVMEM_RECALL ', 'KVMEM_RECALL_STRATEGY ', 'INFO '):
                 if marker not in line:
                     continue
+                if marker == 'INFO ' and 'recall_strategy=layerwise' not in line:
+                    continue
                 for key, value in re.findall(r'(\w+)=([^\s]+)', line.split(marker, 1)[1]):
-                    if key in {'scorer', 'agg'}:
+                    key = {'recall_strategy': 'strategy', 'current_layer_query': 'current_layer_q'}.get(key, key)
+                    if key.startswith('layerwise_'):
+                        key = key.removeprefix('layerwise_')
+                    if key in {'scorer', 'agg', 'strategy', 'mtp_history', 'position_policy', 'native_draft_kind'}:
                         self.observed_scoring[key] = value
-                    elif key == 'lrfu':
+                    elif key in {'lrfu', 'current_layer_q', 'query_replay'} and value in ('0', '1'):
                         self.observed_scoring[key] = value == '1'
                     elif key in {'lambda', 'top_frac', 'graph_alpha'}:
                         self.observed_scoring[key] = float(value)
-                    elif key in {'query_max_tokens', 'query_replay_max_tokens', 'block_tokens'}:
+                    elif key in {'query_max_tokens', 'query_replay_max_tokens', 'block_tokens', 'activation_ram_bytes',
+                                 'activation_disk_bytes', 'staging_bytes', 'metadata_bytes', 'activation_metadata_bytes'}:
                         self.observed_scoring[key] = int(value)
 
     def worker_defaults(self):
@@ -377,7 +400,7 @@ class Controller:
             result['worker'] = self.worker_capabilities(result['argv'][0], params['Backend'], result['environment'])
             if params['Backend']=='radiance' and params.get('Vision') and not result['worker'].get('multimodal'):
                 raise ValueError('该 Radiance worker 未编入图片解码支持，请使用带 FFmpeg 的视觉构建。 This Radiance worker has no image decoder; use a vision build with FFmpeg.')
-            require_launch_features(result['worker'], params)
+            require_launch_features(result['worker'], result['effective_parameters'])
             result['resolved_scoring'] = self.scoring_from_argv(result['argv'])
             with socket.socket() as probe:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -424,7 +447,7 @@ class Controller:
             result['warnings'] = self.redact(run.stdout[:start].strip())
             native_argv = result.get('native_argv', argv)
             result['worker'] = self.worker_capabilities(native_argv[0], params['Backend'])
-            require_launch_features(result['worker'], params)
+            require_launch_features(result['worker'], result.get('effective_parameters', params))
             result['resolved_scoring'] = self.scoring_from_argv(native_argv)
             if params['Backend'] == 'polystrata':
                 block = params.get('BlockTokens', 32)
@@ -738,9 +761,12 @@ class Controller:
                     self.memory_diagnosis_instance = self.instance
                 result['memory_diagnosis'] = copy.deepcopy(self.memory_diagnosis)
             planned = result['planned_scoring']
-            result['scoring_confirmed'] = bool(planned and all(
+            complete = not planned or planned.get('strategy') != 'layerwise' or {
+                'activation_ram_bytes', 'activation_disk_bytes', 'staging_bytes',
+                'metadata_bytes', 'activation_metadata_bytes'}.issubset(self.observed_scoring)
+            result['scoring_confirmed'] = bool(planned and complete and all(
                 key in self.observed_scoring and self.observed_scoring[key] == value for key, value in planned.items()))
-            result['scoring_mismatch'] = bool(planned and set(planned).issubset(self.observed_scoring)
+            result['scoring_mismatch'] = bool(planned and complete and set(planned).issubset(self.observed_scoring)
                                               and not result['scoring_confirmed'])
             if running and self.active and (not service or service['worker_matches']):
                 port = self.active['parameters'].get('Port', 18200)
@@ -810,7 +836,7 @@ class Controller:
                 _, _, plan, config = self.revision_config(profile, state['revision'])
                 if action != 'select':
                     native = self.worker_capabilities(plan['argv'][0], plan['backend'], plan['environment'])
-                    require_launch_features(native, config['parameters'])
+                    require_launch_features(native, plan.get('effective_parameters', config['parameters']))
                     if native.get('executable_sha256') != plan.get('worker', {}).get('executable_sha256'):
                         raise ValueError('Worker changed; generate and register a new version')
                     if not self.inspect_model(config, for_launch=True)['can_start']:
@@ -886,6 +912,8 @@ class Controller:
             raise ValueError('自动调整暂支持 Windows 控制台 / Automatic budget adjustment currently requires Windows')
         clean = normalize(data, self.backends)
         p = clean['parameters']
+        if p.get('RecallStrategy', 'legacy') == 'layerwise':
+            raise ValueError('分层召回尚无独立自动预算报告；请保留所选 KV 格式并手动设置预算 / Layerwise auto budget is not qualified; set its budget explicitly')
         if p['Backend'] != 'ninfer' or not p.get('Gpu') or ',' in p['Gpu'] or p.get('TensorParallel'):
             raise ValueError('自动调整暂支持 NInfer 单卡，请选择一张显卡 / Auto budget requires single-GPU NInfer')
         # Budget is the output of this operation, not an input constraint. Use a
@@ -1032,7 +1060,7 @@ class Controller:
         from launcher.process_linux import OwnedProcess
         directory, _, plan, clean = self.revision_config(data['profile_id'], data['revision'])
         native = self.worker_capabilities(plan['argv'][0], plan['backend'], plan['environment'])
-        require_launch_features(native, clean['parameters'])
+        require_launch_features(native, plan.get('effective_parameters', clean['parameters']))
         if native.get('executable_sha256') != plan.get('worker', {}).get('executable_sha256'):
             raise ValueError('Worker changed after script generation; check the configuration and generate a new version')
         health = self.inspect_model(clean, for_launch=True)
@@ -1340,6 +1368,8 @@ class Handler(BaseHTTPRequestHandler):
                                 'model_inspection_version': 1,
                                 'kv_cache_version': 1,
                                 'query_scoring_version': 2,
+                                'recall_strategy_version': 1,
+                                'worker_capabilities_version': 1,
                                 'platform': 'windows' if os.name == 'nt' else 'linux',
                                 'budget_adjustment': AUTO_BUDGET_SUPPORTED,
                                 'native_picker': os.name == 'nt',
@@ -1450,6 +1480,7 @@ class Handler(BaseHTTPRequestHandler):
                        '/api/launcher/browse-model-folder': lambda data: self.control.browse_model(data, folder=True),
                        '/api/launcher/scan-models': self.control.scan_models,
                        '/api/launcher/inspect-model': self.control.inspect_model,
+                       '/api/launcher/worker-capabilities': self.control.selected_worker_capabilities,
                        '/api/launcher/model-directories': self.control.update_model_directories,
                        '/api/launcher/start': self.control.start, '/api/launcher/retry-memory': self.control.retry_memory,
                        '/api/launcher/stop': lambda _: self.control.stop()}

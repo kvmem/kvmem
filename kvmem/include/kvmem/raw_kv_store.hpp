@@ -100,6 +100,12 @@ public:
     bool has_v_gpu(uint32_t block_id, uint32_t il, uint32_t n = 1) const;
     uint32_t n_tokens(uint32_t block_id) const;
 
+    // Exact token coverage of the Mean-K value for one statistics layer. Zero
+    // means this layer has no usable mean, even if another layer has the block.
+    // Mirrors mean_k's sum-first/raw-FP16 fallback without reading payload bytes.
+    // The caller freezes writers while validating coverage and reading Mean-K.
+    uint32_t mean_k_tokens(uint32_t block_id, uint32_t il) const;
+
     bool copy_k(uint32_t block_id, uint32_t il, float * out) const;
     bool copy_v(uint32_t block_id, uint32_t il, float * out) const;
     bool copy_k_rows(uint32_t block_id, uint32_t il, uint8_t * out, uint32_t n) const;
