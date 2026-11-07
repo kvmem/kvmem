@@ -5599,7 +5599,7 @@ bool llama_memory_kvmem::checkpoint_layer(uint32_t layer) const {
 
 std::shared_ptr<const llama_kvmem_checkpoint_snapshot> llama_kvmem_checkpoint_capture(uint32_t row) {
     auto * mem = kvmem_capture_active();
-    if (!mem || !row) return {};
+    if (!mem) return {};
     std::string reason;
     if (!mem->conv_swap_supported(reason)) return {}; // legacy non-flash path
     auto result = std::make_shared<llama_kvmem_checkpoint_snapshot>();
@@ -5653,7 +5653,9 @@ bool llama_kvmem_checkpoint_restore(const llama_kvmem_checkpoint_snapshot & snap
     if (snapshot.draft) candidate->mtp_raw->import_packed(*snapshot.draft);
     // The rejected outgoing execution is discarded, not harvested again.
     // Failure can affect the private candidate, never the immutable source.
-    return mem->restore_checkpoint_conv(std::move(candidate));
+    const bool empty = snapshot.metadata->runtime->store().total_tokens() == 0;
+    const bool restored = mem->restore_checkpoint_conv(std::move(candidate));
+    return restored || (empty && mem->store_n_tokens() == 0);
 }
 uint64_t llama_kvmem_checkpoint_metadata_bytes(const llama_kvmem_checkpoint_snapshot & snapshot) {
     return snapshot.metadata_bytes;

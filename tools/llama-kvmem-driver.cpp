@@ -976,20 +976,11 @@ struct SnapshotPhaseTimer {
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count()); }
 };
 
-struct CheckpointRead {
-    // Native setters are invoked only after the complete image validates.
-    // Staging is private, bounded by existing Q admission, and dies at restore.
-    CheckpointHostReservation reservation;
-    std::vector<uint8_t> recurrent, carry;
-    CheckpointRead(const std::shared_ptr<MultimodalCheckpointAccounting> & account, size_t n, size_t limit)
-        : reservation(account, n, limit) {}
-};
-
-static std::unique_ptr<CheckpointRead> checkpoint_read(
+std::unique_ptr<CheckpointRead> llama_driver_read_checkpoint(
         LlamaEngineState & st, const std::shared_ptr<const MultimodalCheckpointData> & saved) {
     const auto bytes = saved->recurrent_bytes + saved->carry_bytes;
-    checkpoint_make_room(st, bytes, false, saved->accounting);
-    auto result = std::make_unique<CheckpointRead>(saved->accounting, bytes,
+    checkpoint_make_room(st, bytes);
+    auto result = std::make_unique<CheckpointRead>(st.mm_checkpoint_accounting, bytes,
         st.mm_archive.policy().enabled ? st.mm_archive.policy().host_bytes : SIZE_MAX);
     result->recurrent.resize(saved->recurrent_bytes); result->carry.resize(saved->carry_bytes);
     const auto lease = saved->native_image.lease();
@@ -1096,7 +1087,7 @@ static void multimodal_restore(LlamaEngineState & st, const MultimodalCheckpoint
     if (!checkpoint.data) throw std::runtime_error("missing multimodal checkpoint data");
     if (!llama_kvmem_tail_mean_valid(checkpoint.row, checkpoint.data->tail_mean))
         throw std::runtime_error("stale or foreign mean-K/recurrent checkpoint");
-    const auto owned_read = live || prepared ? nullptr : checkpoint_read(st, checkpoint.data);
+    const auto owned_read = live || prepared ? nullptr : llama_driver_read_checkpoint(st, checkpoint.data);
     const auto * restore_data = prepared ? prepared : owned_read.get();
     if (live) ++st.mm_perf.restore_skips;
     else ++st.mm_perf.restores;
@@ -1107,8 +1098,8 @@ static void multimodal_restore(LlamaEngineState & st, const MultimodalCheckpoint
     // Query replay keeps its newly selected working set. Prefix and rollback
     // restoration instead install the checkpoint's exact native layout.
     if (!live && truncate && checkpoint.data->attention) {
-        checkpoint_make_room(st, checkpoint.data->attention_metadata, false, checkpoint.data->accounting);
-        CheckpointHostReservation metadata_staging(checkpoint.data->accounting,
+        checkpoint_make_room(st, checkpoint.data->attention_metadata);
+        CheckpointHostReservation metadata_staging(st.mm_checkpoint_accounting,
             checkpoint.data->attention_metadata,
             st.mm_archive.policy().enabled ? st.mm_archive.policy().host_bytes : SIZE_MAX);
         SnapshotPhaseTimer timer{llama_kvmem_snapshot_phase::attention_restore};
@@ -1322,7 +1313,7 @@ static bool run_prefill_multimodal(LlamaEngineState & st, kvmem::RequestControl 
             while (checkpoint) {
                 base = *checkpoint;
                 try {
-                    if (st.mm_live_checkpoint != base.data || st.mm_live_row != base.row) base_read = checkpoint_read(st, base.data);
+                    if (st.mm_live_checkpoint != base.data || st.mm_live_row != base.row) base_read = llama_driver_read_checkpoint(st, base.data);
                     found = true; break;
                 }
                 catch (const std::exception & error) {

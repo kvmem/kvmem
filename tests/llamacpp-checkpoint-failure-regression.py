@@ -177,7 +177,9 @@ def main():
                 assert status==500 and 'checkpoint Host budget exhausted' in json.loads(raw)['error'],raw
                 with opener.open(base+'/api/monitor/snapshot',timeout=5) as response:
                     usage=json.load(response)['kvmem']
-                assert usage['physical_checkpoint_bytes']<4096,usage
+                # The empty accepted root retains native content-lineage metadata.
+                assert usage['checkpoint_native_record_ram_bytes']<4096,usage
+                assert usage['physical_checkpoint_bytes']<64*1024,usage
                 assert child.poll() is None
                 print('PASS',name,'late commit error, rollback, repeated rejection without retained state',flush=True)
             trace=log_path.read_text(errors='replace')

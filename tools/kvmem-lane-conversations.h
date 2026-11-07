@@ -784,7 +784,7 @@ private:
     }
     void reclaim_checkpoint_host(const std::shared_ptr<MultimodalCheckpointAccounting>& account,size_t bytes) {
         std::lock_guard<std::mutex> lock(mu_);
-        const auto fits=[&] { const auto used=account->live_bytes.load();
+        const auto fits=[&] { const auto used=account->used();
             return used<=account->limit && bytes<=account->limit-used; };
         const auto owns=[&](const auto& checkpoint) {
             return checkpoint && checkpoint->accounting==account && checkpoint->resident_bytes()!=0;

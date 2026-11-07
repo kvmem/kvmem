@@ -74,6 +74,23 @@ struct MultimodalCheckpointData {
     size_t bytes() const { return metadata_bytes() + native_image.size(); }
 };
 
+// Engine-private validated native staging. The reader's execution owns this
+// temporary allocation; a shared source retains its original immutable account.
+struct CheckpointRead {
+    std::shared_ptr<MultimodalCheckpointAccounting> account;
+    size_t bytes;
+    std::vector<uint8_t> recurrent, carry;
+    CheckpointRead(std::shared_ptr<MultimodalCheckpointAccounting> owner, size_t n, size_t limit)
+        : account(std::move(owner)), bytes(n) {
+        if (!account->reserve(bytes,limit)) throw std::runtime_error("checkpoint Host reservation exceeded budget");
+    }
+    ~CheckpointRead() { account->live_bytes -= bytes; }
+    CheckpointRead(const CheckpointRead &) = delete;
+    CheckpointRead & operator=(const CheckpointRead &) = delete;
+};
+std::unique_ptr<CheckpointRead> llama_driver_read_checkpoint(
+    LlamaEngineState &, const std::shared_ptr<const MultimodalCheckpointData> &);
+
 struct MultimodalCheckpoint {
     int row = 0;
     kvmem::CheckpointPurpose purposes = kvmem::CheckpointPurpose::Endpoint;

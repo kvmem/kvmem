@@ -66,7 +66,7 @@ struct kvmem_lane_conversations_test_access {
     static void seed_checkpoint(kvmem_lane_conversations& c,int id,uint64_t group,uint64_t used,
             const std::shared_ptr<MultimodalCheckpointAccounting>& account) {
         seed_version(c,id,group,used);
-        auto data=std::make_shared<MultimodalCheckpointData>();data->recurrent.resize(128);
+        auto data=std::make_shared<MultimodalCheckpointData>();data->tail_mean.values.resize(32);
         data->accounting=account;account->add(data->resident_bytes());
         c.entries_.at(id).payload.mm_live_checkpoint=std::move(data);
     }
@@ -124,7 +124,7 @@ int main() {
         state.cached_tokens=source.committed.prompt->tokens;
         state.cached_prompt=std::make_shared<kvmem_prompt>(state.cached_tokens);
         for(int row:source.committed.match.ckpt_rows) {
-            auto data=std::make_shared<MultimodalCheckpointData>();data->recurrent.resize(16);
+            auto data=std::make_shared<MultimodalCheckpointData>();data->tail_mean.values.resize(4);
             MultimodalCheckpoint cp;cp.row=row;cp.data=data;state.mm_checkpoints.remember(cp);
         }
         auto tokens=source.committed.prompt->tokens;tokens.push_back(22);
@@ -158,7 +158,7 @@ int main() {
         kvmem::CheckpointPolicy policy;policy.enabled=true;policy.count=8;
         archived.mm_archive=kvmem::CheckpointArchive<MultimodalCheckpoint>(policy);
         for(int row=1;row<=4;++row) {
-            auto data=std::make_shared<MultimodalCheckpointData>();data->recurrent.resize(16);
+            auto data=std::make_shared<MultimodalCheckpointData>();data->tail_mean.values.resize(4);
             MultimodalCheckpoint cp;cp.row=row;cp.data=data;
             assert(archived.mm_archive.remember(cp,kvmem::CoveragePurpose::Periodic));
         }
@@ -195,7 +195,7 @@ int main() {
         kvmem::CheckpointPolicy policy;policy.enabled=true;policy.count=8;
         state.mm_archive=kvmem::CheckpointArchive<MultimodalCheckpoint>(policy);
         for(int row:{64,96,128,160}) {
-            auto data=std::make_shared<MultimodalCheckpointData>();data->recurrent.assign(16,uint8_t(row));
+            auto data=std::make_shared<MultimodalCheckpointData>();data->tail_mean.values.assign(4,float(row));
             MultimodalCheckpoint cp;cp.row=row;cp.data=data;
             state.mm_checkpoints.remember(cp);state.mm_archive.remember(cp,kvmem::CoveragePurpose::Input);
         }
@@ -316,89 +316,93 @@ int main() {
         assert(account->live_bytes.load()+reclaim==account->limit);
     }
     {
-        // A per-session spill can release private attachments but must leave
-        // shared checkpoint vectors and their accounting intact for siblings.
+        // Session manifests serialize private statistics only. Immutable state
+        // records retain one public owner, even when a checkpoint is shared.
         const auto folder=std::filesystem::temp_directory_path()/"kvmem-shared-checkpoint-spill";
         std::filesystem::create_directories(folder);
         auto disk=std::make_shared<kvmem::SpillFile>(folder,4096);
         auto account=std::make_shared<MultimodalCheckpointAccounting>();
+        auto storage=std::make_shared<kvmem::HostKvStorage>(4096,disk);
+        std::atomic_store(&account->storage_owner,storage);
+        const auto make_state=[&](size_t n,uint8_t value) {
+            auto data=std::make_shared<MultimodalCheckpointData>();
+            const std::vector<uint8_t> payload(n,value);
+            data->native_image=storage->allocate(kvmem::checkpoint_image_size(n,2));
+            kvmem::write_checkpoint_image(data->native_image,uint64_t(reinterpret_cast<uintptr_t>(data.get())),
+                {{payload.data(),n},{nullptr,0}});
+            data->native_image.seal();data->residency=data->native_image.lease();data->recurrent_bytes=n;
+            return data;
+        };
         kvmem_conversation parent;
-        auto shared=std::make_shared<MultimodalCheckpointData>();
-        shared->recurrent.assign(128,7);shared->draft_carry.assign(16,9);shared->tail_mean.values.assign(4,2.f);
-        shared->accounting=account;account->add(shared->resident_bytes());
+        auto shared=make_state(128,7);shared->tail_mean.values.assign(4,2.f);
+        shared->accounting=account;account->add(shared->metadata_bytes());
         MultimodalCheckpoint cp;cp.row=64;cp.data=shared;parent.mm_checkpoints.remember(cp);
         auto child=llama_driver_fork_conversation(parent,64);
-        auto own=std::make_shared<MultimodalCheckpointData>();own->recurrent.assign(32,5);
-        own->accounting=account;account->add(own->resident_bytes());
+        auto own=make_state(32,5);own->tail_mean.values.assign(8,5.f);
+        own->accounting=account;account->add(own->metadata_bytes());
         cp.row=96;cp.data=own;parent.mm_checkpoints.remember(cp);
-        const auto charge=account->live_bytes.load();
+        const auto charge=account->used(),payload_charge=storage->charged_bytes();
         std::vector<kvmem::SnapshotBuffer> buffers;llama_driver_conversation_buffers(parent,buffers);
         kvmem_session_payload manifest(1,1,buffers);kvmem_session_files files(folder,disk);
         for(uint32_t i=0;i<manifest.chunks.size();++i)manifest.spill(files,i);
-        assert(files.contains(1) && own->recurrent.empty());
-        assert(shared->recurrent==std::vector<uint8_t>(128,7));
-        assert(shared->draft_carry==std::vector<uint8_t>(16,9) && shared->tail_mean.values==std::vector<float>(4,2.f));
-        assert(account->live_bytes==charge-32 && !child.payload && !shared->cold);
+        assert(files.contains(1) && own->tail_mean.values.empty());
+        assert(shared->tail_mean.values==std::vector<float>(4,2.f));
+        assert(storage->charged_bytes()==payload_charge && account->used()==charge-32 && !child.payload);
         for(uint32_t i=0;i<manifest.chunks.size();++i)manifest.restore(files,i);
-        assert(own->recurrent==std::vector<uint8_t>(32,5) && account->live_bytes==charge);
+        assert(own->tail_mean.values==std::vector<float>(8,5.f) && account->used()==charge);
         parent.mm_checkpoints.clear();shared.reset();cp.data.reset();
-        assert(child.mm_checkpoints.back().data->recurrent.size()==128);
+        LlamaEngineState reader;
+        const auto read=llama_driver_read_checkpoint(reader,child.mm_checkpoints.back().data);
+        assert(read->recurrent==std::vector<uint8_t>(128,7));
     }
     {
-        // All cold restore callers use one materializer. Two readers get
-        // private buffers; releasing or failing one restore preserves source.
+        // Concurrent readers own separate execution-local Q staging. Neither
+        // promotes/mutates the immutable source nor charges the parent's Q.
         const auto folder=std::filesystem::temp_directory_path()/"kvmem-shared-checkpoint-load";
         std::filesystem::create_directories(folder);
         auto disk=std::make_shared<kvmem::SpillFile>(folder,4096);
         auto account=std::make_shared<MultimodalCheckpointAccounting>();
-        auto source=std::make_shared<MultimodalCheckpointData>();
-        source->tail_mean.values.assign(4,2.f);
-        source->accounting=account;account->add(source->resident_bytes());
+        auto storage=std::make_shared<kvmem::HostKvStorage>(4096,disk);
+        std::atomic_store(&account->storage_owner,storage);
         const std::vector<uint8_t> recurrent(128,7),carry(16,9);
-        source->cold_recurrent=recurrent.size();source->cold_carry=carry.size();
-        source->cold=disk->reserve(kvmem::checkpoint_image_size(144,2));
-        kvmem::write_checkpoint_image(source->cold,uint64_t(reinterpret_cast<uintptr_t>(source.get())),
-            {{recurrent.data(),recurrent.size()},{carry.data(),carry.size()}});
-        kvmem_conversation parent;
-        MultimodalCheckpoint cp;cp.row=64;cp.data=source;parent.mm_checkpoints.remember(cp);
-        auto child=llama_driver_fork_conversation(parent,64);
-        const auto charge=account->live_bytes.load(),disk_charge=disk->charged_bytes();
+        const auto make_state=[&] {
+            auto data=std::make_shared<MultimodalCheckpointData>();
+            data->native_image=storage->allocate(kvmem::checkpoint_image_size(144,2));
+            kvmem::write_checkpoint_image(data->native_image,uint64_t(reinterpret_cast<uintptr_t>(data.get())),
+                {{recurrent.data(),recurrent.size()},{carry.data(),carry.size()}});
+            data->native_image.seal();data->recurrent_bytes=128;data->carry_bytes=16;
+            data->accounting=account;account->add(data->metadata_bytes());
+            return data;
+        };
+        auto source=make_state();assert(storage->demote(source->native_image));
+        const auto charge=account->used(),disk_charge=disk->charged_bytes();
         LlamaEngineState a,b;
-        kvmem::CheckpointPolicy policy;policy.enabled=false;
+        kvmem::CheckpointPolicy policy;policy.enabled=true;policy.host_bytes=4096;
         a.mm_archive=kvmem::CheckpointArchive<MultimodalCheckpoint>(policy);
         b.mm_archive=kvmem::CheckpointArchive<MultimodalCheckpoint>(policy);
-        std::shared_ptr<const MultimodalCheckpointData> first,second;
+        std::unique_ptr<CheckpointRead> first,second;
         std::exception_ptr error_a,error_b;
-        std::thread one([&]{try{first=llama_driver_materialize_checkpoint(a,child.mm_checkpoints.back().data);}catch(...){error_a=std::current_exception();}});
-        std::thread two([&]{try{second=llama_driver_materialize_checkpoint(b,source);}catch(...){error_b=std::current_exception();}});
+        std::thread one([&]{try{first=llama_driver_read_checkpoint(a,source);}catch(...){error_a=std::current_exception();}});
+        std::thread two([&]{try{second=llama_driver_read_checkpoint(b,source);}catch(...){error_b=std::current_exception();}});
         one.join();two.join();assert(!error_a && !error_b);
-        assert(first!=source && second!=source && first!=second);
-        assert(first->recurrent==recurrent && second->draft_carry==carry && first->tail_mean.values==source->tail_mean.values);
-        assert(source->cold && source->recurrent.empty() && source->draft_carry.empty());
-        assert(disk->charged_bytes()==disk_charge && account->live_bytes==charge+first->resident_bytes()+second->resident_bytes());
-        assert(llama_driver_materialize_checkpoint(a,first)==first); // rollback reuses its private result
-        first.reset();second.reset();assert(account->live_bytes==charge);
-        // A real checksum failure releases only this read's temporary charge.
-        const uint8_t bad=8,good=7;source->cold.write(40,&bad,1);
+        assert(first.get()!=second.get() && first->recurrent==recurrent && second->carry==carry);
+        assert(!source->native_image.resident_bytes() && disk->charged_bytes()==disk_charge && account->used()==charge);
+        assert(a.mm_checkpoint_accounting->used()==144 && b.mm_checkpoint_accounting->used()==144);
+        first.reset();second.reset();
+        assert(!a.mm_checkpoint_accounting->used() && !b.mm_checkpoint_accounting->used());
+        // Fault injection changes a private image, not the retained source.
+        auto corrupt=make_state();const uint8_t bad=8;corrupt->native_image.write(40,&bad,1);corrupt->native_image.seal();
         bool rejected=false;
-        try{auto invalid=llama_driver_materialize_checkpoint(a,source);(void)invalid;}catch(const kvmem::SnapshotCorrupt&){rejected=true;}
-        assert(rejected && source->cold && source->recurrent.empty() && account->live_bytes==charge);
-        source->cold.write(40,&good,1);
-        auto recovered=llama_driver_materialize_checkpoint(a,source);
-        assert(recovered->recurrent==recurrent && source->cold && disk->charged_bytes()==disk_charge);
-        recovered.reset();assert(account->live_bytes==charge);
-        policy.host_bytes=charge; a.mm_archive=kvmem::CheckpointArchive<MultimodalCheckpoint>(policy);
+        try{auto invalid=llama_driver_read_checkpoint(a,corrupt);(void)invalid;}catch(const kvmem::SnapshotCorrupt&){rejected=true;}
+        assert(rejected && !a.mm_checkpoint_accounting->used());
+        corrupt.reset();assert(account->used()==charge);
+        auto recovered=llama_driver_read_checkpoint(a,source);
+        assert(recovered->recurrent==recurrent && !source->native_image.resident_bytes() && disk->charged_bytes()==disk_charge);
+        recovered.reset();
+        policy.host_bytes=128;a.mm_archive=kvmem::CheckpointArchive<MultimodalCheckpoint>(policy);
         rejected=false;
-        try{auto denied=llama_driver_materialize_checkpoint(a,source);(void)denied;}catch(const std::runtime_error&){rejected=true;}
-        assert(rejected && account->live_bytes==charge && source->cold);
-        // The exclusive path still publishes in place and charges only growth.
-        auto private_source=std::make_shared<MultimodalCheckpointData>();
-        private_source->cold=source->cold;private_source->cold_recurrent=128;private_source->cold_carry=16;
-        private_source->cold_identity=uint64_t(reinterpret_cast<uintptr_t>(source.get()));
-        private_source->accounting=account;account->add(private_source->resident_bytes());
-        a.mm_archive=kvmem::CheckpointArchive<MultimodalCheckpoint>();
-        auto loaded=llama_driver_materialize_checkpoint(a,private_source);
-        assert(loaded==private_source && !loaded->cold && loaded->recurrent==recurrent && source->cold);
+        try{auto denied=llama_driver_read_checkpoint(a,source);(void)denied;}catch(const std::runtime_error&){rejected=true;}
+        assert(rejected && !a.mm_checkpoint_accounting->used() && account->used()==charge);
     }
     // An empty resident slot and an LRU resident victim cannot be moved onto
     // the source lane. Extra catalog capacity still permits a shared branch.
@@ -498,13 +502,13 @@ int main() {
     {
         kvmem_conversation source;
         auto data = std::make_shared<MultimodalCheckpointData>();
-        data->recurrent.assign(16, 7);
+        data->tail_mean.values.assign(4, 7);
         MultimodalCheckpoint cp; cp.row=64; cp.data=data;
         source.mm_checkpoints.remember(cp);
         auto child=llama_driver_fork_conversation(source,64);
         assert(child.mm_checkpoints.back().data==data && data->shared.load());
         source.mm_checkpoints.clear(); cp.data.reset(); data.reset();
-        assert(child.mm_checkpoints.back().data->recurrent.size()==16);
+        assert(child.mm_checkpoints.back().data->tail_mean.values.size()==4);
     }
     {
         ServerState a, b;
@@ -557,7 +561,7 @@ int main() {
             kvmem_lane_conversations catalog({&a,&b},8,0);
             auto op=access::handover(catalog);
             auto data=std::make_shared<MultimodalCheckpointData>();
-            data->recurrent.resize(128);
+            data->tail_mean.values.resize(32);
             const auto charged=data->resident_bytes();
             account->limit=charged;
             data->accounting=account;account->add(charged);

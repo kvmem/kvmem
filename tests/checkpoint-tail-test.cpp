@@ -40,6 +40,8 @@ static void check(llama_model * model, int rows) {
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model, params), llama_free);
     require(bool(ctx), "context initialization failed");
+    const auto empty_checkpoint = llama_kvmem_checkpoint_capture(0);
+    require(bool(empty_checkpoint), "empty checkpoint lost native content lineage");
     std::vector<llama_token> tokens(rows + 32);
     for (int i = 0; i < (int) tokens.size(); ++i) tokens[i] = 100 + i;
     require(llama_decode(ctx.get(), llama_batch_get_one(tokens.data(), rows)) == 0, "prefill failed");
@@ -154,6 +156,14 @@ static void check(llama_model * model, int rows) {
     llama_kvmem_store_bundle_reset(branch.get());
     parent.reset();
     require(state(ctx.get()) == branch_state, "releasing parked owners changed active branch");
+    require(llama_kvmem_checkpoint_restore(*empty_checkpoint), "cannot discard to empty checkpoint");
+    require(llama_kvmem_store_n_tokens() == 0, "empty checkpoint retained native attention");
+    require(image->read() == immutable_bytes, "empty rollback damaged saved source");
+    require(llama_kvmem_checkpoint_restore(*immutable), "source restore after empty rollback failed");
+    require(llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0,
+            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint.size(), "source model restore after empty rollback failed");
+    llama_kvmem_apply_selection(llama_kvmem_preview_retrieval());
+    require(state(ctx.get()) == before, "source changed across empty rollback");
     std::printf("PASS checkpoint tail %d/32: exact native bytes, coverage rejection, cold recovery\n", rows % 32);
     std::printf("PASS checkpoint branches rows=%d: native ID reuse, old parent restore, owner release\n", rows);
 }
