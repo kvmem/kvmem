@@ -16,7 +16,7 @@ inline void kvmem_install_auth(httplib::Server & server, std::vector<std::string
         if (keys.empty() || req.method == "OPTIONS") return Result::Unhandled;
         if (req.path == "/health" || req.path == "/v1/health") return Result::Unhandled;
         const bool api = req.path.compare(0, 13, "/api/monitor/") == 0 || req.path == "/props" || req.path == "/models" || req.path == "/metrics" ||
-                         req.path == "/chat/completions" || req.path == "/responses" ||
+                         req.path == "/chat/completions" || req.path == "/responses" || req.path == "/tools" ||
                          req.path.compare(0, 4, "/v1/") == 0;
         if (!api && (req.method == "GET" || req.method == "HEAD") && ui_paths.count(req.path))
             return Result::Unhandled;

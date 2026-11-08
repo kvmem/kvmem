@@ -81,6 +81,9 @@ def probe_worker(worker, backend, environment=None):
 
 
 def require_launch_features(capabilities, parameters):
+    if (parameters.get('Backend') == 'llamacpp' and '--mcp-servers-config' in parameters.get('WorkerArgs', [])
+            and capabilities.get('mcp_stdio') is not True):
+        raise ValueError('Update the llama.cpp worker to a version with native stdio MCP support')
     if parameters.get('Lora') and capabilities.get('fixed_lora') is not True:
         raise ValueError('This worker does not support fixed LoRA; update the llama.cpp worker')
     require_recall_features(capabilities, parameters)

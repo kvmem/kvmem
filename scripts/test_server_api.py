@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -14,6 +15,7 @@ p.add_argument('--server', required=True)
 p.add_argument('--model', required=True)
 p.add_argument('--output', required=True)
 p.add_argument('--mtp', action='store_true')
+p.add_argument('--mcp-echo-server', type=Path, help='Path to the llama.cpp mcp_echo_server.py test fixture')
 a = p.parse_args()
 out = Path(a.output).resolve()
 out.mkdir(parents=True, exist_ok=True)
@@ -46,6 +48,13 @@ args = [a.server, '-m', a.model, '--host', '127.0.0.1', '--port', str(port),
         '--reasoning-effort', 'none', '--temp', '0', '--no-webui', '--kv-dtype', 'q8_0',
         '--kvmem-budget', '4096', '--kvmem-gen-reserve', '2048']
 args += ['--spec-type', 'draft-mtp' if a.mtp else 'none']
+if a.mcp_echo_server:
+    if not a.mcp_echo_server.is_file():
+        p.error('MCP echo server fixture is missing')
+    config = out / 'mcp servers.json'
+    config.write_text(json.dumps({'mcpServers': {'demo': {
+        'command': sys.executable, 'args': [str(a.mcp_echo_server.resolve())]}}}), encoding='utf-8')
+    args += ['--mcp-servers-config', str(config)]
 log = (out / 'server.log').open('wb')
 proc = subprocess.Popen(args, stdout=log, stderr=log,
     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
@@ -63,6 +72,13 @@ try:
             raise TimeoutError('startup')
         time.sleep(1)
     check('slots requires authentication', request('/slots', auth=False)[0] == 401)
+    if a.mcp_echo_server:
+        check('tool listing requires authentication', request('/tools', auth=False)[0] == 401)
+        status, raw, _ = request('/tools')
+        check('MCP adder discovered', status == 200 and any(
+            item['definition']['function']['name'] == 'demo_add' for item in json.loads(raw)))
+        status, raw, _ = request('/tools', {'tool': 'demo_add', 'params': {'a': 3, 'b': 5}})
+        check('MCP adder invoked', status == 200 and json.loads(raw)['plain_text_response'] == '8')
     check('public preflight with CORS', request('/slots', auth=False, method='OPTIONS')[0] == 204)
     status, body, _ = request('/props')
     props = json.loads(body)
@@ -76,6 +92,8 @@ try:
     for stream in (False, True):
         payload = {'messages': prompt, 'max_tokens': 128, 'stream': stream, 'temperature': 0,
                    'reasoning_effort': 'none'}
+        if stream:
+            payload['stream_options'] = {'include_usage': True}
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(request, '/v1/chat/completions', payload)
             samples = []
@@ -116,8 +134,10 @@ try:
         for value in (4294967297, 18446744073709551615):
             status, raw, _ = request('/v1/chat/completions', {'messages': prompt, field: value,
                 'temperature': 0, 'reasoning_effort': 'none'})
-            check(f'{field} {value} does not wrap to one', status == 200 and
-                  json.loads(raw)['usage']['completion_tokens'] > 1)
+            # A positive cap is first clamped to n_ctx, then checked against
+            # the space left after tokenizing the nonempty prompt.
+            check(f'{field} {value} does not wrap to one', status == 400 and
+                  b'prompt + max_tokens exceeds n_ctx' in raw)
     status, _, _ = request('/v1/chat/completions', {'messages': prompt, 'max_tokens': -2})
     check('invalid request leaves slot idle', status == 400 and not json.loads(request('/slots')[1])[0]['is_processing'])
     (out / 'responses.json').write_text(json.dumps(responses, indent=2), encoding='utf-8')

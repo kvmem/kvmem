@@ -11,6 +11,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from launcher.plan import build_plan, token_settings, capabilities
+from launcher.config import normalize
 from launcher.worker import probe_worker, require_launch_features
 from launcher.export import render_script
 
@@ -269,6 +270,30 @@ class PlanTest(unittest.TestCase):
                 self.plan(WorkerArgs=args)
         args = self.plan(WorkerArgs=['--threads', '8'])['argv']
         self.assertEqual(args[-2:], ['--threads', '8'])
+
+    def test_backend_native_mcp_file_options(self):
+        path = self.directory / 'mcp config.json'
+        path.write_text('{"mcpServers": {}}', encoding='utf-8')
+        llama = ['--mcp-servers-config', str(path)]
+        poly = ['--elastic-experts-headroom', '--mcp-config', str(path)]
+
+        def checked(backend, args):
+            return normalize({'schema_version': 1, 'parameters': {'Backend': backend, 'WorkerArgs': args}},
+                             [backend])['parameters']['WorkerArgs']
+        self.assertEqual(checked('polystrata', poly), poly)
+        relative = self.config('llamacpp', WorkerArgs=[llama[0], path.name])
+        resolved = normalize(relative, ['llamacpp'], path_root=self.directory)
+        self.assertEqual(resolved['parameters']['WorkerArgs'], llama)
+        self.assertEqual(self.plan('llamacpp', WorkerArgs=llama)['argv'][-2:], llama)
+        params = {'Backend': 'llamacpp', 'WorkerArgs': llama}
+        with self.assertRaisesRegex(ValueError, 'MCP'):
+            require_launch_features({}, params)
+        require_launch_features({'mcp_stdio': True}, params)
+        for backend, args in [('llamacpp', poly[1:]), ('polystrata', llama),
+                              ('ninfer', poly[1:]), ('radiance', poly[1:]), ('polystrata', poly[1:] * 2),
+                              ('polystrata', ['--mcp-config']), ('polystrata', ['--mcp-config', str(path) + '.missing'])]:
+            with self.subTest(backend=backend, args=args), self.assertRaises(ValueError):
+                checked(backend, args)
 
     @unittest.skipUnless(os.name == 'nt', 'PowerShell regression comparison')
     def test_heads_capability_descriptions_agree_and_remain_runtime_gated(self):

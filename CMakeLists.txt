@@ -337,7 +337,8 @@ if (KVMEM_BUILD_LLAMA)
     endif()
 
     add_executable(llama-kvmem-server tools/kvmem-server-metrics.cpp tools/llama-kvmem-server.cpp tools/llama-kvmem-driver.cpp tools/kvmem-spec.cpp
-        tools/kvmem-vision.cpp tools/kvmem-responses.cpp tools/kvmem-responses-stream.cpp
+        tools/kvmem-vision.cpp tools/kvmem-responses.cpp tools/kvmem-responses-stream.cpp tools/kvmem-server-mcp.cpp
+        backends/llamacpp/tools/server/server-mcp.cpp
         backends/llamacpp/tools/server/server-common.cpp
         backends/llamacpp/tools/server/server-chat.cpp)
     target_include_directories(llama-kvmem-server PRIVATE
