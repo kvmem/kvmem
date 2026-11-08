@@ -33,6 +33,7 @@ class BackendLaunch(unittest.TestCase):
     def invoke(self, extra, dry=True, devices=None):
         captured = {}
         def frontend():
+            self.frontend_argv = list(sys.argv)
             captured.update(json.loads(Path(sys.argv[sys.argv.index("--config")+1]).read_text(encoding="utf-8")))
             return 0
         query = mock.Mock(return_value=devices) if devices else mock.Mock(side_effect=AssertionError("unexpected NVIDIA query"))
@@ -45,6 +46,17 @@ class BackendLaunch(unittest.TestCase):
             self.assertEqual(self.launcher.main(), 0)
         self.last_stderr = err.getvalue()
         return json.loads(out.getvalue()) if dry else captured
+
+    def test_mcp_file_reaches_frontend_only(self):
+        path = Path(self.directory.name) / 'mcp config.json'
+        path.write_text('{"mcpServers": {}}', encoding='utf-8')
+        cfg = self.invoke(["--backend", "hip", "--gpu", "0", "--", "--elastic-experts-headroom",
+                           "--mcp-config", str(path), "--threads", "4"], dry=False)
+        self.assertEqual(self.frontend_argv[-2:], ["--mcp-config", str(path.resolve())])
+        self.assertNotIn("--mcp-config", cfg["args"])
+        self.assertNotIn(str(path), cfg["args"])
+        index = cfg["args"].index("--elastic-experts-headroom")
+        self.assertEqual(cfg["args"][index:index + 3], ["--elastic-experts-headroom", "--threads", "4"])
 
     def test_hip_handoff_skips_nvidia_and_keeps_ordinal(self):
         for dry in (True, False):

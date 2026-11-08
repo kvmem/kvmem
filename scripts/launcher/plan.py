@@ -200,7 +200,7 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
                     raise ValueError(f'{key} contains an unsupported control character')
                 params[key] = str((root / value).resolve())
     caps = capabilities(root)['backends']
-    supplied = normalize(data, tuple(caps))['parameters']
+    supplied = normalize(data, tuple(caps), path_root=root)['parameters']
     p = dict(LAUNCH_DEFAULTS, **supplied)
     backend = p['Backend']
     if backend == 'radiance':

@@ -15,6 +15,7 @@
 #include "kvmem-webui.h"
 #include "kvmem-server-options.h"
 #include "kvmem-server-auth.h"
+#include "kvmem-server-mcp.h"
 #include "kvmem-server-progress.h"
 #include "kvmem-server-metrics.h"
 #include "kvmem/monitor.hpp"
@@ -80,6 +81,7 @@ static void print_usage(const char * argv0) {
             "\n"
             "  -m, --model PATH           GGUF path\n"
             "  --lora PATH                load one fixed GGUF LoRA on every target context\n"
+            "  --mcp-servers-config PATH  expose configured stdio MCP tools at GET/POST /tools\n"
             "  --lora-scale N             adapter strength (default: 1)\n"
             "  --mmproj PATH              vision projector GGUF\n"
             "  --mmproj-offload           place vision encoder on GPU (default)\n"
@@ -844,6 +846,9 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--kvmem-capabilities") {
         auto contract = json::parse(kvmem::launch_capabilities("llamacpp"));
         contract["fixed_lora"] = true;
+#ifdef LLAMA_SUBPROCESS
+        contract["mcp_stdio"] = true;
+#endif
         puts(contract.dump().c_str());
         return 0;
     }
@@ -852,6 +857,7 @@ int main(int argc, char ** argv) {
     std::string ui_dir;
     bool no_ui = false;
     std::string model_path, lora_path;
+    std::string mcp_config;
     float lora_scale = 1.0f;
     bool lora_scale_set = false;
     std::string mmproj_path;
@@ -915,6 +921,13 @@ int main(int argc, char ** argv) {
             if (!lora_path.empty()) throw std::invalid_argument("only one --lora is supported");
             lora_path = need(arg);
             if (lora_path.empty()) throw std::invalid_argument("--lora requires a GGUF path");
+        } else if (eq(arg, "--mcp-servers-config")) {
+#ifndef LLAMA_SUBPROCESS
+            throw std::invalid_argument("stdio MCP requires a worker built with LLAMA_SUBPROCESS");
+#endif
+            if (!mcp_config.empty()) throw std::invalid_argument("duplicate --mcp-servers-config");
+            mcp_config = need(arg);
+            if (mcp_config.empty()) throw std::invalid_argument("--mcp-servers-config requires a file");
         } else if (eq(arg, "--lora-scale")) {
             const char * value = need(arg);
             char * end = nullptr;
@@ -1137,6 +1150,8 @@ int main(int argc, char ** argv) {
         }
     }
     options.resolve();
+    if (!mcp_config.empty() && options.api_keys.empty() && host != "127.0.0.1" && host != "::1" && host != "localhost")
+        throw std::invalid_argument("MCP on a non-loopback listener requires --api-key");
     if (options.enabled) kvmem::normalize_memory_tokens(options.budget, options.gen_reserve,
         options.sink_tokens, options.recent_tokens, st.kparams.block_tokens, true, false);
     st.kparams.enabled = options.enabled;
@@ -1646,6 +1661,14 @@ int main(int argc, char ** argv) {
     std::unordered_set<std::string> ui_paths;
     if (!kvmem_mount_ui(svr, ui_dir, no_ui, argv[0], &ui_paths)) return 1;
     kvmem_install_auth(svr, options.api_keys, std::move(ui_paths));
+    if (!mcp_config.empty()) {
+        try {
+            kvmem_install_mcp(svr, mcp_config, port, !options.api_keys.empty());
+        } catch (const std::exception & e) {
+            fprintf(stderr, "MCP startup failed: %s\n", e.what());
+            return 1;
+        }
+    }
     const int generation_limit = n_ctx;
     startup["context_actual"] = llama_n_ctx(st.ctx);
     startup["batch_actual"] = llama_n_batch(st.ctx);
