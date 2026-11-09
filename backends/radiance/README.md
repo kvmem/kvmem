@@ -5,6 +5,22 @@ Radiance 1.17.0 / IQ3R-S v4 is qualified on Linux RX 9060 XT gfx1200 TP1/C1 with
 Build and run with `tools/build.py --platform auto|windows|linux` and
 `tools/serve.py --platform auto|windows|linux` on the target OS.
 
+For the native Windows RX 9070 XT text worker, use an x64 Visual Studio
+developer PowerShell with CMake, Ninja and the Windows HIP SDK. From the
+repository root, set `ROCM_PATH` to the SDK directory and run:
+
+```powershell
+python backends/radiance/tools/prepare_native.py --destination build/radiance-native
+python backends/radiance/tools/build.py --platform windows --source build/radiance-native --build build/radiance-win-gfx1201 --rocm "$env:ROCM_PATH" --gpu-target gfx1201 --ffmpeg OFF --target radiance-kvmem-server --target qwen35_w8a8 --target libr4d --target libavx --target libref
+```
+
+The worker is in `build/radiance-win-gfx1201/bin` and its plugins are in
+`build/radiance-win-gfx1201/radiance_home`. Keep the SDK runtime DLLs
+beside the executable. If the CPU plugins link the Visual Studio LLVM
+OpenMP runtime, make the matching `libomp140.x86_64.dll` available to the
+Windows plugin loader on the development machine. The RX 9060 XT uses
+`--gpu-target gfx1200` (the default).
+
 The adapter implements native page ownership, shared RAM/SSD spill and restore,
 recurrent checkpoints, multiple retained conversations and concurrent prefix
 branches. Query uses the common page-softmax or meanq-cosine scorer, bounded

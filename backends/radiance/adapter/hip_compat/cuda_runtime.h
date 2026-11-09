@@ -11,6 +11,9 @@
 #define cudaMalloc hipMalloc
 #define cudaFree hipFree
 #define cudaStream_t hipStream_t
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamSynchronize hipStreamSynchronize

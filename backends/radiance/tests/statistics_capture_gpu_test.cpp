@@ -158,8 +158,7 @@ int main(int argc, char** argv) {
         }
         RawKvStore frozen(cfg);
         const auto skipped = capture.commit(frozen, {19, 1}, 3, UINT32_MAX, UINT32_MAX);
-        CHECK(skipped.token_counts == std::vector<uint32_t>{0});
-        for (const auto v : skipped.sums) CHECK(v == 0);
+        CHECK(skipped.token_counts.empty() && skipped.sums.empty() && skipped.tokens.empty());
         CHECK(frozen.n_tokens(0) == 3);
         // Missing layer coverage fails closed.
         capture.begin({17, 1}, 2, 1);
@@ -218,9 +217,12 @@ int main(int argc, char** argv) {
             RawKvStore target(cfg);
             const auto observed=fresh.commit(target,id,2,qrow,qrow+1);
             // Only the two accepted rows contribute, including a rejected Q row.
-            CHECK(observed.token_counts[0]==uint32_t(qrow<2));
-            for(int col=0;col<8;++col)
-                CHECK(observed.sums[col]==(qrow<2 ? float(iteration*100+qrow*16+col) : 0.f));
+            if (qrow < 2) {
+                CHECK(observed.token_counts == std::vector<uint32_t>{1});
+                for(int col=0;col<8;++col) CHECK(observed.sums[col]==float(iteration*100+qrow*16+col));
+            } else {
+                CHECK(observed.token_counts.empty() && observed.sums.empty() && observed.tokens.empty());
+            }
             target.mean_k(0,0,mean);
             for(int col=0;col<4;++col)CHECK(mean[col]==float(iteration*100+16+col));
             previous=std::move(owned);

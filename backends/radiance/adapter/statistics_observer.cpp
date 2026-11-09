@@ -288,7 +288,7 @@ void StatisticsObserver::clear_session() {
     checkpoint_.reset(); memory_session_.reset(); memory_.reset(); policy_.reset();
     update_archive_charge();
     store_.reset(); session_ = {}; active_request_ = 0; cache_group_=0; images_.clear();
-    query_total_.clear(); query_rows_.clear(); query_counts_.clear(); query_tokens_.clear();
+    query_rows_.clear(); query_counts_.clear(); query_tokens_.clear();
     recall_.reset(); checkpoint_recall_.reset(); prefix_recall_.reset();
     accepted_view_ = {};
 }
@@ -831,7 +831,9 @@ void StatisticsObserver::start_request(const rad::Request& request) {
     const auto q = request.query_begin >= 0 ? bounded_query(request.query_begin,
         request.query_end-request.query_begin,request.prompt.size(),options_.query_tokens) : QueryRange{};
     query_begin_ = q.empty() ? -1 : int32_t(q.begin); query_end_ = q.empty() ? -1 : int32_t(q.end);
-    query_total_.clear();query_counts_.clear();query_tokens_.clear();
+    query_counts_.assign(store_config_.n_layer, 0);
+    query_tokens_.clear();
+    query_tokens_.resize(store_config_.n_layer);
     query_rows_.assign(store_config_.n_layer,frontier_);
     query_frozen_=false;replaying_=false;replay_done_=q.empty();
     checkpoint_.reset();checkpoint_recall_.reset();replay_start_=0;
@@ -896,7 +898,7 @@ int StatisticsObserver::begin(const rad::StepPlan& plan) noexcept {
             session_ = {e.seq, next_incarnation_++};cache_group_=cache_->allocate_group();
             active_request_ = e.seq;
             store_ = std::make_unique<RawKvStore>(store_config_);
-            frontier_ = 0; steps_ = 0; query_total_.clear(); query_rows_.clear();
+            frontier_ = 0; steps_ = 0; query_rows_.clear();
             query_counts_.clear(); query_frozen_ = false;
             checkpoint_.reset(); replaying_ = replay_done_ = false; content_version_ = 0;
             require(e.req, "statistics session has no frontend request identity");
@@ -1107,24 +1109,15 @@ int StatisticsObserver::collect(const rad::StepPlan& plan, const rad::Scheduler:
             query_begin_ < 0 || query_frozen_ ? UINT32_MAX : uint32_t(query_begin_),
             query_end_ < 0 || query_frozen_ ? UINT32_MAX : uint32_t(query_end_)));
         auto frame=move_single_rank_statistics() ? merge_rank_statistics(std::move(shards)) : merge_rank_statistics(shards);
-        require(frame.key_width==store_config_.n_embd_k && frame.query_width==query_heads_*head_dim_,
+        require(frame.layers.size()==store_config_.n_layer &&
+                frame.key_width==store_config_.n_embd_k && frame.query_width==query_heads_*head_dim_,
             "assembled rank head geometry changed");
         for(size_t l=0;l<frame.keys.size();++l)
             store_->write_layer_mean_k(frame.first,frame.rows,uint32_t(l),frame.keys[l].data());
-        auto query=std::move(frame.query);
-        if (query_total_.empty()) {
-            query_total_.resize(query.sums.size());
-            query_rows_.resize(query.token_counts.size());
-            query_counts_.resize(query.token_counts.size());
-            query_tokens_.resize(query.token_counts.size());
-        }
-        require(query_total_.size() == query.sums.size(), "query geometry changed during session");
-        for (size_t i = 0; i < query.sums.size(); ++i) {
-            require(std::isfinite(query.sums[i]), "non-finite Q statistics");
-            query_total_[i] += query.sums[i];
-        }
+        // seal() proved layer coverage even for accepted rows outside the Query.
+        for (auto& count : query_rows_) count += rows;
+        const auto& query = frame.query;
         for (size_t i = 0; i < query.token_counts.size(); ++i) {
-            query_rows_[i] += rows; // seal() proved all attention layers were captured
             query_counts_[i] += query.token_counts[i];
             query_tokens_[i].insert(query_tokens_[i].end(),query.tokens[i].begin(),query.tokens[i].end());
         }
