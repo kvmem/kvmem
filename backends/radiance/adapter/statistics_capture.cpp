@@ -196,9 +196,11 @@ AcceptedStatistics StatisticsCapture::take(SessionIdentity session,
     frame.layers.resize(s.layers.size());
     for(const auto& l:s.layers)frame.layers[l.geometry.ordinal]=l.geometry.layer;
     auto& result=frame.query;
-    result.sums.assign(size_t(bytes(s.layers.size(), qw)), 0.0f);
-    result.token_counts.assign(s.layers.size(), 0);
-    result.tokens.resize(s.layers.size());
+    if (begin < end) {
+        result.sums.assign(size_t(bytes(s.layers.size(), qw)), 0.0f);
+        result.token_counts.assign(s.layers.size(), end - begin);
+        result.tokens.resize(s.layers.size());
+    }
     // Allocate/convert before writing the shared store. A store failure means
     // the caller must discard this logical session; do not retry partial credit.
     frame.keys.resize(s.layers.size());
@@ -207,8 +209,8 @@ AcceptedStatistics StatisticsCapture::take(SessionIdentity session,
         auto& key = keys[l.geometry.ordinal];
         key.resize(size_t(bytes(accepted, kw)));
         for (size_t i = 0; i < key.size(); ++i) key[i] = value(l.k, l.kdtype, i);
-        for (uint32_t row = 0; row < accepted; ++row) if (s.first + row >= query_start && s.first + row < query_end) {
-            ++result.token_counts[l.geometry.ordinal];
+        for (uint32_t position = begin; position < end; ++position) {
+            const auto row = position - s.first;
             for (uint64_t col = 0; col < qw; ++col) {
                 const float v = value(l.q, l.qdtype, (row - s.qfirst) * qw + col);
                 result.sums[l.geometry.ordinal * qw + col] += v;

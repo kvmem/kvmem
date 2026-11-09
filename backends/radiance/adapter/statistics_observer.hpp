@@ -200,7 +200,6 @@ private:
     uint64_t history_allowance(const RetainedSession* extra=nullptr,const RankPrefix* incoming=nullptr) const;
     uint64_t next_incarnation_ = 1, steps_ = 0;
     uint32_t frontier_ = 0, max_position_ = 0;
-    std::vector<double> query_total_;
     std::vector<uint64_t> query_rows_;
     std::vector<uint32_t> query_counts_;
     int32_t query_begin_ = -1, query_end_ = -1;

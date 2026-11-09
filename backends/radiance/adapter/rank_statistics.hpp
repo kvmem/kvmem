@@ -9,6 +9,7 @@
 
 namespace kvmem::radiance {
 struct QueryStatistics {
+    // All three vectors are empty when the accepted prefix has no Query rows.
     std::vector<float> sums; // [layer, query_heads * head_dim]
     std::vector<uint32_t> token_counts;
     std::vector<std::vector<float>> tokens; // [layer][row, head, channel]
@@ -31,17 +32,22 @@ inline AcceptedStatistics merge_rank_statistics(const std::vector<AcceptedStatis
     AcceptedStatistics out;
     out.session=ranks[0].session;out.first=ranks[0].first;out.rows=ranks[0].rows;
     const auto& first=ranks[0];
-    const auto layers=first.layers.size();check(layers>0 && first.query.token_counts.size()==layers);
+    const auto layers=first.layers.size();
+    const bool has_query=!first.query.token_counts.empty();
+    const auto query_layers=has_query ? layers : 0;
+    check(layers>0 && first.query.token_counts.size()==query_layers);
     for(const auto& r:ranks) {
         check(r.session==out.session && r.first==out.first && r.rows==out.rows && r.layers==first.layers &&
-            r.key_width && r.query_width && r.keys.size()==layers && r.query.tokens.size()==layers &&
-            r.query.token_counts==first.query.token_counts && r.query.sums.size()==layers*uint64_t(r.query_width));
+            r.key_width && r.query_width && r.keys.size()==layers && r.query.tokens.size()==query_layers &&
+            r.query.token_counts==first.query.token_counts && r.query.sums.size()==query_layers*uint64_t(r.query_width));
         check(r.key_width<=UINT32_MAX-out.key_width && r.query_width<=UINT32_MAX-out.query_width);
         out.key_width+=r.key_width;out.query_width+=r.query_width;
         for(size_t l=0;l<layers;++l) {
-            check(r.keys[l].size()==uint64_t(out.rows)*r.key_width &&
-                r.query.tokens[l].size()==uint64_t(first.query.token_counts[l])*r.query_width);
+            check(r.keys[l].size()==uint64_t(out.rows)*r.key_width);
             for(float v:r.keys[l])check(std::isfinite(v));
+        }
+        for(size_t l=0;l<query_layers;++l) {
+            check(r.query.tokens[l].size()==uint64_t(first.query.token_counts[l])*r.query_width);
             for(float v:r.query.tokens[l])check(std::isfinite(v));
         }
         for(float v:r.query.sums)check(std::isfinite(v));
@@ -50,13 +56,15 @@ inline AcceptedStatistics merge_rank_statistics(const std::vector<AcceptedStatis
     // The single-rank result already has the requested row/head layout.
     if(consume && ranks.size()==1)return std::move(consume->front());
     out.layers=first.layers;out.query.token_counts=first.query.token_counts;
-    out.keys.resize(layers);out.query.tokens.resize(layers);out.query.sums.reserve(layers*uint64_t(out.query_width));
+    out.keys.resize(layers);out.query.tokens.resize(query_layers);out.query.sums.reserve(query_layers*uint64_t(out.query_width));
     for(size_t l=0;l<layers;++l) {
         auto& keys=out.keys[l];keys.reserve(uint64_t(out.rows)*out.key_width);
         for(uint32_t row=0;row<out.rows;++row)for(const auto& r:ranks) {
             const auto first=r.keys[l].begin()+uint64_t(row)*r.key_width;
             keys.insert(keys.end(),first,first+r.key_width);
         }
+    }
+    for(size_t l=0;l<query_layers;++l) {
         auto& tokens=out.query.tokens[l];tokens.reserve(uint64_t(out.query.token_counts[l])*out.query_width);
         for(uint32_t row=0;row<out.query.token_counts[l];++row)for(const auto& r:ranks) {
             const auto first=r.query.tokens[l].begin()+uint64_t(row)*r.query_width;

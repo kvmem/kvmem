@@ -44,6 +44,14 @@ int main() {
     rejects([&]{merge_rank_statistics(std::move(single));});CHECK(single[0].keys[0].data()==keys);
     single={a};single[0].query.tokens[0].pop_back();rejects([&]{merge_rank_statistics(std::move(single));});
     single={a};single[0].query.sums.pop_back();rejects([&]{merge_rank_statistics(std::move(single));});
+    auto no_q=a;no_q.query={};
+    auto other_no_q=b;other_no_q.query={};
+    const auto frozen=merge_rank_statistics({no_q,other_no_q});
+    CHECK(frozen.keys==merged.keys && frozen.query_width==merged.query_width);
+    CHECK(frozen.query.sums.empty() && frozen.query.tokens.empty() && frozen.query.token_counts.empty());
+    single={no_q};CHECK(merge_rank_statistics(std::move(single)).keys==a.keys);
+    rejects([&]{merge_rank_statistics({no_q,b});});
+    auto stale=no_q;stale.query.sums.push_back(0);rejects([&]{merge_rank_statistics({stale});});
     std::vector<std::vector<AcceptedAttentionRow>> one{left};const auto* masses=one[0][0].mass.data();
     const auto moved_attention=merge_rank_attention(std::move(one),{1});CHECK(moved_attention[0].mass.data()==masses);
     CHECK(moved_attention[0].mass[0].mass==left[0].mass[0].mass);
