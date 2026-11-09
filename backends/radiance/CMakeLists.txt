@@ -198,7 +198,20 @@ if(TARGET rad_core)
     target_include_directories(radiance-kvmem-server PRIVATE ${RADIANCE_SOURCE_DIR}/core ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(radiance-kvmem-server PRIVATE kvmem_radiance_memory)
     set_target_properties(radiance-kvmem-server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin ENABLE_EXPORTS ON)
-    if(NOT WIN32)
+    if(WIN32)
+        # Windows searches System32 before PATH. Keep the HIP runtime paired
+        # with the compiler that emitted the worker's device code.
+        get_filename_component(_hip_libdir "${RAD_HIP_RUNTIME}" DIRECTORY)
+        foreach(_dll IN ITEMS amdhip64_7.dll rocm_kpack.dll amd_comgr.dll)
+            set(_source "${_hip_libdir}/../bin/${_dll}")
+            if(EXISTS "${_source}")
+                add_custom_command(TARGET radiance-kvmem-server POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_source}"
+                            "$<TARGET_FILE_DIR:radiance-kvmem-server>/${_dll}"
+                    VERBATIM)
+            endif()
+        endforeach()
+    else()
         set_target_properties(radiance-kvmem-server PROPERTIES LINK_LIBRARY_OVERRIDE_rad_core WHOLE_ARCHIVE)
     endif()
     add_executable(kvmem-radiance-observer-probe tools/observer_main.cpp)
