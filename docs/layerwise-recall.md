@@ -117,3 +117,7 @@ Legacy 自动预算建议尚未覆盖 Layerwise 的独立资源，当前新策�
 
 English: choose the independent `layerwise` strategy; old profiles remain Legacy. NInfer OWN MTP defaults to `first-layer`; explicit `upstream-global` remains available. Other workers require a choice unless they declare a default. DFlash2 keeps its native full window; PolyStrata Gemma Guess
 uses SharedTarget. All combinations are gated by the selected worker's explicit per-strategy capabilities.
+
+## NInfer 的 DFlash2 反馈回读
+
+使用 `--kvmem-recall-strategy layerwise` 时，单 GPU、最大并发为 1 的 DFlash2 CUDA Graph 路径自动按采样行计算输出反馈，并批量校验回读。其他执行路径沿用各自的反馈实现。排障时可将 `NINFER_SELECT_LAYER_FEEDBACK` 和 `NINFER_BATCH_LAYER_FEEDBACK` 同时设为 `0`，再启动服务，即可对照原分层路径。清除这两个环境变量即可恢复自动选择。
