@@ -26,9 +26,14 @@ On native Windows gfx1201, the single-rank, single-sequence Qwen35
 logical compute lanes on one HIP stream. Stream order handles the GDN
 projection dependencies. The launcher records the statistics completion event
 after the last layer copy, so the CPU can collect the frame as soon as those
-bytes are ready. For a direct worker A/B, set `KVMEM_RAD_HIP_SINGLE_STREAM=0`
-to restore separate streams. The [RX 9070 XT measurements](../../docs/radiance/evidence/windows-gfx1201-dflash7-decode.json)
+bytes are ready. Set `KVMEM_RAD_HIP_SINGLE_STREAM=0` before launching the
+worker or the Windows supervisor to restore separate compute streams.
+The [RX 9070 XT measurements](../../docs/radiance/evidence/windows-gfx1201-dflash7-decode.json)
 include a fixed 256-token response and cached 32K and 49K Task 2 requests.
+On [the full 33-request Task 2 run](../../docs/radiance/evidence/windows-gfx1201-dflash7-task2-256k.json),
+the final request reached 257,958 prompt tokens and decoded 1,542 tokens at
+109.18 tok/s. The same-host historical run reached 43.39 tok/s. All 33 response
+bodies, reasoning texts and speculative token counts matched.
 
 The adapter implements native page ownership, shared RAM/SSD spill and restore,
 recurrent checkpoints, multiple retained conversations and concurrent prefix

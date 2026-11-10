@@ -138,14 +138,28 @@ class RadiancePlanTest(unittest.TestCase):
         parameters = dict(Backend='radiance', Model=str(self.model), Worker=str(self.worker),
                           RadianceHome=str(self.home), Gpu='GPU-65471d75ce486b4f',
                           SpeculativeMode='dflash2', Vision=False)
+        flags = ('KVMEM_CAPTURE_EARLY_SEAL', 'RADIANCE_HIP_SMALL_D2H')
         for platform, overrides, enabled in [
             ('windows', {}, True), ('linux', {}, False),
             ('windows', {'Concurrency': 2}, False), ('windows', {'SpeculativeMode': 'none'}, False),
+            ('windows', {'Gpu': 'GPU-65471d75ce486b4f,GPU-0000000000000001'}, False),
+            ('windows', {'Vision': True}, False),
         ]:
-            with self.subTest(platform=platform, overrides=overrides):
+            with self.subTest(platform=platform, overrides=overrides), mock.patch(
+                    'launcher.radiance.vision_geometry', return_value=(16, 2)):
                 plan = build_radiance_plan({**parameters, **overrides}, self.root, platform, False, {})
-                for key in ('KVMEM_CAPTURE_EARLY_SEAL', 'RADIANCE_HIP_SMALL_D2H'):
+                for key in flags:
                     self.assertEqual(plan['environment'].get(key), '1' if enabled else None)
+        for block_size, quant in [(4, 'w8a8_fwht128'), (8, 'fp8_e4m3')]:
+            with self.subTest(block_size=block_size, quant=quant):
+                container(self.model, ['dflash.fc.weight'], [
+                    ('draft.architectures', 'DFlash2Model'), ('draft.dflash_config.block_size', block_size),
+                ], quant=quant)
+                plan = build_radiance_plan(parameters, self.root, 'windows', False, {})
+                self.assertTrue(all(key not in plan['environment'] for key in flags))
+        container(self.model, ['mtp.fc.weight'], [('mtp_num_hidden_layers', 1)], quant='w8a8_fwht128')
+        plan = build_radiance_plan({**parameters, 'SpeculativeMode': 'mtp'}, self.root, 'windows', False, {})
+        self.assertTrue(all(key not in plan['environment'] for key in flags))
 
     def test_embedded_drafters_accept_case_insensitive_rad_extension(self):
         # The shared launch contract and native magic reader accept .RAD too.
