@@ -65,6 +65,18 @@ class AgentFixtureTest(unittest.TestCase):
         self.assertTrue(truncated['unclosed_code_fence'])
         self.assertFalse(truncated['python_syntax'])
 
+    def test_task2_answer_with_example_output(self):
+        code = '```Python\ndef count():\n    return 1\n```'
+        example = '\n\nExample output:\n```\n$ python count.py\n1\n```'
+        self.assertTrue(final_code_check(code + example)['has_function'])
+        self.assertFalse(final_code_check('```python\ndef broken(\n```' + example)['python_syntax'])
+        self.assertFalse(final_code_check('```console\n1\n```')['python_syntax'])
+        self.assertTrue(final_code_check('plain description\n~~~\ndef f(): pass\n~~~')['has_function'])
+        self.assertTrue(final_code_check('def f(): pass')['has_function'])
+        result = final_code_check('````py\ndef f(): return "```"\n```\n')
+        self.assertTrue(result['unclosed_code_fence'])
+        self.assertFalse(result['python_syntax'])
+
 
 if __name__ == '__main__':
     unittest.main()
