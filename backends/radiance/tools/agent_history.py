@@ -95,11 +95,36 @@ def cached_tokens(usage):
     return usage.get('prompt_cache_hit_tokens', (usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0))
 
 
+def final_python_source(text):
+    """Return the last explicit Python block, falling back to unlabelled code or plain source."""
+    # Read whole fences so a console example's closing fence cannot open a new code block.
+    lines = text.splitlines(keepends=True)
+    blocks = {}
+    fenced = False
+    i = 0
+    while i < len(lines):
+        match = re.fullmatch(r' {0,3}(`{3,}|~{3,})([^\r\n]*)', lines[i].rstrip('\r\n'))
+        i += 1
+        if not match:
+            continue
+        fence, info = match.groups()
+        fenced = True
+        start = i
+        closing = re.compile(r' {0,3}' + fence[0] + '{' + str(len(fence)) + r',}[ \t]*')
+        while i < len(lines) and not closing.fullmatch(lines[i].rstrip('\r\n')):
+            i += 1
+        language = info.strip().lower().split()
+        if not language or language[0] in ('python', 'py', 'python3'):
+            blocks[bool(language)] = (''.join(lines[start:i]), i == len(lines))
+        i += 1
+    return blocks.get(True) or blocks.get(False) or (None if fenced else text, False)
+
+
 def final_code_check(text):
-    blocks = re.findall(r'```(?:python)?\s*\n(.*?)```', text, re.S)
-    opening = list(re.finditer(r'```(?:python)?\s*\n', text))
-    unclosed = bool(not blocks and opening)
-    code = blocks[-1] if blocks else text[opening[-1].end():] if opening else text
+    code, unclosed = final_python_source(text)
+    if not code or not code.strip():
+        return {'python_syntax': False, 'unclosed_code_fence': unclosed,
+                'syntax_error': 'no Python source found', 'semantic_correctness': 'not established'}
     try:
         tree = ast.parse(code)
         return {'python_syntax': True, 'unclosed_code_fence': unclosed,
