@@ -21,6 +21,15 @@ OpenMP runtime, make the matching `libomp140.x86_64.dll` available to the
 Windows plugin loader on the development machine. The RX 9060 XT uses
 `--gpu-target gfx1200` (the default).
 
+On native Windows gfx1201, the single-rank, single-sequence Qwen35
+`w8a8_fwht128` text profile with DFlash7 and all-VRAM placement issues both
+logical compute lanes on one HIP stream. Stream order handles the GDN
+projection dependencies. The launcher records the statistics completion event
+after the last layer copy, so the CPU can collect the frame as soon as those
+bytes are ready. For a direct worker A/B, set `KVMEM_RAD_HIP_SINGLE_STREAM=0`
+to restore separate streams. The [RX 9070 XT measurements](../../docs/radiance/evidence/windows-gfx1201-dflash7-decode.json)
+include a fixed 256-token response and cached 32K and 49K Task 2 requests.
+
 The adapter implements native page ownership, shared RAM/SSD spill and restore,
 recurrent checkpoints, multiple retained conversations and concurrent prefix
 branches. Query uses the common page-softmax or meanq-cosine scorer, bounded

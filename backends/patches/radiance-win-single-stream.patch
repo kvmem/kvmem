@@ -1,0 +1,51 @@
+diff --git a/core/runtime/ctx.cpp b/core/runtime/ctx.cpp
+--- a/core/runtime/ctx.cpp
++++ b/core/runtime/ctx.cpp
+@@ -81,7 +81,7 @@
+     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
+      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
+     if (stream_) rad_stream_sync(stream_);
+-    if (lane1_) rad_stream_sync(lane1_);
++    if (lane1_ && lane1_ != stream_) rad_stream_sync(lane1_);
+ 
+     for (PassTape& t : tapes_) tape_drop(t);
+     tapes_.clear();
+@@ -951,6 +951,25 @@
+ int Ctx::lane_init() {
+     if (lane1_) return RAD_OK;
+     RAD_TRY(rad_dev_set(device_));
++#if defined(_WIN32) && defined(RAD_USE_HIP_RUNTIME)
++    // Keep the GDN projections in issue order on the tested single-card HIP path.
++    // Logical lanes still own their scratch and track pending work independently.
++    const auto& shape = program_->ctx;
++    const auto& model = program_->meta;
++    const char* single_stream = std::getenv("KVMEM_RAD_HIP_SINGLE_STREAM");
++    if (kv_observer_ && world_size_ == 1 && !residency_ && shape.max_seqs == 1 &&
++        shape.max_enc_patches == 0 && shape.max_spec == 7 && program_->drafter_name == "dflash2" &&
++        model.arch_id && std::strcmp(model.arch_id, "qwen35") == 0 &&
++        model.quant && std::strcmp(model.quant, "w8a8_fwht128") == 0 &&
++        (!single_stream || std::strcmp(single_stream, "1") == 0)) {
++        RadDeviceProps props{};
++        if (rad_dev_props(device_, &props) >= 0 && std::strcmp(props.arch, "gfx1201") == 0) {
++            lane1_ = stream_;  // borrowed; own_lane1_ stays false
++            RAD_INFO("KVMem Windows HIP: both compute lanes use one stream (gfx1201 DFlash7)");
++            return RAD_OK;
++        }
++    }
++#endif
+     RAD_TRY(rad_stream_create(&lane1_, 0));
+     own_lane1_ = true;
+     /* Local scope: a lane join only orders this card's two queues. */
+@@ -979,8 +998,10 @@
+      * single-lane step takes this at the end of run_step; it must not build a stream. */
+     if (!lane1_) return RAD_OK;
+     RadStream fs = from ? lane1_ : stream_, ts = to ? lane1_ : stream_;
+-    RAD_TRY(rad_event_record(lane_ev_[from], fs));
+-    RAD_TRY(rad_event_wait(ts, lane_ev_[from]));
++    if (fs != ts) {
++        RAD_TRY(rad_event_record(lane_ev_[from], fs));
++        RAD_TRY(rad_event_wait(ts, lane_ev_[from]));
++    }
+     scratch_open_[from] = false;        /* `to` is now behind every scratch user `from` issued */
+     if (from == 1 && to == 0) lane1_pending_ = false;
+     return RAD_OK;

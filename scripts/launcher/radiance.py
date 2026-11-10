@@ -137,6 +137,12 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     argv+=scoring_args(supplied)+p.get('WorkerArgs',[])
     env={'ROCR_VISIBLE_DEVICES':p['Gpu'],'HIP_VISIBLE_DEVICES':','.join(str(i) for i in range(len(gpu_ids))),
          'KVMEM_RAD_MTP_HEAD':'shared','OMP_NUM_THREADS':str(p['CpuThreads']),'KVMEM_RAD_VISION_CACHE_MIB':str(p['VisionCacheMiB'])}
+    if (platform == 'windows' and mode == 'dflash2' and p['DraftTokens'] == 7 and
+            len(gpu_ids) == 1 and p['Concurrency'] == 1 and not p['Vision']):
+        container = selection['container_preflight']
+        if (container['arch_id'], container['quant']) == ('qwen35', 'w8a8_fwht128'):
+            # Match the standalone Windows profile for the same producer-stream captures.
+            env.update(KVMEM_CAPTURE_EARLY_SEAL='1', RADIANCE_HIP_SMALL_D2H='1')
     if p.get('RocmPath'):
         rocm=Path(p['RocmPath']).resolve()
         runtime=rocm/('bin/amdhip64_7.dll' if platform=='windows' else 'lib/libamdhip64.so')

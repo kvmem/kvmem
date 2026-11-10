@@ -10,6 +10,7 @@ from unittest import mock
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'scripts'))
 from launcher.plan import build_plan,token_settings
+from launcher.radiance import build_radiance_plan
 from console_hardware import parse_rocr_agents
 sys.path.insert(0,str(ROOT/'backends/radiance/tests'))
 from draft_control_test import container
@@ -129,6 +130,22 @@ class RadiancePlanTest(unittest.TestCase):
         args=self.plan(SpeculativeMode='none')['argv']
         self.assertEqual(args[args.index('--num-speculative-tokens')+1],'0')
         self.assertEqual(args[args.index('--kvmem-drafter')+1],'off')
+
+    def test_windows_dflash7_text_capture_profile(self):
+        container(self.model, ['dflash.fc.weight'], [
+            ('draft.architectures', 'DFlash2Model'), ('draft.dflash_config.block_size', 8),
+        ], quant='w8a8_fwht128')
+        parameters = dict(Backend='radiance', Model=str(self.model), Worker=str(self.worker),
+                          RadianceHome=str(self.home), Gpu='GPU-65471d75ce486b4f',
+                          SpeculativeMode='dflash2', Vision=False)
+        for platform, overrides, enabled in [
+            ('windows', {}, True), ('linux', {}, False),
+            ('windows', {'Concurrency': 2}, False), ('windows', {'SpeculativeMode': 'none'}, False),
+        ]:
+            with self.subTest(platform=platform, overrides=overrides):
+                plan = build_radiance_plan({**parameters, **overrides}, self.root, platform, False, {})
+                for key in ('KVMEM_CAPTURE_EARLY_SEAL', 'RADIANCE_HIP_SMALL_D2H'):
+                    self.assertEqual(plan['environment'].get(key), '1' if enabled else None)
 
     def test_embedded_drafters_accept_case_insensitive_rad_extension(self):
         # The shared launch contract and native magic reader accept .RAD too.
