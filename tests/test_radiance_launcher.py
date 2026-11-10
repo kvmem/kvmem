@@ -161,6 +161,22 @@ class RadiancePlanTest(unittest.TestCase):
         plan = build_radiance_plan({**parameters, 'SpeculativeMode': 'mtp'}, self.root, 'windows', False, {})
         self.assertTrue(all(key not in plan['environment'] for key in flags))
 
+    def test_windows_hip_selection_uses_current_physical_ordinals(self):
+        first, second = ('GPU-' + x * 32 for x in ('a', 'b'))
+        parameters = dict(Backend='radiance', Model=str(self.model), Worker=str(self.worker),
+                          RadianceHome=str(self.home), Gpu=second + ',' + first)
+        devices = [dict(uuid=first, ordinal=0), dict(uuid=second, ordinal=2)]
+        with mock.patch('console_hardware.windows_hip_inventory', return_value=devices):
+            plan = build_radiance_plan(parameters, self.root, 'windows', False, {})
+            self.assertEqual(plan['environment']['HIP_VISIBLE_DEVICES'], '2,0')
+            self.assertNotIn('ROCR_VISIBLE_DEVICES', plan['environment'])
+            with self.assertRaisesRegex(ValueError, 'distinct AMD GPUs'):
+                build_radiance_plan({**parameters, 'Gpu': first + ',' + first.upper()}, self.root, 'windows', False, {})
+        for invalid in (devices[:1], devices + [devices[1]]):
+            with mock.patch('console_hardware.windows_hip_inventory', return_value=invalid):
+                with self.assertRaisesRegex(ValueError, 'missing or ambiguous'):
+                    build_radiance_plan(parameters, self.root, 'windows', False, {})
+
     def test_embedded_drafters_accept_case_insensitive_rad_extension(self):
         # The shared launch contract and native magic reader accept .RAD too.
         # Metadata preflight must not newly reject that existing model path.

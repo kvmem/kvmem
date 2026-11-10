@@ -1,6 +1,8 @@
 # Radiance Windows / Linux AMD backend
 
-Radiance 1.17.0 / IQ3R-S v4 is qualified on Linux RX 9060 XT gfx1200 TP1/C1 with FP8 KV/F32 state for text, bounded RAM/SSD history and DFlash2 depth 7, including the 12K two-stage test. CPU PNG request/cache/placement checks pass; the original image suite is 21/22 because low-resolution OCR reads 5829 as 5029, also reproduced by ordinary native without the KVMem observer. The separate higher-resolution probe passes on both paths. JPEG model requests, Windows, TP2 and general-profile workloads remain unqualified. See the [integration record](../../docs/radiance-iqr-v4-integration-20261105.md) and [startup runbook](../../docs/radiance-iq3v4-runbook-20261105.md). The dated sections below describe earlier model/platform runs.
+For native Windows RX 9070 XT (gfx1201), start with the [console and chat quickstart](../../docs/radiance/CLIENT-QUICKSTART.md). The qualified text configuration uses Radiance 1.17.0, ordinary Qwen3.8-27B IQ3R v4, DFlash7, one GPU and one sequence, FP8 KV and F32 state. The full 256K Task 2 run and same-build comparisons are linked below.
+
+The Linux RX 9060 XT (gfx1200) IQ3R-S v4 qualification covers single-GPU text, bounded RAM/SSD history and DFlash7, including a 12K two-stage test. CPU PNG request/cache/placement checks pass. The original image suite scored 21/22 on low-resolution OCR; the separate higher-resolution probe passed. See the [Linux integration record](../../docs/radiance-iqr-v4-integration-20261105.md) for tested profiles and exclusions.
 
 Build and run with `tools/build.py --platform auto|windows|linux` and
 `tools/serve.py --platform auto|windows|linux` on the target OS.
@@ -109,9 +111,9 @@ Image content and native rotary layout participate in retained-prefix identity.
 Complete image pages remain required through Query and Prefill/Decode Pressure.
 KV/state reuse does not currently skip native image preprocessing/encoding.
 
-BF16/FP8 native memory contracts are tested separately. Windows AMD,
-other models/devices, configurable n-gram drafting and DFlash combinations
-still require qualification; their shared-launcher gates remain explicit.
+BF16/FP8 native memory contracts are tested separately. The native Windows
+hardware evidence above covers the specified text profile. Other Windows
+model, device, multimodal and multi-GPU combinations require separate qualification.
 Video/audio input is not enabled by this adapter.
 
 `VisionResidency=resident|cpu` selects the complete Qwen vision encoder's execution

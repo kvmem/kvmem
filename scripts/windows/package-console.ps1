@@ -187,17 +187,19 @@ GPU and model qualification: provenance/validation.json.
 $utf8 = [Text.UTF8Encoding]::new($false)
 if ($Backend -eq 'radiance') {
 $readme = @'
-KVMem - Radiance console integration preview
+KVMem - Radiance Windows console
 
 Double-click START-HERE-EN.bat (English) or START-HERE-CN.bat (Chinese).
 Select radiance-kvmem-server.exe, a .rad model, an AMD GPU, RadianceHome and ROCm path.
-The runtime and model are supplied separately. Native model validation currently covers
-Linux gfx1201 only; Windows AMD inference is not yet hardware-qualified.
+The runtime and model are supplied separately. Set ROCM_PATH to the installed SDK before
+opening the console. Windows text inference is verified on RX 9070 XT (gfx1201), ordinary
+Qwen3.8-27B IQ3R v4, DFlash7, one GPU and one sequence, FP8 KV and F32 state.
 Keep the startup window open. Closing it stops only services it started.
 Diagnostics: START-HERE-EN.bat -Check
 
 双击 START-HERE-CN.bat，选择 Radiance 引擎、.rad 模型、AMD 显卡及运行库路径。
-模型和原生运行库另行提供。目前实机验证仅覆盖 Linux gfx1201；Windows AMD 推理尚未验证。
+模型和原生运行库另行提供。启动控制台前设置 ROCM_PATH。Windows 已验证 RX 9070 XT 单卡单会话文本推理，
+配置为普通 Qwen3.8-27B IQ3R v4、DFlash7、FP8 KV 和 F32 状态。
 '@
 }
 [IO.File]::WriteAllText((Join-Path $output 'START-HERE.txt'), $readme, $utf8)
