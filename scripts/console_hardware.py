@@ -7,7 +7,9 @@ import threading
 import time
 import re
 import os
+import json
 import subprocess
+import sys
 from pathlib import Path
 from threading import Thread
 
@@ -32,10 +34,56 @@ def parse_rocr_agents(text):
     return devices
 
 
+def windows_hip_inventory(root=None):
+    """Enumerate the unmasked SDK in a short-lived process; the console owns no HIP context."""
+    root = root or os.environ.get('ROCM_PATH') or os.environ.get('HIP_PATH')
+    if not root:
+        return []
+    library = Path(root).resolve() / 'bin/amdhip64_7.dll'
+    if not library.is_file():
+        return []
+    env = dict(os.environ)
+    for key in ('HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'CUDA_VISIBLE_DEVICES'):
+        env.pop(key, None)
+    try:
+        run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--hip-devices', str(library)],
+                             capture_output=True, env=env, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+        return json.loads(run.stdout) if run.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return []
+
+
+def read_hip_devices(library):
+    import ctypes as c
+    with os.add_dll_directory(str(library.parent)):
+        hip = c.WinDLL(str(library))
+        count = c.c_int()
+        devices = []
+        if hip.hipGetDeviceCount(c.byref(count)) != 0:
+            return devices
+        for ordinal in range(count.value):
+            uuid = (c.c_ubyte * 16)()
+            name = c.create_string_buffer(256)
+            size = c.c_size_t()
+            if hip.hipDeviceGetUuid(c.byref(uuid), ordinal) or not any(uuid):
+                continue
+            if hip.hipDeviceGetName(name, len(name), ordinal):
+                continue
+            memory_ok = hip.hipDeviceTotalMem(c.byref(size), ordinal) == 0
+            devices.append(dict(uuid='GPU-' + bytes(uuid).hex(), name=name.value.decode(errors='replace'),
+                                memory_mib=str(size.value // 2**20) if memory_ok else None,
+                                vendor='amd', ordinal=ordinal))
+        return devices
+
+
 def amd_gpu_inventory():
     # The optional ROCm inventory tool initializes no model or inference queue.
     # Runtime paths may be versioned; try the explicitly selected installation.
     root=os.environ.get('ROCM_PATH') or os.environ.get('HIP_PATH')
+    if os.name == 'nt':
+        devices = windows_hip_inventory(root)
+        if devices:
+            return devices
     executable=str(Path(root)/'bin'/('rocminfo.exe' if os.name=='nt' else 'rocminfo')) if root else 'rocminfo'
     try:
         result=subprocess.run([executable],capture_output=True,text=True,timeout=5,
@@ -117,3 +165,7 @@ class SystemDiskSampler:
         self.stop_event.set()
         if self.thread is not None:
             self.thread.join(timeout=2)
+
+
+if __name__ == '__main__' and len(sys.argv) == 3 and sys.argv[1] == '--hip-devices':
+    print(json.dumps(read_hip_devices(Path(sys.argv[2]))))

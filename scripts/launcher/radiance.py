@@ -3,6 +3,7 @@ import copy
 import os
 from pathlib import Path
 import json
+import re
 
 
 def draft_selection(model, mode, depth):
@@ -53,7 +54,7 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     if p['SpeculativeMode']=='mtp' and not {'DraftTokens','MtpDrafts'} & supplied.keys():
         p['DraftTokens']=3
     gpu_ids=p['Gpu'].split(',')
-    if not 1<=len(gpu_ids)<=2 or not all(gpu_ids) or len(set(gpu_ids))!=len(gpu_ids):
+    if not 1<=len(gpu_ids)<=2 or not all(gpu_ids) or len({gpu.lower() for gpu in gpu_ids})!=len(gpu_ids):
         raise ValueError('Radiance requires one or two distinct AMD GPUs by ROCr UUID')
     if p.get('StageLayers') or p.get('FastPrefill') or p.get('DeviceProfile','off')!='off':
         raise ValueError('Radiance does not implement NInfer layer splitting or CUDA fast-prefill/device profiles')
@@ -137,6 +138,18 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     argv+=scoring_args(supplied)+p.get('WorkerArgs',[])
     env={'ROCR_VISIBLE_DEVICES':p['Gpu'],'HIP_VISIBLE_DEVICES':','.join(str(i) for i in range(len(gpu_ids))),
          'KVMEM_RAD_MTP_HEAD':'shared','OMP_NUM_THREADS':str(p['CpuThreads']),'KVMEM_RAD_VISION_CACHE_MIB':str(p['VisionCacheMiB'])}
+    if platform == 'windows' and any(re.fullmatch(r'GPU-[0-9a-fA-F]{32}', gpu) for gpu in gpu_ids):
+        from console_hardware import windows_hip_inventory
+        devices = windows_hip_inventory(p.get('RocmPath'))
+        ordinals = []
+        for gpu in gpu_ids:
+            matches = [d['ordinal'] for d in devices if d['uuid'].lower() == gpu.lower()]
+            if len(matches) != 1:
+                raise ValueError(f'Windows HIP device {gpu} is missing or ambiguous; refresh GPU selection')
+            ordinals.append(str(matches[0]))
+        # These native HIP UUIDs belong to the Windows driver. Apply a single ordinal mask.
+        del env['ROCR_VISIBLE_DEVICES']
+        env['HIP_VISIBLE_DEVICES'] = ','.join(ordinals)
     if (platform == 'windows' and mode == 'dflash2' and p['DraftTokens'] == 7 and
             len(gpu_ids) == 1 and p['Concurrency'] == 1 and not p['Vision']):
         container = selection['container_preflight']
