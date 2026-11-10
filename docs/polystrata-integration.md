@@ -1,14 +1,14 @@
 # PolyStrata integration
 
-The opt-in `polystrata` backend pins upstream `v0.1.45-poly.7` at
-`fabae0d6445e524a1dc68b2c2fa99b53880f98e6`. It supports qwen35moe GGUF models
+The opt-in `polystrata` backend pins upstream `v0.1.45-poly.9` at
+`83a7a33272413bf87b8d2742dc557c165e2cb2d2`. It supports qwen35moe GGUF models
 with F16/Q8_0 KV and Gemma 4 26B-A4B with F16/int8/int8k KV on one CUDA GPU.
 This revision also carries the opt-in HIP
 integration, marked experimental and disabled by default. Its compile/link CI
 is a merge gate; AMD inference qualification is required before promoting it
 to validated hardware support, rather than blocking the validated CUDA update.
 The source submodule stays at the upstream commit; `backends/versions.json`
-identifies all sixteen ordered patches and their resulting trees.
+identifies all twenty-two ordered patches and their resulting trees.
 
 ## Gemma 4 26B-A4B
 
@@ -118,12 +118,12 @@ separate state/replay validation before claiming a speed or quality benefit.
 The web chat's send and regenerate paths share the same explicit request
 overrides, client-owned reasoning, native timing and incomplete-stream detection.
 The poly.5 qualification below is historical; the current pin is in
-`backends/versions.json`. The current pin excludes commits after the poly.7
-release. The poly.7 update adds `--ram-experts-mib` expert staging/spill, an
-optional streaming CPU store (`STRATA_POLY_STREAM_STAGE`) and a RAM expert
-pool; the rebase keeps the KVMem memory validation beside the new
-streaming-stage setup instead of replacing it. It also retains upstream's
-`gemma4-kvmem` layer, rebased onto poly.7, so Gemma 4 26B-A4B support is not
+`backends/versions.json`. The current pin is the poly.9 release. The poly.9
+update carries upstream's multi-row step with optional block-token guesses,
+the elastic workspace layer and configurable 32/64-token KVMem blocks; the
+rebase keeps KVMem's per-sequence capture, Query/replay and expert staging
+beside the new batch and elastic paths. It also retains upstream's
+`gemma4-kvmem` layer, rebased onto poly.9, so Gemma 4 26B-A4B support is not
 dropped by the version bump.
 The poly.5 layer had rebased the integration, added HIP KVMem integration,
 linked Kolibri sources into model test targets, and preserved the `(0, 0)`
