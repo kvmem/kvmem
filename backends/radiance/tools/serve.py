@@ -93,7 +93,8 @@ def validate_inputs(a, host, wsl, architecture_plugin='qwen35_fp8'):
 
 
 def child_environment(a, host, wsl, config, inherited=None):
-    env = dict(os.environ if inherited is None else inherited)
+    source = os.environ if inherited is None else inherited
+    env = dict(source)
     for key in list(env):
         if key.startswith(('RADIANCE_', 'KVMEM_', 'KV_DIAG_')) or key in config['environment_reset']:
             env.pop(key, None)
@@ -102,6 +103,8 @@ def child_environment(a, host, wsl, config, inherited=None):
     env.update(ROCM_PATH=str(a.rocm.resolve()), HIP_PATH=str(a.rocm.resolve()))
     if host == 'windows':
         env.update(config['environment'])
+        if source.get('KVMEM_RAD_HIP_SINGLE_STREAM') == '0':
+            env['KVMEM_RAD_HIP_SINGLE_STREAM'] = '0'
         env['PATH'] = str(a.rocm.resolve() / 'bin') + os.pathsep + env.get('PATH', '')
     else:
         env.update(KVMEM_RAD_MTP_HEAD='shared', KVMEM_CAPTURE_EARLY_SEAL='1', OMP_NUM_THREADS='2')

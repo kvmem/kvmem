@@ -97,7 +97,7 @@ class PlatformLaunchTest(unittest.TestCase):
 
     def test_linux_environment_isolated(self):
         inherited = {'PATH':'system', 'LD_PRELOAD':'wrong.so', 'LD_LIBRARY_PATH':'wrong',
-                     'RADIANCE_NO_DRAFT':'1', 'KVMEM_RAD_MTP_SHARED_TOPK':'1',
+                     'RADIANCE_NO_DRAFT':'1', 'KVMEM_RAD_MTP_SHARED_TOPK':'1', 'KVMEM_RAD_HIP_SINGLE_STREAM':'0',
                      'KVMEM_DIAG_ROCDXG_DIR':'wrong', 'PAL_ALWAYS_RESIDENT':'1',
                      'RADIANCE_HIP_FIXED_VA':'2', 'KV_DIAG_FOO':'1', 'HSA_ENABLE_DXG_DETECTION':'1'}
         env = serve.child_environment(self.args(), 'linux', False, serve.profile(), inherited)
@@ -108,6 +108,15 @@ class PlatformLaunchTest(unittest.TestCase):
         self.assertEqual(env['KVMEM_CAPTURE_EARLY_SEAL'], '1')
         self.assertEqual(env['OMP_NUM_THREADS'], '2')
         self.assertNotIn('wrong', env['LD_LIBRARY_PATH'])
+
+    def test_windows_single_stream_explicit_fallback(self):
+        key = 'KVMEM_RAD_HIP_SINGLE_STREAM'
+        for value in ('0', '1', 'invalid'):
+            with self.subTest(value=value):
+                env = serve.child_environment(self.args(), 'windows', False, serve.profile(),
+                                              {key: value, 'KV_DIAG_FOO': '1'})
+                self.assertEqual(env.get(key), '0' if value == '0' else None)
+                self.assertNotIn('KV_DIAG_FOO', env)
 
     def test_wsl_environment_explicit_library_first(self):
         a = self.args()
