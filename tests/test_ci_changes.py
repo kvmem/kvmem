@@ -12,6 +12,29 @@ spec.loader.exec_module(changes)
 
 
 class DocumentationChangesTest(unittest.TestCase):
+    def test_chat_crlf_attributes_are_not_native_build_inputs(self):
+        from unittest.mock import patch
+        old = b'*.md text\n'
+        addition = '\n# Preserve existing lightweight chat CRLF blobs.\nui/lightweight/+page.svelte whitespace=cr-at-eol\nui/lightweight/labels.ts whitespace=cr-at-eol\n'
+        paths = ['backends/patches/radiance-win-single-stream.patch', '.gitattributes']
+        for suffix, expected in [(addition, False), (addition + '* eol=crlf\n', True)]:
+            with patch.object(changes, 'git', side_effect=lambda _, ref, **kw:
+                              old if ref.startswith('old:') else old + suffix.encode()):
+                self.assertEqual(changes.requires_native(paths, 'old', 'new'), expected)
+
+    def test_radiance_console_and_chat_do_not_build_unrelated_engines(self):
+        paths = ['scripts/console_radiance.py', 'scripts/console_state.py',
+                 'ui/lightweight/+page.svelte', 'ui/lightweight/labels.ts',
+                 'ui/monitor/launcher.js', 'tests/test_console_state.py']
+        self.assertTrue(changes.requires_ci(paths))
+        self.assertFalse(changes.requires_native(paths))
+        self.assertFalse(changes.requires_cuda(paths, 'a', 'b'))
+        paths += ['backends/patches/radiance-win-single-stream.patch', 'backends/radiance/upstream.json']
+        self.assertTrue(changes.radiance_only_change(paths))
+        self.assertFalse(changes.requires_native(paths))
+        self.assertFalse(changes.requires_cuda(paths, 'a', 'b'))
+        self.assertTrue(changes.requires_native(paths + ['src/unknown.cpp']))
+
     def test_versioned_radiance_patch_uses_only_radiance_native_checks(self):
         paths = ['backends/patches/radiance-1.17-kvmem.patch',
                  'backends/radiance/adapter/window_checkpoint.hpp',

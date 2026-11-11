@@ -33,10 +33,10 @@ def vision_geometry(model):
 
 
 def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
-    from .config import DEFAULTS, ENGINE_DEFAULTS
+    from .config import DEFAULTS, RADIANCE_LAUNCH_DEFAULTS
     from .recall import strategy
     from .plan import token_settings, scoring_args, scoring_settings, _existing_file, _speculative
-    p = dict(DEFAULTS, **ENGINE_DEFAULTS['radiance'])
+    p = dict(DEFAULTS, **RADIANCE_LAUNCH_DEFAULTS)
     if strategy(supplied) == 'layerwise':
         for key in ('Budget', 'Reserve', 'HostMiB'):
             p[key] = DEFAULTS[key]
@@ -150,12 +150,11 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         # These native HIP UUIDs belong to the Windows driver. Apply a single ordinal mask.
         del env['ROCR_VISIBLE_DEVICES']
         env['HIP_VISIBLE_DEVICES'] = ','.join(ordinals)
-    if (platform == 'windows' and mode == 'dflash2' and p['DraftTokens'] == 7 and
-            len(gpu_ids) == 1 and p['Concurrency'] == 1 and not p['Vision']):
-        container = selection['container_preflight']
-        if (container['arch_id'], container['quant']) == ('qwen35', 'w8a8_fwht128'):
-            # Match the standalone Windows profile for the same producer-stream captures.
-            env.update(KVMEM_CAPTURE_EARLY_SEAL='1', RADIANCE_HIP_SMALL_D2H='1')
+    if platform == 'windows' and len(gpu_ids) == 1 and p['Concurrency'] == 1:
+        # Producer-stream capture optimizations apply across model quantizations and drafters.
+        # Retain an explicit diagnostic opt-out for each optimization.
+        for key in ('KVMEM_CAPTURE_EARLY_SEAL', 'RADIANCE_HIP_SMALL_D2H'):
+            env[key] = '0' if os.environ.get(key) == '0' else '1'
     if p.get('RocmPath'):
         rocm=Path(p['RocmPath']).resolve()
         runtime=rocm/('bin/amdhip64_7.dll' if platform=='windows' else 'lib/libamdhip64.so')

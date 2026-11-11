@@ -5,7 +5,7 @@ T=Path(__file__).resolve().parent
 sys.path.insert(0,str(T.parent/'scripts'))
 sys.path.insert(0,str(T))
 from console_chat import context_payload,request_metrics,ChatBridge
-from console_radiance import enrich_props,speculative_event,enrich_status
+from console_radiance import enrich_props,speculative_event,enrich_status,monitor_execution,effective_settings
 import test_console_chat as fixture
 Control=fixture.Control
 
@@ -41,9 +41,42 @@ class Contract(unittest.TestCase):
     def test_mtp_and_missing_statistics(self):
         event={'id':'test','choices':[],'timings':{'draft_n':42,'draft_n_accepted':31}}
         result=speculative_event(event)
-        self.assertEqual(result['kvmem']['speculative']['mtp_accepted_tokens'],31)
+        self.assertEqual(result['kvmem']['speculative']['accepted_tokens'],31)
         self.assertNotIn('kvmem',speculative_event({'timings':{'draft_n':1,'draft_n_accepted':2}}))
         self.assertEqual(speculative_event({'usage':None}),{'usage':None})
+    def test_template_effort_and_native_override(self):
+        self.info['request_defaults']['reasoning_effort'] = None
+        self.state['radiance_template_effort'] = 'xhigh'
+        result = context_payload(self.state, self.props, self.info)
+        self.assertEqual(result['effective']['reasoning_effort'], 'xhigh')
+        self.assertTrue(result['uses_template_effort'])
+        self.info['request_defaults']['reasoning_effort'] = 'none'
+        result = context_payload(self.state, self.props, self.info)
+        self.assertFalse(result['effective']['enable_thinking'])
+        self.assertFalse(result['uses_template_effort'])
+        self.info['capabilities']['reasoning_efforts'] = None
+        self.assertEqual(context_payload(self.state,self.props,self.info)['capabilities']['efforts'], [])
+        self.assertNotIn('kvmem', speculative_event({'timings':{'draft_n':0,'draft_n_accepted':0}}))
+
+    def test_binding_requires_complete_native_rank_identity(self):
+        device = dict(rank=0,device=2,name='AMD test GPU',arch='gfx1201',uuid='GPU-test',vram_bytes=16*1024**3,free_vram_bytes=123)
+        engine = dict(tensor_parallel=1,devices=[device])
+        result = monitor_execution(engine)
+        self.assertEqual(result['mode'], 'single')
+        bound = result['monitor_devices'][0]
+        self.assertEqual(bound['hip_ordinal'], 2)
+        self.assertEqual(bound['total_bytes'], 16*1024**3)
+        self.assertNotIn('used_bytes',bound)
+        self.assertNotIn('free_vram_bytes',bound)
+        for invalid in ({},dict(engine,tensor_parallel=2),dict(engine,devices=[dict(device,rank=1)]),
+                        dict(engine,devices=[dict(device,device=True)]),dict(engine,devices=[dict(device,name='')]),
+                        dict(tensor_parallel=2,devices=[device,dict(device,rank=1)])):
+            with self.subTest(engine=invalid):self.assertIsNone(monitor_execution(invalid))
+        self.info['engine'].update(engine)
+        props=enrich_props(self.props,self.info,{})
+        self.assertEqual(props['execution'],result)
+        self.assertNotIn('execution',self.props)
+
     def test_exact_identity_and_live_freshness(self):
         control=Control(1);control.backend='radiance';bridge=ChatBridge(control)
         bridge.records['browser']={'id':'browser','instance':'one','native_id':'chatcmpl-a','state':'answering'}

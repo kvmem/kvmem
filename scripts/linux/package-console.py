@@ -34,7 +34,7 @@ def package(source, output, chat, wheel, expected, backend='ninfer'):
     if chat_info.get('console_chat_protocol') != 1 or not (chat / 'index.html').is_file():
         raise ValueError('Compatible built unified chat assets are required')
     files = ['START-HERE-CN.sh', 'START-HERE-EN.sh', 'scripts/linux/start-ui.sh',
-             'scripts/local-console.py', 'scripts/launcher-cli.py', 'scripts/console_chat.py', 'scripts/console_radiance.py',
+             'scripts/local-console.py', 'scripts/launcher-cli.py', 'scripts/console_chat.py', 'scripts/console_radiance.py', 'scripts/console_state.py',
              'scripts/console_hardware.py', 'scripts/console_memory.py', 'scripts/model_health.py', 'scripts/requirements-console.txt',
              'scripts/launcher-capabilities.json', 'scripts/speculative-capabilities.json',
              'scripts/check-recall-worker.py',

@@ -106,7 +106,7 @@ let browser;
   assert.equal(p.LayerwiseActivationRamMiB,0);assert.equal(p.LayerwiseActivationDiskMiB,128);
   assert.equal(p.SinkTokens,0);assert.equal(p.RecentTokens,0);
   for(const key of ['QueryScorer','GraphAlpha','QueryMaxTokens','QueryReplayMaxTokens','Lrfu'])assert.equal(key in p,false,key);
-  await page.locator('#launch-tab-5').click();
+  await page.locator('#launch-tab-6').click();
   await page.screenshot({path:path.join(task,'layerwise-launcher-ui.png'),fullPage:true});
   await set(page,'RecallStrategy','legacy');
   const old=await preview(page);assert.equal(old.QueryScorer,'page-softmax');assert.equal(old.GraphAlpha,.2);

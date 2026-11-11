@@ -21,7 +21,7 @@ CONSOLE_PATHS = {
     'tests/test_radiance_launcher.py',
     'START-HERE-CN.sh', 'START-HERE-EN.sh', 'START-HERE-CN.bat', 'START-HERE-EN.bat',
     'scripts/local-console.py', 'scripts/launcher-cli.py', 'scripts/launcher-capabilities.json',
-    'scripts/console_chat.py', 'scripts/console_hardware.py', 'scripts/model_health.py',
+    'scripts/console_chat.py', 'scripts/console_radiance.py', 'scripts/console_state.py', 'scripts/console_hardware.py', 'scripts/model_health.py',
     'scripts/requirements-console.txt', 'scripts/speculative-capabilities.json',
     'scripts/linux/start-ui.sh', 'scripts/linux/package-console.py',
     'scripts/windows/start-ui.ps1', 'scripts/windows/package-console.ps1',
@@ -48,7 +48,7 @@ EVIDENCE_TEST_STEP = (
 def is_console_path(path):
     if '..' in PurePosixPath(path).parts or path.startswith('/'):
         return False
-    return (path in CONSOLE_PATHS or path.startswith(('scripts/launcher/', 'scripts/model_health_ninfer/', 'ui/monitor/'))
+    return (path in CONSOLE_PATHS or path.startswith(('scripts/launcher/', 'scripts/model_health_ninfer/', 'ui/monitor/', 'ui/lightweight/'))
             or bool(re.fullmatch(r'tests/test_(launcher[^/]*|local_console|console_[^/]+|one_click|model_health)\.py', path))
             or bool(re.fullmatch(r'ui/test-[^/]+\.cjs', path)))
 
@@ -90,7 +90,8 @@ def radiance_only_change(paths, before=None, after=None, cwd=None):
                         'backends/radiance/upstream.json whitespace=cr-at-eol\n'
                         'ui/test-monitor.cjs whitespace=cr-at-eol\n'
                         '.github/workflows/server-compat.yml whitespace=cr-at-eol\n')
-            if new == old + addition:
+            chat_attributes = '\n# Preserve existing lightweight chat CRLF blobs.\nui/lightweight/+page.svelte whitespace=cr-at-eol\nui/lightweight/labels.ts whitespace=cr-at-eol\n'
+            if new in (old + addition, old + chat_attributes):
                 continue
         return False
     return True

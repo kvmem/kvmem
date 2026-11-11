@@ -388,8 +388,9 @@
   const pciKey = (value) => typeof value === "string" && /^[0-9a-f]+:[0-9a-f]+:[0-9a-f]+\.[0-7]$/i.test(value)
     ? value.toLowerCase().split(/[:.]/).map((n) => parseInt(n, 16)).join(":") : null;
   function matchesDevice(device, gpu) {
-    if (device.uuid) return device.uuid === gpu.uuid;
-    return pciKey(device.pci_bus_id) !== null && pciKey(device.pci_bus_id) === pciKey(gpu.pci_bus_id);
+    if (device.uuid && gpu.uuid) return device.uuid.toLowerCase() === gpu.uuid.toLowerCase();
+    const a = pciKey(device.pci_bus_id), b = pciKey(gpu.pci_bus_id);
+    return a !== null && b !== null ? a === b : null;
   }
   function renderGpus(gpus, fresh, append) {
     const devices = props.execution?.monitor_devices;
@@ -407,7 +408,7 @@
     if (grid.dataset.devices !== signature) {
       grid.replaceChildren(...bound.map((d) => {
         const card = $("#gpu-card").content.firstElementChild.cloneNode(true);
-        card.dataset.device = d.uuid || d.pci_bus_id || d.name;
+        card.dataset.device = d.uuid || d.pci_bus_id || (Number.isInteger(d.hip_ordinal) ? `hip:${d.hip_ordinal}` : d.name);
         return card;
       }));
       grid.dataset.devices = signature;
@@ -416,28 +417,31 @@
       const matched = gpus.find((g) => matchesDevice(device, g));
       const g = fresh ? matched || {} : {};
       const card = grid.children[index];
+      const total = number(g.total_bytes) ? g.total_bytes : device.total_bytes;
+      const usage = ratio(g.used_bytes, total);
+      const logicalId = Number.isInteger(device.hip_ordinal) ? [`HIP ${device.hip_ordinal}`, device.arch].filter(Boolean).join(" · ") : t("设备身份未采集");
       const values = {
         name: (device.name || matched?.name || t("推理设备")).replace(/^NVIDIA GeForce /, ""),
-        id: device.uuid ? `UUID · ${device.uuid.slice(-8)}` : matched?.uuid ? `UUID · ${matched.uuid.slice(-8)}` : device.pci_bus_id ? `PCI · ${device.pci_bus_id}` : t("设备身份未采集"),
+        id: device.uuid ? `UUID · ${device.uuid.slice(-8)}` : matched?.uuid ? `UUID · ${matched.uuid.slice(-8)}` : device.pci_bus_id ? `PCI · ${device.pci_bus_id}` : logicalId,
         status: !matched ? t("读数未采集") : !fresh ? t("读数已过期") : t("本服务"),
         load: fmt(g.utilization_percent),
         vram: fmt(number(g.used_bytes) ? g.used_bytes / GiB : null, 1),
-        total: number(g.total_bytes) ? t("共 {0} GiB", fmt(g.total_bytes / GiB, 1)) : t("容量未采集"),
-        capacity: number(ratio(g.used_bytes, g.total_bytes)) ? t("已用 {0}%", fmt(ratio(g.used_bytes, g.total_bytes))) : t("比例未采集"),
+        total: number(total) ? t("共 {0} GiB", fmt(total / GiB, 1)) : t("容量未采集"),
+        capacity: number(usage) ? t("已用 {0}%", fmt(usage)) : t("比例未采集"),
         temp: fmt(g.temperature_c), power: fmt(g.power_w, 1),
         pcie: number(g.pcie_generation) ? `Gen${g.pcie_generation} ×${fmt(g.pcie_width)}` : "—",
         rx: fmt(number(g.pcie_rx_bytes_per_second) ? g.pcie_rx_bytes_per_second / MiB : null, 1),
       };
       for (const [key, value] of Object.entries(values)) card.querySelector(`[data-gpu="${key}"]`).textContent = value;
-      const usage = ratio(g.used_bytes, g.total_bytes);
       gauge(card.querySelector('[data-dial="load"]'), g.utilization_percent, t("GPU 负载 {0}%", fmt(g.utilization_percent)));
-      gauge(card.querySelector('[data-dial="vram"]'), usage, t("整卡显存 {0} / {1} GiB", values.vram, fmt(number(g.total_bytes) ? g.total_bytes / GiB : null, 1)));
+      gauge(card.querySelector('[data-dial="vram"]'), usage, t("整卡显存 {0} / {1} GiB", values.vram, fmt(number(total) ? total / GiB : null, 1)));
       chart(`gpu:${card.dataset.device}`, g.utilization_percent, append, card.querySelector("[data-gpu-chart]"), 100);
     });
     const hardwareList = $('[data-about="devices"]');
     hardwareList.replaceChildren(...gpus.map((g) => {
       const item = document.createElement("p");
-      const role = !known ? t("绑定待确认") : bound.some((d) => matchesDevice(d, g)) ? t("参与当前服务") : t("未参与当前服务");
+      const matches = bound.map((device) => matchesDevice(device, g));
+      const role = matches.includes(true) ? t("参与当前服务") : !known || matches.includes(null) ? t("绑定待确认") : t("未参与当前服务");
       item.textContent = `${g.name} · ${role}\n${g.uuid}\n${fresh ? t("{0}% 负载 · {1} / {2} GiB", fmt(g.utilization_percent), fmt(number(g.used_bytes) ? g.used_bytes / GiB : null, 1), fmt(number(g.total_bytes) ? g.total_bytes / GiB : null, 1)) : t("读数已过期")}`;
       return item;
     }));
@@ -814,7 +818,7 @@
 
     const thinkingMode = first(boolean(k.defaults?.enable_thinking),present(defaults.reasoning_effort)?defaults.reasoning_effort!=='none':undefined);
     row('generation','ThinkingMode',['默认思考模式','Default thinking mode'],thinkingMode,
-      config.ThinkingMode==='on'?true:config.ThinkingMode==='off'?false:config.ThinkingMode,{format:value=>value==='default'?tr('跟随模型','Model default'):format(value)});
+      config.ThinkingMode==='on'?true:config.ThinkingMode==='off'?false:backend==='radiance'&&typeof thinkingMode==='boolean'?undefined:config.ThinkingMode,{format:value=>value==='default'?tr('跟随模型','Model default'):format(value)});
     row('generation','ReasoningEffort',['默认思考强度','Default reasoning effort'],defaults.reasoning_effort,config.ReasoningEffort,{optional:true});
     // Launcher 0 means no separate cap (llama.cpp translates it to -1); PolyStrata uses automatic answer reserve.
     const thinkingBudget = value => value < 0 || (value===0 && backend!=='polystrata') ? -1 : value;

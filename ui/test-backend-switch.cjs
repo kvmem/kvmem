@@ -22,7 +22,7 @@ module.exports=async({browser,base,info})=>{
   return route.fulfill({json:{argv:['fixture-worker'],environment:{}}});
  });
  const field=key=>page.locator(`[data-param=${key}]`);
- const group=index=>page.locator(`#launch-tab-${index}`).click();
+ const group=index=>page.locator(`#launch-tab-${index>=2?index+1:index}`).click();
  const order=()=>field('Gpu').evaluate(el=>Array.from(el.selectedOptions).map(option=>option.value));
  const sharedKeys=['Context','Budget','Reserve','HostMiB','Prefill','MaxTokens','Port','ListenHost',
   'SinkTokens','RecentTokens','Concurrency','RetainedSessions','DiskPath','DiskMiB','LrfuLambda',
@@ -64,8 +64,10 @@ module.exports=async({browser,base,info})=>{
   assert.ok((await page.locator('[data-check-summary]').textContent()).includes('需要补全'));
   await closeCheck();
   // Reordering keeps counts attached to their original physical GPU when returning.
-  await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').click();
+  await page.getByRole('tab',{name:'多卡设置',exact:true}).click();
+  assert.equal(await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').isDisabled(),true);
   await field('Backend').selectOption('ninfer');
+  await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').click();
   assert.deepEqual(await order(),[gpus[0].uuid,gpus[1].uuid]);
   assert.equal(await field('StageLayers').inputValue(),'40,24');
   assert.deepEqual(await values(),{...shared,Port:changed.Port},'resource edits belong to each engine, listener follows the last edit');

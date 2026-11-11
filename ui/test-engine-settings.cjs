@@ -26,7 +26,7 @@ module.exports=async({browser,base,info,stage})=>{
     await f('Tokenizer').fill('C:/tokenizer');await f('Worker').fill('C:/custom/worker.exe');
     assert.equal(await page.locator('[data-engine-environment] .l-engine-status').textContent(),'已自定义');
     await shot('polystrata-runtime');
-    await page.locator('#launch-tab-3').click();await page.locator('[data-vision-assets] > summary').click();
+    await page.locator('#launch-tab-4').click();await page.locator('[data-vision-assets] > summary').click();
     await f('VisionWorker').fill('C:/vision/encoder.exe');await f('Mmproj').fill('C:/vision/mmproj.gguf');
     assert.equal(await page.locator('.l-native [data-param=VisionWorker]').count(),0);
     await page.locator('[data-engine-arguments] > summary').click();await page.locator('[data-native]').fill('["--threads","6"]');
@@ -43,7 +43,7 @@ module.exports=async({browser,base,info,stage})=>{
     }
     await f('Backend').selectOption('llamacpp');
     await f('Model').fill('C:/fixture/model.gguf');
-    await page.locator('#launch-tab-3').click();
+    await page.locator('#launch-tab-4').click();
     assert.equal(await f('LoraScale').isDisabled(),true);
     await f('Lora').fill('C:/adapters/rank two.gguf');
     await f('LoraScale').fill('-0.5');
@@ -51,7 +51,7 @@ module.exports=async({browser,base,info,stage})=>{
     assert.equal(adapted.Lora,'C:/adapters/rank two.gguf');
     assert.equal(adapted.LoraScale,-0.5);
     for(const value of [-0.5,0]){
-      await page.locator('#launch-tab-3').click();
+      await page.locator('#launch-tab-4').click();
       await f('LoraScale').fill(String(value));
       await page.locator('[data-preset="llamacpp-default"]').click();
       assert.equal(await f('Lora').inputValue(),'C:/adapters/rank two.gguf');
@@ -59,7 +59,7 @@ module.exports=async({browser,base,info,stage})=>{
       const reapplied=await preview();
       assert.equal(reapplied.LoraScale,value);
     }
-    await page.locator('#launch-tab-3').click();
+    await page.locator('#launch-tab-4').click();
     await f('Lora').fill('');
     assert.equal(await f('LoraScale').isDisabled(),true);
     const plain=await preview();
