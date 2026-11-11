@@ -34,6 +34,19 @@ class WrapperTest(unittest.TestCase):
             self.assertEqual(valid.returncode, 0, valid.stderr)
             self.assertEqual(json.loads(valid.stdout)['env']['STRATA_FATTN'], '1')
             self.assertEqual(json.loads(valid.stdout)['env']['STRATA_FDEC'], '1')
+            native_args = json.loads(valid.stdout)['args']
+            self.assertEqual(native_args[native_args.index('--ram-experts-mib') + 1], '-1')
+            for value in ('-2', '-1', '0', '4096'):
+                explicit = run(['--', '--ram-experts-mib', value])
+                self.assertEqual(explicit.returncode, 0, explicit.stderr)
+                argv = json.loads(explicit.stdout)['args']
+                self.assertEqual(argv.count('--ram-experts-mib'), 1)
+                self.assertEqual(argv[argv.index('--ram-experts-mib') + 1], value)
+            for option in ('--ram-experts-mib=4096', '--ram-experts-mib 4096', '--ram-experts-mib\t4096'):
+                joined = run(['--', option])
+                self.assertEqual(joined.returncode, 0, joined.stderr)
+                self.assertIn(option, json.loads(joined.stdout)['args'])
+                self.assertNotIn('--ram-experts-mib', json.loads(joined.stdout)['args'])
             env.update(STRATA_FATTN='0', STRATA_FDEC='0')
             disabled = run([])
             self.assertEqual(disabled.returncode, 0, disabled.stderr)

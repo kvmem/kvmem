@@ -31,7 +31,9 @@ jobs:
         run: python3 .github/scripts/classify_changes.py
       - name: Test CI change detection
         if: steps.classify.outputs.run_ci == 'true'
-        run: python3 tests/test_ci_changes.py
+        run: |
+          python3 tests/test_ci_changes.py
+          python3 tests/test_ci_apt.py
       - name: Check portable validation and public evidence
         run: |
           python3 scripts/public_evidence.py --check
@@ -86,6 +88,48 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Prepare reliable Ubuntu package downloads
+        if: runner.os == 'Linux'
+        shell: bash
+        # Containers need this before checkout can install git. Share the same
+        # bootstrap with browser jobs without fetching an unpinned helper.
+        run: &prepare-ubuntu-apt |
+          set -euo pipefail
+          admin=()
+          if [ "$(id -u)" != 0 ]; then admin=(sudo); fi
+          printf '%s\n' 'Acquire::Retries "2";' \
+            'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' \
+            'APT::Update::Error-Mode "any";' \
+            | "${admin[@]}" tee /etc/apt/apt.conf.d/80kvmem-downloads >/dev/null
+          sources=()
+          for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources /etc/apt/apt-mirrors.txt; do
+            if [ -f "$file" ]; then sources+=("$file"); fi
+          done
+          test "${#sources[@]}" -gt 0
+          # Keep the image's suites, components, keys and vendor repositories.
+          # Prefer HTTPS on the original Ubuntu host before trying a mirror.
+          "${admin[@]}" sed -i -E \
+            's#http://(([a-z0-9-]+\.)?archive|security)\.ubuntu\.com/ubuntu([/[:space:]]|$)#https://\1.ubuntu.com/ubuntu\3#g' \
+            "${sources[@]}"
+          log=$(mktemp)
+          trap 'rm -f "$log"' EXIT
+          if timeout 180 "${admin[@]}" apt-get update 2>&1 | tee "$log"; then
+            exit 0
+          fi
+          # Retry transport failures only. Signature/expiry/package errors
+          # remain failures; never disable Ubuntu authentication or freshness.
+          if grep -Eqi 'NO_PUBKEY|BADSIG|EXPKEYSIG|not signed|signature.*invalid|expired|no Release file' "$log"; then
+            exit 1
+          fi
+          if ! grep -Eq 'Could not resolve|Temporary failure resolving|Could not connect|Connection (timed out|failed)' "$log"; then
+            exit 1
+          fi
+          echo '::warning::Ubuntu download failed; retrying through the kernel.org Ubuntu mirror'
+          "${admin[@]}" sed -i -E \
+            -e 's#https?://(([a-z0-9-]+\.)?archive|security)\.ubuntu\.com/ubuntu([/[:space:]]|$)#https://mirrors.kernel.org/ubuntu\3#g' \
+            -e 's#mirror\+file:/etc/apt/apt-mirrors\.txt([[:space:]]|$)#https://mirrors.kernel.org/ubuntu\1#g' \
+            "${sources[@]}"
+          timeout 180 "${admin[@]}" apt-get update
       - name: Browser and launcher syntax checks
         shell: bash
         run: |
@@ -136,6 +180,9 @@ jobs:
           python3 -m unittest discover -s tools/polystrata -p test_cache_observability.py
           python3 -m unittest discover -s tools/polystrata -p test_cache_service.py
           python3 -m unittest discover -s tools/polystrata -p test_ui_contract.py
+          python3 -m unittest discover -s tools/polystrata -p test_prompt_policy.py
+          python3 tools/polystrata/test_attention_rows.py
+          python3 tools/polystrata/test_sequence_buffers.py
           python3 -m unittest discover -s tools/polystrata -p test_console_routes.py
           node ui/test-polystrata-contract.cjs
           node ui/test-polystrata-stream.cjs
@@ -217,11 +264,13 @@ jobs:
       CCACHE_MAXSIZE: 1G
       CCACHE_COMPILERCHECK: content
     steps:
+      - name: Prepare reliable Ubuntu package downloads
+        shell: bash
+        run: *prepare-ubuntu-apt
       - name: Install build dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          apt-get update
           apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build libssl-dev python3 time ccache zstd
       - uses: actions/checkout@v4
       - name: Trust the checked-out workspace in the CUDA container
@@ -276,7 +325,7 @@ jobs:
             cat /sys/fs/cgroup/memory.peak
           fi
       - name: Compiler cache statistics
-        if: ${{ always() }}
+        if: ${{ always() && steps.toolchain.outcome == 'success' }}
         run: ccache --show-stats
   polystrata-cuda-build-linux:
     needs: changes
@@ -296,11 +345,13 @@ jobs:
       CCACHE_COMPILERCHECK: content
       CUDA_VISIBLE_DEVICES: ''
     steps:
+      - name: Prepare reliable Ubuntu package downloads
+        shell: bash
+        run: *prepare-ubuntu-apt
       - name: Install build dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          apt-get update
           apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build python3 time ccache zstd
       - uses: actions/checkout@v4
       - name: Trust the checked-out workspace in the CUDA container
@@ -362,7 +413,7 @@ jobs:
           ctest --test-dir build-polystrata --output-on-failure --no-tests=error
           -R '^poly_kvmem_(history|sessions)_test$'
       - name: Compiler cache statistics
-        if: ${{ always() }}
+        if: ${{ always() && steps.toolchain.outcome == 'success' }}
         run: ccache --show-stats
       - name: Preserve native build and test diagnostics
         if: ${{ always() }}
@@ -399,11 +450,13 @@ jobs:
       CCACHE_MAXSIZE: 1G
       CCACHE_COMPILERCHECK: content
     steps:
+      - name: Prepare reliable Ubuntu package downloads
+        shell: bash
+        run: *prepare-ubuntu-apt
       - name: Install build tools and pinned ROCm BLAS development packages
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          apt-get update
           apt-get install -y --no-install-recommends git ca-certificates cmake ninja-build python3 ccache zstd \
             hipblas-dev=3.2.0.70204-93~24.04 rocblas-dev=5.2.0.70204-93~24.04 hipblaslt-dev=1.2.2.70204-93~24.04
       - uses: actions/checkout@v4
@@ -612,6 +665,10 @@ jobs:
           node-version: '24'
       - run: python3 tests/test_webui_builder.py
         if: needs.changes.outputs.run_ci == 'true'
+      - name: Prepare reliable Ubuntu package downloads
+        if: needs.changes.outputs.run_ci == 'true' && matrix.mode == 'lightweight'
+        shell: bash
+        run: *prepare-ubuntu-apt
       - name: Install console browser tests
         if: needs.changes.outputs.run_ci == 'true' && matrix.mode == 'lightweight'
         working-directory: ui

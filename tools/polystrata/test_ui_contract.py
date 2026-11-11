@@ -99,7 +99,7 @@ class UiContract(unittest.TestCase):
         svc.restore_reasoning=lambda *a:self.fail('text-keyed recovery must not run')
         messages=[{'role':'user','content':'hi'}]
         svc.encode_prompt=lambda supplied,*a: [1,2] if supplied is messages else self.fail('history changed')
-        svc.drop_oldest=False;svc.fit_max_tokens=False;svc.embeddings=SimpleNamespace();svc.engine=SimpleNamespace(max_context=4096)
+        svc.drop_oldest=False;svc.truncate_middle=False;svc.fit_max_tokens=False;svc.embeddings=SimpleNamespace();svc.engine=SimpleNamespace(max_context=4096)
         self.assertEqual(svc.prepare(messages,None,{})[2],17)
         supplied={}
         svc.template_tokens={};svc.call_format='qwen';svc.effort_end=False;svc.preserve_thinking=False
