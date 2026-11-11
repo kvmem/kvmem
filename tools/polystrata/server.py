@@ -229,6 +229,10 @@ def main():
         parser.error("--no-draft conflicts with --mtp-drafts")
     if not any(option == "--vram-reserve-mib" or option.startswith("--vram-reserve-mib=") for option in extra):
         extra += ["--vram-reserve-mib", str(args.vram_reserve_mib)]
+    # Preserve the mapped-expert default used before poly.9. Its automatic RAM
+    # pool can reduce decode throughput; an explicit limit (or -2 for auto) wins.
+    if not any(re.match(r"^--ram-experts-mib(?:$|=|\s)", option) for option in extra):
+        extra += ["--ram-experts-mib", "-1"]
     worker_args = ["--model", str(args.model), "--max-context", str(args.context),
                    "--prompt-batch", str(args.prefill), "--window", str(1+args.mtp_drafts), "--lookup", "0",
                    "--prompt-cache", "0", "--conversation-cache-mib", "0", "--conversation-cache-slots", "0",

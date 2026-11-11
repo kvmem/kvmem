@@ -1,0 +1,468 @@
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.cpp b/src/models/qwen3_5/program/native_layerwise_request.cpp
+index 2f6751d0..f36e07fb 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_request.cpp
+@@ -193,19 +193,25 @@ struct NativeLayerwiseRequest::Impl {
+             if (begin) (void)cudaEventDestroy(begin);
+         }
+     } events;
+-    // The cohort gives one owner exclusive staging until validation. Copies and
+-    // reused device scratch belong to one GPU stream. Pinned slices stay live
+-    // until flush_readbacks has checked and consumed every queued result.
++    // A graph cohort lends disjoint slices of the existing Program staging to
++    // its owners. Device scratch is reused in stream order; each pinned slice
++    // stays live until its owner's queued results have been consumed.
+     struct Readback {
+         std::size_t layer, columns, stride;
+-        std::uint32_t count, local_begin, table;
++        std::uint32_t count, local_begin, table, sampled;
+         const std::int32_t* actual;
+         const float* mass;
++        const std::int32_t* rows;
+     };
+     std::vector<Readback> readbacks;
+     NativeSourceVersionCharge readback_metadata;
+     std::size_t pinned_used=0;
+     cudaStream_t readback_stream=nullptr;
++    std::span<std::byte> graph_staging;
++    std::span<std::byte> feedback_staging() const {
++        if (graph_epoch) return graph_staging;
++        return {static_cast<std::byte*>(p.memory_statistics_host->data()),p.memory_statistics_host->size()};
++    }
+ 
+     void prepare_sampled_preview(Capture& c) {
+         // Graph collection follows DFlash verification and the egress fence,
+@@ -246,11 +252,16 @@ struct NativeLayerwiseRequest::Impl {
+             for (std::uint32_t j=0;j<item.count;++j) {
+                 if (item.actual[j+1]!=static_cast<std::int32_t>(item.local_begin+j))
+                     throw std::logic_error("native feedback original/compact position mismatch");
++            }
++            for (std::uint32_t j=0;j<item.sampled;++j) {
++                const auto row=item.rows[j];
++                if (row<0 || std::uint32_t(row)>=item.count)
++                    throw std::logic_error("native feedback sampled row is outside its current frame");
+                 for (std::size_t col=0;col<item.columns;++col) {
+                     const auto value=item.mass[j*item.stride+col];
+                     if (!std::isfinite(value) || value<0)
+                         throw std::logic_error("native feedback contains invalid persistent-K mass");
+-                    values[j*item.columns+col]=value;
++                    values[std::size_t(row)*item.columns+col]=value;
+                 }
+             }
+         }
+@@ -715,19 +726,20 @@ struct NativeLayerwiseRequest::Impl {
+             selected.push_back(static_cast<std::int32_t>(c.rows[i]-seen));positions.push_back(static_cast<std::int32_t>(c.local_begin+c.rows[i]));destinations.push_back(i);
+         }
+         DeviceBinding binding(p.device.rank(frame.identity.rank).device);
++        const auto staging=feedback_staging();
+         try {
+             // Keep native control validation even when this layer has no sampled mass.
+             if (c.sampled_preview && selected.empty()) {
+                 const auto control_bytes=(std::size_t(count)+1)*sizeof(std::int32_t);
+-                const auto capacity=p.memory_statistics_host->size();
++                const auto capacity=staging.size();
+                 if (control_bytes>capacity) throw std::length_error("feedback control exceeds pinned storage");
+                 if (control_bytes>capacity-pinned_used || readbacks.size()==readbacks.capacity() ||
+                     (!readbacks.empty() && readback_stream!=frame.producer_stream))
+                     flush_readbacks();
+                 auto* controls=reinterpret_cast<std::int32_t*>(
+-                    static_cast<std::byte*>(p.memory_statistics_host->data())+pinned_used);
++                    staging.data()+pinned_used);
+                 readback_stream=frame.producer_stream;
+-                readbacks.push_back({index,0,0,count,c.local_begin+seen,static_cast<std::uint32_t>(table),controls,nullptr});
++                readbacks.push_back({index,0,0,count,c.local_begin+seen,static_cast<std::uint32_t>(table),0,controls,nullptr,nullptr});
+                 pinned_used+=control_bytes;
+                 if (trace_feedback) {
+                     counters.pinned_peak=std::max<std::uint64_t>(counters.pinned_peak,pinned_used);
+@@ -740,38 +752,40 @@ struct NativeLayerwiseRequest::Impl {
+                 const auto n=static_cast<std::int32_t>(std::min<std::size_t>(64,selected.size()-first));
+                 auto rows=shard.attention_rows.slice(0,0,n),ends=shard.attention_positions.slice(0,0,n);
+                 auto scratch=shard.attention_scratch.slice(2,0,n),norms=shard.attention_norms.slice(2,0,n),mass=shard.attention_output.slice(1,0,n);
+-                const auto bytes=mass.bytes();if (bytes>p.memory_statistics_host->size()) throw std::length_error("native feedback readback exceeds pinned account");
++                const auto bytes=mass.bytes();if (bytes>staging.size()) throw std::length_error("native feedback readback exceeds pinned account");
+                 auto timer=trace_feedback && c.output?FeedbackClock::now():FeedbackClock::time_point{};
+                 if (trace_feedback && c.output) { ++counters.tiles;counters.bytes+=bytes; }
+-                const std::size_t control_bytes=(3*std::size_t(count)+1)*sizeof(std::int32_t);
+-                const auto capacity=p.memory_statistics_host->size();
++                const std::size_t control_bytes=(2*std::size_t(n)+count+1)*sizeof(std::int32_t);
++                const auto capacity=staging.size();
+                 // Deferred Output enumerates rows [0,count) before acceptance.
+-                const bool dense_graph_rows=batch_readback && graph_epoch && c.deferred_output &&
++                // Preserve the sparse selected-row indices alongside mass, so
++                // partial DFlash acceptance can use the same asynchronous path.
++                const bool graph_rows=batch_readback && graph_epoch && c.deferred_output &&
+                     p.device.size()==1 && !tensor &&
+                     p.speculative_backend==SpeculativeBackend::DFlash2 && !seen && count==c.count &&
+-                    n==static_cast<std::int32_t>(count) && selected.size()==count && first==0;
+-                if (dense_graph_rows && control_bytes<=capacity-bytes) {
++                    c.rows.size()==count && first==0;
++                if (graph_rows && control_bytes<=capacity-bytes) {
+                     const auto required=control_bytes+bytes;
+                     if (required>capacity-pinned_used || readbacks.size()==readbacks.capacity() ||
+                         (!readbacks.empty() && readback_stream!=frame.producer_stream))
+                         flush_readbacks();
+-                    auto* base=static_cast<std::byte*>(p.memory_statistics_host->data())+pinned_used;
++                    auto* base=staging.data()+pinned_used;
+                     auto* ids=reinterpret_cast<std::int32_t*>(base);
+-                    auto* ends_host=ids+count;
+-                    auto* actual=ends_host+count;
++                    auto* ends_host=ids+n;
++                    auto* actual=ends_host+n;
+                     auto* values=reinterpret_cast<float*>(base+control_bytes);
+-                    std::copy_n(selected.data(),count,ids);
+-                    std::copy_n(positions.data(),count,ends_host);
++                    std::copy_n(selected.data(),n,ids);
++                    std::copy_n(positions.data(),n,ends_host);
+                     readback_stream=frame.producer_stream;
+                     readbacks.push_back({index,columns,std::size_t(mass.ne[0]),count,c.local_begin,
+-                        static_cast<std::uint32_t>(table),actual,values});
++                        static_cast<std::uint32_t>(table),static_cast<std::uint32_t>(n),actual,values,ids});
+                     pinned_used+=required;
+                     if (trace_feedback) {
+                         counters.pinned_peak=std::max<std::uint64_t>(counters.pinned_peak,pinned_used);
+                         counters.control_bytes+=(count+1)*sizeof(*actual);
+                     }
+-                    CUDA_CHECK(cudaMemcpyAsync(rows.data,ids,count*4,cudaMemcpyHostToDevice,readback_stream));
+-                    CUDA_CHECK(cudaMemcpyAsync(ends.data,ends_host,count*4,cudaMemcpyHostToDevice,readback_stream));
++                    CUDA_CHECK(cudaMemcpyAsync(rows.data,ids,n*4,cudaMemcpyHostToDevice,readback_stream));
++                    CUDA_CHECK(cudaMemcpyAsync(ends.data,ends_host,n*4,cudaMemcpyHostToDevice,readback_stream));
+                     CUDA_CHECK(cudaMemcpyAsync(actual,frame.table_rows.data,4,cudaMemcpyDeviceToHost,readback_stream));
+                     CUDA_CHECK(cudaMemcpyAsync(actual+1,frame.cache_positions.data,count*4,cudaMemcpyDeviceToHost,readback_stream));
+                     auto cache=p.decoder->text_kv.batch_layer_view(frame.identity.attention_layer,0);
+@@ -800,7 +814,7 @@ struct NativeLayerwiseRequest::Impl {
+                 }
+                 ops::attention_page_mass(frame.query,rows,ends,table,cache,scratch,norms,mass,frame.producer_stream);
+                 if (sample_device) CUDA_CHECK(cudaEventRecord(events.kernel_done,frame.producer_stream));
+-                CUDA_CHECK(cudaMemcpyAsync(p.memory_statistics_host->data(),mass.data,bytes,cudaMemcpyDeviceToHost,frame.producer_stream));
++                CUDA_CHECK(cudaMemcpyAsync(staging.data(),mass.data,bytes,cudaMemcpyDeviceToHost,frame.producer_stream));
+                 if (sample_device) CUDA_CHECK(cudaEventRecord(events.copy_done,frame.producer_stream));
+                 if (trace_feedback && c.output) { counters.submit_ms+=milliseconds(timer);timer=FeedbackClock::now(); }
+                 CUDA_CHECK(cudaStreamSynchronize(frame.producer_stream));
+@@ -821,14 +835,14 @@ struct NativeLayerwiseRequest::Impl {
+                     }
+                     weighted.resize(n);
+                     AttentionPageMassAccumulator sum(weighted,pages,1,p.parameters.model.config().text.attention->num_attention_heads);
+-                    sum.add({static_cast<const float*>(p.memory_statistics_host->data()),std::size_t(mass.ne[0])*n},
++                    sum.add({reinterpret_cast<const float*>(staging.data()),std::size_t(mass.ne[0])*n},
+                         mass.ne[0],head->count);
+                     // Keep dense zero columns. finish() sparsifies GraphEdges
+                     // for legacy graph consumers, not per-layer core packets.
+                 }
+                 for (std::int32_t j=0;j<n;++j) {
+                     if (actual_positions.at(selected[first+j])!=positions[first+j]) throw std::logic_error("native feedback original/compact position mismatch");
+-                    const auto* values=static_cast<const float*>(p.memory_statistics_host->data())+std::size_t(j)*mass.ne[0];
++                    const auto* values=reinterpret_cast<const float*>(staging.data())+std::size_t(j)*mass.ne[0];
+                     for (std::size_t col=0;col<columns;++col) {
+                         if (!std::isfinite(values[col]) || values[col]<0) throw std::logic_error("native feedback contains invalid persistent-K mass");
+                         auto& value=found->masses[destinations[first+j]*columns+col];
+@@ -1341,6 +1355,38 @@ void NativeLayerwiseRequest::prepare_graph_output(std::uint64_t epoch,std::uint3
+         throw std::logic_error("native graph row lacks its untouched exact physical grant");
+     q.graph_epoch=epoch;q.graph_row=packed_row;q.native_started=true;
+ }
++std::size_t NativeLayerwiseRequest::graph_readback_bytes() {
++    auto& q=*impl_;q.owner();
++    if (!q.graph_epoch || !q.capture || !q.capture->deferred_output || !q.readbacks.empty())
++        throw std::logic_error("native feedback staging has no untouched graph frame");
++    const auto capacity=q.p.memory_statistics_host->size();
++    if (!q.batch_readback || q.p.device.size()!=1 || !q.target_heads.empty() ||
++        q.p.speculative_backend!=SpeculativeBackend::DFlash2) return capacity;
++    auto& c=*q.capture;q.prepare_sampled_preview(c);
++    std::size_t sampled=0;
++    for (auto row:c.rows)
++        sampled+=!c.sampled_preview || (*c.sampled_preview & (std::uint64_t(1)<<row))!=0;
++    const auto columns=std::size_t(q.p.memory_statistics->ranks.at(0).attention_output.ne[0]);
++    const auto frame=(2*sampled+c.count+1)*sizeof(std::int32_t)+sampled*columns*sizeof(float);
++    const auto depth=std::min(q.readbacks.capacity(),c.layers.size());
++    if (!depth || !frame) throw std::logic_error("native feedback staging has no bounded queue");
++    // Fit one complete queue where possible, avoiding extra flushes merely
++    // because a peer joined the cohort. The full Program capacity remains the
++    // bound for a single large frame or a long queue.
++    return frame>capacity/depth?capacity:frame*depth;
++}
++void NativeLayerwiseRequest::bind_graph_readback(std::span<std::byte> staging) {
++    auto& q=*impl_;q.owner();
++    const auto* base=static_cast<const std::byte*>(q.p.memory_statistics_host->data());
++    const auto capacity=q.p.memory_statistics_host->size();
++    if (!q.graph_epoch || staging.empty() || !q.readbacks.empty() || !q.capture ||
++        std::any_of(q.capture->seen.begin(),q.capture->seen.end(),[](auto n){return n!=0;}) ||
++        staging.data()<base || staging.data()>base+capacity ||
++        staging.size()>std::size_t(base+capacity-staging.data()) ||
++        (staging.data()-base)%alignof(float))
++        throw std::logic_error("native graph readback slice is not an untouched Program allocation");
++    q.graph_staging=staging;
++}
+ void NativeLayerwiseRequest::validate_graph_output_complete(std::uint64_t epoch) const {
+     auto& q=*impl_;q.owner();
+     if (!epoch || q.graph_epoch!=epoch || !q.capture || !q.capture->output ||
+@@ -1355,7 +1401,7 @@ void NativeLayerwiseRequest::validate_graph_output_complete(std::uint64_t epoch)
+     }
+ }
+ void NativeLayerwiseRequest::complete_graph_output(std::uint64_t epoch) noexcept {
+-    if (impl_->graph_epoch==epoch) impl_->graph_epoch=0;
++    if (impl_->graph_epoch==epoch) {impl_->graph_epoch=0;impl_->graph_staging={};}
+ }
+ void NativeLayerwiseRequest::abort_graph_output(std::uint64_t epoch) noexcept {
+     auto& q=*impl_;if (q.graph_epoch!=epoch) return;
+@@ -1363,7 +1409,7 @@ void NativeLayerwiseRequest::abort_graph_output(std::uint64_t epoch) noexcept {
+         (void)cudaStreamSynchronize(q.readback_stream);
+         q.readbacks.clear();q.pinned_used=0;
+     }
+-    q.graph_epoch=0;q.failed=true;q.sequence.window.stamp.valid=false;
++    q.graph_epoch=0;q.graph_staging={};q.failed=true;q.sequence.window.stamp.valid=false;
+ }
+ NativeLayerwiseOutputWork NativeLayerwiseRequest::output_work() const noexcept {return impl_->output_work;}
+ bool NativeLayerwiseRequest::query_due() const {return impl_->window.action(impl_->state())==kvmem::LayerwiseWindowAction::Query;}
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.h b/src/models/qwen3_5/program/native_layerwise_request.h
+index 5b06af93..cd2e3b50 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.h
++++ b/src/models/qwen3_5/program/native_layerwise_request.h
+@@ -102,6 +102,10 @@ public:
+     // Borrow the cohort epoch only. Storage arm/fence/release belongs to the
+     // complete native unit; one owner cannot release another row's capture.
+     void prepare_graph_output(std::uint64_t epoch,std::uint32_t physical_rows,std::uint32_t packed_row);
++    // After the graph fence, size from this owner's actual selected rows. The
++    // cohort lends bounded, disjoint slices only for its current readback group.
++    std::size_t graph_readback_bytes();
++    void bind_graph_readback(std::span<std::byte>);
+     void validate_graph_output_complete(std::uint64_t epoch) const;
+     void complete_graph_output(std::uint64_t epoch) noexcept;
+     void abort_graph_output(std::uint64_t epoch) noexcept;
+diff --git a/src/models/qwen3_5/program/native_output_cohort.cpp b/src/models/qwen3_5/program/native_output_cohort.cpp
+index a4232f73..6cdfd36f 100644
+--- a/src/models/qwen3_5/program/native_output_cohort.cpp
++++ b/src/models/qwen3_5/program/native_output_cohort.cpp
+@@ -2,9 +2,20 @@
+ #include "models/qwen3_5/program/program_impl.h"
+ #include "models/qwen3_5/program/native_graph_feedback.h"
+ #include <algorithm>
++#include <cstdlib>
++#include <cstring>
+ #include <stdexcept>
+ 
+ namespace ninfer::models::qwen3_5::detail {
++namespace {
++bool batch_cohort_readbacks() {
++    static const bool enabled=[] {
++        const auto* value=std::getenv("NINFER_BATCH_COHORT_FEEDBACK");
++        return !value || std::strcmp(value,"1")==0;
++    }();
++    return enabled;
++}
++}
+ NativeLayerwiseDecodePreparation::NativeLayerwiseDecodePreparation(ProgramImpl& p,
+     std::span<const std::uint32_t> lanes):p_(p) {
+     if (p.kvmem_options.recall_strategy!=kvmem::RecallStrategy::Layerwise) return;
+@@ -104,20 +115,32 @@ void NativeLayerwiseOutputCohort::collect_graph() {
+     // All K/scales and mappings are still the same as at each captured native
+     // attention. Populate every row's PRIVATE matrix before Native Rawresolve.
+     const auto count=width_*size_;
+-    // DFlash2 feedback can queue asynchronous copies into the same Program
+-    // staging buffer. Drain and validate one owner before reusing it for a peer.
+-    const bool shared_readbacks=p_.device.size()==1 && p_.speculative_backend==SpeculativeBackend::DFlash2;
+-    const auto group=shared_readbacks?1U:size_;
+-    for (std::uint32_t first=0;first<size_;first+=group) {
++    // Queue all owners in a bounded group before waiting. Every owner has a
++    // disjoint pinned slice; shared device scratch is consumed in stream order.
++    const bool asynchronous=p_.device.size()==1 && p_.speculative_backend==SpeculativeBackend::DFlash2;
++    auto* base=static_cast<std::byte*>(p_.memory_statistics_host->data());
++    const auto capacity=p_.memory_statistics_host->size();
++    for (std::uint32_t first=0;first<size_;) {
++        auto end=first;std::size_t used=0;
++        while (end<size_) {
++            const auto bytes=asynchronous && batch_cohort_readbacks()?
++                rows_[end].owner->graph_readback_bytes():capacity;
++            if (bytes>capacity-used) break;
++            rows_[end].owner->bind_graph_readback({base+used,bytes});
++            ++end;
++            if (asynchronous) used+=bytes;
++        }
++        if (end==first) throw std::logic_error("native graph feedback group exceeds Program staging");
+         for (const auto& slot:graph_storage_->view().slots) {
+             const auto query=slot.query.slice(2,0,static_cast<std::int32_t>(count));
+             const auto positions=slot.positions.slice(0,0,static_cast<std::int32_t>(count));
+             const auto tables=slot.table_rows.slice(0,0,static_cast<std::int32_t>(size_));
+             attended({{slot.model_layer,slot.attention_layer,slot.rank},query,positions,tables,
+-                p_.device.stream_for_rank(slot.rank)},first,first+group);
++                p_.device.stream_for_rank(slot.rank)},first,end);
+         }
+-        for (auto row=first;row<first+group;++row)
++        for (auto row=first;row<end;++row)
+             rows_[row].owner->validate_graph_output_complete(graph_epoch_);
++        first=end;
+     }
+     // Complete all checks before clearing any borrowed pending owner tag.
+     for (std::uint32_t row=0;row<size_;++row)
+diff --git a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp
+index c3760129..09e0e64a 100644
+--- a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp
++++ b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp
+@@ -88,24 +88,38 @@ kvmem::ExecutionView restore_native_layer_stripe(
+             throw std::logic_error("native stripe restore requires an eager Program boundary");
+     }
+     // All metadata and geometry checks precede the first native mutation.
+-    // Per-page immutable sources remain cold; the one bounded pinned staging
+-    // record is reused only after every producer-rank copy has drained.
++    // Pack several immutable layer stripes into the already admitted pinned
++    // buffer. Consecutive destination pages can then use the pool's strided
++    // native copy, with one producer fence per batch instead of per page.
++    // Both metadata and transfer memory stay bounded independently of history.
++    constexpr std::size_t max_batch=64;
++    const auto capacity=std::min(max_batch,staging.size()/host.page_stride);
++    std::array<const std::byte*,max_batch> records{};
++    std::array<DeviceKVPageHandle,max_batch> destinations{};
+     Drain drain{device};
+-    for (std::size_t slot=0;slot<selected.size();++slot) {
+-        const auto& source=archive.records.at(static_cast<std::size_t>(selected[slot]));
+-        regions.read(source,0,staging.data(),static_cast<std::size_t>(regions.packed_bytes()));
+-        const std::array records{static_cast<const std::byte*>(staging.data())};
+-        const std::array destinations{addresses.physical_page(address,static_cast<std::uint32_t>(slot))};
++    for (std::size_t first=0;first<selected.size();) {
++        const auto count=std::min(capacity,selected.size()-first);
++        for (std::size_t i=0;i<count;++i) {
++            auto* packed=static_cast<std::byte*>(staging.data())+i*host.page_stride;
++            const auto& source=archive.records.at(static_cast<std::size_t>(selected[first+i]));
++            regions.read(source,0,packed,host.page_stride);
++            records[i]=packed;
++            destinations[i]=addresses.physical_page(address,static_cast<std::uint32_t>(first+i));
++        }
+         drain.armed=true;
+         for (auto plane:planes)
+-            pool.copy_from_host_records(records,{},destinations,host,plane,plane+1,streams);
++            pool.copy_from_host_records({records.data(),count},{},{destinations.data(),count},
++                host,plane,plane+1,streams);
+         drain.finish();
+-        if (verify) {
++        // All uploads must finish before diagnostic readback overwrites any
++        // packed source in this same buffer, including a partial final batch.
++        if (verify) for (std::size_t i=0;i<count;++i) {
++            const auto& source=archive.records.at(static_cast<std::size_t>(selected[first+i]));
+             // Diagnostic readback uses the existing full-page native API; it
+             // compares only the selected stripes, never calls them a canonical
+             // composite record and never inserts them into Host storage.
+             const std::array outputs{static_cast<std::byte*>(staging.data())};
+-            drain.armed=true;pool.copy_to_host_records(destinations,outputs,{},full_host,streams);drain.finish();
++            drain.armed=true;pool.copy_to_host_records({destinations.data()+i,1},outputs,{},full_host,streams);drain.finish();
+             std::array<std::byte,4096> reference;
+             for (const auto& region:regions.regions()) {
+                 std::uint64_t offset=0;
+@@ -120,6 +134,7 @@ kvmem::ExecutionView restore_native_layer_stripe(
+                 }
+             }
+         }
++        first+=count;
+     }
+     return checked.next;
+ }
+diff --git a/tests/models/qwen3_5/test_layerwise_kv_transfer.cpp b/tests/models/qwen3_5/test_layerwise_kv_transfer.cpp
+index e9ab9e0d..765ac259 100644
+--- a/tests/models/qwen3_5/test_layerwise_kv_transfer.cpp
++++ b/tests/models/qwen3_5/test_layerwise_kv_transfer.cpp
+@@ -118,12 +118,107 @@ void qualify(DeviceContext& device,PagedKVPlaneOrder order) {
+         "cold layer transfer leaked native physical ownership");
+     std::cout<<"cold native layer restore order="<<int(order)<<" independent maps, shared slots, K/V/scales exact, RAM=0, immutable checkpoint retained\n";
+ }
++
++// Exercise contiguous native copy runs, bounded staging, multiple batches and
++// a final short batch. The byte oracle includes the untouched peer layer.
++void qualify_batches(DeviceContext& device,PagedKVPlaneOrder order,
++    std::size_t staging_records,bool verify) {
++    constexpr std::uint32_t selected_count=67,source_count=selected_count+2;
++    LayoutBuilder builder;DeviceKVPagePoolSpec spec;
++    spec.page_group_count=selected_count+2;spec.geometry.page_tokens=64;
++    spec.geometry.device_plane_order=order;
++    for (int layer=0;layer<2;++layer) {
++        spec.geometry.planes.push_back({DType::I8,8,2});
++        spec.geometry.planes.push_back({DType::I8,8,2});
++        spec.geometry.planes.push_back({DType::FP16,1,2});
++        spec.geometry.planes.push_back({DType::FP16,1,2});
++    }
++    const auto layout=plan_device_kv_page_pool(builder,spec);
++    const auto table_layout=plan_kv_execution_tables(builder,{selected_count,1});
++    DeviceArena arena(builder.finish(256));const DeviceSpan backing{arena.base(),arena.capacity()};
++    DeviceKVPagePool pool(backing,layout);KVExecutionTablePool tables(backing,table_layout,pool);
++    store::LogicalKVPageStore pages(pool,selected_count+2);
++    store::KVAddressSpaceStore addresses(pages,tables,2,selected_count);
++    const auto address=addresses.create_active(selected_count,0,device.stream);
++    check(bool(address),"batch destination admission failed");
++    addresses.ensure_mapped_to_tokens(*address,selected_count*64,device.stream);
++    const auto host=plan_host_kv_page_layout(pool.geometry());
++    kvmem::MemoryDescriptor descriptor;
++    descriptor.identity={"ninfer-batch-stripe-fixture","native-v1","two-layers","state-v1"};
++    descriptor.layout={"native-i8-fp16-scales",1,64,host.page_stride,256,{}};
++    const std::array kinds{kvmem::PayloadPlaneKind::Key,kvmem::PayloadPlaneKind::Value,
++        kvmem::PayloadPlaneKind::KeyScale,kvmem::PayloadPlaneKind::ValueScale};
++    for (std::size_t p=0;p<host.planes.size();++p)
++        descriptor.layout.planes.push_back({p<4?3u:7u,kinds[p%4],host.planes[p].offset,
++            host.planes[p].page_payload_bytes,256,0,0,0,2});
++    descriptor.capabilities={64,8192,true,true,true,true,true,true};descriptor.validate();
++    kvmem::MemorySnapshot source;source.stamp={true,{21,3},7,4,source_count*64,11};
++    std::vector<std::uint64_t> selected;
++    for (std::uint64_t i=0;i<source_count;++i) {
++        source.blocks.push_back({{{21,3},i,i*64,64,1,1},1});
++        if (i>0 && i+1<source_count) selected.push_back(i);
++    }
++    auto spill=std::make_shared<kvmem::SpillFile>(std::filesystem::current_path(),source_count*host.page_stride);
++    kvmem::HostKvStorage storage(host.page_stride,spill);
++    store::NativeFrozenLayerArchive archive{descriptor,source,{}};
++    std::vector<std::vector<std::byte>> expected(source_count);
++    std::vector<kvmem::HostKvRecord> records;
++    for (std::size_t r=0;r<source_count;++r) {
++        auto& bytes=expected[r];bytes.resize(host.page_stride);
++        for (std::size_t p=0;p<host.planes.size();++p)
++            for (std::size_t d=0;d<host.planes[p].page_payload_bytes;++d)
++                bytes[host.planes[p].offset+d]=std::byte((r*71+p*29+d*7+3)%251);
++        records.push_back(storage.allocate(bytes.size(),bytes.data()));records.back().seal();
++        archive.records.push_back(records.back().source());
++    }
++    storage.trim(0);const auto disk_before=storage.disk_bytes();
++    PinnedHostBuffer io(host.page_stride);
++    std::memcpy(io.data(),expected[0].data(),io.size());
++    for (std::uint32_t i=0;i<selected_count;++i) {
++        const std::array input{static_cast<const std::byte*>(io.data())};
++        const std::array dest{addresses.physical_page(*address,i)};
++        pool.copy_from_host_records(input,{},dest,host,device.stream);
++    }
++    device.synchronize();
++    kvmem::LayerwiseMemoryCatalog catalog(descriptor,{{3,source},{7,source}});
++    const kvmem::MemoryBudget budget{selected_count*64,0,source_count*64,source_count*host.page_stride};
++    const auto plan=catalog.plan_layer({3,source.stamp,selected,{},budget});
++    PinnedHostBuffer staging(std::max<std::size_t>(verify?host.page_stride:0,
++        staging_records*plan.payload.packed_bytes()));
++    const auto restored=store::restore_native_layer_stripe(archive,source,plan,pool,addresses,*address,
++        device,RankStreams::compute(device),staging,0,verify);
++    check(restored.blocks.size()==selected_count,"batch restore changed the selected set");
++    for (std::uint32_t i=0;i<selected_count;++i) {
++        const std::array src{addresses.physical_page(*address,i)};
++        const std::array dst{static_cast<std::byte*>(io.data())};
++        pool.copy_to_host_records(src,dst,{},host,device.stream);device.synchronize();
++        auto composite=expected[0];
++        for (std::size_t p=0;p<4;++p)
++            std::memcpy(composite.data()+host.planes[p].offset,
++                expected[selected[i]].data()+host.planes[p].offset,host.planes[p].page_payload_bytes);
++        check(std::memcmp(io.data(),composite.data(),io.size())==0,
++            "batch restore changed native K/V/scales, slot order or an untouched stripe");
++    }
++    check(addresses.committed_frontier(*address)==0 && storage.charged_bytes()==0 &&
++        storage.disk_bytes()==disk_before,"batch restore published or promoted canonical history");
++    check(addresses.release_after_deactivate(*address) && pool.allocated_pages()==0,"batch restore leaked a physical page");
++    std::cout<<"batch native layer restore order="<<int(order)<<" staging_records="<<staging_records
++        <<" verify="<<verify<<" pages="<<selected_count<<" exact\n";
++}
+ }
+ int main() {
+     try {
+         int count=0;const auto status=cudaGetDeviceCount(&count);
+         if (ninfer::test::cuda_unavailable(status) || (status==cudaSuccess && !count)) return 77;
+         CUDA_CHECK(status);DeviceContext device(0);
+-        qualify(device,PagedKVPlaneOrder::PageMajor);qualify(device,PagedKVPlaneOrder::HeadMajor);return 0;
++        for (auto order:{PagedKVPlaneOrder::PageMajor,PagedKVPlaneOrder::HeadMajor}) {
++            qualify(device,order);
++            qualify_batches(device,order,1,false);
++            qualify_batches(device,order,2,false);
++            qualify_batches(device,order,80,false);
++            qualify_batches(device,order,2,true);
++            qualify_batches(device,order,80,true);
++        }
++        return 0;
+     } catch (const std::exception& error) { std::cerr<<error.what()<<'\n';return 1; }
+ }
