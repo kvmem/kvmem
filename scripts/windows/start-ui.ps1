@@ -12,8 +12,18 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+
+if (Test-Path -LiteralPath (Join-Path $root 'bin/amdhip64_7.dll') -PathType Leaf) {
+    $env:ROCM_PATH = $root
+    $env:HIP_PATH = $root
+    $env:PATH = (Join-Path $root 'bin') + [IO.Path]::PathSeparator + $env:PATH
+    if (!$env:RADIANCE_LOAD_STAGING_MIB) { $env:RADIANCE_LOAD_STAGING_MIB = '128' }
+    if (!$env:RADIANCE_LOAD_WORKERS) { $env:RADIANCE_LOAD_WORKERS = '1' }
+    if (!$env:RADIANCE_LOAD_WINDOW_MIB) { $env:RADIANCE_LOAD_WINDOW_MIB = '16' }
+    if (!$env:RADIANCE_LOAD_RELEASE_PAGES) { $env:RADIANCE_LOAD_RELEASE_PAGES = '1' }
+}
 try {
-    foreach ($relative in 'scripts/local-console.py', 'scripts/console_chat.py', 'scripts/model_health.py', 'scripts/console_hardware.py', 'scripts/console_memory.py',
+    foreach ($relative in 'scripts/local-console.py', 'scripts/console_chat.py', 'scripts/console_state.py', 'scripts/model_health.py', 'scripts/console_hardware.py', 'scripts/console_memory.py',
                           'scripts/launcher/__init__.py', 'scripts/launcher/config.py', 'scripts/launcher/plan.py',
                           'scripts/launcher/export.py', 'scripts/launcher/systemd.py', 'scripts/launcher/worker.py', 'scripts/launcher-capabilities.json',
                           'scripts/launcher/recall.py', 'scripts/check-recall-worker.py', 'scripts/windows/recall-strategy.ps1',
@@ -78,7 +88,7 @@ try {
     if ($PromptAddress) { $arguments += '--prompt-address' }
     $bundledWorkers = @(
         'ninfer-kvmem-server.exe', 'ninfer-serve.exe', 'llama-kvmem-server.exe',
-        'bin/ninfer-kvmem-server.exe', 'bin/ninfer-serve.exe', 'bin/llama-kvmem-server.exe',
+        'bin/radiance-kvmem-server.exe', 'bin/ninfer-kvmem-server.exe', 'bin/ninfer-serve.exe', 'bin/llama-kvmem-server.exe',
         'workers/ninfer/ninfer-kvmem-server.exe', 'workers/ninfer/ninfer-serve.exe',
         'workers/llamacpp/llama-kvmem-server.exe', 'workers/polystrata/strata-poly.exe'
     ) | ForEach-Object { Join-Path $root $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }

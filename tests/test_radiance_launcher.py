@@ -131,7 +131,7 @@ class RadiancePlanTest(unittest.TestCase):
         self.assertEqual(args[args.index('--num-speculative-tokens')+1],'0')
         self.assertEqual(args[args.index('--kvmem-drafter')+1],'off')
 
-    def test_windows_dflash7_text_capture_profile(self):
+    def test_windows_single_request_capture_profile(self):
         container(self.model, ['dflash.fc.weight'], [
             ('draft.architectures', 'DFlash2Model'), ('draft.dflash_config.block_size', 8),
         ], quant='w8a8_fwht128')
@@ -141,9 +141,9 @@ class RadiancePlanTest(unittest.TestCase):
         flags = ('KVMEM_CAPTURE_EARLY_SEAL', 'RADIANCE_HIP_SMALL_D2H')
         for platform, overrides, enabled in [
             ('windows', {}, True), ('linux', {}, False),
-            ('windows', {'Concurrency': 2}, False), ('windows', {'SpeculativeMode': 'none'}, False),
+            ('windows', {'Concurrency': 2}, False), ('windows', {'SpeculativeMode': 'none'}, True),
             ('windows', {'Gpu': 'GPU-65471d75ce486b4f,GPU-0000000000000001'}, False),
-            ('windows', {'Vision': True}, False),
+            ('windows', {'Vision': True}, True),
         ]:
             with self.subTest(platform=platform, overrides=overrides), mock.patch(
                     'launcher.radiance.vision_geometry', return_value=(16, 2)):
@@ -156,10 +156,41 @@ class RadiancePlanTest(unittest.TestCase):
                     ('draft.architectures', 'DFlash2Model'), ('draft.dflash_config.block_size', block_size),
                 ], quant=quant)
                 plan = build_radiance_plan(parameters, self.root, 'windows', False, {})
-                self.assertTrue(all(key not in plan['environment'] for key in flags))
+                self.assertTrue(all(plan['environment'].get(key) == '1' for key in flags))
         container(self.model, ['mtp.fc.weight'], [('mtp_num_hidden_layers', 1)], quant='w8a8_fwht128')
         plan = build_radiance_plan({**parameters, 'SpeculativeMode': 'mtp'}, self.root, 'windows', False, {})
-        self.assertTrue(all(key not in plan['environment'] for key in flags))
+        self.assertTrue(all(plan['environment'].get(key) == '1' for key in flags))
+
+    def test_windows_capture_opt_out_and_recipe_omission(self):
+        flags = ('KVMEM_CAPTURE_EARLY_SEAL', 'RADIANCE_HIP_SMALL_D2H')
+        parameters = dict(Backend='radiance', Model=str(self.model), Worker=str(self.worker),
+                          RadianceHome=str(self.home), Gpu='GPU-65471d75ce486b4f')
+        for disabled in flags:
+            with self.subTest(disabled=disabled), mock.patch.dict(os.environ, {disabled:'0'}):
+                p = build_radiance_plan(parameters, self.root, 'windows', False, {})
+                self.assertEqual(p['environment'][disabled], '0')
+                self.assertEqual(p['environment'][next(k for k in flags if k != disabled)], '1')
+        p = self.plan()
+        self.assertNotIn('--reasoning-effort', p['argv'])
+        self.assertFalse(p['effective_parameters']['Vision'])
+        self.assertEqual(p['effective_parameters']['SpeculativeMode'], 'none')
+
+    def test_explicit_speed_recipe_and_user_overrides(self):
+        from launcher.config import ENGINE_DEFAULTS
+        recipe = ENGINE_DEFAULTS['radiance']
+        self.assertEqual((recipe['HostMiB'], recipe['SinkTokens'], recipe['RecentTokens']), (12288,12288,1024))
+        container(self.model, ['dflash.fc.weight'], [
+            ('draft.architectures', 'DFlash2Model'), ('draft.dflash_config.block_size', 8)])
+        with mock.patch('launcher.radiance.vision_geometry', return_value=(16,2)):
+            p = self.plan(**recipe)
+            self.assertEqual(p['argv'][p['argv'].index('--reasoning-effort')+1], 'xhigh')
+            self.assertEqual(p['effective_parameters']['VisionTokens'], 256)
+            self.assertTrue(p['effective_parameters']['PreserveThinking'])
+            saved = dict(recipe, ThinkingMode='off', PreserveThinking=False)
+            saved.pop('ReasoningEffort')
+            p = self.plan(**saved)
+            self.assertEqual(p['argv'][p['argv'].index('--reasoning-effort')+1], 'none')
+            self.assertFalse(p['effective_parameters']['PreserveThinking'])
 
     def test_windows_hip_selection_uses_current_physical_ordinals(self):
         first, second = ('GPU-' + x * 32 for x in ('a', 'b'))

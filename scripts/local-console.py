@@ -90,7 +90,11 @@ def private_log(path, *, truncate=False):
 
 
 def prepare_state_directory(path):
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == 'nt':
+        from console_state import prepare_windows_state_directory
+        prepare_windows_state_directory(path)
+    else:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != 'nt':
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
@@ -199,6 +203,7 @@ class Controller:
         self.worker_cache = {}
         self.observed_scoring = {}
         self.observed_service = None
+        self.radiance_template_observation = None
         self.observed_offset = 0
         self.observed_pending = ''
         self.instance = secrets.token_hex(12)
@@ -287,6 +292,10 @@ class Controller:
 
     def parse_scoring(self, lines):
         for line in lines:
+            if "a request naming no reasoning_effort" in line:
+                match = re.fullmatch(r"I chat: a request naming no reasoning_effort renders as '([a-z]+)', the template's own default \(--reasoning-effort sets another\)", line.strip())
+                if match:
+                    self.radiance_template_observation = (self.instance, match[1])
             for marker in ('KVMEM_SCORING ', 'KVMEM_LIMITS ', 'KVMEM_BLOCKS ', 'KVMEM_RECALL ', 'KVMEM_RECALL_STRATEGY ', 'KVMEM_CHECKPOINT_RETENTION ', 'INFO '):
                 if marker not in line:
                     continue
@@ -744,6 +753,9 @@ class Controller:
                       'active_config': without_secrets(self.active) if self.active else None,
                       'api_key_configured': bool(self.active and self.active['parameters'].get('ApiKey')), 'url': None}
             result['owner'] = 'temporary' if self.active else None
+            observation = self.radiance_template_observation
+            if running and observation and observation[0] == self.instance and (self.active or {}).get('parameters', {}).get('Backend') == 'radiance':
+                result['radiance_template_effort'] = observation[1]
             if self.service_selection:
                 result.update(owner='systemd', service=service, service_error=service_error,
                               pid=service['pid'] if service else None)
@@ -1417,7 +1429,7 @@ class Handler(BaseHTTPRequestHandler):
                             snapshot=self.control.chat.get_json(state,'/api/monitor/snapshot')
                             if state.get('instance')!=self.control.status().get('instance'):
                                 raise ValueError('Service changed while reading runtime data')
-                            body=enrich_props(json.loads(body),info,snapshot)
+                            body=enrich_props(json.loads(body),info,snapshot,state.get('radiance_template_effort'))
                         self.reply(response.status, body)
                 except urllib.error.HTTPError as error:
                     self.reply(error.code, {'error': 'Inference endpoint unavailable'})

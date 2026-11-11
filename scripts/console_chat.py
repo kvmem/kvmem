@@ -88,7 +88,7 @@ def context_payload(state, props, settings=None):
             if backend == 'ninfer' and key == 'PreserveThinking' and value is False: value = None
             put(field, value, 'launch')
     if backend == 'radiance' and settings:
-        for key,value in effective_settings(settings).items(): put(key,value)
+        for key,value in effective_settings(settings,state.get('radiance_template_effort')).items(): put(key,value)
     mode = launch.get('ThinkingMode')
     if 'enable_thinking' not in effective and mode in ('on','off'):
         put('enable_thinking', mode == 'on', 'launch')
@@ -123,12 +123,13 @@ def context_payload(state, props, settings=None):
         caps=settings.get('capabilities',{})
         capabilities.update(thinking=bool(caps.get('reasoning')),budget=bool(caps.get('reasoning')),
             preserve=bool(props.get('chat_template_caps',{}).get('supports_preserve_reasoning')),
-            efforts=caps.get('reasoning_efforts',[]),vision=bool(caps.get('image')))
+            efforts=caps.get('reasoning_efforts') or [],vision=bool(caps.get('image')))
     return {'schema_version':1, 'state':state['state'], 'instance':state.get('instance'),
             'backend':backend, 'model':props.get('model_name') or props.get('model_alias') or props.get('model'),
             'context':generation.get('n_ctx', launch.get('Context')),
             'limit':native.get('generation_limit') or generation.get('n_ctx') or launch.get('Context'),
             'effective':effective, 'sources':sources, 'capabilities':capabilities,
+            'uses_template_effort': backend == 'radiance' and bool(settings) and 'reasoning_effort' in settings.get('request_defaults', {}) and settings['request_defaults']['reasoning_effort'] is None and 'reasoning_effort' not in settings['request_defaults'].get('chat_template_kwargs', {}),
             'budget_min':1 if backend=='ninfer' else -1 if backend=='radiance' else 0,
             'sampling_by_mode':native.get('sampling', {}),
             'sampling_by_effort':{('xhigh' if backend == 'polystrata' and k == 'high' else k): v
