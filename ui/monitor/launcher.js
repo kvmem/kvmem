@@ -32,7 +32,7 @@
         key.placeholder='';delete key.dataset.launchKeyHidden;
       }
     }
-    draftStatus();renderBudgetAdjustment();
+    draftStatus();renderBudgetAdjustment();syncRecallStatus();
   }
   function syncRunningConfiguration(status){
     const running=['starting','ready'].includes(status.state);
@@ -199,6 +199,21 @@
     }
   }
   function resourceOverride(input){return input.dataset.workerDefault===undefined||input.value!==input.dataset.workerDefault;}
+  function syncRecallStatus(){
+    const box=root.querySelector('[data-worker-capability-status]');if(!box)return;
+    const layerwise=workerSelection().RecallStrategy==='layerwise';
+    box.hidden=!layerwise;
+    if(!layerwise)return;
+    const state=configurationLocked()?'running':workerError?(workerContract?'unsupported':'error'):currentWorkerProfile()?.available===true?'ready':'checking';
+    const labels={checking:['正在检查所选程序…','Checking the selected executable…'],ready:['所选程序声明支持分层召回','Selected executable declares layerwise support'],unsupported:['所选程序未声明分层召回支持','Selected executable does not declare layerwise support'],error:['暂时无法确认所选程序的支持情况','Could not check the selected executable'],running:['当前启动配置已锁定','Current launch configuration is locked']};
+    box.dataset.state=state;box.setAttribute('aria-busy',String(state==='checking'));
+    const note=box.querySelector('[data-worker-capability-note]'),text=tr(...labels[state]);
+    if(note.textContent!==text)note.textContent=text;
+    const retry=box.querySelector('[data-worker-capability-retry]');retry.hidden=!['error','unsupported'].includes(state);
+    const details=box.querySelector('details');details.hidden=['checking','running'].includes(state);
+    const identity=box.querySelector('[data-worker-capability-identity]');
+    identity.textContent=workerContract?tr('程序：','Executable: ')+workerContract.worker.path+'\nSHA256: '+workerContract.worker.executable_sha256:workerError;
+  }
   function workerBlocks(){return workerSelection().RecallStrategy==='layerwise'&&currentWorkerProfile()?.available!==true;}
   function scheduleWorkerCapabilities(force=false){
     if(!info||configurationLocked())return;
@@ -421,6 +436,18 @@
     for(let details=el?.closest('details');details;details=details.parentElement?.closest('details'))details.open=true;
     el?.scrollIntoView({block:'center',behavior:'smooth'});el?.focus();
   }
+  function reportLaunchValidity(){
+    const form=root.querySelector('form');
+    // Reveal only the first invalid field before the browser focuses it.
+    // Passive checks in the configuration dialog must not switch tabs.
+    const invalid=Array.from(form.elements).find(el=>el.willValidate&&!el.validity.valid);
+    if(invalid){
+      for(let parent=invalid.parentElement;parent&&parent!==form;parent=parent.parentElement)if(parent.tagName==='DETAILS')parent.open=true;
+      const panel=invalid.closest('[role=tabpanel]');
+      if(panel?.hidden)root.querySelector('#'+panel.getAttribute('aria-labelledby'))?.click();
+    }
+    return form.reportValidity();
+  }
   function launchData(){
     const data=collect(),p=data.parameters;
     if(p.RecallStrategy==='layerwise'&&info.recall_strategy_version!==1)throw Error(tr('请更新完整控制台以使用分层召回。','Update the complete console to use layerwise recall.'));
@@ -604,6 +631,10 @@
     const fraction=get('LrfuTopFraction');if(fraction)fraction.setCustomValidity(fraction.value!==''&&Number(fraction.value)<=0?tr('候选比例必须大于 0。','The reward fraction must be greater than 0.'): '');
     const backend=get('Backend').value,mode=get('SpeculativeMode')?.value||'none';
     const layerwise=get('RecallStrategy')?.value==='layerwise';
+    const scoringSection=root.querySelector('[data-graph-recall]');if(scoringSection)scoringSection.hidden=layerwise;
+    const description=root.querySelector('[data-recall-description]');if(description)description.textContent=layerwise?
+      tr('每层使用当前 Q 选择相关历史。下方可调整分层暂存预算。','Each layer selects relevant history with its current Q. Adjust layerwise storage budgets below.'):
+      tr('按当前问题检索历史，可组合评分算法、图传播与历史累计。','Retrieve history for the current question using scoring, graph propagation and accumulated relevance.');
     const layerwiseSection=root.querySelector('[data-layerwise-budgets]');if(layerwiseSection)layerwiseSection.hidden=!layerwise;
     for(const key of ['QueryScorer','ScoreAggregation','GraphAlpha','Lrfu','LrfuLambda','LrfuTopFraction','QueryMaxTokens','QueryReplayMaxTokens']){
       dependency(key,!layerwise&&(key!=='LrfuLambda'&&key!=='LrfuTopFraction'||history),tr('这些设置仅用于 Legacy 召回。','These settings apply to Legacy recall.'));
@@ -612,6 +643,8 @@
     for(const key of Object.keys(layerwiseResources))dependency(key,layerwise,tr('先选择分层召回。','Select layerwise recall first.'));
     get('LayerwiseActivationRamMiB')?.setCustomValidity(layerwise&&get('LayerwiseActivationRamMiB')?.value==='0'&&get('LayerwiseActivationDiskMiB')?.value==='0'?tr('前向暂存 RAM 或 SSD 预算必须大于 0。','Forward storage RAM or SSD budget must be positive.'):'');
     dependency('LayerwiseMtpHistory',layerwise&&mode==='mtp',tr('仅分层召回的 OWN MTP 使用此选择。','Applies only to layerwise OWN MTP.'));
+    const draftSection=root.querySelector('[data-layerwise-drafts]');if(draftSection)draftSection.hidden=!layerwise||!['mtp','dflash2','guess'].includes(mode);
+    if(get('LayerwiseMtpHistory'))get('LayerwiseMtpHistory').closest('label').hidden=mode!=='mtp';
     for(const key of ['SinkTokens','RecentTokens']){const el=get(key);if(el){el.dataset.legacyRequired??=String(el.required);el.required=layerwise?false:el.dataset.legacyRequired==='true';el.placeholder=layerwise?tr('自动','Auto'):'';}}
     const note=root.querySelector('[data-layerwise-draft-note]');if(note){note.hidden=!layerwise;note.textContent=mode==='dflash2'?tr('DFlash2 保留独立、完整的原生滑窗，不按目标层选页裁剪。','DFlash2 keeps its independent complete native sliding window; target selections do not trim it.'):mode==='guess'?tr('Gemma Guess 使用原生 SharedTarget/SWA 视图，不使用 OWN MTP 历史策略。','Gemma Guess uses its native SharedTarget/SWA view, without an OWN MTP history policy.'):tr('主模型逐层使用当前 Q。MTP 历史来源留空使用 worker 声明的默认值；未声明默认时必须选择。','The target uses current Q at each layer. Omit MTP history to use the worker-declared default; an explicit choice is required when none is declared.');}
     const profile=currentWorkerProfile();
@@ -649,8 +682,7 @@
     const historyChoice=get('LayerwiseMtpHistory');
     historyChoice?.setCustomValidity(layerwise&&mode==='mtp'&&historyChoice.value&&!baseCap.history_policies?.includes(historyChoice.value)?tr('此 worker 未验证所选 MTP 历史策略；当前选择已保留。','This worker does not qualify the selected MTP history policy; your selection is retained.'):'');
     for(const option of historyChoice?.options||[])option.disabled=layerwise&&mode==='mtp'&&!!option.value&&!baseCap.history_policies?.includes(option.value);
-    const workerNote=root.querySelector('[data-worker-capability-note]');
-    if(workerNote){workerNote.hidden=!layerwise;workerNote.textContent=layerwise?(workerError||(!workerContract?tr('正在读取所选 worker 的实际能力…','Reading the selected worker capabilities…'):tr('已读取 worker 能力：','Worker capabilities: ')+workerContract.worker.path+' · '+workerContract.worker.executable_sha256.slice(0,12))):'';}
+    syncRecallStatus();
     dependency('FastPrefill',['int8','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'].includes(get('KvType')?.value),tr('当前 KV 格式不支持快速预填充。','The current KV format does not support fast prefill.'));
     const gpu=get('Gpu'),gpuCount=gpu?.multiple?gpu.selectedOptions.length:(gpu?.value||'').split(',').filter(Boolean).length;
     const tensor=get('TensorParallel');
@@ -1084,44 +1116,60 @@
     field(panels[0],p,'SinkTokens','保留开头 · tokens','Keep prefix · tokens','number');field(panels[0],p,'RecentTokens','保留最近 · tokens','Keep recent · tokens','number');
     const retained=field(panels[0],{...p,RetainedSessions:poly?Math.max(0,p.RetainedSessions-1):p.RetainedSessions},'RetainedSessions','额外保留的空闲会话','Idle sessions to retain','number',null,['不含活动会话；PolyStrata 当前运行槽之外的历史保留目标，实际数量还受共享内存预算约束。','Excludes active sessions. Retention is also bounded by the shared memory budget.']);
     if(poly){retained.dataset.idleSessions='true';retained.max='15';}
-    const recallSection=(zh,en,badgeZh,badgeEn,noteZh,noteEn)=>{
+    const recallSection=(zh,en,noteZh,noteEn)=>{
       const box=make('section',{class:'l-recall-section l-wide'}),head=make('div',{class:'l-recall-heading'}),title=make('h3',{class:'s-title'},tr(zh,en));
-      help(title,tr(zh,en),tr(noteZh,noteEn));
-      head.append(title,make('span',{class:'l-recall-badge'},tr(badgeZh,badgeEn)));
-      const fields=make('div',{class:'l-fields'});box.append(head,fields);panels[5].append(box);return fields;
+      head.append(title);
+      const fields=make('div',{class:'l-fields'});box.append(head,make('p',{class:'l-recall-description'},tr(noteZh,noteEn)),fields);panels[5].append(box);return fields;
+    };
+    const recallAdvanced=(parent,key,zh,en)=>{
+      const details=make('details',{class:'l-recall-advanced l-wide',['data-recall-advanced']:key});
+      details.append(make('summary',{},tr(zh,en)));
+      const fields=make('div',{class:'l-fields'});details.append(fields);parent.append(details);return fields;
     };
     panels[5].classList.add('l-recall-panel');
-    const scoring=recallSection('历史检索','History retrieval','按问题召回','Query recall',
-      '按当前问题召回相关历史。评分、图传播与历史累计决定历史内容的相关性。',
-      'Recall history relevant to the current question. Scoring, graph propagation and accumulated history determine relevance.');
+    const strategy=recallSection('召回方式','Recall method','选择如何从长对话中找回相关历史。','Choose how to retrieve relevant history from long conversations.');
+    strategy.parentElement.classList.add('l-recall-strategy');
+    field(strategy,{RecallStrategy:'legacy',...p},'RecallStrategy','召回策略','Recall strategy','text',[
+      ['legacy',tr('经典召回 · Legacy','Classic recall · Legacy')],['layerwise',tr('分层召回 · 当前层 Q','Layerwise recall · current-layer Q')]
+    ]);
+    strategy.append(make('p',{class:'l-recall-description','data-recall-description':''}));
+    const capability=make('div',{class:'l-recall-capability l-wide','data-worker-capability-status':'',hidden:''});
+    const capabilityLine=make('div',{class:'l-recall-capability-line'});
+    capabilityLine.append(make('span',{'data-worker-capability-note':'',role:'status','aria-live':'polite'}));
+    const refreshCapabilities=()=>{scheduleWorkerCapabilities(true);syncDependencies();updateStatus(runtime);};
+    const retry=make('button',{type:'button',class:'s-button','data-worker-capability-retry':'',hidden:''},tr('重试','Retry'));retry.onclick=refreshCapabilities;capabilityLine.append(retry);
+    const capabilityDetails=make('details',{'data-worker-capability-details':''});
+    capabilityDetails.append(make('summary',{},tr('检测详情','Check details')),
+      make('p',{class:'l-recall-description'},tr('能力来自所选程序的声明；模型、KV 格式和草稿等组合仍需检查配置。','Support is declared by the selected executable; model, KV format and draft combinations still require configuration checks.')),
+      make('p',{'data-worker-capability-identity':''}));
+    const recheck=make('button',{type:'button',class:'s-button','data-worker-capability-refresh':''},tr('重新检测','Check again'));recheck.onclick=refreshCapabilities;
+    capabilityDetails.append(recheck);capability.append(capabilityLine,capabilityDetails);strategy.append(capability);
+    const scoring=recallSection('历史检索','History retrieval','调整经典召回的相关性评分。','Tune relevance scoring for classic recall.');
     scoring.parentElement.setAttribute('data-graph-recall','');
-    field(scoring,{RecallStrategy:'legacy',...p},'RecallStrategy','召回执行策略','Recall strategy','text',[
-      ['legacy','Legacy'],['layerwise',tr('分层 · 当前层 Q','Layerwise · current-layer Q')]
-    ],['分层召回使用当前前向的各层 Q；需要所选 worker 明确支持。旧配置保持 Legacy。','Layerwise recall uses each layer\'s Q from the current forward and requires explicit worker support. Existing configurations remain Legacy.']);
-    scoring.append(make('p',{class:'l-muted l-wide','data-worker-capability-note':'',role:'status'}));
-    const refreshWorker=make('button',{type:'button',class:'s-button l-secondary','data-worker-capability-refresh':''},tr('刷新 worker 能力','Refresh worker capabilities'));
-    refreshWorker.onclick=()=>{scheduleWorkerCapabilities(true);syncDependencies();updateStatus(runtime);};scoring.append(refreshWorker);
-    const layerwise=recallSection('分层召回预算','Layerwise recall budgets','独立预算','Separate budgets',
-      '这些有限预算分别约束前向暂存、传输与状态元数据，不占用原生 KV 历史预算。',
-      'Finite limits for forward storage, transfers and state metadata, separate from the native KV history budget.');
+    const layerwise=recallSection('分层暂存','Layerwise storage',
+      '暂存前向计算数据，独立于 KV 历史预算。留空使用后端默认值。',
+      'Store forward-pass data separately from the KV history budget. Leave blank for backend defaults.');
     layerwise.parentElement.setAttribute('data-layerwise-budgets','');
+    const layerwiseAdvanced=recallAdvanced(layerwise,'resources','传输与元数据预算','Transfer and metadata budgets');
     for(const [key,zh,en] of [
       ['LayerwiseActivationRamMiB','前向暂存 RAM · MiB','Forward storage RAM · MiB'],
       ['LayerwiseActivationDiskMiB','前向暂存 SSD · MiB','Forward storage SSD · MiB'],
       ['LayerwiseStagingMiB','传输暂存 · MiB','Transfer staging · MiB'],
       ['LayerwiseMetadataMiB','历史状态与索引 · MiB','History state and index · MiB'],
       ['LayerwiseActivationMetadataMiB','前向描述信息 · MiB','Forward descriptors · MiB']
-    ]){const input=field(layerwise,p,key,zh,en,'number',null,['留空使用所选 worker 的原生默认值；填写数值才覆盖，已保存的数值保持不变。','Leave blank for the selected worker default. Enter a value to override; saved explicit values are preserved.']);input.min=key==='LayerwiseActivationRamMiB'||key==='LayerwiseActivationDiskMiB'?'0':'1';input.max='2147483647';input.required=false;}
-    const target=field(layerwise,p,'LayerwiseCheckpointTarget','实例热检查点目标','Hot checkpoints per instance','number');
-    target.min='1';target.required=false;
-    field(layerwise,p,'LayerwiseMtpHistory','MTP 历史来源','MTP history','text',[
+    ]){const input=field(key==='LayerwiseActivationRamMiB'||key==='LayerwiseActivationDiskMiB'?layerwise:layerwiseAdvanced,p,key,zh,en,'number',null,['留空使用所选 worker 的原生默认值；填写数值才覆盖，已保存的数值保持不变。','Leave blank for the selected worker default. Enter a value to override; saved explicit values are preserved.']);input.min=key==='LayerwiseActivationRamMiB'||key==='LayerwiseActivationDiskMiB'?'0':'1';input.max='2147483647';input.required=false;}
+    layerwise.append(layerwiseAdvanced.parentElement);
+    const drafts=make('div',{class:'l-recall-drafts l-wide','data-layerwise-drafts':''});layerwise.append(drafts);
+    field(drafts,p,'LayerwiseMtpHistory','MTP 历史来源','MTP history','text',[
       ['',tr('请选择，无默认值','Choose; no default')],['upstream-global',tr('上游全局 · 私有探测','Upstream global · private probe')],['first-layer',tr('首个目标层 · fresh Q','First target layer · fresh Q')]
     ],['两者的主模型均使用 fresh-Q 分层召回，此选项只决定草稿 OWN KV 的历史 ID。NInfer 默认 first-layer；留空使用所选 worker 的默认，显式值保持不变。','Both target paths use fresh-Q layerwise recall. This choice controls history IDs in draft-owned KV; NInfer defaults to first-layer. Leave blank for the selected worker default; explicit choices are preserved.']);
-    layerwise.append(make('p',{class:'l-muted l-wide','data-layerwise-draft-note':''}));
-    const retention=recallSection('驻留与会话保留','Resident & session retention','注意力保留','Attention retention',
-      '空间不足时，按累计注意力保留驻留内容；开头与最近内容按下方预算保护。空闲会话保留还受共享内存预算限制。',
-      'Under memory pressure, retain resident content by accumulated attention. Protect the prefix and recent tokens using the budgets below. Idle sessions also share the memory budget.');
+    drafts.append(make('p',{class:'l-recall-description','data-layerwise-draft-note':''}));
+    const retention=recallSection('历史保留','History retention',
+      '设置始终保护的开头、最近内容及空闲会话数量。会话保留仍受共享内存预算限制。',
+      'Protect prefix and recent tokens, and retain idle sessions within the shared memory budget.');
     ['SinkTokens','RecentTokens','RetainedSessions'].forEach(k=>{const el=panels[0].querySelector(`[data-param="${k}"]`);if(el)retention.append(el.closest('label'));});
+    const target=field(retention,p,'LayerwiseCheckpointTarget','实例热检查点目标','Hot checkpoints per instance','number');
+    target.min='1';target.required=false;
     if(n){const extra=field(retention,p,'CheckpointExtraRecomputeTokens','快照额外重算上限 · tokens','Checkpoint extra recompute limit · tokens','number',null,['0 关闭。允许用附近较早点替代低收益快照；执行中的 Query 回放点仍受保护。重试可能需要重新保存快照或读取 SSD，因此该值不是耗时上限。','0 disables this optimization. Nearby earlier states can replace low-value checkpoints; active Query replay points remain protected. Retries may rebuild checkpoints or read SSD, so this is not a latency limit.']);extra.min='0';extra.max='2147483647';extra.required=true;}
     if(legacyScoring)scoring.before(make('p',{class:'l-muted','data-scoring-migration':''},tr('已将旧检索设置转换为明确参数；请检查下方评分器和历史累计选项。','Legacy retrieval settings were converted to explicit controls. Review the scorer and LRFU settings below.')));
     field(scoring,p,'QueryScorer','召回评分算法','Recall scoring algorithm','text',[['page-softmax','Page softmax'],['meanq-cosine','Mean-Q cosine']],['评分器、图传播与历史累计可以独立组合。','Scorer, graph propagation and LRFU can be combined independently.']);
@@ -1131,6 +1179,8 @@
     const decay=field(scoring,{LrfuLambda:0.5,...p},'LrfuLambda','历史衰减系数','History decay','number');decay.max='1';decay.step='any';decay.required=true;
     const fraction=field(scoring,{LrfuTopFraction:0.9,...p},'LrfuTopFraction','正向奖励候选比例','Positive reward fraction','number');fraction.min='0';fraction.max='1';fraction.step='any';fraction.required=true;
     for(const [key,zh,en,note] of [['QueryMaxTokens','问题评分上限 · tokens','Query score limit · tokens',['仅使用当前问题末尾的这些 tokens 评分。','Score with at most this many trailing tokens of the current question.']],['QueryReplayMaxTokens','完整回放上限 · tokens','Causal replay limit · tokens',['超过上限时保持驻留视图并使用 Pressure；不会截断因果回放。','Above this limit, retain the resident view with Pressure; causal replay is not truncated.']]]){const limit=field(scoring,p,key,zh,en,'number',null,note);limit.min='1';limit.required=true;}
+    const scoringAdvanced=recallAdvanced(scoring,'scoring','评分与回放细节','Scoring and replay details');
+    for(const key of ['ScoreAggregation','LrfuLambda','LrfuTopFraction','QueryMaxTokens','QueryReplayMaxTokens'])scoringAdvanced.append(scoring.querySelector(`[data-param=${key}]`).closest('label'));
     field(panels[1],p,'Prefill','预填充块大小 · tokens','Prefill chunk · tokens','number');
     if(poly||rad){const vram=field(panels[1],p,'VramReserveMiB','显存预留 · MiB','VRAM reserve · MiB','number',null,['原生引擎最低为 256 MiB；与生成追加空间的 token 预算分别设置。','Worker minimum: 256 MiB. Separate from the generation workspace measured in tokens.']);vram.min='256';vram.max='65536';}
     const tensor=field(panels[1],p,'TensorParallel','张量并行 · heads','Tensor parallelism · heads','checkbox',null,
@@ -1420,7 +1470,7 @@
   }
   function exportDialog(){
     if(busy||configurationLocked())return;
-    if(!root.querySelector('form').reportValidity())return;
+    if(!reportLaunchValidity())return;
     const dialog=make('dialog',{class:'l-model-dialog','aria-label':tr('生成启动脚本','Generate launch script')}),form=make('form',{method:'dialog'});
     const heading=make('div',{class:'l-heading'}),close=make('button',{type:'button',class:'s-button'},tr('关闭','Close'));
     heading.append(make('h2',{class:'s-title'},tr('生成启动脚本','Generate launch script')),close);
@@ -1483,7 +1533,7 @@
     if(action==='preview'){await checkConfiguration();return;}
     try{
       const data=action==='stop'?{}:launchData();
-      if(action==='start'&&!root.querySelector('form').reportValidity())return;
+      if(action==='start'&&!reportLaunchValidity())return;
       saveEditing();busy=true;root.querySelectorAll('[data-action]').forEach(button=>button.disabled=true);
       if(action==='start'){pendingParameters=structuredClone(data.parameters);startPending=true;launchFailure='';applyConfigurationLock();renderLaunchProgress();root.querySelector('[data-launch-progress]').scrollIntoView({block:'nearest',behavior:'smooth'});}
       const result=await api(action,data);startPending=false;launchFailure='';updateStatus(result,true);
