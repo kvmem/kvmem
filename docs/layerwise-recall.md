@@ -120,4 +120,12 @@ uses SharedTarget. All combinations are gated by the selected worker's explicit 
 
 ## NInfer 的 DFlash2 反馈回读
 
-使用 `--kvmem-recall-strategy layerwise` 时，单 GPU、最大并发为 1 的 DFlash2 CUDA Graph 路径自动按采样行计算输出反馈，并批量校验回读。其他执行路径沿用各自的反馈实现。排障时可将 `NINFER_SELECT_LAYER_FEEDBACK` 和 `NINFER_BATCH_LAYER_FEEDBACK` 同时设为 `0`，再启动服务，即可对照原分层路径。清除这两个环境变量即可恢复自动选择。
+使用 `--kvmem-recall-strategy layerwise` 时，单 GPU 的 DFlash2 CUDA Graph 路径自动按每个请求实际采样的行计算输出反馈，支持多个并发槽位。每个请求保留自己的批次行号、原生位置、接受前缀与 graph epoch 校验；其他执行路径沿用各自的反馈实现。
+
+回读使用已有的有限 pinned 暂存区。当前批次内的请求借用互不重叠的切片，按容量分组提交；只有对应 GPU 工作完成、结果校验并消费后才复用切片。部分草稿接受和没有采样行的情况仍校验原生控制信息。取消或异常会先排空已提交工作，再释放相关所有权。
+
+分层 KV 恢复也复用已有暂存区，每批最多装入 64 个层片段，并按实际容量缩小批次。K/V 与量化 scale 原字节保留，未发布的目标检查、共享快照保护和传输完成同步不变。这不引入异步 refresh 调度。
+
+排障时可分别设置 `NINFER_SELECT_LAYER_FEEDBACK=0`（关闭采样行选择）、`NINFER_BATCH_LAYER_FEEDBACK=0`（关闭 mass 批量回读）或 `NINFER_BATCH_COHORT_FEEDBACK=0`（按请求分组回读），然后重新启动服务。清除这些变量即可恢复默认自动启用。它们不关闭独立的 KV 层片段批量搬运优化。
+
+性能取决于负载：PRO 6000 / NVFP4 27B + DFlash2 Q3 的单路 256k 任务2中，prefill 提升约 21.3%，decode 基本持平；每路约 64k 输入、固定 8k 输出的 4/8 并发测试中，完整并发 decode 分别下降约 0.7%/2.8%，提问批次输出吞吐分别提升约 3.0%/1.2%。两种负载与校验设置不同，不能作为只改变并发数的扩展性对照，也不构成通用 decode 提速或语义质量保证。[配置、计时口径与验证范围](benchmarks/ninfer-layerwise-performance-20261111.json)

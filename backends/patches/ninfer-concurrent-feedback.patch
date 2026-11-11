@@ -1,0 +1,207 @@
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.cpp b/src/models/qwen3_5/program/native_layerwise_request.cpp
+index 19ce4c5a..2f6751d0 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_request.cpp
+@@ -154,6 +154,7 @@ struct NativeLayerwiseRequest::Impl {
+     };
+     std::optional<PhysicalGrant> physical_grant;
+     std::uint64_t graph_epoch=0;
++    std::uint32_t graph_row=0;
+     static bool flag(const char* name,bool default_value=false) {
+         const char* value=std::getenv(name);
+         return value ? std::strcmp(value,"1")==0 : default_value;
+@@ -174,6 +175,7 @@ struct NativeLayerwiseRequest::Impl {
+         std::uint64_t hash=14695981039346656037ULL;
+         std::uint64_t candidate_hash=14695981039346656037ULL,snapshot_bytes=0,pinned_peak=0;
+         std::uint64_t all_drafts=0,partial_drafts=0,no_drafts=0,control_bytes=0,graph_steps=0;
++        std::uint32_t max_packed_row=0;
+         double graph_body_ms=0;
+     } counters;
+     FeedbackClock::time_point graph_body_start;
+@@ -191,7 +193,7 @@ struct NativeLayerwiseRequest::Impl {
+             if (begin) (void)cudaEventDestroy(begin);
+         }
+     } events;
+-    // Only used during single-lane graph feedback collection. All copies and
++    // The cohort gives one owner exclusive staging until validation. Copies and
+     // reused device scratch belong to one GPU stream. Pinned slices stay live
+     // until flush_readbacks has checked and consumed every queued result.
+     struct Readback {
+@@ -209,12 +211,12 @@ struct NativeLayerwiseRequest::Impl {
+         // Graph collection follows DFlash verification and the egress fence,
+         // while the original KV and row maps still belong to this capture.
+         if (c.sampled_preview || !selective_readback || !graph_epoch || !c.deferred_output ||
+-            p.max_concurrency!=1 || p.device.size()!=1 || !target_heads.empty() ||
++            p.device.size()!=1 || !target_heads.empty() ||
+             p.speculative_backend!=SpeculativeBackend::DFlash2 || !p.dflash_host_egress) return;
+         const auto& egress=*p.dflash_host_egress;
+-        const auto count=egress.licensed_counts[0];
++        const auto count=egress.licensed_counts[graph_row];
+         if (count<=0 || std::uint32_t(count)>c.count || c.count>64 ||
+-            egress.accepted_drafts[0]!=count-1 || sequence.execution_frontier!=c.begin ||
++            egress.accepted_drafts[graph_row]!=count-1 || sequence.execution_frontier!=c.begin ||
+             sequence.ledger.size()!=std::uint64_t(c.begin)+1 ||
+             sequence.ledger_frontier!=sequence.ledger.size()) return;
+         // Rawresolve consumes the previous anchor, then licensed output IDs.
+@@ -222,7 +224,8 @@ struct NativeLayerwiseRequest::Impl {
+         // discard the entire capture, and a stop can shorten this prefix.
+         c.preview_size=static_cast<std::size_t>(count);
+         c.consumed_preview[0]=sequence.ledger.back();
+-        std::copy_n(egress.licensed_tokens.begin(),count-1,c.consumed_preview.begin()+1);
++        const auto stride=physical_grant->plan.physical_target_rows;
++        std::copy_n(egress.licensed_tokens.begin()+graph_row*stride,count-1,c.consumed_preview.begin()+1);
+         auto parser=*output;
+         c.sampled_preview=parser.prepare(request_id,c.begin,
+             {c.consumed_preview.begin(),c.consumed_preview.begin()+count});
+@@ -337,7 +340,7 @@ struct NativeLayerwiseRequest::Impl {
+                 "active request cannot reserve its retained accepted-feedback publication");}
+         }
+         runtime_metadata=runtime_account->reserve(0);reclaim_metadata();
+-        if (p.layerwise_graph_feedback && (batch_readback || selective_readback) && p.max_concurrency==1 && p.device.size()==1 &&
++        if (p.layerwise_graph_feedback && (batch_readback || selective_readback) && p.device.size()==1 &&
+             p.speculative_backend==SpeculativeBackend::DFlash2) {
+             const auto depth=std::min<std::size_t>(16,config.full_attention_layers);
+             const auto bytes=depth*sizeof(Readback)+sizeof(Capture::consumed_preview)+128;
+@@ -744,7 +747,7 @@ struct NativeLayerwiseRequest::Impl {
+                 const auto capacity=p.memory_statistics_host->size();
+                 // Deferred Output enumerates rows [0,count) before acceptance.
+                 const bool dense_graph_rows=batch_readback && graph_epoch && c.deferred_output &&
+-                    p.max_concurrency==1 && p.device.size()==1 && !tensor &&
++                    p.device.size()==1 && !tensor &&
+                     p.speculative_backend==SpeculativeBackend::DFlash2 && !seen && count==c.count &&
+                     n==static_cast<std::int32_t>(count) && selected.size()==count && first==0;
+                 if (dense_graph_rows && control_bytes<=capacity-bytes) {
+@@ -1328,15 +1331,15 @@ void NativeLayerwiseRequest::withdraw_output_before_submit() {
+     }
+     q.close_physical_grant();q.credit.reset();q.credit_count=0;
+ }
+-void NativeLayerwiseRequest::prepare_graph_output(std::uint64_t epoch,std::uint32_t physical) {
++void NativeLayerwiseRequest::prepare_graph_output(std::uint64_t epoch,std::uint32_t physical,std::uint32_t packed_row) {
+     auto& q=*impl_;q.owner();
+-    if (!epoch || q.graph_epoch || !q.capture || !q.capture->output || !q.credit ||
++    if (!epoch || packed_row>=q.p.max_concurrency || q.graph_epoch || !q.capture || !q.capture->output || !q.credit ||
+         *q.credit!=q.sequence.window.stamp || !q.physical_grant ||
+         physical!=q.physical_grant->plan.physical_target_rows ||
+         q.capture->count!=q.physical_grant->plan.valid_rows ||
+         std::any_of(q.capture->seen.begin(),q.capture->seen.end(),[](auto n){return n!=0;}))
+         throw std::logic_error("native graph row lacks its untouched exact physical grant");
+-    q.graph_epoch=epoch;q.native_started=true;
++    q.graph_epoch=epoch;q.graph_row=packed_row;q.native_started=true;
+ }
+ void NativeLayerwiseRequest::validate_graph_output_complete(std::uint64_t epoch) const {
+     auto& q=*impl_;q.owner();
+@@ -1348,6 +1351,7 @@ void NativeLayerwiseRequest::validate_graph_output_complete(std::uint64_t epoch)
+     if (q.trace_feedback) {
+         q.counters.graph_body_ms+=Impl::milliseconds(q.graph_body_start);
+         ++q.counters.graph_steps;
++        q.counters.max_packed_row=std::max(q.counters.max_packed_row,q.graph_row);
+     }
+ }
+ void NativeLayerwiseRequest::complete_graph_output(std::uint64_t epoch) noexcept {
+@@ -1370,8 +1374,8 @@ void NativeLayerwiseRequest::retire() {
+     auto& q=*impl_;if (q.capture || q.credit || q.physical_grant) throw std::logic_error("native layerwise request cannot retire pending native work");
+     if (q.trace_feedback || q.verify_feedback) {
+         const auto& c=q.counters;
+-        std::fprintf(stderr,"FEEDBACK_DETAIL req=%" PRIu64 " candidate_hash=%" PRIu64 " graph_steps=%" PRIu64 " graph_body_ms=%.3f snapshot_bytes=%" PRIu64 " pinned_peak=%" PRIu64 " control_bytes=%" PRIu64 " full=%" PRIu64 " partial=%" PRIu64 " zero=%" PRIu64 "\n",
+-            static_cast<std::uint64_t>(q.request_id),c.candidate_hash,c.graph_steps,c.graph_body_ms,c.snapshot_bytes,c.pinned_peak,c.control_bytes,c.all_drafts,c.partial_drafts,c.no_drafts);
++        std::fprintf(stderr,"FEEDBACK_DETAIL req=%" PRIu64 " candidate_hash=%" PRIu64 " graph_steps=%" PRIu64 " max_packed_row=%u graph_body_ms=%.3f snapshot_bytes=%" PRIu64 " pinned_peak=%" PRIu64 " control_bytes=%" PRIu64 " full=%" PRIu64 " partial=%" PRIu64 " zero=%" PRIu64 "\n",
++            static_cast<std::uint64_t>(q.request_id),c.candidate_hash,c.graph_steps,q.counters.max_packed_row,c.graph_body_ms,c.snapshot_bytes,c.pinned_peak,c.control_bytes,c.all_drafts,c.partial_drafts,c.no_drafts);
+         std::fprintf(stderr,"FEEDBACK_PROFILE req=%" PRIu64 " tiles=%" PRIu64 " bytes=%" PRIu64 " waits=%" PRIu64 " groups=%" PRIu64 " verified=%" PRIu64 " accepted=%" PRIu64 " sampled=%" PRIu64 " submit_ms=%.3f wait_ms=%.3f reduce_ms=%.3f accept_ms=%.3f snapshot_ms=%.3f kernel_ms=%.3f mass_copy_ms=%.3f hash=%" PRIu64 "\n",
+             static_cast<std::uint64_t>(q.request_id),c.tiles,c.bytes,c.waits,c.groups,c.verified,c.accepted,c.sampled,c.submit_ms,c.wait_ms,c.reduce_ms,c.accept_ms,c.snapshot_ms,c.kernel_ms,c.mass_copy_ms,c.hash);
+     }
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.h b/src/models/qwen3_5/program/native_layerwise_request.h
+index 19cffba6..5b06af93 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.h
++++ b/src/models/qwen3_5/program/native_layerwise_request.h
+@@ -101,7 +101,7 @@ public:
+     void withdraw_output_before_submit();
+     // Borrow the cohort epoch only. Storage arm/fence/release belongs to the
+     // complete native unit; one owner cannot release another row's capture.
+-    void prepare_graph_output(std::uint64_t epoch,std::uint32_t physical_rows);
++    void prepare_graph_output(std::uint64_t epoch,std::uint32_t physical_rows,std::uint32_t packed_row);
+     void validate_graph_output_complete(std::uint64_t epoch) const;
+     void complete_graph_output(std::uint64_t epoch) noexcept;
+     void abort_graph_output(std::uint64_t epoch) noexcept;
+diff --git a/src/models/qwen3_5/program/native_output_cohort.cpp b/src/models/qwen3_5/program/native_output_cohort.cpp
+index 888756f3..a4232f73 100644
+--- a/src/models/qwen3_5/program/native_output_cohort.cpp
++++ b/src/models/qwen3_5/program/native_output_cohort.cpp
+@@ -60,7 +60,8 @@ NativeLayerwiseOutputCohort::NativeLayerwiseOutputCohort(ProgramImpl& p,
+     }
+     observer_.owner=this;observer_.physical_rows=physical;observer_.batch_size=size_;
+     observer_.attended=[](void* owner,const execution::CurrentLayerAttentionFrame& frame) {
+-        static_cast<NativeLayerwiseOutputCohort*>(owner)->attended(frame);
++        auto* cohort=static_cast<NativeLayerwiseOutputCohort*>(owner);
++        cohort->attended(frame,0,cohort->size_);
+     };
+ }
+ NativeLayerwiseOutputCohort::~NativeLayerwiseOutputCohort() {
+@@ -91,7 +92,7 @@ void NativeLayerwiseOutputCohort::arm_graph(const DecodeGraphProfile& profile) {
+     graph_storage_=p_.layerwise_graph_feedback.get();
+     graph_epoch_=graph_storage_->arm(graph_identity_,profile);
+     for (std::uint32_t row=0;row<size_;++row)
+-        rows_[row].owner->prepare_graph_output(graph_epoch_,width_);
++        rows_[row].owner->prepare_graph_output(graph_epoch_,width_,row);
+ }
+ execution::LayerwiseGraphExecutionPermit NativeLayerwiseOutputCohort::graph_permit() const {
+     if (!graph_storage_ || !graph_epoch_) throw std::logic_error("graph copy cohort is not armed");
+@@ -103,21 +104,28 @@ void NativeLayerwiseOutputCohort::collect_graph() {
+     // All K/scales and mappings are still the same as at each captured native
+     // attention. Populate every row's PRIVATE matrix before Native Rawresolve.
+     const auto count=width_*size_;
+-    for (const auto& slot:graph_storage_->view().slots) {
+-        const auto query=slot.query.slice(2,0,static_cast<std::int32_t>(count));
+-        const auto positions=slot.positions.slice(0,0,static_cast<std::int32_t>(count));
+-        const auto tables=slot.table_rows.slice(0,0,static_cast<std::int32_t>(size_));
+-        attended({{slot.model_layer,slot.attention_layer,slot.rank},query,positions,tables,
+-            p_.device.stream_for_rank(slot.rank)});
++    // DFlash2 feedback can queue asynchronous copies into the same Program
++    // staging buffer. Drain and validate one owner before reusing it for a peer.
++    const bool shared_readbacks=p_.device.size()==1 && p_.speculative_backend==SpeculativeBackend::DFlash2;
++    const auto group=shared_readbacks?1U:size_;
++    for (std::uint32_t first=0;first<size_;first+=group) {
++        for (const auto& slot:graph_storage_->view().slots) {
++            const auto query=slot.query.slice(2,0,static_cast<std::int32_t>(count));
++            const auto positions=slot.positions.slice(0,0,static_cast<std::int32_t>(count));
++            const auto tables=slot.table_rows.slice(0,0,static_cast<std::int32_t>(size_));
++            attended({{slot.model_layer,slot.attention_layer,slot.rank},query,positions,tables,
++                p_.device.stream_for_rank(slot.rank)},first,first+group);
++        }
++        for (auto row=first;row<first+group;++row)
++            rows_[row].owner->validate_graph_output_complete(graph_epoch_);
+     }
+     // Complete all checks before clearing any borrowed pending owner tag.
+-    for (std::uint32_t row=0;row<size_;++row)
+-        rows_[row].owner->validate_graph_output_complete(graph_epoch_);
+     for (std::uint32_t row=0;row<size_;++row)
+         rows_[row].owner->complete_graph_output(graph_epoch_);
+     graph_storage_->release(graph_epoch_);graph_epoch_=0;graph_storage_=nullptr;
+ }
+-void NativeLayerwiseOutputCohort::attended(const execution::CurrentLayerAttentionFrame& frame) {
++void NativeLayerwiseOutputCohort::attended(const execution::CurrentLayerAttentionFrame& frame,
++    std::uint32_t first_row,std::uint32_t end_row) {
+     const auto count=std::uint64_t(width_)*size_;
+     if (frame.query.ne[2]!=count || frame.query.ne[3]!=1 || !frame.query.is_contiguous() ||
+         frame.cache_positions.numel()!=count || !frame.cache_positions.is_contiguous() ||
+@@ -125,7 +133,7 @@ void NativeLayerwiseOutputCohort::attended(const execution::CurrentLayerAttentio
+         throw std::logic_error("target Q/control does not match its actual cohort row packing");
+     const auto positions=frame.cache_positions.view({static_cast<std::int32_t>(count)});
+     const auto tables=frame.table_rows.view({static_cast<std::int32_t>(size_)});
+-    for (std::uint32_t row=0;row<size_;++row) {
++    for (auto row=first_row;row<end_row;++row) {
+         const auto& binding=rows_[row];
+         if (p_.lane_epochs.at(binding.lane)!=binding.lane_epoch ||
+             p_.active_sequence(binding.lane).window.layerwise_request.get()!=binding.owner)
+diff --git a/src/models/qwen3_5/program/native_output_cohort.h b/src/models/qwen3_5/program/native_output_cohort.h
+index e9b94944..134f813d 100644
+--- a/src/models/qwen3_5/program/native_output_cohort.h
++++ b/src/models/qwen3_5/program/native_output_cohort.h
+@@ -56,7 +56,7 @@ public:
+     void collect_graph();
+     execution::LayerwiseGraphExecutionPermit graph_permit() const;
+ private:
+-    void attended(const execution::CurrentLayerAttentionFrame&);
++    void attended(const execution::CurrentLayerAttentionFrame&,std::uint32_t first_row,std::uint32_t end_row);
+     ProgramImpl& p_;
+     std::uint32_t width_;
+     std::array<NativeLayerwiseBatchRow,kMaximumConcurrency> rows_{};
