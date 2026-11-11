@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AptBootstrapTest(unittest.TestCase):
-    def run_bootstrap(self, failures):
+    def run_bootstrap(self, failures, hosted=False):
         workflow = (ROOT / '.github/workflows/server-compat.yml').read_text()
         tail = workflow.split('run: &prepare-ubuntu-apt |\n', 1)[1]
         lines = []
@@ -37,6 +37,10 @@ class AptBootstrapTest(unittest.TestCase):
             deb822 = ('Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\n'
                       'Suites: noble noble-updates\nComponents: main universe\n'
                       'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n')
+            if hosted:
+                source = source.replace('http://azure.archive.ubuntu.com/ubuntu/', 'mirror+file:./apt/apt-mirrors.txt')
+                deb822 = deb822.replace('http://archive.ubuntu.com/ubuntu', 'mirror+file:./apt/apt-mirrors.txt')
+                (root / 'apt/apt-mirrors.txt').write_text('http://azure.archive.ubuntu.com/ubuntu/\nhttps://archive.ubuntu.com/ubuntu\n')
             (root / 'apt/sources.list').write_text(source)
             (root / 'apt/sources.list.d/rocm.list').write_text(vendor)
             (root / 'apt/sources.list.d/ubuntu.sources').write_text(deb822)
@@ -93,6 +97,14 @@ echo 'Indexes authenticated successfully'
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(calls, 1)
         self.assertNotIn('mirrors.kernel.org', after['ubuntu.sources'])
+
+    def test_hosted_mirror_indirection_falls_back_to_direct_authenticated_archive(self):
+        result, after, calls = self.run_bootstrap(['Temporary failure resolving azure.archive.ubuntu.com'], hosted=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, 2)
+        for name in ['sources.list', 'ubuntu.sources']:
+            self.assertNotIn('mirror+file:', after[name])
+            self.assertIn('https://mirrors.kernel.org/ubuntu', after[name])
 
     def test_missing_release_is_not_retried(self):
         result, _, calls = self.run_bootstrap(['E: repository has no Release file'])
