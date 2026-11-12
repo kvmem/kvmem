@@ -12,7 +12,7 @@ module.exports=async({browser,base,info})=>{
  await page.route('**/api/launcher/status',r=>r.fulfill({json:runtime}));
  await page.route('**/api/launcher/preview',r=>{previews.push(r.request().postDataJSON().parameters);return r.fulfill({json:{argv:['fixture-worker'],environment:{}}});});
  const field=k=>page.locator(`[data-param=${k}]`);
- const openAdvanced=async()=>{await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();};
+ const openAdvanced=async()=>{await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();await page.locator('[data-recall-advanced=scoring] > summary').click();};
  const preview=async()=>{const n=previews.length;await page.locator('[data-action=preview]').click();await page.waitForFunction(()=>document.querySelector('[data-check-summary]')?.textContent.includes('检查通过'));assert.equal(previews.length,n+1);await page.locator('[data-dialog=check] [data-dialog-close]').click();return previews.at(-1);};
  try{
   await page.goto(base+'/monitor/#config');await field('Backend').waitFor();

@@ -13,7 +13,7 @@ import test_launcher_plan as legacy
 from launcher.plan import build_plan
 from launcher.export import render_script
 from launcher.recall import LAYERWISE_RESOURCES
-from launcher.worker import strategy_profile
+from launcher.worker import strategy_profile, require_launch_features
 from test_layerwise_launcher import contract
 from console_memory import diagnose
 
@@ -52,6 +52,25 @@ class LayerwiseProductTest(unittest.TestCase):
         self.assertTrue(caps['recall_strategies']['layerwise']['speculative'])
         self.assertIsNone(strategy_profile({'recall_strategies':caps['recall_strategies']},'layerwise'))
         self.assertIsNone(strategy_profile({},'legacy'))
+
+    def test_all_backends_without_native_declaration_reject_layerwise(self):
+        controller = console.Controller(ROOT, self.directory/'state', 18199)
+        # A Legacy-capable executable is not evidence of layerwise support,
+        # including when the selected backend is NInfer.
+        old = dict(path=str(self.fixture.worker), executable_sha256='a'*64,
+                   query_scoring_revision=2, independent_graph_lrfu=True, signed_lrfu_hits=True)
+        for backend in ('ninfer', 'llamacpp', 'polystrata', 'radiance'):
+            for capability in (old, dict(old, **contract(available=False))):
+                with self.subTest(backend=backend, declared='recall_strategies' in capability):
+                    parameters = dict(Backend=backend, Worker=str(self.fixture.worker), RecallStrategy='layerwise')
+                    with patch.object(controller, 'worker_capabilities', return_value=capability) as probe:
+                        result = controller.selected_worker_capabilities(dict(schema_version=1, parameters=parameters))
+                    probe.assert_called_once_with(str(self.fixture.worker), backend)
+                    self.assertEqual(result['backend'], backend)
+                    self.assertFalse(result['profile'] and result['profile'].get('available'))
+                    with self.assertRaisesRegex(ValueError, 'qualified layerwise'):
+                        require_launch_features(capability, parameters)
+                    require_launch_features(capability, dict(parameters, RecallStrategy='legacy'))
 
     def test_runtime_confirmation_requires_every_actual_account_and_policy(self):
         plan = build_plan(self.config('llamacpp', SpeculativeMode='mtp', DraftTokens=3,

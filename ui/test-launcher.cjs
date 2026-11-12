@@ -231,7 +231,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  for(const [key,value] of Object.entries(expected))assert.equal(releaseDraft[key],value,'persisted '+key);
  await page.locator('[data-preset-undo]').click();
  assert.equal(await page.locator('[data-param=Model]').inputValue(),'C:/models/my-existing-model.ninfer');
- assert.ok(mutations.every(url=>new URL(url).pathname==='/api/launcher/inspect-model'),
+ assert.ok(mutations.every(url=>['/api/launcher/inspect-model','/api/launcher/worker-capabilities'].includes(new URL(url).pathname)),
   'select/undo may inspect the draft but must not mutate the server');
  assert.deepEqual(await page.locator('[data-preset]').evaluateAll(nodes=>nodes.map(n=>n.dataset.preset).sort()),['ninfer-layerwise','ninfer-quality','ninfer-speed']);
  await page.locator('[data-preset=ninfer-quality]').click();
@@ -423,6 +423,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  await require('./test-engine-settings.cjs')({browser,base,info});
  await require('./test-elastic-experts.cjs')({browser,base,info});
  await require('./test-query-scoring.cjs')({browser,base,info});
+ await require('./test-recall-layout.cjs')({browser,base,info,task:process.env.SCREENSHOT_DIR});
  if(process.env.TEST_MODEL&&process.env.TEST_WORKER&&process.env.TEST_GPU){
   const config={schema_version:1,parameters:{Backend:'llamacpp',Model:process.env.TEST_MODEL,Worker:'',Gpu:process.env.TEST_GPU,Context:4096,Budget:2048,Reserve:512,HostMiB:256,Prefill:128,MaxTokens:128,Port:port+1,ListenHost:'127.0.0.1',SinkTokens:512,RecentTokens:64,QueryScorer:'meanq-cosine',ScoreAggregation:'mean',GraphAlpha:.2,Lrfu:false,QueryMaxTokens:128,QueryReplayMaxTokens:512,WorkerArgs:['--n-gpu-layers','99']}};
   const preview=await api('preview',config);assert.equal(preview.code,200,JSON.stringify(preview.body));assert.ok(preview.body.argv.includes('--kvmem'));
