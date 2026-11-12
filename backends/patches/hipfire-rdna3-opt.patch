@@ -1,0 +1,2465 @@
+diff --git a/crates/hipfire-arch-qwen35/src/forward_slots.rs b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+index e5d3d8ebe827bbed20e2ba340def8f72c5518c80..5217d6a6da5e0c1034f0efdc0971e0750c1ccd16 100644
+--- a/crates/hipfire-arch-qwen35/src/forward_slots.rs
++++ b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+@@ -596,6 +596,18 @@ fn slots_plain_gemm_key(dt: DType) -> Option<KernelKey> {
+         DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
+         DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
+         DType::MQ2G256V2 => KernelKey::GemmMq2G256V2,
++        // Uncoded high-precision DeltaNet siblings: escha-pro / escha-35b keep
++        // in_proj_a/b as F16 (the escha ignore list leaves them plain), and the
++        // F32 arm covers the HIPFIRE_F16_LM_HEAD=f32 upcast plus PARO F32
++        // alpha/beta. Both are UNROTATED — slots_plain_proj feeds them x_norm.
++        // MB8 is the fused-transpose WMMA GEMM (Y[N,M], F16 weight × F32→F16
++        // activation, F32 accumulate): the same kernel the decode lm_head
++        // reference (gemm_f16_batched_lmhead) uses on gfx12, precision-equivalent
++        // to its gfx11 mw16 path, ragged-N safe, and HasWmma-portable across
++        // RDNA3/RDNA4. F32 rides gemm_f32_batched, the canonical DeltaNet
++        // alpha/beta batched GEMM (Y[N,M], any N).
++        DType::F16 => KernelKey::GemmF16WmmaMb8,
++        DType::F32 => KernelKey::GemmF32Batched,
+         // Flat lowbit Bonsai: the tiled prefill GEMMs (same keys
+         // `plain_gemm_key_for` resolves). Explicit run_key bypasses the
+         // BatchGe(32) auto-resolve shape gate, so decode row counts work too.
+@@ -737,6 +749,14 @@ pub(crate) fn require_batchable_deltanet_layer(
+     layer: &DeltaNetLayerWeights,
+     arch: &str,
+ ) -> HipResult<()> {
++    // Escha trellis layers run their own grouped-GEMM arm in the slot body
++    // (qkv/z/o/gate/up/down are codes; in_proj_a/b are plain — MQ6G256V2 on
++    // escha base, F16/F32 on escha-pro — served by `slots_plain_proj`). The
++    // fused/group-plan ladder below cannot read a trellis code, so it must not
++    // gate them — the arm is the batchable path.
++    if layer.escha.is_some() {
++        return Ok(());
++    }
+     plan_proj_group(
+         &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+         "DeltaNet qkvza",
+@@ -753,6 +773,11 @@ pub(crate) fn require_batchable_fullattn_layer(
+     layer: &FullAttnLayerWeights,
+     arch: &str,
+ ) -> HipResult<()> {
++    // See `require_batchable_deltanet_layer`: escha layers take the grouped
++    // trellis arm, not the fused/group-plan ladder.
++    if layer.escha.is_some() {
++        return Ok(());
++    }
+     plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttn qkv", arch).map(|_| ())?;
+     slots_check_residual_weight(&layer.wo, "FullAttn wo", arch)?;
+     plan_proj_group(&[&layer.w_gate, &layer.w_up], "dense FFN gate_up", arch).map(|_| ())?;
+@@ -1139,6 +1164,91 @@ fn q8_gate_up_proj(
+     }
+ }
+ 
++/// `[0, n]` expert-offset table for the grouped escha GEMM. A dense linear is
++/// ONE group holding every slot, so the offsets are `[0, n]` and the slot
++/// permutation is the identity (`DeltaNetEscha::iota` / `FullAttnEscha::iota`).
++/// Built once per layer; every coded projection in the layer shares it. Raw
++/// little-endian i32 bytes — the grouped GEMM reads `expert_offsets` as i32,
++/// the same deliberate reinterpretation `ids`/`iota` use (DType has no integer
++/// variant). This is what turns the per-slot indexed GEMV (weight re-read once
++/// per slot) into a single grouped WMMA GEMM (weight read once per layer,batch).
++fn escha_group_offsets(gpu: &Gpu, n: usize) -> HipResult<GpuTensor> {
++    let bytes: Vec<u8> = [0i32, n as i32]
++        .iter()
++        .flat_map(|x| x.to_ne_bytes())
++        .collect();
++    gpu.upload_raw(&bytes, &[2])
++}
++
++/// Escha trellis FFN for the dense slot bodies (DeltaNet and FullAttn share
++/// it): plain rmsnorm, gate and up as grouped trellis GEMMs, SwiGLU, then down
++/// accumulated into the residual. The fused gate_up kernel cannot serve this —
++/// the two projections have different `rin` and it could not read a trellis
++/// code regardless. `biases` is `(gate, up, down)` from the layer's escha dense
++/// export, or `None` for a bias-free model.
++///
++/// Mirrors the decode reference (`escha_run_proj` PROJ_GATE_UP +
++/// `escha_run_resid` RESID_DOWN_SWIGLU + `apply_proj_biases`) row-for-row, so
++/// batched prefill and per-token decode compute the same function.
++#[allow(clippy::too_many_arguments)]
++fn escha_ffn_body_slots(
++    gpu: &mut Gpu,
++    config: &Qwen35Config,
++    ffn_norm: &GpuTensor,
++    w_gate: &WeightTensor,
++    w_up: &WeightTensor,
++    w_down: &WeightTensor,
++    e_gate: &crate::qwen35::escha::EschaProj,
++    e_up: &crate::qwen35::escha::EschaProj,
++    e_down: &crate::qwen35::escha::EschaProj,
++    ids: &GpuTensor,
++    offsets: &GpuTensor,
++    iota: &GpuTensor,
++    biases: Option<(&GpuTensor, &GpuTensor, &GpuTensor)>,
++    pbs: &PrefillBatchScratch,
++    n: usize,
++) -> HipResult<()> {
++    let grouped = Some((offsets, iota));
++    // Plain rmsnorm: escha applies its own H128 `rin` per projection, so a
++    // pre-rotated input would be rotated twice.
++    gpu.rmsnorm_batched(
++        &pbs.x_batch,
++        ffn_norm,
++        &pbs.x_norm_batch,
++        n,
++        w_gate.k,
++        config.norm_eps,
++    )?;
++    e_gate.forward(
++        gpu, w_gate, ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
++        &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n, grouped,
++    )?;
++    e_up.forward(
++        gpu, w_up, ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
++        &pbs.up_batch, &pbs.up_batch, n, grouped,
++    )?;
++    if let Some((bg, bu, _)) = biases {
++        gpu.bias_add_f32(&pbs.gate_ffn_batch, bg, n, bg.numel())?;
++        gpu.bias_add_f32(&pbs.up_batch, bu, n, bu.numel())?;
++    }
++    gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
++    e_down.forward(
++        gpu, w_down, ids, &pbs.ffn_hidden_batch, &pbs.escha_xh_batch,
++        &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped,
++    )?;
++    // down_proj writes the residual stream. The fused epilogue is SKIPPED, not
++    // supplemented — it would write the residual itself, so running both would
++    // count this projection twice. The split add is exact (both terms f32).
++    let dim = w_down.m;
++    let y = pbs.escha_y_batch.sub_offset(0, n * dim);
++    let x = pbs.x_batch.sub_offset(0, n * dim);
++    gpu.add_inplace_f32(&x, &y)?;
++    if let Some((_, _, bd)) = biases {
++        gpu.bias_add_f32(&pbs.x_batch, bd, n, bd.numel())?;
++    }
++    Ok(())
++}
++
+ /// Dense FFN body, dispatched per site from the gate/up group's dtypes and
+ /// `w_down`'s own dtype:
+ ///
+@@ -1411,18 +1521,25 @@ where
+     D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
+ {
+     let arch = gpu.arch.as_str();
+-    // Per-site plans: the qkvza group keeps one fused launch when uniform,
+-    // otherwise per-weight GEMMs; wo and the FFN weights validate their own
+-    // roles inside their dispatchers.
+-    let qkvza_plan = plan_q8_fused_or_plain(
+-        plan_proj_group(
+-            &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+-            "DeltaNet qkvza",
+-            arch,
+-        )?,
+-        q8_wmma_arch,
+-    );
+-    slots_check_residual_weight(&layer.wo, "DeltaNet wo", arch)?;
++    let escha = layer.escha.as_ref();
++    // One `[0, n]` grouped-GEMM offset table per layer, shared by every coded
++    // projection (a dense linear is a single group holding all n slots). The
++    // trellis `ids`/`iota` tables hold ESCHA_MAX_SLOTS rows; the scheduler's
++    // trunk budget (serve.max_batch_tokens, default 4096) normally keeps n
++    // within them. Fail closed if an operator raised the budget past the table
++    // — the grouped GEMM would otherwise read iota out of bounds.
++    let escha_off = if let Some(e) = escha {
++        if n > e.iota.numel() {
++            return Err(HipError::new(
++                0,
++                "escha batched prefill: step rows exceed the trellis slot table \
++                 (ESCHA_MAX_SLOTS); lower serve.max_batch_tokens",
++            ));
++        }
++        Some(escha_group_offsets(gpu, n)?)
++    } else {
++        None
++    };
+ 
+     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+@@ -1430,97 +1547,170 @@ where
+     let n_v_heads = config.linear_num_value_heads;
+     let hd = config.linear_key_head_dim;
+ 
+-    // 1-2. rmsnorm (+FWHT-rotate for rotated containers) then the 4-way
+-    // QKVZA projection. Uniform rotated groups keep the fused rmsnorm+rotate
+-    // producer; mixed groups normalize once, rotate the normed rows, then
+-    // run one plain GEMM per weight (each member's dtype picks its input
+-    // variant — the load-bearing bit: an unrotated member MUST NOT read
+-    // rotated activations).
+-    let (need_rot, need_norm) = match qkvza_plan {
+-        GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
+-        GroupPlan::Mixed {
+-            needs_rot,
+-            needs_norm,
+-        } => (needs_rot, needs_norm),
+-    };
+-    let qkvza_anchor = if let GroupPlan::Uniform(dt) = qkvza_plan {
+-        slots_weight_rotated(dt).then_some(&layer.wqkv)
+-    } else {
+-        [&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha]
+-            .iter()
+-            .find(|w| slots_weight_rotated(w.gpu_dtype))
+-            .copied()
+-    };
+-    slots_norm_site(
+-        gpu,
+-        &pbs.x_batch,
+-        &layer.attn_norm,
+-        qkvza_anchor,
+-        &pbs.x_rot_batch,
+-        &pbs.x_norm_batch,
+-        need_rot,
+-        need_norm,
+-        config.dim,
+-        config.norm_eps,
+-        n,
+-    )?;
+-    match qkvza_plan {
+-        GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
+-            run_fused_qkvza_key(
+-                gpu,
+-                KernelKey::FusedQkvzaQ8_0,
+-                &layer.wqkv.buf,
+-                &layer.wz.buf,
+-                &layer.w_beta.buf,
+-                &layer.w_alpha.buf,
+-                &pbs.x_norm_batch,
+-                &pbs.dn_qkv_batch,
+-                &pbs.dn_z_batch,
+-                &pbs.dn_beta_batch,
+-                &pbs.dn_alpha_batch,
+-                layer.wqkv.m,
+-                layer.wz.m,
+-                layer.w_beta.m,
+-                layer.w_alpha.m,
+-                layer.wqkv.k,
+-                n,
+-            )?;
+-        }
+-        GroupPlan::Uniform(dt) => {
+-            let x = if slots_weight_rotated(dt) {
+-                &pbs.x_rot_batch
+-            } else {
+-                &pbs.x_norm_batch
+-            };
+-            run_fused_qkvza_key(
+-                gpu,
+-                fused_qkvza_key_for(dt),
+-                &layer.wqkv.buf,
+-                &layer.wz.buf,
+-                &layer.w_beta.buf,
+-                &layer.w_alpha.buf,
+-                x,
+-                &pbs.dn_qkv_batch,
+-                &pbs.dn_z_batch,
+-                &pbs.dn_beta_batch,
+-                &pbs.dn_alpha_batch,
+-                layer.wqkv.m,
+-                layer.wz.m,
+-                layer.w_beta.m,
+-                layer.w_alpha.m,
+-                layer.wqkv.k,
+-                n,
+-            )?;
++    // 1-2. rmsnorm then the 4-way QKVZA projection.
++    //
++    // ESCHA FIRST: a trellis layer bypasses the fused/group-plan machinery
++    // entirely. qkv/z are trellis codes — each applies its OWN `rin` to the
++    // normed input — while in_proj_a/in_proj_b are uncoded (the escha ignore
++    // list leaves them plain). Their container varies by checkpoint: escha base
++    // keeps them MQ6G256V2 (FWHT-rotated basis → needs x_rot), escha-pro /
++    // escha-35b keep them F16 (or F32 under HIPFIRE_F16_LM_HEAD=f32), which are
++    // plain and read x_norm. So the norm site always produces x_norm (for the
++    // trellis pair) and additionally x_rot only when a rotated sibling exists.
++    // A fused Qkvza launch can neither read a trellis code nor share one rotated
++    // activation across projections with different rin. The grouped GEMM reads
++    // each weight once per (layer,batch) instead of once per slot — the
++    // dense-prefill fix.
++    if let Some(e) = escha {
++        let grouped = Some((escha_off.as_ref().expect("escha offsets built"), &e.iota));
++        // Derive need_rot + the anchor from the ACTUAL in_proj dtypes rather than
++        // assuming MQ6. This mirrors the decode reference (escha_run_proj feeds
++        // the unrotated normed s.tmp to weight_gemv, which rotates only for MQ
++        // containers): an F16/F32 sibling must read x_norm, never x_rot.
++        let beta_rot = slots_weight_rotated(layer.w_beta.gpu_dtype);
++        let alpha_rot = slots_weight_rotated(layer.w_alpha.gpu_dtype);
++        let rot_anchor = if beta_rot {
++            Some(&layer.w_beta)
++        } else if alpha_rot {
++            Some(&layer.w_alpha)
++        } else {
++            None
++        };
++        slots_norm_site(
++            gpu,
++            &pbs.x_batch,
++            &layer.attn_norm,
++            rot_anchor,
++            &pbs.x_rot_batch,
++            &pbs.x_norm_batch,
++            beta_rot || alpha_rot,
++            true,
++            config.dim,
++            config.norm_eps,
++            n,
++        )?;
++        e.qkv.forward(
++            gpu, &layer.wqkv, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
++            &pbs.dn_qkv_batch, &pbs.dn_qkv_batch, n, grouped,
++        )?;
++        e.z.forward(
++            gpu, &layer.wz, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
++            &pbs.dn_z_batch, &pbs.dn_z_batch, n, grouped,
++        )?;
++        // Uncoded in_proj_a/b siblings: slots_plain_proj picks x_rot for a
++        // rotated MQ6 container, or x_norm for the plain F16/F32 siblings
++        // (escha-pro), routing each to its dtype's batched GEMM key.
++        let beta = pbs.dn_beta_batch.sub_offset(0, n * layer.w_beta.m);
++        slots_plain_proj(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.x_norm_batch, &beta, n)?;
++        let alpha = pbs.dn_alpha_batch.sub_offset(0, n * layer.w_alpha.m);
++        slots_plain_proj(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.x_norm_batch, &alpha, n)?;
++        if let Some(b) = layer.biases.as_ref() {
++            gpu.bias_add_f32(&pbs.dn_qkv_batch, &b.qkv, n, b.qkv.numel())?;
++            gpu.bias_add_f32(&pbs.dn_z_batch, &b.z, n, b.z.numel())?;
+         }
+-        GroupPlan::Mixed { .. } => {
+-            for (w, out) in [
+-                (&layer.wqkv, &pbs.dn_qkv_batch),
+-                (&layer.wz, &pbs.dn_z_batch),
+-                (&layer.w_beta, &pbs.dn_beta_batch),
+-                (&layer.w_alpha, &pbs.dn_alpha_batch),
+-            ] {
+-                let y = out.sub_offset(0, n * w.m);
+-                slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
++    } else {
++        // Per-site plans: the qkvza group keeps one fused launch when uniform,
++        // otherwise per-weight GEMMs; wo and the FFN weights validate their own
++        // roles inside their dispatchers.
++        let qkvza_plan = plan_q8_fused_or_plain(
++            plan_proj_group(
++                &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
++                "DeltaNet qkvza",
++                arch,
++            )?,
++            q8_wmma_arch,
++        );
++        slots_check_residual_weight(&layer.wo, "DeltaNet wo", arch)?;
++        // Uniform rotated groups keep the fused rmsnorm+rotate producer; mixed
++        // groups normalize once, rotate the normed rows, then run one plain GEMM
++        // per weight (each member's dtype picks its input variant — the
++        // load-bearing bit: an unrotated member MUST NOT read rotated activations).
++        let (need_rot, need_norm) = match qkvza_plan {
++            GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
++            GroupPlan::Mixed {
++                needs_rot,
++                needs_norm,
++            } => (needs_rot, needs_norm),
++        };
++        let qkvza_anchor = if let GroupPlan::Uniform(dt) = qkvza_plan {
++            slots_weight_rotated(dt).then_some(&layer.wqkv)
++        } else {
++            [&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha]
++                .iter()
++                .find(|w| slots_weight_rotated(w.gpu_dtype))
++                .copied()
++        };
++        slots_norm_site(
++            gpu,
++            &pbs.x_batch,
++            &layer.attn_norm,
++            qkvza_anchor,
++            &pbs.x_rot_batch,
++            &pbs.x_norm_batch,
++            need_rot,
++            need_norm,
++            config.dim,
++            config.norm_eps,
++            n,
++        )?;
++        match qkvza_plan {
++            GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
++                run_fused_qkvza_key(
++                    gpu,
++                    KernelKey::FusedQkvzaQ8_0,
++                    &layer.wqkv.buf,
++                    &layer.wz.buf,
++                    &layer.w_beta.buf,
++                    &layer.w_alpha.buf,
++                    &pbs.x_norm_batch,
++                    &pbs.dn_qkv_batch,
++                    &pbs.dn_z_batch,
++                    &pbs.dn_beta_batch,
++                    &pbs.dn_alpha_batch,
++                    layer.wqkv.m,
++                    layer.wz.m,
++                    layer.w_beta.m,
++                    layer.w_alpha.m,
++                    layer.wqkv.k,
++                    n,
++                )?;
++            }
++            GroupPlan::Uniform(dt) => {
++                let x = if slots_weight_rotated(dt) {
++                    &pbs.x_rot_batch
++                } else {
++                    &pbs.x_norm_batch
++                };
++                run_fused_qkvza_key(
++                    gpu,
++                    fused_qkvza_key_for(dt),
++                    &layer.wqkv.buf,
++                    &layer.wz.buf,
++                    &layer.w_beta.buf,
++                    &layer.w_alpha.buf,
++                    x,
++                    &pbs.dn_qkv_batch,
++                    &pbs.dn_z_batch,
++                    &pbs.dn_beta_batch,
++                    &pbs.dn_alpha_batch,
++                    layer.wqkv.m,
++                    layer.wz.m,
++                    layer.w_beta.m,
++                    layer.w_alpha.m,
++                    layer.wqkv.k,
++                    n,
++                )?;
++            }
++            GroupPlan::Mixed { .. } => {
++                for (w, out) in [
++                    (&layer.wqkv, &pbs.dn_qkv_batch),
++                    (&layer.wz, &pbs.dn_z_batch),
++                    (&layer.w_beta, &pbs.dn_beta_batch),
++                    (&layer.w_alpha, &pbs.dn_alpha_batch),
++                ] {
++                    let y = out.sub_offset(0, n * w.m);
++                    slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
++                }
+             }
+         }
+     }
+@@ -1661,32 +1851,74 @@ where
+         n,
+     )?;
+ 
+-    // 8. wo + residual — dispatched by wo's own dtype (Q8 residual, rotated
+-    // containers rotate into dn_normed_rot first, HFQ* containers direct).
+-    slots_residual_proj(
+-        gpu,
+-        &layer.wo,
+-        &pbs.dn_normed_batch,
+-        &pbs.x_batch,
+-        &pbs.dn_normed_rot_batch,
+-        &pbs.x_rot_batch,
+-        n,
+-        q8_wmma_arch,
+-    )?;
++    // 8. wo + residual, 9. FFN.
++    //
++    // ESCHA: out_proj and the whole FFN are trellis codes. The fused residual
++    // epilogue and the fused gate_up launch cannot read a trellis code, so each
++    // projection runs as a grouped GEMM and the residual accumulate is a
++    // separate exact f32 add — mirroring the decode reference's
++    // `escha_run_resid` (RESID_WO + RESID_DOWN_SWIGLU) row-for-row, biases
++    // applied to the residual stream AFTER the add, exactly as `run_residual_gemv`.
++    if let Some(e) = escha {
++        let grouped = Some((escha_off.as_ref().expect("escha offsets built"), &e.iota));
++        // 8. wo + residual.
++        e.o.forward(
++            gpu, &layer.wo, &e.ids, &pbs.dn_normed_batch, &pbs.escha_xh_batch,
++            &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped,
++        )?;
++        let dim = layer.wo.m;
++        let y = pbs.escha_y_batch.sub_offset(0, n * dim);
++        let x = pbs.x_batch.sub_offset(0, n * dim);
++        gpu.add_inplace_f32(&x, &y)?;
++        if let Some(b) = layer.biases.as_ref() {
++            gpu.bias_add_f32(&pbs.x_batch, &b.o, n, b.o.numel())?;
++        }
++        // 9. FFN: rmsnorm, gate+up, silu_mul, down + residual.
++        escha_ffn_body_slots(
++            gpu,
++            config,
++            &layer.ffn_norm,
++            &layer.w_gate,
++            &layer.w_up,
++            &layer.w_down,
++            &e.gate,
++            &e.up,
++            &e.down,
++            &e.ids,
++            escha_off.as_ref().expect("escha offsets built"),
++            &e.iota,
++            layer.biases.as_ref().map(|b| (&b.gate, &b.up, &b.down)),
++            pbs,
++            n,
++        )
++    } else {
++        // 8. wo + residual — dispatched by wo's own dtype (Q8 residual, rotated
++        // containers rotate into dn_normed_rot first, HFQ* containers direct).
++        slots_residual_proj(
++            gpu,
++            &layer.wo,
++            &pbs.dn_normed_batch,
++            &pbs.x_batch,
++            &pbs.dn_normed_rot_batch,
++            &pbs.x_rot_batch,
++            n,
++            q8_wmma_arch,
++        )?;
+ 
+-    // 9. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — dispatched per
+-    // site inside the body.
+-    dense_ffn_body_slots(
+-        gpu,
+-        config,
+-        &layer.ffn_norm,
+-        &layer.w_gate,
+-        &layer.w_up,
+-        &layer.w_down,
+-        pbs,
+-        n,
+-        q8_wmma_arch,
+-    )
++        // 9. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — dispatched per
++        // site inside the body.
++        dense_ffn_body_slots(
++            gpu,
++            config,
++            &layer.ffn_norm,
++            &layer.w_gate,
++            &layer.w_up,
++            &layer.w_down,
++            pbs,
++            n,
++            q8_wmma_arch,
++        )
++    }
+ }
+ 
+ /// Run one `LinearAttention` (DeltaNet) + MoE layer across the whole step.
+@@ -2858,96 +3090,149 @@ fn run_fullattn_layer_slots(
+     use_mrope: bool,
+ ) -> HipResult<()> {
+     let arch = gpu.arch.as_str();
+-    // Per-site plans: {wq,wk,wv} keep one fused launch when uniform, wo and
+-    // the FFN weights validate their own roles inside their dispatchers.
+-    let qkv_plan = plan_q8_fused_or_plain(
+-        plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttn qkv", arch)?,
+-        q8_wmma_arch,
+-    );
+-    slots_check_residual_weight(&layer.wo, "FullAttn wo", arch)?;
+-
++    let escha = layer.escha.as_ref();
++    // One `[0, n]` grouped-GEMM offset table per layer, shared by every coded
++    // projection (a dense linear is a single group holding all n slots). See
++    // `run_deltanet_layer_slots`: fail closed if n exceeds the trellis table.
++    let escha_off = if let Some(e) = escha {
++        if n > e.iota.numel() {
++            return Err(HipError::new(
++                0,
++                "escha batched prefill: step rows exceed the trellis slot table \
++                 (ESCHA_MAX_SLOTS); lower serve.max_batch_tokens",
++            ));
++        }
++        Some(escha_group_offsets(gpu, n)?)
++    } else {
++        None
++    };
+     let dim = config.dim;
+ 
+     // 1-2. rmsnorm (+FWHT-rotate for rotated containers) then the 3-way QKV
+     // projection — same group-plan rules as the DeltaNet site above.
+-    let (need_rot, need_norm) = match qkv_plan {
+-        GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
+-        GroupPlan::Mixed {
+-            needs_rot,
+-            needs_norm,
+-        } => (needs_rot, needs_norm),
+-    };
+-    let qkv_anchor = if let GroupPlan::Uniform(dt) = qkv_plan {
+-        slots_weight_rotated(dt).then_some(&layer.wq)
+-    } else {
+-        [&layer.wq, &layer.wk, &layer.wv]
+-            .iter()
+-            .find(|w| slots_weight_rotated(w.gpu_dtype))
+-            .copied()
+-    };
+-    slots_norm_site(
+-        gpu,
+-        &pbs.x_batch,
+-        &layer.attn_norm,
+-        qkv_anchor,
+-        &pbs.x_rot_batch,
+-        &pbs.x_norm_batch,
+-        need_rot,
+-        need_norm,
+-        dim,
+-        config.norm_eps,
+-        n,
+-    )?;
+-    match qkv_plan {
+-        GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
+-            run_fused_qkv_key(
+-                gpu,
+-                KernelKey::FusedQkvQ8_0,
+-                &layer.wq.buf,
+-                &layer.wk.buf,
+-                &layer.wv.buf,
+-                &pbs.x_norm_batch,
+-                &pbs.fa_q_full_batch,
+-                &pbs.fa_k_batch,
+-                &pbs.fa_v_batch,
+-                layer.wq.m,
+-                layer.wk.m,
+-                layer.wv.m,
+-                layer.wq.k,
+-                n,
+-            )?;
+-        }
+-        GroupPlan::Uniform(dt) => {
+-            let x = if slots_weight_rotated(dt) {
+-                &pbs.x_rot_batch
+-            } else {
+-                &pbs.x_norm_batch
+-            };
+-            run_fused_qkv_key(
+-                gpu,
+-                fused_qkv_key_for(dt),
+-                &layer.wq.buf,
+-                &layer.wk.buf,
+-                &layer.wv.buf,
+-                x,
+-                &pbs.fa_q_full_batch,
+-                &pbs.fa_k_batch,
+-                &pbs.fa_v_batch,
+-                layer.wq.m,
+-                layer.wk.m,
+-                layer.wv.m,
+-                layer.wq.k,
+-                n,
+-            )?;
++    //
++    // ESCHA FIRST: q/k/v are trellis codes, each applying its OWN `rin` to the
++    // normed input. Unlike DeltaNet there is no uncoded MQ6 sibling here, so
++    // only x_norm is produced — no FWHT rotation (a pre-rotated input would be
++    // rotated twice). The fused Qkv launch cannot read a trellis code; the
++    // grouped GEMM reads each weight once per (layer,batch) instead of once per
++    // slot — the dense-prefill fix. Biases land on the FULL q buffer before the
++    // shared deinterleave below, exactly as the decode `apply_proj_biases`.
++    if let Some(e) = escha {
++        let grouped = Some((escha_off.as_ref().expect("escha offsets built"), &e.iota));
++        gpu.rmsnorm_batched(
++            &pbs.x_batch,
++            &layer.attn_norm,
++            &pbs.x_norm_batch,
++            n,
++            dim,
++            config.norm_eps,
++        )?;
++        e.q.forward(
++            gpu, &layer.wq, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
++            &pbs.fa_q_full_batch, &pbs.fa_q_full_batch, n, grouped,
++        )?;
++        e.k.forward(
++            gpu, &layer.wk, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
++            &pbs.fa_k_batch, &pbs.fa_k_batch, n, grouped,
++        )?;
++        e.v.forward(
++            gpu, &layer.wv, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
++            &pbs.fa_v_batch, &pbs.fa_v_batch, n, grouped,
++        )?;
++        if let Some(b) = layer.biases.as_ref() {
++            gpu.bias_add_f32(&pbs.fa_q_full_batch, &b.q, n, b.q.numel())?;
++            gpu.bias_add_f32(&pbs.fa_k_batch, &b.k, n, b.k.numel())?;
++            gpu.bias_add_f32(&pbs.fa_v_batch, &b.v, n, b.v.numel())?;
+         }
+-        GroupPlan::Mixed { .. } => {
+-            for (w, out) in [
+-                (&layer.wq, &pbs.fa_q_full_batch),
+-                (&layer.wk, &pbs.fa_k_batch),
+-                (&layer.wv, &pbs.fa_v_batch),
+-            ] {
+-                let y = out.sub_offset(0, n * w.m);
+-                slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
++    } else {
++        // Per-site plans: {wq,wk,wv} keep one fused launch when uniform, wo and
++        // the FFN weights validate their own roles inside their dispatchers.
++        let qkv_plan = plan_q8_fused_or_plain(
++            plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttn qkv", arch)?,
++            q8_wmma_arch,
++        );
++        slots_check_residual_weight(&layer.wo, "FullAttn wo", arch)?;
++
++        let (need_rot, need_norm) = match qkv_plan {
++            GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
++            GroupPlan::Mixed {
++                needs_rot,
++                needs_norm,
++            } => (needs_rot, needs_norm),
++        };
++        let qkv_anchor = if let GroupPlan::Uniform(dt) = qkv_plan {
++            slots_weight_rotated(dt).then_some(&layer.wq)
++        } else {
++            [&layer.wq, &layer.wk, &layer.wv]
++                .iter()
++                .find(|w| slots_weight_rotated(w.gpu_dtype))
++                .copied()
++        };
++        slots_norm_site(
++            gpu,
++            &pbs.x_batch,
++            &layer.attn_norm,
++            qkv_anchor,
++            &pbs.x_rot_batch,
++            &pbs.x_norm_batch,
++            need_rot,
++            need_norm,
++            dim,
++            config.norm_eps,
++            n,
++        )?;
++        match qkv_plan {
++            GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
++                run_fused_qkv_key(
++                    gpu,
++                    KernelKey::FusedQkvQ8_0,
++                    &layer.wq.buf,
++                    &layer.wk.buf,
++                    &layer.wv.buf,
++                    &pbs.x_norm_batch,
++                    &pbs.fa_q_full_batch,
++                    &pbs.fa_k_batch,
++                    &pbs.fa_v_batch,
++                    layer.wq.m,
++                    layer.wk.m,
++                    layer.wv.m,
++                    layer.wq.k,
++                    n,
++                )?;
++            }
++            GroupPlan::Uniform(dt) => {
++                let x = if slots_weight_rotated(dt) {
++                    &pbs.x_rot_batch
++                } else {
++                    &pbs.x_norm_batch
++                };
++                run_fused_qkv_key(
++                    gpu,
++                    fused_qkv_key_for(dt),
++                    &layer.wq.buf,
++                    &layer.wk.buf,
++                    &layer.wv.buf,
++                    x,
++                    &pbs.fa_q_full_batch,
++                    &pbs.fa_k_batch,
++                    &pbs.fa_v_batch,
++                    layer.wq.m,
++                    layer.wk.m,
++                    layer.wv.m,
++                    layer.wq.k,
++                    n,
++                )?;
++            }
++            GroupPlan::Mixed { .. } => {
++                for (w, out) in [
++                    (&layer.wq, &pbs.fa_q_full_batch),
++                    (&layer.wk, &pbs.fa_k_batch),
++                    (&layer.wv, &pbs.fa_v_batch),
++                ] {
++                    let y = out.sub_offset(0, n * w.m);
++                    slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
++                }
+             }
+         }
+     }
+@@ -3059,31 +3344,70 @@ fn run_fullattn_layer_slots(
+         &pbs.fa_gate_batch.sub_offset(0, gate_elems),
+     )?;
+ 
+-    // 9. wo + residual — dispatched by wo's own dtype (rotated containers
+-    // rotate into fa_attn_out_rot first, HFQ*/Q8 project directly).
+-    slots_residual_proj(
+-        gpu,
+-        &layer.wo,
+-        &pbs.fa_attn_out_batch,
+-        &pbs.x_batch,
+-        &pbs.fa_attn_out_rot_batch,
+-        &pbs.x_rot_batch,
+-        n,
+-        q8_wmma_arch,
+-    )?;
++    // 9. wo + residual, 10. FFN.
++    //
++    // ESCHA: out_proj and the whole FFN are trellis codes — grouped GEMM +
++    // separate exact f32 residual add, mirroring the decode reference's
++    // `escha_run_resid` (input is `fa_attn_out`, not `dn_normed`), biases on the
++    // residual stream AFTER the add.
++    if let Some(e) = escha {
++        let grouped = Some((escha_off.as_ref().expect("escha offsets built"), &e.iota));
++        // 9. wo + residual.
++        e.o.forward(
++            gpu, &layer.wo, &e.ids, &pbs.fa_attn_out_batch, &pbs.escha_xh_batch,
++            &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped,
++        )?;
++        let y = pbs.escha_y_batch.sub_offset(0, n * dim);
++        let x = pbs.x_batch.sub_offset(0, n * dim);
++        gpu.add_inplace_f32(&x, &y)?;
++        if let Some(b) = layer.biases.as_ref() {
++            gpu.bias_add_f32(&pbs.x_batch, &b.o, n, b.o.numel())?;
++        }
++        // 10. FFN: rmsnorm, gate+up, silu_mul, down + residual.
++        escha_ffn_body_slots(
++            gpu,
++            config,
++            &layer.ffn_norm,
++            &layer.w_gate,
++            &layer.w_up,
++            &layer.w_down,
++            &e.gate,
++            &e.up,
++            &e.down,
++            &e.ids,
++            escha_off.as_ref().expect("escha offsets built"),
++            &e.iota,
++            layer.biases.as_ref().map(|b| (&b.gate, &b.up, &b.down)),
++            pbs,
++            n,
++        )
++    } else {
++        // 9. wo + residual — dispatched by wo's own dtype (rotated containers
++        // rotate into fa_attn_out_rot first, HFQ*/Q8 project directly).
++        slots_residual_proj(
++            gpu,
++            &layer.wo,
++            &pbs.fa_attn_out_batch,
++            &pbs.x_batch,
++            &pbs.fa_attn_out_rot_batch,
++            &pbs.x_rot_batch,
++            n,
++            q8_wmma_arch,
++        )?;
+ 
+-    // 10. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — per-site.
+-    dense_ffn_body_slots(
+-        gpu,
+-        config,
+-        &layer.ffn_norm,
+-        &layer.w_gate,
+-        &layer.w_up,
+-        &layer.w_down,
+-        pbs,
+-        n,
+-        q8_wmma_arch,
+-    )
++        // 10. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — per-site.
++        dense_ffn_body_slots(
++            gpu,
++            config,
++            &layer.ffn_norm,
++            &layer.w_gate,
++            &layer.w_up,
++            &layer.w_down,
++            pbs,
++            n,
++            q8_wmma_arch,
++        )
++    }
+ }
+ 
+ /// Run one `FullAttention` + MoE layer across the whole step. Same shape as
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/prefill.rs b/crates/hipfire-arch-qwen35/src/qwen35/prefill.rs
+index aadf4773d01f1bc59b2e31f1af8b6455c25486b3..81df835e16500ae7cf8651f819670f5be45233ce 100644
+--- a/crates/hipfire-arch-qwen35/src/qwen35/prefill.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35/prefill.rs
+@@ -4363,6 +4363,14 @@ pub fn qwen35_layer_batch_admissible(
+             if l.w_down.m != dim || l.w_down.k != config.hidden_dim {
+                 return Err(HipError::new(0, "DeltaNet w_down shape mismatch"));
+             }
++            // Escha trellis layer: geometry above is dtype-agnostic (a code's
++            // m/k are its oc/ic), but `is_batchable_la` only admits the fused
++            // MQ/low-bit ladder and rejects trellis codes. The slot body runs
++            // escha through its own grouped-GEMM arm, so the dtype gate does
++            // not apply — admit once the shapes check out.
++            if l.escha.is_some() {
++                return Ok(());
++            }
+             for (name, dt) in [
+                 ("wqkv", l.wqkv.gpu_dtype),
+                 ("wz", l.wz.gpu_dtype),
+@@ -4416,6 +4424,12 @@ pub fn qwen35_layer_batch_admissible(
+             if l.w_down.m != dim || l.w_down.k != config.hidden_dim {
+                 return Err(HipError::new(0, "FullAttn w_down shape mismatch"));
+             }
++            // Escha trellis layer: see the DeltaNet branch — shapes are
++            // dtype-agnostic, the grouped-GEMM arm replaces the fused ladder
++            // that `is_batchable_la` gates, so admit once geometry checks out.
++            if l.escha.is_some() {
++                return Ok(());
++            }
+             for (name, dt) in [
+                 ("wq", l.wq.gpu_dtype),
+                 ("wk", l.wk.gpu_dtype),
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index b48039955069460552c22e9753af4e2c94e18567..ed410184c69088c82460e1e5e1036270db33019a 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -1014,30 +1014,27 @@ impl Rig {
+         .map_err(|e| format!("kv mode {kv_mode:?}: {e}"))?;
+         let per_pos_bytes = kv_plan.k_bytes_per_pos;
+         let per_pos_v_bytes = kv_plan.v_bytes_per_pos;
+-        // Escha trellis checkpoints (wire qt 42/43 = Escha2T16/Escha3T16) have
+-        // no batched DENSE-prefill kernel: the multi-slot slots ladder admits
+-        // only plain/MQ/low-bit GEMM dtypes (`slots_proj_admissible`), and the
+-        // batched escha GEMM (`EschaProj::forward` slots>1) is wired for MoE
+-        // experts, not a dense linear. The verified escha path is the
+-        // single-position lowered ladder (`forward_scratch_layers_paged_lowered`).
+-        // Forcing prefill_chunk=1 makes every prefill step n==1, which routes
+-        // through `use_reference_decode` in `forward_batch_slots_opts` — a
+-        // branch that sits BEFORE the slots admission gate — into that same
+-        // lowered path. This is exactly how the reference engine prefills escha
+-        // (its dense generate falls back to per-token decode_step when the
+-        // batched prefill is not admitted). Decode speed is untouched; only
+-        // prefill is serialized, matching the reference's own escha prefill, so
+-        // a stock-vs-KVMem decode A/B stays fair. Detected from the tensor
+-        // manifest (no data read); qt 42/43 are exclusively escha wire ids.
+-        let escha_model = hfq
+-            .tensors()
+-            .iter()
+-            .any(|t| t.quant_type == 42 || t.quant_type == 43);
+-        let prefill_chunk = if escha_model {
+-            1
+-        } else {
+-            cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1))
+-        };
++        // Escha trellis checkpoints (wire qt 42/43) now batch prefill like every
++        // other model: the slot bodies run a grouped-GEMM escha arm (one weight
++        // read per (layer,batch)) and `qwen35_layer_batch_admissible` admits
++        // them, so the old `prefill_chunk=1` serialization workaround is gone.
++        let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
++        // Reference-test override: force the engine's prefill quantum independent
++        // of the wire/CLI scratch budget. The CLI clamps `max_batch_tokens` to
++        // `prefill_chunk * n_slots`, and FairQueue requires
++        // `max_batch_tokens >= n_slots + prefill_min_tokens`, so a wire
++        // `prefill_chunk=1` (scratch 1) is an invalid serve config for ANY model.
++        // Setting HIPFIRE_PREFILL_CHUNK_OVERRIDE=1 while leaving the CLI chunk at
++        // its default keeps the wire budget valid (FairQueue passes) yet drives
++        // every prefill step at n==1 -> use_reference_decode -> the lowered
++        // per-token ladder. This is the apples-to-apples serial reference for the
++        // batched-vs-serial recall A/B (same paged KV, attention, and decode; only
++        // the prefill quantum differs). Unset => no change (batched prefill).
++        let prefill_chunk = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_OVERRIDE")
++            .ok()
++            .and_then(|v| v.parse::<usize>().ok())
++            .map(|v| v.max(1).min(cfg.cap_tokens.max(1)))
++            .unwrap_or(prefill_chunk);
+         // DFlash2 draft config pre-parse: the runtime block size B sets
+         // `spec_rows` (verify rows per spec slot), which `max_batch` and the
+         // verify tape are sized by — both allocated before the GPU-side
+diff --git a/crates/hipfire-dispatch/src/families/gemm.rs b/crates/hipfire-dispatch/src/families/gemm.rs
+index a1f36f0ce941f56829284ff17c4bf50b8e5a96e6..be5ec5493b03e0ecb958211ff9b99f6cc3fcd40a 100644
+--- a/crates/hipfire-dispatch/src/families/gemm.rs
++++ b/crates/hipfire-dispatch/src/families/gemm.rs
+@@ -718,7 +718,11 @@ impl GemmFamily {
+                 hip!(gpu.gemm_mq6g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
+             }
+             K::GemmMq3G256V2Residual => {
+-                if mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size) {
++                if gpu.q8x_verify_active(k, batch_size) {
++                    // Exact-gfx1100 int8 small-batch verify GEMV (gemv_q8x.rs).
++                    // lm_head keeps the exact WMMA path (GemmMq3G256V2BatchedLmhead).
++                    hip!(gpu.gemm_mq3g256v2_q8x(&[(w.buf, y, m)], x, k, batch_size, true))
++                } else if mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size) {
+                     hip!(gpu.gemm_mq3v25_residual_iu8(w.buf, x, y, m, k, batch_size, true))
+                 } else if mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size, m) {
+                     hip!(gpu.gemm_mq3v25_residual_iu4(w.buf, x, y, m, k, batch_size, true))
+diff --git a/crates/hipfire-runtime/examples/mq3v2_q8x_parity.rs b/crates/hipfire-runtime/examples/mq3v2_q8x_parity.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbc38eea3d67d0f0fd76a4d15b18afeb4fec10c1
+--- /dev/null
++++ b/crates/hipfire-runtime/examples/mq3v2_q8x_parity.rs
+@@ -0,0 +1,360 @@
++//! Deterministic CPU-vs-GPU parity for the MQ3G256V2 (qt=49) int8 small-batch
++//! verify GEMV (`gemm_mq3g256v2_q8x`) — the gfx1100 q8x route ported from MQ4.
++//!
++//! ## Why this harness exists
++//!
++//! MQ3G256V2 stores 3-bit codes (0..7) in a 104-byte group: an 8-byte header
++//! with two independent fp16 grids `[s0 z0]` (weights 0..127) and `[s1 z1]`
++//! (weights 128..255), then a 96-byte payload where weight `w` lives at bit
++//! `3*w` (LSB-first). The q8x kernel reads 12 payload bytes per lane (lane `l`
++//! owns weights `32*l .. 32*l+31`), unpacks 32 codes, and dots them against
++//! int8-quantized activations with `v_dot4_i32_iu8`. The new 3-bit unpack
++//! (`q8x3_unpack`) is the key risk: a wrong bit shift or half-select silently
++//! corrupts every projection.
++//!
++//! A fixture with equal halves cannot discriminate a half-select bug. This
++//! harness builds DISJOINT halves — half0 in `[-1,1]`, half1 in `[96,160]` —
++//! so a kernel that decodes half1 with half0's header reconstructs `~0`
++//! instead of `~128` and fails by >100% relative error. The same construction
++//! defeats a swapped half and a mis-shifted 3-bit unpack.
++//!
++//! The route quantizes activations to int8 (q8_1-class, ~4e-3 rel-L2), so it
++//! is NOT byte-exact; tolerances mirror `mq4v2_residual_parity`: relative RMS
++//! below 5% against the exact-dequant fp32 reference, with the single-header
++//! bug required to stay at least 10x worse.
++//!
++//! Coverage: single-weight and `_multi` (two weights sharing x) launches,
++//! both residual (`Y += W·X`) and overwrite (`Y = W·X`) semantics, across
++//! batches 2..5 and K∈{256,5120,8192} so both the v4 (persistent, all-K LDS)
++//! and v3 (LDS-staged chunks) variants are exercised. The overwrite case
++//! uploads a NON-ZERO Y init so an accidental accumulate is caught.
++//!
++//! Run: `cargo run --release -p hipfire-runtime --example mq3v2_q8x_parity`
++
++use half::f16;
++use rdna_compute::Gpu;
++
++const GROUP: usize = 256;
++const HALF: usize = 128;
++const GROUP_BYTES: usize = 104;
++const LEVELS: f32 = 7.0; // 3-bit codes 0..7
++
++fn prng(i: usize, salt: u32) -> f32 {
++    let x = (i as u32)
++        .wrapping_mul(0x9E37_79B9)
++        .wrapping_add(salt.wrapping_mul(0x85EB_CA6B));
++    let x = x ^ (x >> 15);
++    let x = x.wrapping_mul(0x2545_F491);
++    let x = x ^ (x >> 13);
++    (x >> 8) as f32 / (1u32 << 24) as f32
++}
++
++fn build_disjoint_halves(m: usize, k: usize, seed: u32) -> Vec<f32> {
++    let mut w = vec![0.0f32; m * k];
++    for r in 0..m {
++        for c in 0..k {
++            let gi = c % GROUP;
++            let idx = r * k + c;
++            if gi < HALF {
++                w[idx] = prng(idx, seed ^ 0xA5A5_0001) * 2.0 - 1.0;
++            } else {
++                w[idx] = 96.0 + prng(idx, seed ^ 0x5A5A_0002) * 64.0;
++            }
++        }
++    }
++    w
++}
++
++/// Pack f32 weights into the canonical MQ3G256V2 wire format: per-128 fp16
++/// `[step lo]` header pairs, then 3-bit codes at bit `3*w` of the 96-byte
++/// payload (LSB-first across bytes).
++fn pack_mq3g256v2(w: &[f32], m: usize, k: usize) -> Vec<u8> {
++    let gpr = k / GROUP;
++    let mut blob = vec![0u8; m * gpr * GROUP_BYTES];
++    for r in 0..m {
++        for g in 0..gpr {
++            let src = r * k + g * GROUP;
++            let dst = (r * gpr + g) * GROUP_BYTES;
++            let mut q = [0u8; GROUP];
++            for h in 0..2 {
++                let off = h * HALF;
++                let s = &w[src + off..src + off + HALF];
++                let lo = s.iter().cloned().fold(f32::INFINITY, f32::min);
++                let hi = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
++                let step = if hi > lo { (hi - lo) / LEVELS } else { 0.0 };
++                let sb = if hi == lo {
++                    0u16
++                } else {
++                    f16::from_f32(step).to_bits()
++                };
++                let zb = f16::from_f32(lo).to_bits();
++                blob[dst + h * 4..dst + h * 4 + 2].copy_from_slice(&sb.to_le_bytes());
++                blob[dst + h * 4 + 2..dst + h * 4 + 4].copy_from_slice(&zb.to_le_bytes());
++                let st = f16::from_bits(sb).to_f32();
++                let z = f16::from_bits(zb).to_f32();
++                if st == 0.0 {
++                    continue;
++                }
++                let inv = 1.0 / st;
++                for i in 0..HALF {
++                    q[off + i] = ((s[i] - z) * inv + 0.5).floor().clamp(0.0, LEVELS) as u8;
++                }
++            }
++            // 3-bit LSB-first: weight w occupies bits [3w, 3w+3).
++            for w in 0..GROUP {
++                let code = q[w] as u32;
++                let bit = 3 * w;
++                let byte = bit / 8;
++                let shift = bit % 8;
++                let val = code << shift;
++                blob[dst + 8 + byte] |= (val & 0xFF) as u8;
++                if shift > 5 {
++                    // code spans into the next byte (shift 6 or 7)
++                    blob[dst + 8 + byte + 1] |= (val >> 8) as u8;
++                }
++            }
++        }
++    }
++    blob
++}
++
++/// Exact dequant: weight w at bit 3w, header half selected by w<128.
++fn decode_w(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
++    let gpr = k / GROUP;
++    let mut w = vec![0.0f32; m * k];
++    for r in 0..m {
++        for g in 0..gpr {
++            let src = (r * gpr + g) * GROUP_BYTES;
++            let h_a = u32::from_le_bytes([blob[src], blob[src + 1], blob[src + 2], blob[src + 3]]);
++            let h_b =
++                u32::from_le_bytes([blob[src + 4], blob[src + 5], blob[src + 6], blob[src + 7]]);
++            let sc0 = f16::from_bits((h_a & 0xFFFF) as u16).to_f32();
++            let zp0 = f16::from_bits((h_a >> 16) as u16).to_f32();
++            let sc1 = f16::from_bits((h_b & 0xFFFF) as u16).to_f32();
++            let zp1 = f16::from_bits((h_b >> 16) as u16).to_f32();
++            for wi in 0..GROUP {
++                let (sc, zp) = if wi < HALF { (sc0, zp0) } else { (sc1, zp1) };
++                let bit = 3 * wi;
++                let byte = bit / 8;
++                let shift = bit % 8;
++                let lo = blob[src + 8 + byte] as u32;
++                let hi = if shift > 5 {
++                    blob[src + 8 + byte + 1] as u32
++                } else {
++                    0
++                };
++                let code = ((lo | (hi << 8)) >> shift) & 7;
++                let wk = g * GROUP + wi;
++                w[r * k + wk] = sc * (code as f32) + zp;
++            }
++        }
++    }
++    w
++}
++
++/// Bug baseline: decode every weight with half0's header (single-header read).
++fn decode_w_single_header(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
++    let gpr = k / GROUP;
++    let mut w = vec![0.0f32; m * k];
++    for r in 0..m {
++        for g in 0..gpr {
++            let src = (r * gpr + g) * GROUP_BYTES;
++            let h_a = u32::from_le_bytes([blob[src], blob[src + 1], blob[src + 2], blob[src + 3]]);
++            let sc0 = f16::from_bits((h_a & 0xFFFF) as u16).to_f32();
++            let zp0 = f16::from_bits((h_a >> 16) as u16).to_f32();
++            for wi in 0..GROUP {
++                let bit = 3 * wi;
++                let byte = bit / 8;
++                let shift = bit % 8;
++                let lo = blob[src + 8 + byte] as u32;
++                let hi = if shift > 5 {
++                    blob[src + 8 + byte + 1] as u32
++                } else {
++                    0
++                };
++                let code = ((lo | (hi << 8)) >> shift) & 7;
++                let wk = g * GROUP + wi;
++                w[r * k + wk] = sc0 * (code as f32) + zp0;
++            }
++        }
++    }
++    w
++}
++
++fn ref_gemm(w: &[f32], x: &[f32], y_init: &[f32], m: usize, k: usize, n: usize) -> Vec<f64> {
++    // y = y_init + W·X, W [m,k] row-major, X [n,k] row-major, Y [n,m] row-major
++    let mut out = vec![0.0f64; n * m];
++    for nn in 0..n {
++        for mm in 0..m {
++            let mut acc = 0.0f64;
++            for kk in 0..k {
++                acc += w[mm * k + kk] as f64 * x[nn * k + kk] as f64;
++            }
++            out[nn * m + mm] = y_init[nn * m + mm] as f64 + acc;
++        }
++    }
++    out
++}
++
++fn rel_err(got: &[f32], want: &[f64]) -> (f64, usize) {
++    let mut worst = 0.0f64;
++    let mut wi = 0usize;
++    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
++        let denom = w.abs().max(1.0);
++        let e = ((g as f64 - w).abs()) / denom;
++        if e > worst {
++            worst = e;
++            wi = i;
++        }
++    }
++    (worst, wi)
++}
++
++fn rel_rms(got: &[f32], want: &[f64]) -> f64 {
++    let mut num = 0.0f64;
++    let mut den = 0.0f64;
++    for (&g, &w) in got.iter().zip(want.iter()) {
++        num += (g as f64 - w).powi(2);
++        den += w * w;
++    }
++    (num / den.max(1e-30)).sqrt()
++}
++
++fn main() {
++    let mut gpu = match Gpu::init() {
++        Ok(g) => g,
++        Err(e) => {
++            eprintln!("mq3v2_q8x_parity: no GPU ({e}) — skipping");
++            return;
++        }
++    };
++    eprintln!(
++        "mq3v2_q8x_parity: arch={} is_gfx1100={} q8x_flag={}",
++        gpu.arch,
++        gpu.arch_caps.is_gfx1100(),
++        gpu.flags.gfx1100_q8x_verify
++    );
++
++    // (M, K, batch): K=256/5120 hit v4 (batch<=4), K=8192 hits v3 (batch>2);
++    // batch=5 always v3. M varies to exercise row tiling.
++    let shapes: &[(usize, usize, usize)] = &[
++        (16, 256, 2),
++        (32, 256, 4),
++        (32, 256, 5),
++        (32, 5120, 3),
++        (32, 5120, 4),
++        (32, 5120, 5),
++        (64, 8192, 2),
++        (32, 8192, 3),
++        (64, 8192, 4),
++        (32, 8192, 5),
++    ];
++
++    let mut failures = Vec::new();
++
++    for &(m, k, n) in shapes {
++        assert!(k % GROUP == 0);
++        assert!((2..=5).contains(&n));
++        let w_f32 = build_disjoint_halves(m, k, 0);
++        let blob = pack_mq3g256v2(&w_f32, m, k);
++        assert_eq!(blob.len(), m * (k / GROUP) * GROUP_BYTES);
++
++        let w_correct = decode_w(&blob, m, k);
++        let w_bug = decode_w_single_header(&blob, m, k);
++        let x: Vec<f32> = (0..n * k)
++            .map(|i| prng(i, 0xC0FF_EE00) * 2.0 - 1.0)
++            .collect();
++        let y_init: Vec<f32> = (0..n * m).map(|i| prng(i, 0xDEAD_BEEF) * 0.5).collect();
++
++        let want = ref_gemm(&w_correct, &x, &y_init, m, k, n);
++        let want_bug = ref_gemm(&w_bug, &x, &y_init, m, k, n);
++        let bug_rel = {
++            let b: Vec<f32> = want_bug.iter().map(|&v| v as f32).collect();
++            rel_rms(&b, &want)
++        };
++        let y_zero = vec![0.0f32; n * m];
++        let want0 = ref_gemm(&w_correct, &x, &y_zero, m, k, n);
++        eprintln!("shape M={m} K={k} batch={n}: bug baseline rel {bug_rel:.3e}");
++        assert!(
++            bug_rel > 0.5,
++            "fixture not discriminating at M={m} K={k} n={n}: bug_rel {bug_rel:.3e}"
++        );
++
++        let d_a = gpu.upload_raw(&blob, &[blob.len()]).unwrap();
++        let d_x = gpu.upload_f32(&x, &[n * k]).unwrap();
++
++        // ── single weight, residual (Y += W·X) ──
++        {
++            let d_y = gpu.upload_f32(&y_init, &[n * m]).unwrap();
++            gpu.gemm_mq3g256v2_q8x(&[(&d_a, &d_y, m)], &d_x, k, n, true)
++                .unwrap_or_else(|e| panic!("single-res M={m} K={k} n={n}: {e}"));
++            gpu.hip.device_synchronize().unwrap();
++            let got = gpu.download_f32(&d_y).unwrap();
++            let (worst, wi) = rel_err(&got, &want);
++            let rms = rel_rms(&got, &want);
++            let status = if rms < 0.05 { "ok" } else { "FAIL" };
++            eprintln!("  single-res  M={m} K={k} n={n}: rel-rms {rms:.3e}, worst {worst:.3e} at {wi} {status}");
++            if rms >= 0.05 {
++                failures.push(format!("single-res M={m} K={k} n={n} rms {rms:.3e}"));
++            }
++            assert!(rms < bug_rel * 0.1, "half-select/unpack bug single-res M={m} K={k} n={n}: rms {rms:.3e}");
++        }
++
++        // ── single weight, overwrite (Y = W·X); non-zero init catches accumulate ──
++        {
++            let d_y = gpu.upload_f32(&y_init, &[n * m]).unwrap();
++            gpu.gemm_mq3g256v2_q8x(&[(&d_a, &d_y, m)], &d_x, k, n, false)
++                .unwrap_or_else(|e| panic!("single-ow M={m} K={k} n={n}: {e}"));
++            gpu.hip.device_synchronize().unwrap();
++            let got = gpu.download_f32(&d_y).unwrap();
++            let rms = rel_rms(&got, &want0);
++            let status = if rms < 0.05 { "ok" } else { "FAIL" };
++            eprintln!("  single-ow   M={m} K={k} n={n}: rel-rms {rms:.3e} {status}");
++            if rms >= 0.05 {
++                failures.push(format!("single-ow M={m} K={k} n={n} rms {rms:.3e}"));
++            }
++        }
++
++        // ── multi (two weights sharing x), residual + overwrite ──
++        {
++            let w2 = build_disjoint_halves(m, k, 0x1234_5678);
++            let blob2 = pack_mq3g256v2(&w2, m, k);
++            let w2_correct = decode_w(&blob2, m, k);
++            let d_a2 = gpu.upload_raw(&blob2, &[blob2.len()]).unwrap();
++            let want2 = ref_gemm(&w2_correct, &x, &y_init, m, k, n);
++            let want2_0 = ref_gemm(&w2_correct, &x, &y_zero, m, k, n);
++
++            for residual in [true, false] {
++                let d_y = gpu.upload_f32(&y_init, &[n * m]).unwrap();
++                let d_y2 = gpu.upload_f32(&y_init, &[n * m]).unwrap();
++                gpu.gemm_mq3g256v2_q8x(
++                    &[(&d_a, &d_y, m), (&d_a2, &d_y2, m)],
++                    &d_x,
++                    k,
++                    n,
++                    residual,
++                )
++                .unwrap_or_else(|e| panic!("multi res={residual} M={m} K={k} n={n}: {e}"));
++                gpu.hip.device_synchronize().unwrap();
++                let got = gpu.download_f32(&d_y).unwrap();
++                let got2 = gpu.download_f32(&d_y2).unwrap();
++                let (w1, w2ref) = if residual { (&want, &want2) } else { (&want0, &want2_0) };
++                let rms1 = rel_rms(&got, w1);
++                let rms2 = rel_rms(&got2, w2ref);
++                let tag = if residual { "multi-res" } else { "multi-ow " };
++                let status = if rms1 < 0.05 && rms2 < 0.05 { "ok" } else { "FAIL" };
++                eprintln!("  {tag}   M={m} K={k} n={n}: rel-rms w1 {rms1:.3e} w2 {rms2:.3e} {status}");
++                if rms1 >= 0.05 || rms2 >= 0.05 {
++                    failures.push(format!("{tag} M={m} K={k} n={n} rms {rms1:.3e}/{rms2:.3e}"));
++                }
++            }
++        }
++    }
++
++    if failures.is_empty() {
++        eprintln!("\nmq3v2_q8x_parity: PASS — 3-bit unpack + half-select correct, single/multi × res/overwrite, v3+v4, batch 2..5");
++    } else {
++        eprintln!("\nmq3v2_q8x_parity: FAIL — {:?}", failures);
++        std::process::exit(1);
++    }
++}
+\ No newline at end of file
+diff --git a/crates/rdna-compute/src/gemm.rs b/crates/rdna-compute/src/gemm.rs
+index 77d3c003924c51d32b54997ddc7974cf9ab6d45f..0100411ac3edb28fa178d22050aa6fa9a8827208 100644
+--- a/crates/rdna-compute/src/gemm.rs
++++ b/crates/rdna-compute/src/gemm.rs
+@@ -46954,6 +46954,21 @@ impl Gpu {
+         k: usize,
+         batch_size: usize,
+     ) -> HipResult<()> {
++        if self.q8x_verify_active(k, batch_size) {
++            // Opt-in exact-gfx1100 int8 small-batch verify GEMV (`gemv_q8x.rs`).
++            return self.gemm_mq3g256v2_q8x(
++                &[
++                    (a_qkv, y_qkv, qkv_m),
++                    (a_z, y_z, z_m),
++                    (a_beta, y_beta, beta_m),
++                    (a_alpha, y_alpha, alpha_m),
++                ],
++                x,
++                k,
++                batch_size,
++                false,
++            );
++        }
+         if self.arch_caps.has_wmma_w32_gfx12() {
+             return self.gemm_qkvza_mq3g256v2_wmma_gfx12(
+                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+@@ -47164,6 +47179,16 @@ impl Gpu {
+         k: usize,
+         batch_size: usize,
+     ) -> HipResult<()> {
++        if self.q8x_verify_active(k, batch_size) {
++            // Opt-in exact-gfx1100 int8 small-batch verify GEMV (`gemv_q8x.rs`).
++            return self.gemm_mq3g256v2_q8x(
++                &[(a_q, y_q, q_m), (a_k, y_k, k_m), (a_v, y_v, v_m)],
++                x,
++                k,
++                batch_size,
++                false,
++            );
++        }
+         if self.arch_caps.has_wmma_w32_gfx12() {
+             return self.gemm_qkv_mq3g256v2_wmma_gfx12(
+                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+@@ -47359,6 +47384,16 @@ impl Gpu {
+         k: usize,
+         batch_size: usize,
+     ) -> HipResult<()> {
++        if self.q8x_verify_active(k, batch_size) {
++            // Opt-in exact-gfx1100 int8 small-batch verify GEMV (`gemv_q8x.rs`).
++            return self.gemm_mq3g256v2_q8x(
++                &[(a_gate, y_gate, gate_m), (a_up, y_up, up_m)],
++                x,
++                k,
++                batch_size,
++                false,
++            );
++        }
+         if self.arch_caps.has_wmma_w32_gfx12() {
+             return self.gemm_gate_up_mq3g256v2_wmma_gfx12(
+                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+diff --git a/crates/rdna-compute/src/gemv_q8x.rs b/crates/rdna-compute/src/gemv_q8x.rs
+index 762224853c8bc6ec6eb06b40055f7f58ed71c368..361ee6895c98a49d8dfb22b99e21651b584a7afd 100644
+--- a/crates/rdna-compute/src/gemv_q8x.rs
++++ b/crates/rdna-compute/src/gemv_q8x.rs
+@@ -139,6 +139,81 @@ const Q8X_MODULES: [(&str, &str, &str); 14] = [
+     ),
+ ];
+ 
++/// MQ3G256V2 (qt49, 3-bit) twins of [`Q8X_MODULES`]; same index layout
++/// ([`q8x_module_index`]), same activation quantizer ([`Q8X_QUANT_MODULE`]).
++const Q8X_MQ3_MODULES: [(&str, &str, &str); 14] = [
++    (
++        "mq3v2_q8x_v4_b2",
++        "mq3v2_q8x_v4_b2_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V4_B2_SRC,
++    ),
++    (
++        "mq3v2_q8x_v4_b2_res",
++        "mq3v2_q8x_v4_b2_res_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V4_B2_RES_SRC,
++    ),
++    (
++        "mq3v2_q8x_v4_b3",
++        "mq3v2_q8x_v4_b3_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V4_B3_SRC,
++    ),
++    (
++        "mq3v2_q8x_v4_b3_res",
++        "mq3v2_q8x_v4_b3_res_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V4_B3_RES_SRC,
++    ),
++    (
++        "mq3v2_q8x_v4_b4",
++        "mq3v2_q8x_v4_b4_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V4_B4_SRC,
++    ),
++    (
++        "mq3v2_q8x_v4_b4_res",
++        "mq3v2_q8x_v4_b4_res_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V4_B4_RES_SRC,
++    ),
++    (
++        "mq3v2_q8x_v3_b2",
++        "mq3v2_q8x_v3_b2_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V3_B2_SRC,
++    ),
++    (
++        "mq3v2_q8x_v3_b2_res",
++        "mq3v2_q8x_v3_b2_res_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V3_B2_RES_SRC,
++    ),
++    (
++        "mq3v2_q8x_v3_b3",
++        "mq3v2_q8x_v3_b3_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V3_B3_SRC,
++    ),
++    (
++        "mq3v2_q8x_v3_b3_res",
++        "mq3v2_q8x_v3_b3_res_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V3_B3_RES_SRC,
++    ),
++    (
++        "mq3v2_q8x_v3_b4",
++        "mq3v2_q8x_v3_b4_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V3_B4_SRC,
++    ),
++    (
++        "mq3v2_q8x_v3_b4_res",
++        "mq3v2_q8x_v3_b4_res_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V3_B4_RES_SRC,
++    ),
++    (
++        "mq3v2_q8x_v3_b5",
++        "mq3v2_q8x_v3_b5_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V3_B5_SRC,
++    ),
++    (
++        "mq3v2_q8x_v3_b5_res",
++        "mq3v2_q8x_v3_b5_res_multi",
++        kernels::GEMV_MQ3G256V2_Q8X_V3_B5_RES_SRC,
++    ),
++];
++
+ const Q8X_QUANT_MODULE: &str = "mq4v2_q8x_quant";
+ 
+ fn q8x_module_index(v: Q8xVariant, batch: usize, residual: bool) -> usize {
+@@ -242,8 +317,11 @@ impl Gpu {
+     /// weights `(A_i, y_i, m_i)` sharing the FWHT-rotated f32 input `x`
+     /// (`[batch x k]`). `residual` adds into `y_i`, otherwise overwrites.
+     /// Callers check [`Self::q8x_verify_active`] first.
+-    pub fn gemm_mq4g256v2_q8x(
++    fn gemm_q8x_inner(
+         &mut self,
++        modules: &[(&str, &str, &str); 14],
++        label: &str,
++        bit_base: usize,
+         outs: &[(&GpuTensor, &GpuTensor, usize)],
+         x: &GpuTensor,
+         k: usize,
+@@ -253,13 +331,13 @@ impl Gpu {
+         if !(2..=Q8X_MAX_BATCH).contains(&batch) || k % 256 != 0 || k > Q8X_MAX_K {
+             return Err(hip_bridge::HipError::new(
+                 1,
+-                &format!("gemm_mq4g256v2_q8x: unsupported shape k={k} batch={batch}"),
++                &format!("{label}: unsupported shape k={k} batch={batch}"),
+             ));
+         }
+         if outs.is_empty() || outs.len() > 4 {
+             return Err(hip_bridge::HipError::new(
+                 1,
+-                &format!("gemm_mq4g256v2_q8x: {} weights (1..=4)", outs.len()),
++                &format!("{label}: {} weights (1..=4)", outs.len()),
+             ));
+         }
+         self.bind_thread()?;
+@@ -296,11 +374,11 @@ impl Gpu {
+         // 2. One GEMV launch for the group (or one per weight for a single weight).
+         let v = q8x_pick(k, batch);
+         let idx = q8x_module_index(v, batch, residual);
+-        let (module, multi_symbol, source) = Q8X_MODULES[idx];
++        let (module, multi_symbol, source) = modules[idx];
+         let use_multi = outs.len() > 1;
+         let func_name = if use_multi { multi_symbol } else { module };
+         self.ensure_kernel(module, source, func_name)?;
+-        let bit = 1u64 << (idx * 2 + usize::from(use_multi));
++        let bit = 1u64 << (bit_base + idx * 2 + usize::from(use_multi));
+         if Q8X_ENGAGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+             eprintln!(
+                 "[q8x-verify] route active: {func_name} k={k} batch={batch} weights={}",
+@@ -387,6 +465,32 @@ impl Gpu {
+             )
+         }
+     }
++
++    /// MQ4G256V2 (qt44) int8 small-batch verify GEMV. See [`Self::q8x_verify_active`].
++    pub fn gemm_mq4g256v2_q8x(
++        &mut self,
++        outs: &[(&GpuTensor, &GpuTensor, usize)],
++        x: &GpuTensor,
++        k: usize,
++        batch: usize,
++        residual: bool,
++    ) -> HipResult<()> {
++        self.gemm_q8x_inner(&Q8X_MODULES, "gemm_mq4g256v2_q8x", 0, outs, x, k, batch, residual)
++    }
++
++    /// MQ3G256V2 (qt49, 3-bit) int8 small-batch verify GEMV. Same activation
++    /// quantizer and LDS staging as MQ4; only the weight payload differs
++    /// (104 B/group, 12 B/lane, codes 0..7). See [`Self::q8x_verify_active`].
++    pub fn gemm_mq3g256v2_q8x(
++        &mut self,
++        outs: &[(&GpuTensor, &GpuTensor, usize)],
++        x: &GpuTensor,
++        k: usize,
++        batch: usize,
++        residual: bool,
++    ) -> HipResult<()> {
++        self.gemm_q8x_inner(&Q8X_MQ3_MODULES, "gemm_mq3g256v2_q8x", 28, outs, x, k, batch, residual)
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/rdna-compute/src/kernel_registry.rs b/crates/rdna-compute/src/kernel_registry.rs
+index 380c08f5b38930778c4d17b9177514f376a7c61d..01d8a2046afa7b48ea11c2be7ef19b84d3b306c9 100644
+--- a/crates/rdna-compute/src/kernel_registry.rs
++++ b/crates/rdna-compute/src/kernel_registry.rs
+@@ -507,6 +507,77 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
+             kernels::GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC,
+             ["mq4v2_q8x_v3_b5_res", "mq4v2_q8x_v3_b5_res_multi"]
+         );
++        // MQ3G256V2 (qt49, 3-bit) q8x verify twins; reuse mq4v2_q8x_quant above.
++        add!(
++            "mq3v2_q8x_v4_b2",
++            kernels::GEMV_MQ3G256V2_Q8X_V4_B2_SRC,
++            ["mq3v2_q8x_v4_b2", "mq3v2_q8x_v4_b2_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v4_b2_res",
++            kernels::GEMV_MQ3G256V2_Q8X_V4_B2_RES_SRC,
++            ["mq3v2_q8x_v4_b2_res", "mq3v2_q8x_v4_b2_res_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v4_b3",
++            kernels::GEMV_MQ3G256V2_Q8X_V4_B3_SRC,
++            ["mq3v2_q8x_v4_b3", "mq3v2_q8x_v4_b3_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v4_b3_res",
++            kernels::GEMV_MQ3G256V2_Q8X_V4_B3_RES_SRC,
++            ["mq3v2_q8x_v4_b3_res", "mq3v2_q8x_v4_b3_res_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v4_b4",
++            kernels::GEMV_MQ3G256V2_Q8X_V4_B4_SRC,
++            ["mq3v2_q8x_v4_b4", "mq3v2_q8x_v4_b4_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v4_b4_res",
++            kernels::GEMV_MQ3G256V2_Q8X_V4_B4_RES_SRC,
++            ["mq3v2_q8x_v4_b4_res", "mq3v2_q8x_v4_b4_res_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v3_b2",
++            kernels::GEMV_MQ3G256V2_Q8X_V3_B2_SRC,
++            ["mq3v2_q8x_v3_b2", "mq3v2_q8x_v3_b2_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v3_b2_res",
++            kernels::GEMV_MQ3G256V2_Q8X_V3_B2_RES_SRC,
++            ["mq3v2_q8x_v3_b2_res", "mq3v2_q8x_v3_b2_res_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v3_b3",
++            kernels::GEMV_MQ3G256V2_Q8X_V3_B3_SRC,
++            ["mq3v2_q8x_v3_b3", "mq3v2_q8x_v3_b3_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v3_b3_res",
++            kernels::GEMV_MQ3G256V2_Q8X_V3_B3_RES_SRC,
++            ["mq3v2_q8x_v3_b3_res", "mq3v2_q8x_v3_b3_res_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v3_b4",
++            kernels::GEMV_MQ3G256V2_Q8X_V3_B4_SRC,
++            ["mq3v2_q8x_v3_b4", "mq3v2_q8x_v3_b4_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v3_b4_res",
++            kernels::GEMV_MQ3G256V2_Q8X_V3_B4_RES_SRC,
++            ["mq3v2_q8x_v3_b4_res", "mq3v2_q8x_v3_b4_res_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v3_b5",
++            kernels::GEMV_MQ3G256V2_Q8X_V3_B5_SRC,
++            ["mq3v2_q8x_v3_b5", "mq3v2_q8x_v3_b5_multi"]
++        );
++        add!(
++            "mq3v2_q8x_v3_b5_res",
++            kernels::GEMV_MQ3G256V2_Q8X_V3_B5_RES_SRC,
++            ["mq3v2_q8x_v3_b5_res", "mq3v2_q8x_v3_b5_res_multi"]
++        );
+     }
+     if matches!(arch, "gfx906" | "gfx942") {
+         add!(
+diff --git a/crates/rdna-compute/src/kernels.rs b/crates/rdna-compute/src/kernels.rs
+index 65c19318f311924561a873f31bec7be98b472413..ab556dd3a349318ec633dbfe151891bdafe541b8 100644
+--- a/crates/rdna-compute/src/kernels.rs
++++ b/crates/rdna-compute/src/kernels.rs
+@@ -2837,6 +2837,72 @@ pub const GEMV_MQ4G256V2_Q8X_V3_B5_SRC: &str =
+ pub const GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC: &str =
+     gemv_mq4g256v2_q8x_v3_source!("5", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b5_res");
+ 
++// MQ3G256V2 (qt49, 3-bit) q8x verify twins. Same activation quantizer
++// (GEMV_MQ4G256V2_Q8X_QUANT_SRC, format-agnostic) and LDS staging; the weight
++// payload is 104 B/group, 12 B/lane, codes 0..7 (gemv_mq3g256v2_q8x.hip).
++macro_rules! gemv_mq3g256v2_q8x_v4_source {
++    ($b:literal, $res:literal, $name:literal) => {
++        concat!(
++            "#define Q8X_GEMV4 1\n#define Q8X3_R 8\n#define Q8X3_P 3\n#define Q8X3_NT 1\n",
++            "#define Q8X3_LDSKB 64\n#define Q8X4_XP 0\n#define Q8X_BMAX ",
++            $b,
++            "\n",
++            $res,
++            "#define Q8X_KERNEL ",
++            $name,
++            "\n#define Q8X_MULTI_KERNEL ",
++            $name,
++            "_multi\n",
++            include_str!("../../../kernels/src/gemv_mq3g256v2_q8x.hip")
++        )
++    };
++}
++macro_rules! gemv_mq3g256v2_q8x_v3_source {
++    ($b:literal, $res:literal, $name:literal) => {
++        concat!(
++            "#define Q8X_GEMV3 1\n#define Q8X3_R 8\n#define Q8X3_W 2\n#define Q8X3_P 2\n",
++            "#define Q8X3_NT 1\n#define Q8X3_LDSKB 32\n#define Q8X_BMAX ",
++            $b,
++            "\n",
++            $res,
++            "#define Q8X_KERNEL ",
++            $name,
++            "\n#define Q8X_MULTI_KERNEL ",
++            $name,
++            "_multi\n",
++            include_str!("../../../kernels/src/gemv_mq3g256v2_q8x.hip")
++        )
++    };
++}
++pub const GEMV_MQ3G256V2_Q8X_V4_B2_SRC: &str =
++    gemv_mq3g256v2_q8x_v4_source!("2", "", "mq3v2_q8x_v4_b2");
++pub const GEMV_MQ3G256V2_Q8X_V4_B2_RES_SRC: &str =
++    gemv_mq3g256v2_q8x_v4_source!("2", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v4_b2_res");
++pub const GEMV_MQ3G256V2_Q8X_V4_B3_SRC: &str =
++    gemv_mq3g256v2_q8x_v4_source!("3", "", "mq3v2_q8x_v4_b3");
++pub const GEMV_MQ3G256V2_Q8X_V4_B3_RES_SRC: &str =
++    gemv_mq3g256v2_q8x_v4_source!("3", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v4_b3_res");
++pub const GEMV_MQ3G256V2_Q8X_V4_B4_SRC: &str =
++    gemv_mq3g256v2_q8x_v4_source!("4", "", "mq3v2_q8x_v4_b4");
++pub const GEMV_MQ3G256V2_Q8X_V4_B4_RES_SRC: &str =
++    gemv_mq3g256v2_q8x_v4_source!("4", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v4_b4_res");
++pub const GEMV_MQ3G256V2_Q8X_V3_B2_SRC: &str =
++    gemv_mq3g256v2_q8x_v3_source!("2", "", "mq3v2_q8x_v3_b2");
++pub const GEMV_MQ3G256V2_Q8X_V3_B2_RES_SRC: &str =
++    gemv_mq3g256v2_q8x_v3_source!("2", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b2_res");
++pub const GEMV_MQ3G256V2_Q8X_V3_B3_SRC: &str =
++    gemv_mq3g256v2_q8x_v3_source!("3", "", "mq3v2_q8x_v3_b3");
++pub const GEMV_MQ3G256V2_Q8X_V3_B3_RES_SRC: &str =
++    gemv_mq3g256v2_q8x_v3_source!("3", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b3_res");
++pub const GEMV_MQ3G256V2_Q8X_V3_B4_SRC: &str =
++    gemv_mq3g256v2_q8x_v3_source!("4", "", "mq3v2_q8x_v3_b4");
++pub const GEMV_MQ3G256V2_Q8X_V3_B4_RES_SRC: &str =
++    gemv_mq3g256v2_q8x_v3_source!("4", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b4_res");
++pub const GEMV_MQ3G256V2_Q8X_V3_B5_SRC: &str =
++    gemv_mq3g256v2_q8x_v3_source!("5", "", "mq3v2_q8x_v3_b5");
++pub const GEMV_MQ3G256V2_Q8X_V3_B5_RES_SRC: &str =
++    gemv_mq3g256v2_q8x_v3_source!("5", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b5_res");
++
+ pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
+     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+diff --git a/kernels/src/gemv_mq3g256v2_q8x.hip b/kernels/src/gemv_mq3g256v2_q8x.hip
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a53ee9c2aac6a155fc0950a8605b3f8f5e8a451
+--- /dev/null
++++ b/kernels/src/gemv_mq3g256v2_q8x.hip
+@@ -0,0 +1,734 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Ben1078
++// hipfire — see LICENSE and NOTICE in the project root.
++//
++// Exact-gfx1100 small-batch MQ3G256V2 (qt49, 3-bit) GEMV on int8 activations for
++// speculative verify (MTP K=3 -> 4 rows), default on for exact gfx1100;
++// HIPFIRE_GFX1100_Q8X_VERIFY=0 restores the f16 WMMA tiers (see
++// crates/rdna-compute/src/gemv_q8x.rs).
++//
++// The f16 WMMA residual tiers spend 12 of 16 tile columns on padding at 4
++// rows; this route reads every weight row once and dots it against all B
++// activation rows with v_dot4_i32_iu8 (unsigned 3-bit codes x signed int8).
++// 3-bit port of gemv_mq4g256v2_q8x.hip: 104 B/group, 12 B/lane payload,
++// codes 0..7; the per-128 fp16 header and mq4v2_q8x_quant are reused unchanged.
++//
++//   mq4v2_q8x_quant (Q8X_QUANT): x f32 [B x K] (already FWHT-rotated) ->
++//     int8, one f32 scale per 32 elements, packed even/odd to match the
++//     nibble order of the MQ4 codes. grid (K/256, B), block 32.
++//   GEMV per 32-element block l of a 256-group, batch row b:
++//     acc += (d * sc) * sum(q * xq) + zp * (d * sum(xq))
++//   The integer sums are exact; the activation quantization is the only
++//   approximation (q8_1 class). Not byte-identical to the WMMA route.
++//
++// Variants (compile-time, one module per batch / residual flavour):
++//   v3 (Q8X_GEMV3): Q8X3_R = 8 warps x Q8X3_W = 2 rows per workgroup, K in
++//     chunks of <= Q8X3_LDSKB = 32 KiB of staged activations, Q8X3_P = 2-deep
++//     weight ring. 256 threads, LDS <= 32 KiB, ~2 workgroups per WGP.
++//   v4 (Q8X_GEMV4): persistent grid (one resident wave of workgroups from
++//     the occupancy API), all of K staged once (LDS = ceil(K/1024) * 4 *
++//     (PSX + PDD) bytes, <= 64 KiB: K <= 5120 at B = 4, K <= 17408 at B = 2),
++//     Q8X3_R = 8 warps, 3-deep nontemporal dwordx4 weight ring that runs
++//     across rows; rows split between two warps are finished in fixed order.
++// Both are deterministic (no atomics; split partials reduced in fixed order
++// through LDS) and have a _multi twin that serves up to four weights sharing
++// one activation (q/k/v, GDN qkv/z/beta/alpha, gate/up) in one launch.
++// Resources (hipcc 7.2, --offload-arch=gfx1100 -O3, no scratch spills):
++//   v4: 91 VGPRs at B = 4, 77 at B = 2; v3 (W = 2): 96 / 107 / 118 VGPRs at
++//   B = 3 / 4 / 5. wave32, 256-thread workgroups; the launcher floors v4 at 2
++//   resident workgroups per WGP (the occupancy API counts 64 KiB LDS per CU).
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++
++#ifndef Q8X_BMAX
++#define Q8X_BMAX 4
++#endif
++#ifndef Q8X_KERNEL
++#define Q8X_KERNEL mq3v2_q8x_gemv
++#endif
++#ifndef Q8X_MULTI_KERNEL
++#define Q8X_MULTI_KERNEL mq3v2_q8x_gemv_multi
++#endif
++
++#ifdef Q8X_QUANT
++// grid (K/256, B), block 32. Lane t owns elements g*256 + t*8 .. +7.
++extern "C" __global__ void mq4v2_q8x_quant(
++    const float* __restrict__ x,
++    unsigned int* __restrict__ xq,   // [B][K/256][32] uint2
++    float* __restrict__ dx,          // [B][K/32]
++    int K)
++{
++    const int g = blockIdx.x, b = blockIdx.y, t = threadIdx.x;
++    const float* xp = x + (long long)b * K + g * 256 + t * 8;
++    const float4 va = *(const float4*)xp;
++    const float4 vb = *(const float4*)(xp + 4);
++    const float v[8] = {va.x, va.y, va.z, va.w, vb.x, vb.y, vb.z, vb.w};
++    float amax = 0.0f;
++#pragma unroll
++    for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(v[j]));
++    // 32-element block = 4 lanes (4k..4k+3).
++    amax = fmaxf(amax, __shfl_xor(amax, 1));
++    amax = fmaxf(amax, __shfl_xor(amax, 2));
++    const float d = amax * (1.0f / 127.0f);
++    const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
++    int q[8];
++#pragma unroll
++    for (int j = 0; j < 8; j++) q[j] = (int)rintf(v[j] * id);
++    const unsigned int e = (unsigned)(q[0] & 0xFF) | ((unsigned)(q[2] & 0xFF) << 8)
++                         | ((unsigned)(q[4] & 0xFF) << 16) | ((unsigned)(q[6] & 0xFF) << 24);
++    const unsigned int o = (unsigned)(q[1] & 0xFF) | ((unsigned)(q[3] & 0xFF) << 8)
++                         | ((unsigned)(q[5] & 0xFF) << 16) | ((unsigned)(q[7] & 0xFF) << 24);
++    uint2* xq2 = (uint2*)xq;
++    xq2[((long long)b * (K >> 8) + g) * 32 + t] = make_uint2(e, o);
++    if ((t & 3) == 0) dx[(long long)b * (K >> 5) + g * 8 + (t >> 2)] = d;
++}
++#endif
++
++#if defined(Q8X_GEMV3) || defined(Q8X_GEMV4)
++// Shared warp helpers of the v3/v4 kernels.
++// v from lane t ^ OFF (OFF in 1, 2, 4, 8: DPP row_xmask; 16: permlanex16).
++template <int OFF>
++__device__ __forceinline__ float q8x_xor(float v) {
++    int x = __float_as_int(v);
++    if constexpr (OFF == 16)
++        x = __builtin_amdgcn_permlanex16(x, x, 0x76543210u, 0xfedcba98u, false, false);
++    else
++        x = __builtin_amdgcn_update_dpp(0, x, 0x160 + OFF, 0xf, 0xf, false);
++    return __int_as_float(x);
++}
++
++// Transposed warp reduction of N = 2^LVP values per lane: stage s halves the
++// values each lane keeps (lanes with bit 4 - s set keep the upper half), so N
++// values cost N - 1 exchanges instead of 5 * N; then plain xor stages.
++// Every lane t returns the warp total of value t >> (5 - LVP). Written with
++// template recursion so every array index is a compile-time constant in the
++// source: with a loop index, InstCombine folds `upper ? v[i + h] : v[i]` into
++// a dynamically indexed access before unrolling, which lowers to long
++// compare/select chains (measured: +22% kernel time at batch 5).
++template <int I, int HALF, int OFF, int N>
++__device__ __forceinline__ void q8x_rpair(float (&v)[N], bool upper) {
++    if constexpr (I < HALF) {
++        const float a = v[I];
++        const float b = v[I + HALF];
++        v[I] = (upper ? b : a) + q8x_xor<OFF>(upper ? a : b);
++        q8x_rpair<I + 1, HALF, OFF, N>(v, upper);
++    }
++}
++
++template <int ST, int LVP, int N>
++__device__ __forceinline__ void q8x_rstages(float (&v)[N], int t) {
++    if constexpr (ST < LVP) {
++        constexpr int OFF = 16 >> ST;
++        q8x_rpair<0, (N >> (ST + 1)), OFF, N>(v, (t & OFF) != 0);
++        q8x_rstages<ST + 1, LVP, N>(v, t);
++    }
++}
++
++template <int OFF>
++__device__ __forceinline__ float q8x_rtail(float r) {
++    if constexpr (OFF >= 1) return q8x_rtail<OFF / 2>(r + q8x_xor<OFF>(r));
++    else return r;
++}
++
++template <int LVP>
++__device__ __forceinline__ float q8x_reduce(float (&v)[1 << LVP], int t) {
++    q8x_rstages<0, LVP, (1 << LVP)>(v, t);
++    return q8x_rtail<(16 >> LVP)>(v[0]);
++}
++#endif
++
++#if defined(Q8X_GEMV3) || defined(Q8X_GEMV4)
++// v3: one warp step = four 256-groups (lane t =
++// group t >> 3, 32-element block t & 7, one dwordx4 of codes) with the int8
++// activations staged in LDS once per workgroup, together with each block's
++// (d, d * sum(xq)). Activations then come from ds_read (lgkmcnt), so the
++// in-order vmcnt only tracks weight loads and the P-deep weight ring really
++// stays in flight; the zero-point term costs one FMA per block instead of
++// eight dot4 per row.
++//   per lane, block, batch row: acc += (d * sc) * sum(q * xq) + zp * (d * sum(xq))
++// K is processed in chunks of at most Q8X3_LDSKB KiB of staged activations
++// (1280 bytes per 4-group step per batch row); one chunk covers K <= 6144 at
++// batch 4 with the default 32 KiB.
++//   Q8X3_R: warps per workgroup (each W rows, all of K), Q8X3_W: rows per
++//   warp, Q8X3_P: weight ring depth (steps), Q8X3_NT: nontemporal weights,
++//   Q8X3_X: 1 = read the next step's activations from LDS one step ahead.
++#ifndef Q8X3_R
++#define Q8X3_R 8
++#endif
++#ifndef Q8X3_W
++#define Q8X3_W 1
++#endif
++#ifndef Q8X3_P
++#define Q8X3_P 3
++#endif
++#ifndef Q8X3_NT
++#define Q8X3_NT 1
++#endif
++#ifndef Q8X3_X
++#define Q8X3_X 0
++#endif
++#ifndef Q8X3_LDSKB
++#define Q8X3_LDSKB 32
++#endif
++#ifndef Q8X3_RQ
++#define Q8X3_RQ 4
++#endif
++#define Q8X3_NB Q8X_BMAX
++#define Q8X3_T (32 * Q8X3_R)
++#define Q8X3_ROWS (Q8X3_R * Q8X3_W)
++#define Q8X3_V (Q8X3_W * Q8X3_NB)
++#define Q8X3_LVP (Q8X3_V <= 1 ? 0 : Q8X3_V <= 2 ? 1 : Q8X3_V <= 4 ? 2 : Q8X3_V <= 8 ? 3 : Q8X3_V <= 16 ? 4 : 5)
++#define Q8X3_VP (1 << Q8X3_LVP)
++static_assert(Q8X3_V <= 32, "mq4v2_q8x v3: W * batch must be <= 32");
++
++typedef unsigned int q8x3_u4 __attribute__((ext_vector_type(4)));
++// MQ3G256V2 weight payload: 32 weights x 3 bit = 96 bit = 12 bytes per lane.
++typedef unsigned int q8x3_w3 __attribute__((ext_vector_type(3)));
++
++extern __shared__ __attribute__((aligned(16))) char q8x3_smem[];
++
++__device__ __forceinline__ q8x3_w3 q8x3_ldw(const char* p) {
++#if Q8X3_NT
++    return __builtin_nontemporal_load((const q8x3_w3*)p);
++#else
++    return *(const q8x3_w3*)p;
++#endif
++}
++
++__device__ __forceinline__ unsigned int q8x3_ldh(const char* p) {
++#if Q8X3_NT
++    return __builtin_nontemporal_load((const unsigned int*)p);
++#else
++    return *(const unsigned int*)p;
++#endif
++}
++
++__device__ __forceinline__ int q8x3_sum(q8x3_u4 a, q8x3_u4 b) {
++    int s = __builtin_amdgcn_sudot4(true, (int)a.x, false, 0x01010101, 0, false);
++    s = __builtin_amdgcn_sudot4(true, (int)a.y, false, 0x01010101, s, false);
++    s = __builtin_amdgcn_sudot4(true, (int)a.z, false, 0x01010101, s, false);
++    s = __builtin_amdgcn_sudot4(true, (int)a.w, false, 0x01010101, s, false);
++    s = __builtin_amdgcn_sudot4(true, (int)b.x, false, 0x01010101, s, false);
++    s = __builtin_amdgcn_sudot4(true, (int)b.y, false, 0x01010101, s, false);
++    s = __builtin_amdgcn_sudot4(true, (int)b.z, false, 0x01010101, s, false);
++    return __builtin_amdgcn_sudot4(true, (int)b.w, false, 0x01010101, s, false);
++}
++
++// LDS layout of a staged chunk, per 256-group g (relative to the chunk):
++//   xq : Q8X3_PSX bytes per group; batch row b's 8 blocks at b*256 + l*32
++//   dd : Q8X3_PDD bytes per group; (d, d*sum) of (b, l) at b*64 + l*8
++// Batch offsets are compile-time immediates of the ds_read. The group pitches
++// are skewed (PSX == 16, PDD == 64 mod 256) so the four groups of a warp step
++// land on different banks: a ds_read_b128 of the step then takes the minimum
++// two bank cycles and a ds_read_b64 one.
++#define Q8X3_PSX (Q8X3_NB * 256 + 16)
++#define Q8X3_PDD (((Q8X3_NB * 64 + 191) / 256) * 256 + 64)   // >= NB*64, == 64 mod 256
++
++// Steps per staged chunk for this K and batch: all of K when it fits in
++// Q8X3_LDSKB KiB, else the largest multiple of P that fits (at least P), so
++// every chunk starts on ring slot 0. The launcher sizes the dynamic LDS with
++// the same formula (steps * 4 * (PSX + PDD) bytes).
++__device__ __forceinline__ int q8x3_chunk_steps(int nst) {
++    int cs = (Q8X3_LDSKB * 1024) / (4 * (Q8X3_PSX + Q8X3_PDD));
++    if (nst <= cs) return nst;
++    cs -= cs % Q8X3_P;
++    return cs < Q8X3_P ? Q8X3_P : cs;
++}
++
++// Stage the activation blocks of steps [c0, c1) (all batch rows) into LDS
++// (layout above), with each block's (d, d * sum(xq)).
++__device__ __forceinline__ void q8x3_stage(
++    const unsigned int* __restrict__ xq, const float* __restrict__ dx,
++    int gpr, int c0, int c1, int cs)
++{
++    const int tid = threadIdx.x;
++    const int g0 = 4 * c0;
++    const int ng = min(4 * c1, gpr) - g0;             // groups in this chunk
++    const int nq = Q8X3_NB * ng * 8;                  // blocks to stage
++    char* sxb = q8x3_smem;
++    char* sdb = q8x3_smem + (long long)cs * 4 * Q8X3_PSX;
++    const q8x3_u4* gx = (const q8x3_u4*)xq;
++    for (int q0 = 0; q0 < nq; q0 += Q8X3_T * Q8X3_RQ) {
++        q8x3_u4 va[Q8X3_RQ], vb[Q8X3_RQ];
++        float vd[Q8X3_RQ];
++#pragma unroll
++        for (int i = 0; i < Q8X3_RQ; i++) {
++            const int q = min(q0 + i * Q8X3_T + tid, nq - 1);
++            const int b = q / (ng * 8);
++            const int r = q - b * (ng * 8);              // (g - g0) * 8 + l
++            const long long gq = (long long)b * gpr * 8 + g0 * 8 + r;   // global block index
++            va[i] = gx[2 * gq];
++            vb[i] = gx[2 * gq + 1];
++            vd[i] = dx[gq];
++        }
++#pragma unroll
++        for (int i = 0; i < Q8X3_RQ; i++) {
++            const int q = q0 + i * Q8X3_T + tid;
++            if (q < nq) {
++                const int b = q / (ng * 8);
++                const int r = q - b * (ng * 8);
++                const int g = r >> 3, l = r & 7;
++                q8x3_u4* px = (q8x3_u4*)(sxb + g * Q8X3_PSX + b * 256 + l * 32);
++                px[0] = va[i];
++                px[1] = vb[i];
++                *(float2*)(sdb + g * Q8X3_PDD + b * 64 + l * 8) =
++                    make_float2(vd[i], vd[i] * (float)q8x3_sum(va[i], vb[i]));
++            }
++        }
++    }
++}
++
++// Activations of block l of chunk group lg for every batch row.
++__device__ __forceinline__ void q8x3_ldsx(
++    q8x3_u4 (&xa)[Q8X3_NB], q8x3_u4 (&xb)[Q8X3_NB], float2 (&dd)[Q8X3_NB], int cs, int lg, int l)
++{
++    const char* px = q8x3_smem + lg * Q8X3_PSX + l * 32;
++    const char* pd = q8x3_smem + (long long)cs * 4 * Q8X3_PSX + lg * Q8X3_PDD + l * 8;
++#pragma unroll
++    for (int b = 0; b < Q8X3_NB; b++) {
++        xa[b] = *(const q8x3_u4*)(px + b * 256);
++        xb[b] = *(const q8x3_u4*)(px + b * 256 + 16);
++        dd[b] = *(const float2*)(pd + b * 64);
++    }
++}
++#endif
++
++#if defined(Q8X_GEMV3) || defined(Q8X_GEMV4)
++
++// MQ3G256V2 3-bit code j (0..31) of a lane's 96-bit payload (lo = bits 0..63,
++// hi = bits 64..95). Code j occupies bits [3j, 3j+3); only j == 21 straddles
++// the 64-bit boundary. if constexpr discards the dead shift branches.
++template <int J>
++__device__ __forceinline__ unsigned int q8x3_code(unsigned long long lo, unsigned int hi) {
++    if constexpr (3 * J + 3 <= 64) return (unsigned int)((lo >> (3 * J)) & 7ull);
++    else if constexpr (3 * J >= 64) return (hi >> (3 * J - 64)) & 7u;
++    else return (unsigned int)(((lo >> (3 * J)) | ((unsigned long long)hi << (64 - 3 * J))) & 7ull);
++}
++
++// Fill q[8] (each a packed 4 x u8 of unsigned 3-bit codes) in the SAME
++// even/odd element order as the MQ4 nibble unpack, so the staged int8
++// activations (mq4v2_q8x_quant, reused unchanged) pair correctly:
++//   q[2i]   = even elements of payload dword i, q[2i+1] = odd elements.
++__device__ __forceinline__ void q8x3_unpack(const q8x3_w3& w, int (&q)[8]) {
++    const unsigned long long lo = (unsigned long long)w.x | ((unsigned long long)w.y << 32);
++    const unsigned int hi = w.z;
++#define Q8X3_C(j) q8x3_code<(j)>(lo, hi)
++#define Q8X3_Q(a, b, c, d) (int)(Q8X3_C(a) | (Q8X3_C(b) << 8) | (Q8X3_C(c) << 16) | (Q8X3_C(d) << 24))
++    q[0] = Q8X3_Q(0, 2, 4, 6);
++    q[1] = Q8X3_Q(1, 3, 5, 7);
++    q[2] = Q8X3_Q(8, 10, 12, 14);
++    q[3] = Q8X3_Q(9, 11, 13, 15);
++    q[4] = Q8X3_Q(16, 18, 20, 22);
++    q[5] = Q8X3_Q(17, 19, 21, 23);
++    q[6] = Q8X3_Q(24, 26, 28, 30);
++    q[7] = Q8X3_Q(25, 27, 29, 31);
++#undef Q8X3_Q
++#undef Q8X3_C
++}
++#endif
++
++#ifdef Q8X_GEMV3
++// Rows row0 .. row0 + R*W - 1 of one weight (one workgroup).
++__device__ __forceinline__ void q8x3_rows(
++    const char* __restrict__ A,
++    const unsigned int* __restrict__ xq,
++    const float* __restrict__ dx,
++    float* __restrict__ y,
++    int M, int K, int row0)
++{
++    const int tid = threadIdx.x;
++    const int t = tid & 31;
++    const int wv = __builtin_amdgcn_readfirstlane(tid >> 5);
++    const int rbase = row0 + wv * Q8X3_W;
++    const int gpr = K >> 8;
++    const int nst = (gpr + 3) >> 2;
++    const int cs = q8x3_chunk_steps(nst);
++    const int j = t >> 3;
++    const int l = t & 7;
++    const bool active = rbase < M;
++
++    float acc[Q8X3_W][Q8X3_NB];
++#pragma unroll
++    for (int r = 0; r < Q8X3_W; r++)
++#pragma unroll
++        for (int b = 0; b < Q8X3_NB; b++) acc[r][b] = 0.0f;
++
++    // Rows past M re-read row M - 1 (never stored).
++    const int rfirst = min(rbase, M - 1);
++    const char* rb0 = A + (long long)rfirst * gpr * 104;
++    int roff[Q8X3_W];
++#pragma unroll
++    for (int r = 0; r < Q8X3_W; r++) roff[r] = (min(rbase + r, M - 1) - rfirst) * gpr * 104;
++    const int lw = 8 + 12 * l;
++    const int lh = 4 * (l >> 2);
++
++    // Weight ring, prologue first so the DRAM latency overlaps the staging.
++    q8x3_w3 wr[Q8X3_P][Q8X3_W];
++    unsigned int hr[Q8X3_P][Q8X3_W];
++#pragma unroll
++    for (int p = 0; p < Q8X3_P; p++) {
++        const int g = min(4 * min(p, nst - 1) + j, gpr - 1);
++#pragma unroll
++        for (int r = 0; r < Q8X3_W; r++) {
++            wr[p][r] = q8x3_ldw(rb0 + roff[r] + g * 104 + lw);
++            hr[p][r] = q8x3_ldh(rb0 + roff[r] + g * 104 + lh);
++        }
++    }
++    asm volatile("" ::: "memory");
++
++    for (int c0 = 0; c0 < nst; c0 += cs) {
++        const int c1 = min(c0 + cs, nst);
++        if (c0 > 0) __syncthreads();
++        q8x3_stage(xq, dx, gpr, c0, c1, cs);
++        __syncthreads();
++        if (active) {
++            auto step = [&](const int st, const int slot) {
++                const int g = 4 * st + j;
++                const bool gv = g < gpr;
++                const int lg = min(g, gpr - 1) - 4 * c0;      // group within the chunk
++                q8x3_u4 xa[Q8X3_NB], xb[Q8X3_NB];
++                float2 dd[Q8X3_NB];
++                q8x3_ldsx(xa, xb, dd, cs, lg, l);
++#pragma unroll
++                for (int r = 0; r < Q8X3_W; r++) {
++                    const q8x3_w3 w = wr[slot][r];
++                    const unsigned int h = hr[slot][r];
++                    const float sc = gv ? __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu))) : 0.0f;
++                    const float zp = gv ? __half2float(__ushort_as_half((unsigned short)(h >> 16))) : 0.0f;
++                    int q[8]; q8x3_unpack(w, q);
++#pragma unroll
++                    for (int b = 0; b < Q8X3_NB; b++) {
++                        int s = __builtin_amdgcn_sudot4(false, q[0], true, (int)xa[b].x, 0, false);
++                        s = __builtin_amdgcn_sudot4(false, q[1], true, (int)xa[b].y, s, false);
++                        s = __builtin_amdgcn_sudot4(false, q[2], true, (int)xa[b].z, s, false);
++                        s = __builtin_amdgcn_sudot4(false, q[3], true, (int)xa[b].w, s, false);
++                        s = __builtin_amdgcn_sudot4(false, q[4], true, (int)xb[b].x, s, false);
++                        s = __builtin_amdgcn_sudot4(false, q[5], true, (int)xb[b].y, s, false);
++                        s = __builtin_amdgcn_sudot4(false, q[6], true, (int)xb[b].z, s, false);
++                        s = __builtin_amdgcn_sudot4(false, q[7], true, (int)xb[b].w, s, false);
++                        acc[r][b] += (dd[b].x * sc) * (float)s + zp * dd[b].y;
++                    }
++                }
++                const int gn = min(4 * min(st + Q8X3_P, nst - 1) + j, gpr - 1);
++#pragma unroll
++                for (int r = 0; r < Q8X3_W; r++) {
++                    wr[slot][r] = q8x3_ldw(rb0 + roff[r] + gn * 104 + lw);
++                    hr[slot][r] = q8x3_ldh(rb0 + roff[r] + gn * 104 + lh);
++                }
++                asm volatile("" ::: "memory");
++            };
++            // Chunks start at multiples of cs (a multiple of P, or 0), so the
++            // ring slot of step st + p is p.
++            int st = c0;
++            for (; st + Q8X3_P <= c1; st += Q8X3_P) {
++#pragma unroll
++                for (int p = 0; p < Q8X3_P; p++) step(st + p, p);
++            }
++#pragma unroll
++            for (int p = 0; p + 1 < Q8X3_P; p++) {
++                if (st + p < c1) step(st + p, p);
++            }
++        }
++    }
++
++    float v[Q8X3_VP];
++#pragma unroll
++    for (int i = 0; i < Q8X3_VP; i++) v[i] = i < Q8X3_V ? acc[i / Q8X3_NB][i % Q8X3_NB] : 0.0f;
++    const float tot = q8x_reduce<Q8X3_LVP>(v, t);
++    const int idx = t >> (5 - Q8X3_LVP);
++    if ((t & ((1 << (5 - Q8X3_LVP)) - 1)) == 0 && idx < Q8X3_V) {
++        const int row = rbase + idx / Q8X3_NB;
++        if (row < M) {
++            float* yp = y + (long long)(idx % Q8X3_NB) * M + row;
++#ifdef Q8X_RESIDUAL
++            *yp += tot;
++#else
++            *yp = tot;
++#endif
++        }
++    }
++}
++
++__launch_bounds__(Q8X3_T)
++extern "C" __global__ void Q8X_KERNEL(
++    const char* __restrict__ A,
++    const unsigned int* __restrict__ xq,
++    const float* __restrict__ dx,
++    float* __restrict__ y,
++    int M, int K, int B)
++{
++    (void)B;
++    q8x3_rows(A, xq, dx, y, M, K, blockIdx.x * Q8X3_ROWS);
++}
++
++__launch_bounds__(Q8X3_T)
++extern "C" __global__ void Q8X_MULTI_KERNEL(
++    const char* __restrict__ A0, float* __restrict__ y0, int M0,
++    const char* __restrict__ A1, float* __restrict__ y1, int M1,
++    const char* __restrict__ A2, float* __restrict__ y2, int M2,
++    const char* __restrict__ A3, float* __restrict__ y3, int M3,
++    const unsigned int* __restrict__ xq,
++    const float* __restrict__ dx,
++    int K, int B)
++{
++    (void)B;
++    int blk = blockIdx.x;
++    const char* A = A0;
++    float* y = y0;
++    int M = M0;
++    const int n0 = (M0 + Q8X3_ROWS - 1) / Q8X3_ROWS;
++    const int n1 = (M1 + Q8X3_ROWS - 1) / Q8X3_ROWS;
++    const int n2 = (M2 + Q8X3_ROWS - 1) / Q8X3_ROWS;
++    if (blk >= n0) {
++        blk -= n0;
++        A = A1; y = y1; M = M1;
++        if (blk >= n1) {
++            blk -= n1;
++            A = A2; y = y2; M = M2;
++            if (blk >= n2) {
++                blk -= n2;
++                A = A3; y = y3; M = M3;
++            }
++        }
++    }
++    q8x3_rows(A, xq, dx, y, M, K, blk * Q8X3_ROWS);
++}
++#endif
++
++#ifdef Q8X_GEMV4
++// v4: persistent v3. grid = G workgroups (the launcher sizes G to the
++// resident capacity); workgroup w owns rows [total*w/G, total*(w+1)/G) of the
++// concatenated weights (rows of A0, then A1, ...), stages the activations
++// once (all of K; the launcher only picks v4 when they fit in LDS), and its R
++// warps split the workgroup's (row, 4-group step) pairs into equal contiguous
++// ranges. A warp streams its range one row at a time with the weight ring
++// running across row boundaries (no per-row pipeline refill, no tail of idle
++// warps). A row split between warp i-1 (tail) and warp i (head) is finished
++// after a barrier as y (+)= tail + head in that fixed order, so results are
++// deterministic. Rows per workgroup >= R keeps every range >= one row, so a
++// row is split at most once.
++#ifndef Q8X4_XP
++#define Q8X4_XP 0
++#endif
++#define Q8X4_V Q8X3_NB
++#define Q8X4_LVP (Q8X4_V <= 1 ? 0 : Q8X4_V <= 2 ? 1 : Q8X4_V <= 4 ? 2 : 3)
++#define Q8X4_VP (1 << Q8X4_LVP)
++
++// The (up to four) weights sharing the activation are passed as separate
++// scalars (not arrays in a struct: that lands in scratch memory and turns the
++// weight loads into flat loads). Row r of the concatenated weights maps to
++// (matrix, row in it) by compare/select, branch-free.
++#define Q8X4_MATS                                                           \
++    const char* __restrict__ A0, float* __restrict__ y0, int M0,            \
++    const char* __restrict__ A1, float* __restrict__ y1, int M1,            \
++    const char* __restrict__ A2, float* __restrict__ y2, int M2,            \
++    const char* __restrict__ A3, float* __restrict__ y3, int M3
++#define Q8X4_MATS_ARGS A0, y0, M0, A1, y1, M1, A2, y2, M2, A3, y3, M3
++
++__device__ __forceinline__ const char* q8x4_rowptr(Q8X4_MATS, int r, int rowbytes) {
++    (void)y0; (void)y1; (void)y2; (void)y3; (void)M3;
++    const int c1 = M0, c2 = c1 + M1, c3 = c2 + M2;
++    const char* a = r >= c3 ? A3 : r >= c2 ? A2 : r >= c1 ? A1 : A0;
++    const int lr = r - (r >= c3 ? c3 : r >= c2 ? c2 : r >= c1 ? c1 : 0);
++    return a + (long long)lr * rowbytes;
++}
++
++__device__ __forceinline__ void q8x4_store(Q8X4_MATS, int r, int b, float v) {
++    (void)A0; (void)A1; (void)A2; (void)A3;
++    const int c1 = M0, c2 = c1 + M1, c3 = c2 + M2;
++    float* y = r >= c3 ? y3 : r >= c2 ? y2 : r >= c1 ? y1 : y0;
++    const int m = r >= c3 ? M3 : r >= c2 ? M2 : r >= c1 ? M1 : M0;
++    const int lr = r - (r >= c3 ? c3 : r >= c2 ? c2 : r >= c1 ? c1 : 0);
++    float* yp = y + (long long)b * m + lr;
++#ifdef Q8X_RESIDUAL
++    *yp += v;
++#else
++    *yp = v;
++#endif
++}
++
++__device__ __forceinline__ void q8x4_run(
++    Q8X4_MATS,
++    const unsigned int* __restrict__ xq,
++    const float* __restrict__ dx,
++    int K)
++{
++    __shared__ float part[Q8X3_R][2][Q8X4_V];     // [warp][head, tail][b]
++    const int tid = threadIdx.x;
++    const int t = tid & 31;
++    const int wv = __builtin_amdgcn_readfirstlane(tid >> 5);
++    const int gpr = K >> 8;
++    const int nst = (gpr + 3) >> 2;
++    const int rowbytes = gpr * 104;
++    const int j = t >> 3;
++    const int l = t & 7;
++    const long long total = (long long)M0 + M1 + M2 + M3;
++    const int G = gridDim.x;
++    const int wg = blockIdx.x;
++    const int r0 = (int)(total * wg / G);
++    const int r1 = (int)(total * (wg + 1) / G);
++    const int T = (r1 - r0) * nst;
++    const int ua = r0 * nst + (int)((long long)T * wv / Q8X3_R);
++    const int ub = r0 * nst + (int)((long long)T * (wv + 1) / Q8X3_R);
++    const bool any = ua < ub;
++
++    // Prefetch cursor: flat step pu = prow * nst + pst, row pointer pbase;
++    // it stops at ub - 1 (the ring tail re-reads that step).
++    int prow = ua / nst;
++    int pst = ua - prow * nst;
++    int pu = ua;
++    const char* pbase = q8x4_rowptr(Q8X4_MATS_ARGS, any ? prow : 0, rowbytes);
++    q8x3_w3 wr[Q8X3_P];
++    unsigned int hr[Q8X3_P];
++    auto issue = [&](const int slot) {
++        const int gl = min(4 * pst + j, gpr - 1);
++        const char* p = pbase + gl * 104;
++        wr[slot] = q8x3_ldw(p + 8 + 12 * l);
++        hr[slot] = q8x3_ldh(p + 4 * (l >> 2));
++        const bool adv = pu + 1 < ub;
++        const bool wrap = adv && pst + 1 == nst;
++        pu += adv ? 1 : 0;
++        pst = wrap ? 0 : pst + (adv ? 1 : 0);
++        prow += wrap ? 1 : 0;
++        pbase = q8x4_rowptr(Q8X4_MATS_ARGS, prow, rowbytes);
++    };
++    if (any) {
++#pragma unroll
++        for (int p = 0; p < Q8X3_P; p++) issue(p);
++    }
++    asm volatile("" ::: "memory");
++
++    // Stage all of K once (single chunk).
++    q8x3_stage(xq, dx, gpr, 0, nst, nst);
++    __syncthreads();
++
++    float acc[Q8X3_NB];
++#pragma unroll
++    for (int b = 0; b < Q8X3_NB; b++) acc[b] = 0.0f;
++    float headv = 0.0f, tailv = 0.0f;
++    bool has_head = false;
++    int crow = ua / nst;
++    int cst = ua - crow * nst;
++
++#if Q8X4_XP
++    // LDS activation double buffer: step i of the range reads lx*[i & 1]; the
++    // next step's reads issue before this step's math (LDS completes in
++    // order, so waiting on this step's reads never waits on the next's).
++    q8x3_u4 lxa[2][Q8X3_NB], lxb[2][Q8X3_NB];
++    float2 ldd[2][Q8X3_NB];
++    if (any) q8x3_ldsx(lxa[0], lxb[0], ldd[0], nst, min(4 * cst + j, gpr - 1), l);
++#endif
++    auto step = [&](const int u, const int slot, const int buf) {
++        const int g = 4 * cst + j;
++        const bool gv = g < gpr;
++#if Q8X4_XP
++        {
++            const int nx = cst + 1 == nst ? 0 : cst + 1;
++            q8x3_ldsx(lxa[buf ^ 1], lxb[buf ^ 1], ldd[buf ^ 1], nst, min(4 * nx + j, gpr - 1), l);
++        }
++        const q8x3_u4 (&xa)[Q8X3_NB] = lxa[buf];
++        const q8x3_u4 (&xb)[Q8X3_NB] = lxb[buf];
++        const float2 (&dd)[Q8X3_NB] = ldd[buf];
++#else
++        (void)buf;
++        const int lg = min(g, gpr - 1);
++        q8x3_u4 xa[Q8X3_NB], xb[Q8X3_NB];
++        float2 dd[Q8X3_NB];
++        q8x3_ldsx(xa, xb, dd, nst, lg, l);
++#endif
++        const q8x3_w3 w = wr[slot];
++        const unsigned int h = hr[slot];
++        const float sc = gv ? __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu))) : 0.0f;
++        const float zp = gv ? __half2float(__ushort_as_half((unsigned short)(h >> 16))) : 0.0f;
++        int q[8]; q8x3_unpack(w, q);
++#pragma unroll
++        for (int b = 0; b < Q8X3_NB; b++) {
++            int s = __builtin_amdgcn_sudot4(false, q[0], true, (int)xa[b].x, 0, false);
++            s = __builtin_amdgcn_sudot4(false, q[1], true, (int)xa[b].y, s, false);
++            s = __builtin_amdgcn_sudot4(false, q[2], true, (int)xa[b].z, s, false);
++            s = __builtin_amdgcn_sudot4(false, q[3], true, (int)xa[b].w, s, false);
++            s = __builtin_amdgcn_sudot4(false, q[4], true, (int)xb[b].x, s, false);
++            s = __builtin_amdgcn_sudot4(false, q[5], true, (int)xb[b].y, s, false);
++            s = __builtin_amdgcn_sudot4(false, q[6], true, (int)xb[b].z, s, false);
++            s = __builtin_amdgcn_sudot4(false, q[7], true, (int)xb[b].w, s, false);
++            acc[b] += (dd[b].x * sc) * (float)s + zp * dd[b].y;
++        }
++        issue(slot);
++        asm volatile("" ::: "memory");
++        // End of a row segment (the row or this warp's range ends here). The
++        // branch issues no loads, so it does not disturb the vmcnt state.
++        const bool row_end = cst == nst - 1;
++        if (row_end || u == ub - 1) {
++            float v[Q8X4_VP];
++#pragma unroll
++            for (int i = 0; i < Q8X4_VP; i++) v[i] = i < Q8X4_V ? acc[i] : 0.0f;
++            const float tot = q8x_reduce<Q8X4_LVP>(v, t);
++            const bool head_part = (u - cst) < ua;         // row began before this range
++            if (head_part) {
++                headv = tot;
++                has_head = true;
++            } else if (!row_end) {
++                tailv = tot;                               // row continues past this range
++            } else {
++                const int idx = t >> (5 - Q8X4_LVP);
++                if ((t & ((1 << (5 - Q8X4_LVP)) - 1)) == 0 && idx < Q8X4_V)
++                    q8x4_store(Q8X4_MATS_ARGS, crow, idx, tot);
++            }
++#pragma unroll
++            for (int b = 0; b < Q8X3_NB; b++) acc[b] = 0.0f;
++        }
++        const bool cwrap = cst + 1 == nst;
++        cst = cwrap ? 0 : cst + 1;
++        crow += cwrap ? 1 : 0;
++    };
++
++    if (any) {
++        // Unrolled by UNR (a multiple of P, even with XP); ring slot p % P,
++        // LDS buffer p & 1. The remainder is peeled so the loop back-edge
++        // carries one exact wait state.
++        constexpr int UNR = ((Q8X4_XP != 0) && ((Q8X3_P & 1) != 0)) ? 2 * Q8X3_P : Q8X3_P;
++        int u = ua;
++        for (; u + UNR <= ub; u += UNR) {
++#pragma unroll
++            for (int p = 0; p < UNR; p++) step(u + p, p % Q8X3_P, p & 1);
++        }
++#pragma unroll
++        for (int p = 0; p + 1 < UNR; p++) {
++            if (u + p < ub) step(u + p, p % Q8X3_P, p & 1);
++        }
++    }
++
++    // Split rows: warp i's head continues warp i-1's tail (fixed order).
++    const int idx = t >> (5 - Q8X4_LVP);
++    const bool writer = (t & ((1 << (5 - Q8X4_LVP)) - 1)) == 0 && idx < Q8X4_V;
++    if (writer) {
++        part[wv][0][idx] = headv;
++        part[wv][1][idx] = tailv;
++    }
++    __syncthreads();
++    if (has_head && writer) q8x4_store(Q8X4_MATS_ARGS, ua / nst, idx, part[wv - 1][1][idx] + headv);
++}
++
++__launch_bounds__(Q8X3_T)
++extern "C" __global__ void Q8X_KERNEL(
++    const char* __restrict__ A,
++    const unsigned int* __restrict__ xq,
++    const float* __restrict__ dx,
++    float* __restrict__ y,
++    int M, int K, int B)
++{
++    (void)B;
++    q8x4_run(A, y, M, A, y, 0, A, y, 0, A, y, 0, xq, dx, K);
++}
++
++__launch_bounds__(Q8X3_T)
++extern "C" __global__ void Q8X_MULTI_KERNEL(
++    Q8X4_MATS,
++    const unsigned int* __restrict__ xq,
++    const float* __restrict__ dx,
++    int K, int B)
++{
++    (void)B;
++    q8x4_run(Q8X4_MATS_ARGS, xq, dx, K);
++}
++#endif
+\ No newline at end of file

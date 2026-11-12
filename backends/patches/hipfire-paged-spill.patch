@@ -1,0 +1,2630 @@
+diff --git a/crates/rdna-compute/examples/bench_verify_attn_wmma.rs b/crates/rdna-compute/examples/bench_verify_attn_wmma.rs
+index 6bad309ed04a8bf9c93aab47ec3171f460a2ce43..887c06f16ebdf5c33e895fce0042e8c8bf6d13f8 100644
+--- a/crates/rdna-compute/examples/bench_verify_attn_wmma.rs
++++ b/crates/rdna-compute/examples/bench_verify_attn_wmma.rs
+@@ -352,6 +352,92 @@ fn main() {
+             base_us = Some((us, name));
+         }
+     }
++    // ---- Paged twin identity check ----
++    // Same Q8 K/V bytes, but the arena is addressed through a permuted page
++    // table (the reverse permutation, so an aliasing or off-by-one page bug
++    // cannot pass). With every page resident the paged route must reproduce
++    // the descriptor-less WMMA output BIT FOR BIT — this is the KVMem
++    // verify-step numerics contract.
++    {
++        let page_tokens = 128usize;
++        let n_pages = max_seq / page_tokens;
++        let page_bytes = page_tokens * per_pos;
++        let mut hkp = vec![0u8; max_seq * per_pos];
++        let mut hvp = vec![0u8; max_seq * per_pos];
++        for l in 0..n_pages {
++            let p = n_pages - 1 - l;
++            hkp[p * page_bytes..(p + 1) * page_bytes]
++                .copy_from_slice(&hk[l * page_bytes..(l + 1) * page_bytes]);
++            hvp[p * page_bytes..(p + 1) * page_bytes]
++                .copy_from_slice(&hv[l * page_bytes..(l + 1) * page_bytes]);
++        }
++        let kp = gpu.alloc_tensor(&[max_seq * per_pos], DType::Q8_0).unwrap();
++        let vp = gpu.alloc_tensor(&[max_seq * per_pos], DType::Q8_0).unwrap();
++        gpu.hip.memcpy_htod(&kp.buf, &hkp).unwrap();
++        gpu.hip.memcpy_htod(&vp.buf, &hvp).unwrap();
++        let bt = gpu.alloc_tensor(&[n_pages], DType::F32).unwrap();
++        let bt_host: Vec<u8> = (0..n_pages)
++            .flat_map(|l| ((n_pages - 1 - l) as i32).to_ne_bytes())
++            .collect();
++        gpu.hip.memcpy_htod(&bt.buf, &bt_host).unwrap();
++        let desc = rdna_compute::kv_slots::KvSlotDesc {
++            block_table: bt.buf.as_ptr() as u64,
++            legacy_k_base: 0,
++            legacy_v_base: 0,
++            seq_len: seq_len as i32,
++            page_tokens: page_tokens as i32,
++        };
++        let desc_bytes: [u8; 32] = unsafe { std::mem::transmute(desc) };
++        let d_desc = gpu.alloc_tensor(&[8], DType::F32).unwrap();
++        gpu.hip.memcpy_htod(&d_desc.buf, &desc_bytes).unwrap();
++        let d_rslot = gpu.alloc_tensor(&[rows], DType::F32).unwrap();
++        let rs: Vec<u8> = (0..rows).flat_map(|_| 0i32.to_ne_bytes()).collect();
++        gpu.hip.memcpy_htod(&d_rslot.buf, &rs).unwrap();
++        // d_out currently holds the descriptor-less WMMA route's output.
++        let plain = gpu.download_f32(&d_out).unwrap();
++        let d_outp = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
++        let mut f = |gpu: &mut Gpu, _s: usize| -> bool {
++            gpu.attention_verify_wmma_q8_gfx1100_paged(
++                &d_q,
++                &kp,
++                &vp,
++                &d_outp,
++                &d_pos,
++                n_heads,
++                n_kv_heads,
++                head_dim,
++                seq_len,
++                rows,
++                &d_part,
++                &d_desc,
++                &d_rslot,
++                page_tokens,
++            )
++            .unwrap()
++        };
++        if !f(&mut gpu, 0) {
++            eprintln!("wmma-paged declined this shape");
++            ok = false;
++        }
++        gpu.hip.device_synchronize().unwrap();
++        let paged = gpu.download_f32(&d_outp).unwrap();
++        let diff = plain
++            .iter()
++            .zip(&paged)
++            .filter(|(a, b)| a.to_bits() != b.to_bits())
++            .count();
++        let max_abs = plain
++            .iter()
++            .zip(&paged)
++            .map(|(a, b)| (a - b).abs())
++            .fold(0.0f32, f32::max);
++        let usp = time(&mut gpu, &mut cur, &mut f);
++        eprintln!(
++            "wmma-paged {usp:8.1} us  diff floats {diff} / {} max_abs {max_abs:.1e}",
++            plain.len()
++        );
++        ok &= diff == 0;
++    }
+     if !ok {
+         eprintln!("FAIL");
+         std::process::exit(1);
+diff --git a/crates/rdna-compute/src/attention.rs b/crates/rdna-compute/src/attention.rs
+index 366d120722c4807f5441e82a6f0dceac1249eb98..7b39e90b811f947e1c880e74709922659d24f384 100644
+--- a/crates/rdna-compute/src/attention.rs
++++ b/crates/rdna-compute/src/attention.rs
+@@ -6171,6 +6171,43 @@ impl Gpu {
+         }
+     }
+ 
++    /// Whether the paged (`_wmma_slots`) prefill route must run the FA2 body
++    /// instead of the query-tiled WMMA kernel.
++    ///
++    /// This mirrors the default-route ingress in
++    /// [`Self::attention_q8_0_flash_prefill_wmma`] step for step — wide arm
++    /// (`gfx11_q8_fa2_wide` + 64..=8192 + `<=512 || %512 == 0`), then the
++    /// narrow `gfx11_fa2_prefill` arm — so a paged launch and a contiguous
++    /// launch of the same rows always run the SAME arithmetic. Any drift here
++    /// would silently break the bit-identical contract between the single-slot
++    /// and paged paths (the two kernels differ by ~6e-5 otherwise).
++    ///
++    /// Exact gfx1100 only: it is the card whose FA2 twin this build ships.
++    /// gfx1151's default body is its own twin file and stays on the
++    /// query-tiled paged kernel.
++    fn fa2_gfx11_paged_admitted(
++        &self,
++        n_heads: usize,
++        n_kv_heads: usize,
++        head_dim: usize,
++        batch_size: usize,
++        max_ctx_len: usize,
++    ) -> bool {
++        self.arch == "gfx1100"
++            && n_heads == 24
++            && n_kv_heads == 4
++            && head_dim == 256
++            && self.fa2_gfx11_ctx_admitted(max_ctx_len)
++            && ((self.flags.gfx11_q8_fa2_wide
++                && self.flags.gfx11_fa2_prefill
++                && (64..=8192).contains(&batch_size)
++                && (batch_size <= 512 || batch_size % 512 == 0))
++                || (self.flags.gfx11_fa2_prefill
++                    && !self.replay.is_recording()
++                    && !self.graphs.capture_mode
++                    && self.fa2_gfx11_batch_admitted(batch_size)))
++    }
++
+     /// Whether the default gfx1201 Q8 FA2 prefill arm of
+     /// [`Self::attention_q8_0_flash_prefill_wmma`] takes this call (exact
+     /// arch/shape gates). Dispatch asks the same question before it routes
+@@ -6545,6 +6582,38 @@ impl Gpu {
+             head_dim <= 256,
+             "head_dim {head_dim} exceeds MAX_D_CHUNKS*16"
+         );
++        // Paged FA2: whenever the contiguous ingress would take the FA2 body
++        // for this row count, the paged route must too. Otherwise the two
++        // paths differ numerically (query-tiled WMMA vs FA2 ~6e-5) and the
++        // bit-identical contract between the single-slot and paged launches
++        // breaks. Spilled pages are masked inside the body; with every page
++        // resident the descriptor degenerates to contiguous addressing.
++        if multi_slot
++            && self.fa2_gfx11_paged_admitted(
++                n_heads,
++                n_kv_heads,
++                head_dim,
++                batch_size,
++                max_ctx_len,
++            )
++        {
++            return self.attention_q8_0_fa2_gqa_gfx11_paged(
++                q,
++                k_cache,
++                v_cache,
++                out,
++                positions,
++                n_heads,
++                n_kv_heads,
++                head_dim,
++                max_ctx_len,
++                batch_size,
++                slot_descs.unwrap(),
++                tile_slot.unwrap(),
++                tile_row0.unwrap(),
++                tile_qbase.unwrap(),
++            );
++        }
+         // HIPFIRE_FLASH_PREFILL_SPLITQ=1 carries Q as a double-single (hi+lo)
+         // pair through two WMMA passes per d-chunk. Q's f16 rounding is the
+         // dominant error term — f16 Q alone through an otherwise-f32 kernel
+@@ -9218,6 +9287,247 @@ impl Gpu {
+         result
+     }
+ 
++    /// Paged multi-slot variant of [`Self::attention_q8_0_fa2_gqa_gfx11`].
++    ///
++    /// Same kernel body and arithmetic as the descriptor-less FA2 launch —
++    /// the K/V fill helpers resolve each key through the tile's slot
++    /// descriptor (`kv_offset_for_k`) and a key whose block-table entry is -1
++    /// (spilled by the KV working-set manager) is staged as zeros and masked
++    /// out of the softmax, never dereferenced. With every page resident the
++    /// descriptor degenerates to `base + pos * row_stride`, so the output is
++    /// bit-identical to the contiguous FA2 launch on the same rows.
++    ///
++    /// Tile arrays follow [`Self::attention_q8_0_flash_prefill_wmma_slots`]:
++    /// `tile_slot[t]` selects the slot descriptor, `tile_qbase[t]` is the
++    /// flat row where tile `t`'s q/out/positions start, `tile_row0[t]` is
++    /// ABI-reserved and unread. Build them with
++    /// `kv_slots::build_tiles(slot_query_counts, 16)` — FA2's query tile is
++    /// the same fixed 16 rows.
++    ///
++    /// Exact gfx1100 only (the card whose FA2 twin this route ships); every
++    /// other arch keeps the query-tiled `_wmma_slots` paged kernel.
++    #[allow(clippy::too_many_arguments)]
++    pub fn attention_q8_0_fa2_gqa_gfx11_paged(
++        &mut self,
++        q: &GpuTensor,
++        k_cache: &GpuTensor,
++        v_cache: &GpuTensor,
++        out: &GpuTensor,
++        positions: &GpuTensor,
++        n_heads: usize,
++        n_kv_heads: usize,
++        head_dim: usize,
++        max_ctx_len: usize,
++        batch_size: usize,
++        slot_descs: &GpuTensor,
++        tile_slot: &GpuTensor,
++        tile_row0: &GpuTensor,
++        tile_qbase: &GpuTensor,
++    ) -> HipResult<()> {
++        self.bind_thread()?;
++        if self.arch != "gfx1100" {
++            return Err(hip_bridge::HipError::new(
++                0,
++                &format!(
++                    "attention_q8_0_fa2_gqa_gfx11_paged requires gfx1100, got {}",
++                    self.arch
++                ),
++            ));
++        }
++        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
++            return Err(hip_bridge::HipError::new(
++                0,
++                &format!(
++                    "attention_q8_0_fa2_gqa_gfx11_paged requires H24/KV4/D256, got \
++                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
++                ),
++            ));
++        }
++        let wide = self.flags.gfx11_q8_fa2_wide;
++        let max_fa2_batch: usize = if wide { 8192 } else { 512 };
++        if batch_size == 0 || batch_size > max_fa2_batch {
++            return Err(hip_bridge::HipError::new(
++                0,
++                &format!(
++                    "attention_q8_0_fa2_gqa_gfx11_paged requires 1 <= batch <= {max_fa2_batch}, got {batch_size}"
++                ),
++            ));
++        }
++        let max_fa2_ctx = self.fa2_gfx11_max_ctx();
++        if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
++            return Err(hip_bridge::HipError::new(
++                0,
++                &format!(
++                    "attention_q8_0_fa2_gqa_gfx11_paged requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
++                ),
++            ));
++        }
++        let Some(need_qo) = batch_size
++            .checked_mul(n_heads)
++            .and_then(|v| v.checked_mul(head_dim))
++        else {
++            return Err(hip_bridge::HipError::new(
++                0,
++                "attention_q8_0_fa2_gqa_gfx11_paged query size overflow",
++            ));
++        };
++        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
++            return Err(hip_bridge::HipError::new(
++                0,
++                &format!(
++                    "attention_q8_0_fa2_gqa_gfx11_paged capacity mismatch: \
++                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
++                    q.numel(),
++                    out.numel(),
++                    positions.numel()
++                ),
++            ));
++        }
++        let n_tiles = tile_slot.numel();
++        if n_tiles == 0 {
++            return Ok(());
++        }
++        if tile_qbase.numel() < n_tiles || slot_descs.numel() == 0 {
++            return Err(hip_bridge::HipError::new(
++                0,
++                "attention_q8_0_fa2_gqa_gfx11_paged tile array too small",
++            ));
++        }
++        // `tile_row0` is ABI-reserved (positions[] is authoritative); bound it
++        // anyway so a malformed caller fails closed rather than silently
++        // passing a short buffer to the kernel.
++        if tile_row0.numel() < n_tiles {
++            return Err(hip_bridge::HipError::new(
++                0,
++                "attention_q8_0_fa2_gqa_gfx11_paged tile_row0 too small",
++            ));
++        }
++        // Same warp-specialized fill / R3 selection as the contiguous
++        // launcher, so a paged launch and the base launch of the same rows
++        // compile the same arithmetic (the variants are documented
++        // bit-identical; matching the flags keeps that independent of env).
++        let fill = hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
++        let r3 = fill && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_R3", true);
++        const MODULE: &str = "attention_q8_0_fa2_gqa_gfx1100_paged";
++        const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1100_paged";
++        if !self.functions.contains_key(MODULE) || !self.functions.contains_key(PRECONVERT) {
++            let src = format!(
++                "{}#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 1\n#define HIPFIRE_FA2_FILL {}\n#define HIPFIRE_FA2_GFX1100 {}\n{}",
++                if r3 { "// HIPFIRE_COMPILER_FLAGS: -mcumode\n" } else { "" },
++                u8::from(fill),
++                u8::from(r3),
++                kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC, true)
++            );
++            self.ensure_kernel(MODULE, &src, MODULE)?;
++            self.ensure_kernel(MODULE, &src, PRECONVERT)?;
++        }
++        // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
++        let need_q16_bytes = need_qo.checked_mul(2).ok_or_else(|| {
++            hip_bridge::HipError::new(0, "attention_q8_0_fa2_gqa_gfx11_paged Q16 size overflow")
++        })?;
++        if batch_size > 512
++            && (self.graphs.capture_mode || self.replay.is_recording())
++            && crate::scratch::scratch_will_grow(
++                self.scratch.fa2_q16_scratch_bytes,
++                self.scratch.fa2_q16_scratch.is_some(),
++                need_q16_bytes,
++            )
++        {
++            return Err(hip_bridge::HipError::new(
++                0,
++                "wide gfx11 FA2 paged Q16 scratch must be grown before graph capture/recording",
++            ));
++        }
++        if crate::scratch::scratch_will_grow(
++            self.scratch.fa2_q16_scratch_bytes,
++            self.scratch.fa2_q16_scratch.is_some(),
++            need_q16_bytes,
++        ) {
++            self.invalidate_for_scratch_growth();
++        }
++        let q16_ptr = self
++            .scratch
++            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
++        let grid_x = n_tiles as u32;
++        let scale = 1.0f32 / (head_dim as f32).sqrt();
++        let mut q16_arg = q16_ptr;
++        let mut k_ptr = k_cache.buf.as_ptr();
++        let mut v_ptr = v_cache.buf.as_ptr();
++        let mut out_ptr = out.buf.as_ptr();
++        let mut pos_ptr = positions.buf.as_ptr();
++        let mut nh = n_heads as i32;
++        let mut nkv = n_kv_heads as i32;
++        let mut hd = head_dim as i32;
++        let mut bs = batch_size as i32;
++        let mut sc = scale;
++        let mut desc_ptr = slot_descs.buf.as_ptr();
++        let mut tile_slot_ptr = tile_slot.buf.as_ptr();
++        let mut tile_row0_ptr = tile_row0.buf.as_ptr();
++        let mut tile_qbase_ptr = tile_qbase.buf.as_ptr();
++        let mut params: Vec<*mut c_void> = vec![
++            &mut q16_arg as *mut _ as *mut c_void,
++            &mut k_ptr as *mut _ as *mut c_void,
++            &mut v_ptr as *mut _ as *mut c_void,
++            &mut out_ptr as *mut _ as *mut c_void,
++            &mut pos_ptr as *mut _ as *mut c_void,
++            &mut nh as *mut _ as *mut c_void,
++            &mut nkv as *mut _ as *mut c_void,
++            &mut hd as *mut _ as *mut c_void,
++            &mut bs as *mut _ as *mut c_void,
++            &mut sc as *mut _ as *mut c_void,
++            &mut desc_ptr as *mut _ as *mut c_void,
++            &mut tile_slot_ptr as *mut _ as *mut c_void,
++            &mut tile_row0_ptr as *mut _ as *mut c_void,
++            &mut tile_qbase_ptr as *mut _ as *mut c_void,
++        ];
++        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
++            batch_size,
++            n_heads,
++            n_kv_heads,
++            head_dim,
++            max_ctx_len,
++        );
++        let timer = crate::profile::begin_timer(&self.hip, "attention", MODULE, bytes);
++        self.launch_fa2_q_preconvert_gfx11(
++            PRECONVERT,
++            q.buf.as_ptr(),
++            q16_ptr,
++            std::ptr::null(),
++            std::ptr::null(),
++            batch_size,
++            0,
++        )?;
++        let result = self.launch_maybe_blob(
++            MODULE,
++            [grid_x, 4, 1],
++            [256, 1, 1],
++            32768,
++            &mut params,
++            || {
++                let mut b = hip_bridge::KernargBlob::new();
++                b.push_ptr(q16_arg);
++                b.push_ptr(k_ptr);
++                b.push_ptr(v_ptr);
++                b.push_ptr(out_ptr);
++                b.push_ptr(pos_ptr);
++                b.push_i32(nh);
++                b.push_i32(nkv);
++                b.push_i32(hd);
++                b.push_i32(bs);
++                b.push_f32(sc);
++                b.push_ptr(desc_ptr);
++                b.push_ptr(tile_slot_ptr);
++                b.push_ptr(tile_row0_ptr);
++                b.push_ptr(tile_qbase_ptr);
++                b
++            },
++        );
++        if let Some(t) = timer {
++            t.finish(&self.hip);
++        }
++        result
++    }
++
+     /// Experimental exact-gfx1100 split-KV twin of the tuned Q16/R3 FA2
+     /// kernel. The partial grid partitions the live KT32 range across Z and
+     /// the merge performs a stable LSE-weighted reduction. Product dispatch
+@@ -11821,6 +12131,351 @@ impl Gpu {
+     /// method). Used by cohere2moe's `sliding_attention` layers so context beyond
+     /// `sliding_window` clips correctly instead of running full-causal (degraded).
+     #[allow(clippy::too_many_arguments)]
++    /// Paged (KVMem) GQA-shared Q8_0 decode attention for a single row.
++    ///
++    /// The paged ladder's generic tile kernel launches one workgroup per
++    /// (q head, tile), so the six q heads of a kv head each re-read that kv
++    /// head's K/V tile — 6x the KV traffic of the reference gfx1100 decode
++    /// route (`attention_flash_q8_0_tile_gqa_gfx1100`, one 256-thread
++    /// workgroup per (kv head, tile)). At 56k context on the 7900 XT that
++    /// duplication made a KVMem AR step 46 ms against the reference's 27 ms.
++    ///
++    /// This launches the paged twin of that GQA tile (same body, block-table
++    /// tile base, spilled pages publish the empty partial) and then the same
++    /// `attention_flash_asym_reduce_batched` the paged ladder uses, so the
++    /// partials contract and reduce numerics are unchanged — only the K/V
++    /// traffic differs.
++    ///
++    /// `Ok(false)` declines (non-gfx1100, shape outside the GQA-6/head_dim
++    /// 256/tile 128 envelope, or tile misalignment with the page size); the
++    /// caller stays on the generic paged tile ladder.
++    #[allow(clippy::too_many_arguments)]
++    pub fn attention_flash_q8_0_gqa_decode_paged(
++        &mut self,
++        q: &GpuTensor,
++        k_cache: &GpuTensor,
++        v_cache: &GpuTensor,
++        out: &GpuTensor,
++        positions: &GpuTensor,
++        n_heads: usize,
++        n_kv_heads: usize,
++        head_dim: usize,
++        max_ctx_len: usize,
++        partials: &GpuTensor,
++        slot_descs: &GpuTensor,
++        row_slot: &GpuTensor,
++    ) -> HipResult<bool> {
++        let pos_ptr = positions.buf.as_ptr();
++        if !self.attention_flash_q8_0_gqa_paged_tile(
++            q,
++            k_cache,
++            v_cache,
++            partials,
++            pos_ptr,
++            n_heads,
++            n_kv_heads,
++            head_dim,
++            max_ctx_len,
++            slot_descs,
++            row_slot,
++        )? {
++            return Ok(false);
++        }
++        let tile_size = 128usize; // fixed by the admitted kernel body
++        let max_tiles = max_ctx_len.div_ceil(tile_size);
++        self.ensure_kernel(
++            "attention_flash_asym_reduce_batched",
++            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
++            "attention_flash_asym_reduce_batched",
++        )?;
++        // Same reduce as the generic paged tile ladder: one row, so chunk=1
++        // and the batch offset is 0.
++        let (p_ptr, o_ptr) = (partials.buf.as_ptr(), out.buf.as_ptr());
++        let nh = n_heads as i32;
++        let hd = head_dim as i32;
++        let ts = tile_size as i32;
++        let mt = max_tiles as i32;
++        let bo = 0i32;
++        let bs = 0i32;
++        let bc = 0i32;
++        let mut rparams: Vec<*mut c_void> = vec![
++            &p_ptr as *const _ as *mut c_void,
++            &o_ptr as *const _ as *mut c_void,
++            &pos_ptr as *const _ as *mut c_void,
++            &nh as *const _ as *mut c_void,
++            &hd as *const _ as *mut c_void,
++            &ts as *const _ as *mut c_void,
++            &mt as *const _ as *mut c_void,
++            &bo as *const _ as *mut c_void,
++            &bs as *const _ as *mut c_void,
++            &bc as *const _ as *mut c_void,
++        ];
++        self.launch_maybe_blob(
++            "attention_flash_asym_reduce_batched",
++            [n_heads as u32, 1, 1],
++            [32, 1, 1],
++            0,
++            &mut rparams,
++            || {
++                let mut b = hip_bridge::KernargBlob::new();
++                b.push_ptr(p_ptr);
++                b.push_ptr(o_ptr);
++                b.push_ptr(pos_ptr);
++                b.push_i32(nh);
++                b.push_i32(hd);
++                b.push_i32(ts);
++                b.push_i32(mt);
++                b.push_i32(bo);
++                b.push_i32(bs);
++                b.push_i32(bc);
++                b
++            },
++        )?;
++        Ok(true)
++    }
++
++    /// Paged (KVMem) gated decode attention: the same block-table tile launch
++    /// as [`Self::attention_flash_q8_0_gqa_decode_paged`], followed by the
++    /// stock gated reduce
++    /// (`attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100`): it
++    /// applies `sigmoid(gate)` and the AWQ MQ rotation in the epilogue and
++    /// yields the prerotated input the `wo` GEMV reads.
++    ///
++    /// This is the paged twin of the reference sequential decode's own
++    /// epilogue route (`attention_flash_q8_0_gqa_gated_awq_gfx1100`), so a
++    /// paged single-row decode step issues byte-identical arithmetic to stock
++    /// hipfire: identical Q8_0 writers, identical tile partials for resident
++    /// pages, the identical reduce kernel. `Ok(false)` declines exactly where
++    /// the non-gated paged twin declines.
++    #[allow(clippy::too_many_arguments)]
++    pub fn attention_flash_q8_0_gqa_decode_paged_gated(
++        &mut self,
++        q: &GpuTensor,
++        k_cache: &GpuTensor,
++        v_cache: &GpuTensor,
++        out: &GpuTensor,
++        gate: &GpuTensor,
++        awq_scale: &GpuTensor,
++        pos_buf: &DeviceBuffer,
++        n_heads: usize,
++        n_kv_heads: usize,
++        head_dim: usize,
++        max_ctx_len: usize,
++        partials: &GpuTensor,
++        slot_descs: &GpuTensor,
++        row_slot: &GpuTensor,
++    ) -> HipResult<bool> {
++        if awq_scale.numel() < n_heads * head_dim {
++            return Err(hip_bridge::HipError::new(
++                1,
++                &format!(
++                    "paged gated mq rotate reducer: undersized awq_scale (got {}, required {})",
++                    awq_scale.numel(),
++                    n_heads * head_dim,
++                ),
++            ));
++        }
++        let pos_ptr = pos_buf.as_ptr();
++        if !self.attention_flash_q8_0_gqa_paged_tile(
++            q,
++            k_cache,
++            v_cache,
++            partials,
++            pos_ptr,
++            n_heads,
++            n_kv_heads,
++            head_dim,
++            max_ctx_len,
++            slot_descs,
++            row_slot,
++        )? {
++            return Ok(false);
++        }
++        const REDUCE: &str = "attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100";
++        self.ensure_kernel(
++            REDUCE,
++            kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
++            REDUCE,
++        )?;
++        self.ensure_mq_signs()?;
++        let tile_size = 128usize;
++        let max_tiles = max_ctx_len.div_ceil(tile_size);
++        let p_ptr = partials.buf.as_ptr();
++        let o_ptr = out.buf.as_ptr();
++        let g_ptr = gate.buf.as_ptr();
++        let aw_ptr = awq_scale.buf.as_ptr();
++        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
++        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
++        let nh = n_heads as i32;
++        let hd = head_dim as i32;
++        let ts = tile_size as i32;
++        let mt = max_tiles as i32;
++        let mut params: Vec<*mut c_void> = vec![
++            &p_ptr as *const _ as *mut c_void,
++            &o_ptr as *const _ as *mut c_void,
++            &g_ptr as *const _ as *mut c_void,
++            &aw_ptr as *const _ as *mut c_void,
++            &s1_ptr as *const _ as *mut c_void,
++            &s2_ptr as *const _ as *mut c_void,
++            &nh as *const _ as *mut c_void,
++            &hd as *const _ as *mut c_void,
++            &pos_ptr as *const _ as *mut c_void,
++            &ts as *const _ as *mut c_void,
++            &mt as *const _ as *mut c_void,
++        ];
++        let k = n_heads * head_dim;
++        let bytes = n_heads * max_tiles * (2 + head_dim) * 4 + k * 4 * 3;
++        let timer = crate::profile::begin_timer(&self.hip, "fused", REDUCE, bytes);
++        let result = self.launch_maybe_blob(
++            REDUCE,
++            [n_heads as u32, 1, 1],
++            [1024, 1, 1],
++            (2 * max_tiles * 4) as u32,
++            &mut params,
++            || {
++                let mut b = hip_bridge::KernargBlob::new();
++                b.push_ptr(p_ptr);
++                b.push_ptr(o_ptr);
++                b.push_ptr(g_ptr);
++                b.push_ptr(aw_ptr);
++                b.push_ptr(s1_ptr);
++                b.push_ptr(s2_ptr);
++                b.push_i32(nh);
++                b.push_i32(hd);
++                b.push_ptr(pos_ptr);
++                b.push_i32(ts);
++                b.push_i32(mt);
++                b
++            },
++        );
++        if let Some(timer) = timer {
++            timer.finish(&self.hip);
++        }
++        result?;
++        Ok(true)
++    }
++
++    /// Admission + tile launch shared by the paged GQA decode twins: one
++    /// 256-thread workgroup per (kv head, tile), block-table-addressed K/V,
++    /// `pos_buf[0]` read as the row's last logical position. `Ok(false)`
++    /// declines (non-gfx1100, shape outside the GQA-6/head_dim-256/tile-128
++    /// envelope, tile misaligned with the page size, or empty context).
++    #[allow(clippy::too_many_arguments)]
++    fn attention_flash_q8_0_gqa_paged_tile(
++        &mut self,
++        q: &GpuTensor,
++        k_cache: &GpuTensor,
++        v_cache: &GpuTensor,
++        partials: &GpuTensor,
++        pos_ptr: *mut std::ffi::c_void,
++        n_heads: usize,
++        n_kv_heads: usize,
++        head_dim: usize,
++        max_ctx_len: usize,
++        slot_descs: &GpuTensor,
++        row_slot: &GpuTensor,
++    ) -> HipResult<bool> {
++        self.bind_thread()?;
++        let tile_size = self.attn_tile_size();
++        // The GQA tile resolves one block-table entry per tile, so the tile
++        // must not straddle a page; page_tokens is 128 in production and the
++        // tile is fixed at 128 by the kernel body.
++        if self.arch.as_str() != "gfx1100"
++            || head_dim != 256
++            || n_kv_heads == 0
++            || n_heads != n_kv_heads * 6
++            || tile_size != 128
++            // One block-table entry must resolve a whole 128-key tile; a
++            // page smaller than the tile would straddle pages.
++            || crate::page_pool::PAGE_TOKENS != 128
++            || max_ctx_len == 0
++        {
++            return Ok(false);
++        }
++        const FUNC: &str = "attention_flash_q8_0_tile_gqa_paged_gfx1100";
++        if !self.functions.contains_key(FUNC) {
++            let src = kernels::attention_flash_q8_0_tile_gqa_paged_source();
++            self.ensure_kernel(FUNC, &src, FUNC)?;
++        }
++        // One stderr line the first time the route runs, so a harness log
++        // proves the paged GQA tile (and not the 6x-duplicated ladder tile)
++        // served this decode step.
++        static GQA_PAGED_ENGAGED: std::sync::atomic::AtomicBool =
++            std::sync::atomic::AtomicBool::new(false);
++        if !GQA_PAGED_ENGAGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
++            eprintln!(
++                "[attn] paged GQA decode tile engaged: {} heads, {} kv heads, \
++                 head_dim {}, max_tiles {}",
++                n_heads,
++                n_kv_heads,
++                head_dim,
++                max_ctx_len.div_ceil(tile_size),
++            );
++        }
++        let max_tiles = max_ctx_len.div_ceil(tile_size);
++        // The GQA entry walks tiles blockIdx.y, +gridDim.y, ...; cap Y so a
++        // 262k-token slot does not dispatch thousands of idle workgroups.
++        let launch_y = max_tiles.min(Q8_DECODE_GQA_GFX1100_TILE_GRID_Y_CAP).max(1) as u32;
++        let q_ptr = q.buf.as_ptr();
++        let k_ptr = k_cache.buf.as_ptr();
++        let v_ptr = v_cache.buf.as_ptr();
++        let p_ptr = partials.buf.as_ptr();
++        let nh = n_heads as i32;
++        let nkv = n_kv_heads as i32;
++        let hd = head_dim as i32;
++        let ms = max_ctx_len as i32;
++        let sc = 1.0f32 / (head_dim as f32).sqrt();
++        let ts = tile_size as i32;
++        let wn = 0i32;
++        let es = 0i32;
++        let desc_ptr = slot_descs.buf.as_ptr();
++        let row_slot_ptr = row_slot.buf.as_ptr();
++        let mut params: Vec<*mut c_void> = vec![
++            &q_ptr as *const _ as *mut c_void,
++            &k_ptr as *const _ as *mut c_void,
++            &v_ptr as *const _ as *mut c_void,
++            &p_ptr as *const _ as *mut c_void,
++            &pos_ptr as *const _ as *mut c_void,
++            &nh as *const _ as *mut c_void,
++            &nkv as *const _ as *mut c_void,
++            &hd as *const _ as *mut c_void,
++            &ms as *const _ as *mut c_void,
++            &sc as *const _ as *mut c_void,
++            &ts as *const _ as *mut c_void,
++            &wn as *const _ as *mut c_void,
++            &es as *const _ as *mut c_void,
++            &desc_ptr as *const _ as *mut c_void,
++            &row_slot_ptr as *const _ as *mut c_void,
++        ];
++        self.launch_maybe_blob(
++            FUNC,
++            [n_kv_heads as u32, launch_y, 1],
++            [256, 1, 1],
++            0,
++            &mut params,
++            || {
++                let mut b = hip_bridge::KernargBlob::new();
++                b.push_ptr(q_ptr);
++                b.push_ptr(k_ptr);
++                b.push_ptr(v_ptr);
++                b.push_ptr(p_ptr);
++                b.push_ptr(pos_ptr);
++                b.push_i32(nh);
++                b.push_i32(nkv);
++                b.push_i32(hd);
++                b.push_i32(ms);
++                b.push_f32(sc);
++                b.push_i32(ts);
++                b.push_i32(wn);
++                b.push_i32(es);
++                b.push_ptr(desc_ptr);
++                b.push_ptr(row_slot_ptr);
++                b
++            },
++        )?;
++        Ok(true)
++    }
++
+     /// Whether [`Self::attention_q8_0_prefill_gqa_wmma`] admits this shape.
+     pub fn attention_q8_0_prefill_gqa_wmma_admitted(
+         &self,
+@@ -12865,7 +13520,13 @@ impl Gpu {
+                 ),
+             ));
+         }
+-        self.ensure_kernel(
++        // The tile body `#include`s kv_slot_desc.h (shared with its paged
++        // twin), and the runtime hipcc compile has no -I to kernels/src, so
++        // this MUST go through the strip-and-prepend helper. Plain
++        // `ensure_kernel` fails the legacy decode with "kv_slot_desc.h file
++        // not found" — it only ever worked on the paged module because that
++        // one is compiled by `ensure_givens4_kv_slot_kernel`.
++        self.ensure_givens4_kernel(
+             TILE,
+             kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
+             TILE,
+diff --git a/crates/rdna-compute/src/attention_wmma_verify.rs b/crates/rdna-compute/src/attention_wmma_verify.rs
+index 9de5d07ef8f990e5e490fc5f54a482e3ea3861e7..52ba2ef7fafc0ac30a67d3ed22acd023af13223b 100644
+--- a/crates/rdna-compute/src/attention_wmma_verify.rs
++++ b/crates/rdna-compute/src/attention_wmma_verify.rs
+@@ -38,6 +38,16 @@
+ //! (the running max moves only when a tile exceeds it by 8 log2 units, exact
+ //! algebra, P <= 256). Not byte-identical to the incumbent routes,
+ //! KLD-gated. Deterministic: no atomics, fixed grid, fixed reduce order.
++//!
++//! Paged twin ([`Gpu::attention_verify_wmma_q8_gfx1100_paged`], module
++//! `attention_verify_wmma_gfx1100_paged`): the slot engine (KVMem) compiles
++//! the same body against the paged `KvSlotDesc` header and appends
++//! `slot_descs`/`row_slot` to the ABI. Every 32-key tile resolves its page
++//! through the block table; a KVMem-spilled (absent) page is addressed at
++//! arena page 0 and masked to -inf, so resident-only data is bitwise equal
++//! to this module and a spilled page costs one mask instead of a full-tile
++//! read. Admitted only for a single active slot's rows (one descriptor per
++//! step).
+ 
+ use crate::{kernels, Gpu, GpuTensor};
+ use hip_bridge::HipResult;
+@@ -53,6 +63,16 @@ pub const WMMA_VERIFY_ATTN_SYMBOLS: [&str; 3] = [
+     "attention_verify_wmma_q8_qt3_gfx1100",
+ ];
+ pub const WMMA_VERIFY_ATTN_REDUCE: &str = "attention_verify_wmma_reduce_gfx1100";
++/// Paged (KVMem) variant: same body compiled against the paged `KvSlotDesc`
++/// header with the QT kernels renamed (see
++/// `kernels::attention_verify_wmma_paged_source`). The reduce kernel is
++/// shared verbatim under its original name.
++pub const WMMA_VERIFY_ATTN_PAGED_MODULE: &str = "attention_verify_wmma_gfx1100_paged";
++pub const WMMA_VERIFY_ATTN_PAGED_SYMBOLS: [&str; 3] = [
++    "attention_verify_wmma_q8_qt1_paged_gfx1100",
++    "attention_verify_wmma_q8_qt2_paged_gfx1100",
++    "attention_verify_wmma_q8_qt3_paged_gfx1100",
++];
+ 
+ /// Largest verify block (rows) the route takes.
+ pub const WMMA_VERIFY_ATTN_MAX_ROWS: usize = 8;
+@@ -226,6 +246,134 @@ impl Gpu {
+         }
+         Ok(true)
+     }
++
++    /// Paged twin of [`Self::attention_verify_wmma_q8_gfx1100`]: identical
++    /// arithmetic and partial layout, but every 32-key tile is addressed
++    /// through this step's `KvSlotDesc` block table, and a tile whose logical
++    /// page is absent (`-1`, KVMem-spilled to host) publishes -inf instead of
++    /// resident bytes. With every page resident the result is bitwise equal
++    /// to the descriptor-less route on the same cache bytes.
++    ///
++    /// `slot_descs`/`row_slot` are the slot engine's usual staging buffers
++    /// (`descs_dev`, `row_slot_dev`). Admission is the descriptor-less gate
++    /// plus `page_tokens` being a positive multiple of the kernel's 32-key
++    /// tile (the paged pool's 128 satisfies it); the caller must pass a
++    /// SINGLE active slot's rows (all `row_slot[..rows]` equal), because the
++    /// kernel resolves one descriptor for the whole verify step. `Ok(false)`
++    /// = not admitted; the caller falls back to its tiles/scalar ladder.
++    #[allow(clippy::too_many_arguments)]
++    pub fn attention_verify_wmma_q8_gfx1100_paged(
++        &mut self,
++        q: &GpuTensor,
++        k_cache: &GpuTensor,
++        v_cache: &GpuTensor,
++        out: &GpuTensor,
++        positions: &GpuTensor,
++        n_heads: usize,
++        n_kv_heads: usize,
++        head_dim: usize,
++        ctx_len: usize,
++        rows: usize,
++        partials: &GpuTensor,
++        slot_descs: &GpuTensor,
++        row_slot: &GpuTensor,
++        page_tokens: usize,
++    ) -> HipResult<bool> {
++        if !self.wmma_verify_attn_active(rows, n_heads, n_kv_heads, head_dim) {
++            return Ok(false);
++        }
++        if page_tokens == 0 || page_tokens % 32 != 0 {
++            return Ok(false);
++        }
++        let q_dim = n_heads * head_dim;
++        let nblk = wmma_verify_attn_spans(rows, ctx_len);
++        if partials.numel() < wmma_verify_attn_partials_len(rows, n_heads, ctx_len)
++            || q.numel() < rows * q_dim
++            || out.numel() < rows * q_dim
++            || positions.numel() < rows
++            || row_slot.numel() < rows
++            || slot_descs.numel() < 1
++        {
++            return Ok(false);
++        }
++        self.bind_thread()?;
++        let qt = wmma_verify_attn_qt(rows);
++        let symbol = WMMA_VERIFY_ATTN_PAGED_SYMBOLS[qt - 1];
++        let source = kernels::attention_verify_wmma_paged_source();
++        self.ensure_kernel(WMMA_VERIFY_ATTN_PAGED_MODULE, &source, symbol)?;
++        self.ensure_kernel(WMMA_VERIFY_ATTN_PAGED_MODULE, &source, WMMA_VERIFY_ATTN_REDUCE)?;
++        let bit = 1u32 << (2 + qt);
++        if WMMA_VERIFY_ATTN_ENGAGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
++            eprintln!(
++                "[wmma-verify-attn] paged route active: {symbol} rows={rows} spans={nblk} ctx={ctx_len}"
++            );
++        }
++        let q_ptr = q.buf.as_ptr();
++        let k_ptr = k_cache.buf.as_ptr();
++        let v_ptr = v_cache.buf.as_ptr();
++        let p_ptr = partials.buf.as_ptr();
++        let pos_ptr = positions.buf.as_ptr();
++        let o_ptr = out.buf.as_ptr();
++        let descs_ptr = slot_descs.buf.as_ptr();
++        let rs_ptr = row_slot.buf.as_ptr();
++        let nh = n_heads as i32;
++        // Scores in log2 units: one v_exp_f32 per score.
++        let scale_log2 = std::f32::consts::LOG2_E / (head_dim as f32).sqrt();
++        let n_blk = nblk as i32;
++        let max_spans = nblk as i32;
++        let batch_offset = 0i32;
++        let rows_i = rows as i32;
++        // Paged ABI: the same tail plus the slot descriptor and row -> slot map.
++        {
++            let func = &self.functions[symbol];
++            let mut params: Vec<*mut c_void> = vec![
++                &q_ptr as *const _ as *mut c_void,
++                &k_ptr as *const _ as *mut c_void,
++                &v_ptr as *const _ as *mut c_void,
++                &p_ptr as *const _ as *mut c_void,
++                &pos_ptr as *const _ as *mut c_void,
++                &nh as *const _ as *mut c_void,
++                &scale_log2 as *const _ as *mut c_void,
++                &n_blk as *const _ as *mut c_void,
++                &max_spans as *const _ as *mut c_void,
++                &batch_offset as *const _ as *mut c_void,
++                &rows_i as *const _ as *mut c_void,
++                &descs_ptr as *const _ as *mut c_void,
++                &rs_ptr as *const _ as *mut c_void,
++            ];
++            unsafe {
++                self.hip.launch_kernel(
++                    func,
++                    [n_kv_heads as u32, nblk as u32, 1],
++                    [(128 * qt) as u32, 1, 1],
++                    0,
++                    self.stream_ref(),
++                    &mut params,
++                )?;
++            }
++        }
++        let func = &self.functions[WMMA_VERIFY_ATTN_REDUCE];
++        let mut params: Vec<*mut c_void> = vec![
++            &p_ptr as *const _ as *mut c_void,
++            &o_ptr as *const _ as *mut c_void,
++            &pos_ptr as *const _ as *mut c_void,
++            &nh as *const _ as *mut c_void,
++            &n_blk as *const _ as *mut c_void,
++            &max_spans as *const _ as *mut c_void,
++            &batch_offset as *const _ as *mut c_void,
++        ];
++        unsafe {
++            self.hip.launch_kernel(
++                func,
++                [n_heads as u32, rows as u32, 1],
++                [256, 1, 1],
++                0,
++                self.stream_ref(),
++                &mut params,
++            )?;
++        }
++        Ok(true)
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -268,12 +416,30 @@ mod tests {
+         {
+             assert!(entry.symbols.contains(s), "{s}");
+         }
++        // The paged (KVMem) twin is its own module: renamed QT kernels over
++        // the paged descriptor header, sharing the reduce kernel.
++        let paged = entries
++            .iter()
++            .find(|e| e.module == WMMA_VERIFY_ATTN_PAGED_MODULE)
++            .expect("paged module registered for gfx1100");
++        assert_eq!(
++            paged.source(),
++            kernels::attention_verify_wmma_paged_source()
++        );
++        for s in WMMA_VERIFY_ATTN_PAGED_SYMBOLS
++            .iter()
++            .chain([&WMMA_VERIFY_ATTN_REDUCE])
++        {
++            assert!(paged.symbols.contains(s), "{s}");
++        }
+         for arch in ["gfx1151", "gfx1201", "gfx906", "gfx942"] {
+             let other = crate::kernel_registry::entries(arch, "").unwrap();
+-            assert!(
+-                other.iter().all(|e| e.module != WMMA_VERIFY_ATTN_MODULE),
+-                "{arch}"
+-            );
++            for module in [WMMA_VERIFY_ATTN_MODULE, WMMA_VERIFY_ATTN_PAGED_MODULE] {
++                assert!(
++                    other.iter().all(|e| e.module != module),
++                    "{arch} must not carry {module}"
++                );
++            }
+         }
+     }
+ }
+diff --git a/crates/rdna-compute/src/kernel_registry.rs b/crates/rdna-compute/src/kernel_registry.rs
+index 1436049fe685b8791c66f931b091eb16b0237039..380c08f5b38930778c4d17b9177514f376a7c61d 100644
+--- a/crates/rdna-compute/src/kernel_registry.rs
++++ b/crates/rdna-compute/src/kernel_registry.rs
+@@ -1771,6 +1771,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
+                 "attention_verify_wmma_reduce_gfx1100"
+             ]
+         );
++        // Paged (KVMem) variant: same body over the block-table-addressed
++        // arenas, symbols renamed. Launched by
++        // `Gpu::attention_verify_wmma_q8_gfx1100_paged` for paged slots.
++        add!(
++            "attention_verify_wmma_gfx1100_paged",
++            kernels::attention_verify_wmma_paged_source(),
++            [
++                "attention_verify_wmma_q8_qt1_paged_gfx1100",
++                "attention_verify_wmma_q8_qt2_paged_gfx1100",
++                "attention_verify_wmma_q8_qt3_paged_gfx1100",
++                "attention_verify_wmma_reduce_gfx1100"
++            ]
++        );
+         add!(
+             "attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100",
+             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
+@@ -1783,9 +1796,22 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
+         );
+         add!(
+             "attention_flash_q8_0_tile_gqa_gfx1100",
+-            kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
++            // The body `#include`s kv_slot_desc.h (shared with its paged
++            // twin); the JIT cache has no -I to kernels/src, so the registry
++            // must hand the preloader the assembled source, exactly like the
++            // lazy `ensure_givens4_kernel` route builds it.
++            assemble_asym(kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC),
+             ["attention_flash_q8_0_tile_gqa_gfx1100"]
+         );
++        // Paged (KVMem) twin of the GQA-shared decode tile: same body over
++        // block-table-addressed arenas. Launched by
++        // `Gpu::attention_flash_q8_0_gqa_decode_paged` for single-row paged
++        // decode.
++        add!(
++            "attention_flash_q8_0_tile_gqa_paged_gfx1100",
++            kernels::attention_flash_q8_0_tile_gqa_paged_source(),
++            ["attention_flash_q8_0_tile_gqa_paged_gfx1100"]
++        );
+         add!(
+             "attention_q8_0_fa2_gqa_gfx1100",
+             q8_fa2_gqa_gfx1100_source(),
+@@ -5781,6 +5807,81 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
+             ]
+         );
+     }
++    // Escha-W2 (merged nw_escha_w2): H128 transform pair, trellis decode GEMVs
++    // and the batched routed executor kernels. Multi-entry modules must list
++    // every symbol — the module name itself is not a kernel.
++    add!(
++        "router_logits_round_f16_rne",
++        kernels::ROUTER_LOGITS_ROUND_F16_RNE_SRC,
++        ["router_logits_round_f16_rne"]
++    );
++    add!(
++        "escha_decode_tiles",
++        kernels::ESCHA_DECODE_TILES_SRC,
++        ["escha_decode_tiles"]
++    );
++    add!(
++        "escha_h128",
++        kernels::ESCHA_H128_SRC,
++        [
++            "escha_h128_in",
++            "escha_h128_out",
++            "escha_h128_in_batched",
++            "escha_h128_out_batched",
++            "escha_swiglu_batched"
++        ]
++    );
++    add!(
++        "escha_bare_to_outmajor",
++        kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
++        ["escha_bare_to_q8_0", "escha_bare_to_f32", "escha_bare_to_f16"]
++    );
++    add!(
++        "escha_moe_gemv_k8_indexed",
++        kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC,
++        [
++            "escha_gemv_q8_0_moe_k8_indexed_batched",
++            "escha_gemv_q8_0_wide_moe_k8_indexed_batched",
++            "escha_round_weights_f16_rne"
++        ]
++    );
++    add!(
++        "escha_moe_gemv_native",
++        kernels::ESCHA_MOE_GEMV_NATIVE_SRC,
++        [
++            "escha_gemv_native_k2_moe_k8_indexed_batched",
++            "escha_gemv_native_k3_moe_k8_indexed_batched",
++            "escha_gemv_native_k2_wide_moe_k8_indexed_batched",
++            "escha_gemv_native_k3_wide_moe_k8_indexed_batched",
++            "escha_gemv_f16_moe_k8_indexed_batched",
++            "escha_gemv_f16_wide_moe_k8_indexed_batched"
++        ]
++    );
++    add!(
++        "escha_moe_gemm_grouped",
++        kernels::ESCHA_MOE_GEMM_GROUPED_SRC,
++        [
++            "escha_gemm_grouped_k2_r4_c2",
++            "escha_gemm_grouped_k2_r8_c2",
++            "escha_gemm_grouped_k2_r8_c4",
++            "escha_gemm_grouped_k2_r8_c8",
++            "escha_gemm_grouped_k2_r16_c2",
++            "escha_gemm_grouped_k2_r16_c4",
++            "escha_gemm_grouped_k3_r4_c2",
++            "escha_gemm_grouped_k3_r8_c2",
++            "escha_gemm_grouped_k3_r8_c4",
++            "escha_gemm_grouped_k3_r8_c8",
++            "escha_gemm_grouped_k3_r16_c2",
++            "escha_gemm_grouped_k3_r16_c4"
++        ]
++    );
++    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
++        add!(
++            "escha_moe_gemm_grouped_wmma",
++            kernels::ESCHA_MOE_GEMM_GROUPED_WMMA_SRC,
++            ["escha_gemm_grouped_wmma_k2", "escha_gemm_grouped_wmma_k3"]
++        );
++    }
+     Ok(entries)
+ }
+ 
+diff --git a/crates/rdna-compute/src/page_pool.rs b/crates/rdna-compute/src/page_pool.rs
+index 559902297543ead8d64ad6a7e2bdfab85fb86923..263f0ecc17848a9e64a780a4495f87960108cd4e 100644
+--- a/crates/rdna-compute/src/page_pool.rs
++++ b/crates/rdna-compute/src/page_pool.rs
+@@ -44,6 +44,14 @@ use crate::kv_slots::{preflight_alloc, KvSlotDesc, R9700_VRAM_BYTES};
+ /// tile size the flash path walks KV in.
+ pub const PAGE_TOKENS: usize = 128;
+ 
++/// Block-table entry marking a logical page whose bytes are NOT resident in
++/// the arena: the host spilled them to the KV working-set manager (KVMem) and
++/// released the physical page. Uploaded as the i32 sentinel -1; the slot
++/// kernels mask it out through `kv_page_present` instead of dereferencing it.
++/// Every pre-KVMem table has no sentinel entries, so release/COW/share paths
++/// are unchanged on them.
++pub const SPILLED_PAGE: u32 = u32::MAX;
++
+ /// A physical page index in the shared arena.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+ pub struct PageId(pub u32);
+@@ -256,11 +264,67 @@ impl BlockTable {
+         self.live_tokens
+     }
+ 
+-    /// Physical page index for logical page `lp`, or None if out of range.
++    /// Physical page index for logical page `lp`, or None if out of range or
++    /// spilled. A spilled logical page occupies a table slot but owns no
++    /// physical page (its bytes live in the KV working-set manager).
+     pub fn physical(&self, lp: usize) -> Option<u32> {
++        self.pages
++            .get(lp)
++            .copied()
++            .filter(|&p| p != SPILLED_PAGE)
++    }
++
++    /// Raw logical→physical entry including the [`SPILLED_PAGE`] sentinel.
++    pub fn raw_entry(&self, lp: usize) -> Option<u32> {
+         self.pages.get(lp).copied()
+     }
+ 
++    /// True when logical page `lp` is spilled (entry present, no physical
++    /// page). Out-of-range logical pages are NOT spilled.
++    pub fn is_spilled(&self, lp: usize) -> bool {
++        self.pages.get(lp) == Some(&SPILLED_PAGE)
++    }
++
++    /// Bind logical page `lp` to a resident physical page (KVMem restore).
++    /// `lp` must already exist in the table — restore never extends the
++    /// logical page count; growth is `PagePool::ensure_capacity`'s job.
++    /// Returns Err when `lp` is out of range or already maps a page.
++    pub fn bind_physical(&mut self, lp: usize, phys: u32) -> Result<(), String> {
++        match self.pages.get(lp).copied() {
++            None => Err(format!(
++                "BlockTable::bind_physical: logical page {lp} does not exist \
++                 ({} pages)",
++                self.pages.len()
++            )),
++            Some(SPILLED_PAGE) => {
++                self.pages[lp] = phys;
++                Ok(())
++            }
++            Some(current) => Err(format!(
++                "BlockTable::bind_physical: logical page {lp} already maps \
++                 phys {current}, refusing to bind {phys} (release first)"
++            )),
++        }
++    }
++
++    /// Mark logical page `lp` spilled (KVMem stage-out). Returns the physical
++    /// page that was mapped, if any: `Ok(None)` is idempotent on an
++    /// already-spilled entry; Err when `lp` is out of range.
++    pub fn unbind_physical(&mut self, lp: usize) -> Result<Option<u32>, String> {
++        match self.pages.get(lp).copied() {
++            None => Err(format!(
++                "BlockTable::unbind_physical: logical page {lp} does not exist \
++                 ({} pages)",
++                self.pages.len()
++            )),
++            Some(SPILLED_PAGE) => Ok(None),
++            Some(phys) => {
++                self.pages[lp] = SPILLED_PAGE;
++                Ok(Some(phys))
++            }
++        }
++    }
++
+     /// Raw page indices for GPU upload.
+     pub fn page_indices(&self) -> &[u32] {
+         &self.pages
+@@ -781,6 +845,54 @@ impl PagePool {
+         Ok(handles)
+     }
+ 
++    // ── KVMem stage-out / stage-in (spill / restore) ──────────────────
++
++    /// Allocate a fresh physical page WITHOUT attaching it to a block
++    /// table. Returns the page in [`PageState::Private`] carrying one
++    /// `table_refs` unit, which the caller transfers to a table entry via
++    /// [`BlockTable::bind_physical`]. This is the restore half of
++    /// spill/restore: allocate, bind, then copy the KVMem bytes in.
++    ///
++    /// The ref is pre-granted because `bind_physical` only rewrites the
++    /// table slot — no separate `refcount_inc` step exists on the bind
++    /// path, so granting at alloc keeps the accounting identical to
++    /// `alloc_pages`.
++    pub fn alloc_page_unbound(&mut self) -> Result<u32, String> {
++        let page = self
++            .free_pages
++            .pop()
++            .ok_or_else(|| "alloc_page_unbound: no free pages".to_string())?;
++        let meta = &mut self.page_meta[page as usize];
++        meta.state = PageState::Private;
++        meta.generation = meta.generation.wrapping_add(1);
++        meta.table_refs = 1;
++        Ok(page)
++    }
++
++    /// Release the table ref on a page detached from any block table (the
++    /// spill half of spill/restore). Identical to `dec_table_ref`, exposed
++    /// publicly so the KVMem controller can retire a page it just removed
++    /// from a table.
++    pub fn release_bound_page(&mut self, phys: u32) -> Result<(), String> {
++        self.dec_table_ref(phys)
++    }
++
++    /// True when `phys` can be staged out to the KV working-set manager:
++    /// it is resident, exclusively owned by ONE block table (exactly one
++    /// table ref), and carries no cache or in-flight leases. Sealed pages
++    /// with ≥2 table refs (COW/prefix shares) are not evictable — the
++    /// bytes are still referenced by another table.
++    pub fn page_evictable(&self, phys: u32) -> bool {
++        if self.check_phys(phys).is_err() {
++            return false;
++        }
++        let meta = &self.page_meta[phys as usize];
++        matches!(meta.state, PageState::Private | PageState::Sealed)
++            && meta.table_refs == 1
++            && meta.cache_refs == 0
++            && meta.inflight_refs == 0
++    }
++
+     // ── Prefix sharing (existing contract preserved) ──────────────────
+ 
+     /// Share the first `n_pages` pages of `src` with `dst` by pushing the
+@@ -848,7 +960,17 @@ impl PagePool {
+             ));
+         }
+         for lp in 0..n_pages {
+-            let phys = src.physical(lp).expect("src page exists");
++            let phys = match src.physical(lp) {
++                Some(p) => p,
++                None => {
++                    return Err(format!(
++                        "share_prefix: src logical page {} is spilled — a \
++                         non-resident prefix cannot be shared (restore it or \
++                         disable prefix sharing under KVMem)",
++                        lp
++                    ))
++                }
++            };
+             self.check_phys(phys)?;
+             let meta = &mut self.page_meta[phys as usize];
+             meta.table_refs = meta
+@@ -924,6 +1046,10 @@ impl PagePool {
+     pub fn release_table(&mut self, table: &mut BlockTable) -> Result<(), String> {
+         let mut had_error = false;
+         for &phys in table.page_indices() {
++            // Spilled entries own no physical page — nothing to decrement.
++            if phys == SPILLED_PAGE {
++                continue;
++            }
+             if let Err(_) = self.dec_table_ref(phys) {
+                 had_error = true;
+             }
+@@ -952,8 +1078,12 @@ impl PagePool {
+     ) -> Result<(), String> {
+         let keep = table.num_pages().saturating_sub(n_pages);
+         // Verify phase: every page about to be dropped must hold a table
+-        // ref. dec_table_ref cannot fail after this.
++        // ref. dec_table_ref cannot fail after this. Spilled entries own no
++        // physical page and are dropped with the table slot.
+         for &phys in &table.pages[keep..] {
++            if phys == SPILLED_PAGE {
++                continue;
++            }
+             if self.page_meta[phys as usize].table_refs == 0 {
+                 return Err(format!(
+                     "free_pages_from_tail: table_refs underflow for phys {} \
+@@ -964,6 +1094,9 @@ impl PagePool {
+         }
+         let freed = table.truncate(keep);
+         for phys in freed {
++            if phys == SPILLED_PAGE {
++                continue;
++            }
+             self.dec_table_ref(phys)?;
+         }
+         Ok(())
+diff --git a/crates/rdna-compute/src/slot_pool.rs b/crates/rdna-compute/src/slot_pool.rs
+index eb03bde190a4d13f8dda4f8d9435a277022b6d49..80ffb618340e468eead4900334b3d31550d5be78 100644
+--- a/crates/rdna-compute/src/slot_pool.rs
++++ b/crates/rdna-compute/src/slot_pool.rs
+@@ -14,7 +14,7 @@
+ //   Enables dynamic allocation, prefix sharing, and over-subscription.
+ 
+ use crate::kv_slots::{preflight_alloc, KvSlotDesc, R9700_VRAM_BYTES};
+-use crate::page_pool::{BlockTable, PagePool, PAGE_TOKENS as POOL_PAGE_TOKENS};
++use crate::page_pool::{BlockTable, PagePool, PAGE_TOKENS as POOL_PAGE_TOKENS, SPILLED_PAGE};
+ 
+ /// Slab capacities round up to this, so a future page size divides them.
+ /// Matches the tile size the flash path walks KV in.
+@@ -447,6 +447,103 @@ impl SlotPool {
+         self.block_tables.get(slot.0).and_then(|bt| bt.as_ref())
+     }
+ 
++    // ── KVMem spill / restore hooks ────────────────────────────────────
++
++    /// Mutable access to `slot`'s block table for KVMem logical-page edits.
++    /// Marks the table dirty so the next forward's `upload_block_tables`
++    /// pushes the rewritten entries (spill/restore write the sentinel and
++    /// rebind physical pages directly).
++    pub fn edit_block_table(&mut self, slot: SlotId) -> Option<&mut BlockTable> {
++        self.block_tables.get(slot.0).and_then(|bt| bt.as_ref())?;
++        self.block_tables_dirty[slot.0] = true;
++        self.block_tables[slot.0].as_mut()
++    }
++
++    /// Stage logical page `lp` of `slot` OUT of the arena (KVMem spill,
++    /// commit half). The caller MUST have copied the page's bytes out
++    /// first — this only drops residency: the entry becomes
++    /// [`SPILLED_PAGE`] and the physical page returns to the pool. Returns
++    /// the released physical page (arena offsets for the copy were derived
++    /// from it).
++    ///
++    /// Refuses unless the page is exclusively table-owned
++    /// ([`PagePool::page_evictable`]) — a COW/prefix-shared or leased page
++    /// still has live readers.
++    pub fn stage_out_page(&mut self, slot: SlotId, lp: usize) -> Result<u32, String> {
++        let pool = self
++            .page_pool
++            .as_mut()
++            .ok_or_else(|| "stage_out_page: not in paged mode".to_string())?;
++        let bt = self
++            .block_tables
++            .get_mut(slot.0)
++            .and_then(|bt| bt.as_mut())
++            .ok_or_else(|| format!("stage_out_page: slot {} has no block table", slot.0))?;
++        let phys = match bt.raw_entry(lp) {
++            Some(SPILLED_PAGE) => {
++                return Err(format!(
++                    "stage_out_page: slot {} logical page {lp} is already spilled",
++                    slot.0
++                ))
++            }
++            Some(phys) => phys,
++            None => {
++                return Err(format!(
++                    "stage_out_page: slot {} has no logical page {lp} ({} pages)",
++                    slot.0,
++                    bt.num_pages()
++                ))
++            }
++        };
++        if !pool.page_evictable(phys) {
++            return Err(format!(
++                "stage_out_page: slot {} logical page {lp} -> phys {phys} is not \
++                 exclusively table-owned (state={:?}, refs={}) — refusing to spill",
++                slot.0,
++                pool.page_state(phys),
++                pool.refcount(phys)
++            ));
++        }
++        bt.unbind_physical(lp)?;
++        pool.release_bound_page(phys)?;
++        self.block_tables_dirty[slot.0] = true;
++        Ok(phys)
++    }
++
++    /// Bind a freshly allocated physical page into logical slot `lp`
++    /// (KVMem restore, commit half). `phys` must come from
++    /// [`PagePool::alloc_page_unbound`]; on a bind failure the page is
++    /// released so it cannot leak. The caller then copies the KVMem bytes
++    /// into `phys`'s arena rows before the next forward — same host thread,
++    /// so no kernel can observe the half-restored page in between.
++    pub fn bind_restored_page(
++        &mut self,
++        slot: SlotId,
++        lp: usize,
++        phys: u32,
++    ) -> Result<(), String> {
++        let bt = match self.block_tables.get_mut(slot.0).and_then(|bt| bt.as_mut()) {
++            Some(bt) => bt,
++            None => {
++                if let Some(pool) = self.page_pool.as_mut() {
++                    let _ = pool.release_bound_page(phys);
++                }
++                return Err(format!(
++                    "bind_restored_page: slot {} has no block table",
++                    slot.0
++                ));
++            }
++        };
++        if let Err(e) = bt.bind_physical(lp, phys) {
++            if let Some(pool) = self.page_pool.as_mut() {
++                let _ = pool.release_bound_page(phys);
++            }
++            return Err(e);
++        }
++        self.block_tables_dirty[slot.0] = true;
++        Ok(())
++    }
++
+     /// True when `slot`'s block table has changed since last upload.
+     pub fn block_table_dirty(&self, slot: SlotId) -> bool {
+         self.block_tables_dirty
+diff --git a/kernels/src/attention_flash_q8_0_tile_batched.hip b/kernels/src/attention_flash_q8_0_tile_batched.hip
+index 7a55f0722043d1bf939b6fde66a2be53083290ff..2329576f7c085f4806d34337aec053cfc7132fa6 100644
+--- a/kernels/src/attention_flash_q8_0_tile_batched.hip
++++ b/kernels/src/attention_flash_q8_0_tile_batched.hip
+@@ -151,6 +151,42 @@ __global__ void attention_flash_q8_0_tile_batched(
+         return;
+     }
+ 
++    // KVMem tile fast path: with tile-aligned pages (`page_tokens % tile_size
++    // == 0` — the production 128/128 shape, since tile_start is always a
++    // multiple of tile_size) every position in this tile resolves through ONE
++    // block-table entry. A tile whose page lives in the host store holds no K/V
++    // bytes in the arena, so publish the empty-partial contract and return
++    // BEFORE the per-position scan. Without this, a prompt longer than the
++    // resident budget pays the presence test for every spilled position of
++    // every head and row — once the host store holds most of the prompt, that
++    // per-position sweep is the dominant decode cost. Same values and same
++    // accumulation order as the per-token form for resident tiles.
++#ifdef HIPFIRE_KV_SLOT_PAGED
++    const bool tile_one_page = (slot_descs != nullptr)
++        && (desc.page_tokens > 0)
++        && (desc.page_tokens % tile_size == 0);
++    long long tile_page_base = 0;
++    if (tile_one_page) {
++        const int phys = desc.block_table[tile_start / desc.page_tokens];
++        if (phys < 0) {
++            if (tid == 0) {
++                float* pe = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
++                                     + tile_id * (2 + head_dim);
++                pe[0] = -1e30f;
++                pe[1] = 0.0f;
++            }
++            return;
++        }
++        tile_page_base = (long long)phys * desc.page_tokens * per_pos_bytes
++                       + (long long)(tile_start % desc.page_tokens) * per_pos_bytes;
++    }
++#else
++    // Legacy header: no block table, no page fields — every tile is resident
++    // and addresses through the contiguous descriptor path below.
++    const bool tile_one_page = false;
++    const long long tile_page_base = 0;
++#endif
++
+     const int kv_group = n_heads / n_kv_heads;
+     const int kv_h = h / kv_group;
+     const int q_dim = n_heads * head_dim;
+@@ -201,11 +237,23 @@ __global__ void attention_flash_q8_0_tile_batched(
+             if (tid == 0) scores[t_local] = -INFINITY;
+             continue;                      // t is wave-uniform, so all lanes skip together
+         }
++        // KVMem residency: a spilled page holds no K bytes. Mask exactly like
++        // the window case; the tile-level guard after Phase B turns an
++        // all-masked tile into the empty-partial contract. Wave-uniform.
++        // Tile-aligned pages resolved residency once above.
++        if (!tile_one_page && !kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
++        const unsigned long long k_addr_off = tile_one_page
++            ? (unsigned long long)tile_page_base
++              + (unsigned long long)t_local * (unsigned long long)per_pos_bytes
++            : kv_offset_for_k(desc, t, per_pos_bytes);
+         float partial = 0.0f;
+         if (lane_one_q8_block && dpt == 8) {
+             const int bi = d0 / 32;
+             const int bj = d0 % 32;
+-            const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
++            const unsigned char* kb = k_cache + k_addr_off
+                                     + (kv_head_blk + bi) * 34;
+             const float ks = (float)*((const _Float16*)kb);
+             const unsigned long long packed = q8_tile_load_u64(kb + 2 + bj);
+@@ -217,7 +265,7 @@ __global__ void attention_flash_q8_0_tile_batched(
+         } else if (lane_one_q8_block && dpt == 4) {
+             const int bi = d0 / 32;
+             const int bj = d0 % 32;
+-            const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
++            const unsigned char* kb = k_cache + k_addr_off
+                                     + (kv_head_blk + bi) * 34;
+             const float ks = (float)*((const _Float16*)kb);
+             const unsigned int packed = q8_tile_load_u32(kb + 2 + bj);
+@@ -232,7 +280,7 @@ __global__ void attention_flash_q8_0_tile_batched(
+             for (int half = 0; half < 4; half++) {
+                 const int k_bi = half * 4 + tid / 8;
+                 const int k_off = (tid % 8) * 4;
+-                const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
++                const unsigned char* kb = k_cache + k_addr_off
+                                         + (kv_head_blk + k_bi) * 34;
+                 const float ks = (float)*((const _Float16*)kb);
+                 partial += mq[half * 4 + 0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
+@@ -245,7 +293,7 @@ __global__ void attention_flash_q8_0_tile_batched(
+                 const int d = d0 + i;
+                 const int bi = d / 32;
+                 const int bj = d % 32;
+-                const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
++                const unsigned char* kb = k_cache + k_addr_off
+                                         + (kv_head_blk + bi) * 34;
+                 const float ks = (float)*((const _Float16*)kb);
+                 partial += mq[i] * (ks * (float)((signed char)kb[2 + bj]));
+@@ -270,6 +318,22 @@ __global__ void attention_flash_q8_0_tile_batched(
+         local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+     float tile_max = local_max;
+ 
++    // KVMem residency guard: a tile whose every key was masked (all pages
++    // spilled, or no key in the window) has tile_max == -INFINITY, and Phase C
++    // would evaluate expf(-INF - -INF) = NaN. Publish the empty-partial
++    // contract the shared reduce already skips (p[1] > 0) and return.
++    // Unreachable when every page is resident: the tile holds at least one
++    // causally-valid key, so Phase B always sees a finite score.
++    if (tile_max == -INFINITY) {
++        if (tid == 0) {
++            float* pe = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
++                                 + tile_id * (2 + head_dim);
++            pe[0] = -1e30f;
++            pe[1] = 0.0f;
++        }
++        return;
++    }
++
+     // Phase C: exp + sum
+     float local_sum = 0.0f;
+     for (int i = tid; i < tile_len; i += 32) {
+@@ -290,7 +354,17 @@ __global__ void attention_flash_q8_0_tile_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             const float w = scores[t_local];
+             const int t = tile_start + t_local;
+-            const unsigned char* vbh = v_cache + kv_offset_for_v(desc, t, per_pos_bytes)
++            // KVMem residency: a spilled page's weight is exactly zero (masked
++            // in Phase A) and its address would resolve through -1. Skip.
++            // Tile-aligned pages resolved residency once above.
++            if (!tile_one_page && !kv_page_present(desc, t)) {
++                continue;
++            }
++            const unsigned long long v_addr_off = tile_one_page
++                ? (unsigned long long)tile_page_base
++                  + (unsigned long long)t_local * (unsigned long long)per_pos_bytes
++                : kv_offset_for_v(desc, t, per_pos_bytes);
++            const unsigned char* vbh = v_cache + v_addr_off
+                                      + (kv_head_blk + bi) * 34;
+             const float vs = (float)*((const _Float16*)vbh);
+             const unsigned long long packed = q8_tile_load_u64(vbh + 2 + bj);
+@@ -306,7 +380,15 @@ __global__ void attention_flash_q8_0_tile_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             const float w = scores[t_local];
+             const int t = tile_start + t_local;
+-            const unsigned char* vbh = v_cache + kv_offset_for_v(desc, t, per_pos_bytes)
++            // KVMem residency: see the u64 branch above.
++            if (!tile_one_page && !kv_page_present(desc, t)) {
++                continue;
++            }
++            const unsigned long long v_addr_off = tile_one_page
++                ? (unsigned long long)tile_page_base
++                  + (unsigned long long)t_local * (unsigned long long)per_pos_bytes
++                : kv_offset_for_v(desc, t, per_pos_bytes);
++            const unsigned char* vbh = v_cache + v_addr_off
+                                      + (kv_head_blk + bi) * 34;
+             const float vs = (float)*((const _Float16*)vbh);
+             const unsigned int packed = q8_tile_load_u32(vbh + 2 + bj);
+@@ -320,7 +402,15 @@ __global__ void attention_flash_q8_0_tile_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             const float w = scores[t_local];
+             const int t = tile_start + t_local;
+-            const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
++            // KVMem residency: see the u64 branch above.
++            if (!tile_one_page && !kv_page_present(desc, t)) {
++                continue;
++            }
++            const unsigned long long v_addr_off = tile_one_page
++                ? (unsigned long long)tile_page_base
++                  + (unsigned long long)t_local * (unsigned long long)per_pos_bytes
++                : kv_offset_for_v(desc, t, per_pos_bytes);
++            const unsigned char* vb = v_cache + v_addr_off;
+             for (int i = 0; i < dpt; i++) {
+                 const int d = d0 + i;
+                 const int bi = d / 32;
+diff --git a/kernels/src/attention_flash_q8_0_tile_gqa.gfx1100.hip b/kernels/src/attention_flash_q8_0_tile_gqa.gfx1100.hip
+index 3e0f8886b73dfd7cbb231c9d587dfa0cfa20fc59..cafc2dd5641eba2814bbc57913c42d0da56c232e 100644
+--- a/kernels/src/attention_flash_q8_0_tile_gqa.gfx1100.hip
++++ b/kernels/src/attention_flash_q8_0_tile_gqa.gfx1100.hip
+@@ -31,6 +31,7 @@
+ // 34*b + 2 + 4*(r%8): an unaligned dword for even b, read with one dword
+ // load as the reference does (RDNA3 unaligned access mode).
+ #include <hip/hip_runtime.h>
++#include "kv_slot_desc.h"
+ 
+ #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__)
+ #error "attention_flash_q8_0_tile_gqa_gfx1100 requires --offload-arch=gfx1100"
+@@ -133,10 +134,15 @@ __device__ __forceinline__ void gqa_accum_key(const unsigned char* __restrict__
+ // One (kv head, tile). All loads are issued at entry (Q, V, K in consumption
+ // order) through buffer descriptors, so per-lane addressing is one 32-bit
+ // offset and the per-load strides fold into instruction offsets.
++// `tile_off` is the byte offset of this tile's first key row in the K/V
++// arenas. Legacy contiguous slots pass `tile_start * row_stride`; the paged
++// (KVMem) entry resolves it through the slot's block table instead. The body
++// is otherwise identical, so partials stay byte-identical between the two.
+ __device__ __forceinline__ void gqa_tile(
+     const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
+     const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
+     int n_kv_heads, int max_tiles, float scale_attn, int seq_len, int kv_h, int tile_id,
++    size_t tile_off,
+     unsigned int* __restrict__ v_lds, float* __restrict__ sc, float* __restrict__ q_lds) {
+     const int tile_start = tile_id * GQA_TILE;
+     const int tile_len = min(GQA_TILE, seq_len - tile_start);
+@@ -151,9 +157,9 @@ __device__ __forceinline__ void gqa_tile(
+     const unsigned head_off = (unsigned)kv_h * GQA_SEG;
+     const unsigned tile_bytes = (unsigned)tile_len * row_stride;
+     const auto k_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+-        (void*)(k_cache + (size_t)tile_start * row_stride), 0, tile_bytes, 0x31004000u);
++        (void*)(k_cache + tile_off), 0, tile_bytes, 0x31004000u);
+     const auto v_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+-        (void*)(v_cache + (size_t)tile_start * row_stride), 0, tile_bytes, 0x31004000u);
++        (void*)(v_cache + tile_off), 0, tile_bytes, 0x31004000u);
+ 
+     const int h0 = kv_h * GQA_GROUP;
+     float2 qv[GQA_Q_CHUNKS];
+@@ -326,7 +332,84 @@ __global__ void attention_flash_q8_0_tile_gqa_gfx1100(
+ 
+     for (int tile_id = blockIdx.y; tile_id < n_tiles; tile_id += gridDim.y) {
+         if (tile_id != (int)blockIdx.y) __syncthreads();
++        const size_t tile_off = (size_t)tile_id * GQA_TILE
++                              * ((size_t)n_kv_heads * GQA_SEG);
+         gqa_tile(q, k_cache, v_cache, partials, n_kv_heads, max_tiles, scale_attn, seq_len, kv_h,
+-                 tile_id, v_lds, sc, q_lds);
++                 tile_id, tile_off, v_lds, sc, q_lds);
+     }
+ }
++
++#ifdef HIPFIRE_KV_SLOT_PAGED
++// Paged (KVMem) twin: same body over block-table-addressed arenas. Each
++// GQA_TILE (128) key tile lives inside exactly one KV page
++// (page_tokens == GQA_TILE in production), so one block-table entry resolves
++// the whole tile; a spilled page (-1) publishes the empty-partial contract
++// and returns before any K/V read. Same ABI as the legacy entry plus the
++// descriptor tail; partials are byte-identical to the batched tile for
++// resident pages.
++extern "C" __launch_bounds__(GQA_THREADS, 1)
++__global__ void attention_flash_q8_0_tile_gqa_paged_gfx1100(
++    const float* __restrict__ q,
++    const unsigned char* __restrict__ k_cache,
++    const unsigned char* __restrict__ v_cache,
++    float* __restrict__ partials,
++    const int* __restrict__ pos_buf,
++    int n_heads,
++    int n_kv_heads,
++    int head_dim,
++    int max_seq,
++    float scale_attn,
++    int tile_size,
++    int window,
++    int effective_seq_len,
++    const KvSlotDesc* __restrict__ slot_descs,
++    const int* __restrict__ row_slot
++) {
++    (void)n_heads; (void)head_dim; (void)tile_size; (void)window;
++    (void)effective_seq_len;
++    const int seq_len = pos_buf[0] + 1;
++    const int kv_h = blockIdx.x;
++    if (kv_h >= n_kv_heads) return;
++    const int slot = (row_slot != nullptr) ? row_slot[0] : 0;
++    const KvSlotDesc desc = (slot_descs != nullptr)
++        ? slot_descs[slot]
++        : kv_slot_legacy(seq_len, max_seq);
++    const int max_tiles = (max_seq + GQA_TILE - 1) / GQA_TILE;
++    const int n_tiles = min((seq_len + GQA_TILE - 1) / GQA_TILE, max_tiles);
++
++    __shared__ __attribute__((aligned(16))) unsigned int v_lds[GQA_V_TILE * GQA_SEG / 4];
++    __shared__ __attribute__((aligned(16))) float sc[GQA_GROUP * GQA_TILE];
++    __shared__ __attribute__((aligned(16))) float q_lds[GQA_GROUP * GQA_HD];
++
++    for (int tile_id = blockIdx.y; tile_id < n_tiles; tile_id += gridDim.y) {
++        if (tile_id != (int)blockIdx.y) __syncthreads();
++        const int tile_start = tile_id * GQA_TILE;
++        size_t tile_off;
++        if (desc.block_table != nullptr) {
++            const int phys = desc.block_table[tile_start / desc.page_tokens];
++            if (phys < 0) {
++                // Spilled page: empty-partial contract for this kv head's
++                // six q heads; the shared reduce skips p[1] <= 0.
++                if (threadIdx.x == 0) {
++                    for (int j = 0; j < GQA_GROUP; ++j) {
++                        float* p = partials
++                            + ((size_t)(kv_h * GQA_GROUP + j) * max_tiles + tile_id)
++                              * (2 + GQA_HD);
++                        p[0] = -1e30f;
++                        p[1] = 0.0f;
++                    }
++                }
++                continue;
++            }
++            tile_off = (size_t)phys * (size_t)desc.page_tokens
++                     * ((size_t)n_kv_heads * GQA_SEG)
++                     + (size_t)(tile_start % desc.page_tokens)
++                       * ((size_t)n_kv_heads * GQA_SEG);
++        } else {
++            tile_off = (size_t)tile_start * ((size_t)n_kv_heads * GQA_SEG);
++        }
++        gqa_tile(q, k_cache, v_cache, partials, n_kv_heads, max_tiles, scale_attn, seq_len, kv_h,
++                 tile_id, tile_off, v_lds, sc, q_lds);
++    }
++}
++#endif
+diff --git a/kernels/src/attention_q8_0_fa2_gqa.gfx11.hip b/kernels/src/attention_q8_0_fa2_gqa.gfx11.hip
+index 7511459db2c96fa52f266a2a5a6138c44b0f79fa..7fe6dbdaf56f3b46d149dbb45b336628ea435220 100644
+--- a/kernels/src/attention_q8_0_fa2_gqa.gfx11.hip
++++ b/kernels/src/attention_q8_0_fa2_gqa.gfx11.hip
+@@ -62,6 +62,34 @@
+ 
+ #include <hip/hip_runtime.h>
+ 
++// Paged (multi-slot / KVMem) build selector. The default route compiles this
++// file with no descriptor header at all; the slot engine's paged module
++// prepends `kv_slot_desc_paged.h` (which defines HIPFIRE_KV_SLOT_PAGED). In
++// that build the K/V fill helpers resolve through the slot descriptor's block
++// table and mask absent (spilled) pages; every other build preprocesses to
++// the identical program it always had.
++#ifdef HIPFIRE_KV_SLOT_PAGED
++#define FA2_PAGED 1
++// Thread a slot's per-tile page map through the shared helpers without
++// forking their signatures in the default build (which has no KvSlotDesc at
++// all). FA2_KV_PASS takes (64-bit page base, page-present flag); the helpers
++// keep `k_cache`/`v_cache` first so the call text is shared with the
++// contiguous build.
++#define FA2_KV_PASS(koff, present) koff, present,
++#define FA2_KV_PASS1(present) present,
++// Paged fills address a tile RELATIVE to its own base: the helper receives
++// in-tile bounds (start 0, length min(seq_len - tile_base, KT)) so the
++// clamped legacy address shape survives, with only the base changing.
++#define FA2_KT0(kt) 0
++#define FA2_KTLEN(kmap) (kmap).rel,
++#else
++#define FA2_PAGED 0
++#define FA2_KV_PASS(koff, present)
++#define FA2_KV_PASS1(present)
++#define FA2_KT0(kt) (kt)
++#define FA2_KTLEN(kmap) seq_len,
++#endif
++
+ // K-cache mode, selected at JIT time (kernels.rs concat define):
+ //   0 = standard Q8 K (34 B blocks, f16 scale + 32 int8 codes).
+ //   3 = fwht3 K (100 B/head: f32 cnorm + 96 B of 3-bit codes, K stored
+@@ -143,6 +171,62 @@ __device__ __forceinline__ int fa2_swiz(int c)
+     return 2 * r;
+ }
+ 
++constexpr int FA2_ROW_B = 4 * (256 / 32) * 34;
++
++#if FA2_PAGED
++// ---- Paged KV translation, hoisted to the key-tile level ----------------
++// `page_tokens` is a multiple of the KT key tile in every Q8 pool the slot
++// engine serves (PAGE_TOKENS = 128 against KT 32/64; the paged entry rejects
++// any other geometry), so all KT keys of a tile share ONE page: resolve the
++// block-table entry once per tile into a byte base, and each key's address is
++// `base + (gk - ktile) * FA2_ROW_B`. Resolving per key instead costs three
++// divergent integer divisions per staged 34-B block (presence, K offset,
++// both V keys); those sequences both slow the fill and triple this kernel's
++// code size, which measurably cost the paged launch ~40% of its prefill
++// speed. The helpers take the precomputed base and presence flag (not the
++// descriptor) so they register-allocate exactly like the contiguous twins.
++struct Fa2KvTile {
++    unsigned long long kbase;  // byte offset of key `tpos` in the K arena
++    unsigned long long vbase;  // same for V (paged mode: identical layout)
++    bool present;              // tile's page resident
++    int rel;                   // in-tile causal bound: min(seq_len - tpos, KT)
++                               // (>= 1; an absent tile uses 1 so every key
++                               // resolves to row 0 of the arena and masks out)
++};
++
++__device__ __forceinline__ Fa2KvTile fa2_kv_tile(const KvSlotDesc& d, int tpos,
++                                                 int seq_len)
++{
++    Fa2KvTile t;
++    if (d.block_table != nullptr) {
++        const int pg = tpos / d.page_tokens;
++        const int phys = d.block_table[pg];
++        t.present = phys >= 0;
++        t.kbase = (unsigned long long)(phys >= 0 ? phys : 0)
++                        * (unsigned long long)d.page_tokens
++                        * (unsigned long long)FA2_ROW_B
++                + (unsigned long long)(tpos - pg * d.page_tokens)
++                        * (unsigned long long)FA2_ROW_B;
++        t.vbase = t.kbase;
++    } else {
++        t.present = true;
++        t.kbase = d.legacy_k_base + (unsigned long long)tpos * FA2_ROW_B;
++        t.vbase = d.legacy_v_base + (unsigned long long)tpos * FA2_ROW_B;
++    }
++    if (!t.present) {
++        // Absent page: never dereference it. Point every key at arena row 0
++        // (memory-safe, contents ignored) and mask all of them off.
++        t.kbase = 0;
++        t.vbase = 0;
++        t.rel = 1;
++    } else {
++        const int rem = seq_len - tpos;
++        t.rel = rem < HIPFIRE_FA2_KT ? rem : HIPFIRE_FA2_KT;
++    }
++    return t;
++}
++#endif  // FA2_PAGED
++
+ #if FA2_FILL
+ // ---- Warp-specialized fill (FA2_FILL) ----
+ // Waves 0..5 compute, waves 6..7 own every K/V fill after tile 0. Per tile
+@@ -169,7 +253,6 @@ typedef union {
+ constexpr int FA2_FILL_HT = 64;               // helper threads (2 waves)
+ constexpr int FA2_FILL_HK = 32 * 8 / 64;      // K slots per helper lane
+ constexpr int FA2_FILL_HV = 32 * 16 / 64;     // V slots per helper lane
+-constexpr int FA2_ROW_B = 4 * (256 / 32) * 34;
+ 
+ // Two biased codes (bytes picked by `sel` from tb, interleaved with 0x64)
+ // times the f16 scale pair s2: RNE(s*c) per half.
+@@ -186,15 +269,34 @@ __device__ __forceinline__ uint32_t fa2_pk_deq2(uint32_t tb, uint32_t sel, uint3
+ // K slot idx = k*8+b: scale (low 16 bits) + the block's 8 code dwords.
+ // Out-of-range keys read the (valid) last row and stage zeros, exactly
+ // the incumbent's null-pointer zero fill.
++//
++// Paged build: every key resolves through its slot descriptor's per-tile
++// page map. A key past the causal bound OR whose page the KV working-set
++// manager has spilled is staged as zeros and NEVER dereferenced (an absent
++// page's block-table entry is -1, so resolving through it would read a wild
++// offset). The resident path — every page present — is byte-identical to the
++// contiguous one above.
+ __device__ __forceinline__ void fa2_fill_k_load(
++#if FA2_PAGED
++    unsigned long long kv_koff, bool kv_present,
++#endif
+     const unsigned char* k_cache, int ktile, int seq_len, int kv_blk, int idx,
+     uint32_t& su, uint32_t* uc)
+ {
+     const int gk = ktile + (idx >> 3);
++#if FA2_PAGED
++    // Same clamped, branch-free address shape as the contiguous twin, with
++    // the tile base folded into the pointer; `kv_present` only masks.
++    const bool ok = gk < seq_len && kv_present;
++    const unsigned char* blk = k_cache + kv_koff
++        + (unsigned long long)min(gk, seq_len - 1) * (unsigned long long)FA2_ROW_B
++        + (unsigned long long)(kv_blk + (idx & 7)) * 34ULL;
++#else
+     const bool ok = gk < seq_len;
+     const unsigned char* blk = k_cache
+         + (unsigned long long)min(gk, seq_len - 1) * (unsigned long long)FA2_ROW_B
+         + (unsigned long long)(kv_blk + (idx & 7)) * 34ULL;
++#endif
+     const uint32_t s = (uint32_t)blk[0] | ((uint32_t)blk[1] << 8);
+     su = ok ? s : 0u;
+ #pragma unroll
+@@ -228,7 +330,14 @@ __device__ __forceinline__ void fa2_fill_k_store(uint32_t* Kdw, int idx, uint32_
+ // V slot = ((m*8+b)<<2) | wq: key pair m, block b, code dwords 2wq, 2wq+1
+ // of both keys. Raw = packed scales (s0 | s1<<16), u[0..1] (key 2m),
+ // u[2..3] (key 2m+1).
++//
++// Paged build: each key of the pair resolves independently through the
++// tile's page map; a key that is past the causal bound or lives in a spilled
++// page contributes zeros and is never dereferenced (see fa2_fill_k_load).
+ __device__ __forceinline__ void fa2_fill_v_load(
++#if FA2_PAGED
++    unsigned long long kv_voff, bool kv_present,
++#endif
+     const unsigned char* v_cache, int ktile, int seq_len, int kv_blk, int slot,
+     uint32_t& s01, uint32_t* u)
+ {
+@@ -236,12 +345,23 @@ __device__ __forceinline__ void fa2_fill_v_load(
+     const int w_base = (slot & 3) * 2;
+     const int k0 = ktile + 2 * (pair >> 3);
+     const unsigned long long boff = (unsigned long long)(kv_blk + (pair & 7)) * 34ULL;
++#if FA2_PAGED
++    const bool ok0 = k0 < seq_len && kv_present;
++    const bool ok1 = k0 + 1 < seq_len && kv_present;
++    const unsigned char* blk0 = v_cache + kv_voff
++        + (unsigned long long)min(k0, seq_len - 1) * (unsigned long long)FA2_ROW_B
++        + boff;
++    const unsigned char* blk1 = v_cache + kv_voff
++        + (unsigned long long)min(k0 + 1, seq_len - 1) * (unsigned long long)FA2_ROW_B
++        + boff;
++#else
+     const bool ok0 = k0 < seq_len;
+     const bool ok1 = k0 + 1 < seq_len;
+     const unsigned char* blk0 = v_cache
+         + (unsigned long long)min(k0, seq_len - 1) * (unsigned long long)FA2_ROW_B + boff;
+     const unsigned char* blk1 = v_cache
+         + (unsigned long long)min(k0 + 1, seq_len - 1) * (unsigned long long)FA2_ROW_B + boff;
++#endif
+     const uint32_t s0 = ok0 ? ((uint32_t)blk0[0] | ((uint32_t)blk0[1] << 8)) : 0u;
+     const uint32_t s1 = ok1 ? ((uint32_t)blk1[0] | ((uint32_t)blk1[1] << 8)) : 0u;
+     s01 = s0 | (s1 << 16);
+@@ -426,6 +546,9 @@ __device__ __forceinline__ void fa2_fill_qk(
+ }
+ 
+ __device__ __forceinline__ void fa2_fill_softmax_pv(
++#if FA2_PAGED
++    bool kv_present,
++#endif
+     const uint32_t* Vdw, const int* __restrict__ positions, float scale_attn,
+     int ktile, int gmin, bool do0, bool do1, float8_t sacc0, float8_t sacc1,
+     bool qok_ml, int qr_ml, int ml, int half, float& m_old, float& l_val,
+@@ -439,11 +562,22 @@ __device__ __forceinline__ void fa2_fill_softmax_pv(
+         float8_t sacc = (sub == 0) ? sacc0 : sacc1;
+         const int kt_sub = ktile + sub * 16;
+         const bool full = (kt_sub + 15) <= gmin;
++        // KVMem residency: `page_tokens` is a multiple of the 16-key subtile
++        // (PAGE_TOKENS = 128 in every Q8 pool), so one per-subtile presence
++        // test covers all 16 keys. An absent key's V plane entry is zeroed by
++        // the fill; masking its probability to -INF keeps it out of m/l
++        // unconditionally. Legacy descriptors test true, folding away.
++        const bool sub_present =
++#if FA2_PAGED
++            kv_present;
++#else
++            true;
++#endif
+         const int pos_ml = (!full && qok_ml) ? positions[qr_ml] : 0;
+ #pragma unroll
+         for (int j = 0; j < 8; ++j) {
+             const int key_g = kt_sub + 2 * j + half;
+-            const bool ok = qok_ml && (full || key_g <= pos_ml);
++            const bool ok = qok_ml && sub_present && (full || key_g <= pos_ml);
+             sacc[j] = ok ? sacc[j] * scale_attn : -INFINITY;
+         }
+         float mx = -INFINITY;
+@@ -529,7 +663,11 @@ __device__ __forceinline__ void fa2_gqa_body(
+     int kv_h,
+     int q_base,
+     int split,
+-    int n_splits)
++    int n_splits
++#if FA2_PAGED
++    , const KvSlotDesc& desc
++#endif
++)
+ {
+     constexpr int KT = HIPFIRE_FA2_KT;
+     constexpr int KT_SUBS = KT / 16;
+@@ -637,15 +775,22 @@ __device__ __forceinline__ void fa2_gqa_body(
+     // tile count and two barriers per tile, so the barriers pair up.
+     const bool fill_compute = __builtin_amdgcn_readfirstlane(wave) < 6;
+     const int hl = tid - 6 * 32;
++#if FA2_PAGED
++    // Tile 0's page map (uniform: same page for all KT keys of the tile).
++    const Fa2KvTile kmap0 = fa2_kv_tile(desc, tile0 * KT, seq_len);
++    const unsigned long long kb0 = kmap0.kbase;
++    const unsigned long long vb0 = kmap0.vbase;
++    const bool tp0 = kmap0.present;
++#endif
+     uint32_t rv_s[FA2_FILL_HV];
+     uint32_t rv_u[FA2_FILL_HV * 4];
+     if (!fill_compute) {
+ #pragma unroll
+         for (int s = 0; s < FA2_FILL_HV; ++s)
+ #if FA2_R3
+-            fa2_fill_v_load(v_cache, tile0 * KT, seq_len, kv_blk, fa2_r3_vslot(hl, s),
++            fa2_fill_v_load(FA2_KV_PASS(vb0, tp0) v_cache, FA2_KT0(tile0 * KT), FA2_KTLEN(kmap0) kv_blk, fa2_r3_vslot(hl, s),
+ #else
+-            fa2_fill_v_load(v_cache, tile0 * KT, seq_len, kv_blk, hl + s * FA2_FILL_HT,
++            fa2_fill_v_load(FA2_KV_PASS(vb0, tp0) v_cache, FA2_KT0(tile0 * KT), FA2_KTLEN(kmap0) kv_blk, hl + s * FA2_FILL_HT,
+ #endif
+                             rv_s[s], rv_u + s * 4);
+     }
+@@ -653,7 +798,7 @@ __device__ __forceinline__ void fa2_gqa_body(
+     {
+         uint32_t su;
+         uint32_t uc[8];
+-        fa2_fill_k_load(k_cache, tile0 * KT, seq_len, kv_blk, tid, su, uc);
++        fa2_fill_k_load(FA2_KV_PASS(kb0, tp0) k_cache, FA2_KT0(tile0 * KT), FA2_KTLEN(kmap0) kv_blk, tid, su, uc);
+         fa2_fill_k_store(Kdw, tid, su, uc);
+     }
+     __syncthreads();
+@@ -662,6 +807,9 @@ __device__ __forceinline__ void fa2_gqa_body(
+             const int ktile = tile * KT;
+             if (PARTIAL ? tile >= tile1 : ktile >= seq_len)
+                 break;
++#if FA2_PAGED
++            const bool tp = fa2_kv_tile(desc, ktile, seq_len).present;
++#endif
+             const bool do0 = ktile <= gmax;
+             const bool do1 = ktile + 16 <= gmax;
+             float8_t sacc0, sacc1;
+@@ -669,7 +817,7 @@ __device__ __forceinline__ void fa2_gqa_body(
+                 fa2_fill_qk(q16, Kdw, qq_base, qok_ml, ml, do0, do1, sacc0, sacc1);
+             __syncthreads();  // B1: V(t) in plane; K(t) consumed
+             if (do0 || do1)
+-                fa2_fill_softmax_pv(Vdw, positions, scale_attn, ktile, gmin, do0, do1,
++                fa2_fill_softmax_pv(FA2_KV_PASS1(tp) Vdw, positions, scale_attn, ktile, gmin, do0, do1,
+                                     sacc0, sacc1, qok_ml, qr_ml, ml, half, m_old,
+                                     l_val, Ofr);
+             __syncthreads();  // B2: K(t+1) in plane; V(t) consumed
+@@ -699,9 +847,14 @@ __device__ __forceinline__ void fa2_gqa_body(
+                 break;
+             const bool next = PARTIAL ? tile + 1 < tile1 : ktile + KT < seq_len;
+             if (next) {
++#if FA2_PAGED
++                const Fa2KvTile kmap_next = fa2_kv_tile(desc, ktile + KT, seq_len);
++                const unsigned long long kb_next = kmap_next.kbase;
++                const bool tp_next = kmap_next.present;
++#endif
+ #pragma unroll
+                 for (int t = 0; t < FA2_FILL_HK; ++t)
+-                    fa2_fill_k_load(k_cache, ktile + KT, seq_len, kv_blk,
++                    fa2_fill_k_load(FA2_KV_PASS(kb_next, tp_next) k_cache, FA2_KT0(ktile + KT), FA2_KTLEN(kmap_next) kv_blk,
+ #if FA2_R3
+                                     fa2_r3_kslot(hl, t), rk_s[t], rk_u + t * 8);
+ #else
+@@ -717,9 +870,14 @@ __device__ __forceinline__ void fa2_gqa_body(
+ #endif
+             __syncthreads();  // B1
+             if (next) {
++#if FA2_PAGED
++                const Fa2KvTile kmap_next = fa2_kv_tile(desc, ktile + KT, seq_len);
++                const unsigned long long vb_next = kmap_next.vbase;
++                const bool tp_next = kmap_next.present;
++#endif
+ #pragma unroll
+                 for (int s = 0; s < FA2_FILL_HV; ++s)
+-                    fa2_fill_v_load(v_cache, ktile + KT, seq_len, kv_blk,
++                    fa2_fill_v_load(FA2_KV_PASS(vb_next, tp_next) v_cache, FA2_KT0(ktile + KT), FA2_KTLEN(kmap_next) kv_blk,
+ #if FA2_R3
+                                     fa2_r3_vslot(hl, s), rv_s[s], rv_u + s * 4);
+ #else
+@@ -767,6 +925,13 @@ __device__ __forceinline__ void fa2_gqa_body(
+ #else
+         constexpr bool have_pf = false;
+ #endif
++#if FA2_PAGED
++        // Current tile's page map (uniform: one block-table entry per tile).
++        const Fa2KvTile kmap_cur = fa2_kv_tile(desc, ktile, seq_len);
++        const unsigned long long kb_cur = kmap_cur.kbase;
++        const unsigned long long vb_cur = kmap_cur.vbase;
++        const bool tp_cur = kmap_cur.present;
++#endif
+ 
+         // ---- Transition 2: cooperative KT fill (all eight waves) ----
+ #if HIPFIRE_FA2_KMODE == 3
+@@ -945,13 +1110,24 @@ __device__ __forceinline__ void fa2_gqa_body(
+             const int idx = tid + t * WG_THREADS;
+             const int k = idx >> 3;
+             const int b = idx & 7;
++#if FA2_PAGED
++            // Tile-relative bounds: same clamped address shape as the
++            // contiguous twin, base folded into the pointer.
++            const int rel = kmap_cur.rel;
++            const bool ok = (k < rel) && tp_cur;
++            const unsigned char* blk = k_cache + kb_cur
++                + (unsigned long long)min(k, rel - 1) * (unsigned long long)FA2_ROW_B
++                + (unsigned long long)(kv_blk + b) * 34ULL;
++#else
+             const int gk = ktile + k;
+-            const unsigned char* blk = (gk < seq_len)
++            const bool ok = gk < seq_len;
++            const unsigned char* blk = ok
+                 ? k_cache + (unsigned long long)gk * (unsigned long long)row_stride
+                     + (unsigned long long)(kv_blk + b) * 34ULL
+                 : nullptr;
++#endif
+             uint16_t su = 0;
+-            if (blk != nullptr)
++            if (ok)
+                 su = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+             _Float16 s = ((fa2_dw_t){.u = (uint32_t)su}).h[0];
+             const float sf = (float)s;
+@@ -963,7 +1139,7 @@ __device__ __forceinline__ void fa2_gqa_body(
+             // memcpy emits a correct unaligned load either way).
+             for (int w = 0; w < 8; ++w) {
+                 uint32_t u = 0;
+-                if (blk != nullptr)
++                if (ok)
+                     __builtin_memcpy(&u, blk + 2 + w * 4, 4);
+                 const float c0 = (float)(int8_t)u;
+                 const float c1 = (float)(int8_t)(u >> 8);
+@@ -987,20 +1163,34 @@ __device__ __forceinline__ void fa2_gqa_body(
+             const int w_base = FA2_Q16 ? (slot & 3) * 2 : 0;
+             const int m = pair >> 3;
+             const int b = pair & 7;
++#if FA2_PAGED
++            const int rel = kmap_cur.rel;
++            const bool ok0 = (2 * m < rel) && tp_cur;
++            const bool ok1 = (2 * m + 1 < rel) && tp_cur;
++            const unsigned char* blk0 = v_cache + vb_cur
++                + (unsigned long long)min(2 * m, rel - 1) * (unsigned long long)FA2_ROW_B
++                + (unsigned long long)(kv_blk + b) * 34ULL;
++            const unsigned char* blk1 = v_cache + vb_cur
++                + (unsigned long long)min(2 * m + 1, rel - 1) * (unsigned long long)FA2_ROW_B
++                + (unsigned long long)(kv_blk + b) * 34ULL;
++#else
+             const int k0 = ktile + 2 * m;
+-            const unsigned char* blk0 = (k0 < seq_len)
++            const bool ok0 = k0 < seq_len;
++            const bool ok1 = k0 + 1 < seq_len;
++            const unsigned char* blk0 = ok0
+                 ? v_cache + (unsigned long long)k0 * (unsigned long long)row_stride
+                     + (unsigned long long)(kv_blk + b) * 34ULL
+                 : nullptr;
+-            const unsigned char* blk1 = (k0 + 1 < seq_len)
++            const unsigned char* blk1 = ok1
+                 ? v_cache + (unsigned long long)(k0 + 1) * (unsigned long long)row_stride
+                     + (unsigned long long)(kv_blk + b) * 34ULL
+                 : nullptr;
++#endif
+             uint16_t s0u = 0;
+             uint16_t s1u = 0;
+-            if (blk0 != nullptr)
++            if (ok0)
+                 s0u = (uint16_t)blk0[0] | ((uint16_t)blk0[1] << 8);
+-            if (blk1 != nullptr)
++            if (ok1)
+                 s1u = (uint16_t)blk1[0] | ((uint16_t)blk1[1] << 8);
+             _Float16 s0 = ((fa2_dw_t){.u = (uint32_t)s0u}).h[0];
+             _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
+@@ -1009,9 +1199,9 @@ __device__ __forceinline__ void fa2_gqa_body(
+ #pragma unroll 1
+             for (int w = w_base; w < w_base + (FA2_Q16 ? 2 : 8); ++w) {
+                 uint32_t u0 = 0, u1 = 0;
+-                if (blk0 != nullptr)
++                if (ok0)
+                     __builtin_memcpy(&u0, blk0 + 2 + w * 4, 4);
+-                if (blk1 != nullptr)
++                if (ok1)
+                     __builtin_memcpy(&u1, blk1 + 2 + w * 4, 4);
+ #pragma unroll
+                 for (int c = 0; c < 4; ++c) {
+@@ -1040,6 +1230,11 @@ __device__ __forceinline__ void fa2_gqa_body(
+         {
+             const int ktile_next = ktile + KT;
+             if (PARTIAL ? tile + 1 < tile1 : ktile_next < seq_len) {
++#if FA2_PAGED
++                const Fa2KvTile kmap_next = fa2_kv_tile(desc, ktile_next, seq_len);
++                const unsigned long long kb_next = kmap_next.kbase;
++                const bool tp_next = kmap_next.present;
++#endif
+ #if HIPFIRE_FA2_KMODE == 3
+ #pragma unroll 1
+                 for (int t = 0; t < KT_KITERS; ++t) {
+@@ -1092,19 +1287,29 @@ __device__ __forceinline__ void fa2_gqa_body(
+                     const int idx = tid + t * WG_THREADS;
+                     const int k = idx >> 3;
+                     const int b = idx & 7;
++#if FA2_PAGED
++                    // Tile-relative bounds, clamped address (see the fill).
++                    const int rel = kmap_next.rel;
++                    const bool ok = (k < rel) && tp_next;
++                    const unsigned char* blk = k_cache + kb_next
++                        + (unsigned long long)min(k, rel - 1) * (unsigned long long)FA2_ROW_B
++                        + (unsigned long long)(kv_blk + b) * 34ULL;
++#else
+                     const int gk = ktile_next + k;
+-                    const unsigned char* blk = (gk < seq_len)
++                    const bool ok = gk < seq_len;
++                    const unsigned char* blk = ok
+                         ? k_cache + (unsigned long long)gk * (unsigned long long)row_stride
+                             + (unsigned long long)(kv_blk + b) * 34ULL
+                         : nullptr;
++#endif
+                     uint16_t su = 0;
+-                    if (blk != nullptr)
++                    if (ok)
+                         su = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+                     pf_ks[t] = su;
+ #pragma unroll 1
+                     for (int w = 0; w < 8; ++w) {
+                         uint32_t u = 0;
+-                        if (blk != nullptr)
++                        if (ok)
+                             __builtin_memcpy(&u, blk + 2 + w * 4, 4);
+                         pf_kc[t * 8 + w] = u;
+                     }
+@@ -1219,6 +1424,14 @@ __device__ __forceinline__ void fa2_gqa_body(
+                     // loaded once per subtile (masked path only).
+                     const int pos_ml =
+                         (!full && qok_ml) ? positions[qr_ml] : 0;
++                    // KVMem residency: PAGE_TOKENS is a multiple of this
++                    // subtile's 16 keys, so one presence test covers them all
++                    // (an absent page's V plane entry is zero-filled below).
++#if FA2_PAGED
++                    const bool sub_present = tp_cur;
++#else
++                    const bool sub_present = true;
++#endif
+ 
+                     // Mask + row max. The mx chain serializes the unrolled
+                     // rows; the other key parity sits in lane ml^16 and is
+@@ -1227,7 +1440,7 @@ __device__ __forceinline__ void fa2_gqa_body(
+ #pragma unroll
+                     for (int j = 0; j < 8; ++j) {
+                         const int key_g = kt_sub + 2 * j + half;
+-                        const bool ok = qok_ml && (full || key_g <= pos_ml);
++                        const bool ok = qok_ml && sub_present && (full || key_g <= pos_ml);
+                         const float x = ok ? sacc[j] * scale_attn : -INFINITY;
+                         // NOTE: max-accumulation happens in the second pass
+                         // below; this pass only masks into sacc.
+@@ -1380,10 +1593,16 @@ __device__ __forceinline__ void fa2_gqa_body(
+                 // rows; the other key parity sits in lane ml^16 and is
+                 // combined with one shuffle, so both pair members share
+                 // the same m_new and alpha.
++#if FA2_PAGED
++                const bool sub_present = tp_cur;
++#else
++                const bool sub_present = true;
++#endif
+ #pragma unroll
+                 for (int j = 0; j < 8; ++j) {
+                     const int key_g = kt_sub + 2 * j + half;
+-                    const bool ok = qok_ml && (full || key_g <= pos_ml);
++                    const bool ok =
++                        qok_ml && sub_present && (full || key_g <= pos_ml);
+                     const float x = ok ? sacc[j] * scale_attn : -INFINITY;
+                     // NOTE: max-accumulation happens in the second pass
+                     // below; this pass only masks into sacc.
+@@ -1544,7 +1763,11 @@ __device__ __forceinline__ void fa2_gqa_body(
+ // deterministic near-miss on both cards (near-uniform softmax hides the
+ // missing rotation to ~1e-3), not an op-order race. Distinct symbols make
+ // each launcher resolve its own module's build.
+-#if HIPFIRE_FA2_KMODE == 3
++#if FA2_PAGED
++// Paged module: distinct entry names so the function cache (keyed by symbol)
++// never binds a paged launch to the default-route build or vice versa.
++#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_gfx1100_paged
++#elif HIPFIRE_FA2_KMODE == 3
+ #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx11
+ #elif HIPFIRE_FA2_KMODE == 4
+ #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht4_gfx11
+@@ -1639,6 +1862,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
+ 
+ // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
+ // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
++// The default-route entry exists only in the descriptor-less build; the paged
++// build below exports ONLY paged entries, so a shared function-cache symbol
++// can never bind one build's launch to the other's.
++#if !FA2_PAGED
+ #if FA2_R3
+ #define HIPFIRE_FA2_BODY_SYM attention_q8_0_fa2_gqa_gfx1100
+ #else
+@@ -1676,8 +1903,63 @@ extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void HIP
+     fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                         scale_attn, kv_h, q_base, 0, 1);
+ }
++#endif  // !FA2_PAGED
++
++#if FA2_PAGED
++// Paged multi-slot entry: grid [n_tiles, 4, 1], n_tiles from
++// kv_slots::build_tiles(_, 16) — the same 16-row tile shape the query-tiled
++// `_wmma_slots` kernel uses. `tile_slot[t]` selects the slot's descriptor
++// (K/V base + block table), `tile_qbase[t]` is the flat row where this tile's
++// q/out/positions start; `tile_row0` is ABI-reserved and unread (positions[]
++// is authoritative for the causal bound, exactly as in the scalar port).
++//
++// With every page resident and an identity block table the descriptor
++// resolves to base 0 + pos*row_stride, so all arithmetic below is the
++// default-route FA2 body verbatim and the output is bit-identical to
++// `attention_q8_0_fa2_gqa_gfx1100`.
++extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void attention_q8_0_fa2_gqa_gfx1100_paged(
++    const _Float16* __restrict__ q16,
++    const unsigned char* __restrict__ k_cache,
++    const unsigned char* __restrict__ v_cache,
++    float* __restrict__ out,
++    const int* __restrict__ positions,
++    int n_heads,
++    int n_kv_heads,
++    int head_dim,
++    int batch_size,
++    float scale_attn,
++    const KvSlotDesc* __restrict__ slot_descs,
++    const int* __restrict__ tile_slot,
++    const int* __restrict__ tile_row0,
++    const int* __restrict__ tile_qbase)
++{
++    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
++        return;
++    const int q_tile = (int)blockIdx.x;
++    const int kv_h = (int)blockIdx.y;
++    if (kv_h >= 4)
++        return;
++    const int slot = (tile_slot != nullptr) ? tile_slot[q_tile] : 0;
++    (void)tile_row0;
++    const int q_base =
++        (tile_qbase != nullptr) ? tile_qbase[q_tile] : q_tile * 16;
++    if (q_base >= batch_size)
++        return;
++    const KvSlotDesc desc =
++        (slot_descs != nullptr) ? slot_descs[slot] : kv_slot_legacy(0, 0);
++    // The per-tile page map requires one page per KT-key tile (page_tokens a
++    // multiple of KT); every Q8 pool the slot engine serves uses 128. A
++    // caller that hands over any other paged geometry fails closed here
++    // instead of having one tile straddle two pages.
++    if (desc.block_table != nullptr &&
++        (desc.page_tokens <= 0 || (desc.page_tokens % HIPFIRE_FA2_KT) != 0))
++        return;
++    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
++                        scale_attn, kv_h, q_base, 0, 1, desc);
++}
++#endif  // FA2_PAGED
+ 
+-#if HIPFIRE_FA2_KMODE == 0 && FA2_R3
++#if !FA2_PAGED && HIPFIRE_FA2_KMODE == 0 && FA2_R3
+ extern "C" __global__ __launch_bounds__(256, 1) void attention_q8_0_fa2_gqa_partial_gfx1100(
+     const _Float16* __restrict__ q16,
+     const unsigned char* __restrict__ k_cache,
+diff --git a/kernels/src/attention_q8_0_flash_prefill_wmma.hip b/kernels/src/attention_q8_0_flash_prefill_wmma.hip
+index 71287974cfad0f3e0b3ab82bfcda8569b970ed54..33a8a3561f8d4933bcc1ed84fa953884cd881ba9 100644
+--- a/kernels/src/attention_q8_0_flash_prefill_wmma.hip
++++ b/kernels/src/attention_q8_0_flash_prefill_wmma.hip
+@@ -183,6 +183,26 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
+         seq_len = max(seq_len, positions[q_base + r] + 1);
+ 
+     for (int kt = 0; kt < seq_len; kt += N_TILE) {
++        // KVMem paging: a fully absent page contributes nothing to any row.
++        // Every in-page key already fails kv_page_present, so Phase A zeroes
++        // its K fragment, its S column publishes -INFINITY, and Phase D adds
++        // P=0 — leaving m, l and O bitwise unchanged. Skipping the page's
++        // N_TILE-sized blocks wholesale therefore costs nothing numerically
++        // and makes the sweep scale with resident pages, not logical context.
++        // Only fires on page-aligned iteration boundaries of a page-aligned
++        // table. This source is also compiled without the paged header (the
++        // legacy non-paged module), where KvSlotDesc has no block table at
++        // all; the guard keeps that module byte-identical to upstream.
++#ifdef HIPFIRE_KV_SLOT_PAGED
++        if (desc.block_table != nullptr
++            && desc.page_tokens > 0
++            && (desc.page_tokens % N_TILE) == 0
++            && (kt % desc.page_tokens) == 0
++            && desc.block_table[kt / desc.page_tokens] < 0) {
++            kt += desc.page_tokens - N_TILE;
++            continue;
++        }
++#endif
+         const int t_len = min(N_TILE, seq_len - kt);
+ 
+         // ── Phase A: S = Q · K^T on the matrix cores ────────────────────
+@@ -195,7 +215,10 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
+         float8_t s_acc = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+         {
+             const int my_k = kt + half;
+-            const bool k_ok = (half < t_len);
++            // KVMem residency: an absent (spilled) key contributes nothing —
++            // its K fragment is zeroed exactly like an out-of-tile key. With
++            // every page present this is the unchanged `half < t_len` test.
++            const bool k_ok = (half < t_len) && kv_page_present(desc, my_k);
+             // ONE shared slab offset (kv_offset_for_k, i.e. desc.k_base) for
+             // both K and V, deliberately — see the file header comment and
+             // attention_q8_0_flash_prefill.hip's identical note. v_base MUST
+@@ -235,7 +258,8 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
+             const int c  = half;              // key within tile
+             float sv = s_acc[j] * scale_attn;
+             const bool valid =
+-                (r < rows) && (c < t_len) && ((kt + c) <= positions[q_base + r]);
++                (r < rows) && (c < t_len) && ((kt + c) <= positions[q_base + r])
++                && kv_page_present(desc, kt + c);
+             // -INF (not f16 min) so a fully-masked row-tile yields m_new = -INF,
+             // which the softmax guard turns into zero weight rather than exp(0)=1.
+             S_lds[r * S_STRIDE + c] = valid ? (_Float16)sv : (_Float16)(-INFINITY);
+@@ -277,7 +301,10 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
+         const int v_blk = d_lo >> 5;                // block index (run-uniform)
+         const int v_off = 2 + (d_lo & 31);          // byte offset within block
+         for (int kr = 0; kr < N_TILE; ++kr) {
+-            if (kr < t_len) {
++            // KVMem residency: a spilled key's V row is zero-filled exactly
++            // like a row past the tile end; its softmax weight is already 0
++            // from the `valid` mask above, so the staged zeros contribute 0.
++            if (kr < t_len && kv_page_present(desc, kt + kr)) {
+                 const unsigned char* vb = v_cache + kv_offset_for_k(desc, kt + kr, row_stride)
+                                         + kv_blk * 34 + v_blk * 34;
+                 const float vs = (float)*((const _Float16*)vb);
+diff --git a/kernels/src/attention_q8_0_kv_batched.hip b/kernels/src/attention_q8_0_kv_batched.hip
+index ecc9d1c8d47d08b9263373da15a621b72ffba33c..316ef422430e2d8610068f8d0541f2a62bad85ee 100644
+--- a/kernels/src/attention_q8_0_kv_batched.hip
++++ b/kernels/src/attention_q8_0_kv_batched.hip
+@@ -143,6 +143,16 @@ extern "C" __global__ void attention_q8_0_kv_batched(
+     // Phase 1: Q @ K^T with Q8_0 dequant.
+     float local_max = -1e30f;
+     for (int t = tid; t < eff_seq_len; t += nthreads) {
++        // KVMem residency: a spilled page holds no K bytes, so its key is
++        // masked with the same -1e30 sentinel an empty sliding-window tile
++        // uses (expf collapses it to zero weight). `t` is uniform across the
++        // block, so this is a whole-block skip, not a divergent read. With
++        // every page present the branch never fires and Phase 1 is the
++        // unchanged arithmetic below.
++        if (!kv_page_present(desc, t)) {
++            scores[t] = -1e30f;
++            continue;
++        }
+         float dot = 0.0f;
+         for (int bi = 0; bi < blocks_per_head; bi++) {
+             const unsigned char* blk = k_cache
+@@ -206,6 +216,12 @@ extern "C" __global__ void attention_q8_0_kv_batched(
+         int bi = d / 32;
+         int bj = d % 32;
+         for (int t = 0; t < eff_seq_len; t++) {
++            // KVMem residency: a spilled page's weight is exactly zero on the
++            // masks above (or contributes nothing on the all-absent fill
++            // path), and its address would resolve through -1. Skip the read.
++            if (!kv_page_present(desc, t)) {
++                continue;
++            }
+             const unsigned char* blk = v_cache
+                                       + kv_offset_for_v(desc, t, per_pos_bytes)
+                                       + (kv_head_block_start + bi) * 34;
+diff --git a/kernels/src/attention_verify_wmma.gfx1100.hip b/kernels/src/attention_verify_wmma.gfx1100.hip
+index e822adf3216615d53ce0f4e4fb82e09e46b67272..d17fef7f042a619bd155a00ca88b692ba64fa140 100644
+--- a/kernels/src/attention_verify_wmma.gfx1100.hip
++++ b/kernels/src/attention_verify_wmma.gfx1100.hip
+@@ -30,9 +30,30 @@
+ //  * The two key-half streams are merged in LDS at the end; one partial per
+ //    (row, head, span): [m (log2 units), l, pad, pad, O[256] in WMMA C order]
+ //    reduced by attention_verify_wmma_reduce_gfx1100.
++//
++// Compiled twice. The default module (this file's source bytes, no descriptor
++// header) keeps the original 11-arg ABI and `key * 1088` addressing for the
++// contiguous KV cache. The slot engine builds a second, paged module from the
++// same body with the paged KvSlotDesc header prepended (HIPFIRE_KV_SLOT_PAGED),
++// which appends `slot_descs`/`row_slot` parameters: every 32-key tile then
++// resolves its page through the block table, and a tile whose page is absent
++// (-1, KVMem-spilled) is addressed at arena page 0 and masked to -inf. Pages
++// are `page_tokens` tokens, a host-gated multiple of VW_KT, so a tile never
++// straddles a page. With every page resident the bytes read and the arithmetic
++// are identical to the default module.
+ #include <hip/hip_runtime.h>
+ #include <stdint.h>
+ 
++#ifdef HIPFIRE_KV_SLOT_PAGED
++// Paged compile: the slot descriptor header (prepended by the Rust side) has
++// already defined KvSlotDesc / kv_slot_legacy / kv_page_present.
++#define VW_DESC_PARAMS , const KvSlotDesc* __restrict__ slot_descs, const int* __restrict__ row_slot
++#define VW_DESC_ARGS , slot_descs, row_slot
++#else
++#define VW_DESC_PARAMS
++#define VW_DESC_ARGS
++#endif
++
+ #define VW_KT 32
+ #define VW_KROW 132
+ #define VW_PSTRIDE 260
+@@ -173,7 +194,7 @@ static __device__ __forceinline__ void vw_body(
+     float* __restrict__ partials,
+     const int* __restrict__ positions,
+     int n_heads, float scale_log2, int n_blk, int max_spans, int batch_offset, int rows,
+-    uint32_t* __restrict__ lds)
++    uint32_t* __restrict__ lds VW_DESC_PARAMS)
+ {
+     using C = VwCfg<QT>;
+     uint32_t* Kl = lds;
+@@ -188,6 +209,14 @@ static __device__ __forceinline__ void vw_body(
+     const int kv_h = blockIdx.x;
+     const int span_idx = blockIdx.y;   // this block owns 32-key tiles span_idx + n_blk * t
+ 
++#ifdef HIPFIRE_KV_SLOT_PAGED
++    // One descriptor for the whole step: the slot engine admits this route
++    // only with a single active slot, so every row maps to the same slot.
++    // Null table => legacy contiguous descriptors (base 0, full residency).
++    const int slot = (row_slot != nullptr) ? row_slot[batch_offset] : 0;
++    const KvSlotDesc desc = (slot_descs != nullptr) ? slot_descs[slot] : kv_slot_legacy(0, 0);
++#endif
++
+     int seq_max = 0, seq_min = 0x7fffffff;
+     for (int r = 0; r < rows; r++) {
+         const int s = positions[batch_offset + r] + 1;
+@@ -258,16 +287,43 @@ static __device__ __forceinline__ void vw_body(
+     }
+     const size_t head_off = (size_t)kv_h * 272;
+ 
++    // Byte offset of 32-key tile starting at absolute position `kt`, and
++    // whether that tile is resident. Paged mode: one block-table lookup per
++    // tile (pages are a multiple of VW_KT tokens, so a tile never straddles
++    // one). An absent page owns no bytes in the arena — address the tile at
++    // arena page 0 instead (always mapped) and let the phase-B presence mask
++    // zero its scores; nothing reads stale or unmapped memory.
++    auto kv_tile_base = [&](int kt, bool& present) __attribute__((always_inline)) {
++        present = true;
++#ifdef HIPFIRE_KV_SLOT_PAGED
++        if (desc.block_table != nullptr) {
++            const int phys = desc.block_table[kt / desc.page_tokens];
++            if (phys < 0) {
++                present = false;
++                return (size_t)0;
++            }
++            return ((size_t)phys * (size_t)desc.page_tokens + (size_t)(kt % desc.page_tokens))
++                 * (size_t)1088;
++        }
++#endif
++        return (size_t)kt * (size_t)1088;
++    };
++
+     auto load_tile = [&](const unsigned char* __restrict__ cache, int t, uint32_t (&dst)[C::UPT][9]) __attribute__((always_inline)) {
+-        const int key0 = (span_idx + n_blk * t) * VW_KT + fk;
++        const int tile = span_idx + n_blk * t;
++        const int kt = tile * VW_KT;
++        const int key0 = kt + fk;
++        bool present;
++        const size_t base = kv_tile_base(kt, present);
+         // Branch-free: keys past the end are clamped to the last valid row
+         // (their scores are masked, and P = 0 times a finite V row adds 0),
+         // so the waitcnt pass can track the prefetch precisely and no key
+-        // past the last written position is ever read.
++        // past the last written position is ever read. Every key of a tile
++        // maps to `base + (key - kt) * 1088` — the same page by construction.
+         #pragma unroll
+         for (int u = 0; u < C::UPT; u++) {
+             const int key = min(key0 + 16 * u, span_end - 1);
+-            vw_load(cache + (size_t)key * 1088 + head_off, fb, dst[u]);
++            vw_load(cache + base + (size_t)(key - kt) * 1088 + head_off, fb, dst[u]);
+         }
+     };
+     auto fill_k = [&](const uint32_t (&src)[C::UPT][9]) __attribute__((always_inline)) {
+@@ -378,6 +434,18 @@ static __device__ __forceinline__ void vw_body(
+                 if (kbase + 2 * j + half > pos_q) sacc[j] = -INFINITY;
+             }
+         }
++#ifdef HIPFIRE_KV_SLOT_PAGED
++        // KVMem: an absent (-1) page has no resident bytes — its 16 keys are
++        // spilled, so they publish -inf and contribute nothing to m, l or O
++        // (exact algebra, the same contract as the causal mask above). Must
++        // be UNCONDITIONAL: the causal mask only fires near the query tip,
++        // while a spilled page can sit anywhere below it. The tile was
++        // addressed at arena page 0, whose bytes this mask makes irrelevant.
++        if (!kv_page_present(desc, kt)) {
++            #pragma unroll
++            for (int j = 0; j < 8; j++) sacc[j] = -INFINITY;
++        }
++#endif
+         float mx = sacc[0];
+         #pragma unroll
+         for (int j = 1; j < 8; j++) mx = fmaxf(mx, sacc[j]);
+@@ -512,10 +580,10 @@ extern "C" __launch_bounds__(128 * QT) __global__ void NAME(
+     const float* __restrict__ q, const unsigned char* __restrict__ k_cache,                           \
+     const unsigned char* __restrict__ v_cache, float* __restrict__ partials,                          \
+     const int* __restrict__ positions, int n_heads, float scale_log2, int n_blk, int max_spans,       \
+-    int batch_offset, int rows) {                                                                     \
++    int batch_offset, int rows VW_DESC_PARAMS) {                                                      \
+     __shared__ __attribute__((aligned(16))) uint32_t lds[VwCfg<QT>::LDS_DW];                          \
+     vw_body<QT>(q, k_cache, v_cache, partials, positions, n_heads, scale_log2, n_blk, max_spans,      \
+-                batch_offset, rows, lds);                                                             \
++                batch_offset, rows, lds VW_DESC_ARGS);                                                \
+ }
+ // QT = 16-query tiles: rows 1..=2 (qt1), 3..=5 (qt2), 6..=8 (qt3).
+ VW_KERNEL(attention_verify_wmma_q8_qt1_gfx1100, 1)
+diff --git a/kernels/src/kv_slot_desc.h b/kernels/src/kv_slot_desc.h
+index 8157bb3cbb2112994826b40360ee96140c4b7ac3..0baee44b3d56bc6b801ccdc523bc092f185ffc04 100644
+--- a/kernels/src/kv_slot_desc.h
++++ b/kernels/src/kv_slot_desc.h
+@@ -25,6 +25,16 @@ struct KvSlotDesc {
+     int cap;                    // physical slab capacity in tokens; seq_len <= cap
+ };
+ 
++// Presence test, legacy-header edition: a contiguous slab is always fully
++// resident, so every kernel body's KVMem mask below is a compile-time-true
++// branch under this header. The paged header defines the real test.
++__device__ __forceinline__ bool kv_page_present(const KvSlotDesc& s, int pos)
++{
++    (void)s;
++    (void)pos;
++    return true;
++}
++
+ // Byte offset of position `pos` within slot `s`'s K slab.
+ // `per_pos_bytes` is the per-position stride in bytes, uniform across slots
+ // (n_kv_heads * (head_dim/32) * 34 for Q8_0).
+diff --git a/kernels/src/kv_slot_desc_paged.h b/kernels/src/kv_slot_desc_paged.h
+index 15c9ae97f20c14051a222b10d6e0dbb3ed6b53e4..cb82d05e28d7b55e22d875df19fe2127b3f72598 100644
+--- a/kernels/src/kv_slot_desc_paged.h
++++ b/kernels/src/kv_slot_desc_paged.h
+@@ -89,6 +89,22 @@ __device__ __forceinline__ unsigned long long kv_offset_for_k(
+     return s.legacy_k_base + (unsigned long long)pos * (unsigned long long)per_pos_bytes;
+ }
+ 
++// Presence test for position `pos` (KVMem block residency).
++//
++// A block-table entry of -1 marks a logical page whose bytes are not resident
++// in the arena: the host spilled it to the KV working-set manager and released
++// the physical page. Kernels MUST NOT resolve an address through such an
++// entry; they mask the key out instead (the same contract the sliding-window
++// masks already use). Legacy descriptors (null block_table) are always
++// present, so every pre-KVMem launch takes the unchanged branch.
++__device__ __forceinline__ bool kv_page_present(const KvSlotDesc& s, int pos)
++{
++    if (s.block_table == nullptr) {
++        return true;
++    }
++    return s.block_table[pos / s.page_tokens] >= 0;
++}
++
+ __device__ __forceinline__ unsigned long long kv_offset_for_v(
+     const KvSlotDesc& s, int pos, int per_pos_bytes)
+ {
