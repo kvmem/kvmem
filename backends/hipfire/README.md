@@ -24,6 +24,11 @@ No kvmem symbol reaches a HIP kernel; device transfers stay in hipfire.
 
 ## Building
 
+`scripts/prepare-backends.py --backend hipfire` clones the pinned base commit
+into `../hipfire` beside this checkout (override with `--hipfire-dir`) and
+applies the verified patch series below; `--backend all` includes it when a
+ROCm toolchain is detected (`HIPFIRE_ROCM_PATH`, `/opt/rocm` or `hipcc`).
+
 Point `KVMEM_ROOT` at this checkout (default is the sibling `../kvmem` of the
 hipfire workspace) and build the CLI **and the daemon** with the `kvmem`
 feature — the multi-slot serve engine lives in the `daemon` binary, so building
