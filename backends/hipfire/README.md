@@ -33,14 +33,19 @@ only the CLI leaves a stale engine:
 HIPFIRE_ROCM_PATH=/opt/rocm cargo build -p hipfire-cli -p hipfire-daemon --features kvmem --release
 ```
 
-The patch series applies to hipfire `efa8fbb1d666b3b9c9732c924802373382bd10c4`
-(v0.4.5); see `upstream.json` for hashes and the verified tree. That sealed
-release predates the escha-dense merge, so the `kvmem` patch also carries the
-escha-dense baseline (escha trellis projections, quantize/dispatch support) it
-builds on, plus the Bonsai TQ2G128/BQ1G128 flat-lowbit slots admission.
+The patch series applies to hipfire `89e32856d25d6f6e6645319f2ec2c641c46be525`
+(v0.4.6, fork `smashdog/hipfire`); see `upstream.json` for hashes and the
+verified tree. That release still predates the escha-dense merge, so the
+`kvmem` patch also carries the escha-dense baseline (escha trellis
+projections, quantize/dispatch support) it builds on, plus the Bonsai
+TQ2G128/BQ1G128 flat-lowbit slots admission. On the v0.4.5 -> v0.4.6 rebase
+the Escha shared-weight DType tags were renumbered 65/66 -> 68/69 (upstream
+took 65..67 for MQ4G256V2P/MQ4G128V2P/HC8E4M3Row); the HFQ wire qt=42/43 is
+unchanged, and the fp16-x scratch marker invalidation the old patch added is
+now enforced by upstream's `fp16_x_scratch_writable`.
 
 The third `rdna3-opt` patch is a gfx1100 (RDNA3) operator pass on top of that
-integration, verified byte-exact (`efa8fbb1d` + the three patches reproduce
+integration, verified byte-exact (`89e32856d` + the three patches reproduce
 `upstream.json`'s `patched_tree`). It removes the `kvmem` patch's escha prefill
 stopgap — that patch forced `prefill_chunk=1` so every prefill row ran through
 the lowered paged decode path — and replaces it with a real grouped-WMMA
