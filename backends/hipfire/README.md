@@ -28,6 +28,9 @@ No kvmem symbol reaches a HIP kernel; device transfers stay in hipfire.
 into `../hipfire` beside this checkout (override with `--hipfire-dir`) and
 applies the verified patch series below; `--backend all` includes it when a
 ROCm toolchain is detected (`HIPFIRE_ROCM_PATH`, `/opt/rocm` or `hipcc`).
+`cargo build` refreshes `Cargo.lock` in the checkout, so `--check` verifies
+the pre-build prepared tree; setup resets the checkout to the pinned base and
+re-prepares it on every build.
 
 Point `KVMEM_ROOT` at this checkout (default is the sibling `../kvmem` of the
 hipfire workspace) and build the CLI **and the daemon** with the `kvmem`
