@@ -228,7 +228,7 @@ module.exports = async function settingsChecks({browser,base,info}) {
   assert.equal(await field('BlockTokens').count(),0,'block switch is PolyStrata only');
   await field('Model').fill('C:/models/ui fixture.ninfer');
   assert.equal(Object.hasOwn(await preview(),'BlockTokens'),false);
-  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/browse-template','/api/launcher/browse-mmproj','/api/launcher/inspect-model'].includes(url)),'settings checks never start/save/stop inference');
+  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/browse-template','/api/launcher/browse-mmproj','/api/launcher/inspect-model','/api/launcher/worker-capabilities'].includes(url)),'settings checks never start/save/stop inference');
   assert.deepEqual(errors,[]);
   console.log('PASS: help, resource placement, feature dependencies, draft/template retention, credentials, native settings and active preview payloads (no inference)');
  } finally { await context.close(); }

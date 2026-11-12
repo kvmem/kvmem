@@ -30,7 +30,7 @@ const context={console,structuredClone,AbortController,info:{worker_capabilities
   root:{querySelector(selector){const match=selector.match(/^\[data-param=([^\]]+)\]$/);return match?inputs[match[1]]||null:null;},
     querySelectorAll(){return Object.values(inputs);}}};
 vm.createContext(context);
-vm.runInContext(resourceLine+'\n'+['workerSelection','currentWorkerProfile','workerResourceDefaults','syncWorkerResourceDefaults',
+vm.runInContext(resourceLine+'\n'+['workerSelection','workerProbeSelection','currentWorkerProfile','workerResourceDefaults','syncWorkerResourceDefaults',
   'resourceOverride','markResourceEdit','captureDraft','collect','scheduleWorkerCapabilities','syncRunningConfiguration'].map(production).join('\n'),context);
 const normalized=x=>JSON.parse(JSON.stringify(x));
 const one={available:true,default_resources:{metadata_bytes:1073741824,activation_disk_bytes:0}};

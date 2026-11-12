@@ -32,7 +32,7 @@
         key.placeholder='';delete key.dataset.launchKeyHidden;
       }
     }
-    draftStatus();renderBudgetAdjustment();syncRecallStatus();
+    draftStatus();renderBudgetAdjustment();syncRecallOptions();
   }
   function syncRunningConfiguration(status){
     const running=['starting','ready'].includes(status.state);
@@ -143,7 +143,8 @@
   function workerSelection(){return {Backend:root.querySelector('[data-param=Backend]')?.value,
     Worker:root.querySelector('[data-param=Worker]')?.value||'',
     RecallStrategy:root.querySelector('[data-param=RecallStrategy]')?.value||'legacy'};}
-  function currentWorkerProfile(){return workerKey===JSON.stringify(workerSelection())?workerContract?.profile:null;}
+  function workerProbeSelection(){return {...workerSelection(),RecallStrategy:'layerwise'};}
+  function currentWorkerProfile(){return workerSelection().RecallStrategy==='layerwise'&&workerKey===JSON.stringify(workerProbeSelection())?workerContract?.profile:null;}
   function workerTokenConstraints(profile,cap,concurrency){
     const limit=(owner,key)=>{
       if(!owner||!Object.hasOwn(owner,key))return null;
@@ -199,30 +200,26 @@
     }
   }
   function resourceOverride(input){return input.dataset.workerDefault===undefined||input.value!==input.dataset.workerDefault;}
-  function syncRecallStatus(){
-    const box=root.querySelector('[data-worker-capability-status]');if(!box)return;
-    const layerwise=workerSelection().RecallStrategy==='layerwise';
-    box.hidden=!layerwise;
-    if(!layerwise)return;
-    const state=configurationLocked()?'running':workerError?(workerContract?'unsupported':'error'):currentWorkerProfile()?.available===true?'ready':'checking';
-    const labels={checking:['正在检查所选程序…','Checking the selected executable…'],ready:['所选程序声明支持分层召回','Selected executable declares layerwise support'],unsupported:['所选程序未声明分层召回支持','Selected executable does not declare layerwise support'],error:['暂时无法确认所选程序的支持情况','Could not check the selected executable'],running:['当前启动配置已锁定','Current launch configuration is locked']};
-    box.dataset.state=state;box.setAttribute('aria-busy',String(state==='checking'));
-    const note=box.querySelector('[data-worker-capability-note]'),text=tr(...labels[state]);
-    if(note.textContent!==text)note.textContent=text;
-    const retry=box.querySelector('[data-worker-capability-retry]');retry.hidden=!['error','unsupported'].includes(state);
-    const details=box.querySelector('details');details.hidden=['checking','running'].includes(state);
-    const identity=box.querySelector('[data-worker-capability-identity]');
-    identity.textContent=workerContract?tr('程序：','Executable: ')+workerContract.worker.path+'\nSHA256: '+workerContract.worker.executable_sha256:workerError;
+  function syncRecallOptions(){
+    const select=root.querySelector('[data-param=RecallStrategy]');if(!select)return;
+    const option=select.querySelector('option[value=layerwise]');
+    const current=workerKey===JSON.stringify(workerProbeSelection());
+    const state=configurationLocked()?'running':!current?'checking':workerError?(workerContract?'unsupported':'error'):workerContract?.profile?.available===true?'ready':'checking';
+    const suffix={checking:tr('（正在检查支持情况）',' (Checking support)'),unsupported:tr('（此推理后端暂不支持）',' (Not yet supported by this backend)'),error:tr('（暂时无法确认支持）',' (Support could not be checked)')};
+    select.dataset.capabilityState=state;
+    option.disabled=state!=='ready'&&!(state==='running'&&select.value==='layerwise');
+    option.textContent=tr('分层召回 · 当前层 Q','Layerwise recall · current-layer Q')+(suffix[state]||'');
+    select.setCustomValidity(select.value==='layerwise'&&option.disabled?option.textContent:'');
   }
   function workerBlocks(){return workerSelection().RecallStrategy==='layerwise'&&currentWorkerProfile()?.available!==true;}
   function scheduleWorkerCapabilities(force=false){
     if(!info||configurationLocked())return;
-    const parameters=workerSelection(),key=JSON.stringify(parameters);
-    if(!force&&key===workerKey)return;
+    // Probe before selection, so unsupported strategies are already disabled.
+    const parameters=workerProbeSelection(),key=JSON.stringify(parameters);
+    if(!force&&key===workerKey){syncWorkerResourceDefaults(currentWorkerProfile());return;}
     workerKey=key;workerContract=null;workerError='';clearTimeout(workerTimer);workerAbort?.abort();
     syncWorkerResourceDefaults(null);
     const sequence=++workerSequence;
-    if(parameters.RecallStrategy!=='layerwise')return;
     if(info.worker_capabilities_version!==1){workerError=tr('请更新控制台以读取当前 worker 能力。','Update the console to read the selected worker capabilities.');return;}
     workerTimer=setTimeout(async()=>{
       const controller=new AbortController();workerAbort=controller;
@@ -232,11 +229,11 @@
         const result=await response.json();
         if(!response.ok)throw Error(result.error||'Worker capability check failed');
         if(result.schema_version!==1||result.backend!==parameters.Backend||result.strategy!==parameters.RecallStrategy||result.requested_worker!==parameters.Worker||!result.worker?.executable_sha256)throw Error('Worker capability response mismatch');
-        if(sequence!==workerSequence||key!==JSON.stringify(workerSelection()))return;
+        if(sequence!==workerSequence||key!==JSON.stringify(workerProbeSelection()))return;
         workerContract=result;
-        syncWorkerResourceDefaults(result.profile);
+        syncWorkerResourceDefaults(currentWorkerProfile());
         if(result.profile?.available!==true)workerError=tr('此 worker 未声明支持所选召回策略。','This worker does not declare the selected recall strategy.');
-      }catch(error){if(sequence!==workerSequence||key!==JSON.stringify(workerSelection()))return;workerContract=null;workerError=error.message;}
+      }catch(error){if(sequence!==workerSequence||key!==JSON.stringify(workerProbeSelection()))return;workerContract=null;workerError=error.message;}
       finally{clearTimeout(timeout);if(sequence===workerSequence&&!configurationLocked()){syncDependencies();updateStatus(runtime);}}
     },force?0:250);
   }
@@ -682,7 +679,7 @@
     const historyChoice=get('LayerwiseMtpHistory');
     historyChoice?.setCustomValidity(layerwise&&mode==='mtp'&&historyChoice.value&&!baseCap.history_policies?.includes(historyChoice.value)?tr('此 worker 未验证所选 MTP 历史策略；当前选择已保留。','This worker does not qualify the selected MTP history policy; your selection is retained.'):'');
     for(const option of historyChoice?.options||[])option.disabled=layerwise&&mode==='mtp'&&!!option.value&&!baseCap.history_policies?.includes(option.value);
-    syncRecallStatus();
+    syncRecallOptions();
     dependency('FastPrefill',['int8','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'].includes(get('KvType')?.value),tr('当前 KV 格式不支持快速预填充。','The current KV format does not support fast prefill.'));
     const gpu=get('Gpu'),gpuCount=gpu?.multiple?gpu.selectedOptions.length:(gpu?.value||'').split(',').filter(Boolean).length;
     const tensor=get('TensorParallel');
@@ -1129,21 +1126,11 @@
     panels[5].classList.add('l-recall-panel');
     const strategy=recallSection('召回方式','Recall method','选择如何从长对话中找回相关历史。','Choose how to retrieve relevant history from long conversations.');
     strategy.parentElement.classList.add('l-recall-strategy');
-    field(strategy,{RecallStrategy:'legacy',...p},'RecallStrategy','召回策略','Recall strategy','text',[
+    const recallChoice=field(strategy,{RecallStrategy:'legacy',...p},'RecallStrategy','召回策略','Recall strategy','text',[
       ['legacy',tr('经典召回 · Legacy','Classic recall · Legacy')],['layerwise',tr('分层召回 · 当前层 Q','Layerwise recall · current-layer Q')]
     ]);
+    recallChoice.addEventListener('focus',()=>{if(workerError&&!workerContract&&!configurationLocked()){scheduleWorkerCapabilities(true);syncDependencies();updateStatus(runtime);}});
     strategy.append(make('p',{class:'l-recall-description','data-recall-description':''}));
-    const capability=make('div',{class:'l-recall-capability l-wide','data-worker-capability-status':'',hidden:''});
-    const capabilityLine=make('div',{class:'l-recall-capability-line'});
-    capabilityLine.append(make('span',{'data-worker-capability-note':'',role:'status','aria-live':'polite'}));
-    const refreshCapabilities=()=>{scheduleWorkerCapabilities(true);syncDependencies();updateStatus(runtime);};
-    const retry=make('button',{type:'button',class:'s-button','data-worker-capability-retry':'',hidden:''},tr('重试','Retry'));retry.onclick=refreshCapabilities;capabilityLine.append(retry);
-    const capabilityDetails=make('details',{'data-worker-capability-details':''});
-    capabilityDetails.append(make('summary',{},tr('检测详情','Check details')),
-      make('p',{class:'l-recall-description'},tr('能力来自所选程序的声明；模型、KV 格式和草稿等组合仍需检查配置。','Support is declared by the selected executable; model, KV format and draft combinations still require configuration checks.')),
-      make('p',{'data-worker-capability-identity':''}));
-    const recheck=make('button',{type:'button',class:'s-button','data-worker-capability-refresh':''},tr('重新检测','Check again'));recheck.onclick=refreshCapabilities;
-    capabilityDetails.append(recheck);capability.append(capabilityLine,capabilityDetails);strategy.append(capability);
     const scoring=recallSection('历史检索','History retrieval','调整经典召回的相关性评分。','Tune relevance scoring for classic recall.');
     scoring.parentElement.setAttribute('data-graph-recall','');
     const layerwise=recallSection('分层暂存','Layerwise storage',

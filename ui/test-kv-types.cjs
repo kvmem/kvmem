@@ -57,7 +57,7 @@ module.exports=async({browser,base,info})=>{
   await saved();await page.reload();await field('KvTypeK').waitFor();
   const beforeRestart=previews.length;await page.locator('[data-action=preview]').click();
   assert.ok((await page.locator('[data-dialog=check]').textContent()).includes('重新启动控制台'));assert.equal(previews.length,beforeRestart);
-  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/inspect-model'].includes(url)),
+  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/inspect-model','/api/launcher/worker-capabilities'].includes(url)),
    'KV edits may preview/inspect but never start, stop or save a service');assert.deepEqual(errors,[]);
   console.log('PASS: independent K/V selection, mixed-bit payload, native pair limits, drafts/templates/reload, legacy migration, backend isolation and restart guidance (no inference)');
  }finally{await context.close();}

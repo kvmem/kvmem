@@ -73,7 +73,7 @@ let browser;
  }
  async function preview(page){
   if(await page.locator('[data-param=RecallStrategy]').inputValue()==='layerwise')
-   await page.waitForFunction(()=>document.querySelector('[data-worker-capability-status]')?.dataset.state==='ready');
+   await page.waitForFunction(()=>document.querySelector('[data-param=RecallStrategy]')?.dataset.capabilityState==='ready');
   let posted;
   await page.route('**/api/launcher/preview',async route=>{
    posted=route.request().postDataJSON();await route.fulfill({json:{argv:['offline-worker'],environment:{},preflight:{port_available:true},effective_settings:{}}});

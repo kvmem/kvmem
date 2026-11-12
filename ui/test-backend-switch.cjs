@@ -111,9 +111,9 @@ module.exports=async({browser,base,info})=>{
   await field('Backend').selectOption('llamacpp');await page.setViewportSize({width:390,height:900});
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'GPU cards fit a narrow screen');
   if(process.env.SCREENSHOT_DIR)await page.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'backend-switch-mobile.png'),fullPage:true});
-  // Preview and model inspection are read-only POSTs; start/stop and every other
+  // Preview, model inspection and capability probes are read-only POSTs; start/stop and every other
   // mutation must remain absent while switching backends.
-  assert.ok(posts.every(url=>['/api/launcher/preview','/api/launcher/inspect-model'].includes(url)),
+  assert.ok(posts.every(url=>['/api/launcher/preview','/api/launcher/inspect-model','/api/launcher/worker-capabilities'].includes(url)),
    'switches never mutate a running service');
   assert.deepEqual(errors,[]);
   console.log('PASS: identical GPU cards, shared settings, explicit capability validation, per-engine assets/raw edits, GPU/layer identity, language/reload and no inference');

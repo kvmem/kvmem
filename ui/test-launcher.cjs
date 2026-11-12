@@ -231,7 +231,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  for(const [key,value] of Object.entries(expected))assert.equal(releaseDraft[key],value,'persisted '+key);
  await page.locator('[data-preset-undo]').click();
  assert.equal(await page.locator('[data-param=Model]').inputValue(),'C:/models/my-existing-model.ninfer');
- assert.ok(mutations.every(url=>new URL(url).pathname==='/api/launcher/inspect-model'),
+ assert.ok(mutations.every(url=>['/api/launcher/inspect-model','/api/launcher/worker-capabilities'].includes(new URL(url).pathname)),
   'select/undo may inspect the draft but must not mutate the server');
  assert.deepEqual(await page.locator('[data-preset]').evaluateAll(nodes=>nodes.map(n=>n.dataset.preset).sort()),['ninfer-layerwise','ninfer-quality','ninfer-speed']);
  await page.locator('[data-preset=ninfer-quality]').click();
