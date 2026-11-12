@@ -35,7 +35,7 @@ if ($copyChat -and (Test-Path -LiteralPath (Join-Path $output 'ui/dist'))) { thr
 if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $PythonSha256) {
     throw 'Python archive SHA-256 does not match the release publisher supplied checksum'
 }
-$files = @('START-HERE-CN.bat', 'START-HERE-EN.bat', 'scripts/local-console.py', 'scripts/console_chat.py', 'scripts/console_radiance.py', 'scripts/windows/start-ui.ps1',
+$files = @('START-HERE-CN.bat', 'START-HERE-EN.bat', 'scripts/local-console.py', 'scripts/console_chat.py', 'scripts/console_radiance.py', 'scripts/console_state.py', 'scripts/windows/start-ui.ps1',
            'scripts/windows/describe-launch-json.ps1', 'scripts/windows/start-backend.ps1',
            'scripts/windows/start-ninfer.ps1', 'scripts/windows/start-dflash2.ps1','scripts/windows/start-polystrata.ps1','tools/polystrata/server.py','tools/polystrata/assets.py',
            'scripts/windows/native-process.ps1', 'scripts/windows/query-scoring.ps1', 'scripts/windows/token-settings.ps1', 'scripts/windows/select-model.ps1', 'scripts/speculative-capabilities.json')

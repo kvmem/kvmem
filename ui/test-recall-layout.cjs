@@ -14,7 +14,7 @@ module.exports=async({browser,base,info,task})=>{
  const layerwiseOption=page.locator('[data-param=RecallStrategy] option[value=layerwise]');
  const capabilityState=state=>page.waitForFunction(value=>document.querySelector('[data-param=RecallStrategy]')?.dataset.capabilityState===value,state);
  const ready=()=>capabilityState('ready');
- const reload=async()=>{await page.reload();await field('Backend').waitFor();await page.locator('#launch-tab-5').click();};
+ const reload=async()=>{await page.reload();await field('Backend').waitFor();await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();};
  page.on('pageerror',e=>errors.push(e.message));
  await page.route('**/api/launcher/info',r=>r.fulfill({json:{...info,worker_capabilities_version:1,gpus:[{uuid:gpu,name:'Fixture GPU',vendor:'nvidia'}],draft:{schema_version:1,parameters},status:runtime}}));
  await page.route('**/api/launcher/status',r=>r.fulfill({json:runtime}));
@@ -28,9 +28,9 @@ module.exports=async({browser,base,info,task})=>{
    profile:p.Backend!=='ninfer'||response==='missing'?null:{available:response!=='unsupported',default_resources:{activation_ram_bytes:268435456,activation_disk_bytes:0,metadata_bytes:1073741824,staging_bytes:16777216,activation_metadata_bytes:134217728},
     checkpoint_retention:{default_target:4,max_target:16},speculative:{none:{available:true},mtp:{available:true,max_draft_tokens:3,history_policies:['first-layer'],default_history_policy:'first-layer'}}}}});
  });
- async function snapshot(name){if(task)await page.locator('#launch-panel-5').screenshot({path:path.join(task,name+'.png')});}
+ async function snapshot(name){if(task)await page.locator('.l-recall-panel').screenshot({path:path.join(task,name+'.png')});}
  try{
-  await page.goto(base+'/monitor/?lang=zh-CN#config');await field('Backend').waitFor();await page.locator('#launch-tab-5').click();
+  await page.goto(base+'/monitor/?lang=zh-CN#config');await field('Backend').waitFor();await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();
   await ready();assert.ok(requests>0,'capabilities are probed before the strategy can be chosen');
   assert.equal(await layerwiseOption.evaluate(el=>el.disabled),false);
   assert.equal(await page.locator('[data-worker-capability-status]').count(),0,'no separate capability card');
@@ -55,7 +55,7 @@ module.exports=async({browser,base,info,task})=>{
   await page.locator('[data-action=start]').click();
   assert.equal(await field('Prefill').isVisible(),true,'first invalid hardware field stays visible');
   assert.equal(await field('Prefill').evaluate(el=>document.activeElement===el),true,'first invalid field receives focus');
-  await field('Prefill').fill('512');await page.locator('#launch-tab-5').click();
+  await field('Prefill').fill('512');await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();
   await page.locator('[data-recall-advanced=scoring] > summary').click();await field('QueryMaxTokens').fill('256');
   await field('RecallStrategy').selectOption('layerwise');await ready();
   assert.equal(await page.locator('[data-graph-recall]').isVisible(),false);
@@ -77,7 +77,7 @@ module.exports=async({browser,base,info,task})=>{
   assert.equal(await page.locator('[data-action=start]').isDisabled(),true);
   response='ready';await reload();await ready();
   for(const backend of ['llamacpp','polystrata','radiance']){
-   await field('Backend').selectOption(backend);await page.locator('#launch-tab-5').click();
+   await field('Backend').selectOption(backend);await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();
    await capabilityState('unsupported');
    assert.equal(await layerwiseOption.evaluate(el=>el.disabled),true,backend+' cannot select an unsupported strategy');
    assert.match(await layerwiseOption.textContent(),/（此推理后端暂不支持）/);
@@ -86,7 +86,7 @@ module.exports=async({browser,base,info,task})=>{
    assert.equal(await field('QueryScorer').isEnabled(),true,backend+' retains Legacy controls');
    if(task)await snapshot('recall-unsupported-'+backend);
   }
-  await field('Backend').selectOption('ninfer');await page.locator('#launch-tab-5').click();await ready();
+  await field('Backend').selectOption('ninfer');await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();await ready();
   assert.equal(await field('LayerwiseMetadataMiB').inputValue(),'384','NInfer override survives backend round trip');
   await page.waitForFunction(()=>JSON.parse(localStorage.getItem('kvmem-launch-draft-v2')||'{}').parameters?.Backend==='ninfer');
   response='missing';await reload();await capabilityState('unsupported');
@@ -95,13 +95,13 @@ module.exports=async({browser,base,info,task})=>{
   assert.equal(await page.locator('[data-action=start]').isDisabled(),true,'old NInfer is not assumed capable by name');
   response='ready';await reload();await ready();
   await page.locator('#launch-tab-1').click();await field('SpeculativeMode').selectOption('mtp');
-  await page.locator('#launch-tab-5').click();assert.equal(await field('LayerwiseMtpHistory').isVisible(),true);
+  await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();assert.equal(await field('LayerwiseMtpHistory').isVisible(),true);
   await field('RecallStrategy').selectOption('legacy');
   assert.equal(await field('QueryMaxTokens').inputValue(),'256');
   await field('RecallStrategy').selectOption('layerwise');await ready();
   assert.equal(await field('LayerwiseMetadataMiB').inputValue(),'384');
   await page.waitForFunction(()=>JSON.parse(localStorage.getItem('kvmem-launch-draft-v2')||'{}').parameters?.RecallStrategy==='layerwise');
-  await page.reload();await field('Backend').waitFor();await page.locator('#launch-tab-5').click();await ready();
+  await page.reload();await field('Backend').waitFor();await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();await ready();
   assert.equal(await field('LayerwiseMetadataMiB').inputValue(),'384');
   const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem('kvmem-launch-draft-v2')).parameters);
   assert.equal(saved.LayerwiseMetadataMiB,384);assert.equal(saved.LayerwiseStagingMiB,undefined,'displayed worker defaults do not become overrides');
@@ -109,7 +109,7 @@ module.exports=async({browser,base,info,task})=>{
    await page.setViewportSize({width:1440,height:1100});
    await page.locator('[data-language-select]').selectOption(language);await page.locator('[data-theme-select]').selectOption(theme);
    await page.setViewportSize({width,height:1100});
-   await page.locator('#launch-tab-5').click();await ready();
+   await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();await ready();
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${width}/${language}: no horizontal overflow`);
    await snapshot(`recall-${width}-${language}-${theme}`);
   }

@@ -99,7 +99,7 @@
     QueryScorer:'page-softmax',GraphAlpha:0.2,Lrfu:false,ScoreAggregation:'mean',QueryMaxTokens:512,QueryReplayMaxTokens:2048};
   const ninferDefaultPreset={...commonPreset,Backend:'ninfer',ThinkingMode:'default',ThinkingBudget:0,KvType:'int8',Prefill:256,DraftTokens:4,DraftPolicy:'adaptive',NgramDrafts:31,NgramMinMatch:12,FastPrefill:true,DeviceProfile:'auto',Vision:true};
   const presets = [
-    {id:'radiance',title:['Radiance AMD','Radiance AMD'],note:['单卡或双卡张量并行、图像、跨轮历史和并发解码。','One or two GPUs with tensor parallelism, images, conversation history and batched decode.'],parameters:{"Backend":"radiance","Context":65536,"Budget":4096,"Reserve":1024,"HostMiB":8192,"SinkTokens":128,"RecentTokens":512,"Concurrency":1,"RetainedSessions":8,"QueryScorer":"page-softmax","ScoreAggregation":"mean","GraphAlpha":0.2,"Lrfu":false,"QueryMaxTokens":512,"QueryReplayMaxTokens":2048,"KvType":"fp8","Prefill":256,"SpeculativeMode":"none","DraftTokens":0,"DraftPolicy":"fixed","Vision":false,"MaxTokens":0,"ThinkingMode":"default","ThinkingBudget":0,"VramReserveMiB":1024}},
+    {id:'radiance',title:['RX 9000 系列 16GB · 极速档','RX 9000 Series 16GB · Speed'],note:['256K 上下文 · 36K KV · CPU 视觉','256K context · 36K KV · CPU vision'],parameters:{...commonPreset,"Backend":"radiance","Budget":36864,"Reserve":4096,"KvType":"fp8","StateCacheType":"f32","Prefill":256,"SpeculativeMode":"dflash2","DraftTokens":7,"DraftPolicy":"fixed","Vision":true,"ThinkingMode":"default","ThinkingBudget":0,"VramReserveMiB":256,"EmbeddingPlacement":"ram","CpuThreads":8,"VisionCacheMiB":64,"VisionTokens":256,"NgramDrafts":0,"NgramMinMatch":12}},
     {id:'ninfer-speed',title:['NInfer · 极速档','NInfer · Speed'],
       parameters:{...ninferDefaultPreset,SpeculativeMode:'dflash2',DraftTokens:5,DraftPolicy:'fixed',Budget:36*1024,Reserve:4*1024,NgramDrafts:0},
       note:['启用 DFlash2，历史 KV 预算较少，侧重响应速度。','Uses DFlash2 with a smaller history KV budget, prioritizing response speed.']},
@@ -110,7 +110,7 @@
     {id:'polystrata-default',title:['PolyStrata · 默认模板','PolyStrata · Default template'],parameters:{...commonPreset,Backend:'polystrata',Budget:36*1024,Reserve:4*1024,ThinkingBudget:0,ThinkingMode:'on',KvType:'q8_0',Prefill:512,DraftTokens:2,DraftPolicy:'adaptive',Vision:false,RetainedSessions:2,VramReserveMiB:256,WorkerArgs:['--elastic-experts-headroom','--elastic-headroom-mib','128','--elastic-physical-reserve-mib','512']},
       note:['256K 上下文 · 36K 驻留 · 4K 生成预留 · 思考不限额','256K context · 36K resident · 4K reserve · no fixed thinking cap']},
     {id:'polystrata-gemma4',title:['PolyStrata · Gemma 4 26B-A4B','PolyStrata · Gemma 4 26B-A4B'],parameters:{...commonPreset,Backend:'polystrata',Budget:32768,Reserve:2048,KvType:'f16',Prefill:512,ThinkingMode:'on',ThinkingBudget:0,SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',ModelAlias:'kvmem-polystrata-gemma4',Vision:false,RetainedSessions:2,VramReserveMiB:512},note:['Gemma 4 26B-A4B；启用 MTP 时选择匹配的 assistant GGUF。','Gemma 4 26B-A4B; select its matching assistant GGUF to enable MTP.']},
-    ...['ninfer','llamacpp','polystrata','radiance'].map(backend=>({
+    ...['ninfer','llamacpp','polystrata'].map(backend=>({
       id:backend+'-layerwise',title:[backend+' · 分层召回',backend+' · Layerwise'],
       note:['文本、无草稿起点；仍需当前 worker 确认该组合。','Text without drafts; the selected worker must qualify this combination.'],
       parameters:{Backend:backend,RecallStrategy:'layerwise',Context:262144,Budget:32768,Reserve:1024,HostMiB:16384,
@@ -127,7 +127,7 @@
   const sharedSettings=['Gpu','Port','ListenHost'];
   const names={llamacpp:'llama.cpp · Dense',ninfer:'NInfer · Dense',polystrata:'PolyStrata · MoE',radiance:'Radiance · AMD'};
   const modelFormat=b=>info?.backend_capabilities?.[b]?.model_format||(b==='radiance'?'.rad':b==='ninfer'?'.ninfer':'.gguf');
-  const groups=[['缓存与历史','Cache & history'],['硬件与加速','Hardware & acceleration'],['思考设置','Thinking settings'],['模板与图像','Templates & vision'],['服务与并发','Service & concurrency'],['召回策略','Recall policy']];
+  const groups=[['缓存与历史','Cache & history'],['硬件与加速','Hardware & acceleration'],['多卡设置','Multi-GPU'],['思考设置','Thinking settings'],['模板与图像','Templates & vision'],['服务与并发','Service & concurrency'],['召回策略','Recall policy']];
   const make=(tag,attrs={},text)=>{const el=document.createElement(tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));if(text!==undefined)el.textContent=text;return el;};
   function healthParameters(){
     const parameters={};
@@ -682,11 +682,25 @@
     syncRecallOptions();
     dependency('FastPrefill',['int8','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'].includes(get('KvType')?.value),tr('当前 KV 格式不支持快速预填充。','The current KV format does not support fast prefill.'));
     const gpu=get('Gpu'),gpuCount=gpu?.multiple?gpu.selectedOptions.length:(gpu?.value||'').split(',').filter(Boolean).length;
+    const gpuLimit=root.querySelector('[data-gpu-limit]'),selectionError=gpuLimit&&!gpuLimit.hidden?gpuLimit.textContent:'';
+    const supportsMulti=backend==='ninfer'||backend==='radiance'&&(info.backend_capabilities?.radiance?.supported_combinations?.text?.max_devices||1)>1;
+    const multiGpu=supportsMulti&&gpuCount>1&&!selectionError;
+    const multiStatus=root.querySelector('[data-multi-gpu-status]');
+    if(multiStatus){
+      multiStatus.dataset.enabled=String(multiGpu);
+      multiStatus.textContent=configurationLocked()
+        ?tr(`本次启动使用 ${gpuCount} 张显卡。停止服务后可修改多卡设置。`,`This run uses ${gpuCount} GPU(s). Stop the service to edit multi-GPU settings.`)
+        :!supportsMulti?tr('当前后端仅开放单卡运行，暂不能配置多卡。','This backend currently exposes single-GPU execution only.')
+        :gpuCount<2
+        ?tr(`已选择 ${gpuCount} 张显卡。请在上方“推理显卡”中勾选至少两张兼容显卡，再配置多卡选项。`,`Selected ${gpuCount} GPU(s). Select at least two compatible GPUs under Inference GPUs above to configure multiple GPUs.`)
+        :selectionError||tr(`已选择 ${gpuCount} 张显卡。以下设置按当前显卡顺序生效。`,`Selected ${gpuCount} GPUs. Settings below follow the displayed GPU order.`);
+    }
     const tensor=get('TensorParallel');
-    dependency('TensorParallel',backend==='ninfer'&&gpuCount>1,tr('至少选择两张显卡后才能启用张量并行。','Select at least two GPUs to enable tensor parallelism.'));
+    const multiReason=selectionError||tr('请先在上方选择至少两张兼容显卡。','Select at least two compatible GPUs above first.');
+    dependency('TensorParallel',backend==='ninfer'&&multiGpu,multiReason);
     const heads=!!tensor?.checked&&!tensor.disabled;
-    dependency('StageLayers',gpuCount>1&&!heads,tr('层数分配用于非 TP 多卡模式。','Layer allocation applies to multiple GPUs without TP.'));
-    dependency('TensorSplit',heads,tr('先启用张量并行。','Enable tensor parallelism first.'));
+    dependency('StageLayers',multiGpu&&!heads,multiGpu?tr('张量并行已开启，改用下方 TP 权重分配。','Tensor parallelism is on; configure TP weights instead.'):multiReason);
+    dependency('TensorSplit',multiGpu&&heads,multiGpu?tr('先启用张量并行。','Enable tensor parallelism first.'):multiReason);
     const weights=get('TensorSplit');
     if(weights){const parts=weights.value.split(',');weights.setCustomValidity(heads&&weights.value.trim()&&(parts.length!==gpuCount||parts.some(x=>!x.trim()||!Number.isFinite(Number(x))||Number(x)<=0)||!Number.isFinite(parts.reduce((total,x)=>total+Number(x),0)))?tr('请按显卡顺序填写等量的正数权重，或留空自动分配。','Enter one positive weight per GPU in order, or leave empty for automatic allocation.'):'');}
     const keyType=get('KvTypeK'),valueType=get('KvTypeV'),pairStatus=root.querySelector('[data-kv-pair-status]');
@@ -981,7 +995,7 @@
     const backend=field(fields,p,'Backend','推理引擎','Backend','text',Object.entries(names).filter(([v])=>info.backends.length!==1||info.backends.includes(v)).map(([v,t])=>[v,t]),['按 KVMem 当前支持范围区分：Dense 为稠密模型，MoE 为混合专家模型。PolyStrata 支持 Qwen3.5 MoE（包括 Tiel）和 Gemma 4 26B-A4B。','Labels describe current KVMem support: Dense for dense models, MoE for mixture-of-experts models. PolyStrata supports Qwen3.5 MoE (including Tiel) and Gemma 4 26B-A4B.']);Array.from(backend.options).forEach(o=>{o.disabled=!info.backends.includes(o.value);if(o.disabled)o.textContent+=' · '+tr('未安装','not installed');});
     modelPicker(fields,p);
     fields.append(make('section',{class:'l-model-health l-wide','data-model-health':'','aria-label':tr('模型体检','Model inspection')}));
-    const gpu=field(fields,p,'Gpu','推理显卡','Inference GPUs','text',info.gpus.map(g=>[g.uuid,g.name+' · '+g.uuid.slice(-8)]),['选择要使用的显卡。多卡按勾选顺序排列，可前移／后移；切换引擎保留当前选择。','Choose the GPUs to use. Multiple GPUs follow selection order and can be reordered. Switching engines retains your selection.']);
+    const gpu=field(fields,p,'Gpu','推理显卡','Inference GPUs','text',info.gpus.map(g=>[g.uuid,g.name+' · '+g.uuid.slice(-8)]),['选择要使用的显卡。勾选至少两张兼容显卡后，在“多卡设置”页签调整执行顺序与分配；切换引擎保留当前选择。','Choose the GPUs to use. Select at least two compatible GPUs, then adjust their order and allocation in Multi-GPU. Switching engines retains your selection.']);
     gpu.closest('label').classList.add('l-gpu-field');
     gpu.multiple=true;gpu.size=2;Array.from(gpu.options).forEach(o=>o.selected=(p.Gpu||'').split(',').includes(o.value));
     gpu.required=true;
@@ -1015,7 +1029,7 @@
         const input=root.querySelector('[data-param=StageLayers]'),layers=(input?.value||'').split(',').map(x=>x.trim());
         const valid=layers.length===order.length&&layers.every(x=>/^[1-9]\d*$/.test(x));
         const tensor=root.querySelector('[data-param=TensorParallel]'),split=root.querySelector('[data-param=TensorSplit]');
-        const heads=!!tensor?.checked&&!tensor.disabled,weights=(split?.value||'').split(',').map(x=>x.trim());
+        const heads=!!tensor?.checked&&tensor.dataset.backendSupported!=='false'&&gpuLimit.hidden,weights=(split?.value||'').split(',').map(x=>x.trim());
         const validWeights=weights.length===order.length&&weights.every(x=>x&&Number.isFinite(Number(x))&&Number(x)>0)&&Number.isFinite(weights.reduce((total,x)=>total+Number(x),0));
         order.forEach((id,i)=>{
           const device=info.gpus.find(g=>g.uuid===id),row=make('div',{class:'l-gpu-order-row','data-ordered-gpu':id,tabindex:'-1'});
@@ -1023,7 +1037,7 @@
           row.append(make('span',{class:'l-gpu-position'},String(i+1)),make('span',{class:'l-gpu-order-name'},device.name.replace(/^NVIDIA GeForce /,'')+' · '+id.slice(-8)),make('small',{'data-gpu-layers':''},allocation));
           for(const [delta,zh,en] of [[-1,'前移','Move earlier'],[1,'后移','Move later']]){
             const move=make('button',{type:'button',class:'s-button','data-gpu-move':String(delta),'aria-label':tr(zh,en)+' · '+device.name+' · '+id.slice(-8)},tr(zh,en));
-            move.disabled=i+delta<0||i+delta>=order.length;
+            move.disabled=i+delta<0||i+delta>=order.length||!gpuLimit.hidden;
             move.onclick=()=>{
               const target=i+delta;
               if(input?.value.trim()){
@@ -1081,6 +1095,13 @@
     const visibleGroups=poly?[...groups,['弹性专家','Elastic experts']]:groups;
     if(activeTab>=visibleGroups.length)activeTab=1;
     visibleGroups.forEach((g,i)=>{const tab=make('button',{type:'button',class:'l-tab',role:'tab',id:'launch-tab-'+i,'aria-selected':String(activeTab===i),'aria-controls':'launch-panel-'+i},tr(...g));tabs.append(tab);const panel=make('div',{class:'l-panel',id:'launch-panel-'+i,role:'tabpanel','aria-labelledby':tab.id});panel.hidden=activeTab!==i;const grid=make('div',{class:'l-fields'});panel.append(grid);panels.push(grid);section.append(panel);tab.onclick=()=>{activeTab=i;tabs.querySelectorAll('button').forEach((x,j)=>x.setAttribute('aria-selected',String(i===j)));section.querySelectorAll('.l-panel').forEach((x,j)=>x.hidden=i!==j);};});
+    const multi=panels[2];multi.classList.add('l-multi-gpu');
+    multi.append(make('p',{class:'l-multi-status l-wide','data-multi-gpu-status':'',role:'status','aria-live':'polite'}));
+    const orderView=root.querySelector('[data-gpu-order]');if(orderView)multi.append(orderView);
+    multi.append(make('p',{class:'l-muted l-wide'},n
+      ?tr('默认由后端自动分配。关闭张量并行时可指定每卡层数；开启后可指定 TP 权重。更换显卡会清空原分配，调整顺序会同步调整分配。','Allocation is automatic by default. Specify layers per GPU with tensor parallelism off, or TP weights with it on. Changing devices clears allocation; reordering also reorders allocation.')
+      :rad&&(info.backend_capabilities?.radiance?.supported_combinations?.text?.max_devices||1)>1?tr('Radiance 选择多张兼容显卡后自动使用张量并行，无需手动设置层数或 TP 权重。可用显卡数量以当前后端支持范围为准。','Radiance automatically uses tensor parallelism with multiple compatible GPUs. No manual layer split or TP weights are needed. The GPU count is limited by the current backend.')
+      :tr('请在上方“推理显卡”中选择一张显卡。','Select one GPU under Inference GPUs above.')));
     field(panels[0],p,'HostMiB','RAM 历史缓存 · MiB','RAM history cache · MiB','number',null,['活动与空闲历史共享的原生 KV 数据硬预算；不含模型、统计索引等其他内存；1024 MiB = 1 GiB','Shared hard budget for active and idle native KV data; excludes model weights, statistics and other memory; 1024 MiB = 1 GiB']);
     if(l){
       const kv=['q8_0','q5_0','q4_0','f16','f32'],aliases={fp16:'f16',fp32:'f32',q8:'q8_0',q5:'q5_0',q4:'q4_0'};
@@ -1099,8 +1120,8 @@
       field(panels[0],{...p,KvType:p.KvType||kv[0]},'KvType','KV 格式','KV format','text',kv.map(v=>[v,v]));
     }
     if(b==='llamacpp'){
-      field(panels[3],p,'Lora','LoRA 适配器路径 · GGUF','LoRA adapter path · GGUF');
-      const scale=field(panels[3],p,'LoraScale','LoRA 强度','LoRA scale','number');
+      field(panels[4],p,'Lora','LoRA 适配器路径 · GGUF','LoRA adapter path · GGUF');
+      const scale=field(panels[4],p,'LoraScale','LoRA 强度','LoRA scale','number');
       scale.removeAttribute('min');scale.step='any';scale.placeholder='1';
     }
     if(rad)field(panels[0],{...p,StateCacheType:p.StateCacheType||'f32'},'StateCacheType','循环状态缓存格式','Recurrent state cache format','text',[['f32','FP32'],['f16','FP16']],['FP16 可减少循环状态缓存显存，可能改变模型输出。','FP16 reduces recurrent-state memory and may change model output.']);
@@ -1116,14 +1137,14 @@
     const recallSection=(zh,en,noteZh,noteEn)=>{
       const box=make('section',{class:'l-recall-section l-wide'}),head=make('div',{class:'l-recall-heading'}),title=make('h3',{class:'s-title'},tr(zh,en));
       head.append(title);
-      const fields=make('div',{class:'l-fields'});box.append(head,make('p',{class:'l-recall-description'},tr(noteZh,noteEn)),fields);panels[5].append(box);return fields;
+      const fields=make('div',{class:'l-fields'});box.append(head,make('p',{class:'l-recall-description'},tr(noteZh,noteEn)),fields);panels[6].append(box);return fields;
     };
     const recallAdvanced=(parent,key,zh,en)=>{
       const details=make('details',{class:'l-recall-advanced l-wide',['data-recall-advanced']:key});
       details.append(make('summary',{},tr(zh,en)));
       const fields=make('div',{class:'l-fields'});details.append(fields);parent.append(details);return fields;
     };
-    panels[5].classList.add('l-recall-panel');
+    panels[6].classList.add('l-recall-panel');
     const strategy=recallSection('召回方式','Recall method','选择如何从长对话中找回相关历史。','Choose how to retrieve relevant history from long conversations.');
     strategy.parentElement.classList.add('l-recall-strategy');
     const recallChoice=field(strategy,{RecallStrategy:'legacy',...p},'RecallStrategy','召回策略','Recall strategy','text',[
@@ -1170,12 +1191,13 @@
     for(const key of ['ScoreAggregation','LrfuLambda','LrfuTopFraction','QueryMaxTokens','QueryReplayMaxTokens'])scoringAdvanced.append(scoring.querySelector(`[data-param=${key}]`).closest('label'));
     field(panels[1],p,'Prefill','预填充块大小 · tokens','Prefill chunk · tokens','number');
     if(poly||rad){const vram=field(panels[1],p,'VramReserveMiB','显存预留 · MiB','VRAM reserve · MiB','number',null,['原生引擎最低为 256 MiB；与生成追加空间的 token 预算分别设置。','Worker minimum: 256 MiB. Separate from the generation workspace measured in tokens.']);vram.min='256';vram.max='65536';}
-    const tensor=field(panels[1],p,'TensorParallel','张量并行 · heads','Tensor parallelism · heads','checkbox',null,
+    const tensor=field(multi,p,'TensorParallel','张量并行 · heads','Tensor parallelism · heads','checkbox',null,
       ['将每层计算分配到多张显卡。默认关闭；启用后只使用 heads 注意力。','Distribute each layer across GPUs. Off by default; uses heads attention.'],!n);
-    const tensorSplit=field(panels[1],{...p,TensorSplit:(p.TensorSplit||[]).join(',')},'TensorSplit','TP 权重（可选）','TP weights (optional)','text',null,
+    const tensorSplit=field(multi,{...p,TensorSplit:(p.TensorSplit||[]).join(',')},'TensorSplit','TP 权重（可选）','TP weights (optional)','text',null,
       ['依次对应上方显卡，例如 3,1；留空由后端根据可用显存和连接情况分配。实际比例受 head 和量化分块约束。','In GPU order, e.g. 3,1. Empty lets the backend allocate using available memory and links. Heads and quantization constrain the actual split.'],!n);
     tensor.addEventListener('change',refreshGpuOrder);tensorSplit.addEventListener('input',refreshGpuOrder);
-    const layerSplit=field(panels[1],{...p,StageLayers:(p.StageLayers||[]).join(',')},'StageLayers','多卡层数分配（可选）','Layer split (optional)','text',null,[n?'依次对应上方第 1、2…张显卡，用逗号分隔；留空由后端分配':'当前接入暂不支持设置多卡层数',n?'Comma-separated counts for GPU 1, 2, … above; empty uses backend allocation':'Layer assignment is unavailable in this integration'],!n);
+    const layerSplit=field(multi,{...p,StageLayers:(p.StageLayers||[]).join(',')},'StageLayers','多卡层数分配（可选）','Layer split (optional)','text',null,[n?'依次对应上方第 1、2…张显卡，用逗号分隔；留空由后端分配':'当前接入暂不支持设置多卡层数',n?'Comma-separated counts for GPU 1, 2, … above; empty uses backend allocation':'Layer assignment is unavailable in this integration'],!n);
+    for(const input of [tensor,tensorSplit,layerSplit])input.closest('label').hidden=!n;
     layerSplit.addEventListener('input',refreshGpuOrder);refreshGpuOrder();
     const specModes=info.speculative_capabilities?.[b]||{none:{},...(n?{mtp:{max_draft_tokens:15,adaptive:true,ngram:true,max_concurrency:8,max_devices:8,draft_asset:'embedded'}}:{})};
     const specMode=field(panels[1],p,'SpeculativeMode','草稿方式','Draft method','text',[
@@ -1193,24 +1215,24 @@
       ['Gemma 4 MTP 和 llama.cpp DFlash2 需要匹配的独立草稿 GGUF；Qwen MTP 和 NInfer 使用内置草稿组件。','Gemma 4 MTP and llama.cpp DFlash2 require a matching draft GGUF; Qwen MTP and NInfer use embedded drafts.'],n||rad);
     if(!n&&!rad&&info.native_picker!==false){const row=inputActions(draftModel),choose=make('button',{type:'button',class:'s-button l-secondary'},tr('选择文件','Choose file'));row.append(choose);choose.onclick=async()=>{try{const result=await api('browse-model',{backend:'llamacpp',current_path:draftModel.value});if(result.path){draftModel.value=result.path;draftModel.dispatchEvent(new Event('change',{bubbles:true}));}}catch(e){message(e.message,true);}};}
     if(n)field(panels[1],p,'FastPrefill','启用快速预填充','Enable fast prefill','checkbox',null,['支持 int8、rk8v4、rk4v4、rk4v4-e8、rk2v4-e8；还需模型支持。与 MTP、普通预填充块大小分别设置。','Supports int8, rk8v4, rk4v4, rk4v4-e8 and rk2v4-e8; model support is also required. Independent of MTP and the standard prefill chunk size.'],!n);
-    const thinking=field(panels[2],p,'ThinkingMode','默认思考模式','Default thinking mode','text',[[(n||rad)?'default':'on',(n||rad)?tr('跟随模型','Model default'):tr('开启','On')],['off',tr('关闭','Off')]],['需要模型与模板支持。聊天请求中的显式设置优先。','Requires model/template support. Explicit chat settings take priority.']);
-    const thinkingBudget=field(panels[2],p,'ThinkingBudget','默认思考预算 · tokens','Default thinking budget · tokens','number',null,poly?['0：根据输出上限自动给答案留空间；正数：思考 token 上限，也受总输出预算约束。','0: automatically reserve answer space within the output limit. Positive values cap reasoning tokens, subject to the total output budget.']:['0：不设置单独的思考限额，仍受总输出预算约束。正数：思考 token 上限。','0: no separate reasoning cap; the total output budget still applies. Positive values cap reasoning tokens.']);
+    const thinking=field(panels[3],p,'ThinkingMode','默认思考模式','Default thinking mode','text',[[(n||rad)?'default':'on',(n||rad)?tr('跟随模型','Model default'):tr('开启','On')],['off',tr('关闭','Off')]],['需要模型与模板支持。聊天请求中的显式设置优先。','Requires model/template support. Explicit chat settings take priority.']);
+    const thinkingBudget=field(panels[3],p,'ThinkingBudget','默认思考预算 · tokens','Default thinking budget · tokens','number',null,poly?['0：根据输出上限自动给答案留空间；正数：思考 token 上限，也受总输出预算约束。','0: automatically reserve answer space within the output limit. Positive values cap reasoning tokens, subject to the total output budget.']:['0：不设置单独的思考限额，仍受总输出预算约束。正数：思考 token 上限。','0: no separate reasoning cap; the total output budget still applies. Positive values cap reasoning tokens.']);
     thinkingBudget.required=true;
-    field(panels[2],p,'ReasoningEffort','默认思考强度（可选）','Default reasoning effort (optional)','text',[
+    field(panels[3],p,'ReasoningEffort','默认思考强度（可选）','Default reasoning effort (optional)','text',[
       ...(!poly?[['',tr('不附加强度指令','No additional effort instruction')]]:[]),...(poly?['none','low','medium','xhigh']:['none','minimal','low','medium','high','xhigh','max']).map(x=>[x,x])
     ],['默认思考强度，具体支持取决于模型；与思考 token 预算分别设置。','Default reasoning effort; supported levels depend on the model. Separate from the thinking-token budget.']);
     if(n){
-      const preserve=field(panels[2],{PreserveThinking:p.PreserveThinking===true?'true':'false'},'PreserveThinking','历史思考','Previous reasoning','text',[['true',tr('开启','On')],['false',tr('跟随模型','Model default')]],['当前 NInfer 启动接口只提供强制保留开关；跟随模型不等于关闭。聊天请求仍可单独覆盖。','NInfer only provides a force-preserve startup switch. Model default does not mean off. Chat requests can override it.']);preserve.dataset.booleanSelect='true';
+      const preserve=field(panels[3],{PreserveThinking:p.PreserveThinking===true?'true':'false'},'PreserveThinking','历史思考','Previous reasoning','text',[['true',tr('开启','On')],['false',tr('跟随模型','Model default')]],['当前 NInfer 启动接口只提供强制保留开关；跟随模型不等于关闭。聊天请求仍可单独覆盖。','NInfer only provides a force-preserve startup switch. Model default does not mean off. Chat requests can override it.']);preserve.dataset.booleanSelect='true';
     }else{
-    field(panels[2],p,'PreserveThinking','保留历史思考','Preserve previous reasoning','checkbox',null,poly?['保留客户端回传的已结束轮次思考；内置聊天页自动回传。不会按回答文本猜测或补回缺失思考。','Retain reasoning supplied by the client. Built-in chat sends it automatically; missing reasoning is never guessed from answer text.']:['在后续提示中保留已结束轮次的 assistant 思考内容。','Retain closed-turn assistant reasoning in later prompts.']);
+    field(panels[3],p,'PreserveThinking','保留历史思考','Preserve previous reasoning','checkbox',null,poly?['保留客户端回传的已结束轮次思考；内置聊天页自动回传。不会按回答文本猜测或补回缺失思考。','Retain reasoning supplied by the client. Built-in chat sends it automatically; missing reasoning is never guessed from answer text.']:['在后续提示中保留已结束轮次的 assistant 思考内容。','Retain closed-turn assistant reasoning in later prompts.']);
     }
-    field(panels[3],p,'Vision','启用图像输入','Enable vision','checkbox',null,['需要模型及配套资源支持','Requires compatible model and resources']);
-    field(panels[3],p,'VisionTokens','图像 token 上限（可选）','Image token limit (optional)','number',null,['开启图像输入时生效。','Applies when vision input is enabled.']);field(panels[3],{VisionResidency:'resident',...p},'VisionResidency','图像编码器存放位置','Vision encoder placement','text',[['resident','GPU'],['cpu','CPU']],['开启图像输入时生效；关闭后保留原选择。','Applies when vision input is enabled; the selection is retained when off.']);
-    templateFileField(panels[3],p);
-    field(panels[4],{ListenHost:'127.0.0.1',...p},'ListenHost','监听地址','Listen address','text',[['127.0.0.1',tr('127.0.0.1 · 仅本机','127.0.0.1 · This computer')],['0.0.0.0',tr('0.0.0.0 · 所有网卡','0.0.0.0 · All interfaces')]],['选择所有网卡后，其他设备可通过本机 IP 和端口访问推理服务','All interfaces allows other devices to access inference through this computer’s IP and port']);field(panels[4],p,'Port','服务端口','Service port','number');
-    const concurrency=field(panels[4],p,'Concurrency','同时处理的请求数（可选）','Simultaneous requests (optional)','number',null,(n||rad)?['范围 1–8；留空为 1。并发增加会提高 KV 和显存需求。','Range 1–8; empty uses 1. More concurrent requests require more KV and VRAM.']:['范围 1–8；留空为 1。当前控制台使用单卡；并发增加会提高 KV 和显存需求。','Range 1–8; empty uses 1. This console uses one GPU; more concurrent requests require more KV and VRAM.']);concurrency.min='1';concurrency.max='8';
-    credentialField(panels[4],p);
-    const serviceAdvanced=make('details',{class:'l-advanced l-wide'});serviceAdvanced.append(make('summary',{},tr('高级 · 服务标识与日志','Advanced · Service identity & logs')));const serviceFields=make('div',{class:'l-fields l-service-fields'});serviceAdvanced.append(serviceFields);panels[4].append(serviceAdvanced);
+    field(panels[4],p,'Vision','启用图像输入','Enable vision','checkbox',null,['需要模型及配套资源支持','Requires compatible model and resources']);
+    field(panels[4],p,'VisionTokens','图像 token 上限（可选）','Image token limit (optional)','number',null,['开启图像输入时生效。','Applies when vision input is enabled.']);field(panels[4],{VisionResidency:'resident',...p},'VisionResidency','图像编码器存放位置','Vision encoder placement','text',[['resident','GPU'],['cpu','CPU']],['开启图像输入时生效；关闭后保留原选择。','Applies when vision input is enabled; the selection is retained when off.']);
+    templateFileField(panels[4],p);
+    field(panels[5],{ListenHost:'127.0.0.1',...p},'ListenHost','监听地址','Listen address','text',[['127.0.0.1',tr('127.0.0.1 · 仅本机','127.0.0.1 · This computer')],['0.0.0.0',tr('0.0.0.0 · 所有网卡','0.0.0.0 · All interfaces')]],['选择所有网卡后，其他设备可通过本机 IP 和端口访问推理服务','All interfaces allows other devices to access inference through this computer’s IP and port']);field(panels[5],p,'Port','服务端口','Service port','number');
+    const concurrency=field(panels[5],p,'Concurrency','同时处理的请求数（可选）','Simultaneous requests (optional)','number',null,(n||rad)?['范围 1–8；留空为 1。并发增加会提高 KV 和显存需求。','Range 1–8; empty uses 1. More concurrent requests require more KV and VRAM.']:['范围 1–8；留空为 1。当前控制台使用单卡；并发增加会提高 KV 和显存需求。','Range 1–8; empty uses 1. This console uses one GPU; more concurrent requests require more KV and VRAM.']);concurrency.min='1';concurrency.max='8';
+    credentialField(panels[5],p);
+    const serviceAdvanced=make('details',{class:'l-advanced l-wide'});serviceAdvanced.append(make('summary',{},tr('高级 · 服务标识与日志','Advanced · Service identity & logs')));const serviceFields=make('div',{class:'l-fields l-service-fields'});serviceAdvanced.append(serviceFields);panels[5].append(serviceAdvanced);
     field(serviceFields,p,'ModelAlias','对外模型名（可选）','Served model name (optional)','text',null,poly?['供 API 客户端使用；留空使用 kvmem-polystrata-qwen35。','API model name; empty uses kvmem-polystrata-qwen35.']:['供 API 客户端使用的稳定名称；留空沿用模型名称。','A stable name for API clients; leave empty to inherit the model name.']);
     field(serviceFields,p,'LogLevel','日志级别','Log level','text',[['info','Info'],['debug','Debug'],['trace','Trace'],['warning','Warning'],['error','Error'],['off',tr('关闭日志','Off')]],['通常使用 Info；排查问题时可临时选择 Debug。','Use Info normally; select Debug temporarily for troubleshooting.']);
     if(n){
@@ -1221,7 +1243,7 @@
     }
     if(poly||l){
       const assets=make('details',{class:'l-advanced l-wide','data-vision-assets':''});assets.append(make('summary',{},tr('图像配套文件','Vision assets')));
-      const grid=make('div',{class:'l-fields l-vision-assets'});assets.append(grid);panels[3].append(assets);
+      const grid=make('div',{class:'l-fields l-vision-assets'});assets.append(grid);panels[4].append(assets);
       for(const [key,zh,en] of [...(poly?[['VisionWorker','图像编码程序','Vision encoder executable']]:[]),['Mmproj','图像投影 GGUF','Vision projection GGUF']]){
         const input=field(grid,p,key,zh,en,'text',null,key==='Mmproj'?['选择与主模型配套的 GGUF，文件名不限。留空时优先查找同名配套文件，否则使用同目录唯一的 mmproj GGUF；多个候选时请手动选择。','Choose a GGUF matching the model; any filename is accepted. If empty, prefer a model-named projector, then the only adjacent mmproj GGUF. Select explicitly when ambiguous.']:null);input.placeholder=tr('自动检测','Auto-detect');input.closest('label').classList.remove('l-row');input.title=input.value;
         if(key==='Mmproj'&&info.native_picker!==false&&!info.script_export_version){
@@ -1257,8 +1279,8 @@
       detected?.available?['留空使用已检测到的程序：'+detected.path,'Leave empty to use the detected executable: '+detected.path]:['未检测到后端程序，请填写已安装程序的完整路径。','No backend executable detected. Enter the full path to an installed executable.']);
     worker.placeholder=tr('自动检测','Auto-detect');worker.closest('label').classList.add('l-wide');
     if(rad){
-      field(panels[3],{CpuThreads:2,...p},'CpuThreads','CPU 编码线程数','CPU encoder threads','number');
-      field(panels[3],{VisionCacheMiB:256,...p},'VisionCacheMiB','图片编码缓存 MiB','Image embedding cache MiB','number',null,['0 关闭；包含图片身份数据，独立于 KV 缓存预算。','0 disables; includes image identity data and has a separate budget from KV.']);
+      field(panels[4],{CpuThreads:2,...p},'CpuThreads','CPU 编码线程数','CPU encoder threads','number');
+      field(panels[4],{VisionCacheMiB:256,...p},'VisionCacheMiB','图片编码缓存 MiB','Image embedding cache MiB','number',null,['0 关闭；包含图片身份数据，独立于 KV 缓存预算。','0 disables; includes image identity data and has a separate budget from KV.']);
       field(panels[0],{EmbeddingPlacement:'vram',...p},'EmbeddingPlacement','文本嵌入表位置','Text embedding placement','text',[['vram','GPU'],['ram','RAM']],['RAM 可为视觉和 KV 释放显存。','RAM frees GPU memory for vision and KV.']);
       for(const [key,zh,en] of [['RadianceHome','Radiance 资源目录','Radiance resource directory'],['RocmPath','ROCm 运行库目录','ROCm runtime directory']])field(ng,p,key,zh,en);
     }
@@ -1288,7 +1310,7 @@
     const raw=make('textarea',{'data-native':'',rows:'4',spellcheck:'false','aria-label':tr('原生选项 · JSON 参数数组','Native options · JSON argument array')});raw.value=JSON.stringify(p.WorkerArgs||[]);nativeLabel.append(raw);
     help(nativeTitle,tr('原生启动参数','Native launch arguments'),tr('仅用于界面未提供的选项。弹性专家等常用设置请使用对应页签；此处保留完整参数供高级检查。允许的选项：','Use for options without a dedicated control. Configure common settings such as elastic experts in their tabs; the full arguments remain available here for advanced inspection. Allowed options: ')+(info.native_options[b].join(', ')||tr('无','None')),raw);
     argumentsPanel.grid.append(nativeLabel);form.append(native);
-    if(poly)elasticControls(panels[6],p,raw);
+    if(poly)elasticControls(panels[7],p,raw);
     const actions=make('div',{class:'l-actions l-draft-actions'});const save=make('button',{type:'button',class:'s-button','data-action':'template'},tr('另存为模板','Save as template'));const preview=make('button',{type:'button',class:'s-button','data-action':'preview'},tr('检查配置','Check configuration'));actions.append(preview,save);heading.append(actions);const output=make('pre',{class:'l-result l-notice','data-launch-message':'','aria-live':'polite'});heading.after(output);
     if(info.script_export_version){const generate=make('button',{type:'button',class:'s-button','data-action':'export'},tr('生成启动脚本','Generate launch script'));generate.onclick=exportDialog;actions.append(generate);}
     if(info.script_export_version){const services=make('button',{type:'button',class:'s-button','data-services-open':''},tr('后台服务管理','Background services'));services.onclick=servicesDialog;actions.append(services);}

@@ -16,7 +16,7 @@ module.exports=async({browser,base,info,stage})=>{
  try{
   await page.goto(base+'/monitor/#config');await mode.waitFor({state:'attached'});await page.getByRole('tab',{name:'弹性专家'}).click();
   await page.waitForFunction(()=>document.querySelector('[data-launch-root]').hasAttribute('data-running-config'));
-  assert.equal(await page.locator('#launch-panel-1 [data-elastic-controls]').count(),0);assert.equal(await page.locator('#launch-panel-6 [data-elastic-controls]').count(),1);assert.equal(await mode.inputValue(),'headroom');assert.equal(await ceiling.inputValue(),'384');assert.equal(await reserve.inputValue(),'768');
+  assert.equal(await page.locator('#launch-panel-1 [data-elastic-controls]').count(),0);assert.equal(await page.locator('#launch-panel-7 [data-elastic-controls]').count(),1);assert.equal(await mode.inputValue(),'headroom');assert.equal(await ceiling.inputValue(),'384');assert.equal(await reserve.inputValue(),'768');
   for(const input of [mode,ceiling,reserve])assert.equal(await input.isDisabled(),true);
   status={state:'stopped'};await page.waitForFunction(()=>!document.querySelector('[data-launch-root]').hasAttribute('data-running-config'));
   await mode.selectOption('workspace');assert.deepEqual(await preview(),['--threads','8','--elastic-experts']);assert.equal(await ceiling.isDisabled(),true);

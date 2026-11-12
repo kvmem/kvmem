@@ -1,5 +1,7 @@
 export const english: Record<string, string> = {
   "MTP 接受 / 提议": "MTP accepted / proposed",
+  "草稿接受 / 提议": "Draft accepted / proposed",
+  "跟随模型": "Model default",
 "排队中":"Queued",
 "预填充中":"Prefilling",
   "解码耗时": "Decode time",
