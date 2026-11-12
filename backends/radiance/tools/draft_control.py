@@ -23,7 +23,8 @@ def declared_integer(value):
     raise ValueError(f"invalid integer in native drafter metadata: {value!r}")
 
 
-def resolve(model, mode, depth=None):
+def resolve(model, mode, depth=None, *, inspected=None):
+    """Reuse a bounded inspect_rad result when the caller already read the directory."""
     if mode not in ("auto", "off", "mtp", "dflash"):
         raise ValueError(f"unknown drafter: {mode}")
     if depth is not None and depth < 0:
@@ -37,7 +38,7 @@ def resolve(model, mode, depth=None):
         return {"requested": mode, "depth": 0, "expected_native": "off"}
     if not model.is_file() or model.suffix.lower() != ".rad":
         raise ValueError("explicit drafter preflight currently requires a complete .rad container")
-    container = inspect(model)
+    container = inspect(model) if inspected is None else inspected
     if container["arch_id"] not in ("qwen35", "qwen35moe"):
         raise ValueError("explicit drafter selection is validated only for the pinned qwen35 plugin")
     meta = container["draft_metadata"]
