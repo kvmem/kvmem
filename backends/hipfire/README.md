@@ -88,6 +88,30 @@ default for a sampled config; the multi-slot DFlash VRAM ceiling (per-slot
 persistent rings, KVMem skips idle-session reclaim) is unchanged — use SLOTS=2 on
 a 20 GiB card.
 
+The fifth `batch-restore` patch batches the KVMem spill/restore transfers,
+verified byte-exact (`89e32856d` + all five patches reproduce `upstream.json`'s
+`patched_tree`). The controller previously copied each spilled/restored page with
+a blocking per-page, per-layer `hipMemcpy`; the patch gathers a chunk of pages
+into one reusable pinned slab (`PinnedTransferBuffer`, 64 MiB cap, allocated once
+so a larger chunk never re-page-locks mid-prefill) and moves it with
+stream-ordered async offset copies, draining the whole chunk at a single sync
+point before the host reads it (spill) or before `forward_step` reads it
+(restore). The copies ride the steady-copy stream when one is installed, else the
+legacy null stream — the same stream prefill compute uses, so ordering holds
+either way; this matters because the capture stream is only installed inside
+decode-graph capture, *after* `prepare_step`, so a stream-required batch would
+fall back to per-page exactly during the TTFT-critical prefill/restore. Spill
+still drains every read before any `stage_out_page` frees a physical page, and
+the whole batch completes inside Pass 1 before Pass 2 reuses a freed page.
+`HIPFIRE_KVMEM_BATCH_XFER=0` restores the exact per-page blocking path. Byte
+neutrality was gated on gfx1100 (N-gate): `HIPFIRE_KVMEM_VERIFY=1` reported 0
+readback mismatch over a 5k–17.5k-token over-budget needle sweep, greedy decode
+was bitwise-identical (sha256) on vs off, and recall was identical. The transfer
+component of `prepare` is ~11% faster batched (spill 31 pages 75.2 vs 86.5 ms,
+restore 30 pages 45.5 vs 49.7 ms); wall TTFT is parity at these host-RAM-spill
+scales because prefill compute dominates (prepare is ~1% of an 11.5 s prefill),
+and the transfer win grows with the restored page count.
+
 ## Enabling
 
 `HIPFIRE_KVMEM=1` on `hipfire serve`. Requires the paged Q8 KV pool (the only
@@ -110,6 +134,7 @@ forward.
 | `HIPFIRE_KVMEM_TRACE` | off | per-step residency diagnostics (`HIPFIRE_KVMEM_TRACE_PAGES=1` adds picked/restored page ids) |
 | `HIPFIRE_KVMEM_TIME` | off | per-step forward/tap timings + controller call breakdowns |
 | `HIPFIRE_KVMEM_VERIFY` | off | checksum every spilled/restored page and read the device block table back against the host table; 0 mismatch proves the spill/restore round is byte-exact |
+| `HIPFIRE_KVMEM_BATCH_XFER` | on | batch spill/restore through a pinned slab with stream-ordered async copies + one sync per chunk (byte-neutral); `0`/`off`/`false` restores the per-page blocking path |
 
 With `cap ≤ budget` nothing ever spills, the tap kernels only copy, and the
 forward is bit-identical to an unpatched hipfire. Spill/restore moves arena

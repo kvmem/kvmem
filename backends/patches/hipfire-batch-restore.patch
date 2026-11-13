@@ -1,0 +1,595 @@
+diff --git a/crates/hip-bridge/src/ffi.rs b/crates/hip-bridge/src/ffi.rs
+index d71d29835..6f56039d6 100644
+--- a/crates/hip-bridge/src/ffi.rs
++++ b/crates/hip-bridge/src/ffi.rs
+@@ -3903,6 +3903,50 @@ impl HipRuntime {
+         self.check(code, "hipMemcpyAsync H2D offset")
+     }
+ 
++    /// [`Self::memcpy_htod_async_at`] with an optional stream: `None` orders the
++    /// copy on the legacy null stream, for callers that have no stream installed
++    /// yet (e.g. KV residency transfers during prefill, before decode-graph
++    /// capture installs one). A pinned `src` makes this a plain stream-ordered
++    /// DMA; the caller keeps `src` unchanged until the stream reaches the copy.
++    pub fn memcpy_htod_async_at_on(
++        &self,
++        dst: &DeviceBuffer,
++        offset: usize,
++        src: &[u8],
++        stream: Option<&Stream>,
++    ) -> HipResult<()> {
++        self.plan_deny("hipMemcpyAsync H2D offset")?;
++        if hip_fault_consume(0, "upload") {
++            return Err(hip_fault_err("upload"));
++        }
++        if stream.is_none() {
++            crate::null_stream::note("hipMemcpyAsync H2D offset", std::panic::Location::caller());
++        }
++        assert!(
++            offset + src.len() <= dst.size,
++            "offset ({}) + source ({}) exceeds device buffer ({})",
++            offset,
++            src.len(),
++            dst.size
++        );
++        let span = sites::begin();
++        // SAFETY: the byte offset was bounds-checked against the DeviceBuffer size;
++        // `u8::add` stays in the same live allocation. Same-device/stream and
++        // host-buffer lifetime across the async copy are the caller's contract.
++        let code = unsafe {
++            (self.fn_memcpy_async)(
++                (dst.ptr as *mut u8).add(offset) as *mut c_void,
++                src.as_ptr() as *const c_void,
++                src.len(),
++                MemcpyKind::HostToDevice as c_uint,
++                stream.map_or(ptr::null_mut(), |s| s.0),
++            )
++        };
++        sites::end(span, SiteApi::MemcpyAsync, SiteDir::HtoD, src.len());
++        memory_effects::htod();
++        self.check(code, "hipMemcpyAsync H2D offset")
++    }
++
+     /// Host-asynchronous H→D copy ordered on `stream` (`None` = the legacy
+     /// stream, only when the caller has no stream). `src` must stay unchanged
+     /// until the stream reaches the copy; a pinned `src` makes this a plain
+@@ -3974,6 +4018,49 @@ impl HipRuntime {
+         self.check(code, "hipMemcpyAsync D2H")
+     }
+ 
++    /// [`Self::memcpy_dtoh_async`] from `src[src_offset..src_offset + dst.len()]`.
++    /// Ordered on `stream` (`None` = the legacy null stream, for callers with no
++    /// stream installed yet — e.g. KV residency transfers during prefill, before
++    /// decode-graph capture installs one). A pinned `dst` makes this a plain
++    /// stream-ordered DMA. The caller keeps `dst` unchanged until the stream
++    /// reaches the copy.
++    pub fn memcpy_dtoh_async_at(
++        &self,
++        dst: &mut [u8],
++        src: &DeviceBuffer,
++        src_offset: usize,
++        stream: Option<&Stream>,
++    ) -> HipResult<()> {
++        self.plan_deny("hipMemcpyAsync D2H offset")?;
++        if stream.is_none() {
++            crate::null_stream::note("hipMemcpyAsync D2H offset", std::panic::Location::caller());
++        }
++        assert!(
++            src_offset + dst.len() <= src.size,
++            "src_offset ({}) + dst len ({}) exceeds device buffer ({})",
++            src_offset,
++            dst.len(),
++            src.size
++        );
++        let span = sites::begin();
++        // SAFETY: the byte offset was bounds-checked against the DeviceBuffer
++        // size; `u8::add` stays in the same live allocation. Same-device/stream
++        // and host-buffer lifetime across the async copy are the caller's
++        // contract; Rust does not deref device ptrs.
++        let code = unsafe {
++            (self.fn_memcpy_async)(
++                dst.as_mut_ptr() as *mut c_void,
++                (src.ptr as *const u8).add(src_offset) as *const c_void,
++                dst.len(),
++                MemcpyKind::DeviceToHost as c_uint,
++                stream.map_or(ptr::null_mut(), |s| s.0),
++            )
++        };
++        sites::end(span, SiteApi::MemcpyAsync, SiteDir::DtoH, dst.len());
++        memory_effects::dtoh();
++        self.check(code, "hipMemcpyAsync D2H offset")
++    }
++
+     /// Async D→D copy with optional offsets on both sides. Ordered on
+     /// `stream` and capturable by hipStreamBeginCapture — use this in
+     /// place of sync `memcpy_dtod_at` wherever the copy needs to live
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index a4aa1eb36..f2a22509b 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -76,6 +76,14 @@ const DEFAULT_HOST_BYTES: u64 = 16 << 30;
+ /// Disk-tier capacity when `HIPFIRE_KVMEM_SPILL_DIR` is set.
+ const DEFAULT_SPILL_BYTES: u64 = 64 << 30;
+ 
++/// Upper bound on the reusable pinned transfer slab used by the batched
++/// spill/restore path (`HIPFIRE_KVMEM_BATCH_XFER`, default on). Pages are
++/// gathered into the slab in chunks of at most this many bytes, each chunk
++/// drained with ONE stream wait, so pinned host RAM stays bounded regardless
++/// of how many pages a step moves. A single page larger than the cap still
++/// fits (the slab grows to one page). Mirrors llama's 32 MiB stage-in slab.
++const XFER_SLAB_CAP: usize = 64 << 20;
++
+ fn env_raw(name: &str) -> Option<String> {
+     hipfire_config::developer_var(name)
+         .ok()
+@@ -117,6 +125,19 @@ fn time_flag() -> bool {
+     env_flag("HIPFIRE_KVMEM_TIME")
+ }
+ 
++/// `HIPFIRE_KVMEM_BATCH_XFER` (default on): gather spilled/restored pages into
++/// a reusable pinned slab and move each chunk with stream-ordered async copies
++/// drained by ONE wait, instead of a blocking null-stream memcpy per page per
++/// layer. Byte-neutral (same payloads, same arena offsets); set to `0` to fall
++/// back to the per-page path for A/B timing or rollback. The batched path also
++/// requires an active steady-copy stream and is skipped during graph capture.
++fn batch_xfer_flag() -> bool {
++    !matches!(
++        env_raw("HIPFIRE_KVMEM_BATCH_XFER").as_deref(),
++        Some("0") | Some("off") | Some("false")
++    )
++}
++
+ fn env_u64(name: &str) -> Option<u64> {
+     env_raw(name).and_then(|v| v.parse::<u64>().ok())
+ }
+@@ -281,6 +302,13 @@ pub struct KvMemCtl {
+     sums: Vec<f32>,
+     q_row: Vec<f32>,
+     counts: Vec<u32>,
++    /// Reusable pinned slab for the batched spill/restore path. Grown on demand
++    /// (never shrunk); each chunk is drained by a stream wait before the slab is
++    /// refilled, so no async copy is ever pending across a reuse or a drop.
++    xfer_slab: Option<hip_bridge::PinnedTransferBuffer>,
++    /// Resolved `HIPFIRE_KVMEM_BATCH_XFER` (default on). When false, or when no
++    /// steady-copy stream is active, spill/restore use the per-page path.
++    batch_xfer: bool,
+ }
+ 
+ impl KvMemCtl {
+@@ -375,6 +403,8 @@ impl KvMemCtl {
+             sums: vec![0f32; geom.n_fa_layers * q_width],
+             q_row: vec![0f32; q_width],
+             counts: vec![1u32; geom.n_fa_layers],
++            xfer_slab: None,
++            batch_xfer: batch_xfer_flag(),
+         })
+     }
+ 
+@@ -667,27 +697,17 @@ impl KvMemCtl {
+                 }
+                 (spill, restore)
+             };
+-            for (lp, phys) in &spill {
+-                let t = std::time::Instant::now();
+-                spill_page(
+-                    gpu,
+-                    &self.slots[s].raw,
+-                    &mut self.page_k,
+-                    &mut self.page_v,
+-                    k_arenas,
+-                    v_arenas,
+-                    self.k_page_bytes,
+-                    self.v_page_bytes,
+-                    *phys,
+-                    *lp,
+-                )?;
+-                pool.stage_out_page(SlotId(s), *lp)
+-                    .map_err(|e| format!("kvmem stage-out: {e}"))?;
+-                if timed {
+-                    t_spill += t.elapsed();
+-                    n_spilled += 1;
+-                }
+-            }
++            self.flush_spill_batch(
++                gpu,
++                pool,
++                s,
++                &spill,
++                k_arenas,
++                v_arenas,
++                timed,
++                &mut t_spill,
++                &mut n_spilled,
++            )?;
+             if self.trace {
+                 eprintln!(
+                     "[kvmem] slot {s} ({}): {pages} pages, full {full_pages}, \
+@@ -720,6 +740,10 @@ impl KvMemCtl {
+         }
+ 
+         // ── Pass 2: restore the selected spilled pages ──────────────────────
++        // Alloc + bind every selected page first (same order as before, so the
++        // free-list interaction is unchanged), then move all the bytes in one
++        // batched flush. No forward runs between bind and restore.
++        let mut restore_batch: Vec<(usize, usize, u32)> = Vec::new();
+         for s in 0..n_slots {
+             let Some(plan) = plans[s].take() else {
+                 continue;
+@@ -733,23 +757,7 @@ impl KvMemCtl {
+                     .map_err(|e| format!("kvmem restore alloc: {e}"))?;
+                 pool.bind_restored_page(SlotId(s), lp, phys)
+                     .map_err(|e| format!("kvmem restore bind: {e}"))?;
+-                let t = std::time::Instant::now();
+-                restore_page(
+-                    gpu,
+-                    &self.slots[s].raw,
+-                    &mut self.page_k,
+-                    &mut self.page_v,
+-                    k_arenas,
+-                    v_arenas,
+-                    self.k_page_bytes,
+-                    self.v_page_bytes,
+-                    phys,
+-                    lp,
+-                )?;
+-                if timed {
+-                    t_restore += t.elapsed();
+-                    n_restored += 1;
+-                }
++                restore_batch.push((s, lp, phys));
+             }
+             if verify_flag() {
+                 if let Some(bt) = pool.block_table(SlotId(s)) {
+@@ -774,6 +782,15 @@ impl KvMemCtl {
+                 }
+             }
+         }
++        self.flush_restore_batch(
++            gpu,
++            &restore_batch,
++            k_arenas,
++            v_arenas,
++            timed,
++            &mut t_restore,
++            &mut n_restored,
++        )?;
+         if timed && (n_spilled > 0 || n_restored > 0 || t_select > std::time::Duration::ZERO) {
+             eprintln!(
+                 "[kvmem-time] prepare: total {:.1} ms (select {:.1} ms, spill {} pages \
+@@ -788,6 +805,336 @@ impl KvMemCtl {
+         }
+         Ok(())
+     }
++
++    /// Grow the reusable pinned slab to at least `need` bytes. The previous
++    /// slab (if any) was drained by the prior chunk's stream wait, so dropping
++    /// it here frees no in-flight copy. The first allocation takes the whole
++    /// chunk cap (`XFER_SLAB_CAP`, or `need` when a single page exceeds it) so a
++    /// later, larger chunk never re-page-locks pinned memory mid-prefill —
++    /// `hipHostMalloc` is costly and would otherwise land in the TTFT path every
++    /// time the batch grows. Every chunk is `<= cap` by construction, so this
++    /// allocates at most once per controller.
++    fn ensure_xfer_slab(&mut self, gpu: &Gpu, need: usize) -> Result<(), String> {
++        if self.xfer_slab.as_ref().is_none_or(|b| b.size() < need) {
++            let alloc = need.max(XFER_SLAB_CAP);
++            self.xfer_slab = None;
++            let buf = gpu
++                .hip
++                .transfer_buffer(alloc)
++                .map_err(|e| format!("kvmem transfer slab alloc ({alloc} B): {e:?}"))?;
++            if time_flag() {
++                eprintln!("[kvmem-time] xfer slab alloc {alloc} B (need {need})");
++            }
++            self.xfer_slab = Some(buf);
++        }
++        Ok(())
++    }
++
++    /// Bytes one full page occupies in the slab across every arena (K+V).
++    fn page_xfer_bytes(&self) -> usize {
++        self.n_fa_layers * (self.k_page_bytes + self.v_page_bytes)
++    }
++
++    /// Spill this slot's selected pages (`(lp, phys)` list) to the host store.
++    /// Batched path: gather every page's K/V out of the arenas into the pinned
++    /// slab with stream-ordered async D2H, ONE wait per chunk, then write the
++    /// host payloads and mark each page spilled. All reads drain before any
++    /// `stage_out_page` frees a physical page, and the whole batch completes
++    /// inside Pass 1 before Pass 2 can reuse a freed page. The copies ride the
++    /// steady-copy stream when one is installed, else the legacy null stream —
++    /// the same stream prefill compute uses, so ordering holds either way. Falls
++    /// back to the per-page blocking path only when batching is off or a graph
++    /// is being captured.
++    #[allow(clippy::too_many_arguments)]
++    fn flush_spill_batch(
++        &mut self,
++        gpu: &Gpu,
++        pool: &mut SlotPool,
++        s: usize,
++        spills: &[(usize, u32)],
++        k_arenas: &[GpuTensor],
++        v_arenas: &[GpuTensor],
++        timed: bool,
++        t_spill: &mut std::time::Duration,
++        n_spilled: &mut usize,
++    ) -> Result<(), String> {
++        if spills.is_empty() {
++            return Ok(());
++        }
++        let stream = gpu.steady_copy_stream();
++        let batched = self.batch_xfer && !gpu.graphs.capture_mode;
++        if timed {
++            eprintln!(
++                "[kvmem-time] spill xfer={} pages={} stream={}",
++                if batched { "batch" } else { "page" },
++                spills.len(),
++                stream.is_some()
++            );
++        }
++        if !batched {
++            for &(lp, phys) in spills {
++                let t = std::time::Instant::now();
++                spill_page(
++                    gpu,
++                    &self.slots[s].raw,
++                    &mut self.page_k,
++                    &mut self.page_v,
++                    k_arenas,
++                    v_arenas,
++                    self.k_page_bytes,
++                    self.v_page_bytes,
++                    phys,
++                    lp,
++                )?;
++                pool.stage_out_page(SlotId(s), lp)
++                    .map_err(|e| format!("kvmem stage-out: {e}"))?;
++                if timed {
++                    *t_spill += t.elapsed();
++                    *n_spilled += 1;
++                }
++            }
++            return Ok(());
++        }
++        let per_page = self.page_xfer_bytes();
++        let chunk_pages = (XFER_SLAB_CAP / per_page).max(1);
++        let kpb = self.k_page_bytes;
++        let vpb = self.v_page_bytes;
++        let n_layers = self.n_fa_layers;
++        for chunk in spills.chunks(chunk_pages) {
++            let t = std::time::Instant::now();
++            self.ensure_xfer_slab(gpu, chunk.len() * per_page)?;
++            let slab = self
++                .xfer_slab
++                .as_mut()
++                .expect("transfer slab")
++                .as_bytes_mut();
++            // Phase A: async D2H gather every page/layer into the slab.
++            let mut off = 0usize;
++            for &(_lp, phys) in chunk {
++                for il in 0..n_layers {
++                    gpu.hip
++                        .memcpy_dtoh_async_at(
++                            &mut slab[off..off + kpb],
++                            &k_arenas[il].buf,
++                            phys as usize * kpb,
++                            stream,
++                        )
++                        .map_err(|e| format!("kvmem spill K read (layer {il}): {e:?}"))?;
++                    off += kpb;
++                    gpu.hip
++                        .memcpy_dtoh_async_at(
++                            &mut slab[off..off + vpb],
++                            &v_arenas[il].buf,
++                            phys as usize * vpb,
++                            stream,
++                        )
++                        .map_err(|e| format!("kvmem spill V read (layer {il}): {e:?}"))?;
++                    off += vpb;
++                }
++            }
++            // ONE wait drains the whole chunk before the host reads the slab.
++            match stream {
++                Some(s) => gpu.hip.stream_synchronize(s),
++                None => gpu.hip.stream_synchronize_default(),
++            }
++            .map_err(|e| format!("kvmem spill sync: {e:?}"))?;
++            // Phase B: write host payloads, then mark each page spilled.
++            let mut off = 0usize;
++            for &(lp, phys) in chunk {
++                let pos0 = (lp * KV_BLOCK_TOKENS) as u32;
++                for il in 0..n_layers {
++                    let ksrc = &slab[off..off + kpb];
++                    self.slots[s]
++                        .raw
++                        .write_layer_k_gpu(pos0, KV_BLOCK_TOKENS as u32, il as u32, ksrc)
++                        .map_err(|e| format!("kvmem spill K store (layer {il}): {e}"))?;
++                    off += kpb;
++                    let vsrc = &slab[off..off + vpb];
++                    self.slots[s]
++                        .raw
++                        .write_layer_v_gpu(pos0, KV_BLOCK_TOKENS as u32, il as u32, vsrc)
++                        .map_err(|e| format!("kvmem spill V store (layer {il}): {e}"))?;
++                    off += vpb;
++                    if il == 0 && verify_flag() {
++                        eprintln!(
++                            "[kvmem-verify] spill lp={lp} phys={phys} \
++                             k={:016x} v={:016x}",
++                            fnv64(ksrc),
++                            fnv64(vsrc)
++                        );
++                    }
++                }
++                pool.stage_out_page(SlotId(s), lp)
++                    .map_err(|e| format!("kvmem stage-out: {e}"))?;
++            }
++            if timed {
++                *t_spill += t.elapsed();
++                *n_spilled += chunk.len();
++            }
++        }
++        Ok(())
++    }
++
++    /// Restore the selected spilled pages (`(slot, lp, phys)` list, already
++    /// alloc'd and bound by the caller) back into the arenas. Batched path:
++    /// gather host payloads into the pinned slab, scatter them with
++    /// stream-ordered async H2D, ONE wait per chunk so every page is resident
++    /// before `forward_step`. The copies ride the steady-copy stream when one is
++    /// installed, else the legacy null stream — the same stream prefill compute
++    /// uses, so the restored bytes are visible to the next attention either way.
++    /// Falls back to the per-page blocking path only when batching is off or a
++    /// graph is captured.
++    #[allow(clippy::too_many_arguments)]
++    fn flush_restore_batch(
++        &mut self,
++        gpu: &Gpu,
++        batch: &[(usize, usize, u32)],
++        k_arenas: &[GpuTensor],
++        v_arenas: &[GpuTensor],
++        timed: bool,
++        t_restore: &mut std::time::Duration,
++        n_restored: &mut usize,
++    ) -> Result<(), String> {
++        if batch.is_empty() {
++            return Ok(());
++        }
++        let stream = gpu.steady_copy_stream();
++        let batched = self.batch_xfer && !gpu.graphs.capture_mode;
++        if timed {
++            eprintln!(
++                "[kvmem-time] restore xfer={} pages={} stream={}",
++                if batched { "batch" } else { "page" },
++                batch.len(),
++                stream.is_some()
++            );
++        }
++        if !batched {
++            for &(s, lp, phys) in batch {
++                let t = std::time::Instant::now();
++                restore_page(
++                    gpu,
++                    &self.slots[s].raw,
++                    &mut self.page_k,
++                    &mut self.page_v,
++                    k_arenas,
++                    v_arenas,
++                    self.k_page_bytes,
++                    self.v_page_bytes,
++                    phys,
++                    lp,
++                )?;
++                if timed {
++                    *t_restore += t.elapsed();
++                    *n_restored += 1;
++                }
++            }
++            return Ok(());
++        }
++        let per_page = self.page_xfer_bytes();
++        let chunk_pages = (XFER_SLAB_CAP / per_page).max(1);
++        let kpb = self.k_page_bytes;
++        let vpb = self.v_page_bytes;
++        let n_layers = self.n_fa_layers;
++        let verify = verify_flag();
++        for chunk in batch.chunks(chunk_pages) {
++            let t = std::time::Instant::now();
++            self.ensure_xfer_slab(gpu, chunk.len() * per_page)?;
++            let slab = self
++                .xfer_slab
++                .as_mut()
++                .expect("transfer slab")
++                .as_bytes_mut();
++            // Phase A: gather host payloads into the slab.
++            let mut off = 0usize;
++            for &(s, lp, _phys) in chunk {
++                let block = lp as u32;
++                for il in 0..n_layers {
++                    if !self.slots[s].raw.copy_k_gpu(
++                        block,
++                        il as u32,
++                        &mut slab[off..off + kpb],
++                        KV_BLOCK_TOKENS as u32,
++                    ) {
++                        return Err(format!(
++                            "kvmem restore: block {block} layer {il} has no K payload"
++                        ));
++                    }
++                    off += kpb;
++                    if !self.slots[s].raw.copy_v_gpu(
++                        block,
++                        il as u32,
++                        &mut slab[off..off + vpb],
++                        KV_BLOCK_TOKENS as u32,
++                    ) {
++                        return Err(format!(
++                            "kvmem restore: block {block} layer {il} has no V payload"
++                        ));
++                    }
++                    off += vpb;
++                }
++            }
++            // Phase B: async H2D scatter the slab into every arena page.
++            let mut off = 0usize;
++            for &(_s, _lp, phys) in chunk {
++                for il in 0..n_layers {
++                    gpu.hip
++                        .memcpy_htod_async_at_on(
++                            &k_arenas[il].buf,
++                            phys as usize * kpb,
++                            &slab[off..off + kpb],
++                            stream,
++                        )
++                        .map_err(|e| format!("kvmem restore K write (layer {il}): {e:?}"))?;
++                    off += kpb;
++                    gpu.hip
++                        .memcpy_htod_async_at_on(
++                            &v_arenas[il].buf,
++                            phys as usize * vpb,
++                            &slab[off..off + vpb],
++                            stream,
++                        )
++                        .map_err(|e| format!("kvmem restore V write (layer {il}): {e:?}"))?;
++                    off += vpb;
++                }
++            }
++            // ONE wait: every restored page is resident before forward_step.
++            match stream {
++                Some(s) => gpu.hip.stream_synchronize(s),
++                None => gpu.hip.stream_synchronize_default(),
++            }
++            .map_err(|e| format!("kvmem restore sync: {e:?}"))?;
++            // VERIFY: read back layer 0 of each page and compare to the slab.
++            if verify {
++                let mut off = 0usize;
++                for &(_s, lp, phys) in chunk {
++                    let ksrc = &slab[off..off + kpb];
++                    let vsrc = &slab[off + kpb..off + kpb + vpb];
++                    let mut rb_k = vec![0u8; kpb];
++                    let mut rb_v = vec![0u8; vpb];
++                    gpu.hip
++                        .memcpy_dtoh_at(&mut rb_k, &k_arenas[0].buf, phys as usize * kpb)
++                        .map_err(|e| format!("kvmem verify K readback (layer 0): {e:?}"))?;
++                    gpu.hip
++                        .memcpy_dtoh_at(&mut rb_v, &v_arenas[0].buf, phys as usize * vpb)
++                        .map_err(|e| format!("kvmem verify V readback (layer 0): {e:?}"))?;
++                    let mk = ksrc.iter().zip(&rb_k).filter(|(a, b)| a != b).count();
++                    let mv = vsrc.iter().zip(&rb_v).filter(|(a, b)| a != b).count();
++                    eprintln!(
++                        "[kvmem-verify] restore lp={lp} phys={phys} \
++                         k={:016x} v={:016x} readback_mismatch k={mk} v={mv}",
++                        fnv64(ksrc),
++                        fnv64(vsrc)
++                    );
++                    off += per_page;
++                }
++            }
++            if timed {
++                *t_restore += t.elapsed();
++                *n_restored += chunk.len();
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ /// Copy a full page's K/V bytes out of the arenas into the host store, then
