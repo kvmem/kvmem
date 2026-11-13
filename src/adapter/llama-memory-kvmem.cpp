@@ -4,6 +4,7 @@
 #include "llama-kvmem-snapshot-stats.h"
 #include "kvmem/retrieval_options.hpp"
 #include "llama-memory-kvmem-hybrid.h"
+#include "llama-memory-kvmem-iswa.h"
 #include "llama-memory-kvmem-mtp.h"
 
 #include "kvmem/mean_key_retrieval.hpp"
@@ -625,6 +626,18 @@ static uint32_t kvmem_n_attn_layers(const llama_model & model) {
     return c == 0 ? n : c;
 }
 
+// Attention layers whose KV this store owns when no borrowed cache fixes the
+// set. KV-shared layers have no storage of their own.
+static std::vector<uint32_t> kvmem_default_layers(const llama_model & model) {
+    std::vector<uint32_t> layers;
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        if (!model.hparams.is_recr(il) && model.hparams.has_kv(il)) {
+            layers.push_back(il);
+        }
+    }
+    return layers;
+}
+
 struct kvmem_pool_plan {
     uint32_t block_tokens = 32;
     uint32_t budget = 0;
@@ -664,7 +677,8 @@ static std::vector<ggml_backend_dev_t> kvmem_tensor_devices(const llama_model & 
 }
 
 static std::vector<uint64_t> kvmem_tensor_kv_row_bytes(
-        const llama_model & model, ggml_type type_k, ggml_type type_v, bool include_mtp) {
+        const llama_model & model, ggml_type type_k, ggml_type type_v, bool include_mtp,
+        const std::vector<uint32_t> * attn_layers = nullptr) {
     const size_t n_devices = model.get_split_state_ud.n_devices;
     std::vector<uint64_t> bytes(n_devices, 0);
     const uint32_t n_layers = include_mtp ? model.hparams.n_layer_all : model.hparams.n_layer();
@@ -677,6 +691,8 @@ static std::vector<uint64_t> kvmem_tensor_kv_row_bytes(
     if (!ctx) throw std::runtime_error("cannot allocate tensor KV split metadata");
     for (uint32_t il = 0; il < n_layers; ++il) {
         if (model.hparams.is_recr(il) || !model.hparams.has_kv(il)) continue;
+        if (attn_layers && il < model.hparams.n_layer() &&
+                !std::binary_search(attn_layers->begin(), attn_layers->end(), il)) continue;
         for (bool is_k : {true, false}) {
             // The draft context can choose a wider cache type than the target.
             const ggml_type type = il >= model.hparams.n_layer() ? GGML_TYPE_F32 : is_k ? type_k : type_v;
@@ -704,7 +720,8 @@ static kvmem_pool_plan kvmem_compute_pool(
         const llama_model & model,
         const llama_memory_params & params,
         const llama_cparams & cparams,
-        uint32_t borrowed_kv_size = 0) {
+        uint32_t borrowed_kv_size = 0,
+        const std::vector<uint32_t> * attn_layers = nullptr) {
     kvmem_pool_plan p;
     p.block_tokens = kvmem_current_execution().params.block_tokens ? kvmem_current_execution().params.block_tokens : 32u;
     uint32_t budget = kvmem_current_execution().params.budget;
@@ -719,8 +736,13 @@ static kvmem_pool_plan kvmem_compute_pool(
     uint32_t gen_reserve = kvmem_current_execution().params.gen_reserve ? kvmem_current_execution().params.gen_reserve : 256u;
     gen_reserve = kvmem_align_tokens(gen_reserve, p.block_tokens);
 
-    const uint32_t il0 = kvmem_first_attn_layer(model);
-    const uint32_t n_attn = kvmem_n_attn_layers(model);
+    std::vector<uint32_t> default_layers;
+    if (!attn_layers) {
+        default_layers = kvmem_default_layers(model);
+    }
+    const std::vector<uint32_t> & layers = attn_layers ? *attn_layers : default_layers;
+    const uint32_t il0 = layers.empty() ? kvmem_first_attn_layer(model) : layers.front();
+    const uint32_t n_attn = layers.empty() ? kvmem_n_attn_layers(model) : uint32_t(layers.size());
     const uint32_t n_embd_k = model.hparams.n_embd_k_gqa(il0);
     const uint32_t n_embd_v = model.hparams.n_embd_v_gqa(il0);
     const uint64_t k_row = ggml_row_size(params.type_k, n_embd_k);
@@ -741,17 +763,18 @@ static kvmem_pool_plan kvmem_compute_pool(
     for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
         auto * dev = model.dev_layer(static_cast<int>(il));
         if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-        if (model.hparams.is_recr(il)) {
-            if (cparams.n_rs_seq > 0) {
-                const uint64_t state = static_cast<uint64_t>(model.hparams.n_embd_r() + model.hparams.n_embd_s()) * sizeof(float);
-                // Match the five FP32 ReplaySSM record widths in llama_memory_recurrent.
-                const uint64_t records = (3 * uint64_t(model.hparams.ssm_n_group) * model.hparams.ssm_d_state +
-                        2 * uint64_t(model.hparams.ssm_d_inner) + 2 * uint64_t(model.hparams.ssm_dt_rank)) *
-                        sizeof(float) * (1 + cparams.n_rs_seq);
-                mtp_state_bytes[dev] += kvmem_current_execution().params.mtp_state == 2 ? state + records : state * (1 + cparams.n_rs_seq);
-            }
-            continue;
+        if (model.hparams.is_recr(il) && cparams.n_rs_seq > 0) {
+            const uint64_t state = static_cast<uint64_t>(model.hparams.n_embd_r() + model.hparams.n_embd_s()) * sizeof(float);
+            // Match the five FP32 ReplaySSM record widths in llama_memory_recurrent.
+            const uint64_t records = (3 * uint64_t(model.hparams.ssm_n_group) * model.hparams.ssm_d_state +
+                    2 * uint64_t(model.hparams.ssm_d_inner) + 2 * uint64_t(model.hparams.ssm_dt_rank)) *
+                    sizeof(float) * (1 + cparams.n_rs_seq);
+            mtp_state_bytes[dev] += kvmem_current_execution().params.mtp_state == 2 ? state + records : state * (1 + cparams.n_rs_seq);
         }
+    }
+    for (uint32_t il : layers) {
+        auto * dev = model.dev_layer(static_cast<int>(il));
+        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
         bytes_per_token[dev] += ggml_row_size(params.type_k, model.hparams.n_embd_k_gqa(il))
                               + ggml_row_size(params.type_v, model.hparams.n_embd_v_gqa(il));
     }
@@ -768,7 +791,8 @@ static kvmem_pool_plan kvmem_compute_pool(
         }
     }
     if (kvmem_tensor_multi_gpu(model) && borrowed_kv_size == 0) {
-        const auto rows = kvmem_tensor_kv_row_bytes(model, params.type_k, params.type_v, cparams.n_rs_seq > 0);
+        const auto rows = kvmem_tensor_kv_row_bytes(model, params.type_k, params.type_v,
+                cparams.n_rs_seq > 0, attn_layers);
         const auto devices = kvmem_tensor_devices(model);
         uint64_t state_reserve = 0;
         if (cparams.n_rs_seq > 0) {
@@ -873,8 +897,13 @@ static kvmem_pool_plan kvmem_compute_pool(
 uint32_t llama_kvmem_pool_cells(
         const llama_model & model,
         const llama_memory_params & params,
-        const llama_cparams & cparams) {
-    return kvmem_compute_pool(model, params, cparams).kv_size;
+        const llama_cparams & cparams,
+        const std::vector<uint32_t> * layers) {
+    return kvmem_compute_pool(model, params, cparams, 0, layers).kv_size;
+}
+
+bool llama_memory_kvmem::owns_layer(int32_t il) const {
+    return il >= 0 && std::binary_search(layers_.begin(), layers_.end(), static_cast<uint32_t>(il));
 }
 
 llama_memory_i * llama_memory_kvmem_maybe_create(
@@ -908,6 +937,11 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         return nullptr;
     }
     if (model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        // Gemma-4 offloads only the base (global) half; the SWA half keeps its
+        // native bounded window.
+        if (model.arch == LLM_ARCH_GEMMA4) {
+            return new llama_memory_kvmem_iswa(model, params, cparams);
+        }
         LLAMA_LOG_WARN("%s: KVMem skips SWA models\n", __func__);
         return nullptr;
     }
@@ -929,9 +963,26 @@ llama_memory_kvmem::llama_memory_kvmem(
     retr_.enabled = perf_.enabled;
     harvest_perf_emit_graph_line();
 
+    // A borrowed cache defines the owned layer subset (e.g. the base/global
+    // half of an iSWA model); otherwise every cached attention layer is ours.
+    layers_.clear();
+    if (ext_kv) {
+        for (uint32_t il : ext_kv->get_layer_ids()) {
+            if (model.hparams.has_kv(static_cast<int32_t>(il))) {
+                layers_.push_back(il);
+            }
+        }
+    }
+    if (layers_.empty()) {
+        layers_ = kvmem_default_layers(model);
+    }
+    std::sort(layers_.begin(), layers_.end());
+    layers_.erase(std::unique(layers_.begin(), layers_.end()), layers_.end());
+
     const kvmem_pool_plan pool = kvmem_compute_pool(
             model, params, cparams,
-            ext_kv && (model.n_devices() > 1 || kvmem_tensor_multi_gpu(model)) ? ext_kv->get_size() : 0);
+            ext_kv && (model.n_devices() > 1 || kvmem_tensor_multi_gpu(model)) ? ext_kv->get_size() : 0,
+            &layers_);
     block_tokens_ = pool.block_tokens;
     kv_size_ = pool.kv_size;
     n_slots_ = pool.n_slots;
@@ -1022,13 +1073,32 @@ llama_memory_kvmem::llama_memory_kvmem(
 
     reset_slots();
 
-    const uint32_t il0 = kvmem_first_attn_layer(model);
+    const uint32_t il0 = layers_.empty() ? kvmem_first_attn_layer(model) : layers_.front();
     n_layer_ = model.hparams.n_layer();
     n_embd_head_ = model.hparams.n_embd_head_k(il0);
     n_head_kv_ = model.hparams.n_head_kv(il0);
     n_head_ = model.hparams.n_head(il0);
     n_embd_k_ = model.hparams.n_embd_k_gqa(il0);
     n_embd_v_ = model.hparams.n_embd_v_gqa(il0);
+    // The host store is keyed by il but has one uniform row width.
+    for (uint32_t il : layers_) {
+        if (model.hparams.n_embd_k_gqa(il) != n_embd_k_ ||
+                model.hparams.n_embd_v_gqa(il) != n_embd_v_) {
+            LLAMA_LOG_WARN("%s: owned layers mix KV widths (layer %u is %ux%u); "
+                    "host KV uses layer %u's geometry\n", __func__, il,
+                    model.hparams.n_embd_k_gqa(il), model.hparams.n_embd_v_gqa(il), il0);
+            break;
+        }
+    }
+    sampled_layers_.clear();
+    if (!layers_.empty()) {
+        sampled_layers_.push_back(static_cast<int>(layers_.front()));
+        sampled_layers_.push_back(static_cast<int>(layers_[layers_.size() / 2]));
+        sampled_layers_.push_back(static_cast<int>(layers_.back()));
+        std::sort(sampled_layers_.begin(), sampled_layers_.end());
+        sampled_layers_.erase(std::unique(sampled_layers_.begin(), sampled_layers_.end()),
+                              sampled_layers_.end());
+    }
     rope_.n_rot = model.hparams.n_rot(il0);
     rope_.n_embd_head = n_embd_head_;
     rope_.n_head_kv = n_head_kv_;
@@ -1077,8 +1147,8 @@ llama_memory_kvmem::llama_memory_kvmem(
             method_ == 1 ? "retrieval" : "recency",
             (int) kvmem_current_execution().params.harvest_v,
             ggml_type_name(type_k_), ggml_type_name(type_v_),
-            n_embd_k_, kvmem_n_attn_layers(model),
-            ext_kv ? " hybrid_attn" : "");
+            n_embd_k_, layers_.empty() ? kvmem_n_attn_layers(model) : uint32_t(layers_.size()),
+            ext_kv ? " borrowed_attn" : "");
     kvmem_diag("KVMEM_KV_BYTES bytes=%zu cells=%u slots=%u budget=%u pool=%u "
             "ratio=%.2f high=%.2f low=%.2f cap_blocks=%u gpu_total=%llu block_bytes=%llu\n",
             kv_bytes, kv_size_, n_slots_, pool.budget, kv_size_,
@@ -2880,7 +2950,7 @@ void llama_memory_kvmem::note_ubatch_pos(const std::vector<llama_pos> & pos) {
 }
 
 void llama_memory_kvmem::register_capture(ggml_tensor * t, int il, char which) {
-    if (!t) {
+    if (!t || !owns_layer(il)) {
         return;
     }
     pending_capture_.push_back({t, il, which});
@@ -3716,7 +3786,7 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
     if (which == 'v') {
         return;
     }
-    if (!host || il < 0 || static_cast<uint32_t>(il) >= n_layer_ || cur_pos_.empty()) {
+    if (!host || il < 0 || static_cast<uint32_t>(il) >= n_layer_ || !owns_layer(il) || cur_pos_.empty()) {
         return;
     }
     // The worker calls this through `this`, and a store swap moves raw_ and
@@ -3763,7 +3833,7 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
     if (which == 'v') {
         return;
     }
-    if (!t || il < 0 || static_cast<uint32_t>(il) >= n_layer_) {
+    if (!t || il < 0 || static_cast<uint32_t>(il) >= n_layer_ || !owns_layer(il)) {
         return;
     }
     if (cur_pos_.empty()) {

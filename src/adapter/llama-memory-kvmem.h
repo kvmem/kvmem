@@ -203,6 +203,13 @@ public:
     uint32_t n_embd_k() const { return n_embd_k_; }
     uint32_t n_embd_v() const { return n_embd_v_; }
 
+    // Layers this store owns. A borrowed cache may hold only a subset of the
+    // model's attention layers (the base/global half of an iSWA model); other
+    // layers keep their native cache and must not be captured or sized here.
+    const std::vector<uint32_t> & layers() const { return layers_; }
+    bool owns_layer(int32_t il) const;
+    const std::vector<int> & sampled_layers() const { return sampled_layers_; }
+
     kvmem::RawKvStore & raw() { return *raw_; }
 
     // One conversation's host KV, moved out of this object and back in so N
@@ -460,6 +467,8 @@ private:
 
     kvmem::RopeConfig rope_{};
     uint32_t n_layer_ = 0;
+    std::vector<uint32_t> layers_;
+    std::vector<int> sampled_layers_;
     uint32_t n_embd_k_ = 0;
     uint32_t n_embd_v_ = 0;
     uint32_t n_head_ = 0;
@@ -562,8 +571,10 @@ private:
 
 // GPU attn-cache cell count for a KVMem slot pool (budget + gen_reserve,
 // clamped to n_ctx on identity). Hybrid uses this as llama_memory_hybrid's
-// attn kv_size so the two halves agree.
+// attn kv_size so the two halves agree. `layers` restricts the pool geometry
+// to a layer subset (iSWA base half); null means every cached attention layer.
 uint32_t llama_kvmem_pool_cells(
         const llama_model & model,
         const llama_memory_params & params,
-        const llama_cparams & cparams);
+        const llama_cparams & cparams,
+        const std::vector<uint32_t> * layers = nullptr);
