@@ -43,6 +43,10 @@ module.exports=async({browser,base,info})=>{
   await openAdvanced();assert.equal(await field('GraphAlpha').isDisabled(),true);
   assert.equal(await field('GraphAlpha').inputValue(),'0.2','locked launch settings retain the submitted value');
   assert.equal(await page.locator('[data-runtime-key="GraphAlpha"] .s-runtime-value').textContent(),'0.7','the observed report remains distinct from launch settings');
+  runtime={state:'stopped'};await page.reload();await field('Backend').waitFor();
+  await page.locator('[data-preset=ninfer-quality]').click();
+  assert.equal(await field('QueryMaxTokens').inputValue(),'0','built-in NInfer recipe uses full Query');
+  assert.equal(await field('QueryReplayMaxTokens').inputValue(),'0','built-in NInfer recipe uses complete replay');
   if(process.env.SCREENSHOT_DIR)await page.screenshot({path:process.env.SCREENSHOT_DIR+'/query-scoring.png',fullPage:true});
   assert.deepEqual(errors,[]);
  }finally{await context.close();}
