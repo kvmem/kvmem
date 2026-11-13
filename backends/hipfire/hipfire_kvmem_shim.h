@@ -157,6 +157,23 @@ int hk_mean_key_retrieval_scores(const hk_raw_store * keys, uint32_t blocks,
                                  uint32_t layers, uint32_t head_dim, uint32_t query_heads,
                                  uint32_t kv_heads, uint32_t aggregation, double * out);
 
+// ── query-span page-softmax retrieval ──
+// Multi-row Q scoring: `q_data` carries `layers * rows * query_heads * head_dim`
+// F32 post-RMSNorm/pre-RoPE Q rows (layer/token/head/channel order);
+// `layer_rows[l]` is the number of present rows for layer l (<= rows). The
+// accepted index is frozen into a QueryScoreFrame from `accepted_through` /
+// `block_tokens` / `budget_blocks` / `sink_blocks` / `recent_blocks`, then each
+// block's softmax mass is averaged over the query rows (FP16-rounded operands,
+// scale 1/sqrt(head_dim) when `attention_scale` is 0). `blocks` must equal the
+// frame's block count. Scores are written per block; HK_OK or HK_ERR.
+int hk_page_softmax_scores(const hk_raw_store * keys, uint32_t blocks,
+                           uint64_t accepted_through, uint32_t block_tokens,
+                           uint32_t budget_blocks, uint32_t sink_blocks,
+                           uint32_t recent_blocks, const float * q_data,
+                           const uint32_t * layer_rows, uint32_t layers, uint32_t rows,
+                           uint32_t query_heads, uint32_t kv_heads, uint32_t head_dim,
+                           float attention_scale, uint32_t aggregation, double * out);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

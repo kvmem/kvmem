@@ -20,6 +20,7 @@ restores it.
 | Multi-slot spec-decode admission fix: `--spec mtp`/`dflash` engage under the router's default penalized+sampled requests (exact-AR penalty prepass + greedy/point-mass sampled verify, shared `SpecRetire`) | `../patches/hipfire-spec-accept.patch` |
 | Batched spill/restore: pinned-slab stream-ordered async page copies with one sync per chunk (byte-neutral; `HIPFIRE_KVMEM_BATCH_XFER=0` restores per-page blocking) | `../patches/hipfire-batch-restore.patch` |
 | Opt-in residency-selection policy knobs: `SELECT_METHOD` (retrieval/recency), LRFU decaying heavy-hitter history (round lifecycle wired through the shim + crate FFI), GPU high/low watermark hysteresis band; defaults byte-neutral | `../patches/hipfire-policy-knobs.patch` |
+| Query-span multi-row Q scoring: `QUERY_SPAN` (1 = mean-K cosine, byte-neutral; >1 = page-softmax over a per-slot host Q ring), `query_score_frame` + `page_softmax_scores` wrapped through the shim + crate FFI; zero VRAM growth | `../patches/hipfire-query-span.patch` |
 
 The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
 `KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
@@ -161,6 +162,63 @@ over-budget requests with distinct needles, both slots running) keeps each slot'
 LRFU round isolated: both requests recall their own passphrase with 0 round
 errors and 0 readback mismatch.
 
+The seventh `query-span` patch adds multi-row Q scoring for retrieval selection,
+verified byte-exact (`89e32856d` + all seven patches reproduce `upstream.json`'s
+`patched_tree`). `HIPFIRE_KVMEM_QUERY_SPAN` (default `1`, range `[1,512]`) chooses
+how many recent Q rows feed the resident-set ranking. At `1` the controller keeps
+the historical path: each layer contributes its single tapped last Q row
+(post-RMSNorm, pre-RoPE) scored by `mean_key_retrieval_scores` (mean-K cosine),
+so the default is byte-identical. At `>1` a per-slot host Q ring
+(`[n_fa_layers × span × q_width]`, layer-major) accumulates the recent Q rows —
+fed each step from the *existing* `q_tap` via `read_q_slot`, so there is zero VRAM
+growth (the ring lives in host RAM) — and selection scores resident pages by
+`page_softmax_scores` (FP16-rounded operands, per-row softmax mass, scale
+`1/√head_dim`, Mean GQA aggregation) over the span. The ring is reset on slot
+reset and at each request boundary so a new turn never inherits the previous Q
+span. The C ABI entry `hk_page_softmax_scores` wraps `query_score_frame` +
+`page_softmax_scores` in the kvmem-repo shim (`hipfire_kvmem_shim.{h,cpp}`, a
+separate kvmem commit); the crate FFI (`crates/hipfire-kvmem/src/lib.rs`) and the
+controller ring + branch (`crates/hipfire-arch-qwen35/src/kvmem_ctl.rs`) are the
+hipfire patch. The two scoring functions are mathematically distinct (cosine vs
+softmax); `span=1` keeps the old path entirely, so there is no bit-identity
+concern between them. The knob only affects the scored `SELECT_METHOD=retrieval`
+branch and is exposed through the same three layers — engine env, router
+parameter spec, wrapper docs — not the embedded `/ui`.
+
+Byte neutrality was gated on gfx1100 (N-gate): with no `QUERY_SPAN` env (and with
+`QUERY_SPAN=1` explicit) the greedy decode sha256 still equals the policy-knobs
+baseline `29e8a27d…` (cross-build bit-identity), recall is identical
+(`True/True/False` over the 8k/16k/28k over-budget needle sweep), and
+`HIPFIRE_KVMEM_VERIFY=1` reports 0 readback mismatch (225 spill checksums). The
+under-budget greedy decode is bitwise-identical across *every* span (selection
+never fires without spill), confirming the kernel path is untouched. Each
+`span>1` passed its own B-gate: `span16/64/256` keep recall `True/True/False`
+(== default) with 0 mismatch and decode parity within 10% on all three targets.
+Sustained decode (256-token generation) confirms no throughput regression:
+over-budget with the span active 13.9 tok/s vs default 14.3, and under-budget
+kernel-neutral 39.85–39.93 tok/s sustained vs default 40.44 — the ring D2H read +
+page-softmax overhead is negligible. A `TRACE=1` activity probe proves `span>1`
+genuinely computes multi-row page-softmax rather than silently falling back:
+`span=1` emits zero query-span lines, while `span=64` emits `rows>1` selections
+whose `score_sum` equals the row count exactly (11.0000 / 12.0000 for 11 / 12
+rows) — the fingerprint of per-row softmax normalization (each Q row contributes
+total probability mass 1.0), distinct from mean-K cosine. Two-slot concurrency
+(`SLOTS=2`, two simultaneous over-budget requests with distinct needles) keeps
+each slot's Q ring isolated: both requests recall their own passphrase with 0
+readback mismatch and no page-softmax/controller error. A ten-SKU recall sweep
+under `QUERY_SPAN=64` (escha / escha-pro / escha-xt, Bonsai tq2 / bq1, mq3 /
+mq3-pro / mq3-xt, mq4-xt / mq4-xts) confirms the ring geometry adapts per model
+(each SKU's `n_fa_layers × q_width`): all ten recall their over-budget needle
+(10/10) with 0 readback mismatch and no controller or admission error.
+
+A note on discrimination: a two-needle compound probe (vault at 25%, backup at
+75%, one compound question) shows identical recall across `span1/64/256`. This is
+a homogeneous-filler limitation, not an inactive span: when the filler is uniform
+both mean-K and page-softmax rank the needle block highest, so selection
+coincides. The `TRACE=1` score-sum fingerprint above is the definitive activity
+evidence; recall discrimination between the two scoring functions requires
+heterogeneous filler and is left to the long-needle sweep rather than gated here.
+
 ## Enabling
 
 `HIPFIRE_KVMEM=1` on `hipfire serve`. Requires the paged Q8 KV pool (the only
@@ -190,6 +248,7 @@ forward.
 | `HIPFIRE_KVMEM_LRFU_TOP` | 0.9 | LRFU hit fraction gating positive reinforcement, in `(0,1]`; scores below the `(1−top)` quantile are clamped to ≤0 so an unselected block is never rewarded |
 | `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` | — (0.95) | spill-trigger ratio of the resident budget. Setting **either** watermark enables the hysteresis band; the unset one defaults to 0.95/0.85. Must satisfy `0 < low ≤ high ≤ 1` |
 | `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | — (0.85) | keep-target ratio of the resident budget; narrows the core selection budget so residency stays below the trigger. The band can only make residency more conservative, never overshoot the physical pool |
+| `HIPFIRE_KVMEM_QUERY_SPAN` | 1 | retrieval query span in `[1,512]`. `1` scores the single tapped last Q row by mean-K cosine (byte-identical to the historical path); `>1` accumulates a per-slot host Q ring of recent post-RMSNorm/pre-RoPE Q rows and scores resident pages by `page_softmax_scores` (FP16-rounded operands, per-row softmax mass, scale `1/√head_dim`). Zero VRAM growth (the ring lives in host RAM); only affects `SELECT_METHOD=retrieval` |
 
 With `cap ≤ budget` nothing ever spills, the tap kernels only copy, and the
 forward is bit-identical to an unpatched hipfire. Spill/restore moves arena

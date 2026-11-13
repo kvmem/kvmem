@@ -5,6 +5,7 @@
 
 #include <kvmem/host_kv_storage.hpp>
 #include <kvmem/kvmem_store.hpp>
+#include <kvmem/graph_recall.hpp>
 #include <kvmem/mean_key_retrieval.hpp>
 #include <kvmem/raw_kv_store.hpp>
 #include <kvmem/spill_io.hpp>
@@ -485,6 +486,56 @@ extern "C" int hk_mean_key_retrieval_scores(const hk_raw_store * keys, uint32_t 
         set_error(e.what());
     } catch (...) {
         set_error("hk_mean_key_retrieval_scores: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+extern "C" int hk_page_softmax_scores(const hk_raw_store * keys, uint32_t blocks,
+                                      uint64_t accepted_through, uint32_t block_tokens,
+                                      uint32_t budget_blocks, uint32_t sink_blocks,
+                                      uint32_t recent_blocks, const float * q_data,
+                                      const uint32_t * layer_rows, uint32_t layers, uint32_t rows,
+                                      uint32_t query_heads, uint32_t kv_heads, uint32_t head_dim,
+                                      float attention_scale, uint32_t aggregation, double * out) {
+    clear_error();
+    if (!keys || !keys->impl || !q_data || !layer_rows || !out || layers == 0 ||
+        rows == 0 || head_dim == 0 || query_heads == 0 || kv_heads == 0 ||
+        block_tokens == 0 || budget_blocks == 0) {
+        set_error("hk_page_softmax_scores: invalid arguments");
+        return HK_ERR;
+    }
+    if (aggregation > 1) {
+        set_error("hk_page_softmax_scores: unknown aggregation");
+        return HK_ERR;
+    }
+    try {
+        const kvmem::QueryScoreFrame frame = kvmem::query_score_frame(
+            accepted_through, block_tokens, budget_blocks, sink_blocks, recent_blocks, {});
+        if (frame.starts.size() != blocks) {
+            set_error("hk_page_softmax_scores: frame block count mismatch");
+            return HK_ERR;
+        }
+        kvmem::PageQueryView view;
+        view.data = q_data;
+        view.layer_rows = layer_rows;
+        view.layers = layers;
+        view.rows = rows;
+        view.query_heads = query_heads;
+        view.kv_heads = kv_heads;
+        view.head_dim = head_dim;
+        view.attention_scale = attention_scale;
+        const std::vector<double> scores = kvmem::page_softmax_scores(
+            *keys->impl, view, frame, static_cast<kvmem::GqaScoreAggregation>(aggregation));
+        if (scores.size() != blocks) {
+            set_error("hk_page_softmax_scores: score count mismatch");
+            return HK_ERR;
+        }
+        std::memcpy(out, scores.data(), scores.size() * sizeof(double));
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_page_softmax_scores: unknown C++ exception");
     }
     return HK_ERR;
 }
