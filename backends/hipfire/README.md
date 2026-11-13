@@ -17,6 +17,7 @@ restores it.
 | Paged spill primitives (sentinel, page ops, kernel masks, paged split-K verify kernel) | `../patches/hipfire-paged-spill.patch` |
 | Statistics taps, controller, serve wiring; escha-dense baseline, Bonsai TQ2/BQ1 slots admission | `../patches/hipfire-kvmem.patch` |
 | RDNA3 (gfx1100) operator pass: MQ3G256V2 q8x verify decode, real escha grouped-WMMA batched prefill (replaces the `kvmem` patch's `prefill_chunk=1` stopgap), escha-pro/xt F16 in_proj handling | `../patches/hipfire-rdna3-opt.patch` |
+| Multi-slot spec-decode admission fix: `--spec mtp`/`dflash` engage under the router's default penalized+sampled requests (exact-AR penalty prepass + greedy/point-mass sampled verify, shared `SpecRetire`) | `../patches/hipfire-spec-accept.patch` |
 
 The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
 `KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
@@ -53,8 +54,8 @@ unchanged, and the fp16-x scratch marker invalidation the old patch added is
 now enforced by upstream's `fp16_x_scratch_writable`.
 
 The third `rdna3-opt` patch is a gfx1100 (RDNA3) operator pass on top of that
-integration, verified byte-exact (`89e32856d` + the three patches reproduce
-`upstream.json`'s `patched_tree`). It removes the `kvmem` patch's escha prefill
+integration, verified byte-exact (`89e32856d` + the first three patches reproduce
+its `after_tree`). It removes the `kvmem` patch's escha prefill
 stopgap — that patch forced `prefill_chunk=1` so every prefill row ran through
 the lowered paged decode path — and replaces it with a real grouped-WMMA
 batched-prefill trellis arm in `forward_slots` (one weight read per
@@ -68,6 +69,24 @@ actual in_proj dtypes). For decode it adds a 3-bit MQ3G256V2 arm to the gfx1100
 q8x verify kernels (bit-exact vs the reference GEMV), lifting MQ3 MTP decode
 36.8 -> 45.9 tok/s (+24.7%); q8x verify only activates at batch>=2 (MTP spec
 decode), so SPEC=off is unaffected.
+
+The fourth `spec-accept` patch fixes multi-slot speculative-decode admission so
+`--spec mtp`/`dflash` actually engage under the router's default sampling,
+verified byte-exact (`89e32856d` + all four patches reproduce `upstream.json`'s
+`patched_tree`). The cold-admit gates previously required
+`!request_penalized && !request_sampled`, so the engine default
+`repeat_penalty=1.05` plus a router-injected `presence_penalty` and `temp>0`
+silently forced every slot back to plain AR (DFlash throughput == AR). The patch
+drops those gates and runs an exact-AR penalty prepass
+(`spec_apply_verify_penalties`) before greedy argmax OR point-mass sampled
+acceptance (`mtp_sampled_accept`, `point_mass=true` — DFlash2 proposals are
+deterministic q=δ(c)); MTP and DFlash share `SpecRetire`. A/B at SLOTS=2 on
+gfx1100: DFlash greedy-neutral prose 40→54.8 tok/s and code 40→93.7, MTP sampled
+prose 40→57.1. Sampled+penalty DFlash can still net-lose on prose (the greedy
+selector's proposals mismatch the penalized nucleus), so MTP is the better
+default for a sampled config; the multi-slot DFlash VRAM ceiling (per-slot
+persistent rings, KVMem skips idle-session reclaim) is unchanged — use SLOTS=2 on
+a 20 GiB card.
 
 ## Enabling
 
