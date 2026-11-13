@@ -1,0 +1,4087 @@
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_layout.rs b/crates/hipfire-arch-qwen35/src/layerwise_layout.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a651509772510c04903bcbe62ad3877851e795d4
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/layerwise_layout.rs
+@@ -0,0 +1,224 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Q8 packed-page layout adapter for the layerwise subsystem (Phase 3.2 ①地基).
++//!
++//! The hipfire analog of ninfer's `native_window_descriptor`: it walks hipfire's
++//! Q8 KV geometry and fills the core GENERIC `kvmem::PayloadLayout` manifest
++//! (layer-major {Key, Value} per fa layer, `token_stride == k_gpu_row_bytes`,
++//! Q8 scales inline). The core `raw_kv_payload_layout` bridge accepts Key/Value
++//! token-row planes directly, so no separate scale plane / `NativeKvArchive`
++//! generic path is needed (design §3.4).
++//!
++//! Clean sibling to the legacy [`crate::kvmem_ctl`]: this adapter is NOT wired
++//! into the live serve allocation in sub-patch ①, so Legacy stays byte-neutral.
++//! It reuses the engine's OWN stride authority ([`SlotKvTierPlan::resolve`]) so
++//! the manifest can never drift from the arena the kernels actually walk, and
++//! bridges to the crate-agnostic [`PackedArenaLayout`] so a composite slot's
++//! byte layout is provably identical to the core record (see the tests).
++
++use hipfire_kvmem::{PayloadLayout, RawStoreConfig};
++use rdna_compute::layerwise_pool::PackedArenaLayout;
++use saddle_core::kv::{KvMode, SlotKvTierPlan};
++
++/// Backend-owned manifest identity for the hipfire Q8 packed-page record.
++pub const Q8_PACKED_FORMAT: &str = "hipfire-q8-packed-v1";
++
++/// Tokens per composite page — the engine page size (`KV_BLOCK_TOKENS` /
++/// `PAGE_TOKENS`). Kept as a literal here so the adapter has no legacy import.
++pub const LAYERWISE_BLOCK_TOKENS: u32 = 128;
++
++/// Resolved Q8 packed-page geometry: the core [`RawStoreConfig`] bridge inputs,
++/// the per-position K/V strides, and the fa-layer manifest list.
++///
++/// `fa_layers` carries the layer IDs the core `RawStore` is indexed by. hipfire's
++/// controller stores packed rows by fa ORDINAL (`0..n_fa_layers`), so the caller
++/// passes ordinals here and `n_layer_total == n_fa_layers`; the model-layer ↔
++/// ordinal mapping is the sub-patch ② catalog's concern.
++#[derive(Debug, Clone)]
++pub struct LayerwiseQ8Layout {
++    raw_cfg: RawStoreConfig,
++    k_stride: usize,
++    v_stride: usize,
++    fa_layers: Vec<u32>,
++}
++
++impl LayerwiseQ8Layout {
++    /// Resolve from model geometry. `n_layer_total` is the core store's layer
++    /// count (`cfg.n_layer`); `fa_layers` the attention-layer IDs to manifest
++    /// (non-empty, unique, each `< n_layer_total`). K/V strides come from the
++    /// engine's Q8 tier plan (`n_kv_heads * (head_dim / 32) * 34`, scales inline).
++    /// Fails closed on bad geometry — never silently defaults.
++    pub fn resolve(
++        n_layer_total: usize,
++        n_kv_heads: usize,
++        head_dim: usize,
++        fa_layers: &[u32],
++    ) -> Result<Self, String> {
++        if n_layer_total == 0 || n_layer_total > u32::MAX as usize {
++            return Err(format!(
++                "layerwise Q8 layout: n_layer_total {n_layer_total} out of range"
++            ));
++        }
++        if fa_layers.is_empty() {
++            return Err("layerwise Q8 layout: empty attention-layer list".to_string());
++        }
++        let mut seen = std::collections::HashSet::with_capacity(fa_layers.len());
++        for &layer in fa_layers {
++            if layer as usize >= n_layer_total {
++                return Err(format!(
++                    "layerwise Q8 layout: fa layer {layer} >= n_layer_total {n_layer_total}"
++                ));
++            }
++            if !seen.insert(layer) {
++                return Err(format!("layerwise Q8 layout: duplicate fa layer {layer}"));
++            }
++        }
++        // The engine's own Q8 stride authority (validates head_dim % 32, etc.).
++        let plan = SlotKvTierPlan::resolve(KvMode::Q8, n_kv_heads, head_dim)
++            .map_err(|e| format!("layerwise Q8 layout: {e}"))?;
++        let k_stride = plan.k_bytes_per_pos;
++        let v_stride = plan.v_bytes_per_pos;
++        let k_width = n_kv_heads
++            .checked_mul(head_dim)
++            .ok_or_else(|| "layerwise Q8 layout: kv_dim overflowed".to_string())?;
++        let raw_cfg = RawStoreConfig {
++            n_layer: n_layer_total as u32,
++            n_embd_k: k_width as u32,
++            n_embd_v: k_width as u32,
++            block_tokens: LAYERWISE_BLOCK_TOKENS,
++            // Opaque packed rows: the packed stride lives in *_gpu_row_bytes.
++            k_row_bytes: 0,
++            k_gpu_row_bytes: k_stride as u64,
++            v_gpu_row_bytes: v_stride as u64,
++        };
++        Ok(Self {
++            raw_cfg,
++            k_stride,
++            v_stride,
++            fa_layers: fa_layers.to_vec(),
++        })
++    }
++
++    /// The core store bridge config (matches the legacy controller's convention).
++    pub fn raw_config(&self) -> &RawStoreConfig {
++        &self.raw_cfg
++    }
++    pub fn k_stride(&self) -> usize {
++        self.k_stride
++    }
++    pub fn v_stride(&self) -> usize {
++        self.v_stride
++    }
++    pub fn fa_layers(&self) -> &[u32] {
++        &self.fa_layers
++    }
++
++    /// Build the core generic `PayloadLayout` manifest (layer-major {Key, Value}
++    /// per fa layer). One record == one canonical page == one composite slot.
++    pub fn payload_layout(&self) -> Result<PayloadLayout, String> {
++        PayloadLayout::from_raw(&self.raw_cfg, Q8_PACKED_FORMAT, &self.fa_layers)
++            .map_err(|e| format!("layerwise Q8 layout: {e}"))
++    }
++
++    /// The crate-agnostic packed arena geometry for `n_slots` composite slots.
++    /// Its `slot_bytes()` equals [`Self::payload_layout`]'s `record_bytes()`, and
++    /// its per-layer plane offsets equal the manifest plane offsets — so a sealed
++    /// archive layer region maps straight onto a slot stripe with no repacking.
++    pub fn packed_arena_layout(&self, n_slots: usize) -> Result<PackedArenaLayout, String> {
++        PackedArenaLayout::new(
++            n_slots,
++            self.fa_layers.len(),
++            LAYERWISE_BLOCK_TOKENS as usize,
++            self.k_stride,
++            self.v_stride,
++        )
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use hipfire_kvmem::PayloadPlaneKind;
++
++    /// Q8 geometry: 4 KV heads × head_dim 256 → 4 * 8 * 34 = 1088 bytes/pos.
++    fn resolved() -> LayerwiseQ8Layout {
++        LayerwiseQ8Layout::resolve(2, 4, 256, &[0, 1]).unwrap()
++    }
++
++    #[test]
++    fn resolve_q8_strides_and_raw_config() {
++        let l = resolved();
++        assert_eq!(l.k_stride(), 1088);
++        assert_eq!(l.v_stride(), 1088);
++        let cfg = l.raw_config();
++        assert_eq!(cfg.n_layer, 2);
++        assert_eq!(cfg.n_embd_k, 4 * 256);
++        assert_eq!(cfg.n_embd_v, 4 * 256);
++        assert_eq!(cfg.block_tokens, 128);
++        assert_eq!(cfg.k_row_bytes, 0);
++        assert_eq!(cfg.k_gpu_row_bytes, 1088);
++        assert_eq!(cfg.v_gpu_row_bytes, 1088);
++        assert_eq!(l.fa_layers(), &[0, 1]);
++    }
++
++    #[test]
++    fn rejects_bad_geometry() {
++        // head_dim not divisible by 32 (engine Q8 gate).
++        assert!(LayerwiseQ8Layout::resolve(2, 4, 100, &[0, 1]).is_err());
++        // zero KV heads.
++        assert!(LayerwiseQ8Layout::resolve(2, 0, 256, &[0, 1]).is_err());
++        // empty / out-of-range / duplicate fa-layer list.
++        assert!(LayerwiseQ8Layout::resolve(2, 4, 256, &[]).is_err());
++        assert!(LayerwiseQ8Layout::resolve(2, 4, 256, &[0, 2]).is_err());
++        assert!(LayerwiseQ8Layout::resolve(2, 4, 256, &[1, 1]).is_err());
++        // zero layer count.
++        assert!(LayerwiseQ8Layout::resolve(0, 4, 256, &[0]).is_err());
++    }
++
++    #[test]
++    fn payload_layout_manifest_is_layer_major_key_value() {
++        let l = resolved();
++        let manifest = l.payload_layout().unwrap();
++        assert_eq!(manifest.block_tokens(), 128);
++        assert_eq!(manifest.plane_count(), 4); // 2 layers × {K, V}
++        let plane_bytes = (1088 * 128) as u64;
++        assert_eq!(manifest.record_bytes(), 4 * plane_bytes);
++        let mut offset = 0u64;
++        for layer in 0..2u32 {
++            for kind in [PayloadPlaneKind::Key, PayloadPlaneKind::Value] {
++                let p = manifest.plane(layer * 2 + kind as u32).unwrap();
++                assert_eq!(p.layer, layer);
++                assert_eq!(p.kind, kind as u32);
++                assert_eq!(p.offset, offset);
++                assert_eq!(p.bytes, plane_bytes);
++                assert_eq!(p.token_stride, 1088);
++                assert_eq!(p.alignment, 1);
++                offset += plane_bytes;
++            }
++        }
++        assert_eq!(offset, manifest.record_bytes());
++    }
++
++    #[test]
++    fn packed_arena_matches_core_record() {
++        let l = resolved();
++        let manifest = l.payload_layout().unwrap();
++        let arena = l.packed_arena_layout(8).unwrap();
++        // One composite slot == one core record, byte for byte.
++        assert_eq!(arena.slot_bytes() as u64, manifest.record_bytes());
++        assert_eq!(arena.arena_bytes(), 8 * arena.slot_bytes());
++        assert_eq!(arena.n_layers(), 2);
++        assert_eq!(arena.block_tokens(), 128);
++        // Slot 0's per-layer plane offsets == the manifest plane offsets.
++        for layer in 0..2usize {
++            let k = manifest.plane((layer * 2) as u32).unwrap();
++            let v = manifest.plane((layer * 2 + 1) as u32).unwrap();
++            assert_eq!(arena.layer_k_offset(0, layer).unwrap() as u64, k.offset);
++            assert_eq!(arena.layer_v_offset(0, layer).unwrap() as u64, v.offset);
++            assert_eq!(arena.k_plane_bytes() as u64, k.bytes);
++            assert_eq!(arena.v_plane_bytes() as u64, v.bytes);
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/crates/hipfire-arch-qwen35/src/lib.rs b/crates/hipfire-arch-qwen35/src/lib.rs
+index e84d256b49a096952484de7d96f4036241c4f4b8..6ec5087e254331074152d530cdcc0edf907b647c 100644
+--- a/crates/hipfire-arch-qwen35/src/lib.rs
++++ b/crates/hipfire-arch-qwen35/src/lib.rs
+@@ -115,6 +115,11 @@ pub mod kvmem_taps;
+ /// `HIPFIRE_KVMEM=1`; requires the paged Q8 pool.
+ #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+ pub mod kvmem_ctl;
++/// Layerwise Q8 packed-page layout adapter (Phase 3.2 ①地基): bridges hipfire Q8
++/// geometry to the core generic `PayloadLayout` manifest + the crate-agnostic
++/// packed arena. Clean sibling to `kvmem_ctl`; not wired into live serve in ①.
++#[cfg(feature = "kvmem")]
++pub mod layerwise_layout;
+ #[cfg(feature = "deltanet")]
+ pub(crate) mod layer_driver;
+ #[cfg(feature = "deltanet")]
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/weights.rs b/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
+index fcd4d079629240a136ee88eb5af7699c614662f1..a9301cd1d4dccc8a0e85027e6e8655177c02fbd7 100644
+--- a/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
+@@ -4415,6 +4415,8 @@ mod dense_shared_tests {
+             w_gate: a.weight(DType::MQ4G256, 16, 8),
+             w_up: a.weight(DType::MQ4G256, 16, 8),
+             w_down: a.weight(DType::MQ4G256, 8, 16),
++            biases: None,
++            escha: None,
+         };
+         let mut wq = a.weight(DType::MQ4G256, 8, 8);
+         wq.awq_scale = Some(a.tensor(&[8], DType::F16, 16));
+@@ -4430,6 +4432,8 @@ mod dense_shared_tests {
+             w_gate: a.weight(DType::MQ4G256, 16, 8),
+             w_up: a.weight(DType::MQ4G256, 16, 8),
+             w_down: a.weight(DType::MQ4G256, 8, 16),
++            biases: None,
++            escha: None,
+         };
+         Qwen35Weights {
+             token_embd,
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index 8394d3ee54bdad9fd56935125e07ad1853b4cd6e..244805fdbf7ab1447bd2e7804e50acd12c45ea02 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -16,7 +16,7 @@
+ //! serialized by the engine's serve loop), so these types are deliberately
+ //! neither `Send` nor `Sync`.
+ 
+-use std::ffi::{c_char, c_int, CStr, CString};
++use std::ffi::{c_char, c_int, c_void, CStr, CString};
+ use std::fmt;
+ use std::path::Path;
+ use std::ptr::{self, NonNull};
+@@ -132,6 +132,444 @@ struct HkKvStore {
+     _private: [u8; 0],
+ }
+ 
++// ── layerwise native payload foundation: C struct mirrors + opaque handles ──
++
++/// `hk_session_identity` — mirrors `kvmem::SessionIdentity`.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SessionIdentity {
++    pub id: u64,
++    pub incarnation: u64,
++}
++
++/// `hk_block_descriptor` — mirrors `kvmem::BlockDescriptor`.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct BlockDescriptor {
++    pub session: SessionIdentity,
++    pub id: u64,
++    pub original_start: u64,
++    pub valid_tokens: u32,
++    pub content_version: u64,
++    pub statistics_version: u64,
++}
++
++/// `hk_payload_plane_kind` ordinals (append-only, mirrors `kvmem::PayloadPlaneKind`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u32)]
++pub enum PayloadPlaneKind {
++    Key = 0,
++    Value = 1,
++    KeyScale = 2,
++    ValueScale = 3,
++    PackedKeyValue = 4,
++}
++
++/// `hk_payload_plane` — mirrors `kvmem::PayloadPlane`. `kind` carries a
++/// [`PayloadPlaneKind`] ordinal; `token_stride == 0` means an opaque page.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct PayloadPlane {
++    pub layer: u32,
++    pub kind: u32,
++    pub offset: u64,
++    pub bytes: u64,
++    pub alignment: u64,
++    pub token_stride: u64,
++    pub rank: u32,
++    pub head_begin: u32,
++    pub head_count: u32,
++}
++
++/// `hk_memory_capabilities` — mirrors `kvmem::MemoryCapabilities` (bools as 0/1).
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct MemoryCapabilities {
++    pub page_tokens: u32,
++    pub max_position: u64,
++    pub native_payload: u32,
++    pub sparse_view: u32,
++    pub original_rope_positions: u32,
++    pub pre_rope_statistics: u32,
++    pub state_checkpoint: u32,
++    pub asynchronous_transfer: u32,
++}
++
++/// Owned backend/model/state identity. The C ABI borrows NUL-terminated strings;
++/// [`BackendIdentity::ffi`] keeps them alive for the duration of a call.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct BackendIdentity {
++    pub backend: String,
++    pub revision: String,
++    pub model: String,
++    pub state_schema: String,
++}
++
++#[repr(C)]
++struct HkBackendIdentity {
++    backend: *const c_char,
++    revision: *const c_char,
++    model: *const c_char,
++    state_schema: *const c_char,
++}
++
++impl BackendIdentity {
++    /// Build the borrowed C view. The returned `CString`s must outlive the view.
++    fn ffi(&self) -> Result<(CString, CString, CString, CString, HkBackendIdentity)> {
++        let cv = |s: &str, what: &str| {
++            CString::new(s).map_err(|e| KvMemError(format!("{what}: {e}")))
++        };
++        let b = cv(&self.backend, "backend")?;
++        let r = cv(&self.revision, "revision")?;
++        let m = cv(&self.model, "model")?;
++        let s = cv(&self.state_schema, "state_schema")?;
++        let view = HkBackendIdentity {
++            backend: b.as_ptr(),
++            revision: r.as_ptr(),
++            model: m.as_ptr(),
++            state_schema: s.as_ptr(),
++        };
++        Ok((b, r, m, s, view))
++    }
++}
++
++#[repr(C)]
++struct HkPayloadLayout {
++    _private: [u8; 0],
++}
++#[repr(C)]
++struct HkMemoryDescriptor {
++    _private: [u8; 0],
++}
++#[repr(C)]
++struct HkKvRegions {
++    _private: [u8; 0],
++}
++#[repr(C)]
++struct HkHostRecord {
++    _private: [u8; 0],
++}
++#[repr(C)]
++struct HkHostSource {
++    _private: [u8; 0],
++}
++#[repr(C)]
++struct HkNativePayload {
++    _private: [u8; 0],
++}
++#[repr(C)]
++struct HkNativeArchive {
++    _private: [u8; 0],
++}
++
++// ── layerwise catalog + planning: C struct mirrors + opaque handles ──
++
++/// `hk_memory_stamp` — mirrors `kvmem::MemoryStamp` (`valid` as 0/1).
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct MemoryStamp {
++    pub valid: u32,
++    pub session: SessionIdentity,
++    pub history_revision: u64,
++    pub view_version: u64,
++    pub frontier: u64,
++    pub execution_history: u64,
++}
++
++/// `hk_block_copies` — a logical block plus its host-copy version (0: none).
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct BlockCopies {
++    pub block: BlockDescriptor,
++    pub host_version: u64,
++}
++
++/// `hk_memory_budget` — mirrors `kvmem::MemoryBudget`.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct MemoryBudget {
++    pub selected_tokens: u64,
++    pub reserve_tokens: u64,
++    pub device_tokens: u64,
++    pub host_payload_bytes: u64,
++}
++
++/// `hk_view_block` — a published view block (attention compact address only).
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct ViewBlock {
++    pub block: BlockDescriptor,
++    pub compact_start: u64,
++}
++
++/// Owned `kvmem::MemorySnapshot`: complete logical catalog plus resident set.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct MemorySnapshot {
++    pub stamp: MemoryStamp,
++    pub blocks: Vec<BlockCopies>,
++    pub resident: Vec<u64>,
++}
++
++/// Owned `kvmem::LayerMemorySnapshot`: one target layer's canonical snapshot.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct LayerMemorySnapshot {
++    pub model_layer: u32,
++    pub memory: MemorySnapshot,
++}
++
++/// Owned `kvmem::LayerWorkingSetSelection`: one layer's selection input.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct LayerSelection {
++    pub model_layer: u32,
++    pub expected: MemoryStamp,
++    pub selected: Vec<u64>,
++    pub mandatory: Vec<u64>,
++    pub budget: MemoryBudget,
++}
++
++impl LayerSelection {
++    /// Borrowed C view; the returned struct points into `self`'s vectors.
++    fn ffi(&self) -> HkLayerSelection {
++        HkLayerSelection {
++            model_layer: self.model_layer,
++            expected: self.expected,
++            selected: self.selected.as_ptr(),
++            selected_count: self.selected.len(),
++            mandatory: self.mandatory.as_ptr(),
++            mandatory_count: self.mandatory.len(),
++            budget: self.budget,
++        }
++    }
++}
++
++#[repr(C)]
++struct HkMemorySnapshot {
++    stamp: MemoryStamp,
++    blocks: *const BlockCopies,
++    block_count: usize,
++    resident: *const u64,
++    resident_count: usize,
++}
++#[repr(C)]
++struct HkLayerMemorySnapshot {
++    model_layer: u32,
++    memory: HkMemorySnapshot,
++}
++#[repr(C)]
++struct HkLayerSelection {
++    model_layer: u32,
++    expected: MemoryStamp,
++    selected: *const u64,
++    selected_count: usize,
++    mandatory: *const u64,
++    mandatory_count: usize,
++    budget: MemoryBudget,
++}
++
++#[repr(C)]
++struct HkMemoryCatalog {
++    _private: [u8; 0],
++}
++#[repr(C)]
++struct HkLayerPlan {
++    _private: [u8; 0],
++}
++#[repr(C)]
++struct HkLayerwisePlan {
++    _private: [u8; 0],
++}
++
++// ── layerwise Query request state machine: C struct mirrors + opaque handle ──
++
++/// `hk_query_range` — a half-open `[begin, end)` token range.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct QueryRange {
++    pub begin: u64,
++    pub end: u64,
++}
++
++/// `hk_layerwise_identity` — the frozen transaction identity proven at every
++/// native boundary: history stamp, request id, evaluation span and query span.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct LayerwiseIdentity {
++    pub history: MemoryStamp,
++    pub request: u64,
++    pub evaluation: QueryRange,
++    pub query: QueryRange,
++}
++
++/// `hk_layer_query_geometry` — one target layer's attention geometry. The
++/// `layer` ordinal indexes `RawKvStore` statistics; `attention_scale == 0`
++/// selects `1/sqrt(head_dim)`.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct LayerQueryGeometry {
++    pub layer: u32,
++    pub query_heads: u32,
++    pub kv_heads: u32,
++    pub head_dim: u32,
++    pub attention_scale: f32,
++}
++
++/// `hk_layerwise_work` — cumulative projection/attendance counters.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct LayerwiseWork {
++    pub projected_rows: u64,
++    pub attended_rows: u64,
++    pub completed_layers: u32,
++}
++
++/// Mirrors `kvmem::LayerwiseRequestPhase` ordinals (`hk_layerwise_phase`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum LayerwisePhase {
++    BetweenLayers = 0,
++    Projecting = 1,
++    Restoring = 2,
++    Attending = 3,
++    AwaitingAcceptance = 4,
++    Accepted = 5,
++    Aborted = 6,
++}
++
++impl LayerwisePhase {
++    fn from_u32(v: u32) -> Self {
++        match v {
++            0 => Self::BetweenLayers,
++            1 => Self::Projecting,
++            2 => Self::Restoring,
++            3 => Self::Attending,
++            4 => Self::AwaitingAcceptance,
++            5 => Self::Accepted,
++            _ => Self::Aborted,
++        }
++    }
++}
++
++/// Owned `kvmem::LayerwiseRequestLayer`: one target layer's admission spec.
++/// `mandatory` holds canonical chronological policy ordinals (u32).
++#[derive(Debug, Clone, PartialEq)]
++pub struct LayerRequestSpec {
++    pub model_layer: u32,
++    pub query: LayerQueryGeometry,
++    pub budget: MemoryBudget,
++    pub mandatory: Vec<u32>,
++}
++
++/// Owned `kvmem::ExecutionView`: the post-fence native view reported to
++/// `restored()`. `blocks` are published compact-address view blocks.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ExecutionView {
++    pub stamp: MemoryStamp,
++    pub blocks: Vec<ViewBlock>,
++    pub visible_tokens: u64,
++}
++
++impl ExecutionView {
++    /// Borrowed C view; the returned struct points into `self`'s vectors.
++    fn ffi(&self) -> HkExecutionView {
++        HkExecutionView {
++            stamp: self.stamp,
++            blocks: self.blocks.as_ptr(),
++            block_count: self.blocks.len(),
++            visible_tokens: self.visible_tokens,
++        }
++    }
++}
++
++#[repr(C)]
++struct HkLayerRequestSpec {
++    model_layer: u32,
++    query: LayerQueryGeometry,
++    budget: MemoryBudget,
++    mandatory: *const u32,
++    mandatory_count: usize,
++}
++#[repr(C)]
++struct HkCurrentLayerQuery {
++    data: *const f32,
++    layer: u32,
++    rows: u32,
++    query_heads: u32,
++    kv_heads: u32,
++    head_dim: u32,
++    attention_scale: f32,
++}
++#[repr(C)]
++struct HkExecutionView {
++    stamp: MemoryStamp,
++    blocks: *const ViewBlock,
++    block_count: usize,
++    visible_tokens: u64,
++}
++
++#[repr(C)]
++struct HkLayerwiseRequest {
++    _private: [u8; 0],
++}
++
++// ── native (device-ready) Query projection: C struct mirrors ──
++
++/// Mirrors `kvmem::NativeQueryScalar` (`hk_native_query_scalar`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u32)]
++pub enum NativeQueryScalar {
++    Float32 = 0,
++    Float16 = 1,
++    BFloat16 = 2,
++}
++
++/// `hk_native_current_layer_query` — a borrowed native Q tensor (device or host)
++/// reported to [`LayerwiseRequest::projected_native`]. Strides and `bytes` are
++/// BYTE quantities and the token axis need not be outermost, so a backend can
++/// expose its real tensor without a CPU copy or layout conversion. `scalar` is a
++/// [`NativeQueryScalar`] ordinal. The data pointer must stay valid and aligned
++/// for the scorer call; the request proves index identity, not the pointer.
++#[repr(C)]
++#[derive(Debug, Clone, Copy)]
++pub struct NativeCurrentLayerQuery {
++    pub data: *const c_void,
++    pub bytes: usize,
++    pub layer: u32,
++    pub rows: u32,
++    pub query_heads: u32,
++    pub kv_heads: u32,
++    pub head_dim: u32,
++    pub attention_scale: f32,
++    pub scalar: u32,
++    pub row_stride: usize,
++    pub head_stride: usize,
++    pub dimension_stride: usize,
++}
++
++/// Borrowed `kvmem::QueryScoreFrame`: the frozen per-block score denominator
++/// handed to a native scorer. Every array has one entry per canonical block;
++/// `score_mask` marks scorable blocks (a masked block MUST receive score 0) and
++/// `transport_mask` marks blocks needing transfer.
++#[derive(Debug, Clone, Copy)]
++pub struct QueryScoreFrame<'a> {
++    pub starts: &'a [u64],
++    pub counts: &'a [u32],
++    pub score_mask: &'a [u8],
++    pub transport_mask: &'a [u8],
++    pub accepted_through: u64,
++}
++
++#[repr(C)]
++struct HkQueryScoreFrame {
++    starts: *const u64,
++    start_count: usize,
++    counts: *const u32,
++    count_count: usize,
++    score_mask: *const u8,
++    score_mask_count: usize,
++    transport_mask: *const u8,
++    transport_mask_count: usize,
++    accepted_through: u64,
++}
++
+ mod ffi {
+     use super::*;
+ 
+@@ -296,6 +734,335 @@ mod ffi {
+             aggregation: u32,
+             out: *mut f64,
+         ) -> c_int;
++
++        // ── layerwise native payload foundation ──
++        pub fn hk_payload_layout_from_raw(
++            cfg: *const RawStoreConfig,
++            format: *const c_char,
++            layers: *const u32,
++            n_layers: u32,
++        ) -> *mut HkPayloadLayout;
++        pub fn hk_payload_layout_create(
++            format: *const c_char,
++            version: u32,
++            block_tokens: u32,
++            record_bytes: u64,
++            alignment: u64,
++            planes: *const PayloadPlane,
++            n_planes: u32,
++        ) -> *mut HkPayloadLayout;
++        pub fn hk_payload_layout_destroy(l: *mut HkPayloadLayout);
++        pub fn hk_payload_layout_record_bytes(l: *const HkPayloadLayout) -> u64;
++        pub fn hk_payload_layout_block_tokens(l: *const HkPayloadLayout) -> u32;
++        pub fn hk_payload_layout_plane_count(l: *const HkPayloadLayout) -> u32;
++        pub fn hk_payload_layout_plane(
++            l: *const HkPayloadLayout,
++            i: u32,
++            out: *mut PayloadPlane,
++        ) -> c_int;
++
++        pub fn hk_memory_descriptor_create(
++            identity: *const HkBackendIdentity,
++            layout: *const HkPayloadLayout,
++            capabilities: *const MemoryCapabilities,
++        ) -> *mut HkMemoryDescriptor;
++        pub fn hk_memory_descriptor_destroy(d: *mut HkMemoryDescriptor);
++
++        pub fn hk_host_record_allocate(
++            s: *mut HkStorage,
++            bytes: *const u8,
++            len: usize,
++        ) -> *mut HkHostRecord;
++        pub fn hk_host_record_destroy(r: *mut HkHostRecord);
++        pub fn hk_host_record_seal(r: *mut HkHostRecord);
++        pub fn hk_host_record_size(r: *const HkHostRecord) -> usize;
++        pub fn hk_host_record_read(
++            r: *const HkHostRecord,
++            offset: usize,
++            dest: *mut u8,
++            bytes: usize,
++        ) -> c_int;
++        pub fn hk_host_record_source(r: *const HkHostRecord) -> *mut HkHostSource;
++        pub fn hk_host_source_destroy(s: *mut HkHostSource);
++        pub fn hk_host_source_size(s: *const HkHostSource) -> usize;
++
++        pub fn hk_kv_regions_create(
++            layout: *const HkPayloadLayout,
++            layer: u32,
++            has_rank: c_int,
++            rank: u32,
++        ) -> *mut HkKvRegions;
++        pub fn hk_kv_regions_destroy(r: *mut HkKvRegions);
++        pub fn hk_kv_regions_packed_bytes(r: *const HkKvRegions) -> u64;
++        pub fn hk_kv_regions_plane_bytes(r: *const HkKvRegions) -> u64;
++        pub fn hk_kv_regions_record_bytes(r: *const HkKvRegions) -> u64;
++        pub fn hk_kv_regions_region_count(r: *const HkKvRegions) -> u32;
++        pub fn hk_kv_regions_region(
++            r: *const HkKvRegions,
++            i: u32,
++            out_plane: *mut PayloadPlane,
++            out_packed_offset: *mut u64,
++        ) -> c_int;
++        pub fn hk_kv_regions_read(
++            r: *const HkKvRegions,
++            source: *const HkHostSource,
++            packed_offset: u64,
++            dest: *mut u8,
++            bytes: usize,
++            max_read_bytes: usize,
++        ) -> c_int;
++
++        pub fn hk_native_payload_export(
++            raw: *const HkRawStore,
++            backend: *const HkBackendIdentity,
++            layout: *const HkPayloadLayout,
++            block: *const BlockDescriptor,
++        ) -> *mut HkNativePayload;
++        pub fn hk_native_payload_create(
++            backend: *const HkBackendIdentity,
++            layout: *const HkPayloadLayout,
++            block: *const BlockDescriptor,
++            bytes: *const u8,
++            len: usize,
++        ) -> *mut HkNativePayload;
++        pub fn hk_native_payload_destroy(p: *mut HkNativePayload);
++        pub fn hk_native_payload_bytes(p: *const HkNativePayload) -> *const u8;
++        pub fn hk_native_payload_size(p: *const HkNativePayload) -> usize;
++        pub fn hk_native_payload_block(p: *const HkNativePayload, out: *mut BlockDescriptor)
++            -> c_int;
++        pub fn hk_native_payload_import(
++            raw: *mut HkRawStore,
++            backend: *const HkBackendIdentity,
++            layout: *const HkPayloadLayout,
++            p: *const HkNativePayload,
++        ) -> c_int;
++
++        pub fn hk_native_archive_create(
++            backend: *const HkBackendIdentity,
++            session: SessionIdentity,
++            layout: *const HkPayloadLayout,
++            capacity_bytes: u64,
++        ) -> *mut HkNativeArchive;
++        pub fn hk_native_archive_destroy(a: *mut HkNativeArchive);
++        pub fn hk_native_archive_put(a: *mut HkNativeArchive, p: *const HkNativePayload) -> c_int;
++        pub fn hk_native_archive_get(
++            a: *const HkNativeArchive,
++            expected: *const BlockDescriptor,
++        ) -> *mut HkNativePayload;
++        pub fn hk_native_archive_erase(a: *mut HkNativeArchive, block_id: u64);
++        pub fn hk_native_archive_bytes(a: *const HkNativeArchive) -> u64;
++
++        pub fn hk_memory_catalog_create(
++            canonical: *const HkMemoryDescriptor,
++            layers: *const HkLayerMemorySnapshot,
++            n_layers: usize,
++        ) -> *mut HkMemoryCatalog;
++        pub fn hk_memory_catalog_destroy(c: *mut HkMemoryCatalog);
++        pub fn hk_memory_catalog_layer_count(c: *const HkMemoryCatalog) -> usize;
++        pub fn hk_memory_catalog_model_layer(c: *const HkMemoryCatalog, i: usize) -> u32;
++        pub fn hk_memory_catalog_snapshot_stamp(
++            c: *const HkMemoryCatalog,
++            model_layer: u32,
++            out: *mut MemoryStamp,
++        ) -> c_int;
++        pub fn hk_memory_catalog_snapshot_block_count(
++            c: *const HkMemoryCatalog,
++            model_layer: u32,
++        ) -> usize;
++        pub fn hk_memory_catalog_snapshot_block(
++            c: *const HkMemoryCatalog,
++            model_layer: u32,
++            i: usize,
++            out: *mut BlockCopies,
++        ) -> c_int;
++        pub fn hk_memory_catalog_snapshot_resident_count(
++            c: *const HkMemoryCatalog,
++            model_layer: u32,
++        ) -> usize;
++        pub fn hk_memory_catalog_snapshot_resident(
++            c: *const HkMemoryCatalog,
++            model_layer: u32,
++            i: usize,
++        ) -> u64;
++        pub fn hk_memory_catalog_plan_layer(
++            c: *const HkMemoryCatalog,
++            sel: *const HkLayerSelection,
++            out: *mut *mut HkLayerPlan,
++        ) -> c_int;
++        pub fn hk_memory_catalog_plan(
++            c: *const HkMemoryCatalog,
++            sels: *const HkLayerSelection,
++            n_sels: usize,
++            out: *mut *mut HkLayerwisePlan,
++        ) -> c_int;
++
++        pub fn hk_layer_plan_destroy(p: *mut HkLayerPlan);
++        pub fn hk_layer_plan_model_layer(p: *const HkLayerPlan) -> u32;
++        pub fn hk_layer_plan_restore_bytes(p: *const HkLayerPlan) -> u64;
++        pub fn hk_layer_plan_spill_bytes(p: *const HkLayerPlan) -> u64;
++        pub fn hk_layer_plan_device_tokens_required(p: *const HkLayerPlan) -> u64;
++        pub fn hk_layer_plan_host_payload_bytes_required(p: *const HkLayerPlan) -> u64;
++        pub fn hk_layer_plan_next_stamp(p: *const HkLayerPlan, out: *mut MemoryStamp) -> c_int;
++        pub fn hk_layer_plan_next_visible_tokens(p: *const HkLayerPlan) -> u64;
++        pub fn hk_layer_plan_next_block_count(p: *const HkLayerPlan) -> usize;
++        pub fn hk_layer_plan_next_block(
++            p: *const HkLayerPlan,
++            i: usize,
++            out: *mut ViewBlock,
++        ) -> c_int;
++        pub fn hk_layer_plan_restore_count(p: *const HkLayerPlan) -> usize;
++        pub fn hk_layer_plan_restore_block(
++            p: *const HkLayerPlan,
++            i: usize,
++            out: *mut BlockDescriptor,
++        ) -> c_int;
++        pub fn hk_layer_plan_spill_count(p: *const HkLayerPlan) -> usize;
++        pub fn hk_layer_plan_spill_block(
++            p: *const HkLayerPlan,
++            i: usize,
++            out: *mut BlockDescriptor,
++        ) -> c_int;
++        pub fn hk_layer_plan_evict_count(p: *const HkLayerPlan) -> usize;
++        pub fn hk_layer_plan_evict_block(
++            p: *const HkLayerPlan,
++            i: usize,
++            out: *mut BlockDescriptor,
++        ) -> c_int;
++        pub fn hk_layer_plan_mandatory_count(p: *const HkLayerPlan) -> usize;
++        pub fn hk_layer_plan_mandatory(p: *const HkLayerPlan, i: usize) -> u64;
++        pub fn hk_layer_plan_payload(p: *const HkLayerPlan, out: *mut *mut HkKvRegions) -> c_int;
++
++        pub fn hk_layerwise_plan_destroy(p: *mut HkLayerwisePlan);
++        pub fn hk_layerwise_plan_layer_count(p: *const HkLayerwisePlan) -> usize;
++        pub fn hk_layerwise_plan_history(p: *const HkLayerwisePlan, out: *mut MemoryStamp)
++            -> c_int;
++        pub fn hk_layerwise_plan_host_payload_bytes_required(p: *const HkLayerwisePlan) -> u64;
++        pub fn hk_layerwise_plan_layer(
++            p: *const HkLayerwisePlan,
++            i: usize,
++            out: *mut *mut HkLayerPlan,
++        ) -> c_int;
++
++        // ── layerwise Query request state machine ──
++        pub fn hk_layerwise_request_create(
++            identity: *const LayerwiseIdentity,
++            catalog: *const HkMemoryCatalog,
++            policy: *const HkKvStore,
++            keys: *const HkRawStore,
++            specs: *const HkLayerRequestSpec,
++            n_specs: usize,
++            native_history_tokens: u64,
++            revision: Option<unsafe extern "C" fn(*mut c_void) -> MemoryStamp>,
++            revision_user: *mut c_void,
++        ) -> *mut HkLayerwiseRequest;
++        pub fn hk_layerwise_request_destroy(r: *mut HkLayerwiseRequest);
++        pub fn hk_layerwise_request_abort(r: *mut HkLayerwiseRequest);
++        pub fn hk_layerwise_request_phase(r: *const HkLayerwiseRequest) -> u32;
++        pub fn hk_layerwise_request_work(
++            r: *const HkLayerwiseRequest,
++            out: *mut LayerwiseWork,
++        ) -> c_int;
++        pub fn hk_layerwise_request_begin_layer(
++            r: *mut HkLayerwiseRequest,
++            id: *const LayerwiseIdentity,
++            model_layer: u32,
++        ) -> c_int;
++        pub fn hk_layerwise_request_projected(
++            r: *mut HkLayerwiseRequest,
++            id: *const LayerwiseIdentity,
++            begin: u64,
++            q: *const HkCurrentLayerQuery,
++        ) -> c_int;
++        pub fn hk_layerwise_request_prepare_restore(
++            r: *mut HkLayerwiseRequest,
++            id: *const LayerwiseIdentity,
++            out: *mut *mut HkLayerPlan,
++        ) -> c_int;
++        pub fn hk_layerwise_request_restored(
++            r: *mut HkLayerwiseRequest,
++            id: *const LayerwiseIdentity,
++            view: *const HkExecutionView,
++        ) -> c_int;
++        pub fn hk_layerwise_request_attended(
++            r: *mut HkLayerwiseRequest,
++            id: *const LayerwiseIdentity,
++            begin: u64,
++            count: u64,
++        ) -> c_int;
++        pub fn hk_layerwise_request_complete_layer(
++            r: *mut HkLayerwiseRequest,
++            id: *const LayerwiseIdentity,
++        ) -> c_int;
++        pub fn hk_layerwise_request_accepted(
++            r: *mut HkLayerwiseRequest,
++            id: *const LayerwiseIdentity,
++            snapshots: *const HkLayerMemorySnapshot,
++            n: usize,
++        ) -> c_int;
++        pub fn hk_layerwise_request_selection_layer(r: *const HkLayerwiseRequest) -> u32;
++        pub fn hk_layerwise_request_selection_score_count(r: *const HkLayerwiseRequest) -> usize;
++        pub fn hk_layerwise_request_selection_score(
++            r: *const HkLayerwiseRequest,
++            i: usize,
++            out: *mut f64,
++        ) -> c_int;
++        pub fn hk_layerwise_request_selection_fixed_count(r: *const HkLayerwiseRequest) -> usize;
++        pub fn hk_layerwise_request_selection_fixed(r: *const HkLayerwiseRequest, i: usize) -> u32;
++        pub fn hk_layerwise_request_selection_selected_count(r: *const HkLayerwiseRequest) -> usize;
++        pub fn hk_layerwise_request_selection_selected(
++            r: *const HkLayerwiseRequest,
++            i: usize,
++        ) -> u32;
++        pub fn hk_layerwise_request_selection_historical_tokens(
++            r: *const HkLayerwiseRequest,
++        ) -> u64;
++        pub fn hk_layerwise_request_selection_charged_tokens(r: *const HkLayerwiseRequest) -> u64;
++        pub fn hk_layerwise_request_accepted_layer_count(r: *const HkLayerwiseRequest) -> usize;
++        pub fn hk_layerwise_request_accepted_model_layer(
++            r: *const HkLayerwiseRequest,
++            i: usize,
++        ) -> u32;
++        pub fn hk_layerwise_request_accepted_stamp(
++            r: *const HkLayerwiseRequest,
++            i: usize,
++            out: *mut MemoryStamp,
++        ) -> c_int;
++        pub fn hk_layerwise_request_accepted_block_count(
++            r: *const HkLayerwiseRequest,
++            i: usize,
++        ) -> usize;
++        pub fn hk_layerwise_request_accepted_block(
++            r: *const HkLayerwiseRequest,
++            i: usize,
++            b: usize,
++            out: *mut BlockCopies,
++        ) -> c_int;
++        pub fn hk_layerwise_request_accepted_resident_count(
++            r: *const HkLayerwiseRequest,
++            i: usize,
++        ) -> usize;
++        pub fn hk_layerwise_request_accepted_resident(
++            r: *const HkLayerwiseRequest,
++            i: usize,
++            b: usize,
++        ) -> u64;
++        pub fn hk_layerwise_request_projected_native(
++            r: *mut HkLayerwiseRequest,
++            id: *const LayerwiseIdentity,
++            begin: u64,
++            q: *const NativeCurrentLayerQuery,
++            scorer: Option<
++                unsafe extern "C" fn(
++                    *mut c_void,
++                    *const HkRawStore,
++                    *const NativeCurrentLayerQuery,
++                    *const HkQueryScoreFrame,
++                    *mut f64,
++                    usize,
++                ) -> c_int,
++            >,
++            scorer_user: *mut c_void,
++        ) -> c_int;
+     }
+ }
+ 
+@@ -797,3 +1564,941 @@ pub fn page_softmax_scores(
+     }
+     Ok(out)
+ }
++
++// ── layerwise native payload foundation: safe wrappers ──
++//
++// These wrap the portable KVMem layerwise building blocks the hipfire packed-page
++// driver orchestrates. They are additive: the legacy residency path never calls
++// them, and none mutates a RawStore's statistics or the engine's resident view.
++// Like the other handles, they own non-Sync C++ state and are neither Send nor Sync.
++
++/// Backend-owned packed payload layout (`kvmem::PayloadLayout`).
++pub struct PayloadLayout {
++    ptr: NonNull<HkPayloadLayout>,
++}
++
++impl PayloadLayout {
++    /// Build the hipfire Q8 adapter layout from a packed [`RawStoreConfig`]: one
++    /// {Key,Value} token-row plane per attention layer, scales inline. `layers`
++    /// are the FullAttention statistics ordinals.
++    pub fn from_raw(cfg: &RawStoreConfig, format: &str, layers: &[u32]) -> Result<Self> {
++        let fmt = CString::new(format).map_err(|e| KvMemError(format!("format: {e}")))?;
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_payload_layout_from_raw(cfg, fmt.as_ptr(), layers.as_ptr(), layers.len() as u32)
++        };
++        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
++    }
++
++    /// Build from an explicit plane list (validated by the core layout rules).
++    pub fn create(
++        format: &str,
++        version: u32,
++        block_tokens: u32,
++        record_bytes: u64,
++        alignment: u64,
++        planes: &[PayloadPlane],
++    ) -> Result<Self> {
++        let fmt = CString::new(format).map_err(|e| KvMemError(format!("format: {e}")))?;
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_payload_layout_create(
++                fmt.as_ptr(),
++                version,
++                block_tokens,
++                record_bytes,
++                alignment,
++                planes.as_ptr(),
++                planes.len() as u32,
++            )
++        };
++        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
++    }
++
++    pub fn record_bytes(&self) -> u64 {
++        unsafe { ffi::hk_payload_layout_record_bytes(self.ptr.as_ptr()) }
++    }
++
++    pub fn block_tokens(&self) -> u32 {
++        unsafe { ffi::hk_payload_layout_block_tokens(self.ptr.as_ptr()) }
++    }
++
++    pub fn plane_count(&self) -> u32 {
++        unsafe { ffi::hk_payload_layout_plane_count(self.ptr.as_ptr()) }
++    }
++
++    pub fn plane(&self, i: u32) -> Result<PayloadPlane> {
++        let mut out = PayloadPlane {
++            layer: 0,
++            kind: 0,
++            offset: 0,
++            bytes: 0,
++            alignment: 0,
++            token_stride: 0,
++            rank: 0,
++            head_begin: 0,
++            head_count: 0,
++        };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_payload_layout_plane(p, i, &mut out); })?;
++        Ok(out)
++    }
++}
++
++impl Drop for PayloadLayout {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_payload_layout_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++/// Backend identity + layout + capabilities (`kvmem::MemoryDescriptor`).
++pub struct MemoryDescriptor {
++    ptr: NonNull<HkMemoryDescriptor>,
++}
++
++impl MemoryDescriptor {
++    pub fn new(
++        identity: &BackendIdentity,
++        layout: &PayloadLayout,
++        capabilities: &MemoryCapabilities,
++    ) -> Result<Self> {
++        let (_b, _r, _m, _s, id) = identity.ffi()?;
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_memory_descriptor_create(&id, layout.ptr.as_ptr(), capabilities)
++        };
++        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
++    }
++}
++
++impl Drop for MemoryDescriptor {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_memory_descriptor_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++/// A sealed host record: the restore source for [`KvRegions::read`].
++pub struct HostRecord {
++    ptr: NonNull<HkHostRecord>,
++}
++
++impl HostRecord {
++    /// Copy `bytes` into the storage account as a new record.
++    pub fn allocate(storage: &Storage, bytes: &[u8]) -> Result<Self> {
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_host_record_allocate(storage.ptr.as_ptr(), bytes.as_ptr(), bytes.len())
++        };
++        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
++    }
++
++    /// Make the record immutable (and eligible for tiering).
++    pub fn seal(&self) -> Result<()> {
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_host_record_seal(p) })
++    }
++
++    pub fn size(&self) -> usize {
++        unsafe { ffi::hk_host_record_size(self.ptr.as_ptr()) }
++    }
++
++    pub fn read(&self, offset: usize, dest: &mut [u8]) -> Result<()> {
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_host_record_read(p, offset, dest.as_mut_ptr(), dest.len()); })
++    }
++
++    /// Borrow a deferred read source (does not pin the RAM tier).
++    pub fn source(&self) -> Result<HostSource> {
++        clear_error();
++        let ptr = unsafe { ffi::hk_host_record_source(self.ptr.as_ptr()) };
++        NonNull::new(ptr).map(|ptr| HostSource { ptr }).ok_or_else(err_from_last)
++    }
++}
++
++impl Drop for HostRecord {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_host_record_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++/// A deferred read source borrowed from a [`HostRecord`].
++pub struct HostSource {
++    ptr: NonNull<HkHostSource>,
++}
++
++impl HostSource {
++    pub fn size(&self) -> usize {
++        unsafe { ffi::hk_host_source_size(self.ptr.as_ptr()) }
++    }
++}
++
++impl Drop for HostSource {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_host_source_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++/// One model layer's planes packed into a compact extent
++/// (`kvmem::NativeKvLayerRegions`).
++pub struct KvRegions {
++    ptr: NonNull<HkKvRegions>,
++}
++
++impl KvRegions {
++    /// `rank == None` selects every rank of the layer; otherwise only that rank.
++    pub fn new(layout: &PayloadLayout, layer: u32, rank: Option<u32>) -> Result<Self> {
++        let (has_rank, rank) = match rank {
++            Some(r) => (1, r),
++            None => (0, 0),
++        };
++        clear_error();
++        let ptr =
++            unsafe { ffi::hk_kv_regions_create(layout.ptr.as_ptr(), layer, has_rank, rank) };
++        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
++    }
++
++    pub fn packed_bytes(&self) -> u64 {
++        unsafe { ffi::hk_kv_regions_packed_bytes(self.ptr.as_ptr()) }
++    }
++
++    pub fn plane_bytes(&self) -> u64 {
++        unsafe { ffi::hk_kv_regions_plane_bytes(self.ptr.as_ptr()) }
++    }
++
++    pub fn record_bytes(&self) -> u64 {
++        unsafe { ffi::hk_kv_regions_record_bytes(self.ptr.as_ptr()) }
++    }
++
++    pub fn region_count(&self) -> u32 {
++        unsafe { ffi::hk_kv_regions_region_count(self.ptr.as_ptr()) }
++    }
++
++    pub fn region(&self, i: u32) -> Result<(PayloadPlane, u64)> {
++        let mut plane = PayloadPlane {
++            layer: 0,
++            kind: 0,
++            offset: 0,
++            bytes: 0,
++            alignment: 0,
++            token_stride: 0,
++            rank: 0,
++            head_begin: 0,
++            head_count: 0,
++        };
++        let mut packed_offset = 0u64;
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_kv_regions_region(p, i, &mut plane, &mut packed_offset); })?;
++        Ok((plane, packed_offset))
++    }
++
++    /// Copy a bounded slice of the packed layer out of a sealed host source into
++    /// caller-owned staging (zero-fills interplane padding). `max_read_bytes`
++    /// bounds each underlying I/O; cold sources stay cold.
++    pub fn read(
++        &self,
++        source: &HostSource,
++        packed_offset: u64,
++        dest: &mut [u8],
++        max_read_bytes: usize,
++    ) -> Result<()> {
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe {
++            ffi::hk_kv_regions_read(
++                p,
++                source.ptr.as_ptr(),
++                packed_offset,
++                dest.as_mut_ptr(),
++                dest.len(),
++                max_read_bytes,
++            );
++        })
++    }
++}
++
++impl Drop for KvRegions {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_kv_regions_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++/// One canonical block's opaque packed record (`kvmem::NativeKvPayload`).
++pub struct NativePayload {
++    ptr: NonNull<HkNativePayload>,
++}
++
++impl NativePayload {
++    /// Gather a [`RawStore`]'s packed K/V for one block into a canonical record.
++    pub fn export(
++        raw: &RawStore,
++        backend: &BackendIdentity,
++        layout: &PayloadLayout,
++        block: &BlockDescriptor,
++    ) -> Result<Self> {
++        let (_b, _r, _m, _s, id) = backend.ffi()?;
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_native_payload_export(raw.ptr.as_ptr(), &id, layout.ptr.as_ptr(), block)
++        };
++        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
++    }
++
++    /// Wrap caller-supplied packed bytes (length must equal the layout record).
++    pub fn create(
++        backend: &BackendIdentity,
++        layout: &PayloadLayout,
++        block: &BlockDescriptor,
++        bytes: &[u8],
++    ) -> Result<Self> {
++        let (_b, _r, _m, _s, id) = backend.ffi()?;
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_native_payload_create(&id, layout.ptr.as_ptr(), block, bytes.as_ptr(), bytes.len())
++        };
++        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
++    }
++
++    /// Borrow the packed bytes (valid until this handle is dropped/mutated).
++    pub fn bytes(&self) -> &[u8] {
++        unsafe {
++            let p = ffi::hk_native_payload_bytes(self.ptr.as_ptr());
++            let n = ffi::hk_native_payload_size(self.ptr.as_ptr());
++            if p.is_null() || n == 0 {
++                &[]
++            } else {
++                std::slice::from_raw_parts(p, n)
++            }
++        }
++    }
++
++    pub fn size(&self) -> usize {
++        unsafe { ffi::hk_native_payload_size(self.ptr.as_ptr()) }
++    }
++
++    pub fn block(&self) -> Result<BlockDescriptor> {
++        let mut out = BlockDescriptor {
++            session: SessionIdentity { id: 0, incarnation: 0 },
++            id: 0,
++            original_start: 0,
++            valid_tokens: 0,
++            content_version: 0,
++            statistics_version: 0,
++        };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_native_payload_block(p, &mut out); })?;
++        Ok(out)
++    }
++
++    /// Write the packed K/V back into a [`RawStore`] (statistics untouched).
++    pub fn import(
++        &self,
++        raw: &RawStore,
++        backend: &BackendIdentity,
++        layout: &PayloadLayout,
++    ) -> Result<()> {
++        let (_b, _r, _m, _s, id) = backend.ffi()?;
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe {
++            ffi::hk_native_payload_import(raw.ptr.as_ptr(), &id, layout.ptr.as_ptr(), p);
++        })
++    }
++}
++
++impl Drop for NativePayload {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_native_payload_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++/// Bounded write-through store of canonical packed records
++/// (`kvmem::NativeKvArchive`).
++pub struct NativeArchive {
++    ptr: NonNull<HkNativeArchive>,
++}
++
++impl NativeArchive {
++    pub fn new(
++        backend: &BackendIdentity,
++        session: SessionIdentity,
++        layout: &PayloadLayout,
++        capacity_bytes: u64,
++    ) -> Result<Self> {
++        let (_b, _r, _m, _s, id) = backend.ffi()?;
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_native_archive_create(&id, session, layout.ptr.as_ptr(), capacity_bytes)
++        };
++        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
++    }
++
++    /// Copy a payload into the archive (the caller keeps its handle). Stale or
++    /// foreign writes are rejected.
++    pub fn put(&self, payload: &NativePayload) -> Result<()> {
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_native_archive_put(p, payload.ptr.as_ptr()); })
++    }
++
++    /// Fetch a NEW caller-owned handle for the stored record matching `expected`.
++    pub fn get(&self, expected: &BlockDescriptor) -> Result<NativePayload> {
++        clear_error();
++        let ptr = unsafe { ffi::hk_native_archive_get(self.ptr.as_ptr(), expected) };
++        NonNull::new(ptr).map(|ptr| NativePayload { ptr }).ok_or_else(err_from_last)
++    }
++
++    pub fn erase(&self, block_id: u64) {
++        unsafe { ffi::hk_native_archive_erase(self.ptr.as_ptr(), block_id) };
++    }
++
++    pub fn bytes(&self) -> u64 {
++        unsafe { ffi::hk_native_archive_bytes(self.ptr.as_ptr()) }
++    }
++}
++
++impl Drop for NativeArchive {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_native_archive_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++// ── layerwise catalog + planning: safe wrappers ──
++
++/// Immutable pure-planning catalog over one canonical accepted history
++/// (`kvmem::LayerwiseMemoryCatalog`). Validates that every target layer shares
++/// one history/catalog and a consistent resident extent; plans per layer.
++pub struct MemoryCatalog {
++    ptr: NonNull<HkMemoryCatalog>,
++}
++
++impl MemoryCatalog {
++    pub fn new(canonical: &MemoryDescriptor, layers: &[LayerMemorySnapshot]) -> Result<Self> {
++        let hk: Vec<HkLayerMemorySnapshot> = layers
++            .iter()
++            .map(|l| HkLayerMemorySnapshot {
++                model_layer: l.model_layer,
++                memory: HkMemorySnapshot {
++                    stamp: l.memory.stamp,
++                    blocks: l.memory.blocks.as_ptr(),
++                    block_count: l.memory.blocks.len(),
++                    resident: l.memory.resident.as_ptr(),
++                    resident_count: l.memory.resident.len(),
++                },
++            })
++            .collect();
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_memory_catalog_create(canonical.ptr.as_ptr(), hk.as_ptr(), hk.len())
++        };
++        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
++    }
++
++    pub fn layer_count(&self) -> usize {
++        unsafe { ffi::hk_memory_catalog_layer_count(self.ptr.as_ptr()) }
++    }
++    pub fn model_layer(&self, i: usize) -> u32 {
++        unsafe { ffi::hk_memory_catalog_model_layer(self.ptr.as_ptr(), i) }
++    }
++    pub fn snapshot_stamp(&self, model_layer: u32) -> Result<MemoryStamp> {
++        let mut out: MemoryStamp = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_memory_catalog_snapshot_stamp(p, model_layer, &mut out); })?;
++        Ok(out)
++    }
++    pub fn snapshot_block_count(&self, model_layer: u32) -> usize {
++        unsafe { ffi::hk_memory_catalog_snapshot_block_count(self.ptr.as_ptr(), model_layer) }
++    }
++    pub fn snapshot_block(&self, model_layer: u32, i: usize) -> Result<BlockCopies> {
++        let mut out: BlockCopies = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_memory_catalog_snapshot_block(p, model_layer, i, &mut out); })?;
++        Ok(out)
++    }
++    pub fn snapshot_resident_count(&self, model_layer: u32) -> usize {
++        unsafe { ffi::hk_memory_catalog_snapshot_resident_count(self.ptr.as_ptr(), model_layer) }
++    }
++    pub fn snapshot_resident(&self, model_layer: u32, i: usize) -> u64 {
++        unsafe { ffi::hk_memory_catalog_snapshot_resident(self.ptr.as_ptr(), model_layer, i) }
++    }
++
++    /// Pure per-layer plan after that layer's Q exists.
++    pub fn plan_layer(&self, sel: &LayerSelection) -> Result<LayerPlan> {
++        let hk = sel.ffi();
++        let mut out: *mut HkLayerPlan = ptr::null_mut();
++        let p = self.ptr.as_ptr();
++        clear_error();
++        let rc = unsafe { ffi::hk_memory_catalog_plan_layer(p, &hk, &mut out) };
++        if rc != 0 {
++            return Err(err_from_last());
++        }
++        NonNull::new(out).map(|ptr| LayerPlan { ptr }).ok_or_else(err_from_last)
++    }
++
++    /// Bulk validation of already-known selections (one entry per target layer).
++    pub fn plan(&self, sels: &[LayerSelection]) -> Result<LayerwisePlan> {
++        let hk: Vec<HkLayerSelection> = sels.iter().map(|s| s.ffi()).collect();
++        let mut out: *mut HkLayerwisePlan = ptr::null_mut();
++        let p = self.ptr.as_ptr();
++        clear_error();
++        let rc = unsafe { ffi::hk_memory_catalog_plan(p, hk.as_ptr(), hk.len(), &mut out) };
++        if rc != 0 {
++            return Err(err_from_last());
++        }
++        NonNull::new(out).map(|ptr| LayerwisePlan { ptr }).ok_or_else(err_from_last)
++    }
++}
++
++impl Drop for MemoryCatalog {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_memory_catalog_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++/// One layer's reduced working-set plan (`kvmem::LayerWorkingSetPlan`). The
++/// per-layer transfer regions are obtained separately via [`LayerPlan::payload`].
++pub struct LayerPlan {
++    ptr: NonNull<HkLayerPlan>,
++}
++
++impl LayerPlan {
++    pub fn model_layer(&self) -> u32 {
++        unsafe { ffi::hk_layer_plan_model_layer(self.ptr.as_ptr()) }
++    }
++    pub fn restore_bytes(&self) -> u64 {
++        unsafe { ffi::hk_layer_plan_restore_bytes(self.ptr.as_ptr()) }
++    }
++    pub fn spill_bytes(&self) -> u64 {
++        unsafe { ffi::hk_layer_plan_spill_bytes(self.ptr.as_ptr()) }
++    }
++    pub fn device_tokens_required(&self) -> u64 {
++        unsafe { ffi::hk_layer_plan_device_tokens_required(self.ptr.as_ptr()) }
++    }
++    pub fn host_payload_bytes_required(&self) -> u64 {
++        unsafe { ffi::hk_layer_plan_host_payload_bytes_required(self.ptr.as_ptr()) }
++    }
++    pub fn next_stamp(&self) -> Result<MemoryStamp> {
++        let mut out: MemoryStamp = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layer_plan_next_stamp(p, &mut out); })?;
++        Ok(out)
++    }
++    pub fn next_visible_tokens(&self) -> u64 {
++        unsafe { ffi::hk_layer_plan_next_visible_tokens(self.ptr.as_ptr()) }
++    }
++    pub fn next_block_count(&self) -> usize {
++        unsafe { ffi::hk_layer_plan_next_block_count(self.ptr.as_ptr()) }
++    }
++    pub fn next_block(&self, i: usize) -> Result<ViewBlock> {
++        let mut out: ViewBlock = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layer_plan_next_block(p, i, &mut out); })?;
++        Ok(out)
++    }
++    pub fn restore_count(&self) -> usize {
++        unsafe { ffi::hk_layer_plan_restore_count(self.ptr.as_ptr()) }
++    }
++    pub fn restore_block(&self, i: usize) -> Result<BlockDescriptor> {
++        let mut out: BlockDescriptor = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layer_plan_restore_block(p, i, &mut out); })?;
++        Ok(out)
++    }
++    pub fn spill_count(&self) -> usize {
++        unsafe { ffi::hk_layer_plan_spill_count(self.ptr.as_ptr()) }
++    }
++    pub fn spill_block(&self, i: usize) -> Result<BlockDescriptor> {
++        let mut out: BlockDescriptor = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layer_plan_spill_block(p, i, &mut out); })?;
++        Ok(out)
++    }
++    pub fn evict_count(&self) -> usize {
++        unsafe { ffi::hk_layer_plan_evict_count(self.ptr.as_ptr()) }
++    }
++    pub fn evict_block(&self, i: usize) -> Result<BlockDescriptor> {
++        let mut out: BlockDescriptor = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layer_plan_evict_block(p, i, &mut out); })?;
++        Ok(out)
++    }
++    pub fn mandatory_count(&self) -> usize {
++        unsafe { ffi::hk_layer_plan_mandatory_count(self.ptr.as_ptr()) }
++    }
++    pub fn mandatory(&self, i: usize) -> u64 {
++        unsafe { ffi::hk_layer_plan_mandatory(self.ptr.as_ptr(), i) }
++    }
++    /// A NEW caller-owned [`KvRegions`] handle for this layer's transfer planes.
++    pub fn payload(&self) -> Result<KvRegions> {
++        let mut out: *mut HkKvRegions = ptr::null_mut();
++        let p = self.ptr.as_ptr();
++        clear_error();
++        let rc = unsafe { ffi::hk_layer_plan_payload(p, &mut out) };
++        if rc != 0 {
++            return Err(err_from_last());
++        }
++        NonNull::new(out).map(|ptr| KvRegions { ptr }).ok_or_else(err_from_last)
++    }
++}
++
++impl Drop for LayerPlan {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_layer_plan_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++/// Bulk layerwise plan (`kvmem::LayerwiseWorkingSetPlan`): one reduced plan per
++/// target layer plus the shared canonical archive accounting.
++pub struct LayerwisePlan {
++    ptr: NonNull<HkLayerwisePlan>,
++}
++
++impl LayerwisePlan {
++    pub fn layer_count(&self) -> usize {
++        unsafe { ffi::hk_layerwise_plan_layer_count(self.ptr.as_ptr()) }
++    }
++    pub fn history(&self) -> Result<MemoryStamp> {
++        let mut out: MemoryStamp = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_plan_history(p, &mut out); })?;
++        Ok(out)
++    }
++    pub fn host_payload_bytes_required(&self) -> u64 {
++        unsafe { ffi::hk_layerwise_plan_host_payload_bytes_required(self.ptr.as_ptr()) }
++    }
++    /// A NEW caller-owned [`LayerPlan`] handle for target layer `i`.
++    pub fn layer(&self, i: usize) -> Result<LayerPlan> {
++        let mut out: *mut HkLayerPlan = ptr::null_mut();
++        let p = self.ptr.as_ptr();
++        clear_error();
++        let rc = unsafe { ffi::hk_layerwise_plan_layer(p, i, &mut out) };
++        if rc != 0 {
++            return Err(err_from_last());
++        }
++        NonNull::new(out).map(|ptr| LayerPlan { ptr }).ok_or_else(err_from_last)
++    }
++}
++
++impl Drop for LayerwisePlan {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_layerwise_plan_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++// ── layerwise Query request state machine: safe wrapper ──
++
++/// Owner state behind the C source-revision callback. Boxed so its heap address
++/// is stable across moves of the request; freed only after the C++ request.
++struct RevisionState {
++    f: Box<dyn FnMut() -> MemoryStamp>,
++}
++
++/// C trampoline: prove the owner's current frozen index stamp. A panicking owner
++/// cannot prove the stamp, so return an invalid (zeroed) stamp and let the core
++/// revision check fail closed (Stale) rather than unwind across the C ABI.
++unsafe extern "C" fn revision_trampoline(user: *mut c_void) -> MemoryStamp {
++    let state = &mut *(user as *mut RevisionState);
++    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (state.f)())) {
++        Ok(stamp) => stamp,
++        Err(_) => std::mem::zeroed(),
++    }
++}
++
++/// Borrow a C array as a slice; a zero count yields an empty slice even when the
++/// pointer is null (which `slice::from_raw_parts` would otherwise reject).
++unsafe fn slice_or_empty<'a, T>(p: *const T, n: usize) -> &'a [T] {
++    if n == 0 {
++        &[]
++    } else {
++        std::slice::from_raw_parts(p, n)
++    }
++}
++
++/// C trampoline for the owner's native scorer. The closure captures its own
++/// statistics/device handle, so the borrowed `keys` pointer is not used here. A
++/// panicking or failing scorer (or a wrong score extent) returns HK_ERR and the
++/// request aborts fail-closed rather than unwinding across the C ABI.
++unsafe extern "C" fn scorer_trampoline<F>(
++    user: *mut c_void,
++    _keys: *const HkRawStore,
++    tile: *const NativeCurrentLayerQuery,
++    frame: *const HkQueryScoreFrame,
++    out: *mut f64,
++    cap: usize,
++) -> c_int
++where
++    F: FnMut(&NativeCurrentLayerQuery, &QueryScoreFrame<'_>) -> Result<Vec<f64>>,
++{
++    let f = &mut *(user as *mut F);
++    let tile = &*tile;
++    let cf = &*frame;
++    let view = QueryScoreFrame {
++        starts: slice_or_empty(cf.starts, cf.start_count),
++        counts: slice_or_empty(cf.counts, cf.count_count),
++        score_mask: slice_or_empty(cf.score_mask, cf.score_mask_count),
++        transport_mask: slice_or_empty(cf.transport_mask, cf.transport_mask_count),
++        accepted_through: cf.accepted_through,
++    };
++    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tile, &view)));
++    match result {
++        Ok(Ok(scores)) if scores.len() == cap => {
++            std::ptr::copy_nonoverlapping(scores.as_ptr(), out, cap);
++            0 // HK_OK
++        }
++        _ => -1, // HK_ERR
++    }
++}
++
++/// An engine-safe-boundary transaction mirroring `kvmem::LayerwiseQueryRequest`.
++///
++/// It connects real projection reports to the qualified Mean-K scorer/picker and
++/// the native layer plan. It does NOT execute tensors, copy GPU bytes, fence
++/// streams or publish state — those stay with the hipfire driver and must precede
++/// each report. The `catalog`/`policy`/`keys` handles are borrowed and must
++/// outlive the request; `revision` proves the frozen index stamp at each native
++/// boundary. Like the other wrappers this type is deliberately neither `Send`
++/// nor `Sync` (the serve loop serializes the C ABI).
++pub struct LayerwiseRequest {
++    ptr: NonNull<HkLayerwiseRequest>,
++    // Ownership anchor for the C SourceRevision trampoline's user pointer: the
++    // C++ request reads it through `revision_trampoline`, never via this field,
++    // and it is freed only after the C++ request is destroyed (see Drop).
++    #[allow(dead_code)]
++    revision: Box<RevisionState>,
++}
++
++impl LayerwiseRequest {
++    /// Admit a frozen layerwise Query transaction. `specs` has one entry per
++    /// target layer (matching the catalog); `native_history_tokens` is the
++    /// already-resident native suffix the driver will append after acceptance.
++    pub fn new(
++        identity: &LayerwiseIdentity,
++        catalog: &MemoryCatalog,
++        policy: &KvStore,
++        keys: &RawStore,
++        specs: &[LayerRequestSpec],
++        native_history_tokens: u64,
++        revision: impl FnMut() -> MemoryStamp + 'static,
++    ) -> Result<Self> {
++        let hk: Vec<HkLayerRequestSpec> = specs
++            .iter()
++            .map(|s| HkLayerRequestSpec {
++                model_layer: s.model_layer,
++                query: s.query,
++                budget: s.budget,
++                mandatory: s.mandatory.as_ptr(),
++                mandatory_count: s.mandatory.len(),
++            })
++            .collect();
++        let mut state = Box::new(RevisionState { f: Box::new(revision) });
++        let user = &mut *state as *mut RevisionState as *mut c_void;
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_layerwise_request_create(
++                identity,
++                catalog.ptr.as_ptr(),
++                policy.ptr.as_ptr(),
++                keys.ptr.as_ptr(),
++                hk.as_ptr(),
++                hk.len(),
++                native_history_tokens,
++                Some(revision_trampoline),
++                user,
++            )
++        };
++        NonNull::new(ptr)
++            .map(|ptr| Self { ptr, revision: state })
++            .ok_or_else(err_from_last)
++    }
++
++    /// Abort the transaction (idempotent); moves the phase to `Aborted`.
++    pub fn abort(&self) {
++        unsafe { ffi::hk_layerwise_request_abort(self.ptr.as_ptr()) };
++    }
++    pub fn phase(&self) -> LayerwisePhase {
++        LayerwisePhase::from_u32(unsafe { ffi::hk_layerwise_request_phase(self.ptr.as_ptr()) })
++    }
++    pub fn work(&self) -> Result<LayerwiseWork> {
++        let mut out: LayerwiseWork = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_work(p, &mut out); })?;
++        Ok(out)
++    }
++
++    /// Open target layer `model_layer` for projection.
++    pub fn begin_layer(&self, id: &LayerwiseIdentity, model_layer: u32) -> Result<()> {
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_begin_layer(p, id, model_layer); })
++    }
++
++    /// Report `rows` contiguous `[rows, query_heads, head_dim]` F32 current-forward
++    /// rows (post-normalization/pre-RoPE) for this layer, starting at token `begin`.
++    pub fn projected(
++        &self,
++        id: &LayerwiseIdentity,
++        begin: u64,
++        rows: u32,
++        data: &[f32],
++        geometry: LayerQueryGeometry,
++    ) -> Result<()> {
++        let q = HkCurrentLayerQuery {
++            data: data.as_ptr(),
++            layer: geometry.layer,
++            rows,
++            query_heads: geometry.query_heads,
++            kv_heads: geometry.kv_heads,
++            head_dim: geometry.head_dim,
++            attention_scale: geometry.attention_scale,
++        };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_projected(p, id, begin, &q); })
++    }
++
++    /// Report a borrowed native Q tensor (device or host) for this layer and let
++    /// the owner's `scorer` compute per-block page mass against the frozen frame.
++    /// Only the tensor's intersection with the explicit user Query enters
++    /// scoring. The scorer must complete its native stream before returning and
++    /// write exactly `frame.starts.len()` non-negative scores (masked blocks 0).
++    /// The closure may borrow the statistics/device handles it needs; it is
++    /// called synchronously, so no `'static` bound is required.
++    pub fn projected_native<F>(
++        &self,
++        id: &LayerwiseIdentity,
++        begin: u64,
++        query: &NativeCurrentLayerQuery,
++        mut scorer: F,
++    ) -> Result<()>
++    where
++        F: FnMut(&NativeCurrentLayerQuery, &QueryScoreFrame<'_>) -> Result<Vec<f64>>,
++    {
++        let p = self.ptr.as_ptr();
++        let user = &mut scorer as *mut F as *mut c_void;
++        checked(|| unsafe {
++            ffi::hk_layerwise_request_projected_native(
++                p,
++                id,
++                begin,
++                query,
++                Some(scorer_trampoline::<F>),
++                user,
++            );
++        })
++    }
++
++    /// Freeze this layer's selection and obtain a NEW caller-owned [`LayerPlan`]
++    /// describing the compact restore/spill/evict working set.
++    pub fn prepare_restore(&self, id: &LayerwiseIdentity) -> Result<LayerPlan> {
++        let mut out: *mut HkLayerPlan = ptr::null_mut();
++        let p = self.ptr.as_ptr();
++        clear_error();
++        let rc = unsafe { ffi::hk_layerwise_request_prepare_restore(p, id, &mut out) };
++        if rc != 0 {
++            return Err(err_from_last());
++        }
++        NonNull::new(out).map(|ptr| LayerPlan { ptr }).ok_or_else(err_from_last)
++    }
++
++    /// Report the post-fence native view the driver actually restored.
++    pub fn restored(&self, id: &LayerwiseIdentity, view: &ExecutionView) -> Result<()> {
++        let v = view.ffi();
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_restored(p, id, &v); })
++    }
++
++    /// Report `count` attended rows starting at token `begin` for this layer.
++    pub fn attended(&self, id: &LayerwiseIdentity, begin: u64, count: u64) -> Result<()> {
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_attended(p, id, begin, count); })
++    }
++
++    /// Close this layer's attending phase (moves to `AwaitingAcceptance`).
++    pub fn complete_layer(&self, id: &LayerwiseIdentity) -> Result<()> {
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_complete_layer(p, id); })
++    }
++
++    /// Publish the accepted per-layer snapshots (one per target layer), advancing
++    /// the canonical history. Moves the phase to `Accepted`.
++    pub fn accepted(&self, id: &LayerwiseIdentity, snapshots: &[LayerMemorySnapshot]) -> Result<()> {
++        let hk: Vec<HkLayerMemorySnapshot> = snapshots
++            .iter()
++            .map(|l| HkLayerMemorySnapshot {
++                model_layer: l.model_layer,
++                memory: HkMemorySnapshot {
++                    stamp: l.memory.stamp,
++                    blocks: l.memory.blocks.as_ptr(),
++                    block_count: l.memory.blocks.len(),
++                    resident: l.memory.resident.as_ptr(),
++                    resident_count: l.memory.resident.len(),
++                },
++            })
++            .collect();
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_accepted(p, id, hk.as_ptr(), hk.len()); })
++    }
++
++    // ── frozen selection (after prepare_restore, through attending) ──
++    pub fn selection_layer(&self) -> u32 {
++        unsafe { ffi::hk_layerwise_request_selection_layer(self.ptr.as_ptr()) }
++    }
++    pub fn selection_score_count(&self) -> usize {
++        unsafe { ffi::hk_layerwise_request_selection_score_count(self.ptr.as_ptr()) }
++    }
++    pub fn selection_score(&self, i: usize) -> Result<f64> {
++        let mut out = 0f64;
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_selection_score(p, i, &mut out); })?;
++        Ok(out)
++    }
++    pub fn selection_fixed_count(&self) -> usize {
++        unsafe { ffi::hk_layerwise_request_selection_fixed_count(self.ptr.as_ptr()) }
++    }
++    pub fn selection_fixed(&self, i: usize) -> u32 {
++        unsafe { ffi::hk_layerwise_request_selection_fixed(self.ptr.as_ptr(), i) }
++    }
++    pub fn selection_selected_count(&self) -> usize {
++        unsafe { ffi::hk_layerwise_request_selection_selected_count(self.ptr.as_ptr()) }
++    }
++    pub fn selection_selected(&self, i: usize) -> u32 {
++        unsafe { ffi::hk_layerwise_request_selection_selected(self.ptr.as_ptr(), i) }
++    }
++    pub fn selection_historical_tokens(&self) -> u64 {
++        unsafe { ffi::hk_layerwise_request_selection_historical_tokens(self.ptr.as_ptr()) }
++    }
++    pub fn selection_charged_tokens(&self) -> u64 {
++        unsafe { ffi::hk_layerwise_request_selection_charged_tokens(self.ptr.as_ptr()) }
++    }
++
++    // ── accepted per-layer snapshots (Accepted phase only) ──
++    pub fn accepted_layer_count(&self) -> usize {
++        unsafe { ffi::hk_layerwise_request_accepted_layer_count(self.ptr.as_ptr()) }
++    }
++    pub fn accepted_model_layer(&self, i: usize) -> u32 {
++        unsafe { ffi::hk_layerwise_request_accepted_model_layer(self.ptr.as_ptr(), i) }
++    }
++    pub fn accepted_stamp(&self, i: usize) -> Result<MemoryStamp> {
++        let mut out: MemoryStamp = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_accepted_stamp(p, i, &mut out); })?;
++        Ok(out)
++    }
++    pub fn accepted_block_count(&self, i: usize) -> usize {
++        unsafe { ffi::hk_layerwise_request_accepted_block_count(self.ptr.as_ptr(), i) }
++    }
++    pub fn accepted_block(&self, i: usize, b: usize) -> Result<BlockCopies> {
++        let mut out: BlockCopies = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_request_accepted_block(p, i, b, &mut out); })?;
++        Ok(out)
++    }
++    pub fn accepted_resident_count(&self, i: usize) -> usize {
++        unsafe { ffi::hk_layerwise_request_accepted_resident_count(self.ptr.as_ptr(), i) }
++    }
++    pub fn accepted_resident(&self, i: usize, b: usize) -> u64 {
++        unsafe { ffi::hk_layerwise_request_accepted_resident(self.ptr.as_ptr(), i, b) }
++    }
++}
++
++impl Drop for LayerwiseRequest {
++    fn drop(&mut self) {
++        // Destroy the C++ request first so its SourceRevision lambda can no
++        // longer call the trampoline; `self.revision` is freed afterwards.
++        unsafe { ffi::hk_layerwise_request_destroy(self.ptr.as_ptr()) };
++    }
++}
+diff --git a/crates/hipfire-kvmem/tests/layerwise_catalog_smoke.rs b/crates/hipfire-kvmem/tests/layerwise_catalog_smoke.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdbfff836ae0f6a41e8394daf41bba61c2793bb3
+--- /dev/null
++++ b/crates/hipfire-kvmem/tests/layerwise_catalog_smoke.rs
+@@ -0,0 +1,262 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Host-only smoke test for the layerwise catalog + planning foundation: no GPU,
++//! no model. Mirrors kvmem's LayerwiseMemoryCatalog / LayerWorkingSetPlan over the
++//! hipfire Q8 {Key,Value} layout adapter: build a two-layer canonical catalog,
++//! plan a per-layer resident swap (restore/evict, drop-evict with a sealed host
++//! archive so no spill), read the reduced plan + per-layer transfer regions, and
++//! exercise the bulk plan and the fail-closed admission rejections.
++
++use hipfire_kvmem::{
++    BackendIdentity, BlockCopies, BlockDescriptor, LayerMemorySnapshot, LayerSelection,
++    MemoryBudget, MemoryCapabilities, MemoryDescriptor, MemorySnapshot, MemoryStamp, PayloadLayout,
++    RawStoreConfig, SessionIdentity,
++};
++
++const BLOCK: u32 = 4;
++const ROW_BYTES: usize = 36;
++const LAYERS: u32 = 2;
++const RECORD_BYTES: u64 = (ROW_BYTES * BLOCK as usize * LAYERS as usize * 2) as u64; // 576
++const PLANE_BYTES: u64 = (ROW_BYTES * BLOCK as usize) as u64; // 144
++const LAYER_BYTES: u64 = PLANE_BYTES * 2; // 288 (K+V for one layer)
++
++fn raw_config() -> RawStoreConfig {
++    RawStoreConfig {
++        n_layer: LAYERS,
++        n_embd_k: 8,
++        n_embd_v: 8,
++        block_tokens: BLOCK,
++        k_row_bytes: 0,
++        k_gpu_row_bytes: ROW_BYTES as u64,
++        v_gpu_row_bytes: ROW_BYTES as u64,
++    }
++}
++
++fn backend() -> BackendIdentity {
++    BackendIdentity {
++        backend: "hipfire".into(),
++        revision: "kvmem-v046".into(),
++        model: "two-layer-fixture".into(),
++        state_schema: "state-v1".into(),
++    }
++}
++
++fn session() -> SessionIdentity {
++    SessionIdentity { id: 42, incarnation: 3 }
++}
++
++fn descriptor() -> MemoryDescriptor {
++    let layout =
++        PayloadLayout::from_raw(&raw_config(), "hipfire-q8-packed-v1", &[0, 1]).expect("layout");
++    let cap = MemoryCapabilities {
++        page_tokens: BLOCK,
++        max_position: 1 << 20,
++        native_payload: 1,
++        sparse_view: 1,
++        original_rope_positions: 1,
++        pre_rope_statistics: 1,
++        state_checkpoint: 1,
++        asynchronous_transfer: 0,
++    };
++    MemoryDescriptor::new(&backend(), &layout, &cap).expect("descriptor")
++}
++
++/// Accepted history stamp; only `view_version` differs between target layers.
++fn stamp(view_version: u64) -> MemoryStamp {
++    MemoryStamp {
++        valid: 1,
++        session: session(),
++        history_revision: 5,
++        view_version,
++        frontier: 8,
++        execution_history: 9,
++    }
++}
++
++fn block(id: u64, start: u64, content_version: u64) -> BlockDescriptor {
++    BlockDescriptor {
++        session: session(),
++        id,
++        original_start: start,
++        valid_tokens: BLOCK,
++        content_version,
++        statistics_version: 2,
++    }
++}
++
++/// Two full blocks (100@0, 200@4), both with completed current host copies.
++fn snapshot(view_version: u64, resident: Vec<u64>) -> MemorySnapshot {
++    MemorySnapshot {
++        stamp: stamp(view_version),
++        blocks: vec![
++            BlockCopies { block: block(100, 0, 1), host_version: 1 },
++            BlockCopies { block: block(200, 4, 2), host_version: 2 },
++        ],
++        resident,
++    }
++}
++
++fn layers() -> Vec<LayerMemorySnapshot> {
++    vec![
++        LayerMemorySnapshot { model_layer: 0, memory: snapshot(6, vec![100]) },
++        LayerMemorySnapshot { model_layer: 1, memory: snapshot(11, vec![200]) },
++    ]
++}
++
++fn budget() -> MemoryBudget {
++    MemoryBudget {
++        selected_tokens: BLOCK as u64,
++        reserve_tokens: 0,
++        device_tokens: BLOCK as u64,
++        host_payload_bytes: RECORD_BYTES * 4,
++    }
++}
++
++/// Swap layer 0's resident set from [100] to [200].
++fn sel0() -> LayerSelection {
++    LayerSelection {
++        model_layer: 0,
++        expected: stamp(6),
++        selected: vec![200],
++        mandatory: vec![],
++        budget: budget(),
++    }
++}
++
++/// Swap layer 1's resident set from [200] to [100].
++fn sel1() -> LayerSelection {
++    LayerSelection {
++        model_layer: 1,
++        expected: stamp(11),
++        selected: vec![100],
++        mandatory: vec![],
++        budget: budget(),
++    }
++}
++
++#[test]
++fn catalog_snapshots_and_per_layer_plan() {
++    let desc = descriptor();
++    let catalog = hipfire_kvmem::MemoryCatalog::new(&desc, &layers()).expect("catalog");
++
++    // Catalog stored both target layers in model order with their own stamps.
++    assert_eq!(catalog.layer_count(), 2);
++    assert_eq!(catalog.model_layer(0), 0);
++    assert_eq!(catalog.model_layer(1), 1);
++    assert_eq!(catalog.snapshot_stamp(0).expect("stamp 0"), stamp(6));
++    assert_eq!(catalog.snapshot_stamp(1).expect("stamp 1"), stamp(11));
++    assert_eq!(catalog.snapshot_block_count(0), 2);
++    let b0 = catalog.snapshot_block(0, 0).expect("block 0");
++    assert_eq!(b0.block.id, 100);
++    assert_eq!(b0.host_version, 1);
++    assert_eq!(catalog.snapshot_block(0, 1).expect("block 1").block.id, 200);
++    assert_eq!(catalog.snapshot_resident_count(0), 1);
++    assert_eq!(catalog.snapshot_resident(0, 0), 100);
++    assert_eq!(catalog.snapshot_resident(1, 0), 200);
++
++    // Plan layer 0's swap: restore 200, drop-evict 100 (sealed host copy → no spill).
++    let plan = catalog.plan_layer(&sel0()).expect("plan layer 0");
++    assert_eq!(plan.model_layer(), 0);
++    assert_eq!(plan.restore_count(), 1);
++    assert_eq!(plan.restore_block(0).expect("restore").id, 200);
++    assert_eq!(plan.evict_count(), 1);
++    assert_eq!(plan.evict_block(0).expect("evict").id, 100);
++    assert_eq!(plan.spill_count(), 0);
++    assert_eq!(plan.mandatory_count(), 0);
++    assert_eq!(plan.next_visible_tokens(), BLOCK as u64);
++    assert_eq!(plan.next_block_count(), 1);
++    let nb = plan.next_block(0).expect("next block");
++    assert_eq!(nb.block.id, 200);
++    assert_eq!(nb.compact_start, 0);
++    let ns = plan.next_stamp().expect("next stamp");
++    assert_eq!(ns.view_version, 7); // 6 + 1
++    assert_eq!(ns.frontier, 8);
++    assert_eq!(ns.history_revision, 5);
++    assert_eq!(plan.restore_bytes(), LAYER_BYTES);
++    assert_eq!(plan.spill_bytes(), 0);
++    assert_eq!(plan.device_tokens_required(), BLOCK as u64);
++    assert_eq!(plan.host_payload_bytes_required(), RECORD_BYTES * 2);
++
++    // The per-layer transfer regions are a separate KvRegions handle.
++    let regions = plan.payload().expect("payload regions");
++    assert_eq!(regions.region_count(), 2);
++    assert_eq!(regions.plane_bytes(), LAYER_BYTES);
++    assert_eq!(regions.packed_bytes(), LAYER_BYTES); // alignment 1, no padding
++    assert_eq!(regions.record_bytes(), RECORD_BYTES);
++
++    // Layer 1 swaps the other way.
++    let plan1 = catalog.plan_layer(&sel1()).expect("plan layer 1");
++    assert_eq!(plan1.model_layer(), 1);
++    assert_eq!(plan1.restore_block(0).expect("restore").id, 100);
++    assert_eq!(plan1.evict_block(0).expect("evict").id, 200);
++    assert_eq!(plan1.next_stamp().expect("stamp").view_version, 12); // 11 + 1
++    assert_eq!(plan1.restore_bytes(), LAYER_BYTES);
++}
++
++#[test]
++fn bulk_plan_shared_archive_accounting() {
++    let desc = descriptor();
++    let catalog = hipfire_kvmem::MemoryCatalog::new(&desc, &layers()).expect("catalog");
++    let plan = catalog.plan(&[sel0(), sel1()]).expect("bulk plan");
++    assert_eq!(plan.layer_count(), 2);
++    let history = plan.history().expect("history");
++    assert_eq!(history.history_revision, 5);
++    assert_eq!(history.frontier, 8);
++    assert_eq!(history.view_version, 0); // bulk history identity carries no view version
++    // Union of canonical full-record IDs, NOT the sum of per-layer requirements.
++    assert_eq!(plan.host_payload_bytes_required(), RECORD_BYTES * 2);
++    let l0 = plan.layer(0).expect("layer 0");
++    let l1 = plan.layer(1).expect("layer 1");
++    assert_eq!(l0.model_layer(), 0);
++    assert_eq!(l1.model_layer(), 1);
++    assert_eq!(l0.restore_block(0).expect("restore").id, 200);
++    assert_eq!(l1.restore_block(0).expect("restore").id, 100);
++    assert!(plan.layer(2).is_err(), "out-of-range layer index");
++}
++
++#[test]
++fn fail_closed_admission_and_stale_selection() {
++    let desc = descriptor();
++    let catalog = hipfire_kvmem::MemoryCatalog::new(&desc, &layers()).expect("catalog");
++
++    // A stale expected view version is rejected.
++    let mut stale = sel0();
++    stale.expected.view_version = 999;
++    assert!(catalog.plan_layer(&stale).is_err(), "stale expected stamp");
++
++    // An unknown target layer is rejected.
++    let mut unknown = sel0();
++    unknown.model_layer = 5;
++    assert!(catalog.plan_layer(&unknown).is_err(), "unknown layer");
++
++    // A selection over budget is rejected (device_tokens too small for the page).
++    let mut tight = sel0();
++    tight.budget.device_tokens = 0;
++    assert!(catalog.plan_layer(&tight).is_err(), "device budget exceeded");
++
++    // Inconsistent resident extent between layers fails catalog admission.
++    let mut bad_extent = layers();
++    bad_extent[1].memory.resident = vec![100, 200]; // 8 tokens vs layer 0's 4
++    assert!(
++        hipfire_kvmem::MemoryCatalog::new(&desc, &bad_extent).is_err(),
++        "inconsistent resident extent"
++    );
++
++    // A divergent accepted history fails catalog admission.
++    let mut bad_history = layers();
++    bad_history[1].memory.stamp.history_revision = 6;
++    assert!(
++        hipfire_kvmem::MemoryCatalog::new(&desc, &bad_history).is_err(),
++        "divergent history"
++    );
++
++    // A cold block without a completed current host copy fails admission.
++    let mut no_host = layers();
++    no_host[0].memory.blocks[1].host_version = 0; // block 200 cold in layer 0
++    assert!(
++        hipfire_kvmem::MemoryCatalog::new(&desc, &no_host).is_err(),
++        "cold history without host copy"
++    );
++}
+\ No newline at end of file
+diff --git a/crates/hipfire-kvmem/tests/layerwise_payload_smoke.rs b/crates/hipfire-kvmem/tests/layerwise_payload_smoke.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..690e6f9abb045863b4569af84db530790ac89d3c
+--- /dev/null
++++ b/crates/hipfire-kvmem/tests/layerwise_payload_smoke.rs
+@@ -0,0 +1,308 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Host-only smoke test for the layerwise native payload foundation: no GPU, no
++//! model. Exercises the exact building blocks the packed-page driver relies on:
++//! the Q8 PayloadLayout adapter, MemoryDescriptor validation, per-layer
++//! NativeKvLayerRegions compact-extent reads from a sealed host record, the
++//! NativeKvArchive write-through store and the raw-KV export/import bridge.
++
++use hipfire_kvmem::{
++    BackendIdentity, BlockDescriptor, HostRecord, KvRegions, MemoryCapabilities, MemoryDescriptor,
++    NativeArchive, NativePayload, PayloadLayout, PayloadPlane, PayloadPlaneKind, RawStore,
++    RawStoreConfig, SessionIdentity, Storage,
++};
++
++const BLOCK: u32 = 4;
++const ROW_BYTES: usize = 36; // opaque packed Q8 row; contents only round-trip
++const LAYERS: u32 = 2;
++const RECORD_BYTES: usize = ROW_BYTES * BLOCK as usize * LAYERS as usize * 2; // K+V per layer
++
++fn raw_config() -> RawStoreConfig {
++    RawStoreConfig {
++        n_layer: LAYERS,
++        n_embd_k: 8,
++        n_embd_v: 8,
++        block_tokens: BLOCK,
++        k_row_bytes: 0,
++        k_gpu_row_bytes: ROW_BYTES as u64,
++        v_gpu_row_bytes: ROW_BYTES as u64,
++    }
++}
++
++fn backend() -> BackendIdentity {
++    BackendIdentity {
++        backend: "hipfire".into(),
++        revision: "kvmem-v046".into(),
++        model: "two-layer-fixture".into(),
++        state_schema: "state-v1".into(),
++    }
++}
++
++fn session() -> SessionIdentity {
++    SessionIdentity { id: 42, incarnation: 3 }
++}
++
++fn block0() -> BlockDescriptor {
++    BlockDescriptor {
++        session: session(),
++        id: 0,
++        original_start: 0,
++        valid_tokens: BLOCK,
++        content_version: 1,
++        statistics_version: 1,
++    }
++}
++
++/// Deterministic packed row for (layer, kind, token): kind 0 = K, 1 = V.
++fn pack_row(layer: u32, kind: u32, token: u32) -> [u8; ROW_BYTES] {
++    let mut row = [0u8; ROW_BYTES];
++    let seed = (layer * 100 + kind * 10 + token) as u8;
++    for (i, b) in row.iter_mut().enumerate() {
++        *b = seed.wrapping_add(i as u8).wrapping_mul(7);
++    }
++    row
++}
++
++/// Write packed K/V for block 0, every layer, into the raw store.
++fn feed_block0(raw: &RawStore) {
++    for il in 0..LAYERS {
++        let mut k = Vec::new();
++        let mut v = Vec::new();
++        for t in 0..BLOCK {
++            k.extend_from_slice(&pack_row(il, 0, t));
++            v.extend_from_slice(&pack_row(il, 1, t));
++        }
++        raw.write_layer_k_gpu(0, BLOCK, il, &k).expect("feed k");
++        raw.write_layer_v_gpu(0, BLOCK, il, &v).expect("feed v");
++    }
++}
++
++#[test]
++fn layout_adapter_and_descriptor() {
++    let layout = PayloadLayout::from_raw(&raw_config(), "hipfire-q8-packed-v1", &[0, 1])
++        .expect("layout from raw");
++    assert_eq!(layout.block_tokens(), BLOCK);
++    assert_eq!(layout.record_bytes(), RECORD_BYTES as u64);
++    assert_eq!(layout.plane_count(), LAYERS * 2);
++
++    // Planes are layer-major {Key,Value}, contiguous, stride = packed row bytes.
++    let mut expect_offset = 0u64;
++    for il in 0..LAYERS {
++        for kind in [PayloadPlaneKind::Key, PayloadPlaneKind::Value] {
++            let p = layout.plane(il * 2 + kind as u32).expect("plane");
++            assert_eq!(p.layer, il);
++            assert_eq!(p.kind, kind as u32);
++            assert_eq!(p.offset, expect_offset);
++            assert_eq!(p.bytes, (ROW_BYTES * BLOCK as usize) as u64);
++            assert_eq!(p.token_stride, ROW_BYTES as u64);
++            assert_eq!(p.alignment, 1);
++            expect_offset += p.bytes;
++        }
++    }
++    assert_eq!(expect_offset, RECORD_BYTES as u64);
++
++    let cap = MemoryCapabilities {
++        page_tokens: BLOCK,
++        max_position: 1 << 20,
++        native_payload: 1,
++        sparse_view: 1,
++        original_rope_positions: 1,
++        pre_rope_statistics: 1,
++        state_checkpoint: 1,
++        asynchronous_transfer: 0,
++    };
++    let _desc = MemoryDescriptor::new(&backend(), &layout, &cap).expect("descriptor");
++
++    // An empty attention-layer list is rejected, not silently zero-sized.
++    assert!(PayloadLayout::from_raw(&raw_config(), "fmt", &[]).is_err());
++}
++
++#[test]
++fn export_regions_read_and_import_roundtrip() {
++    let storage = Storage::new_ram(1 << 30).expect("storage");
++    let raw = RawStore::new(raw_config(), Some(&storage)).expect("raw store");
++    feed_block0(&raw);
++
++    let layout = PayloadLayout::from_raw(&raw_config(), "hipfire-q8-packed-v1", &[0, 1])
++        .expect("layout");
++
++    // Export gathers all layers' packed K/V into one canonical record.
++    let payload = NativePayload::export(&raw, &backend(), &layout, &block0()).expect("export");
++    assert_eq!(payload.size(), RECORD_BYTES);
++    assert_eq!(payload.block().expect("block"), block0());
++
++    // The exported bytes are exactly the layer-major {K,V} packed rows.
++    let bytes = payload.bytes();
++    let mut expect = Vec::new();
++    for il in 0..LAYERS {
++        for t in 0..BLOCK {
++            expect.extend_from_slice(&pack_row(il, 0, t));
++        }
++        for t in 0..BLOCK {
++            expect.extend_from_slice(&pack_row(il, 1, t));
++        }
++    }
++    assert_eq!(bytes, expect.as_slice());
++
++    // Seal the canonical record as a host source, then read layer 0's compact
++    // extent (its K plane then V plane) out of the full multi-layer record.
++    let record = HostRecord::allocate(&storage, bytes).expect("allocate record");
++    record.seal().expect("seal");
++    assert_eq!(record.size(), RECORD_BYTES);
++    let source = record.source().expect("source");
++    assert_eq!(source.size(), RECORD_BYTES);
++
++    let regions = KvRegions::new(&layout, 0, None).expect("regions layer 0");
++    let plane_bytes = (ROW_BYTES * BLOCK as usize) as u64;
++    assert_eq!(regions.region_count(), 2);
++    assert_eq!(regions.plane_bytes(), 2 * plane_bytes);
++    assert_eq!(regions.packed_bytes(), 2 * plane_bytes); // alignment 1, no padding
++    assert_eq!(regions.record_bytes(), RECORD_BYTES as u64);
++    let (k_plane, k_off) = regions.region(0).expect("region 0");
++    let (v_plane, v_off) = regions.region(1).expect("region 1");
++    assert_eq!(k_plane.kind, PayloadPlaneKind::Key as u32);
++    assert_eq!(v_plane.kind, PayloadPlaneKind::Value as u32);
++    assert_eq!(k_off, 0);
++    assert_eq!(v_off, plane_bytes);
++
++    let mut staging = vec![0u8; regions.packed_bytes() as usize];
++    // Bounded reads that deliberately cross a plane boundary, like the core test.
++    let split = 13usize;
++    regions.read(&source, 0, &mut staging[..split], 7).expect("read part 1");
++    regions.read(&source, split as u64, &mut staging[split..], 7).expect("read part 2");
++    let mut expect_layer0 = Vec::new();
++    for t in 0..BLOCK {
++        expect_layer0.extend_from_slice(&pack_row(0, 0, t));
++    }
++    for t in 0..BLOCK {
++        expect_layer0.extend_from_slice(&pack_row(0, 1, t));
++    }
++    assert_eq!(staging, expect_layer0);
++
++    // Layer 1 reads its own stripe from the same canonical record.
++    let regions1 = KvRegions::new(&layout, 1, None).expect("regions layer 1");
++    let mut staging1 = vec![0u8; regions1.packed_bytes() as usize];
++    regions1.read(&source, 0, &mut staging1, 64 << 20).expect("read layer 1");
++    let mut expect_layer1 = Vec::new();
++    for t in 0..BLOCK {
++        expect_layer1.extend_from_slice(&pack_row(1, 0, t));
++    }
++    for t in 0..BLOCK {
++        expect_layer1.extend_from_slice(&pack_row(1, 1, t));
++    }
++    assert_eq!(staging1, expect_layer1);
++
++    // Import the canonical record into a FRESH raw store and verify packed
++    // readback per layer/plane (statistics are untouched by import).
++    let raw2 = RawStore::new(raw_config(), Some(&storage)).expect("raw store 2");
++    payload.import(&raw2, &backend(), &layout).expect("import");
++    for il in 0..LAYERS {
++        assert!(raw2.has_k_gpu(0, il, BLOCK));
++        assert!(raw2.has_v_gpu(0, il, BLOCK));
++        let mut k = vec![0u8; BLOCK as usize * ROW_BYTES];
++        let mut v = vec![0u8; BLOCK as usize * ROW_BYTES];
++        assert!(raw2.copy_k_gpu(0, il, &mut k, BLOCK));
++        assert!(raw2.copy_v_gpu(0, il, &mut v, BLOCK));
++        for t in 0..BLOCK as usize {
++            assert_eq!(&k[t * ROW_BYTES..(t + 1) * ROW_BYTES], &pack_row(il, 0, t as u32));
++            assert_eq!(&v[t * ROW_BYTES..(t + 1) * ROW_BYTES], &pack_row(il, 1, t as u32));
++        }
++    }
++}
++
++#[test]
++fn archive_write_through_and_stale_rejection() {
++    let storage = Storage::new_ram(1 << 30).expect("storage");
++    let raw = RawStore::new(raw_config(), Some(&storage)).expect("raw store");
++    feed_block0(&raw);
++    let layout = PayloadLayout::from_raw(&raw_config(), "hipfire-q8-packed-v1", &[0, 1])
++        .expect("layout");
++    let payload = NativePayload::export(&raw, &backend(), &layout, &block0()).expect("export");
++
++    let archive =
++        NativeArchive::new(&backend(), session(), &layout, (RECORD_BYTES * 4) as u64)
++            .expect("archive");
++    assert_eq!(archive.bytes(), 0);
++    archive.put(&payload).expect("put");
++    assert_eq!(archive.bytes(), RECORD_BYTES as u64);
++
++    // get returns a new caller-owned handle with identical bytes/identity.
++    let fetched = archive.get(&block0()).expect("get");
++    assert_eq!(fetched.bytes(), payload.bytes());
++    assert_eq!(fetched.block().expect("block"), block0());
++
++    // Re-putting the identical version is idempotent (no double charge).
++    archive.put(&payload).expect("idempotent put");
++    assert_eq!(archive.bytes(), RECORD_BYTES as u64);
++
++    // Upgrade to a higher content_version (replaces in place, no double charge).
++    // content_version 0 is invalid at construction, so genuine staleness must be
++    // exercised against a stored version above the minimum valid version 1.
++    let mut upgraded = block0();
++    upgraded.content_version = 2;
++    let newer = NativePayload::create(&backend(), &layout, &upgraded, payload.bytes())
++        .expect("upgraded payload");
++    archive.put(&newer).expect("upgrade put");
++    assert_eq!(archive.bytes(), RECORD_BYTES as u64);
++
++    // A stale (lower content_version) write is rejected.
++    let stale = NativePayload::create(&backend(), &layout, &block0(), payload.bytes())
++        .expect("stale payload");
++    assert!(archive.put(&stale).is_err(), "stale write must be rejected");
++
++    // A foreign backend identity is rejected.
++    let mut foreign = backend();
++    foreign.model = "other-model".into();
++    let foreign_payload =
++        NativePayload::create(&foreign, &layout, &upgraded, payload.bytes()).expect("foreign");
++    assert!(archive.put(&foreign_payload).is_err(), "foreign write must be rejected");
++
++    // A mismatched get identity is rejected (wrong frontier, same version).
++    let mut wrong = block0();
++    wrong.content_version = 2;
++    wrong.valid_tokens = BLOCK - 1;
++    assert!(archive.get(&wrong).is_err());
++
++    archive.erase(0);
++    assert_eq!(archive.bytes(), 0);
++    assert!(archive.get(&upgraded).is_err(), "erased record is missing");
++}
++
++#[test]
++fn generic_layout_create_matches_adapter() {
++    // Hand-build the same two-layer Q8 layout via the explicit plane builder.
++    let plane_bytes = (ROW_BYTES * BLOCK as usize) as u64;
++    let mut planes = Vec::new();
++    let mut offset = 0u64;
++    for il in 0..LAYERS {
++        for kind in [PayloadPlaneKind::Key, PayloadPlaneKind::Value] {
++            planes.push(PayloadPlane {
++                layer: il,
++                kind: kind as u32,
++                offset,
++                bytes: plane_bytes,
++                alignment: 1,
++                token_stride: ROW_BYTES as u64,
++                rank: 0,
++                head_begin: 0,
++                head_count: 0,
++            });
++            offset += plane_bytes;
++        }
++    }
++    let layout = PayloadLayout::create(
++        "hipfire-q8-packed-v1",
++        1,
++        BLOCK,
++        offset,
++        1,
++        &planes,
++    )
++    .expect("generic layout");
++    assert_eq!(layout.record_bytes(), RECORD_BYTES as u64);
++    assert_eq!(layout.plane_count(), LAYERS * 2);
++    assert_eq!(layout.plane(0).expect("plane 0"), planes[0]);
++    assert!(layout.plane(LAYERS * 2).is_err(), "out-of-range plane index");
++}
+\ No newline at end of file
+diff --git a/crates/hipfire-kvmem/tests/layerwise_request_smoke.rs b/crates/hipfire-kvmem/tests/layerwise_request_smoke.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd70af184687551f68e25adeae8d0645af72730c
+--- /dev/null
++++ b/crates/hipfire-kvmem/tests/layerwise_request_smoke.rs
+@@ -0,0 +1,738 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Host-only smoke test for the layerwise Query request state machine: no GPU,
++//! no model. Mirrors kvmem's LayerwiseQueryRequest scalar reference over the C
++//! ABI — admit a frozen two-layer transaction, project the current-forward Q
++//! (host Mean-K path), freeze the per-layer selection, report the restored view,
++//! attend, complete and accept the canonical suffix. The statistics oracle uses
++//! head_dim 1 (n_embd_k 1); the packed catalog layout is decoupled (model layers
++//! 2/7 vs statistics ordinals 0/1) so a swapped model_layer/query.layer is caught.
++
++use std::cell::{Cell, RefCell};
++use std::ffi::c_void;
++use std::rc::Rc;
++
++use hipfire_kvmem::{
++    BackendIdentity, BlockCopies, BlockDescriptor, ExecutionView, KvMemError, KvStore, KvStoreConfig,
++    LayerMemorySnapshot, LayerQueryGeometry, LayerRequestSpec, LayerwiseIdentity, LayerwisePhase,
++    LayerwiseRequest, MemoryBudget, MemoryCapabilities, MemoryDescriptor, MemorySnapshot,
++    MemoryStamp, NativeCurrentLayerQuery, NativeQueryScalar, PayloadLayout, QueryRange,
++    QueryScoreFrame, RawStore, RawStoreConfig, SessionIdentity,
++};
++
++const BLOCK: u32 = 4;
++const EVAL_ROWS: u32 = 4; // evaluation span [8, 12); query span [9, 11)
++const ROW_BYTES: u64 = 4; // one head_dim-1 F32 token row
++const PLANE_BYTES: u64 = ROW_BYTES * BLOCK as u64; // 16
++const LAYER_BYTES: u64 = PLANE_BYTES * 2; // 32 (K+V for one layer)
++
++fn session() -> SessionIdentity {
++    SessionIdentity { id: 42, incarnation: 3 }
++}
++
++/// Statistics-only keys store: head_dim 1, no packed rows.
++fn stats_config() -> RawStoreConfig {
++    RawStoreConfig {
++        n_layer: 2,
++        n_embd_k: 1,
++        n_embd_v: 0,
++        block_tokens: BLOCK,
++        k_row_bytes: 0,
++        k_gpu_row_bytes: 0,
++        v_gpu_row_bytes: 0,
++    }
++}
++
++/// Packed payload layout source: model layers 2 and 7 (n_layer 8 admits them).
++fn payload_config() -> RawStoreConfig {
++    RawStoreConfig {
++        n_layer: 8,
++        n_embd_k: 1,
++        n_embd_v: 1,
++        block_tokens: BLOCK,
++        k_row_bytes: 0,
++        k_gpu_row_bytes: ROW_BYTES,
++        v_gpu_row_bytes: ROW_BYTES,
++    }
++}
++
++fn backend() -> BackendIdentity {
++    BackendIdentity {
++        backend: "hipfire".into(),
++        revision: "kvmem-v046".into(),
++        model: "two-layer-fixture".into(),
++        state_schema: "state-v1".into(),
++    }
++}
++
++fn descriptor() -> MemoryDescriptor {
++    let layout =
++        PayloadLayout::from_raw(&payload_config(), "scalar-request-reference", &[2, 7])
++            .expect("layout");
++    let cap = MemoryCapabilities {
++        page_tokens: BLOCK,
++        max_position: 1 << 20,
++        native_payload: 1,
++        sparse_view: 1,
++        original_rope_positions: 1,
++        pre_rope_statistics: 1,
++        state_checkpoint: 1,
++        asynchronous_transfer: 0,
++    };
++    MemoryDescriptor::new(&backend(), &layout, &cap).expect("descriptor")
++}
++
++/// Accepted history stamp; only `view_version` differs between target layers.
++fn stamp(view_version: u64) -> MemoryStamp {
++    MemoryStamp {
++        valid: 1,
++        session: session(),
++        history_revision: 5,
++        view_version,
++        frontier: 8,
++        execution_history: 9,
++    }
++}
++
++fn identity() -> LayerwiseIdentity {
++    LayerwiseIdentity {
++        history: stamp(6),
++        request: 77,
++        evaluation: QueryRange { begin: 8, end: 12 },
++        query: QueryRange { begin: 9, end: 11 },
++    }
++}
++
++fn block(id: u64, start: u64, content_version: u64) -> BlockDescriptor {
++    BlockDescriptor {
++        session: session(),
++        id,
++        original_start: start,
++        valid_tokens: BLOCK,
++        content_version,
++        statistics_version: 2,
++    }
++}
++
++fn snapshot(view_version: u64, resident: Vec<u64>) -> MemorySnapshot {
++    MemorySnapshot {
++        stamp: stamp(view_version),
++        blocks: vec![
++            BlockCopies { block: block(100, 0, 1), host_version: 1 },
++            BlockCopies { block: block(200, 4, 2), host_version: 2 },
++        ],
++        resident,
++    }
++}
++
++fn initial() -> Vec<LayerMemorySnapshot> {
++    vec![
++        LayerMemorySnapshot { model_layer: 2, memory: snapshot(6, vec![100]) },
++        LayerMemorySnapshot { model_layer: 7, memory: snapshot(11, vec![200]) },
++    ]
++}
++
++fn budget() -> MemoryBudget {
++    MemoryBudget {
++        selected_tokens: BLOCK as u64,
++        reserve_tokens: BLOCK as u64,
++        device_tokens: 2 * BLOCK as u64,
++        host_payload_bytes: 192,
++    }
++}
++
++fn geometry(layer: u32) -> LayerQueryGeometry {
++    LayerQueryGeometry { layer, query_heads: 1, kv_heads: 1, head_dim: 1, attention_scale: 1.0 }
++}
++
++fn specs() -> Vec<LayerRequestSpec> {
++    vec![
++        LayerRequestSpec { model_layer: 2, query: geometry(0), budget: budget(), mandatory: vec![] },
++        LayerRequestSpec { model_layer: 7, query: geometry(1), budget: budget(), mandatory: vec![] },
++    ]
++}
++
++fn policy() -> KvStore {
++    let cfg = KvStoreConfig {
++        block_tokens: BLOCK,
++        select_budget: BLOCK,
++        sink_blocks: 0,
++        recent_blocks: 0,
++        ..KvStoreConfig::default()
++    };
++    let kv = KvStore::new(&cfg).expect("policy");
++    kv.register_append(2 * BLOCK).expect("append");
++    kv
++}
++
++/// block0 mean_k = -1, block1 mean_k = +1 for both statistics ordinals.
++fn keys() -> RawStore {
++    let raw = RawStore::new(stats_config(), None).expect("keys");
++    for il in 0..2u32 {
++        raw.write_layer_mean_k(0, BLOCK, il, &[-1.0; BLOCK as usize]).expect("mean k block0");
++        raw.write_layer_mean_k(BLOCK, BLOCK, il, &[1.0; BLOCK as usize]).expect("mean k block1");
++    }
++    raw
++}
++
++/// One target layer's full forward via the HOST Mean-K path: project (tiled),
++/// then freeze/restore/attend/complete. Returns the published view for acceptance.
++fn execute_layer(
++    request: &LayerwiseRequest,
++    id: &LayerwiseIdentity,
++    model_layer: u32,
++    ordinal: u32,
++    q: &[f32],
++    chunk: u32,
++    expect_ordinal: u32,
++    expect_block: u64,
++) -> ExecutionView {
++    request.begin_layer(id, model_layer).expect("begin_layer");
++    assert_eq!(request.phase(), LayerwisePhase::Projecting);
++
++    // Report every evaluation row exactly once; the scorer keeps only the query
++    // intersection [9, 11), so the opposed header/trailer logits are a trap.
++    let mut first = 0u32;
++    while first < EVAL_ROWS {
++        let count = chunk.min(EVAL_ROWS - first);
++        request
++            .projected(
++                id,
++                8 + first as u64,
++                count,
++                &q[first as usize..(first + count) as usize],
++                geometry(ordinal),
++            )
++            .expect("projected");
++        first += count;
++        if first != EVAL_ROWS {
++            assert!(
++                request.prepare_restore(id).is_err(),
++                "prepare_restore before full Query projection must be Pending"
++            );
++        }
++    }
++
++    restore_attend_complete(request, id, model_layer, ordinal, chunk, expect_ordinal, expect_block)
++}
++
++/// Freeze this layer's selection, restore the packed compact view, attend
++/// (tiled) and complete. Shared by the host and native projection paths: the
++/// selection/plan contract is identical regardless of how Q was scored.
++fn restore_attend_complete(
++    request: &LayerwiseRequest,
++    id: &LayerwiseIdentity,
++    model_layer: u32,
++    ordinal: u32,
++    chunk: u32,
++    expect_ordinal: u32,
++    expect_block: u64,
++) -> ExecutionView {
++    let plan = request.prepare_restore(id).expect("prepare_restore");
++    assert_eq!(request.phase(), LayerwisePhase::Restoring);
++    assert_eq!(plan.model_layer(), model_layer);
++    assert_eq!(plan.next_block_count(), 1);
++    assert_eq!(plan.next_block(0).expect("next block").block.id, expect_block);
++    assert_eq!(plan.next_block(0).expect("next block").compact_start, 0);
++    assert_eq!(plan.restore_count(), 1);
++    assert_eq!(plan.restore_block(0).expect("restore").id, expect_block);
++    assert_eq!(plan.spill_count(), 0); // sealed host archive → drop-evict, no spill
++    assert_eq!(plan.restore_bytes(), LAYER_BYTES);
++    assert_eq!(plan.next_visible_tokens(), BLOCK as u64);
++
++    // Frozen selection: exactly one block, no fixed bands, 4 historical tokens.
++    assert_eq!(request.selection_layer(), ordinal);
++    assert_eq!(request.selection_selected_count(), 1);
++    assert_eq!(request.selection_selected(0), expect_ordinal);
++    assert_eq!(request.selection_fixed_count(), 0);
++    assert_eq!(request.selection_historical_tokens(), BLOCK as u64);
++    assert_eq!(request.selection_charged_tokens(), BLOCK as u64);
++    assert_eq!(request.selection_score_count(), 2);
++    let s0 = request.selection_score(0).expect("score 0");
++    let s1 = request.selection_score(1).expect("score 1");
++    assert!(s0 >= 0.0 && s1 >= 0.0, "page mass must be non-negative: {s0} {s1}");
++    if expect_ordinal == 1 {
++        assert!(s1 > s0, "aligned block1 should win: {s0} {s1}");
++    } else {
++        assert!(s0 > s1, "aligned block0 should win: {s0} {s1}");
++    }
++    assert!(request.selection_score(2).is_err(), "out-of-range score index");
++
++    // The driver restores the packed bytes then reports the view it published;
++    // for the host ABI smoke that view is exactly the plan's compact next view.
++    let view = ExecutionView {
++        stamp: plan.next_stamp().expect("next stamp"),
++        blocks: (0..plan.next_block_count())
++            .map(|i| plan.next_block(i).expect("next block"))
++            .collect(),
++        visible_tokens: plan.next_visible_tokens(),
++    };
++    request.restored(id, &view).expect("restored");
++    assert_eq!(request.phase(), LayerwisePhase::Attending);
++
++    let mut first = 0u32;
++    while first < EVAL_ROWS {
++        let count = chunk.min(EVAL_ROWS - first);
++        request.attended(id, 8 + first as u64, count as u64).expect("attended");
++        first += count;
++    }
++    request.complete_layer(id).expect("complete_layer");
++    view
++}
++
++/// Accepted canonical snapshots: frozen prefix unchanged + resident suffix 300@8.
++fn accepted_snapshots(views: &[ExecutionView], selected: &[u64]) -> Vec<LayerMemorySnapshot> {
++    [2u32, 7u32]
++        .iter()
++        .enumerate()
++        .map(|(i, &model_layer)| {
++            let mut st = views[i].stamp;
++            st.history_revision += 1;
++            st.view_version += 1;
++            st.execution_history += 1;
++            st.frontier = 12;
++            let mut blocks = vec![
++                BlockCopies { block: block(100, 0, 1), host_version: 1 },
++                BlockCopies { block: block(200, 4, 2), host_version: 2 },
++            ];
++            blocks.push(BlockCopies {
++                block: BlockDescriptor {
++                    session: session(),
++                    id: 300,
++                    original_start: 8,
++                    valid_tokens: BLOCK,
++                    content_version: 3,
++                    statistics_version: 1,
++                },
++                host_version: 0, // resident suffix: no sealed host copy required
++            });
++            LayerMemorySnapshot {
++                model_layer,
++                memory: MemorySnapshot { stamp: st, blocks, resident: vec![selected[i], 300] },
++            }
++        })
++        .collect()
++}
++
++#[test]
++fn scalar_reference_selection_restore_and_acceptance() {
++    // The two layers' true Query rows oppose each other; headers/trailers carry
++    // strong opposed logits that would reverse the choice if accidentally scored.
++    let layer0_q = [-1000.0f32, 1.0, 1.0, -1000.0];
++    let layer1_q = [1000.0f32, -2.0, -2.0, 1000.0];
++
++    for chunk in [1u32, 2, 3, 4] {
++        let desc = descriptor();
++        let catalog = hipfire_kvmem::MemoryCatalog::new(&desc, &initial()).expect("catalog");
++        let pol = policy();
++        let key = keys();
++        let id = identity();
++        let revision = Rc::new(Cell::new(id.history));
++        let rev = revision.clone();
++        let request = LayerwiseRequest::new(
++            &id,
++            &catalog,
++            &pol,
++            &key,
++            &specs(),
++            BLOCK as u64,
++            move || rev.get(),
++        )
++        .expect("request");
++        assert_eq!(request.phase(), LayerwisePhase::BetweenLayers);
++
++        let v0 = execute_layer(&request, &id, 2, 0, &layer0_q, chunk, 1, 200);
++        assert_eq!(request.phase(), LayerwisePhase::BetweenLayers);
++        let v1 = execute_layer(&request, &id, 7, 1, &layer1_q, chunk, 0, 100);
++        assert_eq!(request.phase(), LayerwisePhase::AwaitingAcceptance);
++
++        let work = request.work().expect("work");
++        assert_eq!(work.projected_rows, 2 * EVAL_ROWS as u64);
++        assert_eq!(work.attended_rows, 2 * EVAL_ROWS as u64);
++        assert_eq!(work.completed_layers, 2);
++
++        // Acceptance errors must not expose a partially committed result.
++        let accepted = accepted_snapshots(&[v0, v1], &[200, 100]);
++        let mut bad = accepted.clone();
++        bad.pop();
++        assert!(request.accepted(&id, &bad).is_err(), "incomplete acceptance");
++        assert_eq!(request.phase(), LayerwisePhase::AwaitingAcceptance);
++        assert_eq!(request.accepted_layer_count(), 0);
++
++        // The index lease may end now: final acceptance does not re-read source.
++        revision.set({
++            let mut s = id.history;
++            s.history_revision += 1;
++            s
++        });
++        request.accepted(&id, &accepted).expect("accepted");
++        assert_eq!(request.phase(), LayerwisePhase::Accepted);
++
++        assert_eq!(request.accepted_layer_count(), 2);
++        assert_eq!(request.accepted_model_layer(0), 2);
++        assert_eq!(request.accepted_model_layer(1), 7);
++        assert_eq!(request.accepted_resident_count(0), 2);
++        assert_eq!(request.accepted_resident(0, 0), 200);
++        assert_eq!(request.accepted_resident(0, 1), 300);
++        assert_eq!(request.accepted_resident(1, 0), 100);
++        assert_eq!(request.accepted_resident(1, 1), 300);
++        for i in 0..2 {
++            let st = request.accepted_stamp(i).expect("accepted stamp");
++            assert_eq!(st.frontier, 12);
++            assert_eq!(st.history_revision, 6);
++            assert_eq!(request.accepted_block_count(i), 3);
++            let suffix = request.accepted_block(i, 2).expect("suffix block");
++            assert_eq!(suffix.block.id, 300);
++            assert_eq!(suffix.block.original_start, 8);
++            assert_eq!(suffix.block.valid_tokens, BLOCK);
++            assert_eq!(suffix.host_version, 0);
++        }
++
++        // A closed request rejects further layers and re-acceptance.
++        assert!(request.begin_layer(&id, 2).is_err(), "accepted request is closed");
++        assert!(request.accepted(&id, &accepted).is_err(), "double acceptance");
++    }
++}
++
++#[test]
++fn fail_closed_revision_identity_and_phase() {
++    let desc = descriptor();
++    let catalog = hipfire_kvmem::MemoryCatalog::new(&desc, &initial()).expect("catalog");
++    let pol = policy();
++    let key = keys();
++    let id = identity();
++
++    // A source revision that advances after admission aborts at the next boundary.
++    {
++        let revision = Rc::new(Cell::new(id.history)); // valid at admission
++        let rev = revision.clone();
++        let request = LayerwiseRequest::new(
++            &id, &catalog, &pol, &key, &specs(), BLOCK as u64, move || rev.get(),
++        )
++        .expect("request");
++        revision.set({
++            let mut s = id.history;
++            s.history_revision += 1; // index advanced past the frozen stamp
++            s
++        });
++        assert!(request.begin_layer(&id, 2).is_err(), "stale source revision");
++        assert_eq!(request.phase(), LayerwisePhase::Aborted);
++    }
++
++    // A foreign request id is Stale; a future model layer is InvalidPlan.
++    {
++        let rev = id.history;
++        let request = LayerwiseRequest::new(
++            &id, &catalog, &pol, &key, &specs(), BLOCK as u64, move || rev,
++        )
++        .expect("request");
++        let mut foreign = id;
++        foreign.request += 1;
++        assert!(request.begin_layer(&foreign, 2).is_err(), "foreign identity");
++        assert!(request.begin_layer(&id, 7).is_err(), "future model layer out of order");
++        assert_eq!(request.phase(), LayerwisePhase::BetweenLayers);
++
++        // Premature prepare_restore (partial evaluation coverage) is Pending.
++        request.begin_layer(&id, 2).expect("begin_layer");
++        request
++            .projected(&id, 8, 1, &[-1000.0], geometry(0))
++            .expect("partial projected");
++        assert!(request.prepare_restore(&id).is_err(), "incomplete projection");
++        assert_eq!(request.phase(), LayerwisePhase::Projecting);
++        request.abort();
++        assert_eq!(request.phase(), LayerwisePhase::Aborted);
++    }
++}
++
++#[test]
++fn admission_rejects_budget_and_geometry() {
++    let desc = descriptor();
++    let catalog = hipfire_kvmem::MemoryCatalog::new(&desc, &initial()).expect("catalog");
++    let pol = policy();
++    let key = keys();
++    let id = identity();
++    let rev = id.history;
++
++    // selected_tokens must equal the policy's select budget.
++    let mut bad = specs();
++    bad[0].budget.selected_tokens = 2 * BLOCK as u64;
++    assert!(
++        LayerwiseRequest::new(&id, &catalog, &pol, &key, &bad, BLOCK as u64, move || rev).is_err(),
++        "selected_tokens != policy budget"
++    );
++
++    // Statistics ordinals must be unique and within the keys store.
++    let mut dup = specs();
++    dup[1].query.layer = 0;
++    assert!(
++        LayerwiseRequest::new(&id, &catalog, &pol, &key, &dup, BLOCK as u64, move || rev).is_err(),
++        "duplicate statistics layer"
++    );
++
++    // native_history_tokens must be block-aligned and not exceed the frontier.
++    assert!(
++        LayerwiseRequest::new(&id, &catalog, &pol, &key, &specs(), 3, move || rev).is_err(),
++        "unaligned native history extent"
++    );
++}
++
++// ── native (device-ready) Query projection ──
++//
++// The same transaction driven through projected_native: a Rust scorer closure
++// stands in for hipfire's GPU qualified Mean-K kernel. The core hands it ONLY the
++// query-intersection rows it sliced out of each evaluation tile plus the ONE
++// frozen per-block frame; the returned page masses accumulate across tiles before
++// a single pick. These tests prove the C-ABI scorer plumbing — tile slicing, frame
++// delivery, score extent, fail-closed abort vs recoverable validation — with no
++// GPU and no model.
++
++/// Build a full-evaluation native Q tile (F32, head_dim 1, token-major). Strides
++/// and `bytes` are BYTE quantities; the token axis is outermost here but the core
++/// qualifies any non-overlapping permutation.
++fn native_query(q: &[f32], ordinal: u32) -> NativeCurrentLayerQuery {
++    NativeCurrentLayerQuery {
++        data: q.as_ptr() as *const c_void,
++        bytes: q.len() * std::mem::size_of::<f32>(),
++        layer: ordinal,
++        rows: q.len() as u32,
++        query_heads: 1,
++        kv_heads: 1,
++        head_dim: 1,
++        attention_scale: 1.0,
++        scalar: NativeQueryScalar::Float32 as u32,
++        row_stride: 4,
++        head_stride: 4,
++        dimension_stride: 4,
++    }
++}
++
++/// Host reference stand-in for the GPU qualified Mean-K scorer: page mass = sum
++/// over the sliced Query rows of exp(q · mean_k · scale). It reads each operand
++/// through the native byte strides, logs every value it actually scores (so a
++/// test can prove the ±1000 header/trailer traps were never touched), asserts the
++/// frozen frame shape, and forces masked blocks to exactly 0.
++fn reference_scorer(
++    mean_k: Vec<f32>,
++    log: Rc<RefCell<Vec<f32>>>,
++) -> impl FnMut(&NativeCurrentLayerQuery, &QueryScoreFrame<'_>) -> Result<Vec<f64>, KvMemError> {
++    move |tile, frame| {
++        // The frozen denominator: 2 canonical blocks, both scorable, 4 tokens each.
++        assert_eq!(frame.starts, &[0u64, 4], "frozen frame starts");
++        assert_eq!(frame.counts, &[4u32, 4], "frozen frame counts");
++        assert_eq!(frame.score_mask, &[1u8, 1], "frozen frame score mask");
++        assert_eq!(frame.accepted_through, 8, "frozen frame frontier");
++        // Read each sliced Query row exactly once (token-major, head_dim 1) and
++        // log it, so the operand log proves which rows entered scoring.
++        let mut operands = Vec::with_capacity(tile.rows as usize);
++        for r in 0..tile.rows as usize {
++            let q = unsafe {
++                let p = (tile.data as *const u8).add(r * tile.row_stride) as *const f32;
++                *p
++            };
++            log.borrow_mut().push(q);
++            operands.push(q as f64);
++        }
++        let mut scores = Vec::with_capacity(frame.starts.len());
++        for i in 0..frame.starts.len() {
++            if frame.score_mask[i] == 0 {
++                scores.push(0.0);
++                continue;
++            }
++            let mut mass = 0.0f64;
++            for &q in &operands {
++                mass += (q * mean_k[i] as f64 * tile.attention_scale as f64).exp();
++            }
++            scores.push(mass);
++        }
++        Ok(scores)
++    }
++}
++
++/// One target layer's full forward via the NATIVE projection path. `log` collects
++/// every Q operand the scorer actually reads, in tile order.
++fn execute_layer_native(
++    request: &LayerwiseRequest,
++    id: &LayerwiseIdentity,
++    model_layer: u32,
++    ordinal: u32,
++    q: &[f32],
++    chunk: u32,
++    expect_ordinal: u32,
++    expect_block: u64,
++    log: Rc<RefCell<Vec<f32>>>,
++) -> ExecutionView {
++    request.begin_layer(id, model_layer).expect("begin_layer");
++    assert_eq!(request.phase(), LayerwisePhase::Projecting);
++
++    let mean_k = vec![-1.0f32, 1.0]; // block0 = -1, block1 = +1 (both ordinals)
++    let mut first = 0u32;
++    while first < EVAL_ROWS {
++        let count = chunk.min(EVAL_ROWS - first);
++        let tile = native_query(&q[first as usize..(first + count) as usize], ordinal);
++        request
++            .projected_native(
++                id,
++                8 + first as u64,
++                &tile,
++                reference_scorer(mean_k.clone(), log.clone()),
++            )
++            .expect("projected_native");
++        first += count;
++        if first != EVAL_ROWS {
++            assert!(
++                request.prepare_restore(id).is_err(),
++                "prepare_restore before full native Query projection must be Pending"
++            );
++        }
++    }
++
++    restore_attend_complete(request, id, model_layer, ordinal, chunk, expect_ordinal, expect_block)
++}
++
++#[test]
++fn native_reference_selection_restore_and_acceptance() {
++    // Identical opposed Query rows to the host reference; the native scorer must
++    // see only the intersection [9, 11) and pick the same blocks for every tiling.
++    let layer0_q = [-1000.0f32, 1.0, 1.0, -1000.0];
++    let layer1_q = [1000.0f32, -2.0, -2.0, 1000.0];
++
++    for chunk in [1u32, 2, 3, 4] {
++        let desc = descriptor();
++        let catalog = hipfire_kvmem::MemoryCatalog::new(&desc, &initial()).expect("catalog");
++        let pol = policy();
++        let key = keys();
++        let id = identity();
++        let revision = Rc::new(Cell::new(id.history));
++        let rev = revision.clone();
++        let request = LayerwiseRequest::new(
++            &id,
++            &catalog,
++            &pol,
++            &key,
++            &specs(),
++            BLOCK as u64,
++            move || rev.get(),
++        )
++        .expect("request");
++        assert_eq!(request.phase(), LayerwisePhase::BetweenLayers);
++
++        let log0 = Rc::new(RefCell::new(Vec::new()));
++        let v0 = execute_layer_native(&request, &id, 2, 0, &layer0_q, chunk, 1, 200, log0.clone());
++        // The scorer read ONLY the two aligned query rows, never the ±1000 traps,
++        // and the accumulated mass picked block1 (ordinal 1 → block 200).
++        assert_eq!(*log0.borrow(), vec![1.0f32, 1.0], "chunk {chunk}: layer0 sliced operands");
++        assert_eq!(request.phase(), LayerwisePhase::BetweenLayers);
++
++        let log1 = Rc::new(RefCell::new(Vec::new()));
++        let v1 = execute_layer_native(&request, &id, 7, 1, &layer1_q, chunk, 0, 100, log1.clone());
++        assert_eq!(*log1.borrow(), vec![-2.0f32, -2.0], "chunk {chunk}: layer1 sliced operands");
++        assert_eq!(request.phase(), LayerwisePhase::AwaitingAcceptance);
++
++        let work = request.work().expect("work");
++        assert_eq!(work.projected_rows, 2 * EVAL_ROWS as u64);
++        assert_eq!(work.attended_rows, 2 * EVAL_ROWS as u64);
++        assert_eq!(work.completed_layers, 2);
++
++        // The index lease may end now: final acceptance does not re-read source.
++        revision.set({
++            let mut s = id.history;
++            s.history_revision += 1;
++            s
++        });
++        let accepted = accepted_snapshots(&[v0, v1], &[200, 100]);
++        request.accepted(&id, &accepted).expect("accepted");
++        assert_eq!(request.phase(), LayerwisePhase::Accepted);
++        assert_eq!(request.accepted_layer_count(), 2);
++        assert_eq!(request.accepted_resident(0, 0), 200);
++        assert_eq!(request.accepted_resident(0, 1), 300);
++        assert_eq!(request.accepted_resident(1, 0), 100);
++        assert_eq!(request.accepted_resident(1, 1), 300);
++        assert!(request.begin_layer(&id, 2).is_err(), "accepted request is closed");
++    }
++}
++
++#[test]
++fn native_scorer_fail_closed() {
++    let desc = descriptor();
++    let catalog = hipfire_kvmem::MemoryCatalog::new(&desc, &initial()).expect("catalog");
++    let pol = policy();
++    let key = keys();
++    let id = identity();
++    let rev = id.history;
++    let q = [-1000.0f32, 1.0, 1.0, -1000.0];
++
++    // Every scorer-side failure happens INSIDE the projection try block, so the
++    // request must terminate Aborted (never unwind across the C ABI, never pick).
++    let cases: Vec<(&str, Box<dyn FnMut(&NativeCurrentLayerQuery, &QueryScoreFrame<'_>) -> Result<Vec<f64>, KvMemError>>)> = vec![
++        ("reported failure", Box::new(|_, _| Err(KvMemError("scorer failed".into())))),
++        ("wrong score extent", Box::new(|_, f| Ok(vec![1.0; f.starts.len() + 1]))),
++        ("negative page mass", Box::new(|_, f| { let mut s = vec![1.0; f.starts.len()]; s[0] = -1.0; Ok(s) })),
++        ("nonfinite page mass", Box::new(|_, f| { let mut s = vec![1.0; f.starts.len()]; s[0] = f64::INFINITY; Ok(s) })),
++        ("panicking scorer", Box::new(|_, _| panic!("native scorer panic"))),
++    ];
++    for (name, mut scorer) in cases {
++        let request = LayerwiseRequest::new(
++            &id, &catalog, &pol, &key, &specs(), BLOCK as u64, move || rev,
++        )
++        .expect("request");
++        request.begin_layer(&id, 2).expect("begin_layer");
++        let tile = native_query(&q, 0);
++        assert!(
++            request.projected_native(&id, 8, &tile, &mut scorer).is_err(),
++            "{name} must propagate as an error"
++        );
++        assert_eq!(request.phase(), LayerwisePhase::Aborted, "{name} must abort fail-closed");
++        // A closed request rejects further projection.
++        assert!(request.projected_native(&id, 8, &tile, &mut scorer).is_err(), "{name}: closed");
++    }
++}
++
++#[test]
++fn native_geometry_and_stride_validation_is_recoverable() {
++    let desc = descriptor();
++    let catalog = hipfire_kvmem::MemoryCatalog::new(&desc, &initial()).expect("catalog");
++    let pol = policy();
++    let key = keys();
++    let id = identity();
++    let rev = id.history;
++    let request = LayerwiseRequest::new(
++        &id, &catalog, &pol, &key, &specs(), BLOCK as u64, move || rev,
++    )
++    .expect("request");
++    request.begin_layer(&id, 2).expect("begin_layer");
++
++    let q = [-1000.0f32, 1.0, 1.0, -1000.0];
++    let ok_scorer = |_: &NativeCurrentLayerQuery, f: &QueryScoreFrame<'_>| Ok(vec![1.0; f.starts.len()]);
++
++    // Geometry/stride validation precedes any progress mutation and lives OUTSIDE
++    // the projection try block: it rejects the tile but leaves the layer open.
++    let mut wrong_layer = native_query(&q, 0);
++    wrong_layer.layer = 1; // admitted statistics ordinal for model2 is 0
++    assert!(
++        request.projected_native(&id, 8, &wrong_layer, ok_scorer).is_err(),
++        "statistics layer mismatch"
++    );
++    assert_eq!(request.phase(), LayerwisePhase::Projecting, "validation must not abort");
++
++    let mut bad_stride = native_query(&q, 0);
++    bad_stride.row_stride = 0; // overlapping/zero stride is not a native permutation
++    assert!(
++        request.projected_native(&id, 8, &bad_stride, ok_scorer).is_err(),
++        "invalid native stride"
++    );
++    assert_eq!(request.phase(), LayerwisePhase::Projecting, "validation must not abort");
++
++    // The rejected tiles consumed no coverage: a correct full tile still admits,
++    // scores the query intersection and freezes the selection.
++    let log = Rc::new(RefCell::new(Vec::new()));
++    let tile = native_query(&q, 0);
++    request
++        .projected_native(&id, 8, &tile, reference_scorer(vec![-1.0, 1.0], log.clone()))
++        .expect("corrected native tile");
++    assert_eq!(*log.borrow(), vec![1.0f32, 1.0], "only the query intersection is scored");
++    let plan = request.prepare_restore(&id).expect("prepare_restore after recovery");
++    assert_eq!(plan.next_block(0).expect("next block").block.id, 200);
++    assert_eq!(request.phase(), LayerwisePhase::Restoring);
++}
+\ No newline at end of file
+diff --git a/crates/rdna-compute/src/layerwise_pool.rs b/crates/rdna-compute/src/layerwise_pool.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..67bffe221b4e8884e936fe7ddb1666c9682b3760
+--- /dev/null
++++ b/crates/rdna-compute/src/layerwise_pool.rs
+@@ -0,0 +1,732 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Layerwise packed-page composite-slot pool + arena geometry (Phase 3.2 ①地基).
++//!
++//! This is the host substrate for the `RECALL_STRATEGY=Layerwise` subsystem. It
++//! is a CLEAN SIBLING to the legacy [`crate::page_pool::PagePool`] /
++//! [`crate::slot_pool::SlotPool`]: nothing here is wired into the live serve
++//! allocation in sub-patch ①, so the default Legacy path stays byte-neutral.
++//! Sub-patch ② drives this pool from the per-layer recall driver.
++//!
++//! # Model (ninfer-faithful packed pages, design §3.1)
++//!
++//! * One physical **composite slot** holds `block_tokens` positions × EVERY fa
++//!   layer × {Key, Value}. Its byte layout is layer-major {K, V} per layer with
++//!   `token_stride == k_gpu_row_bytes` (Q8 scales inline) — byte-for-byte the
++//!   core `raw_kv_payload_layout` record, so a sealed-archive layer region maps
++//!   straight onto a slot's layer plane with no repacking.
++//! * Each layer selects its OWN canonical pages into the shared compact extent:
++//!   slot `s`'s layer-`i` stripe comes from canonical page `pages_i[s]`, and
++//!   different layers may map different canonical pages into the same slot
++//!   (mixed-stripe destinations). A canonical page is resident iff ANY layer
++//!   selects it.
++//! * Per-layer **compact block table** = an ordered vector of physical slots
++//!   (compact position → slot); the canonical page IDs are read from the slot
++//!   stripes. This replaces the legacy one-shared-sentinel-table-per-slot.
++//! * **Shared compact extent**: every layer's `visible_tokens` is equal (the
++//!   core validates this because each layer gets an equal budget).
++//! * **Drop-evict** (design §3.7): eviction is a bare drop — the sealed host
++//!   archive is the source of truth, so there is NO write-back. A physical slot
++//!   returns to the free list only when ALL of its layer stripes have dropped.
++//!
++//! Everything here is pure host logic over plain integers (no `hipfire-kvmem`
++//! dependency): the geometry and the pool are CPU-unit-testable. The two thin
++//! GPU seams ([`PackedArenaLayout::alloc_tensor`] / [`PackedArenaLayout::stripe_views`])
++//! only apply the tested geometry through the existing `Gpu` primitives and are
++//! exercised by the sub-patch ② integration.
++
++use crate::{DType, Gpu, GpuTensor};
++use hip_bridge::HipResult;
++
++/// Tokens per composite page. Must match the engine page size
++/// ([`crate::page_pool::PAGE_TOKENS`]) and `KV_BLOCK_TOKENS` in the controller;
++/// the pool takes `block_tokens` explicitly so tests can use a small fixture.
++pub const LAYERWISE_PAGE_TOKENS: usize = 128;
++
++// =========================================================================
++// Packed arena geometry
++// =========================================================================
++
++/// Byte geometry of the shared packed arena: `n_slots` composite slots, each
++/// `block_tokens` positions × `n_layers` fa layers × {K, V}. Layer-major {K, V}
++/// per layer, matching the core `raw_kv_payload_layout` record layout exactly.
++///
++/// All sizes are pre-computed with checked arithmetic at construction, so the
++/// accessors and offset helpers cannot overflow: every offset is bounded by
++/// [`Self::arena_bytes`], which already fits `usize`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct PackedArenaLayout {
++    n_slots: usize,
++    n_layers: usize,
++    block_tokens: usize,
++    k_stride: usize,
++    v_stride: usize,
++    layer_stripe_bytes: usize,
++    slot_bytes: usize,
++    arena_bytes: usize,
++}
++
++impl PackedArenaLayout {
++    /// Resolve the geometry. Every argument must be non-zero; `n_slots` must fit
++    /// the `u32` physical-slot index space; every intermediate product is
++    /// checked. Returns `Err` (never panics) on a bad argument or overflow.
++    pub fn new(
++        n_slots: usize,
++        n_layers: usize,
++        block_tokens: usize,
++        k_stride: usize,
++        v_stride: usize,
++    ) -> Result<Self, String> {
++        if n_slots == 0 {
++            return Err("PackedArenaLayout: n_slots must be positive".to_string());
++        }
++        if n_layers == 0 {
++            return Err("PackedArenaLayout: n_layers must be positive".to_string());
++        }
++        if block_tokens == 0 {
++            return Err("PackedArenaLayout: block_tokens must be positive".to_string());
++        }
++        if k_stride == 0 {
++            return Err("PackedArenaLayout: k_stride must be positive".to_string());
++        }
++        if v_stride == 0 {
++            return Err("PackedArenaLayout: v_stride must be positive".to_string());
++        }
++        if n_slots > u32::MAX as usize {
++            return Err(format!(
++                "PackedArenaLayout: {n_slots} slots exceed the u32 slot-index space"
++            ));
++        }
++        const OVERFLOW: &str = "PackedArenaLayout: arena size overflows usize";
++        let kv_stride = k_stride.checked_add(v_stride).ok_or_else(|| OVERFLOW.to_string())?;
++        let layer_stripe_bytes = block_tokens
++            .checked_mul(kv_stride)
++            .ok_or_else(|| OVERFLOW.to_string())?;
++        let slot_bytes = n_layers
++            .checked_mul(layer_stripe_bytes)
++            .ok_or_else(|| OVERFLOW.to_string())?;
++        let arena_bytes = n_slots
++            .checked_mul(slot_bytes)
++            .ok_or_else(|| OVERFLOW.to_string())?;
++        Ok(Self {
++            n_slots,
++            n_layers,
++            block_tokens,
++            k_stride,
++            v_stride,
++            layer_stripe_bytes,
++            slot_bytes,
++            arena_bytes,
++        })
++    }
++
++    pub fn n_slots(&self) -> usize {
++        self.n_slots
++    }
++    pub fn n_layers(&self) -> usize {
++        self.n_layers
++    }
++    pub fn block_tokens(&self) -> usize {
++        self.block_tokens
++    }
++    /// Per-position K row bytes (Q8: `n_kv_heads * (head_dim / 32) * 34`).
++    pub fn k_stride(&self) -> usize {
++        self.k_stride
++    }
++    /// Per-position V row bytes (Q8: equal to the K stride).
++    pub fn v_stride(&self) -> usize {
++        self.v_stride
++    }
++    /// Bytes of one layer's {K, V} stripe inside a slot
++    /// (`block_tokens * (k_stride + v_stride)`).
++    pub fn layer_stripe_bytes(&self) -> usize {
++        self.layer_stripe_bytes
++    }
++    /// Bytes of one composite slot (`n_layers * layer_stripe_bytes`). Equal to
++    /// the core record bytes for the same geometry.
++    pub fn slot_bytes(&self) -> usize {
++        self.slot_bytes
++    }
++    /// Total packed arena bytes (`n_slots * slot_bytes`).
++    pub fn arena_bytes(&self) -> usize {
++        self.arena_bytes
++    }
++    /// Bytes of one layer's K plane inside a slot (`block_tokens * k_stride`).
++    pub fn k_plane_bytes(&self) -> usize {
++        self.block_tokens * self.k_stride
++    }
++    /// Bytes of one layer's V plane inside a slot (`block_tokens * v_stride`).
++    pub fn v_plane_bytes(&self) -> usize {
++        self.block_tokens * self.v_stride
++    }
++
++    /// Byte offset of composite slot `slot` within the arena.
++    pub fn slot_base(&self, slot: usize) -> Result<usize, String> {
++        if slot >= self.n_slots {
++            return Err(format!(
++                "PackedArenaLayout: slot {slot} out of range ({} slots)",
++                self.n_slots
++            ));
++        }
++        // Bounded by arena_bytes (a valid usize), so this cannot overflow.
++        Ok(slot * self.slot_bytes)
++    }
++
++    /// Byte offset of layer `layer`'s K plane inside slot `slot`.
++    pub fn layer_k_offset(&self, slot: usize, layer: usize) -> Result<usize, String> {
++        if layer >= self.n_layers {
++            return Err(format!(
++                "PackedArenaLayout: layer {layer} out of range ({} layers)",
++                self.n_layers
++            ));
++        }
++        Ok(self.slot_base(slot)? + layer * self.layer_stripe_bytes)
++    }
++
++    /// Byte offset of layer `layer`'s V plane inside slot `slot` (its K plane
++    /// followed by `block_tokens * k_stride` bytes).
++    pub fn layer_v_offset(&self, slot: usize, layer: usize) -> Result<usize, String> {
++        Ok(self.layer_k_offset(slot, layer)? + self.k_plane_bytes())
++    }
++
++    /// Allocate the zero-filled packed arena as a raw-byte device tensor. Thin
++    /// seam over [`Gpu::zeros`]; the geometry is host-tested above. Sub-patch ②
++    /// owns the lifetime (mutually exclusive with the legacy per-layer arenas).
++    pub fn alloc_tensor(&self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
++        gpu.zeros(&[self.arena_bytes], DType::Raw)
++    }
++
++    /// Non-owning {K, V} byte views of layer `layer`'s stripe inside slot `slot`.
++    /// The returned tensors are VIEWS into `arena` — never free them. Thin seam
++    /// over [`GpuTensor::sub_offset`] at the host-tested plane offsets.
++    pub fn stripe_views(
++        &self,
++        arena: &GpuTensor,
++        slot: usize,
++        layer: usize,
++    ) -> Result<(GpuTensor, GpuTensor), String> {
++        if arena.dtype != DType::Raw {
++            return Err("PackedArenaLayout: arena tensor must be DType::Raw".to_string());
++        }
++        if arena.buf.size() < self.arena_bytes {
++            return Err(format!(
++                "PackedArenaLayout: arena tensor too small ({} < {} bytes)",
++                arena.buf.size(),
++                self.arena_bytes
++            ));
++        }
++        let k_off = self.layer_k_offset(slot, layer)?;
++        let v_off = self.layer_v_offset(slot, layer)?;
++        // Raw dtype: element size 1, so offsets/lengths are byte counts.
++        Ok((
++            arena.sub_offset(k_off, self.k_plane_bytes()),
++            arena.sub_offset(v_off, self.v_plane_bytes()),
++        ))
++    }
++}
++
++// =========================================================================
++// Composite-slot pool
++// =========================================================================
++
++/// A generation-checked handle to a physical composite slot. A handle from a
++/// prior allocation cycle (the slot was freed and re-allocated) mismatches and
++/// is rejected before any stripe is touched.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct SlotHandle {
++    pub phys: u32,
++    pub generation: u32,
++}
++
++/// One fa layer's compact resident view: the ordered physical slots backing its
++/// selected canonical pages, plus the shared `visible_tokens`. The canonical
++/// page IDs are NOT stored here — they are read from the slot stripes, so there
++/// is a single source of truth for residency.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct LayerView {
++    /// Compact position → physical slot (device block-table order).
++    slots: Vec<u32>,
++    /// Σ valid_tokens of the selected pages. Equal across layers (core rule).
++    visible_tokens: usize,
++}
++
++/// Per-slot metadata: generation, free flag, and the canonical page resident in
++/// each layer's stripe (`None` = no stripe). The stripe refcount is the number
++/// of `Some` entries — the drop-evict lease.
++#[derive(Debug, Clone)]
++struct SlotMeta {
++    generation: u32,
++    free: bool,
++    stripes: Vec<Option<u32>>,
++}
++
++impl SlotMeta {
++    fn new(n_layers: usize) -> Self {
++        Self {
++            generation: 0,
++            free: true,
++            stripes: vec![None; n_layers],
++        }
++    }
++    fn refs(&self) -> u32 {
++        self.stripes.iter().filter(|s| s.is_some()).count() as u32
++    }
++}
++
++/// Composite-slot free-list pool for the layerwise packed arena (design §3.5).
++///
++/// Tracks physical composite slots and per-layer stripe residency. A slot is
++/// reserved by [`Self::alloc_slot`] and returns to the free list only when
++/// [`Self::free_slot`] is called with every layer stripe dropped — the bare
++/// drop-evict invariant. Per-layer compact views ([`Self::set_view`]) record the
++/// device block-table order over the resident slots.
++#[derive(Debug)]
++pub struct LayerwisePagePool {
++    layout: PackedArenaLayout,
++    slots: Vec<SlotMeta>,
++    /// Free slot indices (exactly the slots with `free == true`). Popped from
++    /// the end, like the legacy pool.
++    free: Vec<u32>,
++    views: Vec<LayerView>,
++}
++
++impl LayerwisePagePool {
++    /// Create a pool over `layout`: every slot free at generation 0, every layer
++    /// view empty.
++    pub fn new(layout: PackedArenaLayout) -> Result<Self, String> {
++        let n_slots = layout.n_slots();
++        let n_layers = layout.n_layers();
++        Ok(Self {
++            layout,
++            slots: (0..n_slots).map(|_| SlotMeta::new(n_layers)).collect(),
++            free: (0..n_slots as u32).rev().collect(),
++            views: vec![LayerView::default(); n_layers],
++        })
++    }
++
++    pub fn layout(&self) -> &PackedArenaLayout {
++        &self.layout
++    }
++    pub fn n_slots(&self) -> usize {
++        self.layout.n_slots()
++    }
++    pub fn n_layers(&self) -> usize {
++        self.layout.n_layers()
++    }
++    /// Number of free (unreserved) physical slots.
++    pub fn free_count(&self) -> usize {
++        self.free.len()
++    }
++
++    fn validate_handle(&self, h: SlotHandle) -> Result<usize, String> {
++        let phys = h.phys as usize;
++        let meta = self
++            .slots
++            .get(phys)
++            .ok_or_else(|| format!("LayerwisePagePool: slot {} out of range", h.phys))?;
++        if meta.free {
++            return Err(format!(
++                "LayerwisePagePool: slot {} is free (stale handle)",
++                h.phys
++            ));
++        }
++        if meta.generation != h.generation {
++            return Err(format!(
++                "LayerwisePagePool: slot {} generation mismatch (handle {}, current {})",
++                h.phys, h.generation, meta.generation
++            ));
++        }
++        Ok(phys)
++    }
++
++    fn validate_layer(&self, layer: usize) -> Result<(), String> {
++        if layer >= self.n_layers() {
++            return Err(format!(
++                "LayerwisePagePool: layer {layer} out of range ({} layers)",
++                self.n_layers()
++            ));
++        }
++        Ok(())
++    }
++
++    /// Reserve a free composite slot, bumping its generation. The slot is owned
++    /// by the caller (out of the free list) even before any stripe is bound.
++    /// `Err` when the arena is exhausted.
++    pub fn alloc_slot(&mut self) -> Result<SlotHandle, String> {
++        let phys = self
++            .free
++            .pop()
++            .ok_or_else(|| "LayerwisePagePool: no free composite slot".to_string())?;
++        let meta = &mut self.slots[phys as usize];
++        debug_assert!(meta.free && meta.refs() == 0);
++        meta.free = false;
++        meta.generation = meta.generation.wrapping_add(1);
++        Ok(SlotHandle {
++            phys,
++            generation: meta.generation,
++        })
++    }
++
++    /// Bind canonical page `page` into slot `h`'s layer-`layer` stripe. The slot
++    /// must be reserved and that layer's stripe must be empty (drop first).
++    pub fn bind_stripe(&mut self, h: SlotHandle, layer: usize, page: u32) -> Result<(), String> {
++        let phys = self.validate_handle(h)?;
++        self.validate_layer(layer)?;
++        let meta = &mut self.slots[phys];
++        if meta.stripes[layer].is_some() {
++            return Err(format!(
++                "LayerwisePagePool: slot {} layer {layer} already holds page {} (drop first)",
++                h.phys,
++                meta.stripes[layer].unwrap()
++            ));
++        }
++        meta.stripes[layer] = Some(page);
++        Ok(())
++    }
++
++    /// Drop slot `h`'s layer-`layer` stripe. Returns `true` when EVERY layer
++    /// stripe has now dropped (the slot is freeable via [`Self::free_slot`]).
++    /// Does not itself return the slot to the free list — the driver decides
++    /// whether to free or reuse it. `Err` on a stale handle or an empty stripe.
++    pub fn drop_stripe(&mut self, h: SlotHandle, layer: usize) -> Result<bool, String> {
++        let phys = self.validate_handle(h)?;
++        self.validate_layer(layer)?;
++        let meta = &mut self.slots[phys];
++        if meta.stripes[layer].is_none() {
++            return Err(format!(
++                "LayerwisePagePool: slot {} layer {layer} has no stripe to drop",
++                h.phys
++            ));
++        }
++        meta.stripes[layer] = None;
++        Ok(meta.refs() == 0)
++    }
++
++    /// Return a reserved slot to the free list. Requires every layer stripe to
++    /// have dropped (`refs == 0`) — the drop-evict invariant: a slot is never
++    /// reclaimed while any layer still references it.
++    pub fn free_slot(&mut self, h: SlotHandle) -> Result<(), String> {
++        let phys = self.validate_handle(h)?;
++        let meta = &self.slots[phys];
++        if meta.refs() != 0 {
++            return Err(format!(
++                "LayerwisePagePool: slot {} still holds {} layer stripe(s); drop all before free",
++                h.phys,
++                meta.refs()
++            ));
++        }
++        let meta = &mut self.slots[phys];
++        meta.free = true;
++        self.free.push(h.phys);
++        Ok(())
++    }
++
++    /// The canonical page resident in slot `phys`'s layer-`layer` stripe, or
++    /// `None` if the slot is free / out of range / has no stripe there.
++    pub fn stripe_page(&self, phys: u32, layer: usize) -> Option<u32> {
++        self.slots.get(phys as usize)?.stripes.get(layer).copied().flatten()
++    }
++
++    /// Number of layer stripes currently bound in slot `phys` (0 if free).
++    pub fn slot_refs(&self, phys: u32) -> u32 {
++        self.slots.get(phys as usize).map(SlotMeta::refs).unwrap_or(0)
++    }
++
++    /// True when slot `phys` is reserved (allocated, not in the free list).
++    pub fn is_allocated(&self, phys: u32) -> bool {
++        self.slots.get(phys as usize).map(|m| !m.free).unwrap_or(false)
++    }
++
++    /// True when ANY layer's stripe in ANY slot references canonical page `page`
++    /// (the page is resident in the composite arena).
++    pub fn is_page_resident(&self, page: u32) -> bool {
++        self.slots
++            .iter()
++            .any(|m| m.stripes.iter().any(|s| *s == Some(page)))
++    }
++
++    /// Set layer `layer`'s compact block table: `slots` is the ordered physical
++    /// slot per compact position, `visible_tokens` the shared extent. Every slot
++    /// must be reserved, distinct, and hold a stripe for this layer. An empty
++    /// `slots` clears the view.
++    pub fn set_view(
++        &mut self,
++        layer: usize,
++        slots: &[u32],
++        visible_tokens: usize,
++    ) -> Result<(), String> {
++        self.validate_layer(layer)?;
++        let mut seen = std::collections::HashSet::with_capacity(slots.len());
++        for &phys in slots {
++            if !seen.insert(phys) {
++                return Err(format!(
++                    "LayerwisePagePool: layer {layer} view repeats slot {phys}"
++                ));
++            }
++            let meta = self
++                .slots
++                .get(phys as usize)
++                .ok_or_else(|| format!("LayerwisePagePool: view slot {phys} out of range"))?;
++            if meta.free {
++                return Err(format!(
++                    "LayerwisePagePool: layer {layer} view references free slot {phys}"
++                ));
++            }
++            if meta.stripes[layer].is_none() {
++                return Err(format!(
++                    "LayerwisePagePool: layer {layer} view slot {phys} has no layer-{layer} stripe"
++                ));
++            }
++        }
++        self.views[layer] = LayerView {
++            slots: slots.to_vec(),
++            visible_tokens,
++        };
++        Ok(())
++    }
++
++    /// Layer `layer`'s compact block table (physical slots in compact order).
++    pub fn compact_slots(&self, layer: usize) -> Result<&[u32], String> {
++        self.validate_layer(layer)?;
++        Ok(&self.views[layer].slots)
++    }
++
++    /// Layer `layer`'s selected canonical page IDs in compact order, read from
++    /// the resident slot stripes (the device block-table payload).
++    pub fn canonical_pages(&self, layer: usize) -> Result<Vec<u32>, String> {
++        self.validate_layer(layer)?;
++        self.views[layer]
++            .slots
++            .iter()
++            .map(|&phys| {
++                self.stripe_page(phys, layer).ok_or_else(|| {
++                    format!(
++                        "LayerwisePagePool: layer {layer} view slot {phys} lost its stripe"
++                    )
++                })
++            })
++            .collect()
++    }
++
++    /// Layer `layer`'s shared compact extent (`Σ valid_tokens`).
++    pub fn visible_tokens(&self, layer: usize) -> Result<usize, String> {
++        self.validate_layer(layer)?;
++        Ok(self.views[layer].visible_tokens)
++    }
++
++    /// Validate the shared compact extent: every layer's `visible_tokens` is
++    /// equal (the core enforces this because each layer gets an equal budget).
++    pub fn validate_shared_extent(&self) -> Result<(), String> {
++        let first = self.views[0].visible_tokens;
++        for (layer, view) in self.views.iter().enumerate() {
++            if view.visible_tokens != first {
++                return Err(format!(
++                    "LayerwisePagePool: layer {layer} visible_tokens {} != layer 0 {first} \
++                     (shared compact extent must be equal)",
++                    view.visible_tokens
++                ));
++            }
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::page_pool::PAGE_TOKENS;
++
++    /// Small fixture geometry: 4 slots × 2 layers × 4 tokens, K stride 8 / V 6.
++    fn layout() -> PackedArenaLayout {
++        PackedArenaLayout::new(4, 2, 4, 8, 6).unwrap()
++    }
++
++    #[test]
++    fn page_tokens_matches_legacy() {
++        assert_eq!(LAYERWISE_PAGE_TOKENS, PAGE_TOKENS);
++    }
++
++    #[test]
++    fn arena_geometry_matches_core_record_layout() {
++        let l = layout();
++        // layer stripe = 4 * (8 + 6) = 56; slot = 2 * 56 = 112; arena = 4 * 112.
++        assert_eq!(l.layer_stripe_bytes(), 56);
++        assert_eq!(l.slot_bytes(), 112);
++        assert_eq!(l.arena_bytes(), 448);
++        assert_eq!(l.k_plane_bytes(), 32);
++        assert_eq!(l.v_plane_bytes(), 24);
++
++        // Independently accumulate the core layer-major {K,V} record manifest.
++        let mut record = 0usize;
++        for layer in 0..l.n_layers() {
++            let k_off = record;
++            record += l.block_tokens() * l.k_stride();
++            let v_off = record;
++            record += l.block_tokens() * l.v_stride();
++            // Slot 2's layer planes sit at slot_base(2) + the record offsets.
++            assert_eq!(l.layer_k_offset(2, layer).unwrap(), 2 * 112 + k_off);
++            assert_eq!(l.layer_v_offset(2, layer).unwrap(), 2 * 112 + v_off);
++        }
++        assert_eq!(record, l.slot_bytes());
++        assert_eq!(l.slot_base(0).unwrap(), 0);
++        assert_eq!(l.slot_base(3).unwrap(), 336);
++    }
++
++    #[test]
++    fn q8_stride_geometry() {
++        // Q8: n_kv_heads=4, head_dim=256 → 4 * (256/32) * 34 = 1088 bytes/pos.
++        let stride = 4 * (256 / 32) * 34;
++        let l = PackedArenaLayout::new(8, 3, LAYERWISE_PAGE_TOKENS, stride, stride).unwrap();
++        assert_eq!(l.k_stride(), 1088);
++        assert_eq!(l.layer_stripe_bytes(), 128 * 2 * 1088);
++        assert_eq!(l.slot_bytes(), 3 * 128 * 2 * 1088);
++        assert_eq!(l.arena_bytes(), 8 * l.slot_bytes());
++    }
++
++    #[test]
++    fn rejects_zero_and_overflow() {
++        assert!(PackedArenaLayout::new(0, 2, 4, 8, 6).is_err());
++        assert!(PackedArenaLayout::new(4, 0, 4, 8, 6).is_err());
++        assert!(PackedArenaLayout::new(4, 2, 0, 8, 6).is_err());
++        assert!(PackedArenaLayout::new(4, 2, 4, 0, 6).is_err());
++        assert!(PackedArenaLayout::new(4, 2, 4, 8, 0).is_err());
++        assert!(PackedArenaLayout::new(u32::MAX as usize + 1, 2, 4, 8, 6).is_err());
++        // Overflowing product.
++        assert!(PackedArenaLayout::new(usize::MAX, 2, 4, 8, 6).is_err());
++        assert!(PackedArenaLayout::new(4, usize::MAX, 4, 8, 6).is_err());
++    }
++
++    #[test]
++    fn offset_bounds_are_checked() {
++        let l = layout();
++        assert!(l.slot_base(4).is_err());
++        assert!(l.layer_k_offset(0, 2).is_err());
++        assert!(l.layer_v_offset(4, 0).is_err());
++        assert!(l.layer_k_offset(3, 1).is_ok());
++    }
++
++    #[test]
++    fn alloc_bind_drop_free_lifecycle() {
++        let mut pool = LayerwisePagePool::new(layout()).unwrap();
++        assert_eq!(pool.free_count(), 4);
++        let h = pool.alloc_slot().unwrap();
++        assert_eq!(pool.free_count(), 3);
++        assert!(pool.is_allocated(h.phys));
++        assert_eq!(pool.slot_refs(h.phys), 0);
++
++        // Mixed canonical pages in the same composite slot.
++        pool.bind_stripe(h, 0, 100).unwrap();
++        pool.bind_stripe(h, 1, 200).unwrap();
++        assert_eq!(pool.slot_refs(h.phys), 2);
++        assert_eq!(pool.stripe_page(h.phys, 0), Some(100));
++        assert_eq!(pool.stripe_page(h.phys, 1), Some(200));
++
++        // Dropping one layer does NOT free the slot.
++        assert!(!pool.drop_stripe(h, 0).unwrap());
++        assert_eq!(pool.slot_refs(h.phys), 1);
++        assert!(pool.free_slot(h).is_err(), "slot still holds a layer stripe");
++        // Dropping the last layer reports freeable, then free succeeds.
++        assert!(pool.drop_stripe(h, 1).unwrap());
++        assert_eq!(pool.slot_refs(h.phys), 0);
++        pool.free_slot(h).unwrap();
++        assert!(!pool.is_allocated(h.phys));
++        assert_eq!(pool.free_count(), 4);
++    }
++
++    #[test]
++    fn generation_rejects_stale_handle() {
++        let mut pool = LayerwisePagePool::new(layout()).unwrap();
++        let h1 = pool.alloc_slot().unwrap();
++        pool.free_slot(h1).unwrap();
++        let h2 = pool.alloc_slot().unwrap();
++        assert_eq!(h1.phys, h2.phys);
++        assert_ne!(h1.generation, h2.generation);
++        assert!(pool.bind_stripe(h1, 0, 7).is_err(), "stale generation");
++        assert!(pool.drop_stripe(h1, 0).is_err());
++        assert!(pool.free_slot(h1).is_err());
++        pool.bind_stripe(h2, 0, 7).unwrap();
++    }
++
++    #[test]
++    fn mixed_stripe_destinations_and_residency() {
++        let mut pool = LayerwisePagePool::new(layout()).unwrap();
++        let s0 = pool.alloc_slot().unwrap();
++        let s1 = pool.alloc_slot().unwrap();
++        // Layer 0 selects [100, 200]; layer 1 selects [200, 100] — same slots,
++        // different canonical pages per layer stripe.
++        pool.bind_stripe(s0, 0, 100).unwrap();
++        pool.bind_stripe(s0, 1, 200).unwrap();
++        pool.bind_stripe(s1, 0, 200).unwrap();
++        pool.bind_stripe(s1, 1, 100).unwrap();
++        pool.set_view(0, &[s0.phys, s1.phys], 8).unwrap();
++        pool.set_view(1, &[s0.phys, s1.phys], 8).unwrap();
++        assert_eq!(pool.canonical_pages(0).unwrap(), vec![100, 200]);
++        assert_eq!(pool.canonical_pages(1).unwrap(), vec![200, 100]);
++        assert_eq!(pool.compact_slots(0).unwrap(), &[s0.phys, s1.phys]);
++        assert!(pool.is_page_resident(100));
++        assert!(pool.is_page_resident(200));
++        assert!(!pool.is_page_resident(999));
++        pool.validate_shared_extent().unwrap();
++    }
++
++    #[test]
++    fn shared_extent_must_be_equal() {
++        let mut pool = LayerwisePagePool::new(layout()).unwrap();
++        let s0 = pool.alloc_slot().unwrap();
++        pool.bind_stripe(s0, 0, 1).unwrap();
++        pool.bind_stripe(s0, 1, 2).unwrap();
++        pool.set_view(0, &[s0.phys], 8).unwrap();
++        pool.set_view(1, &[s0.phys], 4).unwrap();
++        assert!(pool.validate_shared_extent().is_err());
++        pool.set_view(1, &[s0.phys], 8).unwrap();
++        pool.validate_shared_extent().unwrap();
++        assert_eq!(pool.visible_tokens(0).unwrap(), 8);
++    }
++
++    #[test]
++    fn set_view_validates_residency() {
++        let mut pool = LayerwisePagePool::new(layout()).unwrap();
++        let s0 = pool.alloc_slot().unwrap();
++        pool.bind_stripe(s0, 0, 1).unwrap();
++        // Layer 1 has no stripe in s0.
++        assert!(pool.set_view(1, &[s0.phys], 4).is_err());
++        // A free slot cannot back a view.
++        let s1 = pool.alloc_slot().unwrap();
++        pool.free_slot(s1).unwrap();
++        assert!(pool.set_view(0, &[s1.phys], 4).is_err());
++        // Repeated slot in one view is rejected.
++        assert!(pool.set_view(0, &[s0.phys, s0.phys], 8).is_err());
++        // Out-of-range layer.
++        assert!(pool.set_view(2, &[s0.phys], 4).is_err());
++        // Valid single-layer view; empty view clears.
++        pool.set_view(0, &[s0.phys], 4).unwrap();
++        pool.set_view(0, &[], 0).unwrap();
++        assert!(pool.compact_slots(0).unwrap().is_empty());
++    }
++
++    #[test]
++    fn alloc_exhaustion_and_double_bind() {
++        let mut pool = LayerwisePagePool::new(layout()).unwrap();
++        let mut handles = Vec::new();
++        for _ in 0..4 {
++            handles.push(pool.alloc_slot().unwrap());
++        }
++        assert_eq!(pool.free_count(), 0);
++        assert!(pool.alloc_slot().is_err());
++        let h = handles[0];
++        pool.bind_stripe(h, 0, 1).unwrap();
++        assert!(pool.bind_stripe(h, 0, 2).is_err(), "double bind without drop");
++        assert!(pool.drop_stripe(h, 1).is_err(), "no stripe to drop");
++        assert!(pool.bind_stripe(h, 2, 1).is_err(), "layer out of range");
++    }
++
++    #[test]
++    fn free_slot_rejects_stale_and_double_free() {
++        let mut pool = LayerwisePagePool::new(layout()).unwrap();
++        let h = pool.alloc_slot().unwrap();
++        pool.free_slot(h).unwrap();
++        assert!(pool.free_slot(h).is_err(), "double free / stale handle");
++    }
++}
+\ No newline at end of file
+diff --git a/crates/rdna-compute/src/lib.rs b/crates/rdna-compute/src/lib.rs
+index 927cba27af17be47ae562dc754d1036becf28599..2b84631b3b75d5bea8aa84f610c05ca578978f0e 100644
+--- a/crates/rdna-compute/src/lib.rs
++++ b/crates/rdna-compute/src/lib.rs
+@@ -124,6 +124,9 @@ pub mod norm;
+ pub mod npu_trunk;
+ mod packed_mq4;
+ pub mod page_pool;
++/// Layerwise packed-page composite-slot pool + arena geometry (Phase 3.2 ①地基).
++/// Clean sibling to `page_pool`/`slot_pool`; not wired into live serve in ①.
++pub mod layerwise_pool;
+ pub mod plan_sink;
+ pub mod pm4_ledger;
+ pub mod pm_decode_twins;

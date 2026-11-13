@@ -22,6 +22,7 @@ restores it.
 | Opt-in residency-selection policy knobs: `SELECT_METHOD` (retrieval/recency), LRFU decaying heavy-hitter history (round lifecycle wired through the shim + crate FFI), GPU high/low watermark hysteresis band; defaults byte-neutral | `../patches/hipfire-policy-knobs.patch` |
 | Query-span multi-row Q scoring: `QUERY_SPAN` (1 = mean-K cosine, byte-neutral; >1 = page-softmax over a per-slot host Q ring), `query_score_frame` + `page_softmax_scores` wrapped through the shim + crate FFI; zero VRAM growth | `../patches/hipfire-query-span.patch` |
 | Host page-softmax SIMD dot reduction: crate build adds `-fopenmp-simd` so the core dot product's `#pragma omp simd` is honoured (float32 accumulation over FP16-rounded operands); per-selection latency ~3.4× lower, default byte-neutral | `../patches/hipfire-softmax-simd.patch` |
+| Layerwise recall foundation (Phase 3.2 sub-patch ①): crate-agnostic `LayerwisePagePool` composite-slot pool + `PackedArenaLayout` packed-page geometry (rdna-compute), Q8 packed-page adapter bridging the engine stride authority to the core generic `PayloadLayout` manifest (hipfire-arch-qwen35), and the core layerwise-API C ABI shim entries + crate FFI (payload builder / catalog `plan_layer` / `NativeKvLayerRegions` / `LayerwiseQueryRequest` state machine / native scorer); additive, NOT wired into live serve, Legacy byte-neutral | `../patches/hipfire-layerwise-foundation.patch` |
 
 The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
 `KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
@@ -247,6 +248,51 @@ actual selections per 256-token decode), so the amortized throughput impact is
 ~1–2% (14.0→14.2 tok/s). A HIP GPU page-softmax kernel is therefore **deferred**:
 the residual ~49 ms per selection does not justify the port + wiring for an opt-in
 mode whose steady-state throughput cost is already negligible.
+
+The ninth `layerwise-foundation` patch lays the additive groundwork for per-layer
+(`RecallStrategy::Layerwise`) KV recall — Phase 3.2 sub-patch ① of three. It is
+purely additive, NOT wired into the live serve allocation, and adds no env toggle,
+so Legacy remains the only path and is byte-neutral. Three pieces land:
+(1) `crates/rdna-compute/src/layerwise_pool.rs` — a crate-agnostic pure-host
+`PackedArenaLayout` (one composite slot = 128 tokens × all fa layers × {K,V},
+layer-major, Q8 scales inline) plus `LayerwisePagePool`: per-layer independent
+stripe selection into shared composite slots, generation handles, per-layer
+compact views with a core-validated equal `visible_tokens` extent, page residency,
+and an intrinsic drop-evict refcount (a slot frees only when every layer stripe
+drops). (2) `crates/hipfire-arch-qwen35/src/layerwise_layout.rs` — the Q8
+packed-page adapter that walks the engine's OWN stride authority
+(`SlotKvTierPlan::resolve`) into the core generic `PayloadLayout` manifest
+(layer-major {Key,Value} per fa layer) and bridges to `PackedArenaLayout` so a
+composite slot's byte layout is provably identical to the core record
+(`slot_bytes == record_bytes`, per-layer plane offsets aligned) — the coherence
+guarantee that lets a sealed archive layer region map onto a slot stripe with no
+repacking in sub-patch ②. (3) the core layerwise-API C ABI shim entries
+(`hipfire_kvmem_shim.{h,cpp}`, a separate kvmem commit) exposing the EXISTING core
+`PayloadLayout` builder / `LayerwiseMemoryCatalog::plan_layer` /
+`NativeKvLayerRegions` / `LayerwiseQueryRequest` state machine / native scorer,
+plus the crate FFI and three smoke tests. The core library is strategy-agnostic
+and unchanged (core logic zero-change); the legacy `MemoryBackend`
+whole-working-set coordinator is NOT consumed by layerwise (direct-drive, design
+§3.5).
+
+The shim smoke (14 crate tests: catalog 3 + payload 4 + request 6 + base shim 1)
+and the new host tests (pool 12 + adapter 4) pass. The N-gate on the rebuilt engine
+reproduces the sealed chain byte-for-byte: greedy decode sha256 == `29e8a27d…`,
+VERIFY 0 mismatch (65 restore readback lines, 225 spill checksums, 0 block-table
+dups), and recall identical to the policy-knobs/query-span baseline
+(`True/True/False` over 8k/16k/28k — the 28k miss is the pre-existing mean-K
+retrieval limit under the 45-page budget, the recall-benefit target for ②③, not a
+regression). A pre-existing `qwen35/weights.rs` `dense_fixture` (missing the
+`biases`/`escha` fields the escha chain added) is repaired test-only (`None/None`,
+matching production) so the crate's `--lib` test target compiles; release N-gate
+builds never compiled `cfg(test)`, so the breakage had stayed latent.
+
+Sub-patch ② adds the GPU HIP scorer + per-layer driver into the three paged paths
++ write-through feed + drop-evict policy + stripe COW restore
+(`RECALL_STRATEGY=Layerwise` opt-in); sub-patch ③ adds the pressure attention-mass
+tap + quota accounts + env exposure + fail-closed guards and seals the
+recall-benefit gate. Each sub-patch is Legacy byte-neutral and independently
+re-verified; rollback granularity = sub-patch.
 
 ## Enabling
 
