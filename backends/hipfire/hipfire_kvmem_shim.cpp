@@ -408,6 +408,19 @@ extern "C" void hk_kv_store_set_retrieval_scores(hk_kv_store * ks, const double 
         "hk_kv_store_set_retrieval_scores");
 }
 
+extern "C" void hk_kv_store_begin_retrieval_round(hk_kv_store * ks) {
+    if (!ks || !ks->impl) return;
+    guarded([&] { ks->impl->begin_retrieval_round(); }, "hk_kv_store_begin_retrieval_round");
+}
+
+extern "C" int hk_kv_store_commit_retrieval_round(hk_kv_store * ks) {
+    if (!ks || !ks->impl) return 0;
+    bool committed = false;
+    guarded([&] { committed = ks->impl->commit_retrieval_round(); },
+            "hk_kv_store_commit_retrieval_round");
+    return committed ? 1 : 0;
+}
+
 extern "C" int hk_kv_store_prefill_needs_offload(const hk_kv_store * ks,
                                                  uint32_t resident_tokens,
                                                  uint32_t incoming_tokens,

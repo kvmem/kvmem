@@ -18,6 +18,8 @@ restores it.
 | Statistics taps, controller, serve wiring; escha-dense baseline, Bonsai TQ2/BQ1 slots admission | `../patches/hipfire-kvmem.patch` |
 | RDNA3 (gfx1100) operator pass: MQ3G256V2 q8x verify decode, real escha grouped-WMMA batched prefill (replaces the `kvmem` patch's `prefill_chunk=1` stopgap), escha-pro/xt F16 in_proj handling | `../patches/hipfire-rdna3-opt.patch` |
 | Multi-slot spec-decode admission fix: `--spec mtp`/`dflash` engage under the router's default penalized+sampled requests (exact-AR penalty prepass + greedy/point-mass sampled verify, shared `SpecRetire`) | `../patches/hipfire-spec-accept.patch` |
+| Batched spill/restore: pinned-slab stream-ordered async page copies with one sync per chunk (byte-neutral; `HIPFIRE_KVMEM_BATCH_XFER=0` restores per-page blocking) | `../patches/hipfire-batch-restore.patch` |
+| Opt-in residency-selection policy knobs: `SELECT_METHOD` (retrieval/recency), LRFU decaying heavy-hitter history (round lifecycle wired through the shim + crate FFI), GPU high/low watermark hysteresis band; defaults byte-neutral | `../patches/hipfire-policy-knobs.patch` |
 
 The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
 `KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
@@ -112,6 +114,53 @@ restore 30 pages 45.5 vs 49.7 ms); wall TTFT is parity at these host-RAM-spill
 scales because prefill compute dominates (prepare is ~1% of an 11.5 s prefill),
 and the transfer win grows with the restored page count.
 
+The sixth `policy-knobs` patch wires the opt-in residency-selection policy knobs,
+verified byte-exact (`89e32856d` + all six patches reproduce `upstream.json`'s
+`patched_tree`). Every knob defaults to the historical behavior, so the patch is
+byte-neutral unless a knob is set. `SELECT_METHOD` chooses the executor-level
+signal that feeds the shared `pick_topk` ranking: `retrieval` (the default) scores
+the resident set against the tapped mean-K query, `recency` feeds no learned
+signal (the core keeps sink + recent and fills the rest by its deterministic id
+tie-break); `h2o` is rejected at construction until the attention-heat tap lands.
+`LRFU` adds a decaying heavy-hitter history on top of retrieval: each round
+reinforces the top `LRFU_TOP` fraction of blocks and decays the rest by
+`LRFU_LAMBDA`. The core requires an explicit round lifecycle
+(`begin_retrieval_round` → `set_retrieval_scores` preview → `pick_topk_blocks` →
+`commit_retrieval_round`); the patch adds the two round entries to the C ABI shim
+(`hipfire_kvmem_shim.{h,cpp}`, a kvmem-repo change) and the crate FFI
+(`crates/hipfire-kvmem/src/lib.rs`), and the controller opens a round before
+previewing scores and commits it after the pick. Both entries are no-ops when
+`LRFU` is off, so the default Retrieval path is unchanged. The GPU
+high/low watermark ratios derive a hysteresis band from the core watermark
+functions (`keep ≤ trigger ≤ budget_blocks`): the trigger replaces the single
+budget spill threshold and the keep target narrows the core selection budget via
+`set_runtime_select_budget`, so the band can only make residency more
+conservative, never overshoot the physical pool. Setting either watermark enables
+the band (the unset ratio defaults to 0.95/0.85). The knobs are exposed through
+three layers — engine env, router parameter spec, wrapper docs — not the embedded
+`/ui` chat surface.
+
+Byte neutrality was gated on gfx1100 (N-gate): with no policy env the greedy
+decode sha256 still equals the batch-restore baseline `29e8a27d…` (cross-build
+bit-identity), setting the non-watermark defaults explicitly (`expdefault`)
+reproduces it exactly, recall is identical over a 5k–17.5k-token over-budget
+needle sweep, and `HIPFIRE_KVMEM_VERIFY=1` reports 0 readback mismatch. Each
+non-default value passed its own B-gate (0 mismatch, recall and decode parity
+reported vs default): `lrfu` keeps recall `True/True/False` (== default) with the
+round lifecycle active (223 spills / 63 restores, no "probe outside a round"
+error across four sequential rounds); `watermark` (`Some((28,22))` band) keeps
+recall `True/True/False` with more conservative residency (237 spills / 47
+restores); `recency` trades the 16k middle needle by design (`True/False/False`,
+160 spills / 0 restores — the needle is never selected back) while staying
+byte-exact. All knobs leave the under-budget greedy decode bitwise-identical.
+Sustained decode parity (256-token generation) confirms no throughput regression:
+over-budget with the policy active 14.1–14.3 tok/s vs default 14.2, and
+under-budget kernel-neutral 40.18–40.27 tok/s sustained vs default 40.2 — every
+knob within 10% on both regimes. Two-slot concurrency (`SLOTS=2`, two simultaneous
+over-budget requests with distinct needles, both slots running) keeps each slot's
+LRFU round isolated: both requests recall their own passphrase with 0 round
+errors and 0 readback mismatch.
+
 ## Enabling
 
 `HIPFIRE_KVMEM=1` on `hipfire serve`. Requires the paged Q8 KV pool (the only
@@ -135,6 +184,12 @@ forward.
 | `HIPFIRE_KVMEM_TIME` | off | per-step forward/tap timings + controller call breakdowns |
 | `HIPFIRE_KVMEM_VERIFY` | off | checksum every spilled/restored page and read the device block table back against the host table; 0 mismatch proves the spill/restore round is byte-exact |
 | `HIPFIRE_KVMEM_BATCH_XFER` | on | batch spill/restore through a pinned slab with stream-ordered async copies + one sync per chunk (byte-neutral); `0`/`off`/`false` restores the per-page blocking path |
+| `HIPFIRE_KVMEM_SELECT_METHOD` | `retrieval` | executor selection signal feeding the shared `pick_topk` ranking: `retrieval`/`0` scores the resident set against the tapped mean-K query; `recency`/`2` feeds no learned signal (sink + recent + the core's id tie-break). `h2o`/`1` is rejected until the attention-heat tap lands |
+| `HIPFIRE_KVMEM_LRFU` | off | decaying heavy-hitter retrieval history: each round reinforces the top-scoring blocks and decays the rest by `lambda`. Requires `SELECT_METHOD=retrieval`; off by default so the Retrieval path is byte-neutral |
+| `HIPFIRE_KVMEM_LRFU_LAMBDA` | 0.5 | LRFU decay weight on the prior committed score, in `[0,1]` (0 = no memory, 1 = no decay) |
+| `HIPFIRE_KVMEM_LRFU_TOP` | 0.9 | LRFU hit fraction gating positive reinforcement, in `(0,1]`; scores below the `(1−top)` quantile are clamped to ≤0 so an unselected block is never rewarded |
+| `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` | — (0.95) | spill-trigger ratio of the resident budget. Setting **either** watermark enables the hysteresis band; the unset one defaults to 0.95/0.85. Must satisfy `0 < low ≤ high ≤ 1` |
+| `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | — (0.85) | keep-target ratio of the resident budget; narrows the core selection budget so residency stays below the trigger. The band can only make residency more conservative, never overshoot the physical pool |
 
 With `cap ≤ budget` nothing ever spills, the tap kernels only copy, and the
 forward is bit-identical to an unpatched hipfire. Spill/restore moves arena

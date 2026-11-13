@@ -135,6 +135,13 @@ uint32_t hk_kv_store_pick_prefill_pressure_blocks(const hk_kv_store * ks,
                                                   uint32_t n_mandatory,
                                                   uint32_t * out, uint32_t capacity);
 void hk_kv_store_set_retrieval_scores(hk_kv_store * ks, const double * scores, uint32_t n);
+// LRFU round lifecycle. When lrfu is enabled the retrieval scorer must run inside
+// an explicit round: begin -> set_retrieval_scores (preview) -> pick_topk_blocks
+// -> commit (rewards the picked blocks). Both are no-ops when lrfu is disabled,
+// so the default Retrieval path is byte-neutral.
+void hk_kv_store_begin_retrieval_round(hk_kv_store * ks);
+// Returns 1 when a round was committed (lrfu on), 0 otherwise.
+int hk_kv_store_commit_retrieval_round(hk_kv_store * ks);
 int hk_kv_store_prefill_needs_offload(const hk_kv_store * ks, uint32_t resident_tokens,
                                       uint32_t incoming_tokens, uint32_t pool_tokens);
 uint32_t hk_kv_store_gpu_high_watermark_tokens(const hk_kv_store * ks, uint32_t pool_tokens);
