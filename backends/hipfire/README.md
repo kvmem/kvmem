@@ -21,6 +21,7 @@ restores it.
 | Batched spill/restore: pinned-slab stream-ordered async page copies with one sync per chunk (byte-neutral; `HIPFIRE_KVMEM_BATCH_XFER=0` restores per-page blocking) | `../patches/hipfire-batch-restore.patch` |
 | Opt-in residency-selection policy knobs: `SELECT_METHOD` (retrieval/recency), LRFU decaying heavy-hitter history (round lifecycle wired through the shim + crate FFI), GPU high/low watermark hysteresis band; defaults byte-neutral | `../patches/hipfire-policy-knobs.patch` |
 | Query-span multi-row Q scoring: `QUERY_SPAN` (1 = mean-K cosine, byte-neutral; >1 = page-softmax over a per-slot host Q ring), `query_score_frame` + `page_softmax_scores` wrapped through the shim + crate FFI; zero VRAM growth | `../patches/hipfire-query-span.patch` |
+| Host page-softmax SIMD dot reduction: crate build adds `-fopenmp-simd` so the core dot product's `#pragma omp simd` is honoured (float32 accumulation over FP16-rounded operands); per-selection latency ~3.4× lower, default byte-neutral | `../patches/hipfire-softmax-simd.patch` |
 
 The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
 `KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
@@ -218,6 +219,34 @@ both mean-K and page-softmax rank the needle block highest, so selection
 coincides. The `TRACE=1` score-sum fingerprint above is the definitive activity
 evidence; recall discrimination between the two scoring functions requires
 heterogeneous filler and is left to the long-needle sweep rather than gated here.
+
+The eighth `softmax-simd` patch optimizes the host page-softmax dot reduction that
+`query-span` introduced. Profiling an over-budget selection on gfx1100 (28k-token
+prompt, `span=64`) isolated the per-page dot product — a serial `double` reduction
+over `head_dim=256` that `-O2` cannot auto-vectorize without reassociation — as
+~96% of the cost (means 6.1 ms / dot 153 ms / ~167 ms per selection). The core
+change (`kvmem/src/host/graph_recall.cpp`, a separate kvmem commit) accumulates the
+dot in `float32` under a `#pragma omp simd reduction`; both operands are
+FP16-rounded, so each product is exact in float32 and the float reduction is a
+principled refinement aligned with the device float math, not a precision loss.
+The hipfire patch adds `-fopenmp-simd` to the crate build
+(`crates/hipfire-kvmem/build.rs`) so the pragma is honoured — SIMD-only, no OpenMP
+runtime linked, and no other pragma in the host library is activated.
+Per-selection latency falls ~167→49 ms (3.4×; the pure dot ~7×, the residual now
+co-dominated by the softmax `exp` loop).
+
+The edit is confined to `page_softmax_scores`, which runs only for `span>1` over
+budget, so the default `span=1` mean-K path is untouched: the N-gate greedy decode
+sha256 still equals the policy-knobs baseline `29e8a27d…`, recall is identical
+(`True/True/False` over the 8k/16k/28k sweep), and VERIFY reports 0 mismatch (225
+spill checksums). Each `span>1` keeps its B-gate — VERIFY 0, decode parity within
+10% on all three targets, and recall `True/True/False` preserved (the float
+perturbation flips no needle selection in the sweep); the under-budget greedy
+decode is bitwise-identical across every span. Selection is interval-gated (~2
+actual selections per 256-token decode), so the amortized throughput impact is
+~1–2% (14.0→14.2 tok/s). A HIP GPU page-softmax kernel is therefore **deferred**:
+the residual ~49 ms per selection does not justify the port + wiring for an opt-in
+mode whose steady-state throughput cost is already negligible.
 
 ## Enabling
 
