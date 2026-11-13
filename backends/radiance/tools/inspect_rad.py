@@ -13,7 +13,8 @@ import struct
 from pathlib import Path
 
 
-def inspect(path, allow_partial=False, include_entries=False, max_directory_bytes=128*1024*1024):
+def inspect(path, allow_partial=False, include_entries=False, max_directory_bytes=128*1024*1024,
+            include_vocab=False):
     header = struct.Struct("<II30Q")
     entry = struct.Struct("<3Q2I6q3iI5Q")
     size = path.stat().st_size
@@ -88,6 +89,34 @@ def inspect(path, allow_partial=False, include_entries=False, max_directory_byte
                 "note": "container directory only; not runtime VRAM or a checksum verification"}
         if include_entries:
             result["weight_entries"] = rows
+        if include_vocab:
+            # abi/rad_format.h: RadVocabHeader. Inspect the header and array
+            # extents only; vocabulary/token payloads and weights stay unread.
+            vocab_header = struct.Struct("<4I5Q6i2I5Q")
+            vocab = None
+            voff, vbytes = h[18:20]
+            if voff > size or vbytes > size - voff:
+                raise ValueError("vocab section outside file")
+            if vbytes:
+                if vbytes < vocab_header.size or voff % 8:
+                    raise ValueError("invalid vocab header size or alignment")
+                v = vocab_header.unpack(read_at(voff, vocab_header.size))
+                nt, nm, ns = v[1:4]
+                for off, count, stride, alignment, optional in (
+                        (v[4], nt, 8, 8, False), (v[5], nt, 4, 4, True),
+                        (v[6], nt, 1, 1, True), (v[7], nm, 8, 4, False),
+                        (v[8], ns, 32, 8, False)):
+                    if count == 0 or (off == 0 and optional):
+                        continue
+                    if (not off or off < voff or off - voff > vbytes
+                            or count * stride > vbytes - (off - voff) or off % alignment):
+                        raise ValueError("vocab array outside section or misaligned")
+                template = string(v[17]).encode('utf-8')
+                vocab = dict(kind=v[0], kind_name={1:'BPE',2:'Unigram',3:'WordPiece',4:'RWKV'}.get(v[0],str(v[0])),
+                             tokens=nt, merges=nm, steps=ns, bytes=vbytes,
+                             chat_template_bytes=len(template),
+                             chat_template_sha256=hashlib.sha256(template).hexdigest() if template else None)
+            result['vocab'] = vocab
         return result
 
 

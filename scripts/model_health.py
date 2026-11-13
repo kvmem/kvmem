@@ -442,12 +442,32 @@ class Inspection:
         size=self.track(path)
         spec=importlib.util.spec_from_file_location('model_health_rad_reader',source)
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-        try:info=module.inspect(path,max_directory_bytes=MAX_DIRECTORY)
+        try:info=module.inspect(path,max_directory_bytes=MAX_DIRECTORY,include_vocab=True)
         except ValueError as error:raise Invalid(str(error)) from error
         self.tick()
         self.report['model']=dict(format='rad',architecture=info['arch_id'],files=1,bytes=size,
                                   name=info['model'],quantization=info['quant'])
         self.report['features']=dict(text='present',vision='unknown',mtp='unknown',dflash2='unknown',tokenizer='unknown',template='unknown')
+        vocab=info.get('vocab') or {}
+        tokenizer=bool(vocab.get('tokens'))
+        template=bool(vocab.get('chat_template_bytes'))
+        self.report['features'].update(tokenizer='present' if tokenizer else 'absent',
+                                       template='present' if template else 'absent')
+        if tokenizer:
+            self.report['model'].update(tokenizer_kind=vocab['kind_name'],vocab_size=vocab['tokens'])
+            self.check('rad_tokenizer','pass','已包含分词器，词表头与范围检查通过',
+                       'Embedded tokenizer header and ranges checked',
+                       f"{vocab['kind_name']}; {vocab['tokens']} tokens; {vocab['merges']} merges; tokenization is checked when loading")
+        else:
+            self.check('rad_tokenizer','error','RAD 模型缺少文本分词器','RAD model has no text tokenizer')
+        if template:
+            self.report['model']['chat_template_bytes']=vocab['chat_template_bytes']
+            self.check('rad_template','pass','已包含聊天模板','Embedded chat template found',
+                       f"{vocab['chat_template_bytes']} UTF-8 bytes; SHA256 {vocab['chat_template_sha256']}; syntax is checked when loading")
+        elif not self.p.get('ChatTemplateFile'):
+            self.check('rad_template','warning','未包含聊天模板，将使用引擎默认 ChatML',
+                       'No embedded chat template; engine defaults to ChatML',
+                       'Choose the model\'s matching custom chat template if it was not trained with ChatML.','config')
         # Use the same declaration/weight/depth rules as the launcher. In
         # particular, retained NextN metadata does not prove MTP weights exist.
         # Pass the bounded directory through instead of reopening the model.
@@ -493,7 +513,8 @@ class Inspection:
             else:
                 self.inspect_gguf(path)
             if self.p.get('ChatTemplateFile'):
-                self.required_file(self.path(self.p['ChatTemplateFile']), 'template_override', '自定义聊天模板文件', 'Custom chat template file')
+                if self.required_file(self.path(self.p['ChatTemplateFile']), 'template_override', '自定义聊天模板文件', 'Custom chat template file'):
+                    self.report['features']['template']='external_ready'
             if self.p['Backend'] == 'polystrata' and self.p.get('Tokenizer'):
                 directory = self.path(self.p['Tokenizer'])
                 merge='merges.json' if (directory/'merges.json').is_file() else 'merges.txt'
