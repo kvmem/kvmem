@@ -28,8 +28,8 @@ ENGINE_DEFAULTS = {'ninfer': {'Context': 262144,
             'ScoreAggregation': 'mean',
             'GraphAlpha': 0.2,
             'Lrfu': False,
-            'QueryMaxTokens': 512,
-            'QueryReplayMaxTokens': 2048,
+            'QueryMaxTokens': 0,
+            'QueryReplayMaxTokens': 0,
             'CheckpointExtraRecomputeTokens': 0,
             'CacheMinTokens': 0,
             'ThinkingMode': 'default',
@@ -199,8 +199,9 @@ def normalize(data, backends, *, path_root=None):
     if p.get('ScoreAggregation', 'mean') not in {'mean', 'max'}:
         raise ValueError('Unsupported ScoreAggregation')
     for key in ('QueryMaxTokens', 'QueryReplayMaxTokens'):
-        if key in p and p[key] <= 0:
-            raise ValueError(f'{key} must be positive')
+        minimum = 0 if p['Backend'] == 'ninfer' else 1
+        if key in p and p[key] < minimum:
+            raise ValueError(f'{key} must be >= {minimum}; zero means unlimited for NInfer')
     if p['Backend'] != 'radiance' and {'CpuThreads','VisionCacheMiB'} & p.keys():
         raise ValueError('CpuThreads and VisionCacheMiB currently configure Radiance only')
     if 'CheckpointExtraRecomputeTokens' in p and p['Backend'] != 'ninfer':

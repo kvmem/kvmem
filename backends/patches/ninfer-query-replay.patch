@@ -1,0 +1,258 @@
+diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
+index 82da2b98..6e0dec6a 100644
+--- a/apps/cli/options.cpp
++++ b/apps/cli/options.cpp
+@@ -185,8 +185,8 @@ std::string usage_text(const char* argv0) {
+            "  --kvmem-disk-mib N            canonical native KV SSD quota (default 0)\n"
+            "  --kvmem-sink-tokens N         kept prefix; layerwise omitted=auto, explicit0=0\n"
+            "  --kvmem-recent-tokens N       kept suffix; layerwise omitted=auto, explicit0=0\n"
+-           "  --kvmem-query-max-tokens N    legacy cached-Q tail cap (default 512)\n"
+-           "  --kvmem-query-replay-max-tokens N legacy complete replay bound (default 2048)\n"
++           "  --kvmem-query-max-tokens N    legacy Query tail cap (default 0: full Query)\n"
++           "  --kvmem-query-replay-max-tokens N legacy replay cap (default 0: unlimited)\n"
+            "  --kvmem-reselect MODE         per-request auto (default) | force | off; layerwise only\n"
+            "  --kvmem-query-begin N         original token Query begin; requires --kvmem-query-end\n"
+            "  --kvmem-query-end N           original token Query end, exclusive\n"
+diff --git a/include/ninfer/engine_options.h b/include/ninfer/engine_options.h
+index 96095c5b..54c9a7e0 100644
+--- a/include/ninfer/engine_options.h
++++ b/include/ninfer/engine_options.h
+@@ -479,8 +479,8 @@ struct KvmemOptions {
+     std::optional<std::uint32_t> layerwise_sink_tokens,layerwise_recent_tokens;
+     // Gate lookup copies against request-local neural draft yield.
+     bool ngram_arbitration = true;
+-    std::uint32_t query_replay_max_tokens = 2048;
+-    std::uint32_t query_max_tokens = 512; // tail of the actual last-user span, matching llama.cpp
++    std::uint32_t query_replay_max_tokens = 0; // zero: complete causal replay, across windows
++    std::uint32_t query_max_tokens = 0; // zero: the full proven last-user Query
+     bool lrfu = false;
+     double lrfu_lambda = 0.5;
+     double lrfu_top_fraction = 0.9;
+diff --git a/src/models/qwen3_5/program/planning/request_plan.cpp b/src/models/qwen3_5/program/planning/request_plan.cpp
+index 3bd28b21..8e40de34 100644
+--- a/src/models/qwen3_5/program/planning/request_plan.cpp
++++ b/src/models/qwen3_5/program/planning/request_plan.cpp
+@@ -163,7 +163,7 @@ std::uint64_t memory_replay_service_work(const runtime::RequestPlanSummary& summ
+         prompt.memory_query->count == 0) return 0;
+     const auto query=bounded_memory_query(prompt,options.query_max_tokens);
+     if(query.begin==0) return 0;
+-    const auto admission=kvmem::query_replay_plan({query.begin,query.begin+query.count},query.begin,
++    const auto admission=kvmem::streaming_query_replay_plan({query.begin,query.begin+query.count},query.begin,
+         summary.prompt_tokens,options.query_replay_max_tokens,64,
+         std::min<uint64_t>((query.begin+63)/64,options.selected_tokens/64),window_tokens/64,workspace);
+     if(!admission.admitted) return 0;
+diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
+index 3d9dd2b2..0b2c3e73 100644
+--- a/src/models/qwen3_5/program/planning/startup.cpp
++++ b/src/models/qwen3_5/program/planning/startup.cpp
+@@ -390,7 +390,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
+             .prefill_chunk = static_cast<std::uint32_t>(effective_prefill_chunk),
+             .verify_window = widest_verify_window(plan),
+             .max_concurrency = plan.max_concurrency,
+-            .query_max_tokens = plan.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise ? 0U : plan.kvmem.query_max_tokens,
++            .query_max_tokens = plan.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise ? 0U :
++                (plan.kvmem.query_max_tokens ? plan.kvmem.query_max_tokens : plan.capacity),
+             .mean_query = plan.kvmem.recall_strategy==kvmem::RecallStrategy::Legacy && plan.kvmem.query_meanq_cosine,
+             .layerwise_graph_capture = plan.use_cuda_graph && plan.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise};
+         out.memory_statistics.resize(ranks);
+diff --git a/src/models/qwen3_5/program/prefill.cpp b/src/models/qwen3_5/program/prefill.cpp
+index b0b3d28a..895993f0 100644
+--- a/src/models/qwen3_5/program/prefill.cpp
++++ b/src/models/qwen3_5/program/prefill.cpp
+@@ -1434,7 +1434,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+         if(kvmem_window_tokens && kvmem_options.recall_strategy==kvmem::RecallStrategy::Legacy &&
+             kvmem_options.verify_transfers && staged.cursor==
+             std::max({staged.base,staged.memory_restore_frontier,staged.disk_restore_frontier})) {
+-            const auto plan=kvmem::query_replay_plan({query.begin,query.begin+query.count},query.begin,
++            const auto plan=kvmem::streaming_query_replay_plan({query.begin,query.begin+query.count},query.begin,
+                 staged.prompt_tokens,kvmem_options.query_replay_max_tokens,64,
+                 std::min<uint64_t>((query.begin+63)/64,kvmem_options.selected_tokens/64),
+                 kvmem_window_tokens/64,backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0);
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index d5d78621..6296eea2 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -785,7 +785,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+         memory_statistics->mean_query = kvmem_options.recall_strategy==kvmem::RecallStrategy::Legacy && kvmem_options.query_meanq_cosine;
+         memory_statistics->query_columns = memory_statistics->mean_query ||
+             kvmem_options.recall_strategy==kvmem::RecallStrategy::Layerwise ? 1U :
+-            std::min({plan.prefill_chunk, plan.capacity, kvmem_options.query_max_tokens});
++            std::min({plan.prefill_chunk, plan.capacity,
++                kvmem_options.query_max_tokens ? kvmem_options.query_max_tokens : plan.capacity});
+         memory_statistics->columns = (std::min(plan.prefill_chunk, plan.capacity) + 126U) / 64U;
+         memory_statistics->ranks.resize(device.size());
+         memory_candidate_statistics = *memory_statistics;
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index f13380b2..63482e1a 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -658,7 +658,7 @@ struct KvmemIdleTransfer {
+ 
+ inline qwen3_5::TokenSpan bounded_memory_query(const PreparedPromptData& prompt, uint32_t limit) {
+     const auto source=prompt.memory_query.value_or(qwen3_5::TokenSpan{});
+-    auto bounded=kvmem::bounded_query(source.begin,source.count,prompt.token_ids.size(),limit);
++    auto bounded=kvmem::bounded_query(source.begin,source.count,prompt.token_ids.size(),limit ? limit : UINT32_MAX);
+     for(const auto& item:prompt.vision_items) for(const auto& span:item.token_spans)
+         if(span.begin<=bounded.begin && bounded.begin<span.begin+span.count)
+             bounded.begin=std::min(bounded.end,span.begin+span.count);
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index 867f71ae..2398918a 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -1937,9 +1937,6 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
+         force_selection = false;
+     }
+     if (end == begin && !force_selection) { return true; }
+-    if (sequence.window.query_replay_active && !force_selection &&
+-        compact_position(sequence,end)>kvmem_window_tokens)
+-        throw std::logic_error("bounded Query replay cannot execute Pressure");
+     if (force_selection || compact_position(sequence, end) > kvmem_window_tokens) {
+         // A reselection replaces the selected blocks; only the trailing recent pages are
+         // guaranteed to stay. Raise the masked-draft floor to that trailing continuous segment
+@@ -1972,7 +1969,26 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
+         const bool query_complete = state.query_tokens != 0 &&
+             (state.query_replayed || begin >= state.query_end) &&
+             state.query_tokens == state.query_end - state.query_begin;
+-        if (reason==kvmem::SelectionReason::Query && query_complete) {
++        if (state.query_replay_active && !force_selection) {
++            // Frozen first-pass Q ranks only the prefix rebuilt so far.
++            // The initial prefix restore below uses its separately admitted set.
++            if (!query_complete || !state.selector || state.statistics_frontier != begin ||
++                state.selector->total_tokens() != begin)
++                throw std::logic_error("Query replay lost its frozen Q or evaluated index");
++            const std::vector<std::uint32_t> required(mandatory.begin(),mandatory.end());
++            score_memory_query(sequence,required,nullptr);
++            std::vector<std::uint32_t> candidates;
++            std::vector<double> scores;
++            candidates.reserve(count); scores.reserve(count);
++            for (std::uint32_t id=0;id<count;++id) {
++                candidates.push_back(id);scores.push_back(state.selector->selection_score(id));
++            }
++            const auto ids=state.selector->pick_scored_blocks(candidates,scores,required,keep,true);
++            selected.assign(ids.begin(),ids.end());
++            if (kvmem_options.verify_transfers)
++                std::fprintf(stderr,"KVMEM_REPLAY_QUERY_SELECTION logical=%u query_tokens=%u candidates=%u selected=%zu\n",
++                    begin,state.query_tokens,count,selected.size());
++        } else if (reason==kvmem::SelectionReason::Query && query_complete) {
+             if (!state.selector || state.statistics_frontier != begin ||
+                 state.selector->total_tokens() != begin) {
+                 throw std::logic_error("KVMem retrieval index does not match the evaluated prefix");
+@@ -2150,7 +2166,7 @@ bool ProgramImpl::memory_query_probe(const SequenceState& sequence, std::uint32_
+     if (window.layerwise_request) return false;
+     if (window.layerwise_rewrite_pending || window.layer_views.active()) return false;
+     const auto workspace=backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0;
+-    const auto admission=kvmem::query_replay_plan({window.query_begin,window.query_end},
++    const auto admission=kvmem::streaming_query_replay_plan({window.query_begin,window.query_end},
+         window.query_begin,prompt_tokens,kvmem_options.query_replay_max_tokens,page_tokens,
+         std::min(kv_pages_for_tokens(window.query_begin),kvmem_options.selected_tokens/page_tokens),
+         kvmem_window_tokens/page_tokens,workspace);
+@@ -3078,7 +3094,7 @@ bool ProgramImpl::rewind_memory_query(SequenceState& sequence) {
+     for (auto page:window.query_selected) std::fprintf(stderr,"%u,",page);
+     std::fprintf(stderr,"\n");
+ #endif
+-    const auto admission=kvmem::query_replay_plan({window.query_begin,window.query_end},frontier,
++    const auto admission=kvmem::streaming_query_replay_plan({window.query_begin,window.query_end},frontier,
+         sequence.text_kv_valid,kvmem_options.query_replay_max_tokens,page_tokens,
+         window.query_selected.size(),kvmem_window_tokens/page_tokens,
+         backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0);
+@@ -3466,7 +3482,7 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(
+             if (kvmem_options.recall_strategy!=kvmem::RecallStrategy::Layerwise) {
+             const auto query=memory_query_span(prompt);
+             const auto workspace=backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0;
+-            const auto admission=kvmem::query_replay_plan({query.begin,query.begin+query.count},query.begin,
++            const auto admission=kvmem::streaming_query_replay_plan({query.begin,query.begin+query.count},query.begin,
+                 prompt.token_ids.size(),kvmem_options.query_replay_max_tokens,page_tokens,
+                 std::min<uint64_t>((query.begin+63)/64,kvmem_options.selected_tokens/page_tokens),
+                 kvmem_window_tokens/page_tokens,workspace);
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index 1a6ccd66..4f42ec6e 100644
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -377,7 +377,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+         options.kvmem.host_bytes > UINT64_MAX - options.kvmem.disk_bytes) {
+         throw std::invalid_argument("KVMem SSD requires a directory and a valid nonzero disk quota");
+     }
+-    if(!options.kvmem.query_max_tokens) throw std::invalid_argument("KVMem Query cap must be positive");
+     if (options.kvmem.recall_strategy==kvmem::RecallStrategy::Legacy)
+         kvmem::validate_query_scoring(options.kvmem.query_meanq_cosine ? kvmem::QueryScorer::MeanQCosine : kvmem::QueryScorer::PageSoftmax,
+             options.kvmem.score_agg_max ? 1 : 0,options.kvmem.graph_alpha);
+@@ -474,8 +473,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+             options.kv_capacity.explicit_tokens != window * options.max_concurrency || window % 64 != 0 || window < 256 ||
+             window > options.max_context || options.kvmem.selected_tokens <
+                 (options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise?64u:128u) ||
+-            (options.kvmem.recall_strategy==kvmem::RecallStrategy::Legacy &&
+-                (!options.kvmem.query_max_tokens || !options.kvmem.query_replay_max_tokens)) ||
+             options.kvmem.selected_tokens % 64 != 0 || options.kvmem.reserve_tokens < 64 ||
+             options.kvmem.reserve_tokens % 64 != 0 || !options.kvmem.host_bytes ||
+             options.kvmem.retained_sessions == 0 || options.kvmem.retained_sessions > 16 ||
+@@ -1015,7 +1012,8 @@ static ConstructedModel construct_model_impl(const EngineOptions& requested, Dev
+                 .verify_window = std::max(options.speculative.draft_tokens,
+                                            options.speculative.ngram_draft_tokens),
+                 .max_concurrency = options.max_concurrency,
+-                .query_max_tokens = options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise ? 0U : options.kvmem.query_max_tokens,
++                .query_max_tokens = options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise ? 0U :
++                    (options.kvmem.query_max_tokens ? options.kvmem.query_max_tokens : options.max_context),
+                 .mean_query = options.kvmem.recall_strategy==kvmem::RecallStrategy::Legacy && options.kvmem.query_meanq_cosine,
+                 .layerwise_graph_capture = options.use_cuda_graph && options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise}};
+         const bool auxiliary_scratch = options.kvmem.recall_strategy == kvmem::RecallStrategy::Layerwise &&
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 31edd218..fac4cca2 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -130,7 +130,7 @@ std::string serve_usage_text(const char* argv0) {
+            "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
+            "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+            "  --kvmem-layerwise-activation-metadata-mib N bounded tape descriptors (default 128)\n"
+-           "  --kvmem-query-replay-max-tokens N  bound complete Query replay (default 2048)\n"
++           "  --kvmem-query-replay-max-tokens N  complete Query replay cap (default 0: unlimited)\n"
+             "  --kvmem-query-scorer NAME    page-softmax (default) | meanq-cosine\n"
+             "  --kvmem-score-agg MODE       mean | max (default: page-softmax mean, cosine max)\n"
+             "  --kvmem-lrfu / --no-kvmem-lrfu  Query history (default on only for cosine)\n"
+@@ -138,7 +138,7 @@ std::string serve_usage_text(const char* argv0) {
+             "  --kvmem-lrfu-top-frac X      history hit fraction in (0,1] (default 0.9)\n"
+             "  --kvmem-graph-alpha X        Query propagation in [0,1] (default: page-softmax 0.2; cosine 0)\n"
+             "  --kvmem-capabilities         Print model-free console capability JSON and exit\n"
+-           "  --kvmem-query-max-tokens N  cap per-token Query capture to its tail (default 512)\n"
++           "  --kvmem-query-max-tokens N  Query scoring tail cap (default 0: full Query)\n"
+             "  --kvmem-gen-reserve N         positive append workspace R (default 1024), rounded down to 64\n"
+            "  --kvmem-host-mib N            positive Host native KV payload budget H, MiB (default 16384)\n"
+            "  --kvmem-sink-tokens N         always-kept prefix; default 0 = one 64-token\n"
+@@ -781,11 +781,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+             continue;
+         }
+         if(arg=="--kvmem-query-replay-max-tokens") {
+-            options.kvmem.query_replay_max_tokens=kvmem::CliOptions::integer(arg,require_value(arg.c_str()),1);
++            options.kvmem.query_replay_max_tokens=kvmem::CliOptions::integer(arg,require_value(arg.c_str()),0);
+             continue;
+         }
+         if(arg=="--kvmem-query-max-tokens") {
+-            options.kvmem.query_max_tokens=kvmem::CliOptions::integer(arg,require_value(arg.c_str()),1);
++            options.kvmem.query_max_tokens=kvmem::CliOptions::integer(arg,require_value(arg.c_str()),0);
+             continue;
+         }
+         if (retention.parse(arg, require_value, memory) || memory.parse(arg, require_value)) continue;
+diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
+index e69461fe..db5eab7a 100644
+--- a/tests/test_serve_options.cpp
++++ b/tests/test_serve_options.cpp
+@@ -75,13 +75,17 @@ int run_serve_option_tests() {
+         failures += check(rejected, "missing ngram arbitration value was accepted");
+     }
+     const auto query_defaults=parse({"ninfer-serve","model.ninfer"});
+-    failures+=check(query_defaults.kvmem.query_max_tokens==512 &&
+-                    query_defaults.kvmem.query_replay_max_tokens==2048,"Query/replay defaults differ");
++    failures+=check(query_defaults.kvmem.query_max_tokens==0 &&
++                    query_defaults.kvmem.query_replay_max_tokens==0,"Query/replay must default to unlimited");
++    const auto full_query=parse({"ninfer-serve","model.ninfer","--kvmem-query-max-tokens","0",
++        "--kvmem-query-replay-max-tokens","0"});
++    failures+=check(full_query.kvmem.query_max_tokens==0 && full_query.kvmem.query_replay_max_tokens==0,
++        "explicit unlimited Query/replay limits lost");
+     const auto query_limits=parse({"ninfer-serve","model.ninfer","--kvmem-query-max-tokens","32",
+         "--kvmem-query-replay-max-tokens","8"});
+     failures+=check(query_limits.kvmem.query_max_tokens==32 && query_limits.kvmem.query_replay_max_tokens==8,
+         "independent Query/replay limits lost");
+-    for(const auto* limit:{"0","-1","1x","2147483648"}) {
++    for(const auto* limit:{"-1","1x","2147483648"}) {
+         bool rejected=false;
+         try { (void)parse({"ninfer-serve","model.ninfer","--kvmem-query-replay-max-tokens",limit}); }
+         catch(const std::invalid_argument&) {rejected=true;}

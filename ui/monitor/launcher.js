@@ -970,7 +970,7 @@
     const scorer=p.QueryScorer||(legacyScoring&&(!p.NoLrfu||p.ScoreAggregation==='max'||'LrfuLambda' in p||'LrfuTopFraction' in p)?'meanq-cosine':'page-softmax');
     p={...p,QueryScorer:scorer,ScoreAggregation:p.ScoreAggregation??(scorer==='meanq-cosine'?'max':'mean'),
       GraphAlpha:p.GraphAlpha??(scorer==='meanq-cosine'?0:0.2),Lrfu:p.Lrfu??('NoLrfu' in p?!p.NoLrfu:scorer==='meanq-cosine'),
-      QueryMaxTokens:p.QueryMaxTokens??512,QueryReplayMaxTokens:p.QueryReplayMaxTokens??2048};
+      QueryMaxTokens:p.QueryMaxTokens??(p.Backend==='ninfer'?0:512),QueryReplayMaxTokens:p.QueryReplayMaxTokens??(p.Backend==='ninfer'?0:2048)};
     let refreshGpuOrder=()=>{};
     const b=p.Backend,n=b==='ninfer',l=b==='llamacpp',poly=b==='polystrata',rad=b==='radiance';
     if(n)p.CheckpointExtraRecomputeTokens??=0;
@@ -1188,7 +1188,7 @@
     const history=field(scoring,p,'Lrfu','历史累计 · LRFU','LRFU history','checkbox',null,['对历次问题的重要性做衰减累计。top-fraction 只筛正向奖励，负分仍保留。','Accumulate decayed relevance across queries. Top-fraction gates positive rewards while retaining negative evidence.']);history.dataset.explicitBoolean='true';
     const decay=field(scoring,{LrfuLambda:0.5,...p},'LrfuLambda','历史衰减系数','History decay','number');decay.max='1';decay.step='any';decay.required=true;
     const fraction=field(scoring,{LrfuTopFraction:0.9,...p},'LrfuTopFraction','正向奖励候选比例','Positive reward fraction','number');fraction.min='0';fraction.max='1';fraction.step='any';fraction.required=true;
-    for(const [key,zh,en,note] of [['QueryMaxTokens','问题评分上限 · tokens','Query score limit · tokens',['仅使用当前问题末尾的这些 tokens 评分。','Score with at most this many trailing tokens of the current question.']],['QueryReplayMaxTokens','完整回放上限 · tokens','Causal replay limit · tokens',['超过上限时保持驻留视图并使用 Pressure；不会截断因果回放。','Above this limit, retain the resident view with Pressure; causal replay is not truncated.']]]){const limit=field(scoring,p,key,zh,en,'number',null,note);limit.min='1';limit.required=true;}
+    for(const [key,zh,en,note] of [['QueryMaxTokens','问题评分上限 · tokens','Query score limit · tokens',['仅使用当前问题末尾的这些 tokens 评分。','Score with at most this many trailing tokens of the current question.']],['QueryReplayMaxTokens','完整回放上限 · tokens','Causal replay limit · tokens',['超过上限时保持驻留视图并使用 Pressure；不会截断因果回放。','Above this limit, retain the resident view with Pressure; causal replay is not truncated.']]]){const limit=field(scoring,p,key,zh,en,'number',null,note);limit.min=p.Backend==='ninfer'?'0':'1';limit.required=true;if(p.Backend==='ninfer')limit.title=tr('0 表示不限制长度；正数设置上限。','0 means unlimited; a positive value sets a cap.');}
     const scoringAdvanced=recallAdvanced(scoring,'scoring','评分与回放细节','Scoring and replay details');
     for(const key of ['ScoreAggregation','LrfuLambda','LrfuTopFraction','QueryMaxTokens','QueryReplayMaxTokens'])scoringAdvanced.append(scoring.querySelector(`[data-param=${key}]`).closest('label'));
     field(panels[1],p,'Prefill','预填充块大小 · tokens','Prefill chunk · tokens','number');

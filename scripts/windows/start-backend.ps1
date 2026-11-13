@@ -66,8 +66,8 @@ param(
     [ValidateRange(1, 2147483647)][int]$LayerwiseActivationMetadataMiB,
     [ValidateSet('page-softmax', 'meanq-cosine')][string]$QueryScorer = 'page-softmax',
     [ValidateRange(0.0, 1.0)][double]$GraphAlpha,
-    [ValidateRange(1, 2147483647)][int]$QueryMaxTokens,
-    [ValidateRange(1, 2147483647)][int]$QueryReplayMaxTokens,
+    [ValidateRange(0, 2147483647)][int]$QueryMaxTokens,
+    [ValidateRange(0, 2147483647)][int]$QueryReplayMaxTokens,
     [ValidateRange(0, 2147483647)][int]$CheckpointExtraRecomputeTokens = 0,
     [switch]$Lrfu,
     [switch]$NoLrfu,
@@ -415,7 +415,18 @@ if ($CacheMinTokens -gt 0) { $nativeArgs += @('--kvmem-cache-min-tokens', "$Cach
 if ($Backend -eq 'llamacpp') { $nativeArgs += @('--kvmem-block-tokens', "$resolvedBlock") }
 if ($Backend -eq 'llamacpp') { $nativeArgs += $nativeArgsSpec }
 if ($DiskPath) { $nativeArgs += @('--kvmem-disk-path', $DiskPath, '--kvmem-disk-mib', "$DiskMiB") }
-$nativeArgs += @(Get-KVMemQueryScoringArgs $PSBoundParameters)
+$scoringParameters = @{} + $PSBoundParameters
+if ($RecallStrategy -ne 'layerwise') {
+    foreach ($limitName in @('QueryMaxTokens','QueryReplayMaxTokens')) {
+        if ($Backend -eq 'ninfer' -and !$scoringParameters.ContainsKey($limitName)) {
+            $scoringParameters[$limitName] = 0
+        } elseif ($Backend -ne 'ninfer' -and $scoringParameters.ContainsKey($limitName) -and
+                  $scoringParameters[$limitName] -eq 0) {
+            throw "$limitName must be positive for $Backend"
+        }
+    }
+}
+$nativeArgs += @(Get-KVMemQueryScoringArgs $scoringParameters)
 $nativeArgs = @(Remove-KVMemImplicitRecallBands $nativeArgs $PSBoundParameters)
 if($RecallStrategy -eq 'layerwise' -and @($WorkerArgs | Where-Object {$_ -match '^--(kvmem-mtp-state|spec[^=]*|draft[^=]*|mtp[^=]*|adaptive-mtp|ngram[^=]*)(=|$)'}).Count) {throw 'Use named layerwise speculative settings; WorkerArgs cannot override the qualified draft owner'}
 $nativeArgs += $WorkerArgs

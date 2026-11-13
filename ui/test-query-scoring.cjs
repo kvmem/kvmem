@@ -19,6 +19,10 @@ module.exports=async({browser,base,info})=>{
   assert.equal(await page.locator('[data-scoring-migration]').count(),1);
   await page.locator('[data-language-select]').selectOption('zh-CN');await openAdvanced();
   assert.equal(await field('QueryScorer').inputValue(),'meanq-cosine');assert.equal(await field('GraphAlpha').inputValue(),'0');assert.equal(await field('Lrfu').isChecked(),true);
+  assert.equal(await field('QueryMaxTokens').getAttribute('min'),'0');
+  assert.equal(await field('QueryReplayMaxTokens').getAttribute('min'),'0');
+  await field('QueryMaxTokens').fill('0');await field('QueryReplayMaxTokens').fill('0');
+  const unlimited=await preview();assert.equal(unlimited.QueryMaxTokens,0);assert.equal(unlimited.QueryReplayMaxTokens,0);
   await field('QueryScorer').selectOption('page-softmax');assert.equal(await field('Lrfu').isChecked(),true,'scorer must not toggle history');
   await field('GraphAlpha').fill('.2');await field('ScoreAggregation').selectOption('mean');await field('LrfuLambda').fill('.3');await field('LrfuTopFraction').fill('.5');
   await field('QueryMaxTokens').fill('128');await field('QueryReplayMaxTokens').fill('512');
