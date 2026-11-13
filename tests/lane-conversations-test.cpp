@@ -540,6 +540,23 @@ int main() {
         catalog.finish(op, a); // completion remains idempotent
         assert(access::entry(catalog, 2).committed.match.rows == 3);
     }
+    for (bool other_reader : {false, true}) {
+        ServerState a, b;
+        kvmem_lane_conversations catalog({&a, &b}, 1, 0, true);
+        auto op = access::handover(catalog);
+        access::seed_version(catalog, 0, 1, 1);
+        access::entry(catalog, 0).refs = other_reader ? 2 : 1;
+        op.source = 0; op.source_pinned = true;
+        a.cached_tokens = {41, 42, 43};
+        catalog.finish(op, a);
+        // Only an independent reader may keep the old group pinned when the
+        // completed branch competes for the single retention group.
+        assert(!op.source_pinned);
+        assert(access::exists(catalog, 0) == other_reader);
+        assert(access::entry(catalog, 2).committed.match.rows == (other_reader ? 0 : 3));
+        if (other_reader) assert(access::entry(catalog, 0).refs == 1);
+        assert(catalog.status()["retained_sessions"] == 1);
+    }
     for (bool fail : {false, true}) {
         ServerState a, b;
         kvmem_lane_conversations catalog({&a, &b}, 8, 0);

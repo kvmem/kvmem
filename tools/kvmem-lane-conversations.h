@@ -358,15 +358,19 @@ public:
         op.finished = true;
         struct source_guard {
             kvmem_lane_conversations& owner; operation& op;
-            ~source_guard() {
+            void release_locked() {
                 if (!op.source_reserved && !op.source_pinned) return;
-                std::lock_guard<std::mutex> lock(owner.mu_);
                 const auto source = owner.entries_.find(op.source);
                 if (source != owner.entries_.end()) {
                     if (op.source_reserved) source->second.switching = false;
                     if (op.source_pinned) --source->second.refs;
                 }
                 op.source_reserved = op.source_pinned = false;
+            }
+            ~source_guard() {
+                if (!op.source_reserved && !op.source_pinned) return;
+                std::lock_guard<std::mutex> lock(owner.mu_);
+                release_locked();
             }
         } release_source{*this,op};
         try {
@@ -405,6 +409,10 @@ public:
             }
             // Successful attach released outgoing. Another lane may already
             // have evicted it or reserved it for a different handover.
+            // Native completion no longer needs the source lease. Release it
+            // before publication so a shared template prefix cannot pin the
+            // only retained group and reject an otherwise eligible new history.
+            release_source.release_locked();
             enforce_sessions(op.lane);
             enforce_bytes();
         } catch (const std::exception & e) {
