@@ -208,6 +208,19 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(plan['argv'][plan['argv'].index('--tensor-split') + 1], '3,1')
         self.assertIsNone(self.controller.process)
 
+    def test_cache_minimum_rejects_old_worker_before_start(self):
+        model = Path(self.tmp.name) / 'admission.ninfer'; model.touch()
+        worker = Path(self.tmp.name) / f'admission{EXE}'; worker.touch(); worker.chmod(0o755)
+        self.config['parameters'].update(Model=str(model), Worker=str(worker),
+            Gpu='GPU-00000000-0000-0000-0000-000000000001', CacheMinTokens=4096)
+        with self.assertRaisesRegex(ValueError, 'CacheMinTokens'):
+            self.controller.plan(self.config)
+        self.assertIsNone(self.controller.process)
+        self.controller.worker_capabilities.return_value['cache_admission_revision'] = 1
+        plan = self.controller.plan(self.config)
+        self.assertEqual(plan['argv'][plan['argv'].index('--kvmem-cache-min-tokens') + 1], '4096')
+        self.assertIsNone(self.controller.process)
+
     def test_actual_scoring_is_observed_independently_of_the_editing_draft(self):
         planned = self.controller.scoring_from_argv(['worker', '--kvmem-query-scorer', 'meanq-cosine',
             '--kvmem-score-agg', 'max', '--kvmem-graph-alpha', '.123456789', '--no-kvmem-lrfu'])

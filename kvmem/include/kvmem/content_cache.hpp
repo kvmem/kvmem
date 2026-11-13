@@ -18,6 +18,14 @@
 
 namespace kvmem {
 
+// Test the complete, safely restorable logical history at a save boundary.
+// This does not govern prefix lookup, working KV or individual checkpoints.
+// Call before reserving a directory slot, replacing an ancestor or copying an
+// optional retained snapshot. Zero preserves the existing retention policy.
+inline bool admit_content_history(uint64_t accepted_tokens, uint64_t minimum_tokens) noexcept {
+    return accepted_tokens >= minimum_tokens;
+}
+
 // Adapters add only native-eligible candidates. In particular, continuation is
 // an adapter proof about this request's input/accepted boundary, never ID equality.
 struct ContentCacheCandidate {

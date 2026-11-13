@@ -165,6 +165,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-disk-path PATH    process-local native K/V spill directory\n"
             "  --kvmem-harvest-v          optional prefill D2H V capture (default off)\n"
             "  --kvmem-sessions N         internal content retention groups (default 4), independent of client keys\n"
+            "  --kvmem-cache-min-tokens N minimum complete restorable history to retain (default 0: disabled)\n"
             "                            snapshot records <= max(2*N, parallel lanes); active native leases survive eviction\n"
             "  --kvmem-conversations N    deprecated spelling for the retention group limit\n"
             "                            incompatible with --kvmem-sessions; no same-value alias\n"
@@ -1425,7 +1426,10 @@ int main(int argc, char ** argv) {
         kvmem_execution_scope scope(st.execution.get());
         st.execution->graph_budget=shared_graph_budget;
         llama_kvmem_set_params(&st.kparams);
-        if (options.payload_disk_bytes) {
+        // Retained packed checkpoints can move between lanes. With admission
+        // enabled, RAM-only snapshots need the same account just like SSD
+        // snapshots; otherwise a parked source fails native import on another lane.
+        if (options.payload_disk_bytes || options.cache_min_tokens) {
             st.execution->payload_domains = options.parallel;
             st.execution->payload_storage = shared_payload_storage;
         }
@@ -1469,7 +1473,7 @@ int main(int argc, char ** argv) {
             }
         }
 
-        if (st.kparams.payload_disk_bytes && !shared_payload_storage)
+        if ((st.kparams.payload_disk_bytes || options.cache_min_tokens) && !shared_payload_storage)
             shared_payload_storage = st.execution->payload_storage;
         if (st.kparams.payload_disk_bytes && !llama_kvmem_payload_budget()) {
             LOG_ERR("srv    KVMEM SSD RAM quota must hold a native working window including MTP\n");
@@ -1575,7 +1579,7 @@ int main(int argc, char ** argv) {
             }
             lane->vision = st.vision;
         }
-        lane_conversations = std::make_unique<kvmem_lane_conversations>(lanes, options.legacy_conversations ? options.conversations : int(options.sessions), options.conversation_bytes, !options.legacy_conversations);
+        lane_conversations = std::make_unique<kvmem_lane_conversations>(lanes, options.legacy_conversations ? options.conversations : int(options.sessions), options.conversation_bytes, !options.legacy_conversations, options.cache_min_tokens);
         LOG_INF("srv    KVMEM retention_groups=%u snapshot_records<=max(2*groups,lanes) lanes=%d cpu_budget_per_store=%llu\n",
                 options.legacy_conversations ? unsigned(options.conversations) : options.sessions, options.parallel, (unsigned long long)st.kparams.cpu_bytes);
     }

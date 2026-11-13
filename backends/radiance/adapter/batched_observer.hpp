@@ -62,6 +62,10 @@ class BatchedStatisticsObserver final : public rad::StepObserver {
                 {"parking_sessions",cache_->parking.size()},{"cache_park_errors",cache_->park_errors},
                 {"finishing_sessions",cache_->finishing.size()},
                 {"history_forks",cache_->forks},
+                {"cache_min_tokens",options_.cache_min_tokens},{"cache_candidate_tokens",cache_->candidate_tokens},
+                {"cache_below_minimum",cache_->below_minimum},
+                {"history_retention_evictions",cache_->retention_evictions},
+                {"history_capacity_evictions",cache_->evictions-cache_->retention_evictions},
                 {"io_pending_sequences",std::count_if(slots_.begin(),slots_.end(),[](const Slot& s){return s.observer->pending_io();})},
                 {"history_evictions",cache_->evictions},{"host_payload_bytes",cache_->payload ? cache_->payload->charged_bytes() : 0},
                 {"host_payload_budget_bytes",options_.host_bytes},{"disk_payload_bytes",cache_->payload ? cache_->payload->disk_bytes() : 0},
@@ -152,7 +156,7 @@ public:
             try {
                 pending->ticket.wait();pending->work->prefix->finish_park();pending->saved.prefix=std::move(pending->work->prefix);
                 const auto session=pending->saved.session.id;
-                if(!cache_->publish(std::move(pending->saved),options_.cache_sessions,options_.effective_cache_records(),true)) {
+                if(!cache_->publish(std::move(pending->saved),options_.cache_sessions,options_.effective_cache_records(),options_.cache_min_tokens,true)) {
                     if(cache_->bytes<bytes)throw std::runtime_error("invalid pending cache charge");
                     cache_->bytes-=bytes;
                     RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=directory_capacity source_preserved=1",(unsigned long long)session);

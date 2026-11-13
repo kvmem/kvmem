@@ -253,6 +253,37 @@ class PlanTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'MIN_GAP=0'):
                 self.plan(CheckpointExtraRecomputeTokens=16)
 
+    def test_cache_minimum_preserves_disabled_argv(self):
+        self.assertEqual(self.plan()['argv'], self.plan(CacheMinTokens=0)['argv'])
+        self.assertEqual(self.plan()['effective_parameters']['CacheMinTokens'], 0)
+        for value in (1, 4096, 2147483647):
+            plan = self.plan(CacheMinTokens=value)
+            index = plan['argv'].index('--kvmem-cache-min-tokens')
+            self.assertEqual(plan['argv'][index + 1], str(value))
+            self.assertEqual(plan['effective_parameters']['CacheMinTokens'], value)
+            plan['target_platform'] = 'linux'
+            self.assertIn('--kvmem-cache-min-tokens', render_script(plan, '/tmp/worker.lock'))
+        for value in (-1, 2147483648, True, 1.5, '4096'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.plan(CacheMinTokens=value)
+        for backend in ('llamacpp', 'polystrata', 'radiance'):
+            with self.subTest(backend=backend):
+                normalize({'schema_version': 1, 'parameters': {'Backend': backend, 'CacheMinTokens': 4096}},
+                          capabilities()['backends'])
+        self.assertEqual(self.plan('llamacpp')['argv'], self.plan('llamacpp', CacheMinTokens=0)['argv'])
+        argv=self.plan('llamacpp', CacheMinTokens=4096)['argv']
+        self.assertEqual(argv[argv.index('--kvmem-cache-min-tokens')+1], '4096')
+        with self.assertRaises(ValueError):
+            self.plan(WorkerArgs=['--kvmem-cache-min-tokens', '4096'])
+
+    def test_cache_minimum_requires_worker_support_only_when_enabled(self):
+        for value in (None, False, True, 0, -1, '1', 1.0):
+            contract = {'cache_admission_revision': value}
+            require_launch_features(contract, {'CacheMinTokens': 0})
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'CacheMinTokens'):
+                require_launch_features(contract, {'CacheMinTokens': 4096})
+        require_launch_features({'cache_admission_revision': 1}, {'CacheMinTokens': 4096})
+
     def test_checkpoint_recompute_requires_worker_support_only_when_enabled(self):
         for value in (None, False, True, 0, -1, '1', 1.0):
             contract = {'checkpoint_recompute_revision': value}
@@ -316,6 +347,7 @@ class PlanTest(unittest.TestCase):
         cases = [('ninfer', {}), ('llamacpp', {}),
                  ('llamacpp', dict(Lora=str(self.models['llamacpp']), LoraScale=-0.5)),
                  ('ninfer', dict(CheckpointExtraRecomputeTokens=16)),
+                 ('ninfer', dict(CacheMinTokens=4096)),
                  ('ninfer', dict(TensorParallel=True, TensorSplit=[3.5, 1],
                      Gpu=GPU+',GPU-00000000-0000-0000-0000-000000000002')),
                  ('ninfer', dict(SpeculativeMode='mtp', DraftTokens=4, DraftPolicy='adaptive',

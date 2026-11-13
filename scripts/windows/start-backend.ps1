@@ -47,6 +47,7 @@ param(
     [ValidateRange(4, 64)][int]$NgramMinMatch = 12,
     [ValidateRange(1, 8)][int]$Concurrency = 1,
     [ValidateRange(1, 16)][int]$RetainedSessions = 4,
+    [ValidateRange(0, 2147483647)][int]$CacheMinTokens = 0,
     [switch]$Vision,
     [ValidateSet('resident', 'cpu')][string]$VisionResidency = 'resident',
     [ValidateRange(0, 2147483647)][int]$CpuVisionIdleSeconds = 300,
@@ -241,7 +242,7 @@ if ($Backend -eq 'ninfer' -and $ThinkingMode -eq 'off' -and
     ($ReasoningEffort -or @($WorkerArgs | Where-Object { $_ -match '^--default-reasoning-effort(=|$)' }).Count)) {
     throw 'ReasoningEffort conflicts with ThinkingMode off'
 }
-if (@($WorkerArgs | Where-Object { $_ -match '^--(no-)?kvmem($|-(budget|gen-reserve|host-mib|sessions|sink-tokens|recent-tokens|lrfu|lrfu-lambda|lrfu-top-frac|score-agg|query-scorer|graph-alpha|recall-strategy|layerwise-[a-z-]+)(=|$))' }).Count) {
+if (@($WorkerArgs | Where-Object { $_ -match '^--(no-)?kvmem($|-(budget|gen-reserve|host-mib|sessions|cache-min-tokens|sink-tokens|recent-tokens|lrfu|lrfu-lambda|lrfu-top-frac|score-agg|query-scorer|graph-alpha|recall-strategy|layerwise-[a-z-]+)(=|$))' }).Count) {
     throw 'KVMem common options are owned by the launcher; use its named parameters instead of WorkerArgs'
 }
 if (!$Worker) {
@@ -410,6 +411,7 @@ if ($LogLevel) {
 if ($ThinkingMode -eq 'off') { $nativeArgs += $(if ($Backend -eq 'ninfer') { '--no-thinking' } else { '--no-think' }) }
 if ($ThinkingMode -eq 'on') { $nativeArgs += '--enable-thinking' }
 $nativeArgs += '--kvmem'
+if ($CacheMinTokens -gt 0) { $nativeArgs += @('--kvmem-cache-min-tokens', "$CacheMinTokens") }
 if ($Backend -eq 'llamacpp') { $nativeArgs += @('--kvmem-block-tokens', "$resolvedBlock") }
 if ($Backend -eq 'llamacpp') { $nativeArgs += $nativeArgsSpec }
 if ($DiskPath) { $nativeArgs += @('--kvmem-disk-path', $DiskPath, '--kvmem-disk-mib', "$DiskMiB") }
@@ -420,6 +422,7 @@ $nativeArgs += $WorkerArgs
 $effective=@{};foreach($entry in $PSBoundParameters.GetEnumerator()) {if($entry.Key -ne 'ApiKey'){$effective[$entry.Key]=$entry.Value}}
 foreach($name in @('Backend','Model','Worker','Gpu','Concurrency','KvType','Budget','Reserve','HostMiB','RetainedSessions','MaxTokens','Context','Prefill','Vision','VisionResidency','NgramDrafts','TensorParallel')) {$effective[$name]=Get-Variable -Name $name -ValueOnly}
 $effective.BlockTokens=$resolvedBlock;$effective.SpeculativeMode=$SpeculativeMode;$effective.DraftTokens=$MtpDrafts
+$effective.CacheMinTokens=$CacheMinTokens
 $effective.DraftPolicy=if($AdaptiveMtp){'adaptive'}else{'fixed'}
 $effective.Vision=[bool]$Vision;$effective.TensorParallel=[bool]$TensorParallel;$effective.AdaptiveMtp=[bool]$AdaptiveMtp
 if ($DiskPath) { $effective.DiskPath=$DiskPath; $effective.DiskMiB=$DiskMiB }
@@ -442,7 +445,7 @@ if ($DryRun) {
     return
 }
 Invoke-KVMemRecallWorkerCheck $Worker $effective $root
-if ($Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0) {
+if ($Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0 -or $CacheMinTokens -gt 0) {
     $probeInfo = New-KVMemProcessInfo $Worker @('--kvmem-capabilities')
     $probeInfo.RedirectStandardOutput = $true
     $probeInfo.RedirectStandardError = $true
@@ -466,6 +469,11 @@ if ($Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0) {
             throw 'Worker does not support KVMem heads tensor parallelism; update the complete NInfer package'
         }
         $checkpointRevision = if ($contract) { $contract.PSObject.Properties['checkpoint_recompute_revision'] } else { $null }
+        $admissionRevision = if ($contract) { $contract.PSObject.Properties['cache_admission_revision'] } else { $null }
+        if ($CacheMinTokens -gt 0 -and (!$admissionRevision -or
+            ($admissionRevision.Value -isnot [int] -and $admissionRevision.Value -isnot [long]) -or $admissionRevision.Value -lt 1)) {
+            throw 'Worker does not support CacheMinTokens; update the complete backend package'
+        }
         if ($CheckpointExtraRecomputeTokens -gt 0 -and (!$checkpointRevision -or
             ($checkpointRevision.Value -isnot [int] -and $checkpointRevision.Value -isnot [long]) -or $checkpointRevision.Value -lt 1)) {
             throw 'Worker does not support checkpoint recompute limits; update the complete NInfer package'

@@ -65,6 +65,10 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  assert.deepEqual(await page.locator('[data-param=Backend] option').evaluateAll(items=>items.map(x=>x.value)),['llamacpp','ninfer','polystrata','radiance']);
  assert.equal(await page.locator('[data-view=config]').isVisible(),true);
  await page.locator('#launch-tab-6').click();
+ const cacheMinimum=page.locator('[data-param=CacheMinTokens]');
+ assert.equal(await cacheMinimum.inputValue(),'0');
+ await cacheMinimum.fill('-1');assert.equal(await cacheMinimum.evaluate(el=>el.checkValidity()),false);
+ await cacheMinimum.fill('4096');assert.equal(await cacheMinimum.evaluate(el=>el.checkValidity()),true);
  const checkpointLimit=page.locator('[data-param=CheckpointExtraRecomputeTokens]');
  assert.equal(await checkpointLimit.inputValue(),'0');
  await checkpointLimit.fill('-1');assert.equal(await checkpointLimit.evaluate(el=>el.checkValidity()),false);
@@ -72,11 +76,17 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  await page.waitForFunction(()=>document.querySelector('[data-draft-state]').textContent.includes('已自动保存'));
  await page.reload();await page.locator('[data-param=Backend]').waitFor();
  assert.equal(await page.locator('[data-param=CheckpointExtraRecomputeTokens]').inputValue(),'16');
+ assert.equal(await page.locator('[data-param=CacheMinTokens]').inputValue(),'4096');
  await page.locator('[data-param=Backend]').selectOption('llamacpp');
  assert.equal(await page.locator('[data-param=CheckpointExtraRecomputeTokens]').count(),0);
+ assert.equal(await page.locator('[data-param=CacheMinTokens]').inputValue(),'0');
+ await page.locator('#launch-tab-6').click();
+ await page.locator('[data-param=CacheMinTokens]').fill('1024');
  await page.locator('[data-param=Backend]').selectOption('ninfer');
  assert.equal(await page.locator('[data-param=CheckpointExtraRecomputeTokens]').inputValue(),'16');
  await page.locator('#launch-tab-6').click();await page.locator('[data-param=CheckpointExtraRecomputeTokens]').fill('0');
+ assert.equal(await page.locator('[data-param=CacheMinTokens]').inputValue(),'4096');
+ await page.locator('[data-param=CacheMinTokens]').fill('0');
  await page.locator('#launch-tab-0').click();
  console.log('PASS: NInfer checkpoint recompute limit validation, persistence and backend isolation');
  if(info.gpus.length){

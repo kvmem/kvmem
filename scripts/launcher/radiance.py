@@ -113,6 +113,7 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
            '--placement','all_vram','--embedding-placement',p['EmbeddingPlacement'],
            '--draft-window',p['DraftPolicy'],'--kvmem','--kvmem-block-tokens','128']
     pair('--kvmem-drafter','off' if mode=='none' else mode)
+    if p['CacheMinTokens']:pair('--kvmem-cache-min-tokens',p['CacheMinTokens'])
     if p.get('Vision'):
         patch,merge=vision_geometry(p['Model'])
         pair('--vision-residency',p['VisionResidency'])

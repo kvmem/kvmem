@@ -30,6 +30,15 @@ int main() {
             check(config.parse(flag, [&](const char *) { return value; }));
         };
         parse_memory(defaults, "--kvmem"); defaults.resolve();
+        for(const char* value:{"0","4095","4096","4097","2147483647"}) {
+            kvmem::CliOptions c;parse_memory(c,"--kvmem-cache-min-tokens",value);
+            if(std::string(value)!="0") {
+                rejects([&]{c.resolve();});parse_memory(c,"--kvmem");
+            }
+            c.resolve();check(c.cache_min_tokens==uint32_t(std::stoul(value)));
+        }
+        for(const char* value:{"-1","1.5","","2147483648"," 4096","4096x"})
+            rejects([&]{kvmem::CliOptions c;parse_memory(c,"--kvmem-cache-min-tokens",value);});
         check(defaults.enabled && defaults.budget == 32768 && defaults.gen_reserve == 1024 &&
               defaults.payload_host_bytes == (16384ULL << 20) && defaults.sessions == 4);
         check(defaults.query_scorer == kvmem::QueryScorer::PageSoftmax && defaults.score_agg == 0 &&

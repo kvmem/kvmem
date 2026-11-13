@@ -87,6 +87,10 @@ def require_launch_features(capabilities, parameters):
     if parameters.get('Lora') and capabilities.get('fixed_lora') is not True:
         raise ValueError('This worker does not support fixed LoRA; update the llama.cpp worker')
     require_recall_features(capabilities, parameters)
+    admission_revision = capabilities.get('cache_admission_revision')
+    if parameters.get('CacheMinTokens', 0) and (
+            type(admission_revision) is not int or admission_revision < 1):
+        raise ValueError('This worker does not support CacheMinTokens; update the complete backend package')
     checkpoint_revision = capabilities.get('checkpoint_recompute_revision')
     if parameters.get('CheckpointExtraRecomputeTokens', 0) and (
             type(checkpoint_revision) is not int or checkpoint_revision < 1):

@@ -1,0 +1,292 @@
+diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
+index 9bbd294..82da2b9 100644
+--- a/apps/cli/options.cpp
++++ b/apps/cli/options.cpp
+@@ -180,6 +180,7 @@ std::string usage_text(const char* argv0) {
+            "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+            "  --kvmem-layerwise-activation-metadata-mib N tape descriptors (default 128)\n"
+            "  --kvmem-host-mib N            canonical native KV RAM quota (default 16384)\n"
++           "  --kvmem-cache-min-tokens N    minimum complete restorable history to retain (default 0, disabled)\n"
+            "  --kvmem-disk-path PATH        native KV/activation spill directory\n"
+            "  --kvmem-disk-mib N            canonical native KV SSD quota (default 0)\n"
+            "  --kvmem-sink-tokens N         kept prefix; layerwise omitted=auto, explicit0=0\n"
+diff --git a/apps/serve/main.cpp b/apps/serve/main.cpp
+index 7f429f1..b99e704 100644
+--- a/apps/serve/main.cpp
++++ b/apps/serve/main.cpp
+@@ -223,6 +223,7 @@ int main(int argc, char** argv) {
+         capabilities["budget_planning_version"] = 1;
+         capabilities["heads_tensor_parallel_revision"] = 1;
+         capabilities["checkpoint_recompute_revision"] = 1;
++        capabilities["cache_admission_revision"] = 1;
+         // Publish this Native implementation's layerwise execution contract.
+         // Runtime tests record their actual coverage separately; public limits
+         // are shared constraints, not a whitelist of test combinations.
+diff --git a/include/ninfer/engine_options.h b/include/ninfer/engine_options.h
+index d3deced..96095c5 100644
+--- a/include/ninfer/engine_options.h
++++ b/include/ninfer/engine_options.h
+@@ -500,6 +500,7 @@ struct KvmemOptions {
+         return sink_tokens < 64 ? 1U : sink_tokens / 64U;
+     }
+     [[nodiscard]] std::uint32_t recent_blocks() const noexcept { return recent_tokens / 64U; }
++    std::uint32_t cache_min_tokens = 0; // complete accepted history, not newly evaluated tokens
+     std::uint32_t retained_sessions = 4; // bounded inactive Host histories, 1..16
+     bool verify_transfers = false;    // correctness diagnostics, off in product runs
+     // Process-local active/idle native KV tier. H bounds resident payload; D
+diff --git a/include/ninfer/observability/resources.h b/include/ninfer/observability/resources.h
+index 3ea6efa..687bfb9 100644
+--- a/include/ninfer/observability/resources.h
++++ b/include/ninfer/observability/resources.h
+@@ -114,6 +114,9 @@ struct KvmemMemorySummary {
+     std::uint64_t statistics_staging_bytes = 0;
+     std::uint32_t mtp_resident_pages = 0;
+     std::uint32_t retained_sessions = 0, active_sessions = 0, retained_sessions_limit = 0;
++    std::uint32_t cache_min_tokens = 0;
++    std::uint64_t cache_below_minimum = 0, cache_candidate_tokens = 0;
++    std::uint64_t history_retention_evictions = 0;
+     std::uint64_t history_hits = 0, history_misses = 0, history_evictions = 0;
+     std::uint64_t disk_hits = 0, disk_writes = 0, disk_errors = 0;
+     std::uint64_t active_payload_reservation_bytes = 0;
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index 98a40e7..d5d7862 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -1303,6 +1303,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+         memory.selected_tokens = kvmem_options.selected_tokens;
+         memory.reserve_tokens = kvmem_options.reserve_tokens;
+         memory.retained_sessions_limit = kvmem_options.retained_sessions;
++        memory.cache_min_tokens = kvmem_options.cache_min_tokens;
++        memory.cache_below_minimum = memory_cache_below_minimum;
++        memory.cache_candidate_tokens = memory_cache_candidate_tokens;
++        memory.history_retention_evictions = memory_history_retention_evictions;
+         for (const auto& request : requests)
+             if (request.lifecycle != Lifecycle::Empty) ++memory.active_sessions;
+         memory.host_payload_budget_bytes = kvmem_options.host_bytes;
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index 211c977..f13380b 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -1350,6 +1350,8 @@ public:
+     // identity decide reuse; client affinity keys never identify these entries.
+     std::vector<std::optional<KvmemWindowState>> memory_histories{16};
+     std::uint64_t memory_history_hits = 0, memory_history_misses = 0, memory_history_evictions = 0;
++    std::uint64_t memory_cache_below_minimum = 0, memory_cache_candidate_tokens = 0;
++    std::uint64_t memory_history_retention_evictions = 0;
+ 
+     std::optional<Tensor> score_hidden;
+     Tensor sampling_config;
+@@ -2292,6 +2294,7 @@ private:
+     void reserve_memory_history(SequenceState& sequence, RequestControl& request,
+                                 uint64_t additional = 0, bool optional = false);
+     bool restore_memory_history(SequenceState& sequence, RequestControl::Prefill& staged);
++    bool admit_retained_history(std::uint32_t frontier) noexcept;
+     void retain_memory_history(SequenceState& sequence, const RequestControl& request,
+                                bool completed = false) noexcept;
+     void prepare_memory_statistics(SequenceState& sequence, std::uint32_t query_begin,
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index d20c0a7..867f71a 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -2970,6 +2970,9 @@ void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const Request
+     const auto frontier = sequence.execution_frontier;
+     if (sequence.text_kv_valid != frontier || !sequence.tail_hidden_valid ||
+         sequence.state.fork_pending || (backend_kv_pages && sequence.mtp_kv_valid != frontier)) return;
++    // Endpoint export is optional cross-request retention. Keep Query/replay
++    // and accepted-state cleanup above, but avoid a copy for a short history.
++    if (!kvmem::admit_content_history(frontier, kvmem_options.cache_min_tokens)) return;
+     if (!sequence.window.coverage.policy().extra_recompute_tokens &&
+         !sequence.window.query_replay_active &&
+         memory_checkpoint(sequence.window, KvmemCheckpointKind::PromptTail)) {
+@@ -4147,6 +4150,16 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
+     }
+ }
+ 
++bool ProgramImpl::admit_retained_history(std::uint32_t frontier) noexcept {
++    memory_cache_candidate_tokens = frontier;
++    if (kvmem::admit_content_history(frontier, kvmem_options.cache_min_tokens)) return true;
++    ++memory_cache_below_minimum;
++    if (kvmem_options.verify_transfers) std::fprintf(stderr,
++        "KVMEM_SNAPSHOT_SKIP reason=below_min_tokens candidate_tokens=%u minimum_tokens=%u\n",
++        frontier, kvmem_options.cache_min_tokens);
++    return false;
++}
++
+ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestControl& request,
+                                        bool completed) noexcept {
+     // A cancelled request can retain an earlier complete checkpoint, but cannot
+@@ -4158,10 +4171,21 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+         catch (...) {sequence.window.layerwise_request->abort();}
+         sequence.window.layerwise_request.reset();
+     }
+-    if (sequence.window.layerwise_rewrite_pending || !kvmem_window_tokens || !request.allow_memory_reuse || !sequence.window.stamp.valid ||
+-        (sequence.window.checkpoints.empty() && sequence.window.coverage.size()==0)) return;
++    if (sequence.window.layerwise_rewrite_pending || !kvmem_window_tokens || !request.allow_memory_reuse || !sequence.window.stamp.valid) return;
+     auto& window = sequence.window;
+     if (!window.update_session_index) return;
++    // The endpoint capture may have been skipped solely because this complete
++    // accepted state is short. Report its actual logical boundary once, before
++    // pruning or allocating any optional retention metadata. Cancellation uses
++    // the surviving checkpoint frontier below, never pending execution rows.
++    if (completed && request.lifecycle == Lifecycle::Finishable &&
++        sequence.text_kv_valid == sequence.execution_frontier && sequence.tail_hidden_valid &&
++        !sequence.state.fork_pending && (!backend_kv_pages || sequence.mtp_kv_valid == sequence.execution_frontier) &&
++        !kvmem::admit_content_history(sequence.execution_frontier, kvmem_options.cache_min_tokens)) {
++        (void)admit_retained_history(sequence.execution_frontier);
++        return;
++    }
++    if (window.checkpoints.empty() && window.coverage.size()==0) return;
+     window.query_tokens=0;
+     window.query_capture=false;
+     for(auto& rows:window.query_rows) std::vector<float>().swap(rows);
+@@ -4220,6 +4244,7 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+     for (const auto kind : checkpoint_kinds(window))
+         if (const auto* checkpoint = memory_checkpoint(window, kind))
+             frontier = std::max(frontier, static_cast<std::uint32_t>(checkpoint->prefix.size()));
++    if (!admit_retained_history(frontier)) return;
+     const auto pages = kv_pages_for_tokens(frontier);
+     if (!pages || pages > window.archive.size() || pages > window.host_versions.size() ||
+         !window.archive.front()) return;
+@@ -4274,7 +4299,9 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+         if(kvmem_options.verify_transfers) std::fprintf(stderr,"KVMEM_SNAPSHOT_PUBLISH admitted=0 reason=%u\n",unsigned(destination.reason));
+         return;
+     }
+-    if(memory_histories[*destination] && slots[*destination].occupied) ++memory_history_evictions;
++    if(memory_histories[*destination] && slots[*destination].occupied) {
++        ++memory_history_evictions; ++memory_history_retention_evictions;
++    }
+     // Capture already completed every Host copy. The active state's later
+     // writes and unpublished output never become this checkpoint's contents.
+     for (auto& record : window.archive) record.seal();
+@@ -4291,7 +4318,7 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+     memory_histories[*destination].emplace(std::move(window));
+     for(const auto index:superseded) if(index!=*destination) memory_histories[index].reset();
+     for(const auto index:destination.retired_slots) if(index!=*destination && memory_histories[index]) {
+-        memory_histories[index].reset(); ++memory_history_evictions;
++        memory_histories[index].reset(); ++memory_history_evictions; ++memory_history_retention_evictions;
+     }
+     if(kvmem_options.verify_transfers) std::fprintf(stderr,"KVMEM_SNAPSHOT_PUBLISH admitted=1 reason=%u slot=%zu group=%llu\n",
+         unsigned(destination.reason),*destination,(unsigned long long)memory_histories[*destination]->cache_group);
+diff --git a/src/product/kvmem_cli_options.h b/src/product/kvmem_cli_options.h
+index f3d225c..71d1fc0 100644
+--- a/src/product/kvmem_cli_options.h
++++ b/src/product/kvmem_cli_options.h
+@@ -39,6 +39,7 @@ inline void apply_kvmem_cli_options(const kvmem::CliOptions& source,KvmemOptions
+     target.sink_tokens=source.sink_tokens;
+     target.recent_tokens=source.recent_tokens;
+     target.retained_sessions=source.sessions;
++    target.cache_min_tokens=source.cache_min_tokens;
+     target.lrfu=source.lrfu;
+     target.lrfu_lambda=source.lrfu_lambda;
+     target.lrfu_top_fraction=source.lrfu_top_fraction;
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index 6101507..1a6ccd6 100644
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -411,7 +411,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+     if ((options.kvmem.lrfu || options.kvmem.score_agg_max || options.kvmem.query_meanq_cosine || options.kvmem.graph_alpha != 0.2) && !options.kvmem.selected_tokens)
+         throw std::invalid_argument("KVMem retrieval options require selected_tokens");
+     if (!options.kvmem.selected_tokens &&
+-        (options.kvmem.reserve_tokens || options.kvmem.host_bytes || options.kvmem.verify_transfers ||
++        (options.kvmem.reserve_tokens || options.kvmem.host_bytes || options.kvmem.verify_transfers || options.kvmem.cache_min_tokens ||
+          !options.kvmem.disk_path.empty() || options.kvmem.disk_bytes)) {
+         throw std::invalid_argument("KVMem auxiliary budgets require selected_tokens");
+     }
+diff --git a/src/serve/http_server.cpp b/src/serve/http_server.cpp
+index 5a3bfe2..9a5a7a6 100644
+--- a/src/serve/http_server.cpp
++++ b/src/serve/http_server.cpp
+@@ -1184,6 +1184,7 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
+             {"ngram_min_match", options.speculative.ngram_min_match},
+             {"max_active_requests", options.max_concurrency},
+             {"retained_sessions_limit", options.kvmem.retained_sessions},
++            {"cache_min_tokens", options.kvmem.cache_min_tokens},
+             {"multi_gpu_mode", execution.devices.size() > 1 ? "layer" : "single"},
+             {"shared_host_history", true},
+             {"disk_budget_bytes", options.kvmem.disk_bytes},
+diff --git a/src/serve/kvmem_status_json.h b/src/serve/kvmem_status_json.h
+index 89bf625..8811d7c 100644
+--- a/src/serve/kvmem_status_json.h
++++ b/src/serve/kvmem_status_json.h
+@@ -7,6 +7,10 @@ namespace ninfer::serve {
+ inline nlohmann::json kvmem_status_json(const KvmemMemorySummary& m) {
+     nlohmann::json result = {{"enabled", m.enabled}, {"cache_semantics_revision",2},
+         {"retained_sessions_unit","internal_content_groups"},
++        {"cache_min_tokens",m.cache_min_tokens}, {"cache_below_minimum",m.cache_below_minimum},
++        {"cache_candidate_tokens",m.cache_candidate_tokens},
++        {"history_retention_evictions",m.history_retention_evictions},
++        {"history_capacity_evictions",m.history_evictions-m.history_retention_evictions},
+         {"retained_groups",m.retained_sessions}, {"retained_groups_limit",m.retained_sessions_limit},
+         {"retained_snapshot_limit",m.checkpoint_target ? std::max<uint64_t>(16,m.checkpoint_target+1) : std::min<uint64_t>(16,m.retained_sessions_limit)}, {"selected_tokens", m.selected_tokens},
+         {"reserve_tokens", m.reserve_tokens}, {"host_payload_budget_bytes", m.host_payload_budget_bytes},
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 5be3a34..31edd21 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -148,6 +148,7 @@ std::string serve_usage_text(const char* argv0) {
+            "                                DFlash2 raises this to its draft ring (usually 2048);\n"
+            "                                B must hold sink plus the effective recent span\n"
+            "  --kvmem-sessions N            inactive histories, 1..16 (default 4); active requests excluded\n"
++           "  --kvmem-cache-min-tokens N    minimum complete restorable history to retain (default 0, disabled)\n"
+            "  --kvmem-disk-path PATH        Ephemeral active/idle KV spill directory\n"
+            "  --kvmem-disk-mib N            Shared SSD payload quota D, MiB; 0 = off (default)\n"
+            "                                KVMem uses B+R device tokens and its own\n"
+@@ -2176,7 +2177,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+         // --no-prefix-reuse still controls request reuse. Only the native catalog
+         // is disabled here; KVMem owns the current session's trusted checkpoint.
+         options.context_cache.enabled = false;
+-    } else if (options.kvmem.reserve_tokens || options.kvmem.host_bytes || options.kvmem.verify_transfers ||
++    } else if (options.kvmem.reserve_tokens || options.kvmem.host_bytes || options.kvmem.verify_transfers || options.kvmem.cache_min_tokens ||
+          !options.kvmem.disk_path.empty() || options.kvmem.disk_bytes) {
+         throw std::invalid_argument("KVMem auxiliary options require --kvmem-budget");
+     }
+diff --git a/tests/test_cli_options.cpp b/tests/test_cli_options.cpp
+index d6ecf24..851414e 100644
+--- a/tests/test_cli_options.cpp
++++ b/tests/test_cli_options.cpp
+@@ -34,6 +34,19 @@ int check(bool condition, const char* message) {
+ 
+ int run_tests() {
+     int failures = 0;
++    failures += check(parse({"ninfer", "model.ninfer", "--prompt", "x"}).kvmem.cache_min_tokens == 0,
++                      "cache admission must default to disabled");
++    for (const auto value : {"0", "4096", "2147483647"}) {
++        const auto options = parse({"ninfer", "model.ninfer", "--prompt", "x", "--kvmem",
++                                   "--max-context", "65536", "--kvmem-cache-min-tokens", value});
++        failures += check(options.kvmem.cache_min_tokens == std::stoul(value), "CLI cache minimum was lost");
++    }
++    for (const auto value : {"-1", "4k", "1.5", "2147483648", ""}) {
++        failures += check(rejects([&] {
++            (void)parse({"ninfer", "model.ninfer", "--prompt", "x", "--kvmem",
++                         "--max-context", "65536", "--kvmem-cache-min-tokens", value});
++        }), "invalid CLI cache minimum was accepted");
++    }
+     const auto layerwise_args=[] {
+         return std::vector<std::string>{"ninfer-cli","model.ninfer","--prompt","x",
+             "--max-context","2048","--kvmem-budget","128","--kvmem-gen-reserve","256",
+diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
+index 0c3b6e9..e69461f 100644
+--- a/tests/test_serve_options.cpp
++++ b/tests/test_serve_options.cpp
+@@ -40,6 +40,21 @@ ServeOptions parse(std::vector<std::string> arguments) {
+ 
+ int run_serve_option_tests() {
+     int failures = 0;
++    failures += check(parse({"ninfer-serve", "model.ninfer"}).kvmem.cache_min_tokens == 0,
++                      "cache admission must default to disabled");
++    for (const auto value : {"0", "4095", "4096", "4097", "2147483647"}) {
++        const auto options = parse({"ninfer-serve", "model.ninfer", "--kvmem", "--max-context", "65536",
++                                   "--kvmem-cache-min-tokens", value});
++        failures += check(options.kvmem.cache_min_tokens == std::stoul(value),
++                          "cache minimum was lost or aligned");
++    }
++    for (const auto value : {"-1", "4k", "1.5", "2147483648", ""}) {
++        bool rejected = false;
++        try { (void)parse({"ninfer-serve", "model.ninfer", "--kvmem", "--max-context", "65536",
++                           "--kvmem-cache-min-tokens", value}); }
++        catch (const std::invalid_argument&) { rejected = true; }
++        failures += check(rejected, "invalid cache minimum was accepted");
++    }
+     failures += check(parse({"ninfer-serve", "model.ninfer"}).kvmem.ngram_arbitration,
+                       "ngram arbitration must default to on");
+     for (const auto value : {"on", "off"}) {

@@ -51,9 +51,18 @@ struct kvmem_lane_conversations_test_access {
     static auto& entry(kvmem_lane_conversations& c, int id) { return c.entries_.at(id); }
     static void seed_version(kvmem_lane_conversations& c,int id,uint64_t group,uint64_t used) {
         auto& held=c.entries_[id];held.cache_group=group;held.used=used;
+        c.next_id_=std::max(c.next_id_,id+1);
         held.committed.match.rows=held.committed.match.live_row=128;
     }
     static void retain(kvmem_lane_conversations& c,int lane) { c.enforce_sessions(lane); }
+    static void complete(kvmem_lane_conversations& c,const kvmem_lane_conversations::operation& op,int tokens) {
+        c.entries_.at(op.outgoing).lane=-1;c.entries_.at(op.outgoing).switching=false;
+        auto& held=c.entries_.at(op.id);held.lane=op.lane;held.busy=false;
+        held.committed.match.rows=held.committed.match.live_row=tokens;
+        held.committed.match.ckpt_rows={tokens};c.resident_[op.lane]=op.id;
+        c.enforce_sessions(op.lane);
+    }
+    static void discard_short(kvmem_lane_conversations& c) {c.discard_short_parked();}
     static void classify(kvmem_lane_conversations& c,int id) { c.classify_content_group_locked(id,c.entries_.at(id)); }
     static auto payload_bytes(const kvmem_conversation& c) { return kvmem_lane_conversations::payload_bytes(c); }
     static void cpu_parked(kvmem_lane_conversations& c,int id) { c.entries_[id].cpu_arena_parked=true; }
@@ -114,6 +123,34 @@ int main() {
     check_fork_coverage(live);
 
     using access = kvmem_lane_conversations_test_access;
+    for(int frontier:{4095,4096,4097}) {
+        ServerState state;kvmem_lane_conversations catalog({&state},1,0,true,4096);
+        for(int id:{0,1}) {
+            access::seed_version(catalog,id,1,id+1);
+            auto& held=access::entry(catalog,id);
+            held.committed.match.rows=held.committed.match.live_row=100000;
+            held.committed.match.ckpt_rows={2048,100000};
+            held.committed.prompt=std::make_shared<kvmem_prompt>(std::vector<llama_token>(100000,11));
+        }
+        // A full directory must admit the working request without consuming
+        // an old slot before its accepted/restorable length is known.
+        kvmem_prompt request(std::vector<llama_token>(64,22));kvmem_lane_conversations::operation op;
+        assert(catalog.select(request,"",false,{false},true,op)==0);
+        assert(op.added && access::exists(catalog,0) && access::exists(catalog,1));
+        access::complete(catalog,op,frontier);
+        if(frontier<4096) {
+            assert(catalog.status()["history_retention_evictions"]==0);
+            assert(catalog.status()["retained_snapshot_count"]==2);
+            assert(access::exists(catalog,0) && access::exists(catalog,1));
+            auto follow=std::vector<llama_token>(100000,11);follow.push_back(12);
+            assert(catalog.preview(kvmem_prompt(follow),"",false,{})==100000);
+            // Working short prefixes remain readable; a detached temporary
+            // source lives only until its outstanding reader is released.
+            auto& short_source=access::entry(catalog,op.id);short_source.lane=-1;short_source.refs=1;
+            access::discard_short(catalog);assert(access::exists(catalog,op.id));
+            short_source.refs=0;access::discard_short(catalog);assert(!access::exists(catalog,op.id));
+        } else assert(catalog.status()["history_retention_evictions"]==2);
+    }
     for(bool exact_tip:{false,true}) {
         ServerState state;kvmem_lane_conversations catalog({&state},8,0,true);
         auto& source=access::entry(catalog,0);

@@ -49,8 +49,8 @@ public:
         int id_ = -1;
     };
     kvmem_lane_conversations(const std::vector<ServerState *> & lanes, int count, uint64_t bytes,
-                            bool inactive_limit = false)
-        : lanes_(lanes), resident_(lanes.size()), max_(count), inactive_limit_(inactive_limit), bytes_max_(bytes) {
+                            bool inactive_limit = false, uint32_t minimum_tokens = 0)
+        : lanes_(lanes), resident_(lanes.size()), max_(count), inactive_limit_(inactive_limit), bytes_max_(bytes), minimum_tokens_(minimum_tokens) {
         snapshot_slots_ = std::max(lanes.size(), size_t(std::max(1,count))*2);
         if (!lanes.empty()) cpu_arena_per_store_ = lanes.front()->kparams.cpu_bytes;
         const auto arena_stores = uint64_t(snapshot_slots_) + uint64_t(lanes.size());
@@ -120,7 +120,8 @@ public:
         if (!resident_reuse) {
             for (const auto & item : entries_) {
                 const auto & held = item.second;
-                if (held.committed.match.rows == 0 && !protected_entry(held) && eligible(held, busy)) {
+                if ((!held.committed.match.rows || (minimum_tokens_ && !retained(held) && (!fork || item.first!=source))) &&
+                    !protected_entry(held) && eligible(held, busy)) {
                     // A resident target cannot be rebound on the source lane.
                     // When capacity permits, allocate a detached branch instead.
                     if (fork && held.lane >= 0 &&
@@ -129,7 +130,7 @@ public:
                 }
             }
         }
-        if (id < 0 && !resident_reuse && entries_.size() >= snapshot_slots_) {
+        if (id < 0 && !resident_reuse && !minimum_tokens_ && entries_.size() >= snapshot_slots_) {
             // Queued previews are hints, not capacity reservations. select()
             // replans and media_ready() rechecks any evicted prefix. Reclaim
             // idle capacity without privileging any client-supplied label.
@@ -192,17 +193,23 @@ public:
         entry * incoming;
         entry * outgoing;
         entry * fork_source = nullptr;
+        bool discard_outgoing = false;
         {
             std::lock_guard<std::mutex> lock(mu_);
             incoming = &entries_.at(op.id);
             outgoing = &entries_.at(op.outgoing);
             if (op.source >= 0) fork_source = &entries_.at(op.source);
+            discard_outgoing=minimum_tokens_ && op.id!=op.outgoing && op.source!=op.outgoing &&
+                !outgoing->refs && !retained(*outgoing);
         }
         // source_reserved prevents erasure while fork/I/O runs without mu_.
         // All map lookups above must remain under mu_, including the source.
         // Reserve independently from raw Host/Disk payload quotas, before any
         // source-preserving native fork or fresh runtime constructor allocates.
         cpu_arena_reservation arena_reservation(*this, op);
+        // Discard an ineligible outgoing working binding before optional
+        // parking/spill. A fork's leased source must survive until completion.
+        if(discard_outgoing)llama_driver_clear(st);
         const auto fork_started = std::chrono::steady_clock::now();
         uint64_t fork_host_bytes = 0;
         if (op.resident_reuse) {
@@ -276,7 +283,8 @@ public:
         incoming->lane = op.lane;
         resident_[op.lane] = op.id;
         op.attached = true;
-        if (op.fresh && !op.added && (!incoming->client_id.empty() || incoming->committed.match.rows > 0)) ++evictions_;
+        if (op.fresh && !op.added && (!incoming->client_id.empty() || incoming->committed.match.rows > 0) &&
+            (!minimum_tokens_ || retained(*incoming))) ++evictions_;
         incoming->client_id.swap(client_id);
         incoming->native_bytes = incoming_native;
         incoming->attachment_bytes = 0;
@@ -287,7 +295,7 @@ public:
             outgoing->committed.input_end=input_end;
             outgoing->bytes = payload_bytes(outgoing->payload) + llama_kvmem_store_bundle_bytes(outgoing->parked.get());
             outgoing->native_bytes = llama_kvmem_store_bundle_payload_bytes(outgoing->parked.get());
-            if (disk_ && bytes_max_ && bytes_locked() > bytes_max_) {
+            if (retained(*outgoing) && disk_ && bytes_max_ && bytes_locked() > bytes_max_) {
                 // switching protects this owner while its lane thread performs
                 // I/O outside the catalog lock and outside other GPU lanes.
                 lock.unlock();
@@ -312,6 +320,7 @@ public:
         }
         arena_reservation.finish_locked();
         op.ready = true;
+        discard_short_parked();
         kvmem_diag("KVMEM_LANE_STORE lane=%d out=%d in=%d fresh=%d restaged=%d stores=%zu\n",
                 op.lane, op.outgoing, op.id, (int)op.fresh, (int)restaged, entries_.size());
     }
@@ -366,6 +375,7 @@ public:
                     if (op.source_pinned) --source->second.refs;
                 }
                 op.source_reserved = op.source_pinned = false;
+                owner.discard_short_parked();
             }
             ~source_guard() {
                 if (!op.source_reserved && !op.source_pinned) return;
@@ -397,7 +407,9 @@ public:
             held.native_bytes = native;
             held.reserved_bytes = 0;
             held.used = ++clock_;
-            classify_content_group_locked(active,held);
+            candidate_tokens_=restorable_tokens(held.committed);
+            if(retained(held))classify_content_group_locked(active,held);
+            else if(minimum_tokens_ && held.committed.match.rows>0)++below_minimum_;
             if (!op.attached && op.added) entries_.erase(op.id);
             else entries_.at(op.id).busy = false;
             held.switching = false;
@@ -457,8 +469,8 @@ public:
         std::set<uint64_t> groups;
         for (const auto & item : entries_) {
             active += item.second.busy ? 1 : 0;
-            retained += !item.second.busy && item.second.committed.match.rows > 0 ? 1 : 0;
-            if(item.second.committed.match.rows>0)groups.insert(item.second.cache_group);
+            retained += !item.second.busy && this->retained(item.second) ? 1 : 0;
+            if(this->retained(item.second))groups.insert(item.second.cache_group);
         }
         json result = {{"count", entries_.size()}, {"max", max_}, {"bytes", bytes_locked()},
             {"active_sessions", active}, {"retained_sessions", groups.size()},
@@ -486,6 +498,11 @@ public:
         result["content_cache_revision"] = 1;
         result["peak_admitted_requests"] = peak_admitted_requests_;
         result["cache_semantics_revision"] = 2;
+        result["cache_min_tokens"] = minimum_tokens_;
+        result["cache_candidate_tokens"] = candidate_tokens_;
+        result["cache_below_minimum"] = below_minimum_;
+        result["history_retention_evictions"] = retention_evictions_;
+        result["history_capacity_evictions"] = evictions_-retention_evictions_;
         result["snapshot_fork_host_bytes_scope"] = "logical_host_including_shared_payload";
         result["resident_reuses"] = resident_reuses_;
         result["snapshot_fork_us"] = snapshot_fork_us_;
@@ -525,6 +542,26 @@ private:
     uint64_t cpu_arena_per_store_ = 0, cpu_arena_budget_ = 0;
     uint64_t cpu_arena_reserved_stores_ = 0, cpu_arena_reservation_failures_ = 0;
     uint64_t next_group_ = 1;
+    uint32_t minimum_tokens_ = 0;
+    uint64_t candidate_tokens_ = 0, below_minimum_ = 0, retention_evictions_ = 0;
+    static uint64_t restorable_tokens(const snapshot& value) {
+        int frontier=0;
+        for(const int row:value.match.ckpt_rows)
+            if(row<=value.match.live_row && row<=value.match.rows)frontier=std::max(frontier,row);
+        return uint64_t(frontier);
+    }
+    bool retained(const entry& held) const {
+        return held.committed.match.rows>0 && (!minimum_tokens_ ||
+            kvmem::admit_content_history(restorable_tokens(held.committed),minimum_tokens_));
+    }
+    void discard_short_parked() {
+        if(!minimum_tokens_)return;
+        for(auto it=entries_.begin();it!=entries_.end();) {
+            const auto& held=it->second;
+            if(held.lane<0 && !held.busy && !held.switching && !protected_entry(held) && !retained(held))it=entries_.erase(it);
+            else ++it;
+        }
+    }
     uint64_t cpu_arena_live_stores_locked() const noexcept {
         uint64_t count = lanes_.size(); // Every lane keeps one configured runtime.
         for (const auto& item : entries_) count += item.second.cpu_arena_parked;
@@ -715,7 +752,7 @@ private:
         struct Group { bool compatible=true,exact=false;size_t common=0; };
         std::map<uint64_t,Group> groups;
         for(const auto& item:entries_) {
-            if(item.first==incoming_id || !item.second.committed.match.rows || !item.second.cache_group)continue;
+            if(item.first==incoming_id || !retained(item.second) || !item.second.cache_group)continue;
             const auto& prior=item.second.committed;
             auto& group=groups[item.second.cache_group];
             if(!prior.prompt || !prior.input_end || prior.input_end>prior.prompt->tokens.size()) {
@@ -741,7 +778,7 @@ private:
     void enforce_sessions(int finishing_lane) {
         const auto incoming_id=resident_.at(size_t(finishing_lane));
         auto& incoming=entries_.at(incoming_id);
-        if(incoming.committed.match.rows>0) {
+        if(retained(incoming)) {
             // The incoming version is already attached, but is excluded from
             // the directory view so the common planner reserves exactly one
             // slot for it. Groups express capacity fairness, never identity.
@@ -757,7 +794,7 @@ private:
                     lane_locks.push_back(std::move(candidate));
                 }
                 ids.push_back(item.first);
-                slots.push_back({item.first!=incoming_id && held.committed.match.rows>0,
+                slots.push_back({item.first!=incoming_id && retained(held),
                     pinned,held.used,nullptr,held.cache_group});
             }
             const auto plan=kvmem::plan_content_group_publication(slots,snapshot_slots_,size_t(max_),incoming.cache_group);
@@ -775,6 +812,7 @@ private:
                         held.native_bytes=llama_kvmem_store_payload_bytes(llama_kvmem_store_current(),false);
                     } else entries_.erase(victim);
                     ++evictions_;
+                    ++retention_evictions_;
                 }
             } else {
                 // Publication is optional. Keep this request's valid native

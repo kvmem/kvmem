@@ -45,6 +45,7 @@ if(!(Test-Path -LiteralPath $python -PathType Leaf)) {
 $worker=(Resolve-Path -LiteralPath $worker).Path;$model=(Resolve-Path -LiteralPath $model).Path;$python=(Resolve-Path -LiteralPath $python).Path
 $arguments=@((Join-Path $Root 'tools/polystrata/server.py'),'--source',$tree,'--worker',$worker,'--model',$model,'--gpu',$gpu)
 $arguments+=@('--kvmem-block-tokens',[string](Setting 'BlockTokens' 32))
+if ((Setting 'CacheMinTokens' 0) -gt 0) { $arguments+=@('--cache-min-tokens',[string]$Parameters.CacheMinTokens) }
 $arguments+=@('--thinking-mode',[string](Setting 'ThinkingMode' 'default'))
 if($Parameters.ContainsKey('ThinkingBudget')) { $arguments+=@('--thinking-budget',[string]$Parameters.ThinkingBudget) }
 if(Setting 'ReasoningEffort' '') { $arguments+=@('--reasoning-effort',$(if($Parameters.ReasoningEffort -eq 'xhigh'){'high'}else{[string]$Parameters.ReasoningEffort})) }
@@ -101,6 +102,7 @@ $effective.Backend='polystrata';$effective.Model=$model;$effective.Worker=$worke
 $effective.SpeculativeMode=$mode;$effective.DraftTokens=$count;$effective.DraftPolicy=if($count){'adaptive'}else{'fixed'}
 $effective.KvType=$kv;$effective.Concurrency=[int](Setting 'Concurrency' 1);$effective.BlockTokens=[int](Setting 'BlockTokens' 32)
 $effective.Reserve=[int](Setting 'Reserve' 1024);$effective.Vision=[bool](Setting 'Vision' $false)
+$effective.CacheMinTokens=[int](Setting 'CacheMinTokens' 0)
 $environment=@{CUDA_DEVICE_ORDER='PCI_BUS_ID'}
 if(Setting 'ApiKey' '') { $environment.STRATA_API_KEY=$Parameters.ApiKey }
 if(Setting 'DryRun' $false) {

@@ -69,6 +69,14 @@ int main(int argc, char** argv) {
             else options.recent_tokens = value;
             continue;
         }
+        if(flag=="--kvmem-cache-min-tokens") {
+            if(++i>=argc)throw std::invalid_argument("missing cache minimum token count");
+            uint32_t value=0;const std::string_view text(argv[i]);
+            const auto parsed=std::from_chars(text.data(),text.data()+text.size(),value);
+            if(parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size() || value>INT32_MAX)
+                throw std::invalid_argument("cache minimum must be between 0 and 2147483647");
+            options.cache_min_tokens=value;continue;
+        }
         if (flag == "--kvmem-cache-sessions" || flag == "--kvmem-cache-records") {
             if (++i>=argc) { std::cerr << "missing cache group/record count\n"; return 2; }
             uint32_t value=0; const std::string_view text(argv[i]);
@@ -103,6 +111,8 @@ int main(int argc, char** argv) {
         if (!alpha_set) options.graph_alpha = 0;
         if (!lrfu_set) options.lrfu = true;
     }
+    if(options.cache_min_tokens && !options.budget_tokens)
+        throw std::invalid_argument("cache minimum requires a positive KVMem budget");
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 2; }
     engine_args.push_back(nullptr);
     rad::Config cfg;
@@ -115,6 +125,7 @@ int main(int argc, char** argv) {
         std::cout << "Bounds: --kvmem-query-tokens 512 --kvmem-query-replay-tokens 2048; generation reserve: --kvmem-replay-tokens\n";
         std::cout << "History: --kvmem-lrfu|--no-kvmem-lrfu --kvmem-lrfu-lambda [0,1] --kvmem-lrfu-top-fraction (0,1]\n";
         std::cout << "Retained content groups: --kvmem-cache-sessions N (default 8; 0 disables), sharing --kvmem-host-mib\n";
+        std::cout << "Minimum restorable history: --kvmem-cache-min-tokens N (default 0: disabled)\n";
         std::cout << "Retained records: --kvmem-cache-records N (default 0: follow group limit; each record has up to 3 restore points)\n";
         std::cout << "Optional SSD: --kvmem-disk-path DIR --kvmem-disk-mib MiB (shared native KV and retained state)\n";
         return 0;
