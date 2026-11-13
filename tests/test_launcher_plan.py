@@ -127,6 +127,17 @@ class PlanTest(unittest.TestCase):
             self.assertEqual(args[args.index(flag) + 1], value)
         self.assertIn('--no-kvmem-lrfu', args)
 
+    def test_ninfer_full_query_and_unlimited_replay_defaults(self):
+        for values in ({}, {'QueryMaxTokens': 0, 'QueryReplayMaxTokens': 0}):
+            result = self.plan(**values)
+            for key in ('query_max_tokens', 'query_replay_max_tokens'):
+                self.assertEqual(result['resolved_scoring'][key], 0)
+        for key in ('QueryMaxTokens', 'QueryReplayMaxTokens'):
+            with self.assertRaises(ValueError):
+                self.plan(**{key: -1})
+            with self.assertRaises(ValueError):
+                self.plan('llamacpp', **{key: 0})
+
     def test_speculative_capability_boundaries(self):
         for backend, values in [('ninfer', dict(SpeculativeMode='dflash2', DraftPolicy='adaptive')),
                                 ('llamacpp', dict(SpeculativeMode='mtp', DraftTokens=6)),

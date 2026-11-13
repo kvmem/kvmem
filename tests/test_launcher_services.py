@@ -33,7 +33,10 @@ if '--kvmem-capabilities' in sys.argv:
                          independent_graph_lrfu=True, signed_lrfu_hits=True)))
     raise SystemExit(0)
 print('KVMEM_SCORING scorer=page-softmax agg=mean lrfu=0 lambda=0.5 top_frac=0.9 graph_alpha=0.2', flush=True)
-print('KVMEM_LIMITS query_max_tokens=512 query_replay_max_tokens=2048', flush=True)
+def limit(flag):
+    return sys.argv[sys.argv.index(flag)+1] if flag in sys.argv else '0'
+print('KVMEM_LIMITS query_max_tokens=' + limit('--kvmem-query-max-tokens') +
+      ' query_replay_max_tokens=' + limit('--kvmem-query-replay-max-tokens'), flush=True)
 if '--api-key' in sys.argv: print('credential-test ' + sys.argv[sys.argv.index('--api-key')+1], flush=True)
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):

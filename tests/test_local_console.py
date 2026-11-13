@@ -158,8 +158,8 @@ class ConsoleTests(unittest.TestCase):
             self.assertNotIn('NoLrfu', migrated)
             if no_history: self.assertNotIn('LrfuLambda', migrated)
         for invalid in ({'QueryScorer': 'bad'}, {'GraphAlpha': float('nan')}, {'GraphAlpha': 1.1},
-                        {'ScoreAggregation': 'median'}, {'QueryMaxTokens': 0},
-                        {'QueryReplayMaxTokens': 0}, {'QueryScorer': 'page-softmax', 'Lrfu': False, 'LrfuLambda': .4}):
+                        {'ScoreAggregation': 'median'}, {'QueryMaxTokens': -1},
+                        {'QueryReplayMaxTokens': -1}, {'QueryScorer': 'page-softmax', 'Lrfu': False, 'LrfuLambda': .4}):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 console.normalize({'schema_version': 1, 'parameters': dict(console.DEFAULTS, **invalid)}, self.controller.backends)
 

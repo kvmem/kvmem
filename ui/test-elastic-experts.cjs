@@ -2,7 +2,7 @@
 const assert=require('node:assert/strict');
 module.exports=async({browser,base,info,stage})=>{
  const context=await browser.newContext({viewport:{width:1440,height:1100}}),page=await context.newPage(),errors=[],previews=[];
- const p={...info.draft.parameters,Backend:'polystrata',Model:'C:/fixture/model.gguf',Gpu:'GPU-elastic-fixture',Context:262144,Budget:32768,Reserve:2048,Prefill:512,RetainedSessions:4,ThinkingMode:'on',QueryScorer:'page-softmax',GraphAlpha:.2,Lrfu:false,
+ const p={...info.draft.parameters,QueryMaxTokens:512,QueryReplayMaxTokens:2048,Backend:'polystrata',Model:'C:/fixture/model.gguf',Gpu:'GPU-elastic-fixture',Context:262144,Budget:32768,Reserve:2048,Prefill:512,RetainedSessions:4,ThinkingMode:'on',QueryScorer:'page-softmax',GraphAlpha:.2,Lrfu:false,
   DraftTokens:2,WorkerArgs:['--threads','8','--elastic-experts-headroom','--elastic-headroom-mib','384','--elastic-physical-reserve-mib','768']};
  let status={state:'ready',pid:12,instance:'elastic-first',active_config:{schema_version:1,parameters:p}};
  page.on('pageerror',e=>errors.push(e.message));
