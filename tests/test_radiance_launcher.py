@@ -41,6 +41,15 @@ class RadiancePlanTest(unittest.TestCase):
                 args=plan['argv']
                 self.assertEqual(args[args.index('--max-num-batched-tokens')+1],str(expected))
 
+    def test_cache_minimum(self):
+        self.assertEqual(self.plan()['argv'],self.plan(CacheMinTokens=0)['argv'])
+        for value in (4095,4096,4097,2147483647):
+            plan=self.plan(CacheMinTokens=value);args=plan['argv']
+            self.assertEqual(args[args.index('--kvmem-cache-min-tokens')+1],str(value))
+            self.assertEqual(plan['effective_parameters']['CacheMinTokens'],value)
+        for value in (-1,2147483648,True,1.5):
+            with self.subTest(value=value),self.assertRaises(ValueError):self.plan(CacheMinTokens=value)
+
     def test_cpu_threads_and_image_cache_budget(self):
         plan=self.plan(CpuThreads=8,VisionCacheMiB=64)
         self.assertEqual(plan['environment']['OMP_NUM_THREADS'],'8')

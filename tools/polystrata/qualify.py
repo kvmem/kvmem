@@ -26,11 +26,14 @@ class Worker:
                    "--window", str(1+getattr(args,"mtp_drafts",0)), "--lookup", "0", "--tail-skip", "0", "--expert-swaps", str(args.swaps),
                    "--prompt-cache", "0", "--conversation-cache-mib", "0", "--conversation-cache-slots", "0"]
         if not getattr(args,"mtp_drafts",0): command += ["--no-draft"]
+        if getattr(args,"ignore_eos",False): command += ["--eos-ids", "2147483647"]
         if getattr(args,"kv_type",None): command += ["--kv", "fp16" if args.kv_type=="f16" else args.kv_type]
         if args.whole:
             command += ["--kv-whole"]
         if args.no_graphs:
             command += ["--no-graphs"]
+        if getattr(args, "batch_slots", 0):
+            command += ["--batch", str(args.batch_slots)]
         if getattr(args, "vram_reserve_mib", None) is not None:
             command += ["--vram-reserve-mib", str(args.vram_reserve_mib)]
         if args.mode == "kvmem":
@@ -50,6 +53,8 @@ class Worker:
                 command += ["--kvmem-history-reuse"]
             if getattr(args, "sessions", 1) != 1:
                 command += ["--kvmem-sessions", str(args.sessions)]
+            if getattr(args, "cache_min_tokens", 0):
+                command += ["--kvmem-cache-min-tokens", str(args.cache_min_tokens)]
         if getattr(args, "session_metrics", False):
             env["KVMEM_POLY_SESSION_METRICS"] = "1"
         if args.fault:

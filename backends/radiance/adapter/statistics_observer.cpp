@@ -73,6 +73,8 @@ int StatisticsObserver::pool_token_limit(const rad::Config& cfg, const rad::Prog
 }
 int StatisticsObserver::configure(const rad::Config& cfg, rad::CtxDesc& desc) noexcept {
     try {
+        require(options_.cache_min_tokens<=INT32_MAX && (!options_.cache_min_tokens || options_.budget_tokens),
+            "cache minimum requires a positive KVMem budget and must fit 2147483647");
         require(desc.program && (cfg.tp==1 || cfg.tp==2) && desc.world_size==cfg.tp &&
             desc.rank>=0 && size_t(desc.rank)==ranks_.size(),"statistics rank configuration is incomplete/out of order");
         auto rank=std::make_unique<Rank>();
@@ -272,6 +274,7 @@ void StatisticsObserver::verify_rank_view(uint64_t sequence) const {
     }
 }
 void StatisticsObserver::clear_session() {
+    retention_declined_=false;
     if(finishing_id_) {
         std::erase_if(cache_->finishing,[&](const auto& entry){return entry.id==finishing_id_;});
         finishing_id_=0;
@@ -550,9 +553,10 @@ void StatisticsObserver::admit_carried_input(std::unique_ptr<RetainedSession> sa
     RAD_INFO("KVMEM_INPUT_CARRY request=%llu frontier=%zu immutable_payload_shared=1",
         (unsigned long long)session,frontier);
 }
-bool StatisticsObserver::CacheState::publish(RetainedSession&& saved,size_t max_groups,size_t max_records,bool already_charged) {
+bool StatisticsObserver::CacheState::publish(RetainedSession&& saved,size_t max_groups,size_t max_records,uint32_t minimum_tokens,bool already_charged) {
     const bool complete=saved.identity && saved.prefix && saved.memory && saved.store && saved.policy && saved.recall && saved.recall_snapshot;
     if(!complete)return false;
+    if(!admit(saved.identity->tokens.size(),minimum_tokens))return false;
     std::vector<CanonicalGroupMember<ImageIdentity>> members;
     for(const auto& previous:sessions)members.push_back({previous.group,previous.identity->canonical});
     const auto compatible=classify_canonical_group(saved.identity->canonical,members);
@@ -573,6 +577,7 @@ bool StatisticsObserver::CacheState::publish(RetainedSession&& saved,size_t max_
     saved.group=group; // Only the ready incoming directory slot is reclassified.
     if(!publish_content_checkpoint(sessions,std::move(saved),plan,complete))return false;
     bytes=bytes-released+added;evictions+=plan.retired_slots.size();
+    retention_evictions+=plan.retired_slots.size();
     RAD_INFO("KVMEM_SESSION_PUBLISH group=%llu retired=%zu records=%zu reason=%s",
         (unsigned long long)group,plan.retired_slots.size(),sessions.size(),content_publication_reason(plan.reason));
     return true;
@@ -594,6 +599,7 @@ void StatisticsObserver::park_session() {
     if (!prefix_ || !prefix_recall_ || !options_.cache_sessions) { clear_session(); return; }
     const auto identity = std::atomic_load(&cached_identity_);
     require(identity && memory_ && store_ && policy_ && recall_, "incomplete session cache entry");
+    if(!cache_->admit(identity->tokens.size(),options_.cache_min_tokens)) {clear_session();return;}
     // Count inactive KV, recurrent state and statistical metadata against one
     // retained-host allowance. Model/runtime workspace is not a cache payload.
     const uint64_t fixed = input_extra_bytes() + prefix_->state_bytes() + prefix_->metadata_bytes() + memory_->archive_bytes() + store_->allocated_bytes() +
@@ -650,7 +656,7 @@ void StatisticsObserver::park_session() {
     saved.recall_snapshot=std::move(prefix_recall_);
     if(parking) {
         parking->saved=std::move(saved);cache_->parking.push_back(std::move(parking));cache_->bytes+=bytes;
-    } else if(!cache_->publish(std::move(saved),options_.cache_sessions,options_.effective_cache_records())) {
+    } else if(!cache_->publish(std::move(saved),options_.cache_sessions,options_.effective_cache_records(),options_.cache_min_tokens)) {
         RAD_INFO("KVMEM_SESSION_SKIP session=%llu reason=directory_capacity source_preserved=1",(unsigned long long)session_.id);
     }
     RAD_INFO("KVMEM_SESSION_CACHE entries=%zu logical_bytes=%llu limit=%llu gpu_pages=0 pending=%zu",
@@ -1392,6 +1398,10 @@ int StatisticsObserver::finish(const rad::StepEntry& e, const rad::Request& requ
         if (!policy_ || !frontier_ || !options_.cache_sessions) return RAD_OK;
         require(request.id == active_request_ && e.seq == active_request_ &&
                 request.n_computed == frontier_, "terminal state is not the accepted frontier");
+        // Only optional terminal export is declined. Pending selection/input
+        // work still drains through the normal retire path before release.
+        retention_declined_=!cache_->admit(frontier_,options_.cache_min_tokens);
+        if(retention_declined_)return RAD_OK;
         auto identity=std::make_shared<CachedIdentity>();
         identity->tokens=request.prompt;
         identity->tokens.insert(identity->tokens.end(),request.output.begin(),request.output.end());
@@ -1500,6 +1510,9 @@ void StatisticsObserver::retire(uint64_t id) noexcept {
                 (unsigned long long)reuse.spill_staging_bytes_avoided_peak);
         }
     } catch (const std::exception& e) { failure("retire", e); }
+    if(retention_declined_ || !cache_->admit(frontier_,options_.cache_min_tokens)) {
+        retention_declined_=false;clear_session();return;
+    }
     if(!prefix_ && (input_ || fallback_)) {
         try {if(!input_)input_=std::move(fallback_);promote_input();}
         catch(const std::exception& e){failure("input fallback",e);clear_session();return;}

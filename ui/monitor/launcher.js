@@ -974,6 +974,7 @@
     let refreshGpuOrder=()=>{};
     const b=p.Backend,n=b==='ninfer',l=b==='llamacpp',poly=b==='polystrata',rad=b==='radiance';
     if(n)p.CheckpointExtraRecomputeTokens??=0;
+    p.CacheMinTokens??=0;
     // Resolve the launcher's omitted values before rendering; keep explicit 0/false.
     const concreteDefaults={Prefill:rad?256:poly?512:defaults.Prefill,ThinkingBudget:0,Concurrency:1,VisionTokens:1024,NgramDrafts:0,NgramMinMatch:12,
       DeviceProfile:'off',LogLevel:'info',QueryMaxTokens:512,ReplayMaxTokens:2048};
@@ -1178,6 +1179,7 @@
     ['SinkTokens','RecentTokens','RetainedSessions'].forEach(k=>{const el=panels[0].querySelector(`[data-param="${k}"]`);if(el)retention.append(el.closest('label'));});
     const target=field(retention,p,'LayerwiseCheckpointTarget','实例热检查点目标','Hot checkpoints per instance','number');
     target.min='1';target.required=false;
+    {const minimum=field(retention,p,'CacheMinTokens','会话缓存最低长度 · tokens','Minimum cached history · tokens','number',null,['0 关闭。保存时按可恢复的完整会话长度判断，包含历史输入和已提交的输出；短会话不占保留名额，仍可读取已有缓存。','0 disables filtering. At save time, count the complete restorable history, including input and committed output. Short histories do not use a retention slot; existing prefixes remain reusable.']);minimum.min='0';minimum.max='2147483647';minimum.required=true;}
     if(n){const extra=field(retention,p,'CheckpointExtraRecomputeTokens','快照额外重算上限 · tokens','Checkpoint extra recompute limit · tokens','number',null,['0 关闭。允许用附近较早点替代低收益快照；执行中的 Query 回放点仍受保护。重试可能需要重新保存快照或读取 SSD，因此该值不是耗时上限。','0 disables this optimization. Nearby earlier states can replace low-value checkpoints; active Query replay points remain protected. Retries may rebuild checkpoints or read SSD, so this is not a latency limit.']);extra.min='0';extra.max='2147483647';extra.required=true;}
     if(legacyScoring)scoring.before(make('p',{class:'l-muted','data-scoring-migration':''},tr('已将旧检索设置转换为明确参数；请检查下方评分器和历史累计选项。','Legacy retrieval settings were converted to explicit controls. Review the scorer and LRFU settings below.')));
     field(scoring,p,'QueryScorer','召回评分算法','Recall scoring algorithm','text',[['page-softmax','Page softmax'],['meanq-cosine','Mean-Q cosine']],['评分器、图传播与历史累计可以独立组合。','Scorer, graph propagation and LRFU can be combined independently.']);
