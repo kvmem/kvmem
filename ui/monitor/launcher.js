@@ -276,7 +276,7 @@
     const model=health?.model||{},facts=[model.format,model.architecture,model.files?tr(`${model.files} 个文件`,`${model.files} file(s)`):'',model.bytes?`${(model.bytes/1024**3).toFixed(2)} GiB`:''].filter(Boolean);
     if(facts.length)box.append(make('p',{class:'l-health-meta'},facts.join(' · ')));
     box.append(make('p',{class:'l-health-note'},tr('仅检查文件与资源；worker 加载、显存用量与推理结果尚未验证。','Files and resources only; worker loading, VRAM use and inference remain unverified.')));
-    const features=make('div',{class:'l-health-features'}),states={present:['已包含','Included'],absent:['未包含','Absent'],unknown:['未确认','Unverified'],external:['需外部文件','External file']};
+    const features=make('div',{class:'l-health-features'}),states={present:['已包含','Included'],absent:['未包含','Absent'],unknown:['未确认','Unverified'],external:['需外部文件','External file'],external_ready:['外部文件已选','External file selected']};
     for(const [key,zh,en] of [['text','文本','Text'],['vision','图像','Vision'],['mtp','MTP','MTP'],['dflash2','DFlash2','DFlash2'],['tokenizer','分词器','Tokenizer'],['template','聊天模板','Chat template']]){
       const state=health?.features?.[key];if(!state)continue;
       features.append(make('span',{'data-feature':key,'data-state':state},tr(zh,en)+' · '+tr(...(states[state]||states.unknown))));

@@ -9,7 +9,8 @@ from draft_control import resolve, verify_log
 from inspect_rad import inspect
 
 
-def container(path, names, metadata=(), arch='qwen35', quant='fp8_e4m3'):
+def container(path, names, metadata=(), arch='qwen35', quant='fp8_e4m3', vocab=True,
+              template='{{ messages }}'):
     """Small valid directory fixture; no real model payload or GPU needed."""
     header = struct.Struct("<II30Q")
     entry = struct.Struct("<3Q2I6q3iI5Q")
@@ -34,11 +35,22 @@ def container(path, names, metadata=(), arch='qwen35', quant='fp8_e4m3'):
         kind = 2 if isinstance(value, str) else 1
         meta.append(struct.pack("<QIIQ", key_offset, kind, 0,
                                 string(value) if kind == 2 else value))
+    template_offset = string(template) if vocab else 0
+    token_offset = string('test-token') if vocab else 0
     h[8], h[9] = header.size, len(strings)
     h[10], h[11] = h[8] + h[9], len(meta)
     h[12], h[13] = h[10] + 24 * len(meta), len(entries)
     h[2] = h[12] + len(entries) * entry.size
-    path.write_bytes(header.pack(*h) + strings + b"".join(meta) + b"".join(entries))
+    tail = b''
+    if vocab:
+        padding = (-h[2]) % 8
+        vh = struct.Struct('<4I5Q6i2I5Q')
+        h[18],h[19] = h[2]+padding,vh.size+8
+        values=[0]*22
+        values[0],values[1],values[4],values[17]=1,1,h[18]+vh.size,template_offset
+        tail=b'\0'*padding+vh.pack(*values)+struct.pack('<Q',token_offset)
+        h[2]+=len(tail)
+    path.write_bytes(header.pack(*h) + strings + b"".join(meta) + b"".join(entries) + tail)
 
 
 class DraftControlTest(unittest.TestCase):
