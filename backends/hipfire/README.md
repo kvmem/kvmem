@@ -107,7 +107,9 @@ forward.
 | `HIPFIRE_KVMEM_HOST_BYTES` | 16 GiB | RAM tier capacity |
 | `HIPFIRE_KVMEM_SPILL_DIR` | — | set to enable the disk tier |
 | `HIPFIRE_KVMEM_SPILL_BYTES` | 64 GiB | disk tier capacity |
-| `HIPFIRE_KVMEM_TRACE` | off | per-step residency diagnostics |
+| `HIPFIRE_KVMEM_TRACE` | off | per-step residency diagnostics (`HIPFIRE_KVMEM_TRACE_PAGES=1` adds picked/restored page ids) |
+| `HIPFIRE_KVMEM_TIME` | off | per-step forward/tap timings + controller call breakdowns |
+| `HIPFIRE_KVMEM_VERIFY` | off | checksum every spilled/restored page and read the device block table back against the host table; 0 mismatch proves the spill/restore round is byte-exact |
 
 With `cap ≤ budget` nothing ever spills, the tap kernels only copy, and the
 forward is bit-identical to an unpatched hipfire. Spill/restore moves arena
