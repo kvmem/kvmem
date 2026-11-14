@@ -70,7 +70,8 @@ class LayerwiseProductTest(unittest.TestCase):
                     self.assertFalse(result['profile'] and result['profile'].get('available'))
                     with self.assertRaisesRegex(ValueError, 'qualified layerwise'):
                         require_launch_features(capability, parameters)
-                    require_launch_features(capability, dict(parameters, RecallStrategy='legacy'))
+                    require_launch_features(capability, dict(parameters, RecallStrategy='legacy',
+                        QueryMaxTokens=512, QueryReplayMaxTokens=2048))
 
     def test_runtime_confirmation_requires_every_actual_account_and_policy(self):
         plan = build_plan(self.config('llamacpp', SpeculativeMode='mtp', DraftTokens=3,

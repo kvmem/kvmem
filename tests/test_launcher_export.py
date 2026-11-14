@@ -19,7 +19,7 @@ import json, os, signal, sys, time
 from pathlib import Path
 if '--kvmem-capabilities' in sys.argv:
     print(json.dumps(dict(schema_version=1, backend='ninfer', query_scoring_revision=2,
-                         independent_graph_lrfu=True, signed_lrfu_hits=True)))
+                         independent_graph_lrfu=True, signed_lrfu_hits=True, legacy_query_replay_revision=1)))
     raise SystemExit(0)
 output = Path(os.environ['KVMEM_TEST_OUTPUT'])
 output.write_text(json.dumps(dict(argv=sys.argv, pid=os.getpid(), cwd=os.getcwd(),
@@ -83,7 +83,7 @@ class ExportTest(unittest.TestCase):
                 parallel_modes=['single'],kv_formats=['bf16'],vision_residency=[],speculative={
                     'mtp': dict(available=True,history_policies=['upstream-global','first-layer'],
                         state_modes=['native'],max_draft_tokens=3,adaptive=False,ngram=False)})})
-        old = "print(json.dumps(dict(schema_version=1, backend='ninfer', query_scoring_revision=2,\n                         independent_graph_lrfu=True, signed_lrfu_hits=True)))"
+        old = "print(json.dumps(dict(schema_version=1, backend='ninfer', query_scoring_revision=2,\n                         independent_graph_lrfu=True, signed_lrfu_hits=True, legacy_query_replay_revision=1)))"
         self.assertIn(old, WORKER)
         self.worker.write_text(WORKER.replace(old, 'print(' + repr(json.dumps(capability)) + ')'), encoding='utf-8')
         self.data['parameters'].update(RecallStrategy='layerwise',KvType='bf16',SpeculativeMode='mtp',

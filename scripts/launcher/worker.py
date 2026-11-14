@@ -87,6 +87,13 @@ def require_launch_features(capabilities, parameters):
     if parameters.get('Lora') and capabilities.get('fixed_lora') is not True:
         raise ValueError('This worker does not support fixed LoRA; update the llama.cpp worker')
     require_recall_features(capabilities, parameters)
+    if (parameters.get('Backend') == 'ninfer' and parameters.get('RecallStrategy', 'legacy') == 'legacy'
+            and any(parameters.get(key, 0) == 0 for key in ('QueryMaxTokens', 'QueryReplayMaxTokens'))):
+        revision = capabilities.get('legacy_query_replay_revision')
+        if type(revision) is not int or revision < 1:
+            raise ValueError('This worker does not support NInfer full Query/replay (zero token limits); '
+                             'update the complete NInfer package, or explicitly set both QueryMaxTokens '
+                             'and QueryReplayMaxTokens to positive limits')
     admission_revision = capabilities.get('cache_admission_revision')
     if parameters.get('CacheMinTokens', 0) and (
             type(admission_revision) is not int or admission_revision < 1):

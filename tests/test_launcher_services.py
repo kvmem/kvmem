@@ -30,7 +30,7 @@ import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 if '--kvmem-capabilities' in sys.argv:
     print(json.dumps(dict(schema_version=1, backend='ninfer', query_scoring_revision=2,
-                         independent_graph_lrfu=True, signed_lrfu_hits=True)))
+                         independent_graph_lrfu=True, signed_lrfu_hits=True, legacy_query_replay_revision=1)))
     raise SystemExit(0)
 print('KVMEM_SCORING scorer=page-softmax agg=mean lrfu=0 lambda=0.5 top_frac=0.9 graph_alpha=0.2', flush=True)
 def limit(flag):

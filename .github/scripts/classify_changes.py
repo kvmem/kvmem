@@ -19,6 +19,8 @@ NON_CUDA_PATHS = {
 CONSOLE_PATHS = {
     '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
     'tests/test_radiance_launcher.py',
+    'tests/test_layerwise_launcher.py', 'tests/test_layerwise_product.py',
+    'tests/test_windows_worker_args.py', 'scripts/windows/start-backend.ps1',
     'START-HERE-CN.sh', 'START-HERE-EN.sh', 'START-HERE-CN.bat', 'START-HERE-EN.bat',
     'scripts/local-console.py', 'scripts/launcher-cli.py', 'scripts/launcher-capabilities.json',
     'scripts/console_chat.py', 'scripts/console_radiance.py', 'scripts/console_state.py', 'scripts/console_hardware.py', 'scripts/model_health.py',
@@ -43,6 +45,14 @@ EVIDENCE_TEST_STEP = (
     "        if: steps.classify.outputs.run_ci == 'true'\n"
     '        run: python3 backends/radiance/tests/cpu_image_evidence_test.py\n'
 )
+CONSOLE_CONTRACT_TEST_STEP = (
+    '      - name: Test model-free recall and worker contracts\n'
+    '        shell: bash\n'
+    '        run: |\n'
+    '          python -m unittest discover -s tests -p "test_layerwise_launcher.py"\n'
+    '          python -m unittest discover -s tests -p "test_layerwise_product.py"\n'
+    '          python -m unittest discover -s tests -p "test_windows_worker_args.py"\n'
+)
 
 
 def is_console_path(path):
@@ -60,7 +70,8 @@ def requires_native(paths, before=None, after=None, cwd=None):
     # still run Python/browser checks, without configuring or building engines.
     return not paths or any(
         not is_documentation(path) and not is_console_path(path) and path not in EVIDENCE_PATHS
-        and not (path == WORKFLOW and only_evidence_test_step_changed(before, after, cwd))
+        and not (path == WORKFLOW and only_test_step_added(before, after,
+                 (EVIDENCE_TEST_STEP, CONSOLE_CONTRACT_TEST_STEP), cwd))
         for path in paths)
 
 
@@ -170,14 +181,18 @@ def git(*args, cwd=None):
 
 
 def only_evidence_test_step_changed(before, after, cwd=None):
-    # Allow only the exact standalone Python check added by this change.
-    # Every other workflow edit retains the conservative native-build policy.
+    return only_test_step_added(before, after, (EVIDENCE_TEST_STEP,), cwd)
+
+
+def only_test_step_added(before, after, steps, cwd=None):
+    # Only an exact known model-free test addition can avoid native builds.
+    # Other recipe edits retain the conservative native-build policy.
     if not all(isinstance(ref, str) and re.fullmatch(r'[0-9a-f]{40}', ref) for ref in (before, after)):
         return False
     try:
         old, new = (git('show', ref + ':' + WORKFLOW, cwd=cwd).decode('utf-8').replace('\r\n', '\n')
                     for ref in (before, after))
-        return new.count(EVIDENCE_TEST_STEP) == 1 and new.replace(EVIDENCE_TEST_STEP, '', 1) == old
+        return any(new.count(step) == 1 and new.replace(step, '', 1) == old for step in steps)
     except (OSError, UnicodeError, subprocess.CalledProcessError):
         return False
 
