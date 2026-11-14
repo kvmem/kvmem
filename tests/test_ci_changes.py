@@ -16,7 +16,7 @@ class DocumentationChangesTest(unittest.TestCase):
         from unittest.mock import patch
         paths = ['scripts/windows_amd_hardware.py','scripts/windows_gpu_hardware.py',
                  'scripts/windows/package-polystrata.ps1','tests/test_windows_amd_hardware.py',
-                 'tests/test_windows_gpu_hardware.py']
+                 'tests/test_windows_gpu_hardware.py','ui/memory-fixture.py']
         self.assertTrue(changes.requires_ci(paths))
         self.assertFalse(changes.requires_native(paths))
         current = (Path(__file__).resolve().parents[1] / changes.WORKFLOW).read_text(encoding='utf8')

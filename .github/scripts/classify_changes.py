@@ -33,7 +33,7 @@ CONSOLE_PATHS = {
     'scripts/windows/package-unified.py', 'scripts/windows/native-process.ps1',
     'scripts/windows/describe-launch-json.ps1', 'scripts/install-console-dependency.py',
     'scripts/windows/start-polystrata.ps1', 'scripts/windows/select-model.ps1',
-    'ui/package.json', 'ui/package-lock.json', 'ui/README.md',
+    'ui/package.json', 'ui/package-lock.json', 'ui/README.md', 'ui/memory-fixture.py',
 }
 
 # These files audit archived results; none is an input to a native target.

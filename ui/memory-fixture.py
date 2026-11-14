@@ -51,5 +51,5 @@ control.plan,control._run_budget_plan=budget_launch,budget_worker
 server = console.Server(('127.0.0.1',int(sys.argv[1])),console.Handler)
 server.control=control
 server.gpus=[{'uuid':'GPU-12345678','name':'Test GPU','memory_mib':'8192'}]
-server.hardware=console.SystemDiskSampler()
+server.hardware=console.SystemHardwareSampler()
 server.serve_forever()
