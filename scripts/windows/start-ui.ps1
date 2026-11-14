@@ -24,6 +24,7 @@ if (Test-Path -LiteralPath (Join-Path $root 'bin/amdhip64_7.dll') -PathType Leaf
 }
 try {
     foreach ($relative in 'scripts/local-console.py', 'scripts/console_chat.py', 'scripts/console_state.py', 'scripts/model_health.py', 'scripts/console_hardware.py', 'scripts/console_memory.py',
+                          'scripts/windows_gpu_hardware.py', 'scripts/windows_amd_hardware.py',
                           'scripts/launcher/__init__.py', 'scripts/launcher/config.py', 'scripts/launcher/plan.py',
                           'scripts/launcher/export.py', 'scripts/launcher/systemd.py', 'scripts/launcher/worker.py', 'scripts/launcher-capabilities.json',
                           'scripts/launcher/recall.py', 'scripts/check-recall-worker.py', 'scripts/windows/recall-strategy.ps1',

@@ -1,4 +1,4 @@
-"""Backend-independent system disk telemetry, sampled once for all UI clients.
+"""Backend-independent system telemetry, sampled once for all UI clients.
 
 Uses PolyStrata's psutil cumulative-byte delta approach. Durations use a monotonic
 clock; wall time is only for snapshot freshness. Engine cache I/O stays separate.
@@ -10,6 +10,9 @@ import os
 import json
 import subprocess
 import sys
+import copy
+import queue
+import math
 from pathlib import Path
 from threading import Thread
 
@@ -70,9 +73,15 @@ def read_hip_devices(library):
             if hip.hipDeviceGetName(name, len(name), ordinal):
                 continue
             memory_ok = hip.hipDeviceTotalMem(c.byref(size), ordinal) == 0
-            devices.append(dict(uuid='GPU-' + bytes(uuid).hex(), name=name.value.decode(errors='replace'),
+            row = dict(uuid='GPU-' + bytes(uuid).hex(), name=name.value.decode(errors='replace'),
                                 memory_mib=str(size.value // 2**20) if memory_ok else None,
-                                vendor='amd', ordinal=ordinal))
+                                vendor='amd', ordinal=ordinal)
+            pci = c.create_string_buffer(64)
+            if hip.hipDeviceGetPCIBusId(pci, len(pci), ordinal) == 0:
+                value = pci.value.decode('ascii', errors='replace')
+                if re.fullmatch(r'[0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]', value):
+                    row['pci_bus_id'] = value.lower()
+            devices.append(row)
         return devices
 
 
@@ -122,7 +131,7 @@ class SystemDiskSampler:
                     system_disk_read_bytes_per_second=None,
                     system_disk_write_bytes_per_second=None)
 
-    def sample(self):
+    def _sample_disk(self):
         value = self._empty('unavailable' if self.reader else 'dependency_missing')
         current = None
         try:
@@ -143,8 +152,11 @@ class SystemDiskSampler:
                     value.update(status='ready', interval_ms=dt * 1000,
                                  system_disk_read_bytes_per_second=read / dt,
                                  system_disk_write_bytes_per_second=write / dt)
-        with self.lock:
-            self.value = value
+        return value
+
+    def sample(self):
+        value = self._sample_disk()
+        with self.lock: self.value = value
 
     def snapshot(self):
         with self.lock:
@@ -165,6 +177,114 @@ class SystemDiskSampler:
         self.stop_event.set()
         if self.thread is not None:
             self.thread.join(timeout=2)
+
+
+class WindowsGpuSampler:
+    """Supervised helper: a blocked or crashed driver cannot block console HTTP."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.value = {}
+        self.thread = None
+
+    def snapshot(self):
+        with self.lock: value = copy.deepcopy(self.value)
+        stamp = value.get('sampled_at_ms')
+        if not isinstance(stamp, (int, float)) or not math.isfinite(stamp) or not -1000 <= time.time()*1000-stamp < 5000:
+            return {'gpus': [], 'gpu_status': 'unavailable', 'gpu_sampled_at_ms': None}
+        return {'gpus': value.get('gpus', []), 'gpu_status': 'ready' if value.get('gpus') else 'unavailable',
+                'gpu_sampled_at_ms': stamp}
+
+    def start(self):
+        if self.thread is None:
+            self.thread = Thread(target=self._loop, name='console-gpu-supervisor', daemon=True)
+            self.thread.start()
+        return self
+
+    def _loop(self):
+        script = Path(__file__).with_name('windows_gpu_hardware.py')
+        while not self.stop_event.is_set():
+            process = None
+            reader = None
+            failed = False
+            try:
+                process = subprocess.Popen([sys.executable, '-I', str(script), '--parent-pipe'], stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, stdin=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+                messages = queue.Queue(maxsize=2)
+                def drain(stream, target):
+                    while True:
+                        line = stream.readline(65537)
+                        if not line or len(line) > 65536: break
+                        try: target.put_nowait(line)
+                        except queue.Full: pass
+                reader = Thread(target=drain, args=(process.stdout, messages), daemon=True)
+                reader.start()
+                last = time.monotonic()
+                while not self.stop_event.is_set():
+                    try: line = messages.get(timeout=.5)
+                    except queue.Empty:
+                        if process.poll() is not None:
+                            failed = process.returncode != 0
+                            break
+                        if time.monotonic()-last > 8: raise TimeoutError('GPU sampler stalled')
+                        continue
+                    value = json.loads(line)
+                    if not isinstance(value, dict) or not isinstance(value.get('gpus'), list) or len(value['gpus']) > 256:
+                        raise ValueError('Invalid GPU sample')
+                    with self.lock: self.value = value
+                    last = time.monotonic()
+            except (OSError, ValueError, TimeoutError):
+                failed = True
+            finally:
+                if process:
+                    process.stdin.close()
+                    if process.poll() is None: process.kill()
+                    try: process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        failed = True
+                    if reader: reader.join(timeout=2)
+                    if not reader or not reader.is_alive(): process.stdout.close()
+            if failed:
+                with self.lock: self.value = {}
+                self.stop_event.wait(3)
+
+    def close(self):
+        self.stop_event.set()
+        if self.thread: self.thread.join(timeout=6)
+
+
+class SystemHardwareSampler(SystemDiskSampler):
+    def __init__(self, gpu_sampler=None):
+        super().__init__()
+        self.gpu_sampler = gpu_sampler if gpu_sampler is not None else (WindowsGpuSampler() if os.name == 'nt' else None)
+
+    def sample(self):
+        value = self._sample_disk()
+        metrics = {'cpu_percent': None, 'ram_used_bytes': None, 'ram_total_bytes': None, 'ram_available_bytes': None}
+        if psutil:
+            try:
+                metrics['cpu_percent'] = psutil.cpu_percent(interval=None)
+                memory = psutil.virtual_memory()
+                metrics.update(ram_total_bytes=memory.total, ram_available_bytes=memory.available,
+                               ram_used_bytes=memory.total-memory.available)
+            except (OSError, RuntimeError): pass
+        value.update(metrics)
+        with self.lock: self.value = value
+
+    def snapshot(self):
+        with self.lock: value = copy.deepcopy(self.value)
+        # GPU freshness is checked at read time, independently of CPU/disk ticks.
+        value.update(self.gpu_sampler.snapshot() if self.gpu_sampler else {'gpus': []})
+        return value
+
+    def start(self):
+        if self.gpu_sampler: self.gpu_sampler.start()
+        return super().start()
+
+    def close(self):
+        super().close()
+        if self.gpu_sampler: self.gpu_sampler.close()
 
 
 if __name__ == '__main__' and len(sys.argv) == 3 and sys.argv[1] == '--hip-devices':

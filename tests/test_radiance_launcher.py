@@ -205,11 +205,14 @@ class RadiancePlanTest(unittest.TestCase):
         first, second = ('GPU-' + x * 32 for x in ('a', 'b'))
         parameters = dict(Backend='radiance', Model=str(self.model), Worker=str(self.worker),
                           RadianceHome=str(self.home), Gpu=second + ',' + first)
-        devices = [dict(uuid=first, ordinal=0), dict(uuid=second, ordinal=2)]
+        devices = [dict(uuid=first, ordinal=0, name='AMD GPU', pci_bus_id='0000:01:00.0'),
+                   dict(uuid=second, ordinal=2, name='AMD GPU', pci_bus_id='0000:24:00.0')]
         with mock.patch('console_hardware.windows_hip_inventory', return_value=devices):
             plan = build_radiance_plan(parameters, self.root, 'windows', False, {})
             self.assertEqual(plan['environment']['HIP_VISIBLE_DEVICES'], '2,0')
             self.assertNotIn('ROCR_VISIBLE_DEVICES', plan['environment'])
+            self.assertEqual([d['pci_bus_id'] for d in plan['monitor_devices']], ['0000:24:00.0','0000:01:00.0'])
+            self.assertEqual([d['hip_ordinal'] for d in plan['monitor_devices']], [0,1])
             with self.assertRaisesRegex(ValueError, 'distinct AMD GPUs'):
                 build_radiance_plan({**parameters, 'Gpu': first + ',' + first.upper()}, self.root, 'windows', False, {})
         for invalid in (devices[:1], devices + [devices[1]]):

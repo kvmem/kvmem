@@ -27,6 +27,9 @@ CONSOLE_PATHS = {
     'scripts/requirements-console.txt', 'scripts/speculative-capabilities.json',
     'scripts/linux/start-ui.sh', 'scripts/linux/package-console.py',
     'scripts/windows/start-ui.ps1', 'scripts/windows/package-console.ps1',
+    'scripts/windows/package-polystrata.ps1',
+    'scripts/windows_amd_hardware.py', 'scripts/windows_gpu_hardware.py',
+    'tests/test_windows_amd_hardware.py', 'tests/test_windows_gpu_hardware.py',
     'scripts/windows/package-unified.py', 'scripts/windows/native-process.ps1',
     'scripts/windows/describe-launch-json.ps1', 'scripts/install-console-dependency.py',
     'scripts/windows/start-polystrata.ps1', 'scripts/windows/select-model.ps1',
@@ -53,6 +56,14 @@ CONSOLE_CONTRACT_TEST_STEP = (
     '          python -m unittest discover -s tests -p "test_layerwise_product.py"\n'
     '          python -m unittest discover -s tests -p "test_windows_worker_args.py"\n'
 )
+HARDWARE_TEST_STEP = (
+    '      - name: Test hardware telemetry contracts without a GPU\n'
+    '        shell: bash\n'
+    '        run: |\n'
+    '          python -m unittest discover -s tests -p "test_console_hardware.py"\n'
+    '          python -m unittest discover -s tests -p "test_console_radiance.py"\n'
+    '          python -m unittest discover -s tests -p "test_windows_*hardware.py"\n'
+)
 
 
 def is_console_path(path):
@@ -71,7 +82,7 @@ def requires_native(paths, before=None, after=None, cwd=None):
     return not paths or any(
         not is_documentation(path) and not is_console_path(path) and path not in EVIDENCE_PATHS
         and not (path == WORKFLOW and only_test_step_added(before, after,
-                 (EVIDENCE_TEST_STEP, CONSOLE_CONTRACT_TEST_STEP), cwd))
+                 (EVIDENCE_TEST_STEP, CONSOLE_CONTRACT_TEST_STEP, HARDWARE_TEST_STEP), cwd))
         for path in paths)
 
 
