@@ -64,10 +64,20 @@ class LayerwiseProductTest(unittest.TestCase):
                 with self.subTest(backend=backend, declared='recall_strategies' in capability):
                     parameters = dict(Backend=backend, Worker=str(self.fixture.worker), RecallStrategy='layerwise')
                     with patch.object(controller, 'worker_capabilities', return_value=capability) as probe:
-                        result = controller.selected_worker_capabilities(dict(schema_version=1, parameters=parameters))
-                    probe.assert_called_once_with(str(self.fixture.worker), backend)
-                    self.assertEqual(result['backend'], backend)
-                    self.assertFalse(result['profile'] and result['profile'].get('available'))
+                        request = dict(schema_version=1, parameters=parameters)
+                        if backend not in controller.backends:
+                            # Linux does not expose every backend in the console.
+                            # An unavailable selection must fail before probing.
+                            with self.assertRaisesRegex(ValueError, 'Backend is not installed'):
+                                controller.selected_worker_capabilities(request)
+                            probe.assert_not_called()
+                        else:
+                            result = controller.selected_worker_capabilities(request)
+                            probe.assert_called_once_with(str(self.fixture.worker), backend)
+                            self.assertEqual(result['backend'], backend)
+                            self.assertFalse(result['profile'] and result['profile'].get('available'))
+                    # The shared contract guard still covers every backend,
+                    # independently of the platform's console selection list.
                     with self.assertRaisesRegex(ValueError, 'qualified layerwise'):
                         require_launch_features(capability, parameters)
                     require_launch_features(capability, dict(parameters, RecallStrategy='legacy',
