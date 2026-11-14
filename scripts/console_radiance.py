@@ -1,5 +1,6 @@
-"""Radiance API -> console UI contract. All values come from the current worker."""
+"""Radiance runtime, frozen launch identities and console telemetry -> UI contract."""
 import copy
+import re
 
 def effective_settings(info, template_effort=None):
     native=info.get('request_defaults',{})
@@ -17,7 +18,7 @@ def effective_settings(info, template_effort=None):
         effective.setdefault('enable_thinking', True)
     return effective
 
-def monitor_execution(engine):
+def monitor_execution(engine, launch_devices=None):
     """Translate a complete worker rank list; startup free memory is not telemetry."""
     ranks = engine.get('devices')
     count = engine.get('tensor_parallel')
@@ -35,6 +36,20 @@ def monitor_execution(engine):
             value = row.get(key)
             if isinstance(value, str) and value.strip():
                 device[key] = value.strip()
+        # The launch plan records the physical devices behind the HIP visibility mask.
+        # Require the worker's complete rank list AND the exact frozen launch mapping.
+        bindings = launch_devices if isinstance(launch_devices, list) and len(launch_devices) == count else []
+        matches = [b for b in bindings if isinstance(b, dict) and b.get('rank') == rank
+                   and b.get('hip_ordinal') == ordinal and b.get('name', '').strip() == name.strip()]
+        if len(matches) == 1:
+            binding = matches[0]
+            uuid, pci = binding.get('uuid'), binding.get('pci_bus_id')
+            if (isinstance(uuid, str) and re.fullmatch(r'GPU-[0-9a-fA-F]{32}', uuid)
+                    and isinstance(pci, str) and re.fullmatch(r'[0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]', pci)
+                    and ('uuid' not in device or device['uuid'].lower() == uuid.lower())
+                    and ('pci_bus_id' not in device or device['pci_bus_id'].lower() == pci.lower())):
+                device.setdefault('uuid', uuid)
+                device.setdefault('pci_bus_id', pci)
         capacity = row.get('vram_bytes')
         if type(capacity) is int and capacity > 0:
             device['total_bytes'] = capacity
@@ -44,7 +59,7 @@ def monitor_execution(engine):
         return None
     return {'mode': 'single' if count == 1 else 'tensor', 'monitor_devices': devices}
 
-def enrich_props(props,info,snapshot,template_effort=None):
+def enrich_props(props,info,snapshot,template_effort=None,launch_devices=None):
     out=copy.deepcopy(props)
     out['kvmem']=copy.deepcopy(snapshot.get('kvmem',{}))
     effective=effective_settings(info,template_effort)
@@ -53,7 +68,7 @@ def enrich_props(props,info,snapshot,template_effort=None):
     engine=info.get('engine') or {}
     execution = out.get('execution') or {}
     if not isinstance(execution.get('monitor_devices'), list):
-        reported = monitor_execution(engine)
+        reported = monitor_execution(engine, launch_devices)
         if reported:
             out['execution'] = {**execution, **reported}
     out['radiance_engine']=engine
@@ -63,6 +78,14 @@ def enrich_props(props,info,snapshot,template_effort=None):
                         'draft_tokens':spec.get('depth',0)}
     policy=out['kvmem'].get('draft_policy')
     if policy in ('fixed','adaptive'):out['speculative']['adaptive']=policy=='adaptive'
+    return out
+
+
+def enrich_hardware(snapshot, hardware):
+    """Supply console hardware only where Radiance has no native hardware sampler."""
+    out = copy.deepcopy(snapshot)
+    if out.get('backend') == 'radiance' and not isinstance(out.get('hardware'), dict):
+        out['hardware'] = copy.deepcopy(hardware)
     return out
 
 def speculative_event(event):

@@ -137,17 +137,21 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     if level in ('debug','trace'):argv.append('-v' if level=='debug' else '-vv')
     elif level!='info':raise ValueError('Radiance LogLevel currently supports info, debug or trace')
     argv+=scoring_args(supplied)+p.get('WorkerArgs',[])
+    monitor_devices = []
     env={'ROCR_VISIBLE_DEVICES':p['Gpu'],'HIP_VISIBLE_DEVICES':','.join(str(i) for i in range(len(gpu_ids))),
          'KVMEM_RAD_MTP_HEAD':'shared','OMP_NUM_THREADS':str(p['CpuThreads']),'KVMEM_RAD_VISION_CACHE_MIB':str(p['VisionCacheMiB'])}
     if platform == 'windows' and any(re.fullmatch(r'GPU-[0-9a-fA-F]{32}', gpu) for gpu in gpu_ids):
         from console_hardware import windows_hip_inventory
         devices = windows_hip_inventory(p.get('RocmPath'))
         ordinals = []
-        for gpu in gpu_ids:
-            matches = [d['ordinal'] for d in devices if d['uuid'].lower() == gpu.lower()]
+        for rank, gpu in enumerate(gpu_ids):
+            matches = [d for d in devices if d['uuid'].lower() == gpu.lower()]
             if len(matches) != 1:
                 raise ValueError(f'Windows HIP device {gpu} is missing or ambiguous; refresh GPU selection')
-            ordinals.append(str(matches[0]))
+            physical = matches[0]
+            ordinals.append(str(physical['ordinal']))
+            monitor_devices.append(dict(rank=rank, hip_ordinal=rank, uuid=physical['uuid'],
+                name=physical.get('name', ''), pci_bus_id=physical.get('pci_bus_id')))
         # These native HIP UUIDs belong to the Windows driver. Apply a single ordinal mask.
         del env['ROCR_VISIBLE_DEVICES']
         env['HIP_VISIBLE_DEVICES'] = ','.join(ordinals)
@@ -167,5 +171,6 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     for safe in (safe_supplied,safe_effective):safe.pop('ApiKey',None)
     return dict(schema_version=1,launch_contract_version=3,target_platform=platform,backend='radiance',
         argv=argv,cwd=str(root),environment=env,token_settings=tokens,requested_parameters=safe_supplied,
+        monitor_devices=monitor_devices,
         effective_parameters=safe_effective,api_key_configured=bool(p.get('ApiKey')),capabilities=copy.deepcopy(capability),
         resolved_scoring=scoring_settings(argv),warnings='\n'.join(f"KVMEM_CONFIG {x['parameter']}: {x['requested']} -> {x['effective']} ({x['reason']})" for x in tokens['adjustments']))

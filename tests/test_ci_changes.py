@@ -12,6 +12,21 @@ spec.loader.exec_module(changes)
 
 
 class DocumentationChangesTest(unittest.TestCase):
+    def test_windows_telemetry_runs_console_checks_without_engine_builds(self):
+        from unittest.mock import patch
+        paths = ['scripts/windows_amd_hardware.py','scripts/windows_gpu_hardware.py',
+                 'scripts/windows/package-polystrata.ps1','tests/test_windows_amd_hardware.py',
+                 'tests/test_windows_gpu_hardware.py','ui/memory-fixture.py']
+        self.assertTrue(changes.requires_ci(paths))
+        self.assertFalse(changes.requires_native(paths))
+        current = (Path(__file__).resolve().parents[1] / changes.WORKFLOW).read_text(encoding='utf8')
+        self.assertEqual(current.count(changes.HARDWARE_TEST_STEP),1)
+        before = current.replace(changes.HARDWARE_TEST_STEP,'',1)
+        for after, expected in ((current,False),(current+'\n# unrelated recipe change\n',True)):
+            with patch.object(changes,'git',side_effect=lambda _,ref,**kw:
+                              (before if ref.startswith('a'*40) else after).encode()):
+                self.assertEqual(changes.requires_native(paths+[changes.WORKFLOW],'a'*40,'b'*40),expected)
+
     def test_query_launcher_contracts_run_without_engine_builds(self):
         from unittest.mock import patch
         paths = ['scripts/launcher/worker.py', 'scripts/windows/start-backend.ps1',
