@@ -148,6 +148,12 @@ Layerwise 的单 GPU 普通目标或 DFlash2 路径，默认在 GPU 内整理已
 
 PRO 6000 的频繁整理诊断中，平均刷新占用时间约从 75 ms 降至 39 ms；常用 16k reserve 的完整任务2总时间降低约 0.9%，decode 持平，4/8 路总体变化较小。[实现、计时口径及验证范围](ninfer-resident-pressure-20261111.md)
 
+单 GPU、FP8 KV、D256／24 个 Query heads／4 个 KV heads 的 prefill 可以设置 `NINFER_PREFILL_PAGE_LSE_REUSE=1`，从主 attention kernel 复用采样位置的每页 LSE，再归一化为 attention mass，省去独立的 Q·K 统计。Ampere/Ada 和默认 Blackwell 构建均支持；RTX 5090 和 RTX PRO 6000 Blackwell 使用 CUDA 13.1 或更新版本编译 `sm_120a`。不满足条件时沿用独立统计。`NINFER_PREFILL_FP8_WIDE_KV` 仍保留 Ampere/Ada 的准入条件。
+
+本轮实测设备为 RTX PRO 6000 Blackwell，未单独测试 RTX 5090。36K 历史、1024-token chunk、32 个采样位置的 attention 加统计约从 31.81 ms 降至 9.75 ms；四组内核用例的主 attention 输出逐 bit 一致，页概率通过独立 FP64 参考检验，但与独立 FP32 Q·K 统计存在浮点累计差异。
+
+完整服务对照使用同一 Qwen3.8-27B NVIDIA NVFP4 模型、FP8 KV、36K 预算、64-token 物理页及评分、1024-token chunk、单路请求，只切换统计复用开关；另一个 MTP 驻留整理优化在两组中固定开启，不包含在此 SM120 支持改动内。每种输入各测三次：16,384-token 输入从平均 5,005 提升到 7,899 token/s（+57.8%）；98,304-token 输入从 1,988 提升到 3,910 token/s（+96.7%），耗时从 49.44 降到 25.14 秒。口径包含主机处理、KV 搬运和单 token 完成，排除模型加载及预热；未重跑 130 题准确率或测量 decode／并发吞吐。[测量条件、误差和验证范围](benchmarks/ninfer-sm120-prefill-page-lse-20261114.json)
+
 `--kvmem-layerwise-score-tokens 32` 让 NInfer 每 32 个 token 保存一个 Mean-K。每个查询位置和注意力头在所有候选半页上做 softmax，然后把同一物理页的两个概率相加，按总概率选页。预算、固定区、Pressure 和 KV 搬运仍以 64-token 物理页计量。默认值 64 每页保存一个 Mean-K。选 32 时统计记录数加倍。
 
 `--kvmem-layerwise-score-tokens 32 --kvmem-layerwise-half-reduce max` 改用两个半页分数中的较大值。每个查询位置、每个头仍在该层全部可评分半页上做 softmax；先对头求平均、累加所有查询行，再取 `max(left, right)` 给原来的 64-token 页排序。查询分块不影响取 max 的位置。固定区和 TopK 仍以整页计费；`--kvmem-layerwise-half-reduce sum` 为默认。
