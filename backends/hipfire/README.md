@@ -23,6 +23,7 @@ restores it.
 | Query-span multi-row Q scoring: `QUERY_SPAN` (1 = mean-K cosine, byte-neutral; >1 = page-softmax over a per-slot host Q ring), `query_score_frame` + `page_softmax_scores` wrapped through the shim + crate FFI; zero VRAM growth | `../patches/hipfire-query-span.patch` |
 | Host page-softmax SIMD dot reduction: crate build adds `-fopenmp-simd` so the core dot product's `#pragma omp simd` is honoured (float32 accumulation over FP16-rounded operands); per-selection latency ~3.4× lower, default byte-neutral | `../patches/hipfire-softmax-simd.patch` |
 | Layerwise recall foundation (Phase 3.2 sub-patch ①): crate-agnostic `LayerwisePagePool` composite-slot pool + `PackedArenaLayout` packed-page geometry (rdna-compute), Q8 packed-page adapter bridging the engine stride authority to the core generic `PayloadLayout` manifest (hipfire-arch-qwen35), and the core layerwise-API C ABI shim entries + crate FFI (payload builder / catalog `plan_layer` / `NativeKvLayerRegions` / `LayerwiseQueryRequest` state machine / native scorer); additive, NOT wired into live serve, Legacy byte-neutral | `../patches/hipfire-layerwise-foundation.patch` |
+| Layerwise recall function (Phase 3.2 sub-patch ②): GPU HIP page scorer (`kvmem_page_score`, 4 wave-aware gfx1100 kernels, FP64-oracle parity) + per-layer driver (`layerwise_driver`: composite-arena stripe COW restore + drop-evict + suffix partial restore) wired into the three paged paths A/B/C via `serve_engine` scoped orchestration + `KvMemCtl` re-bootstrap/accessor/page-aligned policy + write-through feed; `HIPFIRE_KVMEM_RECALL_STRATEGY=layerwise` engine opt-in (default Legacy byte-neutral). Consumes ①'s shim + crate FFI unchanged (no new C entries, core logic zero-change) | `../patches/hipfire-layerwise-function.patch` |
 
 The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
 `KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
@@ -287,12 +288,63 @@ regression). A pre-existing `qwen35/weights.rs` `dense_fixture` (missing the
 matching production) so the crate's `--lib` test target compiles; release N-gate
 builds never compiled `cfg(test)`, so the breakage had stayed latent.
 
-Sub-patch ② adds the GPU HIP scorer + per-layer driver into the three paged paths
-+ write-through feed + drop-evict policy + stripe COW restore
-(`RECALL_STRATEGY=Layerwise` opt-in); sub-patch ③ adds the pressure attention-mass
-tap + quota accounts + env exposure + fail-closed guards and seals the
-recall-benefit gate. Each sub-patch is Legacy byte-neutral and independently
-re-verified; rollback granularity = sub-patch.
+The tenth `layerwise-function` patch makes per-layer (`RecallStrategy::Layerwise`)
+KV recall functional — Phase 3.2 sub-patch ② of three, opt-in via
+`HIPFIRE_KVMEM_RECALL_STRATEGY=layerwise` (default `legacy` stays byte-neutral). It
+consumes sub-patch ①'s EXISTING core layerwise-API shim + crate FFI unchanged (no
+new C ABI entries, no `hipfire-kvmem/src/lib.rs` change); the core library is
+strategy-agnostic and unchanged (core logic zero-change, `hybrid.rs` untouched).
+Four pieces land:
+(1) `crates/rdna-compute/src/kvmem_page_score.rs` + `kernels/src/kvmem_page_score.hip`
+— the GPU HIP page scorer (4 wave-aware gfx1100 kernels, wave32/64 shuffle
+reduction) scoring resident pages against the current layer's tapped Q, ported from
+the host reference and verified against an FP64 oracle (`2e-6 + 3e-5·expected`).
+(2) `crates/hipfire-arch-qwen35/src/layerwise_driver.rs` — the per-layer Rust driver
+wrapping the core `LayerwiseQueryRequest` state machine: composite-arena stripe COW
+restore (whole-page copy preserving the other layers + restricted-plane write +
+`writer_references==1`/`validate_sources`/eager-stream/Drain guards), intrinsic
+drop-evict (a composite slot frees only when every layer stripe drops), and suffix
+partial restore (mid-page `fed%128` causal bound). A single pinned slab sized
+`n_slots × extent` gives each cold page a disjoint host slice with one end-fence, so
+batched async H2D restore is tear-free (the slab-reuse race fix).
+(3) `serve_engine.rs` scoped orchestration + `kvmem_ctl.rs` re-bootstrap — the engine
+synthesizes a canonical bootstrap (all pages resident, `suffix_page=fed/128`,
+`partial=fed%128`), takes the driver into `forward_step(Some)` across the three paged
+paths (A `paged_decode_reference_layers`, B `run_layers_slots` dense/MoE shared seam,
+C `forward_scratch_layers_paged`), then frees + advances the layerwise seq + restores.
+Three core-contract fixes (read directly from the C++ core): 0→1-based identity
+normalization at the bootstrap synthesis boundary (`memory_contract.cpp:157` /
+`layerwise_selection.cpp:85` require non-zero identity; engine counters/SessionTable
+untouched, bijective monotone, Legacy byte-neutral), `evaluation.begin = frontier =
+full_pages*128` (`layerwise_selection.cpp:88`), and a page-aligned policy
+(`register_append(full_pages*128)`, `total_tokens%128==0`, each block `n_tokens==128`).
+(4) write-through feed (`feed_rows` writes the packed K/V archive) + the
+`LayerwiseFwd<'a,'b>` double-lifetime alias threaded through `opts`/`graphed_opts` and
+every call site (the `vmm.rs`/`vmm/exact.rs`/`ep_batch.rs` +1..3-line edits initialise
+the new field to `None`, keeping Legacy byte-neutral).
+
+Verification is layered and GPU-exact on gfx1100: D1 FP64-oracle scorer parity; D4a
+composite-arena↔paged attention addressing byte-exact (production shape, non-trivial
+slot map, incl. spill mask); D4b-3 Path A/B/C per-layer restore interleave byte-exact
+vs Legacy (`layerwise_driver` 12/12); D4b-4 Path-D real `forward_step` orchestration
+byte-exact (`partial∈{0,40}`, fed-prefix==pack proves mid-page restore). The N-gate on
+the rebuilt engine reproduces the sealed chain: greedy decode sha256 == `29e8a27d…`,
+VERIFY 0 mismatch, recall identical to baseline. A real-serve smoke under
+`RECALL_STRATEGY=layerwise` (KVMEM=1, VERIFY=1) passes (short+long needle recall True,
+0 mismatch/dups/poison, clean VRAM teardown). The recall-benefit gate — the hard seal
+condition — is met: a compound two-needle discriminator (vault@25% / backup@75%, one
+compound question, over the 45-page budget) shows Layerwise recalling the backup
+passphrase exactly where Legacy confabulates, reproduced byte-identically across two
+runs, with Layerwise ≥ Legacy on every metric (no regression). The B-gate seals the
+new baseline: a 10-SKU recall sweep (7 qwen/bonsai SKUs patched==stock on
+short/long/multi-turn + 3 escha SKUs batched-WMMA==per-token needle) and stock-v0.4.6
+sustained decode parity within 10% on all three targets (mq4-xts +3.74% slower,
+tq2 −4.07% faster, bq1 −9.26% faster).
+
+Sub-patch ③ adds the pressure attention-mass tap + quota accounts
+(`HIPFIRE_KVMEM_LAYERWISE_*_MIB`) + wrapper/router env exposure + fail-closed guards
+and seals the final recall-benefit gate. Each sub-patch is Legacy byte-neutral and
+independently re-verified; rollback granularity = sub-patch.
 
 ## Enabling
 
