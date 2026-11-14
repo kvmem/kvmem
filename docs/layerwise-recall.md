@@ -148,14 +148,93 @@ Layerwise 的单 GPU 普通目标或 DFlash2 路径，默认在 GPU 内整理已
 
 PRO 6000 的频繁整理诊断中，平均刷新占用时间约从 75 ms 降至 39 ms；常用 16k reserve 的完整任务2总时间降低约 0.9%，decode 持平，4/8 路总体变化较小。[实现、计时口径及验证范围](ninfer-resident-pressure-20261111.md)
 
-单 GPU、FP8 KV、D256／24 个 Query heads／4 个 KV heads 的 prefill 可以设置 `NINFER_PREFILL_PAGE_LSE_REUSE=1`，从主 attention kernel 复用采样位置的每页 LSE，再归一化为 attention mass，省去独立的 Q·K 统计。Ampere/Ada 和默认 Blackwell 构建均支持；RTX 5090 和 RTX PRO 6000 Blackwell 使用 CUDA 13.1 或更新版本编译 `sm_120a`。不满足条件时沿用独立统计。`NINFER_PREFILL_FP8_WIDE_KV` 仍保留 Ampere/Ada 的准入条件。
-
-本轮实测设备为 RTX PRO 6000 Blackwell，未单独测试 RTX 5090。36K 历史、1024-token chunk、32 个采样位置的 attention 加统计约从 31.81 ms 降至 9.75 ms；四组内核用例的主 attention 输出逐 bit 一致，页概率通过独立 FP64 参考检验，但与独立 FP32 Q·K 统计存在浮点累计差异。
-
-完整服务对照使用同一 Qwen3.8-27B NVIDIA NVFP4 模型、FP8 KV、36K 预算、64-token 物理页及评分、1024-token chunk、单路请求，只切换统计复用开关；另一个 MTP 驻留整理优化在两组中固定开启，不包含在此 SM120 支持改动内。每种输入各测三次：16,384-token 输入从平均 5,005 提升到 7,899 token/s（+57.8%）；98,304-token 输入从 1,988 提升到 3,910 token/s（+96.7%），耗时从 49.44 降到 25.14 秒。口径包含主机处理、KV 搬运和单 token 完成，排除模型加载及预热；未重跑 130 题准确率或测量 decode／并发吞吐。[测量条件、误差和验证范围](benchmarks/ninfer-sm120-prefill-page-lse-20261114.json)
-
 `--kvmem-layerwise-score-tokens 32` 让 NInfer 每 32 个 token 保存一个 Mean-K。每个查询位置和注意力头在所有候选半页上做 softmax，然后把同一物理页的两个概率相加，按总概率选页。预算、固定区、Pressure 和 KV 搬运仍以 64-token 物理页计量。默认值 64 每页保存一个 Mean-K。选 32 时统计记录数加倍。
 
 `--kvmem-layerwise-score-tokens 32 --kvmem-layerwise-half-reduce max` 改用两个半页分数中的较大值。每个查询位置、每个头仍在该层全部可评分半页上做 softmax；先对头求平均、累加所有查询行，再取 `max(left, right)` 给原来的 64-token 页排序。查询分块不影响取 max 的位置。固定区和 TopK 仍以整页计费；`--kvmem-layerwise-half-reduce sum` 为默认。
 
 `--kvmem-layerwise-unique-query-anchor` 为文本查询增加可选的精确匹配。对于 32–64 个 token 的查询，当已接受历史中只有一个最长连续匹配、且至少匹配 32 个 token，选择器从原预算中保留实际相交的至多两个 64-token 页。重复、过短、图像或预算不足的情况沿用原打分。其余候选页继续根据当前层的 Mean-K 分数选择。
+
+## NInfer 的 FP8 prefill 页分数复用
+
+单序列、FP8 E4M3 Row256 KV、24 个 Q 头 / 4 个 KV 头 / head dimension 256 的 eager prefill，
+可在启动服务前设置 `NINFER_PREFILL_PAGE_LSE_REUSE=1`，复用 attention 已计算的页 log-sum-exp，
+省去独立的页分数 QK 扫描。再设 `NINFER_PREFILL_FP8_WIDE_KV=1`，可将每层可见 KV 展开一次并跨查询块共享。
+两个开关默认关闭；不适用的形状和调用沿用普通 attention 与独立反馈计算。
+
+Blackwell 的 page-LSE 支持沿用 [PR #305](https://github.com/kvmem/kvmem/pull/305)；本次增量扩展 Turing 的内核形状选择，
+并按共享内存需求放开 wide-KV，不重复叠加 Blackwell 的收益。架构判定如下：
+
+| 后端目标 | page-LSE 复用 | wide-KV 复用 |
+|---|---|---|
+| Turing，sm_75 / RTX 20 系 | 使用 Turing 小共享内存形状 | 不启用：内核需 96 KiB，硬件上限 64 KiB |
+| Ampere / Ada，sm_80/86/89 | 支持 | 支持 |
+| Blackwell，sm_120a / RTX 50 系、RTX PRO 6000 | 支持 | 支持 |
+| Volta，sm_70 / V100 | 保留独立反馈路径，其专用 prompt 实现未接入捕获 | 不启用 |
+
+本次通过 sm_75/80/86/89/120a 编译检查；实际 GPU 验证使用 RTX PRO 6000，不能视为 Turing 等其他实卡已验证。
+后端的原生编译目标范围未扩大到 Hopper/B200。
+wide-KV 仍要求 prefill 宽度至少 128、可见 KV 不超过 65536 tokens，额外暂存空间在 40960 tokens 时为 160 MiB、
+65536 tokens 时为 256 MiB。窄 prefill 可能不足以摊薄展开和额外读写成本。
+
+以下独立算子及 NVFP4 整模型数据来自合入 #305 前的原生树 `9fb10dda69e2`，各报告保留原始构建标识。
+PRO6000 上，前两组固定 36864 历史、6 轮轮换顺序、每组每轮预热 5 次并计时 10 次，
+attention 加页分数计算的单次耗时中位数如下（单位 ms）：
+
+| Prefill / 历史 tokens | 全关闭 | 仅 page-LSE | 两项全开 |
+|---|---:|---:|---:|
+| 1024 / 36864 | 16.771 | 7.908 | 6.792 |
+| 4096 / 36864 | 65.743 | 29.770 | 21.133 |
+| 128 / 65408 | 5.078 | 3.319 | 4.138 |
+
+前两组两项全开的算子吞吐分别为基线的约 2.47 / 3.11 倍；第三组 wide-KV 比只开 page-LSE 慢约 24.7%，
+因此不能把两项全开作为所有负载的最快设置。这些是独立算子结果，不是整模型 tokens/s，未测 decode 或 RULER 质量。
+
+45 组边界/开关组合完成 90 项独立 FP64 参考检查，覆盖非连续物理页、页/分块边界及 65536-token 阈值，
+并检查归一化、因果不可见页为零和输出/暂存区哨兵。attention 输出在三组之间逐位相同；
+复用页分数与独立 FP32 反馈存在舍入差异，最大相对 L2 约 0.508%，不可宣称页分数逐位一致。
+新测试初稿的 0.9% 单点相对上限也被未优化基线触发；独立舍入诊断确认来自已有 BF16 Q/K 暂存及 softmax 放大。
+最终对所有样本统一采用 1.2% 相对 L2 和 `0.004 + 1.2% × max(|reference|)` 单点上限后全量重跑，
+未改变生产计算或原有测试标准。[完整计时、数值标准与验证范围](benchmarks/ninfer-prefill-architectures-20261114.json)
+
+同日补测 PRO6000 整模型：Qwen3.8-27B NVFP4、FP8 KV、单并发、262148-token 固定输入，
+历史预算 36864、生成预留 4096、prefill 分块 4096；关闭最终 Query 重选和投机解码。
+每次独立重启服务并预热，三组轮换顺序各测三次，全部长请求缓存命中为零。
+中位数如下；首 token 时间从客户端发出请求到收到首个非空文本片段，排除服务启动和预热：
+
+| 设置 | Prefill tokens/s | 相对全关闭 | 首 token 秒 |
+|---|---:|---:|---:|
+| 全关闭 | 1977.4 | — | 132.86 |
+| 仅 page-LSE | 2286.7 | +15.6% | 114.94 |
+| 两项全开 | 2329.8 | +17.8% | 112.84 |
+
+两项全开让首 token 时间减少约 20.0 秒（15.1%），其中 wide-KV 相比仅开 page-LSE 额外增加约 1.9% 吞吐。
+三次吞吐范围分别为 1974–2003、2271–2295、2328–2331 tokens/s。
+这验证了该配置下的整模型 prefill 收益；分块不同于 PR 的 1024-token 配置，不能视为 PR #302 的 RTX4090 数据的精确复现。
+输出仅为短确认 `OK`，本轮未评估召回质量或 decode 吞吐。两个开关仍默认关闭。
+[整模型配置、逐次计时和证据校验](benchmarks/ninfer-prefill-pro6000-model-20261114.json)
+
+PR #305 的作者另在 Linux / CUDA 13.1、`NINFER_SM120_NATIVE=OFF` 的兼容构建上报告：
+
+本轮实测设备为 RTX PRO 6000 Blackwell，未单独测试 RTX 5090。36K 历史、1024-token chunk、32 个采样位置的 attention 加统计约从 31.81 ms 降至 9.75 ms；四组内核用例的主 attention 输出逐 bit 一致，页概率通过独立 FP64 参考检验，但与独立 FP32 Q·K 统计存在浮点累计差异。
+
+完整服务对照使用同一 Qwen3.8-27B NVIDIA NVFP4 模型、FP8 KV、36K 预算、64-token 物理页及评分、1024-token chunk、单路请求，只切换统计复用开关；另一个 MTP 驻留整理优化在两组中固定开启，不包含在此 SM120 支持改动内。每种输入各测三次：16,384-token 输入从平均 5,005 提升到 7,899 token/s（+57.8%）；98,304-token 输入从 1,988 提升到 3,910 token/s（+96.7%），耗时从 49.44 降到 25.14 秒。口径包含主机处理、KV 搬运和单 token 完成，排除模型加载及预热；未重跑 130 题准确率或测量 decode／并发吞吐。[测量条件、误差和验证范围](benchmarks/ninfer-sm120-prefill-page-lse-20261114.json)
+
+本地独立复测 #305 使用 Windows / CUDA 13.2、`NINFER_SM120_NATIVE=ON` 的 NInfer，
+模型为 Qwen3.8-27B GSQ-RCO IQ3_S，FP8 KV、36864-token 历史预算、4096-token reserve、1024-token prefill chunk，
+关闭 Query 重选、投机解码和 wide-KV，仅切换 page-LSE。冻结原始 token 输入，每组每种长度三次，
+关闭组分布在开启组的前后；每次重启服务后均预热。全部计时请求的缓存命中为零。
+吞吐口径为输入 token 数除以平均请求到单 token 完成耗时，不包含启动和预热：
+
+| 输入 tokens | 关闭 tokens/s | 开启 tokens/s | 吞吐提升 | 关闭 / 开启秒 |
+|---|---:|---:|---:|---:|
+| 16384 | 3383.8 | 4079.3 | +20.6% | 4.842 / 4.016 |
+| 98304 | 1737.2 | 2700.7 | +55.5% | 56.588 / 36.399 |
+
+这验证了 #305 在本机 IQ3 配置下的收益；模型、操作系统、原生构建及 MTP 配置不同，不能与作者 NVFP4 数据直接比大小，
+也不能把它与前述 262148-token、4096 chunk 的结果当作只改变 chunk 的对照。
+[本地复测配置、12 次结果及证据校验](benchmarks/ninfer-pr305-pro6000-20261114.json)
+
+增量合入后的原生树 `dc3be91cb6e42` 再次通过五种架构编译、45 组用例 / 90 项 FP64 参考检查；
+PRO6000 的两项全开版本另完成 16K、98K IQ3 输入的集成验证。后两次仅为功能验证，不作为增量性能的统计结论。
+原有 #305 的实验测试保留不变，两个环境变量仍默认关闭。
+[增量构建、数值与模型验证记录](benchmarks/ninfer-prefill-architecture-integration-20261114.json)
