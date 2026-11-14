@@ -22,15 +22,6 @@ ggml_tensor* borrowed(ggml_context* ctx,ggml_tensor* source) {
     leaf->data=source->data; leaf->buffer=source->buffer;
     return leaf;
 }
-std::vector<int> sampled_layers(const llama_model& model) {
-    std::vector<int> standard;
-    for(uint32_t il=0;il<model.hparams.n_layer();++il) if(!model.hparams.is_recr(il)) standard.push_back(int(il));
-    if(standard.empty()) return {};
-    std::vector<int> result{standard.front(),standard[standard.size()/2],standard.back()};
-    std::sort(result.begin(),result.end());
-    result.erase(std::unique(result.begin(),result.end()),result.end());
-    return result;
-}
 } // namespace
 
 struct llama_memory_kvmem::AttentionSampler {
@@ -199,7 +190,7 @@ struct llama_memory_kvmem::AttentionSampler {
 void llama_memory_kvmem::capture_attention(ggml_context* ctx,ggml_cgraph* graph,
     ggml_tensor* q,ggml_tensor* k,ggml_tensor* mask,float scale,float max_bias,float softcap,int layer) {
     if(layer<0 || uint32_t(layer)>=n_layer_) return; // target layers only; native MTP is the suffix
-    const auto selected=sampled_layers(model_);
+    const auto& selected=sampled_layers_;
     if(!std::binary_search(selected.begin(),selected.end(),layer)) return;
     auto* captured=ggml_cont(ctx,q);
     // FA may cast an F32 cache into a temporary F16 K. Keep that operand alive
@@ -288,7 +279,7 @@ void llama_memory_kvmem::observe_attention(uint32_t index,uint32_t accepted,ggml
     for(size_t i=0;i<rows.size();++i) observations[i].source_position=batch.begin+rows[i];
     if(!rows.empty()) {
         if(sched) ggml_backend_sched_synchronize(sched);
-        if(attention_captures_.size()!=sampled_layers(model_).size())
+        if(attention_captures_.size()!=sampled_layers_.size())
             throw std::runtime_error("KVMem missed a selected attention layer");
         if(!attention_sampler_) attention_sampler_=std::make_shared<AttentionSampler>();
         for(const auto& capture:attention_captures_) {
