@@ -13,6 +13,8 @@
 #include <kvmem/native_kv_payload.hpp>
 #include <kvmem/layerwise_memory.hpp>
 #include <kvmem/layerwise_request.hpp>
+#include <kvmem/query_projection_tape.hpp>
+#include <kvmem/layerwise_pressure.hpp>
 
 #include <cstring>
 #include <filesystem>
@@ -1773,4 +1775,876 @@ extern "C" uint64_t hk_layerwise_request_accepted_resident(const hk_layerwise_re
     } catch (...) {
         return 0;
     }
+}
+
+// ── layerwise activation accounts + projected-Q history tape ──
+
+struct hk_spill {
+    std::unique_ptr<kvmem::SpillFile> impl;
+};
+struct hk_reservation {
+    kvmem::HostKvReservation impl;
+};
+struct hk_tape {
+    std::unique_ptr<kvmem::QueryProjectionTape> impl;
+};
+struct hk_tape_chunk {
+    kvmem::QueryProjectionChunkSource impl;
+};
+
+namespace {
+
+kvmem::QueryProjectionLayout query_layout_from(const hk_query_layout * l) {
+    if (!l) throw std::invalid_argument("null query projection layout");
+    if (!l->planes && l->plane_count) throw std::invalid_argument("null query projection planes");
+    kvmem::QueryProjectionLayout out;
+    out.format = l->format ? l->format : "";
+    out.version = l->version;
+    out.planes.reserve(l->plane_count);
+    for (size_t i = 0; i < l->plane_count; ++i)
+        out.planes.push_back({l->planes[i].id, l->planes[i].row_stride});
+    return out;
+}
+
+std::vector<kvmem::QueryProjectionPlaneBytes> query_plane_bytes_from(const hk_query_plane_bytes * p,
+                                                                   size_t n) {
+    if (!p && n) throw std::invalid_argument("null query plane bytes");
+    std::vector<kvmem::QueryProjectionPlaneBytes> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) out.push_back({p[i].id, p[i].data, p[i].bytes});
+    return out;
+}
+
+} // namespace
+
+extern "C" hk_spill * hk_spill_create(const char * directory, uint64_t capacity_bytes) {
+    clear_error();
+    if (!directory || !*directory) {
+        set_error("hk_spill_create: null directory");
+        return nullptr;
+    }
+    try {
+        return new hk_spill{
+            std::make_unique<kvmem::SpillFile>(std::filesystem::path(directory), capacity_bytes)};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_spill_create: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_spill_destroy(hk_spill * s) { delete s; }
+
+extern "C" uint64_t hk_spill_charged_bytes(const hk_spill * s) {
+    return (s && s->impl) ? s->impl->charged_bytes() : 0;
+}
+
+extern "C" uint64_t hk_spill_capacity_bytes(const hk_spill * s) {
+    return (s && s->impl) ? s->impl->capacity_bytes() : 0;
+}
+
+extern "C" hk_reservation * hk_storage_reserve(hk_storage * s, uint64_t bytes) {
+    clear_error();
+    if (!s || !s->impl) {
+        set_error("hk_storage_reserve: null storage");
+        return nullptr;
+    }
+    try {
+        return new hk_reservation{s->impl->reserve(bytes)};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_storage_reserve: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_reservation_destroy(hk_reservation * r) { delete r; }
+
+extern "C" uint64_t hk_reservation_remaining(const hk_reservation * r) {
+    return r ? r->impl.remaining() : 0;
+}
+
+extern "C" hk_host_record * hk_reservation_allocate(hk_reservation * r, const void * bytes,
+                                                    size_t len) {
+    clear_error();
+    if (!r) {
+        set_error("hk_reservation_allocate: null reservation");
+        return nullptr;
+    }
+    try {
+        return new hk_host_record{r->impl.allocate(len, bytes)};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_reservation_allocate: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" hk_tape * hk_tape_create_ram(hk_storage * activation, hk_storage * metadata,
+                                       uint64_t max_chunks, const hk_layerwise_identity * identity,
+                                       uint32_t model_layer, const hk_query_layout * layout) {
+    clear_error();
+    if (!activation || !activation->impl || !metadata || !metadata->impl || !identity || !layout) {
+        set_error("hk_tape_create_ram: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_tape{std::make_unique<kvmem::QueryProjectionTape>(
+            *activation->impl, *metadata->impl, max_chunks, identity_from(identity), model_layer,
+            query_layout_from(layout))};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_tape_create_ram: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" hk_tape * hk_tape_create_disk(hk_spill * activation, hk_storage * metadata,
+                                        uint64_t max_chunks, const hk_layerwise_identity * identity,
+                                        uint32_t model_layer, const hk_query_layout * layout) {
+    clear_error();
+    if (!activation || !activation->impl || !metadata || !metadata->impl || !identity || !layout) {
+        set_error("hk_tape_create_disk: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_tape{std::make_unique<kvmem::QueryProjectionTape>(
+            *activation->impl, *metadata->impl, max_chunks, identity_from(identity), model_layer,
+            query_layout_from(layout))};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_tape_create_disk: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_tape_destroy(hk_tape * t) { delete t; }
+
+extern "C" uint64_t hk_tape_metadata_bound(const hk_query_layout * layout, uint64_t max_chunks) {
+    clear_error();
+    try {
+        return kvmem::QueryProjectionTape::metadata_bound(query_layout_from(layout), max_chunks);
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_tape_metadata_bound: unknown C++ exception");
+    }
+    return 0;
+}
+
+extern "C" uint64_t hk_tape_metadata_bytes(const hk_tape * t) {
+    return (t && t->impl) ? t->impl->metadata_bytes() : 0;
+}
+extern "C" uint64_t hk_tape_max_chunks(const hk_tape * t) {
+    return (t && t->impl) ? t->impl->max_chunks() : 0;
+}
+extern "C" uint64_t hk_tape_total_bytes(const hk_tape * t) {
+    return (t && t->impl) ? t->impl->total_bytes() : 0;
+}
+extern "C" uint64_t hk_tape_reserved_bytes(const hk_tape * t) {
+    return (t && t->impl) ? t->impl->reserved_bytes() : 0;
+}
+extern "C" uint64_t hk_tape_covered_end(const hk_tape * t) {
+    return (t && t->impl) ? t->impl->covered_end() : 0;
+}
+extern "C" size_t hk_tape_chunk_count(const hk_tape * t) {
+    return (t && t->impl) ? t->impl->chunk_count() : 0;
+}
+extern "C" uint32_t hk_tape_model_layer(const hk_tape * t) {
+    return (t && t->impl) ? t->impl->model_layer() : 0;
+}
+extern "C" int hk_tape_complete(const hk_tape * t) {
+    return (t && t->impl && t->impl->complete()) ? 1 : 0;
+}
+extern "C" int hk_tape_aborted(const hk_tape * t) {
+    return (t && t->impl && t->impl->aborted()) ? 1 : 0;
+}
+
+extern "C" hk_tape_chunk * hk_tape_append(hk_tape * t, const hk_layerwise_identity * identity,
+                                         uint32_t model_layer, uint64_t begin, uint64_t count,
+                                         const hk_query_plane_bytes * planes, size_t plane_count) {
+    clear_error();
+    if (!t || !t->impl || !identity) {
+        set_error("hk_tape_append: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_tape_chunk{t->impl->append(identity_from(identity), model_layer, begin, count,
+                                                 query_plane_bytes_from(planes, plane_count))};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_tape_append: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" int hk_tape_finish(hk_tape * t, const hk_layerwise_identity * identity,
+                             uint32_t model_layer) {
+    if (!t || !t->impl || !identity) {
+        set_error("hk_tape_finish: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded([&] { t->impl->finish(identity_from(identity), model_layer); }, "hk_tape_finish");
+}
+
+extern "C" hk_tape_chunk * hk_tape_chunk_at(const hk_tape * t, const hk_layerwise_identity * identity,
+                                           uint32_t model_layer, size_t index) {
+    clear_error();
+    if (!t || !t->impl || !identity) {
+        set_error("hk_tape_chunk_at: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_tape_chunk{t->impl->chunk(identity_from(identity), model_layer, index)};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_tape_chunk_at: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" int hk_tape_read_rows(const hk_tape * t, const hk_layerwise_identity * identity,
+                                 uint32_t model_layer, uint32_t plane, uint64_t begin, uint64_t count,
+                                 void * dest, size_t dest_bytes) {
+    if (!t || !t->impl || !identity || (!dest && dest_bytes)) {
+        set_error("hk_tape_read_rows: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded(
+        [&] {
+            t->impl->read_rows(identity_from(identity), model_layer, plane, begin, count, dest,
+                               dest_bytes);
+        },
+        "hk_tape_read_rows");
+}
+
+extern "C" void hk_tape_abort(hk_tape * t) {
+    if (t && t->impl) t->impl->abort();
+}
+
+extern "C" void hk_tape_chunk_destroy(hk_tape_chunk * c) { delete c; }
+extern "C" uint32_t hk_tape_chunk_model_layer(const hk_tape_chunk * c) {
+    return c ? c->impl.model_layer() : 0;
+}
+extern "C" uint64_t hk_tape_chunk_begin(const hk_tape_chunk * c) {
+    return c ? c->impl.rows().begin : 0;
+}
+extern "C" uint64_t hk_tape_chunk_end(const hk_tape_chunk * c) {
+    return c ? c->impl.rows().end : 0;
+}
+extern "C" size_t hk_tape_chunk_size(const hk_tape_chunk * c) { return c ? c->impl.size() : 0; }
+
+extern "C" int hk_tape_chunk_read_rows(const hk_tape_chunk * c, const hk_layerwise_identity * identity,
+                                       uint32_t model_layer, uint32_t plane, uint64_t begin,
+                                       uint64_t count, void * dest, size_t dest_bytes) {
+    if (!c || !identity || (!dest && dest_bytes)) {
+        set_error("hk_tape_chunk_read_rows: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded(
+        [&] {
+            c->impl.read_rows(identity_from(identity), model_layer, plane, begin, count, dest,
+                              dest_bytes);
+        },
+        "hk_tape_chunk_read_rows");
+}
+
+// ── layerwise attention-mass pressure ──
+
+struct hk_prefill_pressure {
+    std::unique_ptr<kvmem::LayerwisePrefillPressure> impl;
+};
+struct hk_prefill_snapshot {
+    kvmem::LayerwisePrefillSnapshot impl;
+};
+struct hk_output_pressure {
+    std::unique_ptr<kvmem::LayerwiseOutputPressure> impl;
+};
+struct hk_output_snapshot {
+    kvmem::LayerwiseOutputSnapshot impl;
+};
+struct hk_pressure_choices {
+    std::vector<kvmem::LayerwisePressureChoice> impl;
+};
+
+namespace {
+
+std::vector<uint32_t> copy_u32(const uint32_t * p, size_t n) {
+    if (!p || !n) return {};
+    return std::vector<uint32_t>(p, p + n);
+}
+std::vector<double> copy_f64(const double * p, size_t n) {
+    if (!p || !n) return {};
+    return std::vector<double>(p, p + n);
+}
+void session_to(const kvmem::SessionIdentity & s, hk_session_identity * out) {
+    out->id = s.id;
+    out->incarnation = s.incarnation;
+}
+
+kvmem::LayerwisePrefillOptions prefill_options_from(const hk_prefill_options * o) {
+    if (!o) throw std::invalid_argument("null prefill options");
+    kvmem::LayerwisePrefillOptions out;
+    out.block_tokens = o->block_tokens;
+    out.select_tokens = o->select_tokens;
+    out.reserve_tokens = o->reserve_tokens;
+    out.interval = o->interval;
+    out.stride = o->stride;
+    out.half_life = o->half_life;
+    return out;
+}
+void prefill_options_to(const kvmem::LayerwisePrefillOptions & o, hk_prefill_options * out) {
+    out->block_tokens = o.block_tokens;
+    out->select_tokens = o.select_tokens;
+    out->reserve_tokens = o.reserve_tokens;
+    out->interval = o.interval;
+    out->stride = o.stride;
+    out->half_life = o.half_life;
+}
+
+kvmem::LayerwisePrefillMass prefill_mass_from(const hk_prefill_mass & m) {
+    if (!m.starts && m.start_count) throw std::invalid_argument("null prefill mass starts");
+    if (!m.history && m.history_count) throw std::invalid_argument("null prefill mass history");
+    if (!m.masses && m.mass_count) throw std::invalid_argument("null prefill mass values");
+    kvmem::LayerwisePrefillMass out;
+    out.model_layer = m.model_layer;
+    out.starts = copy_u64(m.starts, m.start_count);
+    out.history = copy_u64(m.history, m.history_count);
+    out.masses = copy_f64(m.masses, m.mass_count);
+    return out;
+}
+kvmem::LayerwisePrefillAcceptance prefill_acceptance_from(const hk_prefill_acceptance * a) {
+    if (!a) throw std::invalid_argument("null prefill acceptance");
+    if (!a->rows && a->row_count) throw std::invalid_argument("null prefill acceptance rows");
+    if (!a->layers && a->layer_count) throw std::invalid_argument("null prefill acceptance layers");
+    kvmem::LayerwisePrefillAcceptance out;
+    out.history = stamp_from(a->history);
+    out.count = a->count;
+    out.accepted = a->accepted;
+    out.local_begin = a->local_begin;
+    out.rows = copy_u32(a->rows, a->row_count);
+    out.layers.reserve(a->layer_count);
+    for (size_t i = 0; i < a->layer_count; ++i) out.layers.push_back(prefill_mass_from(a->layers[i]));
+    return out;
+}
+
+kvmem::LayerwiseOutputOptions output_options_from(const hk_output_options * o) {
+    kvmem::LayerwiseOutputOptions out; // null selects the C++ defaults
+    if (o) {
+        out.scope = o->scope == HK_OUTPUT_NON_THINKING ? kvmem::LayerwiseOutputScope::NonThinking
+                                                       : kvmem::LayerwiseOutputScope::ToolCall;
+        out.interval = o->interval;
+        out.decay = o->decay;
+        out.commit_max_bytes = o->commit_max_bytes;
+    }
+    return out;
+}
+kvmem::LayerwiseOutputMass output_mass_from(const hk_output_mass & m) {
+    if (!m.history && m.history_count) throw std::invalid_argument("null output mass history");
+    if (!m.masses && m.mass_count) throw std::invalid_argument("null output mass values");
+    kvmem::LayerwiseOutputMass out;
+    out.model_layer = m.model_layer;
+    out.history = copy_u64(m.history, m.history_count);
+    out.masses = copy_f64(m.masses, m.mass_count);
+    return out;
+}
+kvmem::LayerwiseOutputAcceptance output_acceptance_from(const hk_output_acceptance * a) {
+    if (!a) throw std::invalid_argument("null output acceptance");
+    if (!a->rows && a->row_count) throw std::invalid_argument("null output acceptance rows");
+    if (!a->layers && a->layer_count) throw std::invalid_argument("null output acceptance layers");
+    kvmem::LayerwiseOutputAcceptance out;
+    out.history = stamp_from(a->history);
+    out.request = a->request;
+    out.accepted = a->accepted;
+    out.rows = copy_u32(a->rows, a->row_count);
+    out.layers.reserve(a->layer_count);
+    for (size_t i = 0; i < a->layer_count; ++i) out.layers.push_back(output_mass_from(a->layers[i]));
+    return out;
+}
+
+void pressure_choice_to(const kvmem::LayerwisePressureChoice & c, hk_pressure_choice * out) {
+    out->model_layer = c.model_layer;
+    out->candidates = c.candidates.data(); out->candidate_count = c.candidates.size();
+    out->fixed = c.fixed.data(); out->fixed_count = c.fixed.size();
+    out->selected = c.selected.data(); out->selected_count = c.selected.size();
+    out->scores = c.scores.data(); out->score_count = c.scores.size();
+    out->accepted_score_end = c.accepted_score_end;
+    out->samples = c.samples;
+    out->chunks = c.chunks;
+    out->selected_tokens = c.selected_tokens;
+    out->charged_tokens = c.charged_tokens;
+    out->source = c.source == kvmem::LayerwisePressureSource::Output ? HK_PRESSURE_OUTPUT
+                                                                     : HK_PRESSURE_PREFILL;
+    out->output_samples = c.output_samples;
+    out->output_rounds = c.output_rounds;
+}
+
+} // namespace
+
+extern "C" hk_prefill_pressure * hk_prefill_pressure_create(hk_session_identity session,
+                                                            const uint32_t * model_layers,
+                                                            size_t n_layers,
+                                                            const hk_prefill_options * options) {
+    clear_error();
+    if ((!model_layers && n_layers) || !options) {
+        set_error("hk_prefill_pressure_create: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_prefill_pressure{std::make_unique<kvmem::LayerwisePrefillPressure>(
+            kvmem::SessionIdentity{session.id, session.incarnation},
+            copy_u32(model_layers, n_layers), prefill_options_from(options))};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_prefill_pressure_create: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_prefill_pressure_destroy(hk_prefill_pressure * p) { delete p; }
+
+extern "C" uint32_t hk_prefill_pressure_rows(const hk_prefill_pressure * p, uint64_t begin,
+                                             uint32_t count, uint64_t local_begin, int replay,
+                                             uint32_t * out, uint32_t capacity) {
+    clear_error();
+    if (!p || !p->impl) {
+        set_error("hk_prefill_pressure_rows: invalid arguments");
+        return UINT32_MAX;
+    }
+    try {
+        const auto rows = p->impl->rows(begin, count, local_begin, replay != 0);
+        if (out) {
+            const size_t n = rows.size() < capacity ? rows.size() : capacity;
+            for (size_t i = 0; i < n; ++i) out[i] = rows[i];
+        }
+        return static_cast<uint32_t>(rows.size());
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_prefill_pressure_rows: unknown C++ exception");
+    }
+    return UINT32_MAX;
+}
+
+extern "C" int hk_prefill_pressure_accept(hk_prefill_pressure * p, const hk_prefill_acceptance * a) {
+    clear_error();
+    if (!p || !p->impl || !a) {
+        set_error("hk_prefill_pressure_accept: invalid arguments");
+        return HK_ERR;
+    }
+    try {
+        return p->impl->accept(prefill_acceptance_from(a)) ? 1 : 0;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_prefill_pressure_accept: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+extern "C" int hk_prefill_pressure_options(const hk_prefill_pressure * p, hk_prefill_options * out) {
+    if (!p || !p->impl || !out) {
+        set_error("hk_prefill_pressure_options: invalid arguments");
+        return HK_ERR;
+    }
+    prefill_options_to(p->impl->options(), out);
+    return HK_OK;
+}
+
+extern "C" hk_prefill_snapshot * hk_prefill_pressure_snapshot(const hk_prefill_pressure * p) {
+    clear_error();
+    if (!p || !p->impl) {
+        set_error("hk_prefill_pressure_snapshot: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_prefill_snapshot{p->impl->snapshot()};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_prefill_pressure_snapshot: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" int hk_prefill_pressure_restore(hk_prefill_pressure * p, const hk_prefill_snapshot * s,
+                                           uint64_t position) {
+    if (!p || !p->impl || !s) {
+        set_error("hk_prefill_pressure_restore: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded([&] { p->impl->restore(s->impl, position); }, "hk_prefill_pressure_restore");
+}
+
+extern "C" hk_pressure_choices * hk_prefill_pressure_select(const hk_prefill_pressure * p,
+                                                            const hk_memory_catalog * catalog,
+                                                            const uint64_t * mandatory,
+                                                            size_t n_mandatory, uint64_t budget_tokens,
+                                                            uint32_t sink_blocks) {
+    clear_error();
+    if (!p || !p->impl || !catalog || !catalog->impl || (!mandatory && n_mandatory)) {
+        set_error("hk_prefill_pressure_select: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_pressure_choices{p->impl->select(*catalog->impl,
+            copy_u64(mandatory, n_mandatory), budget_tokens, sink_blocks)};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_prefill_pressure_select: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_prefill_snapshot_destroy(hk_prefill_snapshot * s) { delete s; }
+
+extern "C" int hk_prefill_snapshot_session(const hk_prefill_snapshot * s, hk_session_identity * out) {
+    if (!s || !out) {
+        set_error("hk_prefill_snapshot_session: invalid arguments");
+        return HK_ERR;
+    }
+    session_to(s->impl.session, out);
+    return HK_OK;
+}
+
+extern "C" size_t hk_prefill_snapshot_layer_count(const hk_prefill_snapshot * s) {
+    return s ? s->impl.layers.size() : 0;
+}
+
+extern "C" int hk_prefill_snapshot_layer(const hk_prefill_snapshot * s, size_t i, uint32_t * model_layer,
+                                         uint64_t * end, uint64_t * samples, uint64_t * chunks) {
+    if (!s || i >= s->impl.layers.size()) {
+        set_error("hk_prefill_snapshot_layer: invalid arguments");
+        return HK_ERR;
+    }
+    const auto & layer = s->impl.layers[i];
+    if (model_layer) *model_layer = layer.model_layer;
+    if (end) *end = layer.end;
+    if (samples) *samples = layer.samples;
+    if (chunks) *chunks = layer.chunks;
+    return HK_OK;
+}
+
+extern "C" size_t hk_prefill_snapshot_value_count(const hk_prefill_snapshot * s, size_t i) {
+    if (!s || i >= s->impl.layers.size()) return 0;
+    return s->impl.layers[i].values.size();
+}
+
+extern "C" int hk_prefill_snapshot_value(const hk_prefill_snapshot * s, size_t i, size_t v,
+                                         uint64_t * original_start, double * mass, double * exposure) {
+    if (!s || i >= s->impl.layers.size() || v >= s->impl.layers[i].values.size()) {
+        set_error("hk_prefill_snapshot_value: invalid arguments");
+        return HK_ERR;
+    }
+    const auto & value = s->impl.layers[i].values[v];
+    if (original_start) *original_start = value.original_start;
+    if (mass) *mass = value.mass;
+    if (exposure) *exposure = value.exposure;
+    return HK_OK;
+}
+
+extern "C" void hk_pressure_choices_destroy(hk_pressure_choices * c) { delete c; }
+
+extern "C" size_t hk_pressure_choices_count(const hk_pressure_choices * c) {
+    return c ? c->impl.size() : 0;
+}
+
+extern "C" int hk_pressure_choices_get(const hk_pressure_choices * c, size_t i, hk_pressure_choice * out) {
+    if (!c || !out || i >= c->impl.size()) {
+        set_error("hk_pressure_choices_get: invalid arguments");
+        return HK_ERR;
+    }
+    pressure_choice_to(c->impl[i], out);
+    return HK_OK;
+}
+
+extern "C" hk_output_pressure * hk_output_pressure_create_markers(hk_session_identity session,
+                                                                  const uint32_t * model_layers,
+                                                                  size_t n_layers,
+                                                                  const hk_prefill_options * prefill,
+                                                                  const int32_t * markers5,
+                                                                  const hk_output_options * options) {
+    clear_error();
+    if ((!model_layers && n_layers) || !prefill || !markers5) {
+        set_error("hk_output_pressure_create_markers: invalid arguments");
+        return nullptr;
+    }
+    try {
+        std::array<int32_t, 5> markers{};
+        for (size_t i = 0; i < 5; ++i) markers[i] = markers5[i];
+        return new hk_output_pressure{std::make_unique<kvmem::LayerwiseOutputPressure>(
+            kvmem::SessionIdentity{session.id, session.incarnation},
+            copy_u32(model_layers, n_layers), prefill_options_from(prefill), markers,
+            output_options_from(options))};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_output_pressure_create_markers: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" hk_output_pressure * hk_output_pressure_create_external(hk_session_identity session,
+                                                                   const uint32_t * model_layers,
+                                                                   size_t n_layers,
+                                                                   const hk_prefill_options * prefill,
+                                                                   const hk_output_options * options) {
+    clear_error();
+    if ((!model_layers && n_layers) || !prefill) {
+        set_error("hk_output_pressure_create_external: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_output_pressure{std::make_unique<kvmem::LayerwiseOutputPressure>(
+            kvmem::SessionIdentity{session.id, session.incarnation},
+            copy_u32(model_layers, n_layers), prefill_options_from(prefill),
+            kvmem::LayerwiseExternalOutputScope{}, output_options_from(options))};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_output_pressure_create_external: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_output_pressure_destroy(hk_output_pressure * p) { delete p; }
+
+extern "C" int hk_output_pressure_begin(hk_output_pressure * p, const hk_memory_stamp * accepted_history,
+                                        uint64_t request, const uint32_t * prompt, size_t prompt_count) {
+    if (!p || !p->impl || !accepted_history || (!prompt && prompt_count)) {
+        set_error("hk_output_pressure_begin: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded([&] {
+        p->impl->begin(stamp_from(*accepted_history), request, copy_u32(prompt, prompt_count));
+    }, "hk_output_pressure_begin");
+}
+
+extern "C" int hk_output_pressure_begin_scope(hk_output_pressure * p,
+                                              const hk_memory_stamp * accepted_history,
+                                              uint64_t request, hk_output_scope_state scope) {
+    if (!p || !p->impl || !accepted_history) {
+        set_error("hk_output_pressure_begin_scope: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded([&] {
+        p->impl->begin_scope(stamp_from(*accepted_history), request,
+                             kvmem::LayerwiseOutputScopeState{scope.thinking != 0, scope.tool_call != 0});
+    }, "hk_output_pressure_begin_scope");
+}
+
+extern "C" int hk_output_pressure_accept_prefill(hk_output_pressure * p,
+                                                 const hk_memory_stamp * accepted_history,
+                                                 uint64_t request, uint64_t begin) {
+    if (!p || !p->impl || !accepted_history) {
+        set_error("hk_output_pressure_accept_prefill: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded([&] {
+        p->impl->accept_prefill(stamp_from(*accepted_history), request, begin);
+    }, "hk_output_pressure_accept_prefill");
+}
+
+extern "C" int hk_output_pressure_prepare(hk_output_pressure * p, uint64_t request, uint64_t begin,
+                                          const uint32_t * consumed_tokens, size_t count,
+                                          uint64_t * out_mask) {
+    clear_error();
+    if (!p || !p->impl || !out_mask || (!consumed_tokens && count)) {
+        set_error("hk_output_pressure_prepare: invalid arguments");
+        return HK_ERR;
+    }
+    try {
+        *out_mask = p->impl->prepare(request, begin, copy_u32(consumed_tokens, count));
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_output_pressure_prepare: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+extern "C" int hk_output_pressure_prepare_scope(hk_output_pressure * p, uint64_t request, uint64_t begin,
+                                                const hk_output_scope_row * rows, size_t count,
+                                                uint64_t * out_mask) {
+    clear_error();
+    if (!p || !p->impl || !out_mask || (!rows && count)) {
+        set_error("hk_output_pressure_prepare_scope: invalid arguments");
+        return HK_ERR;
+    }
+    try {
+        std::vector<kvmem::LayerwiseOutputScopeRow> scope_rows;
+        scope_rows.reserve(count);
+        for (size_t i = 0; i < count; ++i)
+            scope_rows.push_back({rows[i].thinking != 0, rows[i].tool_call != 0, rows[i].body != 0});
+        *out_mask = p->impl->prepare_scope(request, begin, scope_rows);
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_output_pressure_prepare_scope: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+extern "C" int hk_output_pressure_accept(hk_output_pressure * p, const hk_output_acceptance * a,
+                                         uint64_t * out_mask) {
+    clear_error();
+    if (!p || !p->impl || !a || !out_mask) {
+        set_error("hk_output_pressure_accept: invalid arguments");
+        return HK_ERR;
+    }
+    try {
+        *out_mask = p->impl->accept(output_acceptance_from(a));
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_output_pressure_accept: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+extern "C" int hk_output_pressure_finish(hk_output_pressure * p, uint64_t request,
+                                         const hk_memory_catalog * accepted_history) {
+    if (!p || !p->impl || !accepted_history || !accepted_history->impl) {
+        set_error("hk_output_pressure_finish: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded([&] { p->impl->finish(request, *accepted_history->impl); },
+                   "hk_output_pressure_finish");
+}
+
+extern "C" hk_output_snapshot * hk_output_pressure_snapshot(const hk_output_pressure * p) {
+    clear_error();
+    if (!p || !p->impl) {
+        set_error("hk_output_pressure_snapshot: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_output_snapshot{p->impl->snapshot()};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_output_pressure_snapshot: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" int hk_output_pressure_restore(hk_output_pressure * p, const hk_output_snapshot * s,
+                                          uint64_t position) {
+    if (!p || !p->impl || !s) {
+        set_error("hk_output_pressure_restore: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded([&] { p->impl->restore(s->impl, position); }, "hk_output_pressure_restore");
+}
+
+extern "C" hk_pressure_choices * hk_output_pressure_select(const hk_output_pressure * p,
+                                                           const hk_memory_catalog * catalog,
+                                                           const hk_prefill_pressure * prefill,
+                                                           const uint64_t * mandatory, size_t n_mandatory,
+                                                           uint64_t budget_tokens, uint32_t sink_blocks) {
+    clear_error();
+    if (!p || !p->impl || !catalog || !catalog->impl || !prefill || !prefill->impl ||
+        (!mandatory && n_mandatory)) {
+        set_error("hk_output_pressure_select: invalid arguments");
+        return nullptr;
+    }
+    try {
+        return new hk_pressure_choices{p->impl->select(*catalog->impl, *prefill->impl,
+            copy_u64(mandatory, n_mandatory), budget_tokens, sink_blocks)};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_output_pressure_select: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_output_snapshot_destroy(hk_output_snapshot * s) { delete s; }
+
+extern "C" int hk_output_snapshot_session(const hk_output_snapshot * s, hk_session_identity * out) {
+    if (!s || !out) {
+        set_error("hk_output_snapshot_session: invalid arguments");
+        return HK_ERR;
+    }
+    session_to(s->impl.session, out);
+    return HK_OK;
+}
+
+extern "C" int hk_output_snapshot_meta(const hk_output_snapshot * s, uint64_t * request,
+                                       uint64_t * accepted_end, int * active, int * thinking,
+                                       int * action, uint64_t * parser_tokens) {
+    if (!s) {
+        set_error("hk_output_snapshot_meta: invalid arguments");
+        return HK_ERR;
+    }
+    if (request) *request = s->impl.request;
+    if (accepted_end) *accepted_end = s->impl.accepted_end;
+    if (active) *active = s->impl.active ? 1 : 0;
+    if (thinking) *thinking = s->impl.parser.thinking ? 1 : 0;
+    if (action) *action = s->impl.parser.action ? 1 : 0;
+    if (parser_tokens) *parser_tokens = s->impl.parser.tokens;
+    return HK_OK;
+}
+
+extern "C" size_t hk_output_snapshot_layer_count(const hk_output_snapshot * s) {
+    return s ? s->impl.layers.size() : 0;
+}
+
+extern "C" int hk_output_snapshot_layer(const hk_output_snapshot * s, size_t i, uint32_t * model_layer,
+                                        uint64_t * samples, uint64_t * rounds) {
+    if (!s || i >= s->impl.layers.size()) {
+        set_error("hk_output_snapshot_layer: invalid arguments");
+        return HK_ERR;
+    }
+    const auto & layer = s->impl.layers[i];
+    if (model_layer) *model_layer = layer.model_layer;
+    if (samples) *samples = layer.samples;
+    if (rounds) *rounds = layer.rounds;
+    return HK_OK;
+}
+
+extern "C" size_t hk_output_snapshot_score_count(const hk_output_snapshot * s, size_t i) {
+    if (!s || i >= s->impl.layers.size()) return 0;
+    return s->impl.layers[i].scores.size();
+}
+
+extern "C" int hk_output_snapshot_score(const hk_output_snapshot * s, size_t i, size_t j,
+                                        uint64_t * start, double * score) {
+    if (!s || i >= s->impl.layers.size() || j >= s->impl.layers[i].scores.size()) {
+        set_error("hk_output_snapshot_score: invalid arguments");
+        return HK_ERR;
+    }
+    const auto & entry = s->impl.layers[i].scores[j];
+    if (start) *start = entry.first;
+    if (score) *score = entry.second;
+    return HK_OK;
+}
+
+extern "C" size_t hk_output_snapshot_pending_count(const hk_output_snapshot * s, size_t i) {
+    if (!s || i >= s->impl.layers.size()) return 0;
+    return s->impl.layers[i].pending.size();
+}
+
+extern "C" int hk_output_snapshot_pending(const hk_output_snapshot * s, size_t i, size_t j,
+                                          uint64_t * start, double * score) {
+    if (!s || i >= s->impl.layers.size() || j >= s->impl.layers[i].pending.size()) {
+        set_error("hk_output_snapshot_pending: invalid arguments");
+        return HK_ERR;
+    }
+    const auto & entry = s->impl.layers[i].pending[j];
+    if (start) *start = entry.first;
+    if (score) *score = entry.second;
+    return HK_OK;
 }

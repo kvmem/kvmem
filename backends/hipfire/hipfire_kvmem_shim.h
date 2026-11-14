@@ -635,6 +635,330 @@ int hk_layerwise_request_projected_native(hk_layerwise_request * r,
                                           const hk_native_current_layer_query * q,
                                           hk_native_scorer_fn scorer, void * scorer_user);
 
+// ── layerwise activation accounts + projected-Q history tape (host-only, additive) ──
+// The engine-owned projected-Q history substrate that backs the layerwise
+// activation quotas, mirroring kvmem::QueryProjectionTape and the ninfer native
+// Query runner account model. A tape records one model layer's projected rows
+// (post-RMSNorm/pre-RoPE Q, or any engine-declared opaque planes) over one exact
+// Query evaluation span, chunk by chunk, into an explicit activation account.
+// It is NOT consumed by the legacy residency path and never mutates statistics
+// or the resident view. The finite-metadata constructor overloads reserve the
+// complete conservative descriptor/layout/chunk-table bound (metadata_bound)
+// against an independent metadata account BEFORE any payload is admitted; the
+// RAM overload admits against HostKvStorage RAM, the SpillFile overload against
+// a disk span (a layer larger than the RAM account). All handles are caller-owned
+// and destroyed explicitly; byte buffers are HOST pointers consumed synchronously
+// at append/read time (device transfers stay in hipfire). Every entry is noexcept
+// at the boundary: failures return NULL/HK_ERR and publish hk_last_error().
+
+typedef struct hk_spill hk_spill;
+typedef struct hk_reservation hk_reservation;
+typedef struct hk_tape hk_tape;
+typedef struct hk_tape_chunk hk_tape_chunk;
+
+// One opaque projected plane: an engine format/version-identified row layout.
+// row_stride includes any native row padding (bytes per token row).
+typedef struct hk_query_plane {
+    uint32_t id;
+    uint64_t row_stride;
+} hk_query_plane;
+
+// Borrowed layout description; format/planes are copied into the C++ handle.
+typedef struct hk_query_layout {
+    const char * format;
+    uint32_t version;
+    const hk_query_plane * planes;
+    size_t plane_count;
+} hk_query_layout;
+
+// Borrowed caller-owned CPU rows for one plane, consumed synchronously by append.
+typedef struct hk_query_plane_bytes {
+    uint32_t id;
+    const void * data;
+    size_t bytes;
+} hk_query_plane_bytes;
+
+// SpillFile: a standalone process-local disk account (one ephemeral file). The
+// tape's disk overload reserves/writes complete layer spans here, with no
+// tape-owned RAM. Copies of the handle pin both the file range and its quota.
+hk_spill * hk_spill_create(const char * directory, uint64_t capacity_bytes);
+void hk_spill_destroy(hk_spill * s);
+uint64_t hk_spill_charged_bytes(const hk_spill * s);
+uint64_t hk_spill_capacity_bytes(const hk_spill * s);
+
+// HostKvReservation: a finite charge against a HostKvStorage account, counted
+// like live/leased payload. A failed allocation retains its reservation;
+// destruction returns unused capacity. Used for the tape metadata control bound.
+hk_reservation * hk_storage_reserve(hk_storage * s, uint64_t bytes);
+void hk_reservation_destroy(hk_reservation * r);
+uint64_t hk_reservation_remaining(const hk_reservation * r);
+hk_host_record * hk_reservation_allocate(hk_reservation * r, const void * bytes, size_t len);
+
+// QueryProjectionTape: the finite-metadata overloads (ninfer native Query model).
+// `metadata` is an independent HostKvStorage account; `max_chunks` is the frozen
+// chunk-directory bound. Both reserve metadata_bound(layout,max_chunks) before
+// payload. activation is the RAM account (hk_storage) or disk account (hk_spill).
+hk_tape * hk_tape_create_ram(hk_storage * activation, hk_storage * metadata,
+                             uint64_t max_chunks, const hk_layerwise_identity * identity,
+                             uint32_t model_layer, const hk_query_layout * layout);
+hk_tape * hk_tape_create_disk(hk_spill * activation, hk_storage * metadata,
+                              uint64_t max_chunks, const hk_layerwise_identity * identity,
+                              uint32_t model_layer, const hk_query_layout * layout);
+void hk_tape_destroy(hk_tape * t);
+// Conservative descriptor/layout/chunk-table bound, reserved before payload.
+uint64_t hk_tape_metadata_bound(const hk_query_layout * layout, uint64_t max_chunks);
+uint64_t hk_tape_metadata_bytes(const hk_tape * t);
+uint64_t hk_tape_max_chunks(const hk_tape * t);
+uint64_t hk_tape_total_bytes(const hk_tape * t);
+uint64_t hk_tape_reserved_bytes(const hk_tape * t);
+uint64_t hk_tape_covered_end(const hk_tape * t);
+size_t hk_tape_chunk_count(const hk_tape * t);
+uint32_t hk_tape_model_layer(const hk_tape * t);
+int hk_tape_complete(const hk_tape * t);
+int hk_tape_aborted(const hk_tape * t);
+// Append `count` contiguous rows starting at `begin`; planes carry one borrowed
+// CPU buffer per declared plane (row_stride*count bytes each). Returns a NEW
+// caller-owned sealed chunk source. Coverage must be exact and contiguous.
+hk_tape_chunk * hk_tape_append(hk_tape * t, const hk_layerwise_identity * identity,
+                               uint32_t model_layer, uint64_t begin, uint64_t count,
+                               const hk_query_plane_bytes * planes, size_t plane_count);
+// Complete only after exact contiguous coverage of the evaluation span.
+int hk_tape_finish(hk_tape * t, const hk_layerwise_identity * identity, uint32_t model_layer);
+// Borrow a sealed chunk by index (NEW caller-owned source handle).
+hk_tape_chunk * hk_tape_chunk_at(const hk_tape * t, const hk_layerwise_identity * identity,
+                                 uint32_t model_layer, size_t index);
+// Read a bounded covered range of one plane into caller-owned staging. Full
+// layer completion is not required to read a previously sealed chunk.
+int hk_tape_read_rows(const hk_tape * t, const hk_layerwise_identity * identity,
+                      uint32_t model_layer, uint32_t plane, uint64_t begin, uint64_t count,
+                      void * dest, size_t dest_bytes);
+// Release unused reservation and tape-owned chunk references; exported sources
+// stay valid. No device work is cancelled here.
+void hk_tape_abort(hk_tape * t);
+
+// QueryProjectionChunkSource: a sealed immutable chunk whose byte source and
+// identity survive the tape owner. Reads acquire only a short source read lease.
+void hk_tape_chunk_destroy(hk_tape_chunk * c);
+uint32_t hk_tape_chunk_model_layer(const hk_tape_chunk * c);
+uint64_t hk_tape_chunk_begin(const hk_tape_chunk * c);
+uint64_t hk_tape_chunk_end(const hk_tape_chunk * c);
+size_t hk_tape_chunk_size(const hk_tape_chunk * c);
+int hk_tape_chunk_read_rows(const hk_tape_chunk * c, const hk_layerwise_identity * identity,
+                            uint32_t model_layer, uint32_t plane, uint64_t begin, uint64_t count,
+                            void * dest, size_t dest_bytes);
+
+// ── layerwise attention-mass pressure (host-only, additive) ──
+// Mirrors kvmem::LayerwisePrefillPressure / LayerwiseOutputPressure: independent
+// attention-mass keep-set refinement over an accepted canonical history. This is
+// NOT plan_residency: the driver feeds accepted per-page probability mass (from
+// its own recomputed Q×K page-mass kernel — the attention kernels stay untouched)
+// and reads back a resident-only keep-set selection to drive catalog.plan, exactly
+// as ninfer's compact_layerwise_pressure does. No cold recall: select candidates
+// come exclusively from each layer's accepted resident map; sink/mandatory IDs
+// must also be resident. All handles are caller-owned and destroyed explicitly;
+// input arrays are borrowed and copied at call time; output snapshots/choices are
+// opaque handles read through indexed accessors (a choice's arrays borrow the
+// choices handle and stay valid until hk_pressure_choices_destroy). Every entry is
+// noexcept at the boundary: failures return NULL/0/HK_ERR and publish hk_last_error().
+
+typedef struct hk_prefill_pressure hk_prefill_pressure;
+typedef struct hk_prefill_snapshot hk_prefill_snapshot;
+typedef struct hk_output_pressure hk_output_pressure;
+typedef struct hk_output_snapshot hk_output_snapshot;
+typedef struct hk_pressure_choices hk_pressure_choices;
+
+// Mirrors kvmem::LayerwisePrefillOptions. block_tokens MUST equal the catalog
+// layout block_tokens (hipfire 128). stride 0 samples the last row only.
+typedef struct hk_prefill_options {
+    uint32_t block_tokens;
+    uint64_t select_tokens;
+    uint64_t reserve_tokens;
+    uint64_t interval;
+    uint32_t stride;
+    double half_life;
+} hk_prefill_options;
+
+// One model layer's accepted per-page probability mass (borrowed arrays).
+// starts: physical dense-window segment starts; history: original logical block
+// starts (duplicates are meaningful); masses: rows × history_count, row-major,
+// native values unchanged (each sampled row sums to 1 within tolerance).
+typedef struct hk_prefill_mass {
+    uint32_t model_layer;
+    const uint64_t * starts; size_t start_count;
+    const uint64_t * history; size_t history_count;
+    const double * masses; size_t mass_count;
+} hk_prefill_mass;
+
+// Whole-model acceptance: history.frontier is end; count==accepted for a complete
+// native boundary; rows are the sampled offsets; layers are exactly the configured
+// public target layers. Partial/old/unsampled acceptance returns 0 unchanged.
+typedef struct hk_prefill_acceptance {
+    hk_memory_stamp history;
+    uint64_t count;
+    uint64_t accepted;
+    uint64_t local_begin;
+    const uint32_t * rows; size_t row_count;
+    const hk_prefill_mass * layers; size_t layer_count;
+} hk_prefill_acceptance;
+
+// Mirrors kvmem::LayerwisePressureSource ordinals.
+typedef enum hk_pressure_source {
+    HK_PRESSURE_PREFILL = 0,
+    HK_PRESSURE_OUTPUT = 1
+} hk_pressure_source;
+
+// One layer's keep-set choice. The arrays borrow the choices handle (valid until
+// hk_pressure_choices_destroy). candidates/fixed/selected are native canonical IDs
+// chronological; scores are candidate-aligned mass/exposure.
+typedef struct hk_pressure_choice {
+    uint32_t model_layer;
+    const uint64_t * candidates; size_t candidate_count;
+    const uint64_t * fixed; size_t fixed_count;
+    const uint64_t * selected; size_t selected_count;
+    const double * scores; size_t score_count;
+    uint64_t accepted_score_end;
+    uint64_t samples;
+    uint64_t chunks;
+    uint64_t selected_tokens;
+    uint64_t charged_tokens;
+    uint32_t source;            // hk_pressure_source
+    uint64_t output_samples;
+    uint64_t output_rounds;
+} hk_pressure_choice;
+
+// PrefillPressure: the session-lifetime persistent keep-set owner (decision A).
+hk_prefill_pressure * hk_prefill_pressure_create(hk_session_identity session,
+                                                 const uint32_t * model_layers, size_t n_layers,
+                                                 const hk_prefill_options * options);
+void hk_prefill_pressure_destroy(hk_prefill_pressure * p);
+// Sampled row offsets for [begin,begin+count). Writes into out (capacity); returns
+// the required count, or (uint32_t)-1 on error. out=NULL/capacity=0 queries count.
+uint32_t hk_prefill_pressure_rows(const hk_prefill_pressure * p, uint64_t begin, uint32_t count,
+                                  uint64_t local_begin, int replay, uint32_t * out, uint32_t capacity);
+// 1 accepted (true), 0 rejected unchanged (partial/old end/unsampled), HK_ERR exception.
+int hk_prefill_pressure_accept(hk_prefill_pressure * p, const hk_prefill_acceptance * a);
+int hk_prefill_pressure_options(const hk_prefill_pressure * p, hk_prefill_options * out);
+// NEW caller-owned snapshot handle (a copy of the current state).
+hk_prefill_snapshot * hk_prefill_pressure_snapshot(const hk_prefill_pressure * p);
+// Rewind: a sampled history beyond position is cleared.
+int hk_prefill_pressure_restore(hk_prefill_pressure * p, const hk_prefill_snapshot * s,
+                                uint64_t position);
+// Resident-only keep-set selection. NEW caller-owned choices handle.
+hk_pressure_choices * hk_prefill_pressure_select(const hk_prefill_pressure * p,
+                                                 const hk_memory_catalog * catalog,
+                                                 const uint64_t * mandatory, size_t n_mandatory,
+                                                 uint64_t budget_tokens, uint32_t sink_blocks);
+
+// Prefill snapshot accessors (copy into out; HK_OK/HK_ERR).
+void hk_prefill_snapshot_destroy(hk_prefill_snapshot * s);
+int hk_prefill_snapshot_session(const hk_prefill_snapshot * s, hk_session_identity * out);
+size_t hk_prefill_snapshot_layer_count(const hk_prefill_snapshot * s);
+int hk_prefill_snapshot_layer(const hk_prefill_snapshot * s, size_t i, uint32_t * model_layer,
+                              uint64_t * end, uint64_t * samples, uint64_t * chunks);
+size_t hk_prefill_snapshot_value_count(const hk_prefill_snapshot * s, size_t i);
+int hk_prefill_snapshot_value(const hk_prefill_snapshot * s, size_t i, size_t v,
+                              uint64_t * original_start, double * mass, double * exposure);
+
+// Choices accessors.
+void hk_pressure_choices_destroy(hk_pressure_choices * c);
+size_t hk_pressure_choices_count(const hk_pressure_choices * c);
+int hk_pressure_choices_get(const hk_pressure_choices * c, size_t i, hk_pressure_choice * out);
+
+// ── Output pressure (decode-output scope refinement; ninfer production surface) ──
+// An independent-layer application of the ordinary ActionHistory rule. One
+// accepted-token scope parser is shared by all target layers; layer scores/mass
+// and publication are separate. Its select() replaces the prefill select whenever
+// output exists, seeding from the prefill snapshot fallback. compact_layerwise_
+// pressure compacts Prefill- and Output-source choices identically.
+typedef enum hk_output_scope {
+    HK_OUTPUT_TOOL_CALL = 0,
+    HK_OUTPUT_NON_THINKING = 1
+} hk_output_scope;
+
+typedef struct hk_output_options {
+    uint32_t scope;             // hk_output_scope
+    uint32_t interval;
+    double decay;
+    uint64_t commit_max_bytes;
+} hk_output_options;
+
+typedef struct hk_output_scope_state { int thinking; int tool_call; } hk_output_scope_state;
+typedef struct hk_output_scope_row { int thinking; int tool_call; int body; } hk_output_scope_row;
+
+// One model layer's captured output mass (borrowed arrays). history: native
+// physical segment -> original logical start; masses: captured rows × history_count,
+// no renormalization.
+typedef struct hk_output_mass {
+    uint32_t model_layer;
+    const uint64_t * history; size_t history_count;
+    const double * masses; size_t mass_count;
+} hk_output_mass;
+
+// history.frontier is the native consumed-row frontier (never predicted-token +1);
+// accepted is the scheduler-confirmed prefix of the prepared verifier batch; rows
+// are captured native row offsets (rejected rows ignored).
+typedef struct hk_output_acceptance {
+    hk_memory_stamp history;
+    uint64_t request;
+    uint32_t accepted;
+    const uint32_t * rows; size_t row_count;
+    const hk_output_mass * layers; size_t layer_count;
+} hk_output_acceptance;
+
+// Tokenizer-verified markers ctor: markers5 = {tool-open, tool-close, think-open,
+// think-close, message-start}. Missing/aliased markers are unsupported; callers
+// must not guess replacements for another model's template.
+hk_output_pressure * hk_output_pressure_create_markers(hk_session_identity session,
+                                                       const uint32_t * model_layers, size_t n_layers,
+                                                       const hk_prefill_options * prefill,
+                                                       const int32_t * markers5,
+                                                       const hk_output_options * options);
+// Explicit model-native semantic scope ctor (no Qwen markers installed; the
+// token-marker begin()/prepare() entry points reject this owner).
+hk_output_pressure * hk_output_pressure_create_external(hk_session_identity session,
+                                                        const uint32_t * model_layers, size_t n_layers,
+                                                        const hk_prefill_options * prefill,
+                                                        const hk_output_options * options);
+void hk_output_pressure_destroy(hk_output_pressure * p);
+int hk_output_pressure_begin(hk_output_pressure * p, const hk_memory_stamp * accepted_history,
+                             uint64_t request, const uint32_t * prompt, size_t prompt_count);
+int hk_output_pressure_begin_scope(hk_output_pressure * p, const hk_memory_stamp * accepted_history,
+                                   uint64_t request, hk_output_scope_state scope);
+// Prompt rows advance native acceptance without becoming Output samples.
+int hk_output_pressure_accept_prefill(hk_output_pressure * p, const hk_memory_stamp * accepted_history,
+                                      uint64_t request, uint64_t begin);
+// prepare/accept return a sampled-row bitmask via out_mask; HK_OK/HK_ERR.
+int hk_output_pressure_prepare(hk_output_pressure * p, uint64_t request, uint64_t begin,
+                               const uint32_t * consumed_tokens, size_t count, uint64_t * out_mask);
+int hk_output_pressure_prepare_scope(hk_output_pressure * p, uint64_t request, uint64_t begin,
+                                     const hk_output_scope_row * rows, size_t count, uint64_t * out_mask);
+int hk_output_pressure_accept(hk_output_pressure * p, const hk_output_acceptance * a, uint64_t * out_mask);
+// finish clears pending mass, retains sample N until begin(), publishes S'=decay*S+mass/N.
+int hk_output_pressure_finish(hk_output_pressure * p, uint64_t request,
+                              const hk_memory_catalog * accepted_history);
+hk_output_snapshot * hk_output_pressure_snapshot(const hk_output_pressure * p);
+int hk_output_pressure_restore(hk_output_pressure * p, const hk_output_snapshot * s, uint64_t position);
+hk_pressure_choices * hk_output_pressure_select(const hk_output_pressure * p,
+                                                const hk_memory_catalog * catalog,
+                                                const hk_prefill_pressure * prefill,
+                                                const uint64_t * mandatory, size_t n_mandatory,
+                                                uint64_t budget_tokens, uint32_t sink_blocks);
+
+// Output snapshot accessors (copy into out; HK_OK/HK_ERR).
+void hk_output_snapshot_destroy(hk_output_snapshot * s);
+int hk_output_snapshot_session(const hk_output_snapshot * s, hk_session_identity * out);
+int hk_output_snapshot_meta(const hk_output_snapshot * s, uint64_t * request, uint64_t * accepted_end,
+                            int * active, int * thinking, int * action, uint64_t * parser_tokens);
+size_t hk_output_snapshot_layer_count(const hk_output_snapshot * s);
+int hk_output_snapshot_layer(const hk_output_snapshot * s, size_t i, uint32_t * model_layer,
+                             uint64_t * samples, uint64_t * rounds);
+size_t hk_output_snapshot_score_count(const hk_output_snapshot * s, size_t i);
+int hk_output_snapshot_score(const hk_output_snapshot * s, size_t i, size_t j,
+                             uint64_t * start, double * score);
+size_t hk_output_snapshot_pending_count(const hk_output_snapshot * s, size_t i);
+int hk_output_snapshot_pending(const hk_output_snapshot * s, size_t i, size_t j,
+                               uint64_t * start, double * score);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
