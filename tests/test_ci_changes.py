@@ -12,6 +12,28 @@ spec.loader.exec_module(changes)
 
 
 class DocumentationChangesTest(unittest.TestCase):
+    def test_query_launcher_contracts_run_without_engine_builds(self):
+        from unittest.mock import patch
+        paths = ['scripts/launcher/worker.py', 'scripts/windows/start-backend.ps1',
+                 'tests/test_layerwise_launcher.py', 'tests/test_layerwise_product.py',
+                 'tests/test_windows_worker_args.py', 'tests/test_launcher_export.py',
+                 '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py']
+        self.assertTrue(changes.requires_ci(paths))
+        self.assertFalse(changes.requires_native(paths))
+        self.assertFalse(changes.requires_cuda(paths, 'a' * 40, 'b' * 40))
+        current = (Path(__file__).resolve().parents[1] / changes.WORKFLOW).read_text(encoding='utf-8')
+        self.assertEqual(current.count(changes.CONSOLE_CONTRACT_TEST_STEP), 1)
+        before = current.replace(changes.CONSOLE_CONTRACT_TEST_STEP, '', 1)
+        for after, expected in ((current, False), (current + '\n# unrelated edit\n', True),
+                                (current.replace('cmake --build build', 'cmake --build other'), True)):
+            with patch.object(changes, 'git', side_effect=lambda _, ref, **kw:
+                              (before if ref.startswith('a' * 40) else after).encode()):
+                self.assertEqual(changes.requires_native(paths + [changes.WORKFLOW], 'a' * 40, 'b' * 40), expected)
+        for extra in ('kvmem/src/host/kvmem_store.cpp', 'backends/ninfer', 'CMakeLists.txt',
+                      'scripts/windows/build-backends.ps1', 'tests/unreviewed_native_test.py'):
+            self.assertTrue(changes.requires_native(paths + [extra]))
+            self.assertTrue(changes.requires_cuda(paths + [extra], 'a' * 40, 'b' * 40))
+
     def test_chat_crlf_attributes_are_not_native_build_inputs(self):
         from unittest.mock import patch
         old = b'*.md text\n'

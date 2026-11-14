@@ -41,6 +41,43 @@ class PlanTest(unittest.TestCase):
     def plan(self, backend='ninfer', **values):
         return build_plan(self.config(backend, **values))
 
+    def test_full_query_limits_require_new_worker_without_changing_requested_values(self):
+        cases = ({}, {'QueryMaxTokens': 512}, {'QueryReplayMaxTokens': 2048},
+                 {'QueryMaxTokens': 0, 'QueryReplayMaxTokens': 2048},
+                 {'QueryMaxTokens': 512, 'QueryReplayMaxTokens': 0},
+                 {'QueryMaxTokens': 0, 'QueryReplayMaxTokens': 0})
+        for limits in cases:
+            parameters = self.plan(**limits)['effective_parameters']
+            for capabilities in ({}, *({'legacy_query_replay_revision': value}
+                                      for value in (None, False, True, 0, -1, '1', 1.0))):
+                with self.subTest(limits=limits, capabilities=capabilities), self.assertRaisesRegex(
+                        ValueError, 'both QueryMaxTokens and QueryReplayMaxTokens'):
+                    require_launch_features(capabilities, parameters)
+            for revision in (1, 2):
+                with self.subTest(limits=limits, revision=revision):
+                    before = dict(parameters)
+                    require_launch_features({'legacy_query_replay_revision': revision}, parameters)
+                    self.assertEqual(parameters, before)
+            argv = self.plan(**limits)['argv']
+            for key, flag in (('QueryMaxTokens', '--kvmem-query-max-tokens'),
+                              ('QueryReplayMaxTokens', '--kvmem-query-replay-max-tokens')):
+                self.assertEqual(argv[argv.index(flag) + 1], str(limits.get(key, 0)))
+        # Direct callers may supply an unexpanded parameter set.
+        with self.assertRaisesRegex(ValueError, 'full Query/replay'):
+            require_launch_features({}, {'Backend': 'ninfer'})
+
+    def test_explicit_bounded_query_remains_compatible_with_old_workers(self):
+        for backend in ('ninfer', 'llamacpp'):
+            for limits in ((1, 1), (512, 2048)):
+                p = self.plan(backend, QueryMaxTokens=limits[0], QueryReplayMaxTokens=limits[1])['effective_parameters']
+                require_launch_features({}, p)
+        for backend in ('llamacpp', 'polystrata', 'radiance'):
+            require_launch_features({}, {'Backend': backend})
+        for flag in ('--kvmem-query-max-tokens', '--kvmem-query-replay-max-tokens'):
+            for args in ([flag, '0'], [flag + '=0']):
+                with self.subTest(args=args), self.assertRaisesRegex(ValueError, 'native option'):
+                    self.plan(QueryMaxTokens=512, QueryReplayMaxTokens=2048, WorkerArgs=args)
+
     def test_token_invariants_cover_page_boundaries(self):
         for backend in ('ninfer', 'llamacpp', 'polystrata'):
             for reserve in (128, 129, 255, 256, 1023, 1024):
