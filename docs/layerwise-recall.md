@@ -142,8 +142,14 @@ Layerwise 的单 GPU 普通目标或 DFlash2 路径，默认在 GPU 内整理已
 
 未完成的搬运持有自己的复制流、完成事件和已计费的元数据；该请求暂时让出执行，其他就绪请求仍可调度。原生地址在此期间不发布有效覆盖，完成后才校验请求版本和 lane epoch 并发布全部目标层。取消或失败先排空复制流，再使未完成的目标失效。部分 prefill 进度按实际切分累计服务预算，纯等待不消耗计算配额。
 
-归档新接受的 KV、选页和建立共享页写入保护仍发生在提交前；本改动没有把所有准备工作移到后台。当前公开的非滚动请求还会为声明的完整最大输出预留空间，因此“输出超过 gen reserve”本身不证明 decode 期间发生了 Pressure。分析刷新性能应核对实际刷新事件，并单独观察混合 prefill/decode。
+归档新接受的 KV、选页和建立共享页写入保护仍发生在提交前；本改动没有把所有准备工作移到后台。在 Qwen3.5 系列的 NInfer 后端，执行新 Query 的请求可以用满配置的历史预算 K。生成时按实际接受的 token 占用剩余窗口，到达物理块边界后按需执行 Pressure。没有新 Query 的请求仍按声明输出上限预留空间。分析刷新性能应核对实际刷新事件，并单独观察混合 prefill/decode。
 
 排障对照可设置 `NINFER_RESIDENT_LAYER_PRESSURE=0` 恢复 Host 搬运，或设置 `NINFER_ASYNC_LAYER_PRESSURE=0` 保留 GPU 搬运但等待完成。`NINFER_LAYER_RESTORE_PIPELINE=0` 关闭 Host 恢复的双缓冲。清除变量恢复默认；`NINFER_TIME_LAYER_REFRESH=1` 仅用于阶段计时，性能对照应关闭计时。
 
 PRO 6000 的频繁整理诊断中，平均刷新占用时间约从 75 ms 降至 39 ms；常用 16k reserve 的完整任务2总时间降低约 0.9%，decode 持平，4/8 路总体变化较小。[实现、计时口径及验证范围](ninfer-resident-pressure-20261111.md)
+
+`--kvmem-layerwise-score-tokens 32` 让 NInfer 每 32 个 token 保存一个 Mean-K。每个查询位置和注意力头在所有候选半页上做 softmax，然后把同一物理页的两个概率相加，按总概率选页。预算、固定区、Pressure 和 KV 搬运仍以 64-token 物理页计量。默认值 64 每页保存一个 Mean-K。选 32 时统计记录数加倍。
+
+`--kvmem-layerwise-score-tokens 32 --kvmem-layerwise-half-reduce max` 改用两个半页分数中的较大值。每个查询位置、每个头仍在该层全部可评分半页上做 softmax；先对头求平均、累加所有查询行，再取 `max(left, right)` 给原来的 64-token 页排序。查询分块不影响取 max 的位置。固定区和 TopK 仍以整页计费；`--kvmem-layerwise-half-reduce sum` 为默认。
+
+`--kvmem-layerwise-unique-query-anchor` 为文本查询增加可选的精确匹配。对于 32–64 个 token 的查询，当已接受历史中只有一个最长连续匹配、且至少匹配 32 个 token，选择器从原预算中保留实际相交的至多两个 64-token 页。重复、过短、图像或预算不足的情况沿用原打分。其余候选页继续根据当前层的 Mean-K 分数选择。

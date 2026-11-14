@@ -261,6 +261,9 @@ struct KvMemStoreConfig {
     KvMemPrototypeMode prototype_mode = KvMemPrototypeMode::Contiguous;
     double adaptive_gain_1to2 = 0.10;
     double adaptive_gain_2to4 = 0.06;
+    // Layerwise Mean-K uses a separate 32-token statistics grid. When set,
+    // keep the stronger half after the entire Query contribution is known.
+    bool layerwise_half_max = false;
     KvMemSubblockReduce subblock_reduce = KvMemSubblockReduce::Max; // --kvmem-subblock-reduce
     KvMemSemanticExpansion semantic_expansion =
         KvMemSemanticExpansion::None;

@@ -1,0 +1,67 @@
+diff --git a/docs/serving.md b/docs/serving.md
+index 3b21ed2e1c3e713ca3f68c087d081c5655e3f0f0..c2bd35603485860629eacc28917affaa519630ea 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -3015,10 +3015,13 @@ Ordinary tool continuation cannot recall with a cached old question.
+ When an exact continuation has no effective Query and its actual resident
+ rows, remaining prompt and output reserve fit with the required block
+ headroom, it retains the selected views (`keep_selected`). Otherwise the
+-ordinary Pressure schedule applies. Full Query, output reserve and fixed
+-band validation occurs against the selected actual checkpoint before its
+-owner is restored or consumed. Invalid ranges and capacity failures are
+-request errors; they do not authorize truncating a Query.
++ordinary Pressure schedule applies. When a request executes a new Query,
++selection can use the full configured historical KV budget, independently of
++the requested output limit. During generation, accepted rows fill the remaining
++physical window and trigger resident Pressure at block boundaries. The logical
++context and output limits still bound generation. The complete Query and fixed
++bands must fit at the selected checkpoint before its owner is restored or
++consumed. An invalid range or capacity failure is a request error.
+ 
+ Nondefault Query policy requires enabled `--kvmem-recall-strategy layerwise`
+ with a positive selected-token budget.
+diff --git a/src/models/qwen3_5/program/native_layerwise_frontend.cpp b/src/models/qwen3_5/program/native_layerwise_frontend.cpp
+index 09f13a21ada93dd0a6928c5d3c6218dab3e3ee06..5a02c44552c80f44e681ddd42f1bed9fdb5d53e4 100644
+--- a/src/models/qwen3_5/program/native_layerwise_frontend.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_frontend.cpp
+@@ -68,7 +68,9 @@ kvmem::LayerwiseRequestEnvelope ProgramImpl::layerwise_envelope(const PreparedPr
+         result.query=kvmem::QueryRange{query.begin,query.begin+query.count};
+         validate_layerwise_media(prompt);
+         result.replay=kvmem::QueryRange{layerwise_media_replay_begin(prompt,query.begin,64),result.prompt_end};
+-        result.reserve_query_output=true;
++        // Keep the full historical budget for this Query. Decode already admits
++        // accepted rows at block boundaries and compacts the resident KV when full.
++        result.rolling_active_window=true;
+     }
+     try {
+         const kvmem::LayerwiseWindowPlan validate(result,kvmem_window_tokens);
+diff --git a/tests/models/qwen3_5/test_layerwise_program_query.cpp b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+index cfd3aa5b1727cd488767ca53a3777e47eb97fbb9..8afb9dd2ae3f9402299ca6fd5590b67cc8ae5948 100644
+--- a/tests/models/qwen3_5/test_layerwise_program_query.cpp
++++ b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+@@ -395,6 +395,25 @@ public:
+             prepared_data.memory_query->begin==prefix && prepared_data.memory_query->count==query_rows &&
+             prepared_data.memory_query_inferred && prepared_data.memory_query_has_history,
+             "real chat tokenizer/template did not bind the complete final-user Query span");
++        if (!minimal_budget) {
++            PromptInput short_query;
++            short_query.messages.push_back(message(ChatRole::User,std::string(191,'D')));
++            short_query.messages.push_back(message(ChatRole::Assistant,"!"));
++            short_query.messages.push_back(message(ChatRole::User,"QQQQ"));
++            const auto input=frontend.prepare(short_query);
++            const auto& data=PreparedPromptAccess::view(input);
++            check(data.token_ids.size()==196 && data.memory_query && data.memory_query->begin==192,
++                "unexpected public Query coordinates in output headroom fixture");
++            for (const std::uint32_t output : {1U,256U,300U}) {
++                const kvmem::LayerwiseWindowPlan window(program.layerwise_envelope(data,output),capacity);
++                const auto evaluation=window.query_evaluation();
++                check(evaluation && evaluation->begin==192 &&
++                      window.selection_budget(evaluation->begin)==options.kvmem.selected_tokens,
++                    "declared output cap consumed the public Query's historical KV budget");
++                check(window.action({384,384})==kvmem::LayerwiseWindowAction::Pressure,
++                    "rolling Query output missed its first accepted resident boundary");
++            }
++        }
+         PromptInput continuation=conversation;continuation.messages.push_back(message(ChatRole::Assistant,"running tool"));
+         continuation.messages.back().tool_calls.push_back({"call_1","lookup","{}"});
+         continuation.messages.push_back(message(ChatRole::Tool,"tool result"));
