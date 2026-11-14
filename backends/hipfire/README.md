@@ -24,6 +24,7 @@ restores it.
 | Host page-softmax SIMD dot reduction: crate build adds `-fopenmp-simd` so the core dot product's `#pragma omp simd` is honoured (float32 accumulation over FP16-rounded operands); per-selection latency ~3.4× lower, default byte-neutral | `../patches/hipfire-softmax-simd.patch` |
 | Layerwise recall foundation (Phase 3.2 sub-patch ①): crate-agnostic `LayerwisePagePool` composite-slot pool + `PackedArenaLayout` packed-page geometry (rdna-compute), Q8 packed-page adapter bridging the engine stride authority to the core generic `PayloadLayout` manifest (hipfire-arch-qwen35), and the core layerwise-API C ABI shim entries + crate FFI (payload builder / catalog `plan_layer` / `NativeKvLayerRegions` / `LayerwiseQueryRequest` state machine / native scorer); additive, NOT wired into live serve, Legacy byte-neutral | `../patches/hipfire-layerwise-foundation.patch` |
 | Layerwise recall function (Phase 3.2 sub-patch ②): GPU HIP page scorer (`kvmem_page_score`, 4 wave-aware gfx1100 kernels, FP64-oracle parity) + per-layer driver (`layerwise_driver`: composite-arena stripe COW restore + drop-evict + suffix partial restore) wired into the three paged paths A/B/C via `serve_engine` scoped orchestration + `KvMemCtl` re-bootstrap/accessor/page-aligned policy + write-through feed; `HIPFIRE_KVMEM_RECALL_STRATEGY=layerwise` engine opt-in (default Legacy byte-neutral). Consumes ①'s shim + crate FFI unchanged (no new C entries, core logic zero-change) | `../patches/hipfire-layerwise-function.patch` |
+| MTP foundation (Phase 4.1 sub-patch ①): width-param multi-row driver/seam primitives (`LayerwiseDescStaging::new_with_width`, pure-host `bootstrap_layerwise_rows` n-row span, `accept_output_pressure` partial verify via the core `OutputPressure`), Main+aux composite-record Q8 layout adapter (`LayerwiseMtpQ8Layout`, head KV geometry), head bounded-pool geometry (`mtp_auxiliary_capacity` + `mtp_head_pool`, window + one scratch block), and aux-selection binding primitives (new `layerwise_mtp`: `LayerwiseMtpHistory` FirstLayer/UpstreamGlobal policy + `AuxiliarySelection` bind-once/exact-extent guards); additive host/pure, NOT wired into live serve, NO env toggle, width=1 byte-identical to AR, Legacy byte-neutral (no new C entries, core logic zero-change) | `../patches/hipfire-mtp-foundation.patch` |
 
 The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
 `KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
@@ -345,6 +346,46 @@ Sub-patch ③ adds the pressure attention-mass tap + quota accounts
 (`HIPFIRE_KVMEM_LAYERWISE_*_MIB`) + wrapper/router env exposure + fail-closed guards
 and seals the final recall-benefit gate. Each sub-patch is Legacy byte-neutral and
 independently re-verified; rollback granularity = sub-patch.
+
+The twelfth `mtp-foundation` patch lays the additive groundwork for MTP-head
+(`--spec mtp`) KV recall under `RecallStrategy::Layerwise` — Phase 4.1 sub-patch ①
+of three, following ninfer's integration pattern (ninfer KV-management faithful,
+the hipfire head algorithm unchanged). It is purely host/pure logic, NOT wired
+into live serve, and adds NO env toggle, so Legacy is byte-neutral and the opt-in
+Layerwise path is unchanged at width=1. Four pieces land:
+(1) `layerwise_driver` width-param multi-row primitives —
+`LayerwiseDescStaging::new_with_width` (width-sized positions/row_slot, fail-closed
+`width==0`; `new()` delegates to width=1, byte-identical to AR), the PURE-HOST
+`bootstrap_layerwise_rows` n-row span bootstrap (`evaluation=[frontier,frontier+width)`,
+query bounds validated), and `accept_output_pressure` (partial MTP verify through
+the core `OutputPressure.accept`, `accepted=prefix` — NOT the all-or-nothing
+`PrefillPressure`, since the core requires `history.frontier==begin_+accepted`).
+(2) `layerwise_layout` `LayerwiseMtpQ8Layout` — the Main+aux composite-record Q8
+adapter: the main plane is byte-identical to the trunk record, the aux (head) plane
+is appended, and the head ordinal resolves against the 1-layer head KvCache geometry.
+(3) `rdna-compute` `layerwise_pool` head bounded-pool geometry —
+`mtp_auxiliary_capacity` (`main_capacity` + one block, fail-closed on
+zero/misaligned/overflow, mirroring ninfer) and `mtp_head_pool` (a 1-layer composite
+pool of window pages + one scratch block).
+(4) the NEW `layerwise_mtp` module — `LayerwiseMtpHistory`
+(Unspecified/UpstreamGlobal/FirstLayer, mirroring the core `layerwise_mtp.hpp`),
+`auxiliary_visible_tokens` (ninfer `visible_tokens` mirror), `AuxiliarySelection`
+(bind-once / exact-extent / requires-actual-pool guards), and `admit_auxiliary_source`
++ `first_layer_auxiliary_ids` (the FirstLayer source rule). The UpstreamGlobal
+private probe is sub-patch ③; ① only scaffolds its policy + admission.
+
+Verification: 23 new host tests (F1 n-row span + width-one identity, F2 ×5
+main-plane byte-identity, F3 ×5 head-pool geometry, F4 ×17 policy/aux-bind) + 2 new
+GPU fixtures (staging-width geometry, multi-row partial-acceptance carrier) + the
+16-fixture layerwise GPU regression, all pass; zero new warnings; the 11 new symbols
+have zero production call sites (not wired). The N-gate on the rebuilt engine
+reproduces the sealed chain byte-for-byte: greedy decode sha256 == `29e8a27d…`,
+VERIFY 0 mismatch (restore_readback=65, nonzero_mismatch=0, spill_checksums=225,
+nonempty_dups=0), recall(8k/16k/28k)=[True,True,False] identical to baseline. No
+kvmem core/shim change (the multi-row core transaction + `OutputPressure` FFI already
+exist upstream). Sub-patches ② (trunk+head offload/restore + FirstLayer + admission)
+and ③ (UpstreamGlobal probe + dual-policy exposure + guards) follow; each is Legacy
+byte-neutral and independently re-verified, rollback granularity = sub-patch.
 
 ## Enabling
 
