@@ -44,6 +44,7 @@ def resolve(model, mode, depth=None, *, inspected=None):
     meta = container["draft_metadata"]
     groups = container["entries_by_name_prefix"]
     has_dflash = "DFlash" in str(meta.get("draft.architectures", ""))
+    mtp_head_policy = "shared"
     if mode == "mtp":
         if not groups.get("mtp", 0):
             raise ValueError("model contains no mtp.* weights; use an MTP-bearing container converted without --draft-model")
@@ -51,6 +52,11 @@ def resolve(model, mode, depth=None, *, inspected=None):
             raise ValueError("pinned upstream prioritizes DFlash; use an MTP-only container, not renamed metadata")
         if declared_integer(meta.get("qwen35.nextn_predict_layers", meta.get("mtp_num_hidden_layers", 0))) <= 0:
             raise ValueError("MTP weights exist but the container declares no NextN layer")
+        features = container.get("draft_features", {})
+        if features.get("vocab_weighted_output") and not features.get("mtp_u2_output"):
+            raise ValueError("MTP with a vocabulary-weighted output requires a dedicated U2 draft head")
+        if features.get("vocab_weighted_output"):
+            mtp_head_policy = "auto"
         chosen = 3 if depth is None else depth
         if chosen == 0:
             raise ValueError("--drafter mtp needs a positive depth; use off to disable")
@@ -66,6 +72,7 @@ def resolve(model, mode, depth=None, *, inspected=None):
             raise ValueError(f"DFlash trained block requires {block - 1} speculative tokens")
         native = "dflash2"
     return {"requested": mode, "depth": chosen, "expected_native": native,
+            "mtp_head_policy": mtp_head_policy,
             "container_preflight": container,
             "note": "directory check only; runtime must still verify the actual drafter"}
 

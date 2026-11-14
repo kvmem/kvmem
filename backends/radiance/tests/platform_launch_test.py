@@ -95,6 +95,19 @@ class PlatformLaunchTest(unittest.TestCase):
             self.assertEqual(resolved['arguments'][-1],'off')
             self.assertEqual(resolved['arguments'][args.index('--num-speculative-tokens')+1],'0')
 
+    def test_vocab_weighted_mtp_uses_u2_in_windows_and_linux_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            a=self.args(Path(directory))
+            container(a.model,['output.k3.weight','output.vrow','mtp.fc.weight','mtp.draft_head.weight'],
+                      [('mtp_num_hidden_layers',1)],quant='w8a8_fwht128',mtp_head_dtype=20)
+            a.drafter,a.speculative_tokens='mtp',3
+            config,plugin=serve.model_profile(a,serve.profile())
+            self.assertEqual(plugin,'qwen35_w8a8')
+            for platform in ('windows','linux'):
+                with self.subTest(platform=platform):
+                    env=serve.child_environment(a,platform,False,config,{})
+                    self.assertEqual(env['KVMEM_RAD_MTP_HEAD'],'auto')
+
     def test_linux_environment_isolated(self):
         inherited = {'PATH':'system', 'LD_PRELOAD':'wrong.so', 'LD_LIBRARY_PATH':'wrong',
                      'RADIANCE_NO_DRAFT':'1', 'KVMEM_RAD_MTP_SHARED_TOPK':'1', 'KVMEM_RAD_HIP_SINGLE_STREAM':'0',

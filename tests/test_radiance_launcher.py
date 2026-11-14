@@ -123,6 +123,18 @@ class RadiancePlanTest(unittest.TestCase):
             with self.subTest(values=values),self.assertRaises(ValueError):
                 self.plan(SpeculativeMode='mtp',**values)
 
+    def test_vocab_weighted_mtp_selects_u2_without_changing_other_models(self):
+        meta=[('mtp_num_hidden_layers',1)]
+        names=['output.k3.weight','output.vrow','mtp.fc.weight','mtp.draft_head.weight']
+        container(self.model,names,meta,quant='w8a8_fwht128',mtp_head_dtype=20)
+        self.assertEqual(self.plan(SpeculativeMode='mtp')['environment']['KVMEM_RAD_MTP_HEAD'],'auto')
+        self.assertEqual(self.plan(SpeculativeMode='none')['environment']['KVMEM_RAD_MTP_HEAD'],'shared')
+        container(self.model,names,meta,quant='w8a8_fwht128',mtp_head_dtype=2)
+        with self.assertRaisesRegex(ValueError,'requires a dedicated U2'):
+            self.plan(SpeculativeMode='mtp')
+        container(self.model,['output.weight','mtp.fc.weight','mtp.draft_head.weight'],meta,mtp_head_dtype=20)
+        self.assertEqual(self.plan(SpeculativeMode='mtp')['environment']['KVMEM_RAD_MTP_HEAD'],'shared')
+
     def test_embedded_dflash_uses_its_trained_depth(self):
         container(self.model,['dflash.fc.weight'],[
             ('draft.architectures','DFlash2Model'),('draft.dflash_config.block_size',8)])

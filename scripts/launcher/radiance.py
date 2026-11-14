@@ -89,10 +89,12 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     p['Model']=_existing_file(p['Model'],'Model')
     if Path(p['Model']).suffix.lower()!='.rad':raise ValueError('Radiance requires a .rad model')
     mode=p['SpeculativeMode']
+    mtp_head_policy='shared'
     if mode in ('mtp','dflash2'):
         explicit_depth=p['DraftTokens'] if {'DraftTokens','MtpDrafts'} & supplied.keys() else None
         selection=draft_selection(p['Model'],mode,explicit_depth)
         p['DraftTokens']=selection['depth']
+        if mode=='mtp':mtp_head_policy=selection.get('mtp_head_policy','shared')
     _speculative(p,supplied)
     if platform=='linux' and os.name!='nt' and not os.access(p['Worker'],os.X_OK):
         raise ValueError('Worker is not executable')
@@ -139,7 +141,7 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     argv+=scoring_args(supplied)+p.get('WorkerArgs',[])
     monitor_devices = []
     env={'ROCR_VISIBLE_DEVICES':p['Gpu'],'HIP_VISIBLE_DEVICES':','.join(str(i) for i in range(len(gpu_ids))),
-         'KVMEM_RAD_MTP_HEAD':'shared','OMP_NUM_THREADS':str(p['CpuThreads']),'KVMEM_RAD_VISION_CACHE_MIB':str(p['VisionCacheMiB'])}
+         'KVMEM_RAD_MTP_HEAD':mtp_head_policy,'OMP_NUM_THREADS':str(p['CpuThreads']),'KVMEM_RAD_VISION_CACHE_MIB':str(p['VisionCacheMiB'])}
     if platform == 'windows' and any(re.fullmatch(r'GPU-[0-9a-fA-F]{32}', gpu) for gpu in gpu_ids):
         from console_hardware import windows_hip_inventory
         devices = windows_hip_inventory(p.get('RocmPath'))

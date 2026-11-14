@@ -63,6 +63,8 @@ def inspect(path, allow_partial=False, include_entries=False, max_directory_byte
         planes = read_at(h[14], h[15] * 16) if include_entries else b""
         totals = collections.defaultdict(int)
         rows = []
+        draft_features = {"vocab_weighted_output": False, "mtp_u2_output": False}
+        vocab_heads = {f"output.k{bits}.weight" for bits in range(2, 8)}
         for e in entry.iter_unpack(directory):
             name = string(e[0])
             if not 0 <= e[4] <= 6 or e[16] > h[2] or e[17] > h[2] - e[16]:
@@ -70,6 +72,22 @@ def inspect(path, allow_partial=False, include_entries=False, max_directory_byte
             group = name.split(".")[0]
             totals[group] += e[17]
             counts[group] += 1
+            if name in vocab_heads:
+                draft_features["vocab_weighted_output"] = True
+            if name == "mtp.draft_head.weight":
+                # RadEncoding begins with two 24-byte names, n_planes and pad;
+                # its first RadEncPlane has a 24-byte role followed by dtype.
+                if e[3] >= h[17]:
+                    raise ValueError("invalid MTP draft-head encoding index")
+                enc_offset = h[16] + e[3] * 568
+                if allow_partial and (enc_offset > size or 568 > size - enc_offset):
+                    draft_features["mtp_u2_output"] = None  # encoding has not arrived yet
+                else:
+                    encoding = read_at(enc_offset, 568)
+                    n_planes = struct.unpack_from("<i", encoding, 48)[0]
+                    if not 1 <= n_planes <= 8 or e[14] != n_planes:
+                        raise ValueError("invalid MTP draft-head plane count")
+                    draft_features["mtp_u2_output"] = struct.unpack_from("<I", encoding, 80)[0] == 20  # RAD_U2
             rows.append({"name": name, "bytes": e[17], "shape": e[5:5 + e[4]],
                          "encoding_index": e[3], "layer": e[11], "offset": e[16]})
             if include_entries:
@@ -84,6 +102,7 @@ def inspect(path, allow_partial=False, include_entries=False, max_directory_byte
                 "complete_container": h[2] == size, "arch_id": string(h[3]),
                 "model": string(h[4]), "quant": string(h[5]), "entries": len(rows),
                 "draft_metadata": metadata, "vision_metadata": vision_metadata, "entries_by_name_prefix": dict(counts),
+                "draft_features": draft_features,
                 "directory_weight_bytes": sum(totals.values()), "bytes_by_name_prefix": dict(totals),
                 "largest_weights": sorted(rows, key=lambda x: x["bytes"], reverse=True)[:15],
                 "note": "container directory only; not runtime VRAM or a checksum verification"}
