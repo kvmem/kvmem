@@ -14,6 +14,46 @@ SHELLS = [path for name in ('powershell.exe', 'pwsh.exe') if (path := shutil.whi
 
 @unittest.skipUnless(os.name == 'nt' and SHELLS, 'Windows PowerShell launchers')
 class WorkerArgsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.binary_dir = tempfile.TemporaryDirectory(prefix='kvmem-contract-worker-')
+        cls.addClassCleanup(cls.binary_dir.cleanup)
+        directory = Path(cls.binary_dir.name)
+        source = directory / 'worker.cs'
+        source.write_text(r'''
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Text;
+using System.Web.Script.Serialization;
+class Worker {
+    static void Main(string[] args) {
+        Console.OutputEncoding = new UTF8Encoding(false);
+        var executable = Assembly.GetExecutingAssembly().Location;
+        var json = new JavaScriptSerializer();
+        var gpu = Environment.GetEnvironmentVariable("CUDA_VISIBLE_DEVICES");
+        if (args.Length == 1 && args[0] == "--kvmem-capabilities") {
+            File.WriteAllText(executable + ".probe.json", json.Serialize(new { gpu = gpu }));
+            Console.WriteLine(File.ReadAllText(executable + ".capabilities.json"));
+            return;
+        }
+        var received = new string[Math.Max(0, args.Length - 1)];
+        if (received.Length > 0) Array.Copy(args, 1, received, 0, received.Length);
+        var result = json.Serialize(new { received = received, gpu = gpu });
+        File.WriteAllText(executable + ".started.json", result);
+        Console.WriteLine(result);
+    }
+}
+''', encoding='utf-8')
+        compiler = Path(os.environ['SystemRoot']) / 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+        if not compiler.is_file():
+            compiler = Path(os.environ['SystemRoot']) / 'Microsoft.NET/Framework/v4.0.30319/csc.exe'
+        cls.binary = directory / 'worker.exe'
+        # A tiny model-free argv/contract fixture, not an inference-engine build.
+        subprocess.run([str(compiler), '/nologo', '/reference:System.Web.Extensions.dll',
+                        '/out:' + str(cls.binary), str(source)], check=True, capture_output=True, timeout=30)
+
     def test_canonical_dflash2_maps_to_each_native_backend(self):
         draft = self.folder / "draft & ' spaces.gguf"; draft.touch()
         target = self.folder / 'target.gguf'; target.touch()
@@ -64,11 +104,13 @@ class WorkerArgsTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix='kvmem-argv-')
         self.folder = Path(self.tmp.name)
         self.model = self.folder / "model & ' spaces.ninfer"
-        # The Python executable acts as a worker and reads the model argument as
-        # its script. It reports argv without interpreting any native options.
-        self.model.write_text(
-            "import json, os, sys\nprint(json.dumps({'received': sys.argv[1:], "
-            "'gpu': os.environ.get('CUDA_VISIBLE_DEVICES')}))\n", encoding='utf-8')
+        self.model.touch()
+        self.worker = self.folder / "worker & ' spaces.exe"
+        shutil.copyfile(self.binary, self.worker)
+        self.contract_file = Path(str(self.worker) + '.capabilities.json')
+        self.contract_file.write_text(json.dumps(dict(backend='ninfer', legacy_query_replay_revision=1)))
+        self.probe_file = Path(str(self.worker) + '.probe.json')
+        self.started_file = Path(str(self.worker) + '.started.json')
         self.file = self.folder / "args & ' spaces.json"
 
     def tearDown(self):
@@ -77,7 +119,7 @@ class WorkerArgsTests(unittest.TestCase):
     def run_launcher(self, shell, entry, extra, *, dry=True, gpu='GPU-test'):
         args = [shell, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
                 str(ROOT / 'scripts/windows' / entry), '-Model', str(self.model),
-                '-Worker', sys.executable, '-Gpu', gpu]
+                '-Worker', str(self.worker), '-Gpu', gpu]
         if entry == 'start-backend.ps1':
             args += ['-Backend', 'ninfer']
         elif entry == 'start-ninfer.ps1':
@@ -89,6 +131,70 @@ class WorkerArgsTests(unittest.TestCase):
     def plan(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout[result.stdout.index('{'):])
+
+    def test_old_worker_rejected_before_inference_for_zero_or_omitted_limits(self):
+        self.contract_file.write_text('{"backend":"ninfer"}')
+        cases = ([], ['-QueryMaxTokens', '512'], ['-QueryReplayMaxTokens', '2048'],
+                 ['-QueryMaxTokens', '0', '-QueryReplayMaxTokens', '2048'],
+                 ['-QueryMaxTokens', '512', '-QueryReplayMaxTokens', '0'],
+                 ['-QueryMaxTokens', '0', '-QueryReplayMaxTokens', '0'])
+        for shell in SHELLS:
+            for extra in cases:
+                with self.subTest(shell=shell, extra=extra):
+                    result = self.run_launcher(shell, 'start-backend.ps1', extra, dry=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('full Query/replay', result.stderr)
+                    self.assertIn('QueryReplayMaxTokens', result.stderr)
+                    self.assertFalse(self.started_file.exists())
+                    self.assertEqual(json.loads(self.probe_file.read_text())['gpu'], '-1')
+
+    def test_query_capability_revision_must_be_a_positive_integer(self):
+        for shell in SHELLS:
+            for revision in (None, False, True, 0, -1, '1', 1.0):
+                with self.subTest(shell=shell, revision=revision):
+                    self.contract_file.write_text(json.dumps(dict(backend='ninfer', legacy_query_replay_revision=revision)))
+                    result = self.run_launcher(shell, 'start-backend.ps1', [], dry=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('full Query/replay', result.stderr)
+                    self.assertFalse(self.started_file.exists())
+            self.contract_file.write_text('{"backend":"llamacpp","legacy_query_replay_revision":1}')
+            self.assertNotEqual(self.run_launcher(shell, 'start-backend.ps1', [], dry=False).returncode, 0)
+            self.assertFalse(self.started_file.exists())
+
+    def test_compatible_worker_keeps_full_query_defaults_through_wrappers(self):
+        for shell in SHELLS:
+            for entry in ('start-backend.ps1', 'start-ninfer.ps1', 'start-dflash2.ps1'):
+                with self.subTest(shell=shell, entry=entry):
+                    result = self.plan(self.run_launcher(shell, entry, [], dry=False))
+                    self.assertTrue(self.started_file.exists())
+                    self.assertEqual(result['gpu'], 'GPU-test')
+                    self.assertEqual(json.loads(self.probe_file.read_text())['gpu'], '-1')
+                    for flag in ('--kvmem-query-max-tokens', '--kvmem-query-replay-max-tokens'):
+                        self.assertEqual(result['received'][result['received'].index(flag) + 1], '0')
+
+    def test_old_worker_keeps_explicit_positive_query_limits(self):
+        self.contract_file.write_text('{"backend":"ninfer"}')
+        for shell in SHELLS:
+            result = self.plan(self.run_launcher(shell, 'start-backend.ps1',
+                ['-QueryMaxTokens', '512', '-QueryReplayMaxTokens', '2048'], dry=False))
+            self.assertFalse(self.probe_file.exists())
+            for flag, value in (('--kvmem-query-max-tokens', '512'), ('--kvmem-query-replay-max-tokens', '2048')):
+                self.assertEqual(result['received'][result['received'].index(flag) + 1], value)
+
+    def test_worker_args_cannot_bypass_query_capability_check(self):
+        self.contract_file.write_text('{"backend":"ninfer"}')
+        for shell in SHELLS:
+            for flag in ('--kvmem-query-max-tokens', '--kvmem-query-replay-max-tokens'):
+                for native in ([flag, '0'], [flag + '=0']):
+                    with self.subTest(shell=shell, native=native):
+                        self.file.write_text(json.dumps(native))
+                        result = self.run_launcher(shell, 'start-backend.ps1', [
+                            '-QueryMaxTokens', '512', '-QueryReplayMaxTokens', '2048',
+                            '-WorkerArgsFile', str(self.file)], dry=False)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('WorkerArgs cannot override', result.stderr)
+                        self.assertFalse(self.probe_file.exists())
+                        self.assertFalse(self.started_file.exists())
 
     def test_dflash2_pipeline_reaches_child(self):
         for shell in SHELLS:

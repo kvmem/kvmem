@@ -242,6 +242,9 @@ if ($Backend -eq 'ninfer' -and $ThinkingMode -eq 'off' -and
     ($ReasoningEffort -or @($WorkerArgs | Where-Object { $_ -match '^--default-reasoning-effort(=|$)' }).Count)) {
     throw 'ReasoningEffort conflicts with ThinkingMode off'
 }
+if ($Backend -eq 'ninfer' -and @($WorkerArgs | Where-Object { $_ -match '^--kvmem-query-(max-tokens|replay-max-tokens)(=|$)' }).Count) {
+    throw 'Use -QueryMaxTokens and -QueryReplayMaxTokens; WorkerArgs cannot override the checked NInfer Query limits'
+}
 if (@($WorkerArgs | Where-Object { $_ -match '^--(no-)?kvmem($|-(budget|gen-reserve|host-mib|sessions|cache-min-tokens|sink-tokens|recent-tokens|lrfu|lrfu-lambda|lrfu-top-frac|score-agg|query-scorer|graph-alpha|recall-strategy|layerwise-[a-z-]+)(=|$))' }).Count) {
     throw 'KVMem common options are owned by the launcher; use its named parameters instead of WorkerArgs'
 }
@@ -456,7 +459,9 @@ if ($DryRun) {
     return
 }
 Invoke-KVMemRecallWorkerCheck $Worker $effective $root
-if ($Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0 -or $CacheMinTokens -gt 0) {
+$fullQueryReplay = $Backend -eq 'ninfer' -and $RecallStrategy -ne 'layerwise' -and
+    ($scoringParameters.QueryMaxTokens -eq 0 -or $scoringParameters.QueryReplayMaxTokens -eq 0)
+if ($fullQueryReplay -or $Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0 -or $CacheMinTokens -gt 0) {
     $probeInfo = New-KVMemProcessInfo $Worker @('--kvmem-capabilities')
     $probeInfo.RedirectStandardOutput = $true
     $probeInfo.RedirectStandardError = $true
@@ -471,6 +476,12 @@ if ($Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0 -or $Cac
         $contract = $stdout.Result | ConvertFrom-Json
         $revision = if ($contract) { $contract.PSObject.Properties['heads_tensor_parallel_revision'] } else { $null }
         if ($probe.ExitCode -ne 0) { throw 'NInfer capability probe failed' }
+        $queryRevision = if ($contract) { $contract.PSObject.Properties['legacy_query_replay_revision'] } else { $null }
+        $workerBackend = if ($contract) { $contract.PSObject.Properties['backend'] } else { $null }
+        if ($fullQueryReplay -and (!$workerBackend -or $workerBackend.Value -ne 'ninfer' -or !$queryRevision -or
+            ($queryRevision.Value -isnot [int] -and $queryRevision.Value -isnot [long]) -or $queryRevision.Value -lt 1)) {
+            throw 'This worker does not support NInfer full Query/replay (zero token limits); update the complete NInfer package, or explicitly set both QueryMaxTokens and QueryReplayMaxTokens to positive limits'
+        }
         $loraCapability = if ($contract) { $contract.PSObject.Properties['fixed_lora'] } else { $null }
         if ($Lora -and (!$loraCapability -or $loraCapability.Value -isnot [bool] -or !$loraCapability.Value)) {
             throw 'Worker does not support fixed LoRA; update the llama.cpp worker'

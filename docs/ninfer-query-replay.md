@@ -22,6 +22,17 @@ The console and PowerShell launchers accept zero for NInfer and report the actua
 limits. Other backends retain their existing positive-limit defaults. Layerwise
 does not execute Legacy replay and does not receive these controls.
 
+The console and PowerShell launchers check the selected worker before starting
+inference. A zero or omitted Legacy limit requires the worker to advertise
+`legacy_query_replay_revision >= 1`. Update the complete NInfer package if that
+capability is missing. Older workers remain usable when **both** Query limits
+are explicitly positive; the launchers never replace full replay with bounded
+replay silently. Layerwise and other backends do not require this capability.
+Use the named Query limit parameters; NInfer `WorkerArgs` cannot override these
+checked values, including through `WorkerArgsFile` or `--option=value` syntax.
+PowerShell `-DryRun` only renders the command; the console's configuration check
+and an actual launch perform the worker check.
+
 This does not change the selected Query scoring formula, aggregation, graph
 propagation or LRFU settings. Mean-Q cosine retains a fixed-size aggregate per
 layer. Per-token PageSoftmax retains Query rows, so full-Query capture can use
