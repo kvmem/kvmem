@@ -1,0 +1,487 @@
+diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
+index 6e0dec6a38ce1c5698943ff4798ce3c7da4c45fd..f47f96ea9df2648c6d265ecb8f0c26a7ea90a328 100644
+--- a/apps/cli/options.cpp
++++ b/apps/cli/options.cpp
+@@ -176,6 +176,7 @@ std::string usage_text(const char* argv0) {
+            "  --kvmem-layerwise-activation-ram-mib N   Query tape RAM (default 256)\n"
+            "  --kvmem-layerwise-activation-disk-mib N  Query tape SSD (default 0)\n"
+            "  --kvmem-layerwise-staging-mib N          bounded transfer staging (default 16)\n"
++           "  --kvmem-layerwise-score-tokens N   Mean-K statistics per 64-token page: 32 or 64 (default 64)\n"
+            "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
+            "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+            "  --kvmem-layerwise-activation-metadata-mib N tape descriptors (default 128)\n"
+@@ -772,6 +773,7 @@ Options parse_options(int argc, char** argv) {
+     product::apply_kvmem_cli_options(memory,options.kvmem);
+     options.kvmem.layerwise.metadata_bytes = retention.metadata_bytes;
+     options.kvmem.checkpoint_target = retention.target;
++    options.kvmem.layerwise_score_tokens = retention.score_tokens;
+     if (memory.enabled) {
+         const auto window=options.kvmem.device_tokens();
+         if (window>options.max_context || window>std::numeric_limits<std::uint32_t>::max() ||
+diff --git a/include/ninfer/engine_options.h b/include/ninfer/engine_options.h
+index 54c9a7e0aa975a7cc2ef56a69837f4d515192fc1..f7db799bd2bc7d39b8ff9ae577eb9faa0857e469 100644
+--- a/include/ninfer/engine_options.h
++++ b/include/ninfer/engine_options.h
+@@ -470,6 +470,13 @@ struct KvmemOptions {
+     kvmem::RecallStrategy recall_strategy = kvmem::RecallStrategy::Legacy;
+     kvmem::LayerwiseOptions layerwise=native_layerwise_defaults();
+     std::uint32_t checkpoint_target = kDefaultLayerwiseCheckpointTarget;
++    std::uint32_t layerwise_score_tokens = 64;
++    [[nodiscard]] std::uint32_t mean_key_block_tokens() const {
++        if (recall_strategy != kvmem::RecallStrategy::Layerwise) return 64;
++        if (layerwise_score_tokens != 32 && layerwise_score_tokens != 64)
++            throw std::invalid_argument("native layerwise score tokens must be 32 or 64");
++        return layerwise_score_tokens;
++    }
+     // No default has been selected for layerwise native MTP. Its draft owns
+     // independent K/V for these original historical IDs; target selection is
+     // fresh and per layer under either explicit experimental alternative.
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.cpp b/src/models/qwen3_5/program/native_layerwise_request.cpp
+index 1ae4ac3ce518375c84286d4a59662f0e79a0f888..301bf7f97d287294aecd2fea89db9cf5622edac5 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_request.cpp
+@@ -47,7 +47,7 @@ std::uint64_t native_layerwise_mutable_metadata_bound(
+     const auto& cfg=statistics.config();
+     if (!logical_capacity || !compact_capacity || compact_capacity>logical_capacity ||
+         !attention_layers || cfg.n_layer!=attention_layers || !cfg.n_embd_k ||
+-        cfg.block_tokens!=64 || existing_target_maps>attention_layers)
++        (cfg.block_tokens!=64 && cfg.block_tokens!=32) || existing_target_maps>attention_layers)
+         throw std::logic_error("native mutable statistics admission has inconsistent geometry");
+     const auto blocks=(std::uint64_t(logical_capacity)+63)/64;
+     const auto compact_blocks=(std::uint64_t(compact_capacity)+63)/64;
+@@ -62,7 +62,7 @@ std::uint64_t native_layerwise_mutable_metadata_bound(
+ void prepare_native_layerwise_fresh_statistics_admission(
+     NativeLayerwiseAdmission& admission,const KvmemWindowState* prospective,
+     std::uint32_t logical_capacity,std::uint32_t compact_capacity,
+-    std::uint32_t attention_layers,std::uint32_t key_width) {
++    std::uint32_t attention_layers,std::uint32_t key_width,std::uint32_t mean_block_tokens) {
+     const auto& account=admission.account();
+     if (!account || !attention_layers || !key_width)
+         throw std::logic_error("native fresh statistics admission lacks its Program account/geometry");
+@@ -81,7 +81,7 @@ void prepare_native_layerwise_fresh_statistics_admission(
+         throw std::logic_error("native fresh statistics has an invalid target map count");
+     std::uint64_t bytes=0;
+     const auto bound=[&](const kvmem::RawKvStore& statistics) {
+-        if (statistics.config().n_embd_k!=key_width)
++        if (statistics.config().n_embd_k!=key_width || statistics.config().block_tokens!=mean_block_tokens)
+             throw std::logic_error("native fresh statistics key width differs from its Program");
+         return native_layerwise_mutable_metadata_bound(logical_capacity,compact_capacity,
+             statistics,attention_layers,static_cast<std::uint32_t>(maps));
+@@ -91,7 +91,7 @@ void prepare_native_layerwise_fresh_statistics_admission(
+         // Same exact mean-only config as prepare_memory_statistics; constructor
+         // creates no blocks, canonical payload or Native/GPU allocation.
+         kvmem::RawKvStore empty(kvmem::RawKvStoreConfig{
+-            .n_layer=attention_layers,.n_embd_k=key_width,.block_tokens=64});
++            .n_layer=attention_layers,.n_embd_k=key_width,.block_tokens=mean_block_tokens});
+         bytes=bound(empty);
+     }
+     if (admission.fresh_statistics_metadata.account()) {
+diff --git a/src/models/qwen3_5/program/native_query_runner.cpp b/src/models/qwen3_5/program/native_query_runner.cpp
+index 1a3ff1fc81fc63580bc59b0111dc467c6bc021a0..a827d3fad8c2438855e71b700cdda75941a2068f 100644
+--- a/src/models/qwen3_5/program/native_query_runner.cpp
++++ b/src/models/qwen3_5/program/native_query_runner.cpp
+@@ -103,6 +103,7 @@ struct NativeLayerwiseQueryExecution::Impl {
+     NativeQueryRunnerBindings bindings;
+     NativeQueryPromptInput prompt_input;
+     std::uint32_t rope_axes=1;
++    std::uint32_t mean_block=64;
+     struct InputTile {std::uint64_t begin;std::uint32_t count;};
+     std::vector<InputTile> tiles;
+     NativeQueryRunnerStage stage = NativeQueryRunnerStage::Embedding;
+@@ -171,6 +172,10 @@ struct NativeLayerwiseQueryExecution::Impl {
+             if (value<0) throw std::invalid_argument("native Query original RoPE position is negative");
+         validate_context(context);
+         DeviceBinding device_binding(device.device);
++        if (context.execution.memory_statistics)
++            mean_block = context.execution.memory_statistics->ranks.at(0).block_tokens;
++        if (mean_block != 32 && mean_block != 64)
++            throw std::invalid_argument("native Query has unsupported Mean-K capture geometry");
+         if (bindings.commit_mean && context.execution.memory_statistics == nullptr)
+             throw std::invalid_argument("native Query Mean-K publication requires native statistics buffers");
+         const auto rows = identity.evaluation.end - identity.evaluation.begin;
+@@ -560,7 +565,7 @@ struct NativeLayerwiseQueryExecution::Impl {
+                     execution::CurrentLayerQueryIdentity{layer,attention,static_cast<std::uint32_t>(rank)},storage);
+                 card.project_query_attention(storage.residual,storage.cache_positions,storage.rope_positions,*saved);
+                 transfer_planes(storage,n,true,rank);
+-                const auto buckets=static_cast<std::uint32_t>((cursor%64+n+63)/64);
++                const auto buckets=static_cast<std::uint32_t>((cursor%mean_block+n+mean_block-1)/mean_block);
+                 const auto& layout=tensor_projection[rank].layout;
+                 std::memset(tensor_host(rank,KeySum,n),0,addressable(multiply(layout.planes.back().row_stride,n)));
+                 if (c.execution.memory_statistics) {
+@@ -638,7 +643,7 @@ struct NativeLayerwiseQueryExecution::Impl {
+     }
+     void tensor_chunk(execution::PrefillContext& c,std::span<const TokenId> public_input,
+         std::uint32_t n,bool full) {
+-        const auto buckets=static_cast<std::uint32_t>((cursor%64+n+63)/64);
++        const auto buckets=static_cast<std::uint32_t>((cursor%mean_block+n+mean_block-1)/mean_block);
+         auto* complete_sums=tensor_extension();
+         if (full) std::memset(complete_sums,0,addressable(multiply(multiply(buckets,config.attention->key_width()),4)));
+         tensor_exchange(c,public_input,n,full?attention_ranks:device.size(),
+@@ -687,7 +692,7 @@ struct NativeLayerwiseQueryExecution::Impl {
+             std::size_t(config.attention->query_width())*2,std::size_t(config.attention->head_dim)*2,2};
+         request.projected_native(identity,cursor,q,bindings.score);
+         transfer_planes(s,n,true);
+-        const auto buckets=static_cast<std::uint32_t>((cursor%64+n+63)/64);
++        const auto buckets=static_cast<std::uint32_t>((cursor%mean_block+n+mean_block-1)/mean_block);
+         std::memset(host(KeySum,n),0,addressable(multiply(projected_layout.planes.back().row_stride,n)));
+         if (c.execution.memory_statistics) {
+             const auto& shard=c.execution.memory_statistics->ranks.at(device.active_rank());
+@@ -718,7 +723,7 @@ struct NativeLayerwiseQueryExecution::Impl {
+         // staging buffer; the native sum plane follows every residual byte.
+         append_residual(*output,n);
+         if (bindings.commit_mean) {
+-            const auto buckets=static_cast<std::uint32_t>((cursor%64+n+63)/64);
++            const auto buckets=static_cast<std::uint32_t>((cursor%mean_block+n+mean_block-1)/mean_block);
+             bindings.commit_mean(attention,cursor,n,{reinterpret_cast<const float*>(host(KeySum,n)),
+                 addressable(multiply(buckets,config.attention->key_width()))});
+         }
+diff --git a/src/models/qwen3_5/program/planning/memory_statistics_layout.h b/src/models/qwen3_5/program/planning/memory_statistics_layout.h
+index 9e76b2be15b136115891087adaba87f547a35899..27d810accb842ecbf9c58a88c877c76f5ada205e 100644
+--- a/src/models/qwen3_5/program/planning/memory_statistics_layout.h
++++ b/src/models/qwen3_5/program/planning/memory_statistics_layout.h
+@@ -46,7 +46,7 @@ void plan_memory_statistics_shard(MemoryStatisticsLayout& out,
+     const auto pages = (std::uint64_t(plan.window_tokens) + 63) / 64;
+     const auto divided = MemoryStatisticsOwner::Divided, every = MemoryStatisticsOwner::Every;
+     out.key_sums = allocate(divided, DType::FP32,
+-        {d(key_width), d((std::uint64_t(prefill)+126)/64), d(out.layers)}, "memory key sums");
++        {d(key_width), d((std::uint64_t(prefill)+2*plan.mean_block_tokens-2)/plan.mean_block_tokens), d(out.layers)}, "memory key sums");
+     out.candidate_keys = allocate(divided, DType::FP32,
+         {d(key_width), d(candidates), d(out.layers)}, "memory candidate keys");
+     out.candidate_origin = allocate(every, DType::I32, {1}, "memory candidate origin");
+@@ -90,7 +90,7 @@ void plan_memory_statistics_rank0(MemoryStatisticsLayout& out, std::optional<Ten
+         {d(std::max<std::uint64_t>(prefill, candidates))}, "memory consumed token capture");
+     if (!plan.mean_query) {
+         const auto bytes = kvmem::PageSoftmaxCuda::workspace_bytes(
+-            static_cast<std::uint32_t>((std::uint64_t(plan.capacity)+63)/64),
++            static_cast<std::uint32_t>((std::uint64_t(plan.capacity)+plan.mean_block_tokens-1)/plan.mean_block_tokens),
+             query_heads, kv_heads, head_dim);
+         workspace = allocate(first, DType::U8, {d(bytes)}, "memory page-softmax workspace");
+     }
+diff --git a/src/models/qwen3_5/program/planning/memory_statistics_options.h b/src/models/qwen3_5/program/planning/memory_statistics_options.h
+index 24e791bf966310bc04381eacb5c2385d2e82a8c4..da4a138d752e6a539ac127edc2001cf999e23d15 100644
+--- a/src/models/qwen3_5/program/planning/memory_statistics_options.h
++++ b/src/models/qwen3_5/program/planning/memory_statistics_options.h
+@@ -18,6 +18,7 @@ struct MemoryStatisticsPlanning {
+     bool mean_query = false;
+     // Independent all-target decode feedback; not cached Query/spread3 Q.
+     bool layerwise_graph_capture = false;
++    std::uint32_t mean_block_tokens = 64;
+ };
+ 
+ } // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
+index 0b2c3e7321df66aa9458ca450ee9b896c9f12d67..c333e67b6d3abfe9faf3c76bb3f76f318f6aaf0d 100644
+--- a/src/models/qwen3_5/program/planning/startup.cpp
++++ b/src/models/qwen3_5/program/planning/startup.cpp
+@@ -393,7 +393,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
+             .query_max_tokens = plan.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise ? 0U :
+                 (plan.kvmem.query_max_tokens ? plan.kvmem.query_max_tokens : plan.capacity),
+             .mean_query = plan.kvmem.recall_strategy==kvmem::RecallStrategy::Legacy && plan.kvmem.query_meanq_cosine,
+-            .layerwise_graph_capture = plan.use_cuda_graph && plan.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise};
++            .layerwise_graph_capture = plan.use_cuda_graph && plan.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise,
++            .mean_block_tokens = plan.kvmem.mean_key_block_tokens()};
+         out.memory_statistics.resize(ranks);
+         if (parameters.text.tensor_parallel()) {
+             for (std::size_t rank = 0; rank < ranks; ++rank) {
+@@ -450,7 +451,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
+                 out.memory_layerwise_extra_storage.push_back(add_tensor(builders[rank],DType::I8,
+                     {dimension(bytes)},"layerwise stable stage Query planes"));
+                 if (!parameters.text.tensor_parallel() && out.memory_statistics[rank].layers) {
+-                    const auto score_bytes=kvmem::PageSoftmaxCuda::workspace_bytes((plan.capacity+63U)/64U,
++                    const auto score_bytes=kvmem::PageSoftmaxCuda::workspace_bytes(
++                        (std::uint64_t(plan.capacity)+statistics_plan.mean_block_tokens-1)/statistics_plan.mean_block_tokens,
+                         config.attention->num_attention_heads,config.attention->num_key_value_heads,config.attention->head_dim);
+                     out.memory_layerwise_extra_workspace[rank-1]=add_tensor(builders[rank],DType::U8,
+                         {dimension(score_bytes)},"layerwise stage page-softmax workspace");
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index 6296eea2d2152b9842537adabb3f8bf54eb06d9f..9a06694cef5d2cfef4ea7749ed60d488faf661d0 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -552,7 +552,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+             kvmem::RawKvStoreConfig shape;
+             shape.n_layer = text.full_attention_layers;
+             shape.n_embd_k = text.attention->key_width();
+-            shape.block_tokens = 64;
++            shape.block_tokens = kvmem_options.mean_key_block_tokens();
+             const kvmem::RawKvStore mean(shape);
+             const auto mutable_history = native_layerwise_mutable_metadata_bound(
+                 capacity, kvmem_window_tokens, mean, shape.n_layer, shape.n_layer);
+@@ -762,11 +762,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+     for (std::size_t rank=1;rank<device.size() && !plan.persistent.memory_layerwise_extra_storage.empty();++rank)
+         layerwise_query_extra_storage.push_back(plan.persistent.memory_layerwise_extra_storage.at(rank-1).bind(backings[rank]));
+     if (!plan.persistent.memory_statistics.empty()) {
++        const auto mean_block = kvmem_options.mean_key_block_tokens();
++        const auto mean_blocks = static_cast<std::uint32_t>((std::uint64_t(capacity)+mean_block-1)/mean_block);
+         const auto& config = parameters.model.config().text;
+         if (plan.persistent.memory_query_workspace) {
+             const auto query_workspace=plan.persistent.memory_query_workspace->bind(backing);
+             memory_query_scorer=std::make_unique<kvmem::PageSoftmaxCuda>(device.rank(0).device,
+-                query_workspace.data,query_workspace.bytes(),(capacity+63U)/64U,
++                query_workspace.data,query_workspace.bytes(),mean_blocks,
+                 config.attention->num_attention_heads,config.attention->num_key_value_heads,config.attention->head_dim);
+         }
+         memory_query_extra_scorers.resize(device.size()-1);
+@@ -775,7 +777,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+             if (!layout) continue;
+             const auto workspace=layout->bind(backings[rank]);
+             memory_query_extra_scorers[rank-1]=std::make_unique<kvmem::PageSoftmaxCuda>(device.rank(rank).device,
+-                workspace.data,workspace.bytes(),(capacity+63U)/64U,
++                workspace.data,workspace.bytes(),mean_blocks,
+                 config.attention->num_attention_heads,config.attention->num_key_value_heads,config.attention->head_dim);
+         }
+         memory_statistics.emplace();
+@@ -787,7 +789,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+             kvmem_options.recall_strategy==kvmem::RecallStrategy::Layerwise ? 1U :
+             std::min({plan.prefill_chunk, plan.capacity,
+                 kvmem_options.query_max_tokens ? kvmem_options.query_max_tokens : plan.capacity});
+-        memory_statistics->columns = (std::min(plan.prefill_chunk, plan.capacity) + 126U) / 64U;
++        memory_statistics->columns = static_cast<std::uint32_t>(
++            (std::uint64_t(std::min(plan.prefill_chunk, plan.capacity)) + 2*mean_block-2)/mean_block);
+         memory_statistics->ranks.resize(device.size());
+         memory_candidate_statistics = *memory_statistics;
+         memory_candidate_statistics->columns = (detail::widest_verify_window(plan) + 1U) * plan.max_concurrency;
+@@ -801,6 +804,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+             stats.first_layer = candidates.first_layer = layout.first_layer;
+             stats.key_offset = candidates.key_offset = layout.key_offset;
+             stats.query_offset = candidates.query_offset = layout.query_offset;
++            stats.block_tokens = mean_block;
+             candidates.block_tokens = 1;
+             if(rank==0) stats.attention_tokens=layout.attention_tokens.bind(backings[rank]);
+             candidates.attention_tokens=stats.attention_tokens;
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index 2398918a7f54343e46ed16acf7fccc3d0e55c0c1..1ffeadc9429c1405f3e3ab7760fe4ca244554246 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -878,9 +878,12 @@ struct NativeLayerwiseProgramQuery::Impl {
+         if (frozen_keys->config().n_layer!=config.full_attention_layers ||
+             frozen_keys->config().n_embd_k!=config.attention->key_width())
+             throw std::logic_error("native layerwise frozen index changed its native statistics geometry");
++        const auto mean_block = frozen_keys->config().block_tokens;
++        if (mean_block != p.kvmem_options.mean_key_block_tokens())
++            throw std::logic_error("native Query Mean-K geometry differs from its current Program");
+         for (std::uint32_t layer=0;layer<config.full_attention_layers;++layer)
+-            for (std::uint32_t id=0;id<begin/64;++id)
+-                if (frozen_keys->mean_k_tokens(id,layer)!=64)
++            for (std::uint32_t id=0;id<begin/mean_block;++id)
++                if (frozen_keys->mean_k_tokens(id,layer)!=mean_block)
+                     throw std::logic_error("native layerwise frozen index has incomplete accepted Mean-K coverage");
+         kvmem::KvMemStoreConfig configuration;
+         kvmem::validate_layerwise_selection_bands({resources.sink_blocks,resources.recent_blocks},64,selected_budget);
+@@ -904,7 +907,7 @@ struct NativeLayerwiseProgramQuery::Impl {
+         const kvmem::LayerwiseQuerySelection admission(*policy,*frozen_keys,identity,
+             {0,config.attention->num_attention_heads,config.attention->num_key_value_heads,
+              config.attention->head_dim,resources.attention_scale},[this]{return identity.history;});
+-        const auto max_blocks=std::max(1u,begin/64);
++        const auto max_blocks=std::max(1u,begin/mean_block);
+         const auto score_bytes=kvmem::PageSoftmaxCuda::workspace_bytes(max_blocks,config.attention->num_attention_heads,
+             config.attention->num_key_value_heads,config.attention->head_dim);
+         if (resources.borrow_program_buffers) {
+@@ -1034,9 +1037,10 @@ struct NativeLayerwiseProgramQuery::Impl {
+             return actual_view(model,plan.plan.next.stamp);
+         };
+         hooks.commit_mean=[this](std::uint32_t layer,std::uint64_t begin,std::uint32_t count,std::span<const float> sums) {
+-            const auto width=sequence.window.statistics->config().n_embd_k;
++            const auto& stats = sequence.window.statistics->config();
++            const auto width=stats.n_embd_k;
+             for (std::uint32_t at=0,bucket=0;at<count;++bucket) {
+-                const auto take=std::min(count-at,64-static_cast<std::uint32_t>((begin+at)%64));
++                const auto take=std::min(count-at,stats.block_tokens-static_cast<std::uint32_t>((begin+at)%stats.block_tokens));
+                 if (std::uint64_t(bucket+1)*width>sums.size()) throw std::logic_error("native Query lost its exact FP32 key-sum bucket");
+                 sequence.window.statistics->write_layer_mean_sum(static_cast<std::uint32_t>(begin+at),take,layer,sums.data()+std::size_t(bucket)*width);
+                 at+=take;
+@@ -3668,7 +3672,7 @@ void ProgramImpl::prepare_layerwise_admission(MaterializationTransaction& transa
+         owner->source_epoch=owner->source?owner->source->epoch:0;
+         owner->checkpoints.reserve(3);
+         prepare_native_layerwise_fresh_statistics_admission(*owner,prospective,capacity,kvmem_window_tokens,
+-            parameters.model.config().text.full_attention_layers,memory_statistics->key_width);
++            parameters.model.config().text.full_attention_layers,memory_statistics->key_width,kvmem_options.mean_key_block_tokens());
+         // Graph/cohort adapter prices sizeof its actual Impl and reserves all
+         // three feedback tickets in Waiting; this is not a capacity-only probe.
+         NativeLayerwiseRequest::prepare_feedback_admission(*this,*owner,envelope,
+@@ -3681,7 +3685,7 @@ void ProgramImpl::prepare_layerwise_admission(MaterializationTransaction& transa
+         const kvmem::CheckpointIdentity identity{descriptor.identity,descriptor.layout,{}};
+         kvmem::RawKvStoreConfig config;
+         config.n_layer=parameters.model.config().text.full_attention_layers;
+-        config.n_embd_k=memory_statistics->key_width;config.block_tokens=64;
++        config.n_embd_k=memory_statistics->key_width;config.block_tokens=kvmem_options.mean_key_block_tokens();
+         kvmem::RawKvStore empty(config);
+         const auto& mean=prospective && prospective->statistics?*prospective->statistics:empty;
+         auto graph=admission_graph(checkpoint,staged.prompt,capacity);
+diff --git a/src/models/qwen3_5/program/storage/layerwise_source.h b/src/models/qwen3_5/program/storage/layerwise_source.h
+index a3d58f49fbd9dd7a6968e4376da4cef6f59d96fb..2b1e6441ea2999402758fcbe963d024e94cd3f2f 100644
+--- a/src/models/qwen3_5/program/storage/layerwise_source.h
++++ b/src/models/qwen3_5/program/storage/layerwise_source.h
+@@ -128,8 +128,14 @@ struct NativeCanonicalHistoryVersion {
+             const auto valid=std::min<std::uint64_t>(64,frontier-id*64);
+             if (!records[id] || records[id].size()!=descriptor.layout.record_bytes || valid_tokens[id]!=valid)
+                 throw std::logic_error("native immutable source changed its original page geometry");
++        }
++        const auto mean_block = mean_index->config().block_tokens;
++        if (mean_block != 64 && mean_block != 32)
++            throw std::logic_error("native immutable source lost its Mean-K geometry");
++        for (std::uint64_t at=0;at<frontier;at+=mean_block) {
++            const auto valid=std::min<std::uint64_t>(mean_block,frontier-at);
+             for (std::uint32_t layer=0;layer<mean_index->config().n_layer;++layer)
+-                if (mean_index->mean_k_tokens(static_cast<std::uint32_t>(id),layer)!=valid)
++                if (mean_index->mean_k_tokens(static_cast<std::uint32_t>(at/mean_block),layer)!=valid)
+                     throw std::logic_error("native immutable source lost exact Mean-K counts");
+         }
+     }
+diff --git a/src/models/qwen3_5/program/storage/layerwise_statistics_admission.h b/src/models/qwen3_5/program/storage/layerwise_statistics_admission.h
+index 7097a7b8581bbf713aaf0ad56c536530a6210960..1de68a623c4ef1ebebf0b9eed8cf917bc3c28b67 100644
+--- a/src/models/qwen3_5/program/storage/layerwise_statistics_admission.h
++++ b/src/models/qwen3_5/program/storage/layerwise_statistics_admission.h
+@@ -20,5 +20,5 @@ std::uint64_t native_layerwise_mutable_metadata_bound(
+ void prepare_native_layerwise_fresh_statistics_admission(
+     NativeLayerwiseAdmission& admission,const KvmemWindowState* prospective,
+     std::uint32_t logical_capacity,std::uint32_t compact_capacity,
+-    std::uint32_t attention_layers,std::uint32_t key_width);
++    std::uint32_t attention_layers,std::uint32_t key_width,std::uint32_t mean_block_tokens);
+ } // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/models/qwen3_5/program/storage/memory_statistics.cpp b/src/models/qwen3_5/program/storage/memory_statistics.cpp
+index bf6acc0903141870e27b7f00667c3d35b3f2b71e..64ab2f4deff5f7f208c4c386fe7b33bb5fdab9bd 100644
+--- a/src/models/qwen3_5/program/storage/memory_statistics.cpp
++++ b/src/models/qwen3_5/program/storage/memory_statistics.cpp
+@@ -60,7 +60,7 @@ void ProgramImpl::prepare_memory_statistics(SequenceState& sequence, std::uint32
+         state.statistics = std::make_unique<kvmem::RawKvStore>(kvmem::RawKvStoreConfig{
+             .n_layer = config.full_attention_layers,
+             .n_embd_k = memory_statistics->key_width,
+-            .block_tokens = 64});
++            .block_tokens = kvmem_options.mean_key_block_tokens()});
+         kvmem::KvMemStoreConfig selection;
+         selection.lrfu = kvmem_options.lrfu;
+         selection.lrfu_lambda = kvmem_options.lrfu_lambda;
+@@ -136,12 +136,13 @@ void ProgramImpl::commit_memory_statistics(SequenceState& sequence, std::uint32_
+     const bool read_query=state.query_capture && !state.query_replayed && query_last>query_first;
+     read_statistics(device,buffers,host,read_query,read_query?query_last-query_first:0);
+     const auto width = buffers.key_width;
++    const auto mean_block = state.statistics->config().block_tokens;
+     const auto layer_stride = static_cast<std::size_t>(width) * buffers.columns;
+     const auto* keys = reinterpret_cast<const float*>(host);
+     for (std::uint32_t layer = 0; layer < state.statistics->config().n_layer; ++layer) {
+         for (auto at = begin; at < end;) {
+-            const auto count = std::min(end - at, 64 - at % 64);
+-            const auto bucket = at / 64 - begin / 64;
++            const auto count = std::min(end - at, mean_block - at % mean_block);
++            const auto bucket = at / mean_block - begin / mean_block;
+             const auto* sum = keys + layer * layer_stride + bucket * width;
+             for (std::uint32_t channel = 0; channel < width; ++channel) {
+                 if (!std::isfinite(sum[channel])) { throw std::runtime_error("Nonfinite KVMem key sum"); }
+diff --git a/src/product/kvmem_cli_options.h b/src/product/kvmem_cli_options.h
+index 71d1fc0f260a029aaf0f4740fcdcf2bdf80306d1..030a52d64c49bd1086ed5bda1f484433ebdf6faa 100644
+--- a/src/product/kvmem_cli_options.h
++++ b/src/product/kvmem_cli_options.h
+@@ -12,6 +12,7 @@ namespace ninfer::product {
+ struct NativeRetentionOptions {
+     std::uint64_t metadata_bytes = 0;
+     std::uint32_t target = kDefaultLayerwiseCheckpointTarget;
++    std::uint32_t score_tokens = 64;
+ 
+     template<class Need>
+     bool parse(const std::string& arg, const Need& need, kvmem::CliOptions& memory) {
+@@ -19,6 +20,10 @@ struct NativeRetentionOptions {
+             target = memory.integer(arg, need(arg.c_str()), 1);
+             if (target > kMaxLayerwiseCheckpointTarget)
+                 throw std::invalid_argument("checkpoint target exceeds 256");
++        } else if (arg == "--kvmem-layerwise-score-tokens") {
++            score_tokens = memory.integer(arg, need(arg.c_str()), 1);
++            if (score_tokens != 32 && score_tokens != 64)
++                throw std::invalid_argument("native layerwise score tokens must be 32 or 64");
+         } else if (arg == "--kvmem-layerwise-metadata-mib") {
+             const std::string value(need(arg.c_str()));
+             metadata_bytes = value == "auto" ? 0 : std::uint64_t(memory.integer(arg, value.c_str(), 1)) << 20;
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index 4f42ec6ee435becd4df15060908ce37610ddf158..fa1d88fbd18fdc7f4fb02104917f0bd52d1fe539 100644
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -1015,7 +1015,8 @@ static ConstructedModel construct_model_impl(const EngineOptions& requested, Dev
+                 .query_max_tokens = options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise ? 0U :
+                     (options.kvmem.query_max_tokens ? options.kvmem.query_max_tokens : options.max_context),
+                 .mean_query = options.kvmem.recall_strategy==kvmem::RecallStrategy::Legacy && options.kvmem.query_meanq_cosine,
+-                .layerwise_graph_capture = options.use_cuda_graph && options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise}};
++                .layerwise_graph_capture = options.use_cuda_graph && options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise,
++                .mean_block_tokens = options.kvmem.mean_key_block_tokens()}};
+         const bool auxiliary_scratch = options.kvmem.recall_strategy == kvmem::RecallStrategy::Layerwise &&
+             options.speculative.backend == SpeculativeBackend::Mtp;
+         split_speed = rank_copy_bandwidth(device);
+@@ -1044,7 +1045,8 @@ static ConstructedModel construct_model_impl(const EngineOptions& requested, Dev
+                 .max_concurrency = options.max_concurrency,
+                 .query_max_tokens = 0U,
+                 .mean_query = false,
+-                .layerwise_graph_capture = options.use_cuda_graph && options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise}};
++                .layerwise_graph_capture = options.use_cuda_graph && options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise,
++                .mean_block_tokens = options.kvmem.mean_key_block_tokens()}};
+         const bool auxiliary_scratch = options.kvmem.recall_strategy == kvmem::RecallStrategy::Layerwise &&
+             options.speculative.backend == SpeculativeBackend::Mtp;
+         options.stage_layers = auxiliary_scratch
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index fac4cca28edd57344a704308abad3c9a4a62a354..b9e0fffef407a6509f590aec7ccff3bef3b50d82 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -127,6 +127,7 @@ std::string serve_usage_text(const char* argv0) {
+            "  --kvmem-layerwise-activation-ram-mib N  bounded Query activation RAM (default 256)\n"
+            "  --kvmem-layerwise-activation-disk-mib N bounded Query activation SSD (default 0)\n"
+            "  --kvmem-layerwise-staging-mib N bounded Query/KV transfer staging (default 16)\n"
++           "  --kvmem-layerwise-score-tokens N   Mean-K statistics per 64-token page: 32 or 64 (default 64)\n"
+            "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
+            "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+            "  --kvmem-layerwise-activation-metadata-mib N bounded tape descriptors (default 128)\n"
+@@ -1828,6 +1829,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+     product::apply_kvmem_cli_options(memory, options.kvmem);
+     options.kvmem.layerwise.metadata_bytes = retention.metadata_bytes;
+     options.kvmem.checkpoint_target = retention.target;
++    options.kvmem.layerwise_score_tokens = retention.score_tokens;
+     kvmem::validate_layerwise_mtp_history(memory.recall_strategy,
+         options.speculative.backend==SpeculativeBackend::Mtp,memory.layerwise_mtp_history);
+     if (options.kvmem.selected_tokens != 0 &&
+diff --git a/tests/models/qwen3_5/test_layerwise_program_query.cpp b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+index 8afb9dd2ae3f9402299ca6fd5590b67cc8ae5948..6ea503f50a449d2097584eb20a1eaa9d9f2396f7 100644
+--- a/tests/models/qwen3_5/test_layerwise_program_query.cpp
++++ b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+@@ -358,7 +358,7 @@ public:
+         check(program.state_store->release(*state),"Program fixture leaked native StateImage");sequence.state={};
+         std::cout<<"PASS actual Program prefix320 + fresh Query3 + tool61/64/64 + Output80: cold page1, whole Query once, independent native mass, unsampled accepted frontier, nonrolling budget128, rolling Output Pressure and accepted scope60/N4\n";
+     }
+-    static void run_public_owner(bool minimal_budget=false) {
++    static void run_public_owner(bool minimal_budget=false,std::uint32_t score_tokens=64) {
+         DeviceContext device(0);fixture::ModelFixture artifact(true,2,
+             "{%- for message in messages -%}{{ message['content'] }}{%- endfor -%}");
+         ninfer::artifact::Reader reader(artifact.file.entry);
+@@ -369,6 +369,7 @@ public:
+         EngineOptions options;options.max_context=512;options.prefill_chunk=128;options.max_concurrency=1;
+         options.kv_capacity=KvCapacityPolicy::explicit_capacity(capacity);options.use_cuda_graph=false;
+         options.kvmem.selected_tokens=minimal_budget?64:192;options.kvmem.reserve_tokens=minimal_budget?192:256;
++        options.kvmem.layerwise_score_tokens=score_tokens;
+         options.kvmem.recall_strategy=kvmem::RecallStrategy::Layerwise;
+         options.kvmem.layerwise_sink_tokens=minimal_budget?0:64;options.kvmem.layerwise_recent_tokens=minimal_budget?0:64;
+         // This quota-isolation fixture deliberately holds a 32 MiB source lease.
+@@ -1506,6 +1507,6 @@ int main(int argc,char** argv) {
+             qwen::detail::NativeLayerwiseQueryFixture::run_mtp(argv[2],mode=="cancel"?2:1);return 0;}
+         catch(const std::exception& error) {std::cerr<<"FAIL MTP Output "<<error.what()<<'\n';return 1;}
+     }
+-    try {qwen::detail::NativeLayerwiseQueryFixture::run_public_owner();qwen::detail::NativeLayerwiseQueryFixture::run_public_owner(true);qwen::detail::NativeLayerwiseQueryFixture::run();qwen::detail::NativeLayerwiseQueryFixture::run_branch();qwen::detail::NativeLayerwiseQueryFixture::run_no_refresh();return 0;}
++    try {qwen::detail::NativeLayerwiseQueryFixture::run_public_owner();qwen::detail::NativeLayerwiseQueryFixture::run_public_owner(true);qwen::detail::NativeLayerwiseQueryFixture::run_public_owner(false,32);qwen::detail::NativeLayerwiseQueryFixture::run();qwen::detail::NativeLayerwiseQueryFixture::run_branch();qwen::detail::NativeLayerwiseQueryFixture::run_no_refresh();return 0;}
+     catch (const std::exception& error) {std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
+ }
+diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
+index db5eab7a8a548e435955bc9ba727f05a8b979b18..c81f80ba0e92d763348293239cc9037c32b01be2 100644
+--- a/tests/test_serve_options.cpp
++++ b/tests/test_serve_options.cpp
+@@ -277,6 +277,17 @@ int run_serve_option_tests() {
+             failures+=check(chosen.kvmem.layerwise_mtp_history==::kvmem::parse_layerwise_mtp_history(history),
+                 "explicit native MTP historical policy was lost before Engine options");
+         }
++        for (const auto tokens : {"32","64"}) {
++            auto args=base;
++            args.insert(args.end(),{"--kvmem-layerwise-score-tokens",tokens});
++            failures+=check(make_engine_options(parse(args)).kvmem.mean_key_block_tokens()==std::stoul(tokens),
++                "native Mean-K geometry did not reach the engine");
++        }
++        auto invalid_grid=base;
++        invalid_grid.insert(invalid_grid.end(),{"--kvmem-layerwise-score-tokens","48"});
++        bool bad_grid=false;
++        try {(void)parse(invalid_grid);} catch(const std::invalid_argument&) {bad_grid=true;}
++        failures+=check(bad_grid,"invalid native Mean-K geometry was accepted");
+         auto missing=base;missing.insert(missing.end(),{"--spec","mtp","--draft-tokens","1"});
+         failures+=check(make_engine_options(parse(missing)).kvmem.layerwise_mtp_history==
+             ::kvmem::LayerwiseMtpHistory::FirstLayer,"layerwise MTP lost its approved first-layer default");

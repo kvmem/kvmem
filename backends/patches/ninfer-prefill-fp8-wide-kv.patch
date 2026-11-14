@@ -1,0 +1,396 @@
+diff --git a/docs/serving.md b/docs/serving.md
+index 62bc1e5c3e62612847b5165f293f89de751e9a02..472bd37683f957860907a90724e1b4c441666876 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -3043,6 +3043,16 @@ variable unset for the reference page-statistics route. The prompt kernel rounds
+ its rotated Q and decoded K to BF16: its page probabilities need not be bitwise
+ equal to the reference FP32 dot-product statistics, especially near a ranking tie.
+ 
++For long single-sequence Ada prefill, set `NINFER_PREFILL_FP8_WIDE_KV=1`
++together with `NINFER_PREFILL_PAGE_LSE_REUSE=1`. Each layer widens its
++visible K and V once into temporary BF16 and FP16 planes shared by its query
++blocks. The 64-row register tile retains the existing two 32-key softmax and
++PV updates per feedback page. The persistent cache remains FP8. Workspace is
++4 KiB per visible token rounded up to a 64-token page, shared across layers
++(160 MiB for 40,960 tokens). Widths below 128 or visibility above 65,536 use
++the existing prompt route. Both settings are read at planning and execution;
++set them before starting the server.
++
+ KVMem's Qwen3.5-core dense path supports explicit heads tensor parallelism:
+ `--devices 0,1 --tensor-parallel --tensor-attention heads`. Merely selecting two
+ devices retains layer-pipeline placement. Optional `--tensor-split 3,1` weights
+diff --git a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+index 4e568e9378653945b0cb79201ed53a963df6bc57..be44eb3ebd29781a13d155aa5c05e76ae8754850 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+@@ -695,6 +695,10 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
+             maximum = std::max(maximum, exact_capacity(width));
+         }
+     }
++    if (batch_size == 1 && geometry.query_heads == 24 && geometry.kv_heads == 4 &&
++        cache_storage == KvCacheStorage::Fp8E4M3Row256) {
++        maximum = std::max(maximum, detail::prompt_fp8_wide_workspace(max_width, envelope.max_visible_keys));
++    }
+     if ((batch_size == 1 || dense_gqa4(geometry)) && kv_cache_is_int8_family(cache_storage) &&
+         detail::causal_attention_prompt_fast_kernel(cache_storage, envelope.fast_prompt_kernel)) {
+         // The fast INT8-family prompt kernel's split partials. Only widths past every
+@@ -920,7 +924,7 @@ void causal_softmax_attention_with_page_lse(const Tensor& q, const Tensor& k, co
+     }
+     if (capture && batch == 1 && !valid_columns.data && cache.storage == KvCacheStorage::Fp8E4M3Row256 &&
+         q.ne[1] == 24 && kv_heads == 4 && detail::try_prompt_fp8_page_lse(
+-            q, k, v, positions, kv_table_rows, scale, cache, envelope.max_visible_keys, out, stream, *capture)) {
++            q, k, v, positions, kv_table_rows, scale, cache, envelope.max_visible_keys, workspace, out, stream, *capture)) {
+         capture->captured = true;
+         if (gate) sigmoid_mul(*gate, out, stream);
+         return;
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh b/src/ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh
+index eae20d77eadc225ee3849d0281a9bfba7ca9081f..5cdf09ca6b7b219d2fca28050fc9af788780abf1 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh
+@@ -276,12 +276,12 @@ __device__ __forceinline__ void causal_prompt_softmax(float (&score)[kCausalProm
+ // software-pipelined: the transposed ldmatrix for the next V fragment is issued while the current
+ // MMA runs. Each x4.trans load covers 2 output n-tiles (16 dims); the next load is pipelined
+ // against the current pair of MMAs.
+-template <class Mma>
++template <int ContractionSteps = kCausalPromptPVKs, class Mma>
+ __device__ __forceinline__ void causal_prompt_pv(float (&acc)[kCausalPromptPVNt][4],
+                                                  const unsigned (&p_frag)[kCausalPromptPVKs][4],
+                                                  const CausalPromptWarpTiles& tiles, Mma&& mma) {
+     constexpr int PVHalf  = kCausalPromptPVNt / 2;      // 16 n-tile pairs
+-    constexpr int PVLoads = kCausalPromptPVKs * PVHalf; // 64 x4.trans loads
++    constexpr int PVLoads = ContractionSteps * PVHalf; // 64 x4.trans loads
+     // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
+     unsigned vf[2][4];
+     ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
+index c457da7b944aafd6674eacbde986f0726e214f86..9a57770a4f5cb774fb99adeaceda7a8ff53d1763 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
+@@ -6,9 +6,12 @@
+ #include "ops/kv_cache/append/launch.h"
+ #include "ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh"
+ #include "ops/kv_cache/plane_types.h"
++#include "ops/softmax_attention/dense/causal_cache/prompt_fp8_wide.cuh"
+ #include "ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h"
+ #include <algorithm>
+ #include <climits>
++#include <cstdlib>
++#include <cstring>
+ 
+ #include <cstdint>
+ 
+@@ -88,15 +91,49 @@ void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const
+ }
+ 
+ namespace {
++// Logical [kv_head, token, dimension] view for this layer and call only.
++__global__ void widen_prompt_fp8_kv(const std::uint8_t* keys, const std::uint8_t* values,
++    const __half* key_scales, const __half* value_scales, const int* tables,
++    const int* table_row, int table_stride, const int* positions, int width, int stride,
++    __nv_bfloat16* wide_keys, __half* wide_values) {
++    constexpr int heads = 4, dim = 256;
++    constexpr int lanes = dim/8;
++    const int head = blockIdx.y;
++    const int token = blockIdx.x*(blockDim.x/lanes) + threadIdx.x/lanes;
++    const int d = (threadIdx.x%lanes)*8;
++    if (token >= stride) return;
++    const int visible = positions[0] + width;
++    const size_t destination = (size_t(head)*stride + token)*dim+d;
++    int4 key = make_int4(0,0,0,0), value = make_int4(0,0,0,0);
++    if (token < visible) {
++        const int physical = tables[size_t(*table_row)*table_stride + token/64];
++        const auto scale = kv_cache_fp8_scale_index(physical,head,token%64,heads);
++        const auto src = kv_cache_fp8_code_index(physical,head,d,token%64,heads);
++        key = kv_cache_fp8_dequant_bf16x8(keys+src,key_scales[scale]);
++        value = kv_cache_fp8_dequant_f16x8(values+src,value_scales[scale]);
++    }
++    store_vec(wide_keys+destination,key);
++    store_vec(wide_values+destination,value);
++}
++
+ __global__ void clear_prompt_page_lse(float* values, int n) {
+     const int i = blockIdx.x*blockDim.x+threadIdx.x;
+     if (i<n) values[i]=-CUDART_INF_F;
+ }
+ }
+ 
++std::size_t prompt_fp8_wide_workspace(int width, std::uint32_t max_visible) {
++    const char* setting = std::getenv("NINFER_PREFILL_FP8_WIDE_KV");
++    const char* feedback = std::getenv("NINFER_PREFILL_PAGE_LSE_REUSE");
++    if (!feedback || std::strcmp(feedback,"1") || !setting || std::strcmp(setting,"1") || width < 128 || max_visible > 65536 ||
++        current_device_tier() != DeviceTier::Ampere) return 0;
++    const std::size_t stride = (std::size_t(max_visible)+63)/64*64;
++    return stride * 4 * 256 * 2 * sizeof(__half);
++}
++
+ bool try_prompt_fp8_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
+     const Tensor& positions, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+-    std::uint32_t max_visible, Tensor& out, cudaStream_t stream, PromptPageLse& capture) {
++    std::uint32_t max_visible, WorkspaceArena& workspace, Tensor& out, cudaStream_t stream, PromptPageLse& capture) {
+     // This implementation was qualified on the Ada wide-BF16-MMA FP8 route.
+     if (current_device_tier() != DeviceTier::Ampere) return false;
+     const auto& scratch = capture.scratch;
+@@ -120,6 +157,26 @@ bool try_prompt_fp8_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
+     // The CTA only traverses its visible prefix. Clear non-visible capacity,
+     // including stale values from the previous layer, to zero probability.
+     clear_prompt_page_lse<<<(int(scratch.numel())+255)/256,256,0,stream>>>(tile.values,int(scratch.numel()));
++    if (const auto bytes = prompt_fp8_wide_workspace(q.ne[2],max_visible)) {
++        auto scope = workspace.scope();
++        auto buffer = workspace.alloc_bytes(bytes);
++        const int width = q.ne[2], stride = (max_visible+63)/64*64;
++        auto* wide_keys = static_cast<__nv_bfloat16*>(buffer.data);
++        auto* wide_values = reinterpret_cast<__half*>(wide_keys + size_t(stride)*4*256);
++        widen_prompt_fp8_kv<<<dim3((stride+7)/8,4),256,0,stream>>>(
++            static_cast<const std::uint8_t*>(cache.k_pages.data),static_cast<const std::uint8_t*>(cache.v_pages.data),
++            static_cast<const __half*>(cache.k_scale_pages.data),static_cast<const __half*>(cache.v_scale_pages.data),
++            meta.tables,meta.table_rows,meta.table_stride,static_cast<const int*>(positions.data),width,stride,wide_keys,wide_values);
++        constexpr int shared_bytes = kCausalPromptSmemBytes;
++        raise_dynamic_shared_memory(wide_prompt_fp8_page_attention, shared_bytes);
++        const dim3 grid(div_up(width, kCausalPromptBr), 24);
++        wide_prompt_fp8_page_attention<<<grid, kCausalPromptThreads, shared_bytes, stream>>>(
++            static_cast<const __nv_bfloat16*>(q.data), wide_keys, wide_values, stride,
++            static_cast<const int*>(positions.data), width, scale,
++            static_cast<__nv_bfloat16*>(out.data), tile);
++        CUDA_CHECK(cudaGetLastError());
++        return true;
++    }
+     const auto kernel=causal_attention_prompt_fp8_kernel<CausalD256H24Kv4,Metadata,false,PromptPageLseTile>;
+     raise_dynamic_shared_memory(kernel,Shape::SmemBytes);
+     const dim3 grid(unsigned(div_up(int(q.ne[2]),Shape::Br)),unsigned(q.ne[1]),1);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8_wide.cuh b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8_wide.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..07220948626376ee1d3b5e0bdd657b2f1f6746ed
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8_wide.cuh
+@@ -0,0 +1,147 @@
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh"
++#include "ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh"
++
++namespace ninfer::ops {
++
++// Match the original FP8 kernel's 32-key softmax and FP16 PV operand
++// boundaries. Its two producer warps each reduce 16 keys and then add their
++// FP32 sums. One warp can reproduce that order in registers for its own rows.
++template<int Half>
++__device__ __forceinline__ void wide_prompt_half(float (&score)[kCausalPromptQKNt][4],
++    float (&acc)[kCausalPromptPVNt][4], const CausalPromptWarpTiles& tiles,
++    float& m0,float& m1,float& l0,float& l1,float& page0,float& page1,
++    int q0,int k0,int r0,int width,int base,float scale,float scale_l2,int lane,
++    bool last_piece,float* out0,float* out1) {
++    constexpr int keys=32, ntiles=keys/8;
++    const int key_base=k0+Half*keys;
++    const int qrow0=q0+r0, qrow1=qrow0+8;
++    const int end0=qrow0<width ? base+qrow0 : -1;
++    const int end1=qrow1<width ? base+qrow1 : -1;
++    const int lid=lane%4;
++    float maximum0=-CUDART_INF_F, maximum1=-CUDART_INF_F;
++#pragma unroll
++    for (int n=0;n<ntiles;++n) {
++        float* s=score[Half*ntiles+n];
++        const int k=key_base+n*8+2*lid;
++        s[0]=k<=end0?s[0]:-CUDART_INF_F; s[1]=k+1<=end0?s[1]:-CUDART_INF_F;
++        s[2]=k<=end1?s[2]:-CUDART_INF_F; s[3]=k+1<=end1?s[3]:-CUDART_INF_F;
++        maximum0=fmaxf(maximum0,fmaxf(s[0],s[1]));
++        maximum1=fmaxf(maximum1,fmaxf(s[2],s[3]));
++    }
++    const float next0=fmaxf(m0,warp_max<4>(maximum0)),next1=fmaxf(m1,warp_max<4>(maximum1));
++    const float scaled0=next0*scale_l2,scaled1=next1*scale_l2;
++    const float a0=m0==-CUDART_INF_F?0:exp2_approx(__fmaf_rn(m0,scale_l2,-scaled0));
++    const float a1=m1==-CUDART_INF_F?0:exp2_approx(__fmaf_rn(m1,scale_l2,-scaled1));
++    float left[2]{},right[2]{};
++    unsigned probability[kCausalPromptPVKs][4];
++#pragma unroll
++    for (int n=0;n<ntiles;++n) {
++        const float* s=score[Half*ntiles+n];
++        const float p0=s[0]>-CUDART_INF_F?exp2_approx(__fmaf_rn(s[0],scale_l2,-scaled0)):0;
++        const float p1=s[1]>-CUDART_INF_F?exp2_approx(__fmaf_rn(s[1],scale_l2,-scaled0)):0;
++        const float p2=s[2]>-CUDART_INF_F?exp2_approx(__fmaf_rn(s[2],scale_l2,-scaled1)):0;
++        const float p3=s[3]>-CUDART_INF_F?exp2_approx(__fmaf_rn(s[3],scale_l2,-scaled1)):0;
++        float* sums=n<2?left:right;
++        sums[0]+=p0+p1; sums[1]+=p2+p3;
++        probability[n/2][(n%2)*2]=pack_f16x2(p0,p1);
++        probability[n/2][(n%2)*2+1]=pack_f16x2(p2,p3);
++    }
++    const float sum0=warp_sum<4>(left[0])+warp_sum<4>(right[0]);
++    const float sum1=warp_sum<4>(left[1])+warp_sum<4>(right[1]);
++    l0=__fmaf_rn(l0,a0,sum0);l1=__fmaf_rn(l1,a1,sum1);m0=next0;m1=next1;
++    if constexpr (Half==0) {page0=sum0;page1=sum1;}
++    else {page0=__fmaf_rn(page0,a0,sum0);page1=__fmaf_rn(page1,a1,sum1);}
++    if (last_piece && lid==0) {
++        if(out0)*out0=page0>0?m0*scale+logf(page0):-CUDART_INF_F;
++        if(out1)*out1=page1>0?m1*scale+logf(page1):-CUDART_INF_F;
++    }
++#pragma unroll
++    for (int n=0;n<kCausalPromptPVNt;++n) {
++        acc[n][0]*=a0;acc[n][1]*=a0;acc[n][2]*=a1;acc[n][3]*=a1;
++    }
++    auto adjusted=tiles;
++    adjusted.v_base+=Half*keys*kCausalPromptHeadDim*sizeof(__half);
++    auto pv=[](float& a,float& b,float& c,float& d,unsigned x,unsigned y,unsigned z,unsigned w,unsigned u,unsigned v){
++        mma_f16(a,b,c,d,x,y,z,w,u,v);
++    };
++    causal_prompt_pv<2>(acc,probability,adjusted,pv);
++}
++
++__global__ __launch_bounds__(128,1) void wide_prompt_fp8_page_attention(
++    const __nv_bfloat16* query, const __nv_bfloat16* key, const __half* value, int stride,
++    const int* positions, int width, float scale, __nv_bfloat16* out,
++    const __grid_constant__ PromptPageLseTile feedback) {
++    if constexpr (!shape_set_in_image(false)) return;
++    using Geometry = CausalD256H24Kv4;
++    constexpr int br=kCausalPromptBr,bc=kCausalPromptBc,dim=kCausalPromptHeadDim;
++    constexpr float log2e=1.4426950408889634f;
++    extern __shared__ __align__(16) unsigned char wide_smem[];
++    auto* qs=reinterpret_cast<__nv_bfloat16*>(wide_smem);
++    auto* ks=qs+br*dim;
++    auto* vs=reinterpret_cast<__half*>(ks+bc*dim);
++    const int tid=threadIdx.x,warp=tid/32,lane=tid%32;
++    const int head=blockIdx.y,q0=blockIdx.x*br,head_group=head/Geometry::GroupSize;
++    const int base=positions[0],last=base+min(q0+br,width)-1;
++    const auto tiles=causal_prompt_warp_tiles(smem_addr(qs),smem_addr(ks),smem_addr(vs),warp*16,lane);
++    // A single warp rotates one represented BF16 query row before QK.
++    for (int row=warp;row<br;row+=4) {
++        float v[8];
++#pragma unroll
++        for (int i=0;i<8;++i) {
++            const int d=lane+32*i;
++            v[i]=q0+row<width ? __bfloat162float(query[(size_t(q0+row)*24+head)*dim+d]) : 0;
++        }
++        normalized_hadamard_d256_inplace(v,lane);
++#pragma unroll
++        for (int i=0;i<8;++i) {
++            const int d=lane+32*i;
++            qs[row*dim+causal_prompt_swz(row,d)]=__float2bfloat16_rn(v[i]);
++        }
++    }
++    const int r0=q0+warp*16+lane/4;
++    const int slot0=feedback.slot(r0),slot1=feedback.slot(r0+8);
++    auto stage=[&](auto* dst,const auto* src,int tile) {
++        const auto* start=src+(size_t(head_group)*stride+tile*bc)*dim;
++#pragma unroll
++        for (int v=tid;v<bc*dim/8;v+=128) {
++            const int row=v/(dim/8),d=v%(dim/8)*8;
++            cp_async<16,Cache::cg>(dst+row*dim+causal_prompt_swz(row,d),start+v*8);
++        }
++        cp_commit();
++    };
++    float acc[kCausalPromptPVNt][4]{};
++    float m0=-CUDART_INF_F,m1=-CUDART_INF_F,l0=0,l1=0;
++    auto qk=[](float& a,float& b,float& c,float& d,unsigned x,unsigned y,unsigned z,unsigned w,unsigned u,unsigned v){
++        mma_bf16(a,b,c,d,x,y,z,w,u,v);
++    };
++    stage(ks,key,0);
++    for (int tile=0;tile<=last/bc;++tile) {
++        cp_wait<0>();__syncthreads();
++        stage(vs,value,tile);
++        float score[kCausalPromptQKNt][4];
++        causal_prompt_qk(score,tiles,qk);
++        auto page=[&](int slot) { return slot>=0 ? feedback.values+(size_t(slot)*24+head)*feedback.pages+tile : nullptr; };
++        cp_wait<0>();__syncthreads();
++        if (tile<last/bc) stage(ks,key,tile+1);
++        // Warps from adjacent 32-query-row groups can have different
++        // causal ends. Retain each group's original number of updates.
++        const int group_last=base+min(width,q0+(warp/2+1)*32)-1;
++        const int k0=tile*bc;
++        float ps0=0,ps1=0;
++        if(k0<=group_last) {
++            const bool second=k0+32<=group_last;
++            wide_prompt_half<0>(score,acc,tiles,m0,m1,l0,l1,ps0,ps1,
++                q0,k0,warp*16+lane/4,width,base,scale,scale*log2e,lane,!second,page(slot0),page(slot1));
++            if(second) wide_prompt_half<1>(score,acc,tiles,m0,m1,l0,l1,ps0,ps1,
++                q0,k0,warp*16+lane/4,width,base,scale,scale*log2e,lane,true,page(slot0),page(slot1));
++        }
++
++    }
++    // The store sums the four per-lane contributions. The original 32-key
++    // order already has their total in every lane.
++    if ((lane%4)!=0) {l0=0;l1=0;}
++    causal_prompt_store<Geometry>(acc,l0,l1,out,head,q0,width,width,warp*16,lane,tid);
++}
++} // namespace ninfer::ops
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h b/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h
+index 0f1629ffdfb40031b41f2a71b06b6979daa3245d..7ab3ba39a0c5b66c21c40ab215ba7d24e92bb214 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h
+@@ -2,7 +2,9 @@
+ #include "ninfer/ops/prompt_page_lse.h"
+ 
+ namespace ninfer::ops::detail {
++// Optional single-layer prefill scratch: widen each visible FP8 KV row once.
++std::size_t prompt_fp8_wide_workspace(int width, std::uint32_t max_visible);
+ bool try_prompt_fp8_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
+     const Tensor& positions, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+-    std::uint32_t max_visible, Tensor& out, cudaStream_t stream, PromptPageLse&);
++    std::uint32_t max_visible, WorkspaceArena& workspace, Tensor& out, cudaStream_t stream, PromptPageLse&);
+ } // namespace ninfer::ops::detail
+diff --git a/tests/experimental/prompt_page_lse.cpp b/tests/experimental/prompt_page_lse.cpp
+index 5324f72930f6344d78e229b1aadb6e6e0de98e51..98fb29b5fa1870fe258e57272221fbc035ad1dd3 100644
+--- a/tests/experimental/prompt_page_lse.cpp
++++ b/tests/experimental/prompt_page_lse.cpp
+@@ -67,12 +67,27 @@ static void qualify(int base,int width,std::vector<int> samples) {
+     if(!capture.captured) throw std::runtime_error("qualified route fell back");
+     ops::attention_page_mass_from_lse(st,nt,mt,nullptr);
+     const auto fused=from_device<float>(mass,mt.numel());
+-    if(from_device<std::uint16_t>(result,nq)!=from_device<std::uint16_t>(other,nq))
++    const auto main_output=from_device<std::uint16_t>(result,nq);
++    const bool equal_main=main_output==from_device<std::uint16_t>(other,nq);
++    if (!equal_main)
+         throw std::runtime_error("capture changed main attention output bits");
+     codes=from_device<std::uint8_t>(pc,codes.size());
+     scales=from_device<std::uint16_t>(ps,scales.size());
+     std::vector<double> represented(nk*D);
+     for(size_t i=0;i<nk;++i) for(int d=0;d<D;++d) represented[i*D+d]=half_scale(scales[i])*fp8(codes[i*D+d]);
++    // Read actual, post-append persistent V bytes. The original-coordinate V
++    // of this plain FP8 profile is not Hadamard rotated. Exercise every output
++    // dimension of each head at the sampled rows against decoded FP64 attention.
++    std::vector<double> represented_v(nk*D);
++    {
++        const auto vc=from_device<std::uint8_t>(pv,codes.size());
++        const auto vs_bits=from_device<std::uint16_t>(vs,scales.size());
++        for (size_t row=0;row<nk;++row) {
++            const double scale=half_scale(vs_bits[row]);
++            for (int d=0;d<D;++d) represented_v[row*D+d]=scale*fp8(vc[row*D+d]);
++        }
++    }
++    double main_error2=0,main_norm2=0,main_max=0;
+     std::vector<double> oracle(size_t(pages)*S);
+     for(int j=0;j<S;++j) for(int h=0;h<H;++h) {
+         const auto* raw=&q[(size_t(samples[j])*H+h)*D];
+@@ -86,7 +101,21 @@ static void qualify(int base,int width,std::vector<int> samples) {
+         }
+         const auto peak=*std::max_element(logits.begin(),logits.end());double z=0;
+         for(auto& y:logits){y=std::exp(y-peak);z+=y;}
+-        for(size_t t=0;t<logits.size();++t) oracle[size_t(j)*pages+t/64]+=logits[t]/(z*H);
++        double ideal[D]{};
++        for(size_t t=0;t<logits.size();++t) {
++            const double prob=logits[t]/z;
++            oracle[size_t(j)*pages+t/64]+=prob/H;
++            const size_t row=(size_t(table[capacity+t/64])*K+h/(H/K))*64+t%64;
++            for (int d=0;d<D;++d) ideal[d]+=prob*represented_v[row*D+d];
++        }
++        for (int d=0;d<D;++d) {
++            const double actual=bf16_to_f32(main_output[(size_t(samples[j])*H+h)*D+d]);
++            if (!std::isfinite(actual)) throw std::runtime_error("nonfinite attention output");
++            const double error=actual-ideal[d];
++            main_error2+=error*error;
++            main_norm2+=ideal[d]*ideal[d];
++            main_max=std::max(main_max,std::abs(error));
++        }
+     }
+     double worst=0,old_err=0,old_delta=0,max_l1=0,sum_err=0;
+     for(int j=0;j<S;++j){
+@@ -101,9 +130,10 @@ static void qualify(int base,int width,std::vector<int> samples) {
+         }
+         max_l1=std::max(max_l1,l1);sum_err=std::max(sum_err,std::abs(sum-1));
+     }
+-    std::cout<<"base="<<base<<" width="<<width<<" samples="<<S<<" main_bits_equal=1 max_abs="<<worst
++    const double main_rel=std::sqrt(main_error2/main_norm2);
++    std::cout<<"base="<<base<<" width="<<width<<" samples="<<S<<" main_bits_equal="<<equal_main<<" main_fp64_rel_l2="<<main_rel<<" main_fp64_max_abs="<<main_max<<" max_abs="<<worst
+              <<" row_l1="<<max_l1<<" old_oracle="<<old_err<<" fused_old="<<old_delta<<" sum_err="<<sum_err<<std::endl;
+-    if(old_err>2e-5 || worst>0.002 || max_l1>0.005 || sum_err>2e-6)
++    if(main_rel>0.02 || old_err>2e-5 || worst>0.002 || max_l1>0.005 || sum_err>2e-6)
+         throw std::runtime_error("outside page probability tolerance");
+     // A stale or invalid requested capture must not be mistaken for materialized stats.
+     capture.rows[0]=-1;

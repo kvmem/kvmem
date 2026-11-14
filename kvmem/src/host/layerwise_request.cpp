@@ -37,7 +37,7 @@ LayerwiseQueryRequest::LayerwiseQueryRequest(LayerwiseQueryIdentity identity,
     if (!revision_ || specs_.size() != catalog_.layers().size() ||
         identity_.history.frontier != policy_.total_tokens() || policy_.config().block_tokens != block ||
         identity_.history.frontier % block || tokens % block || tokens > identity_.history.frontier ||
-        keys_.config().block_tokens != block)
+        !layerwise_score_geometry(block, keys_.config().block_tokens))
         fail(MemoryErrorCode::InvalidPlan,"invalid native layerwise Query admission");
     source();
     completed_views_.reserve(specs_.size());

@@ -8,6 +8,22 @@
 
 namespace kvmem {
 
+// A native transport page may own either one or two equally sized Mean-K records.
+bool layerwise_score_geometry(uint32_t page_tokens, uint32_t mean_tokens);
+
+// In max mode return both half scores, ordered [page0.left, page0.right, ...].
+// Tile owners must accumulate them separately and collapse exactly once at finish.
+std::vector<double> layerwise_tile_scores(const QueryScoreFrame&, uint32_t page_tokens,
+    uint32_t mean_tokens, bool keep_halves,
+    const std::function<std::vector<double>(const QueryScoreFrame&)>&);
+std::size_t layerwise_score_slots(const QueryScoreFrame&, bool keep_halves);
+std::vector<double> layerwise_max_page_scores(const std::vector<double>& accumulated_halves);
+// Existing callers request page probabilities with the legacy sum reduction.
+std::vector<double> layerwise_page_scores(const QueryScoreFrame&, uint32_t page_tokens,
+    uint32_t mean_tokens, const std::function<std::vector<double>(const QueryScoreFrame&)>&);
+
+
+
 struct LayerwiseHistorySelection {
     uint32_t layer = 0; // RawKvStore statistics ordinal, not a physical GPU slot
     QueryScoreFrame frame;
