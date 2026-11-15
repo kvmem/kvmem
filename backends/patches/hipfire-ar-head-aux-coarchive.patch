@@ -1,0 +1,103 @@
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 18a549b76d08ac60e3b6ce11da01322f37a78620..4dae4e6e8481f4c0b90ed0a281a5758a2dfd0ca1 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -6592,6 +6592,11 @@ fn run_loop(
+             if rig.model.kvmem.is_some() {
+                 let mut row = 0usize;
+                 let mut feed_err: Option<String> = None;
++                // fix(a) (② head-plane gap): take the controller OUT so the AR-decode
++                // head aux co-archive below can borrow head/weights/hidden
++                // disjointly alongside `&mut ctl` (mirrors the MTP verify accept
++                // path's `self.kvmem.take()`).
++                let mut kvmem = rig.model.kvmem.take();
+                 for s in 0..n {
+                     let m = batch.m_per_slot[s];
+                     if m == 0 {
+@@ -6603,8 +6608,8 @@ fn run_loop(
+                     if spec_drafts[s].is_some() {
+                         continue;
+                     }
+-                    let fed = {
+-                        let ctl = rig.model.kvmem.as_mut().unwrap();
++                    let fed: Result<(), String> = (|| {
++                        let ctl = kvmem.as_mut().unwrap();
+                         let taps = rig
+                             .model
+                             .pbs
+@@ -6614,13 +6619,73 @@ fn run_loop(
+                         ctl.feed_rows(
+                             &rig.gpu, taps, s, pos0, m, row_start,
+                             &rig.pool, &rig.model.k_arenas, &rig.model.v_arenas,
+-                        )
+-                    };
++                        )?;
++                        // fix(a) (AR-decode head aux co-archive, ② head-plane gap):
++                        // the head aux plane was co-archived ONLY in MTP prefill
++                        // (mtp_prefill) + MTP verify accept; plain AR-decode rows
++                        // fed here advanced the trunk Main plane but NOT the aux
++                        // ordinal, so the head aux frontier lagged the trunk. The
++                        // next composite (Main+aux) suffix-block export then threw
++                        // "packed KV layer ... partial frontier" (masked downstream
++                        // as "layer 0 mass not captured"). Co-archive the head K/V
++                        // for these accepted AR rows exactly like the verify accept:
++                        // norm the trunk PRE-final-norm residual (pbs.x_batch) into
++                        // the head's post-norm staging, recompute the head K/V, and
++                        // seal at the GLOBAL pos. Prefill rows (decoding=false) are
++                        // already co-archived by mtp_prefill ⇒ skipped (no double).
++                        if work[s].decoding && ctl.head_plane_enabled() {
++                            if let (Some(head), Some(state)) = (
++                                rig.model.mtp_head.as_ref(),
++                                rig.model.mtp_states[s].as_mut(),
++                            ) {
++                                let tokens: Vec<u32> = slots[s]
++                                    .as_ref()
++                                    .map(|f| f.session)
++                                    .and_then(|sid| rig.sessions.get(sid))
++                                    .map(|sess| sess.tokens[pos0..pos0 + m].to_vec())
++                                    .unwrap_or_default();
++                                if tokens.len() == m {
++                                    let dim = rig.model.config.dim;
++                                    let rope_shift = ctl.head_prefill_shift(pos0 + m);
++                                    let raw = rig
++                                        .model
++                                        .pbs
++                                        .x_batch
++                                        .sub_offset(row_start * dim, m * dim);
++                                    let staged = state.takeover_fill_hidden.sub_offset(0, m * dim);
++                                    rig.gpu
++                                        .rmsnorm_batched(
++                                            &raw,
++                                            &rig.model.weights.output_norm,
++                                            &staged,
++                                            m,
++                                            dim,
++                                            rig.model.config.norm_eps,
++                                        )
++                                        .map_err(|e| format!("kvmem AR head hidden norm: {e:?}"))?;
++                                    crate::mtp_spec::mtp_takeover_fill_head_kv(
++                                        &mut rig.gpu, head, state, &rig.model.weights,
++                                        pos0, &tokens, rope_shift,
++                                    )
++                                    .map_err(|e| format!("kvmem AR head fill: {e}"))?;
++                                    ctl.head_write_through_archive(
++                                        &rig.gpu,
++                                        &state.mtp_kv.inner.k_gpu[0],
++                                        &state.mtp_kv.inner.v_gpu[0],
++                                        s, pos0, m, pos0 - rope_shift,
++                                    )?;
++                                    ctl.accept_head_append(s, pos0 as u64, (pos0 + m) as u64)?;
++                                }
++                            }
++                        }
++                        Ok(())
++                    })();
+                     if let Err(e) = fed {
+                         feed_err = Some(e);
+                         break;
+                     }
+                 }
++                rig.model.kvmem = kvmem;
+                 if let Some(e) = feed_err {
+                     fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                     poison = Some(e);
