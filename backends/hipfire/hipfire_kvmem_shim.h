@@ -1207,6 +1207,30 @@ int hk_content_group_publication(const hk_content_slot * slots, size_t n, size_t
                                  int * out_reason, size_t * retired_out, size_t retired_capacity,
                                  size_t * out_retired_count);
 
+// ── Speculative contract (kvmem/include/kvmem/speculative.hpp) ────────────
+//
+// Configuration, capability and completed-request statistics schema shared
+// with every backend (the nInfer integration pattern): KVMem owns the
+// contract, the engine owns proposal/verify/KV/rollback. hipfire builds its
+// /props.speculative object from these values; arithmetic stays in the core
+// type so the schema semantics (accepted excludes correction/bonus, drafted
+// excludes internal replay, scope = completed requests) are not restated.
+typedef struct hk_speculative_statistics {
+    uint64_t requests;
+    uint64_t rounds;
+    uint64_t drafted_tokens;
+    uint64_t accepted_tokens;
+    uint64_t generated_tokens;
+    uint64_t fallback_steps;
+} hk_speculative_statistics;
+
+// 0 none, 1 mtp, 2 dflash, 3 dflash2 (kvmem::SpeculativeAlgorithm ordinals).
+uint32_t hk_speculative_schema_version(void);
+const char * hk_speculative_algorithm_name(uint32_t algorithm);
+void hk_speculative_statistics_reset(hk_speculative_statistics * out);
+void hk_speculative_statistics_add(hk_speculative_statistics * dst,
+                                   const hk_speculative_statistics * src);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
