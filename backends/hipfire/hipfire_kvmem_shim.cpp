@@ -2549,6 +2549,31 @@ extern "C" int hk_output_pressure_restore(hk_output_pressure * p, const hk_outpu
     return guarded([&] { p->impl->restore(s->impl, position); }, "hk_output_pressure_restore");
 }
 
+extern "C" int hk_output_pressure_sync_prefill(hk_output_pressure * p, uint64_t position) {
+    if (!p || !p->impl) {
+        set_error("hk_output_pressure_sync_prefill: invalid arguments");
+        return HK_ERR;
+    }
+    // A continuation turn's unsampled Legacy prefill advances the native consumed
+    // frontier without the persistent output window observing it (ninfer calls
+    // accept_prefill after every prefill chunk). hipfire keeps ONE window per
+    // session (request = session_id + 1, begin_scope idempotent, never finished),
+    // so the raw accept_prefill's prepared_==false guard cannot fire mid-window.
+    // Reposition the accepted feedback to the validated native prefix via the
+    // core restore primitive: it advances accepted_end to `position`, clears
+    // prepared_, and preserves the accumulated scores + pending mass exactly —
+    // accept_prefill semantics, usable mid-window. Idempotent: when accepted_end
+    // has already reached `position` (steady-state decode lockstep) this is a
+    // no-op, keeping the within-turn / Legacy / AR-only paths byte-neutral.
+    return guarded([&] {
+        auto snap = p->impl->snapshot();
+        if (snap.accepted_end < position) {
+            snap.accepted_end = position;
+            p->impl->restore(snap, position);
+        }
+    }, "hk_output_pressure_sync_prefill");
+}
+
 extern "C" hk_pressure_choices * hk_output_pressure_select(const hk_output_pressure * p,
                                                            const hk_memory_catalog * catalog,
                                                            const hk_prefill_pressure * prefill,
