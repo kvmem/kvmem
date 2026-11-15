@@ -432,7 +432,7 @@ void HistoricalKvStepEvidence::evaluate(const std::shared_ptr<HistoricalKvPageFe
             if (s.evaluated && (s.value.duplicate_begin || s.feature_epoch == epoch)) {
                 if (s.missing_observations.empty() || s.observation_revision == observation_revision) continue;
                 s.observation_revision = observation_revision;
-                if (!features->any_observed(s.missing_observations)) continue;
+                if (!features->any_observed(s.missing_observations, config_.relaxed_attention_redundancy)) continue;
             }
             candidate.value = s.value;
             candidate.revision = s.revision;
@@ -482,7 +482,7 @@ void HistoricalKvStepEvidence::evaluate(const std::shared_ptr<HistoricalKvPageFe
             continue;
         }
         Feature f{page,b.handle,std::vector<float>(dims),0};
-        if (!features->read_observed(b,f.key.data(),f.importance)) {
+        if (!features->read_observed(b,f.key.data(),f.importance,config_.relaxed_attention_redundancy)) {
             missing_observations.push_back(page);
             continue;
         }
@@ -503,15 +503,16 @@ void HistoricalKvStepEvidence::evaluate(const std::shared_ptr<HistoricalKvPageFe
     const auto& masks = candidate.value.witness_masks;
     const bool audit = historical_kv_audit_enabled();
     size_t literal_vetoes = 0;
+    size_t importance_rejections = 0, similarity_rejections = 0;
     for (const auto& s:sources) {
         bool vetoed = false;
         const auto witness = std::find_if(witnesses.begin(), witnesses.end(), [&](const Feature& w) {
-            if (w.importance<s.importance) return false;
-            const bool covered = masks.empty() ||
+            if (w.importance<s.importance) { ++importance_rejections; return false; }
+            const bool covered = config_.relaxed_attention_redundancy || masks.empty() ||
                 (masks[s.page - first_source] & (1u << (w.page - first_witness)));
             if (!covered && !audit) return false;
             ++comparisons;
-            if (!(cosine(s.key,w.key)>=config_.similarity)) return false;
+            if (!(cosine(s.key,w.key)>=config_.similarity)) { ++similarity_rejections; return false; }
             vetoed |= !covered;
             return covered;
         });
@@ -533,6 +534,11 @@ void HistoricalKvStepEvidence::evaluate(const std::shared_ptr<HistoricalKvPageFe
         net_gain ? selected.size() : 0,(unsigned long long)epoch,
         (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-started).count());
     if (!net_gain) selected.clear();
+    if (audit && !duplicate) std::fprintf(stderr,
+        "KVMEM_STEP_FILTER id=%s mode=%s similarity=%.3f observed_sources=%zu observed_witnesses=%zu missing_pages=%zu importance_rejected_pairs=%zu similarity_rejected_pairs=%zu literal_vetoed_sources=%zu selected_sources=%zu\n",
+        candidate.value.id.c_str(),config_.relaxed_attention_redundancy ? "attention_redundancy" : "strict",
+        config_.similarity,sources.size(),witnesses.size(),missing_observations.size(),
+        importance_rejections,similarity_rejections,literal_vetoes,selected.size());
     std::sort(selected.begin(), selected.end(), [](const Selection& a, const Selection& b) {
         return std::tie(a.witness, a.page) < std::tie(b.witness, b.page);
     });

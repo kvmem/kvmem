@@ -1,0 +1,110 @@
+diff --git a/include/ninfer/engine_options.h b/include/ninfer/engine_options.h
+index f1877a9..bb1c2f8 100644
+--- a/include/ninfer/engine_options.h
++++ b/include/ninfer/engine_options.h
+@@ -443,6 +443,8 @@ struct KvmemOptions {
+     // application metadata alone never authorizes deletion in this mode.
+     bool historical_gc_step_redundancy = false;
+     bool historical_gc_step_observe = false;
++    // Opt-in experiment: attention-only importance, cosine >= .85, no literal veto.
++    bool historical_gc_step_relaxed = false;
+     std::uint32_t historical_gc_min_observations = 3, historical_gc_min_cold_observations = 3;
+     double historical_gc_max_importance = 0.1;
+     [[nodiscard]] bool historical_gc_enabled() const noexcept {
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index f3004f8..10ae7b6 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -228,6 +228,8 @@ std::shared_ptr<kvmem::HistoricalKvStepEvidence> make_step_evidence(const KvmemO
+     limits.max_importance=options.historical_gc_max_importance;
+     limits.source_floor_tokens=options.sink_blocks()*page_tokens;
+     limits.feature_gate=options.historical_gc_step_redundancy;
++    limits.relaxed_attention_redundancy=options.historical_gc_step_relaxed;
++    if (options.historical_gc_step_relaxed) limits.similarity=0.85;
+     // The producer reuses the normal analysis field; no new summary KV is
+     // generated. Other statistical evidence producers keep their own limits.
+     limits.charge_result_pages=!options.historical_gc_step_redundancy;
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index 3cc1982..14d3512 100644
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -337,6 +337,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+         throw std::invalid_argument("Statistical GC currently requires a RAM-only Host archive");
+     if (options.kvmem.historical_gc_step_observe && !options.kvmem.historical_gc_step_redundancy)
+         throw std::invalid_argument("Step observation requires proactive step redundancy");
++    if (options.kvmem.historical_gc_step_relaxed && !options.kvmem.historical_gc_step_redundancy)
++        throw std::invalid_argument("Relaxed step GC requires step redundancy");
+     if (options.kvmem.historical_gc_step_redundancy &&
+         (!options.kvmem.historical_gc_statistical || options.kvmem.historical_gc_min_observations!=1 ||
+          options.kvmem.historical_gc_min_cold_observations!=0 || options.kvmem.historical_gc_max_importance!=1))
+diff --git a/src/serve/http_server.cpp b/src/serve/http_server.cpp
+index 1c6500e..22fb440 100644
+--- a/src/serve/http_server.cpp
++++ b/src/serve/http_server.cpp
+@@ -1105,6 +1105,8 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
+             options.kvmem.historical_gc_redundancy ? "redundancy" : options.kvmem.historical_gc_lru ? "lru" : "off"},
+         {"pressure_fallback", options.kvmem.historical_gc_step_redundancy ? "lru" : "none"},
+         {"observe_only", options.kvmem.historical_gc_step_observe},
++        {"step_content_rule", options.kvmem.historical_gc_step_relaxed ? "attention_redundancy" : "strict"},
++        {"step_similarity", options.kvmem.historical_gc_step_relaxed ? 0.85 : 0.9},
+         {"min_observations", options.kvmem.historical_gc_min_observations},
+         {"min_cold_observations", options.kvmem.historical_gc_min_cold_observations},
+         {"max_importance", options.kvmem.historical_gc_max_importance},
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 80c4d8c..60963c4 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -110,6 +110,7 @@ std::string serve_usage_text(const char* argv0) {
+            "  --kvmem-gc-statistical       proactively retire completed spans with retained-result evidence\n"
+            "  --kvmem-gc-step-redundancy  proactive thinking redundancy; pressure LRU fallback (no LLM judge)\n"
+            "  --kvmem-gc-step-observe     evaluate step redundancy without excluding or retiring pages\n"
++           "  --kvmem-gc-step-relaxed     experiment: attention + cosine >= .85, no literal veto (requires step-redundancy)\n"
+            "  --kvmem-gc-min-observations N  minimum distinct observations (default 3)\n"
+            "  --kvmem-gc-min-cold-observations N  consecutive cold observations (default 3)\n"
+            "  --kvmem-gc-max-importance X  latest importance ceiling (default 0.1)\n"
+@@ -750,6 +751,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+             options.kvmem.historical_gc_step_observe = true;
+             continue;
+         }
++        if (arg == "--kvmem-gc-step-relaxed") {
++            options.kvmem.historical_gc_step_relaxed = true;
++            continue;
++        }
+         if (arg == "--kvmem-gc-min-observations") {
+             options.kvmem.historical_gc_min_observations = kvmem::CliOptions::integer(arg, require_value(arg.c_str()), 1);
+             continue;
+@@ -2084,6 +2089,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+         throw std::invalid_argument("Statistical GC currently requires a RAM-only Host archive");
+     if (options.kvmem.historical_gc_step_observe && !options.kvmem.historical_gc_step_redundancy)
+         throw std::invalid_argument("--kvmem-gc-step-observe requires --kvmem-gc-step-redundancy");
++    if (options.kvmem.historical_gc_step_relaxed && !options.kvmem.historical_gc_step_redundancy)
++        throw std::invalid_argument("--kvmem-gc-step-relaxed requires --kvmem-gc-step-redundancy");
+     if (options.kvmem.historical_gc_step_redundancy &&
+         (!options.kvmem.historical_gc_statistical || options.kvmem.historical_gc_min_observations!=1 ||
+          options.kvmem.historical_gc_min_cold_observations!=0 || options.kvmem.historical_gc_max_importance!=1))
+diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
+index e1af4ce..4a02bde 100644
+--- a/tests/test_serve_options.cpp
++++ b/tests/test_serve_options.cpp
+@@ -2381,8 +2381,13 @@ int test_statistical_gc_options() {
+         "--kvmem-gc-step-redundancy","--kvmem-gc-step-observe","--kvmem-query-scorer","meanq-cosine"});
+     if (!step.kvmem.historical_gc_step_redundancy || !step.kvmem.historical_gc_statistical ||
+         !step.kvmem.historical_gc_step_observe ||
++        step.kvmem.historical_gc_step_relaxed ||
+         step.kvmem.historical_gc_min_observations!=1 || step.kvmem.historical_gc_min_cold_observations!=0)
+         return 1;
++    const auto relaxed=parse({"ninfer-serve","model.ninfer","--kvmem-budget","2048",
++        "--kvmem-gc-step-relaxed","--kvmem-gc-step-redundancy","--kvmem-query-scorer","meanq-cosine"});
++    if (!relaxed.kvmem.historical_gc_step_relaxed || !relaxed.kvmem.historical_gc_step_redundancy)
++        return 1;
+     const auto selected = parse({"ninfer-serve", "model.ninfer", "--kvmem-budget", "2048",
+         "--kvmem-gen-reserve", "1024", "--kvmem-gc-statistical", "--kvmem-gc-min-observations", "1",
+         "--kvmem-gc-min-cold-observations", "0", "--kvmem-gc-max-importance", "1"});
+@@ -2391,6 +2396,7 @@ int test_statistical_gc_options() {
+         "statistical GC profile did not reach engine options");
+     for (const auto& extra : {std::vector<std::string>{"--kvmem-gc-lru"},
+             std::vector<std::string>{"--kvmem-gc-step-observe"},
++            std::vector<std::string>{"--kvmem-gc-step-relaxed"},
+             std::vector<std::string>{"--kvmem-gc-max-importance", "nan"},
+             std::vector<std::string>{"--kvmem-gc-min-observations", "0"}}) {
+         std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--kvmem-budget", "2048", "--kvmem-gc-statistical"};

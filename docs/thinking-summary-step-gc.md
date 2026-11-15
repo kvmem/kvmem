@@ -302,7 +302,7 @@ r6 COBOL reward=1、3/3 检查、Agent 正常结束，实际回收 3 页/192 tok
 
 这轮先完成 16 题、32 次正式尝试，再逐项检查 `degradation-review-queue.json` 中的退化：分别核对官方 verifier、Agent 是否自行结束、HTTP/环境异常、第一次轨迹差异是否早于逻辑删除，以及实际标记、提交、Ready 页数及被删内容。单次配对仍不能独立证明因果。当前 Native 二进制、策略门槛和生成参数已冻结；仅修复已复现的依赖下载/构建问题，不在对照途中调整算法。
 
-原始数据位于 `artifacts/combined-step-gc-20261104`，远程隔离目录为 `/tmp/kvmem-ninfer-gc-20261028/proactive-20261103/combined-step-20261104`。正式进度和成绩查看 `official-pairs-controlled/status.json`、`results.json`、`comparison.json`。已完成尝试另备份到 `/home/yifan/kvmem-validation/proactive-fixed16-20261104`。p95/吞吐沿用5%/3%筛查门槛，质量下降与最低内存净收益门槛未指定。
+原始数据位于 `artifacts/combined-step-gc-20261104`，远程隔离目录为 `/tmp/kvmem-ninfer-gc-20261028/proactive-20261103/combined-step-20261104`。正式进度和成绩查看 `official-pairs-controlled/status.json`、`results.json`、`comparison.json`。已完成尝试另备份到 `$HOME/kvmem-validation/proactive-fixed16-20261104`。p95/吞吐沿用5%/3%筛查门槛，质量下降与最低内存净收益门槛未指定。
 
 ## 视频题控制变量复核
 
@@ -337,7 +337,7 @@ r6 COBOL reward=1、3/3 检查、Agent 正常结束，实际回收 3 页/192 tok
 
 进程 PSS 的各轮中位数为4,947.68、4,987.38、4,989.08、4,990.12、4,990.82、4,992.81 MiB。第2至第6轮中位数增加5.43 MiB，最高采样5,139.61 MiB，Native RSS高水位5,140.50 MiB。该负载验证了槽位可持续复用和观测期内的内存趋势。累计周转量表示可再次分配的 Host KV 字节数。96K 长请求下的总内存仍有上述净增量。
 
-本轮视频题最终节点未复现官方评分下降。解码轮次 p95 通过原定筛查值，吞吐未达到原定筛查值。内存采样和原生释放日志位于 `combined-memory-20261105`，与视频、效率证据一起归档至 `/home/yifan/kvmem-validation/proactive-fixed16-20261104/qualification-20261105.tar.gz`。
+本轮视频题最终节点未复现官方评分下降。解码轮次 p95 通过原定筛查值，吞吐未达到原定筛查值。内存采样和原生释放日志位于 `combined-memory-20261105`，与视频、效率证据一起归档至 `$HOME/kvmem-validation/proactive-fixed16-20261104/qualification-20261105.tar.gz`。
 
 ## 2026-11-06 主动回收后的前缀续接
 
