@@ -18,6 +18,7 @@
 #include <kvmem/layerwise_pressure.hpp>
 #include <kvmem/layerwise_window.hpp>
 #include <kvmem/layerwise_import.hpp>
+#include <kvmem/checkpoint_policy.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -3030,4 +3031,93 @@ extern "C" int hk_layerwise_import_plan(const hk_layerwise_window_plan * p,
         set_error("hk_layerwise_import_plan: unknown C++ exception");
         return HK_ERR;
     }
+}
+
+// ── checkpoint policy: capture plan + coverage retention ──
+
+struct hk_checkpoint_plan {
+    kvmem::CheckpointCapturePlan impl;
+};
+
+extern "C" hk_checkpoint_plan * hk_checkpoint_plan_create(uint64_t base, uint64_t stride,
+                                                          uint64_t root_at, uint64_t tail_at) {
+    clear_error();
+    try {
+        auto plan = std::make_unique<hk_checkpoint_plan>();
+        plan->impl = kvmem::CheckpointCapturePlan(base, stride, root_at, tail_at);
+        return plan.release();
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_checkpoint_plan_create: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_checkpoint_plan_destroy(hk_checkpoint_plan * p) {
+    delete p;
+}
+
+extern "C" uint64_t hk_checkpoint_plan_cut(const hk_checkpoint_plan * p, uint64_t begin,
+                                           uint64_t end) {
+    clear_error();
+    if (!p) {
+        set_error("hk_checkpoint_plan_cut: null plan");
+        return end;
+    }
+    return p->impl.cut(begin, end);
+}
+
+extern "C" int hk_checkpoint_plan_due(const hk_checkpoint_plan * p, uint64_t frontier,
+                                      uint32_t * purpose) {
+    clear_error();
+    if (!p) {
+        set_error("hk_checkpoint_plan_due: null plan");
+        return -1;
+    }
+    const auto due = p->impl.due(frontier);
+    if (!due) return 0;
+    if (!purpose) {
+        set_error("hk_checkpoint_plan_due: null purpose");
+        return -1;
+    }
+    *purpose = static_cast<uint32_t>(*due);
+    return 1;
+}
+
+extern "C" void hk_checkpoint_plan_saved(hk_checkpoint_plan * p, uint64_t frontier) {
+    if (p) p->impl.saved(frontier);
+}
+
+extern "C" size_t hk_checkpoint_coverage_retain(const hk_coverage_info * infos, size_t n,
+                                                uint64_t count, uint64_t bytes,
+                                                uint64_t interval, uint64_t min_gap,
+                                                size_t * out, size_t out_capacity) {
+    clear_error();
+    if (!infos && n) {
+        set_error("hk_checkpoint_coverage_retain: null infos");
+        return size_t(-1);
+    }
+    try {
+        std::vector<kvmem::CoverageInfo> in(n);
+        for (size_t i = 0; i < n; ++i) {
+            in[i].frontier = infos[i].frontier;
+            in[i].bytes = infos[i].bytes;
+            in[i].used = infos[i].used;
+            in[i].identity = infos[i].identity
+                ? reinterpret_cast<const void *>(static_cast<uintptr_t>(infos[i].identity))
+                : nullptr;
+            in[i].purpose = static_cast<kvmem::CoveragePurpose>(infos[i].purpose);
+            in[i].protections = static_cast<uint8_t>(infos[i].protections);
+        }
+        const auto keep = kvmem::retain_checkpoint_coverage(in, size_t(count), bytes, interval, min_gap);
+        if (!out || out_capacity < keep.size()) return keep.size();
+        std::copy(keep.begin(), keep.end(), out);
+        return keep.size();
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_checkpoint_coverage_retain: unknown C++ exception");
+    }
+    return size_t(-1);
 }
