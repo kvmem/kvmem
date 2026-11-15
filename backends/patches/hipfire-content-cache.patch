@@ -1,0 +1,420 @@
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index c1900d960..198e49c6e 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -1846,6 +1846,47 @@ mod ffi {
+             out: *mut usize,
+             out_capacity: usize,
+         ) -> usize;
++
++        // ── content cache policy ──
++        pub fn hk_cache_owner_resolve(
++            hints: *const CacheOwnerHints,
++            out: *mut c_char,
++            out_capacity: usize,
++        ) -> c_int;
++        pub fn hk_content_rank_candidates(
++            input: *const ContentCandidate,
++            n: usize,
++            new_user_query: c_int,
++            max_candidates: usize,
++            out: *mut ContentCandidate,
++            out_capacity: usize,
++        ) -> usize;
++        pub fn hk_content_snapshot_covers(
++            incoming: *const u64,
++            incoming_count: usize,
++            previous: *const u64,
++            previous_count: usize,
++        ) -> c_int;
++        pub fn hk_content_publication(
++            slots: *const ContentSlot,
++            n: usize,
++            max_entries: usize,
++            incoming_identity: u64,
++            reason: *mut c_int,
++        ) -> c_int;
++        pub fn hk_content_eviction(slots: *const ContentSlot, n: usize) -> c_int;
++        pub fn hk_content_group_publication(
++            slots: *const ContentSlot,
++            n: usize,
++            max_entries: usize,
++            max_groups: usize,
++            incoming_group: u64,
++            out_slot: *mut usize,
++            out_reason: *mut c_int,
++            retired_out: *mut usize,
++            retired_capacity: usize,
++            out_retired_count: *mut usize,
++        ) -> c_int;
+     }
+ }
+ 
+@@ -4512,3 +4553,237 @@ pub fn retain_checkpoint_coverage(
+     out.truncate(written.min(out.len()));
+     Ok(out)
+ }
++
++// ── content cache policy: safe wrappers ──
++
++#[repr(C)]
++struct CacheOwnerHints {
++    conversation: *const c_char,
++    prompt: *const c_char,
++    sdk_prompt: *const c_char,
++    legacy_session: *const c_char,
++}
++
++/// Adapter-supplied candidate metadata (native eligibility is the caller's
++/// proof; this struct carries only the ranking inputs).
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct ContentCandidate {
++    pub slot: u64,
++    pub frontier: u64,
++    pub cold_bytes: u64,
++    pub last_used: u64,
++    pub continuation: c_int,
++}
++
++/// Directory slot metadata; `identity == 0` means an empty/unsealed slot.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct ContentSlot {
++    pub occupied: c_int,
++    pub pinned: c_int,
++    pub last_used: u64,
++    pub identity: u64,
++    pub group: u64,
++}
++
++/// Mirrors `kvmem::ContentPublicationReason` (append-only ordinals).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u32)]
++pub enum PublicationReason {
++    Inserted = 0,
++    Replaced = 1,
++    Deduplicated = 2,
++    Disabled = 3,
++    AllPinned = 4,
++    MetadataLimit = 5,
++    Incomplete = 6,
++}
++
++impl PublicationReason {
++    pub fn from_ordinal(v: i32) -> Option<Self> {
++        match v {
++            0 => Some(Self::Inserted),
++            1 => Some(Self::Replaced),
++            2 => Some(Self::Deduplicated),
++            3 => Some(Self::Disabled),
++            4 => Some(Self::AllPinned),
++            5 => Some(Self::MetadataLimit),
++            6 => Some(Self::Incomplete),
++            _ => None,
++        }
++    }
++}
++
++fn cstring(value: Option<&str>) -> Result<Option<CString>> {
++    value
++        .map(|v| CString::new(v).map_err(|e| KvMemError(format!("cache owner: {e}"))))
++        .transpose()
++}
++
++/// Resolve the cache owner exactly like the core: conversation wins, the two
++/// prompt keys must agree, an empty prompt key is ignored, and a legacy
++/// session label is accepted only up to 256 bytes.
++pub fn resolve_cache_owner(
++    conversation: Option<&str>,
++    prompt: Option<&str>,
++    sdk_prompt: Option<&str>,
++    legacy_session: Option<&str>,
++) -> Result<Option<String>> {
++    let c = cstring(conversation)?;
++    let p = cstring(prompt)?;
++    let s = cstring(sdk_prompt)?;
++    let l = cstring(legacy_session)?;
++    let hints = CacheOwnerHints {
++        conversation: c.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
++        prompt: p.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
++        sdk_prompt: s.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
++        legacy_session: l.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
++    };
++    let mut buf = vec![0i8; 300];
++    clear_error();
++    match unsafe { ffi::hk_cache_owner_resolve(&hints, buf.as_mut_ptr(), buf.len()) } {
++        1 => {
++            let s = unsafe { CStr::from_ptr(buf.as_ptr()) };
++            Ok(Some(s.to_string_lossy().into_owned()))
++        }
++        0 => Ok(None),
++        _ => Err(err_from_last()),
++    }
++}
++
++/// Rank candidates (filter unproven zeros, continuation-only unless a new user
++/// query, then frontier desc / cold_bytes asc / last_used desc / slot asc).
++pub fn rank_content_candidates(
++    candidates: &[ContentCandidate],
++    new_user_query: bool,
++    max_candidates: usize,
++) -> Result<Vec<ContentCandidate>> {
++    clear_error();
++    let n = unsafe {
++        ffi::hk_content_rank_candidates(
++            candidates.as_ptr(),
++            candidates.len(),
++            new_user_query as c_int,
++            max_candidates,
++            ptr::null_mut(),
++            0,
++        )
++    };
++    if n == usize::MAX {
++        return Err(err_from_last());
++    }
++    let mut out = vec![ContentCandidate::default(); n];
++    let written = unsafe {
++        ffi::hk_content_rank_candidates(
++            candidates.as_ptr(),
++            candidates.len(),
++            new_user_query as c_int,
++            max_candidates,
++            out.as_mut_ptr(),
++            out.len(),
++        )
++    };
++    if written == usize::MAX {
++        return Err(err_from_last());
++    }
++    out.truncate(written.min(out.len()));
++    Ok(out)
++}
++
++/// True when `incoming` covers every previous origin (nonempty, no zero IDs).
++pub fn content_snapshot_covers(incoming: &[u64], previous: &[u64]) -> bool {
++    unsafe { ffi::hk_content_snapshot_covers(incoming.as_ptr(), incoming.len(), previous.as_ptr(), previous.len()) == 1 }
++}
++
++/// Choose the directory slot for one publication. `None` means publish nothing
++/// (the reason explains why); a returned index equal to `slots.len()` appends.
++pub fn select_content_publication(
++    slots: &[ContentSlot],
++    max_entries: usize,
++    incoming_identity: Option<u64>,
++) -> Result<(Option<usize>, PublicationReason)> {
++    let mut reason = 0i32;
++    clear_error();
++    let slot = unsafe {
++        ffi::hk_content_publication(
++            slots.as_ptr(),
++            slots.len(),
++            max_entries,
++            incoming_identity.unwrap_or(0),
++            &mut reason,
++        )
++    };
++    if let Some(e) = last_error() {
++        return Err(KvMemError(e));
++    }
++    let slot = if slot < 0 { None } else { Some(slot as usize) };
++    let reason = PublicationReason::from_ordinal(reason)
++        .ok_or_else(|| KvMemError(format!("unknown publication reason {reason}")))?;
++    Ok((slot, reason))
++}
++
++/// Eviction victim (redundant group versions first, then LRU); `None` when
++/// nothing is evictable.
++pub fn select_content_eviction(slots: &[ContentSlot]) -> Result<Option<usize>> {
++    clear_error();
++    let v = unsafe { ffi::hk_content_eviction(slots.as_ptr(), slots.len()) };
++    if let Some(e) = last_error() {
++        return Err(KvMemError(e));
++    }
++    Ok(if v < 0 { None } else { Some(v as usize) })
++}
++
++/// Group-aware publication: chosen slot (or `slots.len()` = append), reason and
++/// the retired slots that must be released.
++pub fn plan_content_group_publication(
++    slots: &[ContentSlot],
++    max_entries: usize,
++    max_groups: usize,
++    incoming_group: u64,
++) -> Result<(Option<usize>, PublicationReason, Vec<usize>)> {
++    let mut slot = usize::MAX;
++    let mut reason = 0i32;
++    let mut count = 0usize;
++    clear_error();
++    let rc = unsafe {
++        ffi::hk_content_group_publication(
++            slots.as_ptr(),
++            slots.len(),
++            max_entries,
++            max_groups,
++            incoming_group,
++            &mut slot,
++            &mut reason,
++            ptr::null_mut(),
++            0,
++            &mut count,
++        )
++    };
++    if rc != 0 {
++        return Err(err_from_last());
++    }
++    let mut retired = vec![0usize; count];
++    let rc = unsafe {
++        ffi::hk_content_group_publication(
++            slots.as_ptr(),
++            slots.len(),
++            max_entries,
++            max_groups,
++            incoming_group,
++            &mut slot,
++            &mut reason,
++            retired.as_mut_ptr(),
++            retired.len(),
++            &mut count,
++        )
++    };
++    if rc != 0 {
++        return Err(err_from_last());
++    }
++    retired.truncate(count.min(retired.len()));
++    let slot = if slot == usize::MAX { None } else { Some(slot) };
++    let reason = PublicationReason::from_ordinal(reason)
++        .ok_or_else(|| KvMemError(format!("unknown publication reason {reason}")))?;
++    Ok((slot, reason, retired))
++}
+diff --git a/crates/hipfire-kvmem/tests/content_cache_smoke.rs b/crates/hipfire-kvmem/tests/content_cache_smoke.rs
+new file mode 100644
+index 000000000..50e42b57c
+--- /dev/null
++++ b/crates/hipfire-kvmem/tests/content_cache_smoke.rs
+@@ -0,0 +1,124 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 The hipfire authors
++// hipfire — see LICENSE or NOTICE in the project root.
++
++//! Host-only smoke test for the content-cache policy wrappers: cache-owner
++//! resolution, candidate ranking, snapshot coverage, directory publication /
++//! eviction and group-aware retention. Pure metadata; no payload or directory
++//! mutation happens here.
++
++use hipfire_kvmem::{
++    content_snapshot_covers, plan_content_group_publication, rank_content_candidates,
++    resolve_cache_owner, select_content_eviction, select_content_publication, ContentCandidate,
++    ContentSlot, PublicationReason,
++};
++
++fn cand(slot: u64, frontier: u64, cold: u64, used: u64, cont: bool) -> ContentCandidate {
++    ContentCandidate { slot, frontier, cold_bytes: cold, last_used: used, continuation: cont as i32 }
++}
++
++fn mk(occupied: bool, pinned: bool, used: u64, identity: u64, group: u64) -> ContentSlot {
++    ContentSlot { occupied: occupied as i32, pinned: pinned as i32, last_used: used, identity, group }
++}
++
++#[test]
++fn ranking_filters_orders_and_caps() {
++    let c = vec![
++        cand(0, 100, 10, 5, false),
++        cand(1, 200, 20, 9, false),
++        cand(2, 0, 10, 9, true),  // zero frontier is not a candidate
++        cand(3, 150, 10, 7, true),
++    ];
++    let all = rank_content_candidates(&c, true, 16).expect("rank");
++    let ids: Vec<u64> = all.iter().map(|v| v.slot).collect();
++    assert_eq!(ids, vec![1, 3, 0]);
++    // Without a new user query only proven continuations survive.
++    let cont = rank_content_candidates(&c, false, 16).expect("rank");
++    assert_eq!(cont.iter().map(|v| v.slot).collect::<Vec<_>>(), vec![3]);
++    // The cap applies after ordering.
++    let capped = rank_content_candidates(&c, true, 2).expect("rank");
++    assert_eq!(capped.iter().map(|v| v.slot).collect::<Vec<_>>(), vec![1, 3]);
++}
++
++#[test]
++fn snapshot_coverage_requires_every_named_origin() {
++    assert!(content_snapshot_covers(&[1, 2, 3], &[1, 3]));
++    assert!(!content_snapshot_covers(&[1, 2], &[1, 3]));
++    assert!(!content_snapshot_covers(&[0, 1], &[1]), "unknown origin");
++    assert!(!content_snapshot_covers(&[1], &[]), "empty coverage is no proof");
++}
++
++#[test]
++fn publication_inserts_dedupes_and_replaces() {
++    let (slot, reason) = select_content_publication(&[], 4, None).expect("publication");
++    assert_eq!((slot, reason), (Some(0), PublicationReason::Inserted));
++    let slots = vec![mk(true, false, 1, 7, 0), mk(true, false, 2, 8, 0)];
++    let (slot, reason) = select_content_publication(&slots, 4, Some(7)).expect("publication");
++    assert_eq!((slot, reason), (Some(0), PublicationReason::Deduplicated));
++    let (slot, reason) = select_content_publication(&slots, 2, None).expect("publication");
++    assert_eq!((slot, reason), (Some(0), PublicationReason::Replaced), "LRU unpinned victim");
++    let pinned = vec![mk(true, true, 1, 7, 0), mk(true, true, 2, 8, 0)];
++    let (slot, reason) = select_content_publication(&pinned, 2, None).expect("publication");
++    assert_eq!((slot, reason), (None, PublicationReason::AllPinned));
++    let (slot, reason) = select_content_publication(&slots, 0, None).expect("publication");
++    assert_eq!((slot, reason), (None, PublicationReason::Disabled));
++}
++
++#[test]
++fn eviction_prefers_redundant_group_versions() {
++    // Group 1 has two retained versions; group 2 one. The stale redundant
++    // version goes first even though group 2 is older.
++    let slots = vec![
++        mk(true, false, 3, 10, 1),
++        mk(true, false, 9, 11, 1),
++        mk(true, false, 1, 12, 2),
++    ];
++    assert_eq!(select_content_eviction(&slots).expect("eviction"), Some(0));
++    let pinned = vec![mk(true, true, 1, 10, 1), mk(true, true, 2, 11, 1)];
++    assert_eq!(select_content_eviction(&pinned).expect("eviction"), None);
++}
++
++#[test]
++fn group_publication_retires_whole_groups() {
++    let slots = vec![
++        mk(true, false, 1, 10, 1),
++        mk(true, false, 5, 11, 1),
++        mk(true, false, 9, 12, 2),
++    ];
++    let (slot, reason, retired) =
++        plan_content_group_publication(&slots, 8, 2, 4).expect("group publication");
++    assert_eq!(retired, vec![0, 1], "the oldest whole group retires");
++    assert_eq!(slot, Some(0), "the first released slot is reused");
++    assert_eq!(reason, PublicationReason::Replaced);
++    // A pinned sole group cannot be retired for the new group.
++    let pinned = vec![mk(true, true, 1, 10, 1), mk(true, true, 5, 11, 1)];
++    let (slot, reason, retired) =
++        plan_content_group_publication(&pinned, 8, 1, 2).expect("group publication");
++    assert_eq!((slot, reason, retired), (None, PublicationReason::AllPinned, vec![]));
++    assert_eq!(
++        plan_content_group_publication(&slots, 8, 2, 0).expect("group publication").1,
++        PublicationReason::Incomplete,
++        "an unknown incoming group never publishes"
++    );
++}
++
++#[test]
++fn cache_owner_resolution_matches_the_core_precedence() {
++    assert_eq!(
++        resolve_cache_owner(Some("conv"), Some("p"), None, None).expect("owner"),
++        Some("conv".into())
++    );
++    assert_eq!(
++        resolve_cache_owner(None, Some("p"), Some("p"), None).expect("owner"),
++        Some("p".into())
++    );
++    assert!(resolve_cache_owner(None, Some("p"), Some("other"), None).is_err());
++    assert_eq!(
++        resolve_cache_owner(None, Some(""), None, Some("legacy")).expect("owner"),
++        Some("legacy".into())
++    );
++    assert_eq!(resolve_cache_owner(None, None, None, None).expect("owner"), None);
++    assert!(resolve_cache_owner(Some(""), None, None, None).is_err());
++    let long = "x".repeat(300);
++    assert_eq!(resolve_cache_owner(None, None, None, Some(&long)).expect("owner"), None);
++}
