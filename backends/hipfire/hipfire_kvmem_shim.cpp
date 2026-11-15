@@ -16,7 +16,10 @@
 #include <kvmem/layerwise_request.hpp>
 #include <kvmem/query_projection_tape.hpp>
 #include <kvmem/layerwise_pressure.hpp>
+#include <kvmem/layerwise_window.hpp>
+#include <kvmem/layerwise_import.hpp>
 
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -2794,4 +2797,237 @@ extern "C" int hk_output_snapshot_pending(const hk_output_snapshot * s, size_t i
     if (start) *start = entry.first;
     if (score) *score = entry.second;
     return HK_OK;
+}
+
+// ── layerwise window / import policy ──
+
+struct hk_layerwise_window_plan {
+    std::optional<kvmem::LayerwiseWindowPlan> impl;
+};
+
+namespace {
+
+bool to_window_state(const hk_layerwise_window_state & in, kvmem::LayerwiseWindowState & out) {
+    out.history = in.history;
+    out.visible_tokens = in.visible_tokens;
+    return true;
+}
+
+kvmem::LayerwiseRequestEnvelope to_envelope(const hk_layerwise_envelope & in) {
+    kvmem::LayerwiseRequestEnvelope out;
+    out.prompt_end = in.prompt_end;
+    out.block_tokens = in.block_tokens;
+    out.generation_tokens = in.generation_tokens;
+    out.output_tokens = in.output_tokens;
+    out.rolling_active_window = in.rolling_active_window != 0;
+    out.prefill_window = static_cast<kvmem::LayerwiseWindowPolicy>(in.prefill_window);
+    if (in.has_query) out.query = kvmem::QueryRange{in.query.begin, in.query.end};
+    if (in.has_replay) out.replay = kvmem::QueryRange{in.replay.begin, in.replay.end};
+    out.reserve_query_output = in.reserve_query_output != 0;
+    out.probe_tokens = in.probe_tokens;
+    out.pressure_probe_tokens = in.pressure_probe_tokens;
+    out.has_query_mandatory = in.has_query_mandatory != 0;
+    return out;
+}
+
+} // namespace
+
+extern "C" hk_layerwise_window_plan * hk_layerwise_window_plan_create(
+    const hk_layerwise_envelope * envelope, uint64_t capacity_tokens) {
+    clear_error();
+    if (!envelope) {
+        set_error("hk_layerwise_window_plan_create: null envelope");
+        return nullptr;
+    }
+    try {
+        auto plan = std::make_unique<hk_layerwise_window_plan>();
+        plan->impl.emplace(to_envelope(*envelope), capacity_tokens);
+        return plan.release();
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_layerwise_window_plan_create: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_layerwise_window_plan_destroy(hk_layerwise_window_plan * p) {
+    delete p;
+}
+
+extern "C" uint32_t hk_layerwise_window_action_at(const hk_layerwise_window_plan * p,
+                                               hk_layerwise_window_state state) {
+    clear_error();
+    if (!p || !p->impl) {
+        set_error("hk_layerwise_window_action: null plan");
+        return UINT32_MAX;
+    }
+    try {
+        kvmem::LayerwiseWindowState st;
+        to_window_state(state, st);
+        return static_cast<uint32_t>(p->impl->action(st));
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_layerwise_window_action: unknown C++ exception");
+    }
+    return UINT32_MAX;
+}
+
+extern "C" int hk_layerwise_window_admit(const hk_layerwise_window_plan * p,
+                                         hk_layerwise_window_state state, uint64_t desired,
+                                         uint64_t * out) {
+    clear_error();
+    if (!p || !p->impl || !out) {
+        set_error("hk_layerwise_window_admit: null plan/out");
+        return HK_ERR;
+    }
+    try {
+        kvmem::LayerwiseWindowState st;
+        to_window_state(state, st);
+        *out = p->impl->admit(st, desired);
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+        return HK_ERR;
+    } catch (...) {
+        set_error("hk_layerwise_window_admit: unknown C++ exception");
+        return HK_ERR;
+    }
+}
+
+extern "C" int hk_layerwise_window_selection_budget(const hk_layerwise_window_plan * p,
+                                                    uint64_t history, uint64_t * out) {
+    clear_error();
+    if (!p || !p->impl || !out) {
+        set_error("hk_layerwise_window_selection_budget: null plan/out");
+        return HK_ERR;
+    }
+    try {
+        *out = p->impl->selection_budget(history);
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+        return HK_ERR;
+    } catch (...) {
+        set_error("hk_layerwise_window_selection_budget: unknown C++ exception");
+        return HK_ERR;
+    }
+}
+
+extern "C" int hk_layerwise_window_prefill_checkpoint(const hk_layerwise_window_plan * p,
+                                                      uint64_t * out) {
+    clear_error();
+    if (!p || !p->impl) {
+        set_error("hk_layerwise_window_prefill_checkpoint: null plan");
+        return -1;
+    }
+    try {
+        const auto value = p->impl->prefill_checkpoint();
+        if (!value) return 0;
+        if (!out) {
+            set_error("hk_layerwise_window_prefill_checkpoint: null out");
+            return -1;
+        }
+        *out = *value;
+        return 1;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("hk_layerwise_window_prefill_checkpoint: unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" int hk_layerwise_window_generation_checkpoint(const hk_layerwise_window_plan * p,
+                                                         uint64_t * out) {
+    clear_error();
+    if (!p || !p->impl || !out) {
+        set_error("hk_layerwise_window_generation_checkpoint: null plan/out");
+        return HK_ERR;
+    }
+    try {
+        *out = p->impl->generation_checkpoint();
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+        return HK_ERR;
+    } catch (...) {
+        set_error("hk_layerwise_window_generation_checkpoint: unknown C++ exception");
+        return HK_ERR;
+    }
+}
+
+extern "C" int hk_layerwise_window_prefill_boundary(const hk_layerwise_window_plan * p,
+                                                    uint64_t history, int64_t * out) {
+    clear_error();
+    if (!p || !p->impl || !out) {
+        set_error("hk_layerwise_window_prefill_boundary: null plan/out");
+        return HK_ERR;
+    }
+    try {
+        *out = p->impl->prefill_boundary(history);
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+        return HK_ERR;
+    } catch (...) {
+        set_error("hk_layerwise_window_prefill_boundary: unknown C++ exception");
+        return HK_ERR;
+    }
+}
+
+extern "C" int hk_layerwise_window_query_evaluation(const hk_layerwise_window_plan * p,
+                                                    hk_query_range * out) {
+    clear_error();
+    if (!p || !p->impl) {
+        set_error("hk_layerwise_window_query_evaluation: null plan");
+        return -1;
+    }
+    try {
+        const auto value = p->impl->query_evaluation();
+        if (!value) return 0;
+        if (!out) {
+            set_error("hk_layerwise_window_query_evaluation: null out");
+            return -1;
+        }
+        out->begin = value->begin;
+        out->end = value->end;
+        return 1;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("hk_layerwise_window_query_evaluation: unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" int hk_layerwise_import_plan(const hk_layerwise_window_plan * p,
+                                        hk_layerwise_window_state state,
+                                        hk_layerwise_import_start * out) {
+    clear_error();
+    if (!p || !p->impl || !out) {
+        set_error("hk_layerwise_import_plan: null plan/out");
+        return HK_ERR;
+    }
+    try {
+        kvmem::LayerwiseWindowState st;
+        to_window_state(state, st);
+        const auto start = kvmem::plan_layerwise_import(*p->impl, st);
+        out->terminal_reserve_overflow = start.terminal_reserve_overflow ? 1 : 0;
+        out->prefill_probe_overflow = start.prefill_probe_overflow ? 1 : 0;
+        out->query_replay_overflow = start.query_replay_overflow ? 1 : 0;
+        out->budget_tokens = start.budget_tokens;
+        out->restore_tokens = start.restore_tokens;
+        out->selection_budget = start.selection_budget;
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+        return HK_ERR;
+    } catch (...) {
+        set_error("hk_layerwise_import_plan: unknown C++ exception");
+        return HK_ERR;
+    }
 }

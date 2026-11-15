@@ -1012,6 +1012,93 @@ size_t hk_output_snapshot_pending_count(const hk_output_snapshot * s, size_t i);
 int hk_output_snapshot_pending(const hk_output_snapshot * s, size_t i, size_t j,
                                uint64_t * start, double * score);
 
+// ── layerwise window / import policy (host-only, additive) ──
+// Mirrors kvmem::LayerwiseWindowPlan and kvmem::plan_layerwise_import
+// (core layerwise_window.hpp / layerwise_import.hpp): the pure 72a81cc
+// request-plan action/admit/selection policy plus the fenced-import admission
+// tests. Neither executes native work, scores Q, reads KV nor mutates a
+// catalog; owners prove the supplied prompt/checkpoint identity themselves.
+// Action/policy ordinals mirror the core enums (append-only).
+
+typedef enum hk_layerwise_window_policy {
+    HK_WINDOW_PRESSURE = 0,
+    HK_WINDOW_KEEP_SELECTED = 1,
+    HK_WINDOW_SEMANTIC_CHUNK = 2
+} hk_layerwise_window_policy;
+
+typedef enum hk_layerwise_window_action {
+    HK_WINDOW_ACTION_NONE = 0,
+    HK_WINDOW_ACTION_QUERY = 1,
+    HK_WINDOW_ACTION_PRESSURE = 2,
+    HK_WINDOW_ACTION_CHUNK = 3,
+    HK_WINDOW_ACTION_EXHAUSTED = 4
+} hk_layerwise_window_action;
+
+// Borrowed trusted request metadata (copied at plan-create time). `query` /
+// `replay` are present only when has_query / has_replay is nonzero.
+typedef struct hk_layerwise_envelope {
+    uint64_t prompt_end;
+    uint32_t block_tokens;
+    uint64_t generation_tokens;
+    uint64_t output_tokens;
+    int rolling_active_window;
+    uint32_t prefill_window; // hk_layerwise_window_policy
+    int has_query;
+    hk_query_range query;
+    int has_replay;
+    hk_query_range replay;
+    int reserve_query_output;
+    uint64_t probe_tokens;
+    uint64_t pressure_probe_tokens;
+    int has_query_mandatory;
+} hk_layerwise_envelope;
+
+// `history` = complete accepted original-coordinate frontier; `visible_tokens`
+// = actual native length including the accepted partial tail.
+typedef struct hk_layerwise_window_state {
+    uint64_t history;
+    uint64_t visible_tokens;
+} hk_layerwise_window_state;
+
+// Mirrors kvmem::LayerwiseImportStart.
+typedef struct hk_layerwise_import_start {
+    int terminal_reserve_overflow;
+    int prefill_probe_overflow;
+    int query_replay_overflow;
+    uint64_t budget_tokens;
+    uint64_t restore_tokens;
+    uint64_t selection_budget;
+} hk_layerwise_import_start;
+
+typedef struct hk_layerwise_window_plan hk_layerwise_window_plan;
+
+// Returns a new caller-owned plan, or NULL on an invalid envelope/capacity.
+hk_layerwise_window_plan * hk_layerwise_window_plan_create(
+    const hk_layerwise_envelope * envelope, uint64_t capacity_tokens);
+void hk_layerwise_window_plan_destroy(hk_layerwise_window_plan * p);
+// Action ordinal for the state, or UINT32_MAX on error.
+uint32_t hk_layerwise_window_action_at(const hk_layerwise_window_plan * p,
+                                    hk_layerwise_window_state state);
+// Exact admitted tile for `desired` rows (0 = this tile cannot start).
+int hk_layerwise_window_admit(const hk_layerwise_window_plan * p,
+                              hk_layerwise_window_state state, uint64_t desired,
+                              uint64_t * out);
+int hk_layerwise_window_selection_budget(const hk_layerwise_window_plan * p,
+                                         uint64_t history, uint64_t * out);
+// 1 = present (stored into *out), 0 = absent (out untouched), -1 = error.
+int hk_layerwise_window_prefill_checkpoint(const hk_layerwise_window_plan * p,
+                                           uint64_t * out);
+int hk_layerwise_window_generation_checkpoint(const hk_layerwise_window_plan * p,
+                                              uint64_t * out);
+int hk_layerwise_window_prefill_boundary(const hk_layerwise_window_plan * p,
+                                         uint64_t history, int64_t * out);
+int hk_layerwise_window_query_evaluation(const hk_layerwise_window_plan * p,
+                                         hk_query_range * out);
+// Same three admission tests + exact import budgets as the core function.
+int hk_layerwise_import_plan(const hk_layerwise_window_plan * p,
+                             hk_layerwise_window_state state,
+                             hk_layerwise_import_start * out);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
