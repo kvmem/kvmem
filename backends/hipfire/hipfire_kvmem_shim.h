@@ -1140,6 +1140,73 @@ size_t hk_checkpoint_coverage_retain(const hk_coverage_info * infos, size_t n,
                                      uint64_t count, uint64_t bytes, uint64_t interval,
                                      uint64_t min_gap, size_t * out, size_t out_capacity);
 
+// ── content cache policy: owner, candidate ranking, publication/retention ──
+// Mirrors kvmem/cache_owner.hpp and the pure policy half of
+// kvmem/content_cache.hpp. No payload, native proof or directory mutation: the
+// adapter supplies the metadata and performs the actual insert/erase.
+
+typedef struct hk_cache_owner_hints {
+    const char * conversation;   // NULL = absent
+    const char * prompt;
+    const char * sdk_prompt;
+    const char * legacy_session;
+} hk_cache_owner_hints;
+
+// 1 = resolved (NUL-terminated into out), 0 = none, -1 = error/validation.
+int hk_cache_owner_resolve(const hk_cache_owner_hints * hints, char * out, size_t out_capacity);
+
+typedef struct hk_content_candidate {
+    uint64_t slot;
+    uint64_t frontier;
+    uint64_t cold_bytes;
+    uint64_t last_used;
+    int continuation; // nonzero = native continuation proof present
+} hk_content_candidate;
+
+// Filters (zero frontier; continuation-only unless new_user_query) and sorts
+// by frontier desc, cold_bytes asc, last_used desc, slot asc; caps at
+// max_candidates. Returns the required count, or (size_t)-1 on error.
+size_t hk_content_rank_candidates(const hk_content_candidate * in, size_t n,
+                                  int new_user_query, size_t max_candidates,
+                                  hk_content_candidate * out, size_t out_capacity);
+
+// 1 = incoming covers every previous origin (nonempty, no zero origins).
+int hk_content_snapshot_covers(const uint64_t * incoming, size_t incoming_count,
+                               const uint64_t * previous, size_t previous_count);
+
+typedef struct hk_content_slot {
+    int occupied;
+    int pinned;
+    uint64_t last_used;
+    uint64_t identity; // nonzero = sealed native identity
+    uint64_t group;    // 0 = unknown/independent
+} hk_content_slot;
+
+// Publication reason ordinals (append-only).
+typedef enum hk_content_publication_reason {
+    HK_CONTENT_INSERTED = 0,
+    HK_CONTENT_REPLACED = 1,
+    HK_CONTENT_DEDUPLICATED = 2,
+    HK_CONTENT_DISABLED = 3,
+    HK_CONTENT_ALL_PINNED = 4,
+    HK_CONTENT_METADATA_LIMIT = 5,
+    HK_CONTENT_INCOMPLETE = 6
+} hk_content_publication_reason;
+
+// Chosen slot index, or -1 when the plan publishes nothing (reason explains).
+// A returned index == n means append.
+int hk_content_publication(const hk_content_slot * slots, size_t n, size_t max_entries,
+                           uint64_t incoming_identity, int * reason);
+// Eviction victim index, or -1 (none / all pinned).
+int hk_content_eviction(const hk_content_slot * slots, size_t n);
+// Group-aware publication: chosen slot (or n = append) via *out_slot, reason
+// via *out_reason, retired indices via retired_out. *out_retired_count is the
+// required count; returns HK_OK or HK_ERR.
+int hk_content_group_publication(const hk_content_slot * slots, size_t n, size_t max_entries,
+                                 size_t max_groups, uint64_t incoming_group, size_t * out_slot,
+                                 int * out_reason, size_t * retired_out, size_t retired_capacity,
+                                 size_t * out_retired_count);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

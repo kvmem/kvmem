@@ -19,6 +19,8 @@
 #include <kvmem/layerwise_window.hpp>
 #include <kvmem/layerwise_import.hpp>
 #include <kvmem/checkpoint_policy.hpp>
+#include <kvmem/cache_owner.hpp>
+#include <kvmem/content_cache.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -3120,4 +3122,175 @@ extern "C" size_t hk_checkpoint_coverage_retain(const hk_coverage_info * infos, 
         set_error("hk_checkpoint_coverage_retain: unknown C++ exception");
     }
     return size_t(-1);
+}
+
+// ── content cache policy ──
+
+namespace {
+std::optional<std::string> opt_string(const char * value) {
+    if (!value) return std::nullopt;
+    return std::string(value);
+}
+kvmem::ContentCacheCandidate to_candidate(const hk_content_candidate & in) {
+    kvmem::ContentCacheCandidate out;
+    out.slot = size_t(in.slot);
+    out.frontier = in.frontier;
+    out.cold_bytes = in.cold_bytes;
+    out.last_used = in.last_used;
+    out.continuation = in.continuation != 0;
+    return out;
+}
+kvmem::ContentCacheSlot to_slot(const hk_content_slot & in) {
+    kvmem::ContentCacheSlot out;
+    out.occupied = in.occupied != 0;
+    out.pinned = in.pinned != 0;
+    out.last_used = in.last_used;
+    out.immutable_identity = in.identity
+        ? reinterpret_cast<const void *>(static_cast<uintptr_t>(in.identity))
+        : nullptr;
+    out.group = in.group;
+    return out;
+}
+} // namespace
+
+extern "C" int hk_cache_owner_resolve(const hk_cache_owner_hints * hints, char * out,
+                                      size_t out_capacity) {
+    clear_error();
+    if (!hints) {
+        set_error("hk_cache_owner_resolve: null hints");
+        return -1;
+    }
+    try {
+        kvmem::CacheOwnerHints in;
+        in.conversation = opt_string(hints->conversation);
+        in.prompt = opt_string(hints->prompt);
+        in.sdk_prompt = opt_string(hints->sdk_prompt);
+        in.legacy_session = opt_string(hints->legacy_session);
+        const auto owner = kvmem::resolve_cache_owner(in);
+        if (!owner) return 0;
+        if (!out || out_capacity <= owner->size()) {
+            set_error("hk_cache_owner_resolve: output buffer too small");
+            return -1;
+        }
+        std::memcpy(out, owner->data(), owner->size());
+        out[owner->size()] = '\0';
+        return 1;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+        return -1;
+    } catch (...) {
+        set_error("hk_cache_owner_resolve: unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" size_t hk_content_rank_candidates(const hk_content_candidate * in, size_t n,
+                                             int new_user_query, size_t max_candidates,
+                                             hk_content_candidate * out,
+                                             size_t out_capacity) {
+    clear_error();
+    if (!in && n) {
+        set_error("hk_content_rank_candidates: null input");
+        return size_t(-1);
+    }
+    try {
+        std::vector<kvmem::ContentCacheCandidate> candidates;
+        candidates.reserve(n);
+        for (size_t i = 0; i < n; ++i) candidates.push_back(to_candidate(in[i]));
+        const auto ranked = kvmem::rank_content_candidates(
+            std::move(candidates), new_user_query != 0, max_candidates);
+        if (!out || out_capacity < ranked.size()) return ranked.size();
+        for (size_t i = 0; i < ranked.size(); ++i) {
+            out[i].slot = ranked[i].slot;
+            out[i].frontier = ranked[i].frontier;
+            out[i].cold_bytes = ranked[i].cold_bytes;
+            out[i].last_used = ranked[i].last_used;
+            out[i].continuation = ranked[i].continuation ? 1 : 0;
+        }
+        return ranked.size();
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_content_rank_candidates: unknown C++ exception");
+    }
+    return size_t(-1);
+}
+
+extern "C" int hk_content_snapshot_covers(const uint64_t * incoming, size_t incoming_count,
+                                          const uint64_t * previous, size_t previous_count) {
+    try {
+        std::vector<uint64_t> a;
+        if (incoming_count) a.assign(incoming, incoming + incoming_count);
+        std::vector<uint64_t> b;
+        if (previous_count) b.assign(previous, previous + previous_count);
+        return kvmem::content_snapshot_covers(a, b) ? 1 : 0;
+    } catch (...) {
+        set_error("hk_content_snapshot_covers: unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" int hk_content_publication(const hk_content_slot * slots, size_t n,
+                                      size_t max_entries, uint64_t incoming_identity,
+                                      int * reason) {
+    try {
+        std::vector<kvmem::ContentCacheSlot> in;
+        in.reserve(n);
+        for (size_t i = 0; i < n; ++i) in.push_back(to_slot(slots[i]));
+        const auto plan = kvmem::select_content_publication(
+            in, max_entries,
+            incoming_identity
+                ? reinterpret_cast<const void *>(static_cast<uintptr_t>(incoming_identity))
+                : nullptr);
+        if (reason) *reason = static_cast<int>(plan.reason);
+        return plan.slot ? int(*plan.slot) : -1;
+    } catch (...) {
+        set_error("hk_content_publication: unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" int hk_content_eviction(const hk_content_slot * slots, size_t n) {
+    try {
+        std::vector<kvmem::ContentCacheSlot> in;
+        in.reserve(n);
+        for (size_t i = 0; i < n; ++i) in.push_back(to_slot(slots[i]));
+        const auto victim = kvmem::select_content_eviction(in);
+        return victim ? int(*victim) : -1;
+    } catch (...) {
+        set_error("hk_content_eviction: unknown C++ exception");
+        return -1;
+    }
+}
+
+extern "C" int hk_content_group_publication(const hk_content_slot * slots, size_t n,
+                                            size_t max_entries, size_t max_groups,
+                                            uint64_t incoming_group, size_t * out_slot,
+                                            int * out_reason, size_t * retired_out,
+                                            size_t retired_capacity,
+                                            size_t * out_retired_count) {
+    clear_error();
+    if (!out_slot || !out_retired_count) {
+        set_error("hk_content_group_publication: null output");
+        return HK_ERR;
+    }
+    try {
+        std::vector<kvmem::ContentCacheSlot> in;
+        in.reserve(n);
+        for (size_t i = 0; i < n; ++i) in.push_back(to_slot(slots[i]));
+        const auto plan =
+            kvmem::plan_content_group_publication(in, max_entries, max_groups, incoming_group);
+        *out_slot = plan.slot ? *plan.slot : size_t(-1);
+        if (out_reason) *out_reason = static_cast<int>(plan.reason);
+        *out_retired_count = plan.retired_slots.size();
+        if (retired_out && retired_capacity >= plan.retired_slots.size())
+            std::copy(plan.retired_slots.begin(), plan.retired_slots.end(), retired_out);
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+        return HK_ERR;
+    } catch (...) {
+        set_error("hk_content_group_publication: unknown C++ exception");
+        return HK_ERR;
+    }
 }
