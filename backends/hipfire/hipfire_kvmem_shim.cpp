@@ -8,6 +8,7 @@
 #include <kvmem/graph_recall.hpp>
 #include <kvmem/mean_key_retrieval.hpp>
 #include <kvmem/raw_kv_store.hpp>
+#include <kvmem/prefix_checkpoint.hpp>
 #include <kvmem/spill_io.hpp>
 #include <kvmem/memory_contract.hpp>
 #include <kvmem/native_kv_payload.hpp>
@@ -283,6 +284,127 @@ extern "C" void hk_raw_store_restore_mean_checkpoint(hk_raw_store * st, uint32_t
             st->impl->restore_mean_checkpoint(token_pos, v);
         },
         "hk_raw_store_restore_mean_checkpoint");
+}
+
+// ── P4.3 KVMem-native prefix fork / packed exchange ──
+
+struct hk_packed_snapshot {
+    std::unique_ptr<kvmem::PackedKvSnapshot> impl;
+};
+
+extern "C" hk_raw_store * hk_raw_store_fork_prefix(hk_raw_store * st, uint32_t token_pos) {
+    clear_error();
+    if (!st || !st->impl) {
+        set_error("hk_raw_store_fork_prefix: null store");
+        return nullptr;
+    }
+    try {
+        return new hk_raw_store{st->impl->fork_prefix(token_pos)};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_raw_store_fork_prefix: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" hk_raw_store * hk_raw_store_fork_mean_prefix(const hk_raw_store * st,
+                                                        uint32_t token_pos) {
+    clear_error();
+    if (!st || !st->impl) {
+        set_error("hk_raw_store_fork_mean_prefix: null store");
+        return nullptr;
+    }
+    try {
+        return new hk_raw_store{st->impl->fork_mean_prefix(token_pos)};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_raw_store_fork_mean_prefix: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" hk_packed_snapshot * hk_raw_store_export_packed(hk_raw_store * st,
+                                                           const hk_packed_selection * selections,
+                                                           size_t n_selections,
+                                                           size_t metadata_limit) {
+    clear_error();
+    if (!st || !st->impl || (!selections && n_selections)) {
+        set_error("hk_raw_store_export_packed: invalid arguments");
+        return nullptr;
+    }
+    try {
+        std::vector<kvmem::PackedKvSelection> sel;
+        sel.reserve(n_selections);
+        for (size_t i = 0; i < n_selections; ++i) {
+            sel.push_back({selections[i].block, selections[i].layer, selections[i].valid_tokens});
+        }
+        kvmem::PackedKvOptions options;
+        options.metadata_limit = metadata_limit;
+        auto snap = st->impl->export_packed(sel, options);
+        return new hk_packed_snapshot{std::make_unique<kvmem::PackedKvSnapshot>(std::move(snap))};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_raw_store_export_packed: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_raw_store_import_packed(hk_raw_store * st, hk_packed_snapshot * snapshot,
+                                           size_t metadata_limit) {
+    if (!st || !st->impl || !snapshot || !snapshot->impl) return;
+    guarded(
+        [&] {
+            kvmem::PackedKvOptions options;
+            options.metadata_limit = metadata_limit;
+            st->impl->import_packed(std::move(*snapshot->impl), options);
+        },
+        "hk_raw_store_import_packed");
+}
+
+extern "C" void hk_packed_snapshot_destroy(hk_packed_snapshot * snap) {
+    delete snap;
+}
+
+extern "C" size_t hk_packed_snapshot_entry_count(const hk_packed_snapshot * snap) {
+    if (!snap || !snap->impl) return 0;
+    return snap->impl->entries().size();
+}
+
+extern "C" size_t hk_packed_snapshot_metadata_bytes(const hk_packed_snapshot * snap) {
+    if (!snap || !snap->impl) return 0;
+    return snap->impl->metadata_bytes();
+}
+
+// ── P4.3 prefix reuse anchors ──
+
+extern "C" uint64_t hk_prefix_anchor(uint64_t base, uint64_t lcp, uint64_t query,
+                                     const hk_prefix_range * indivisible, size_t n_groups) {
+    clear_error();
+    if (!indivisible && n_groups) {
+        set_error("hk_prefix_anchor: null groups with nonzero count");
+        return UINT64_MAX;
+    }
+    try {
+        std::vector<kvmem::PrefixRange> groups;
+        groups.reserve(n_groups);
+        for (size_t i = 0; i < n_groups; ++i) {
+            groups.push_back({indivisible[i].begin, indivisible[i].end});
+        }
+        return kvmem::prefix_anchor(base, lcp, query, groups);
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_prefix_anchor: unknown C++ exception");
+    }
+    return UINT64_MAX;
+}
+
+extern "C" uint64_t hk_prefix_restore_limit(uint64_t lcp, uint64_t live, uint64_t eval_end,
+                                            int needs_logits) {
+    return kvmem::prefix_restore_limit(lcp, live, eval_end, needs_logits != 0);
 }
 
 // ── block repository / selection ──
