@@ -25,6 +25,7 @@ restores it.
 | Layerwise recall foundation (Phase 3.2 sub-patch ①): crate-agnostic `LayerwisePagePool` composite-slot pool + `PackedArenaLayout` packed-page geometry (rdna-compute), Q8 packed-page adapter bridging the engine stride authority to the core generic `PayloadLayout` manifest (hipfire-arch-qwen35), and the core layerwise-API C ABI shim entries + crate FFI (payload builder / catalog `plan_layer` / `NativeKvLayerRegions` / `LayerwiseQueryRequest` state machine / native scorer); additive, NOT wired into live serve, Legacy byte-neutral | `../patches/hipfire-layerwise-foundation.patch` |
 | Layerwise recall function (Phase 3.2 sub-patch ②): GPU HIP page scorer (`kvmem_page_score`, 4 wave-aware gfx1100 kernels, FP64-oracle parity) + per-layer driver (`layerwise_driver`: composite-arena stripe COW restore + drop-evict + suffix partial restore) wired into the three paged paths A/B/C via `serve_engine` scoped orchestration + `KvMemCtl` re-bootstrap/accessor/page-aligned policy + write-through feed; `HIPFIRE_KVMEM_RECALL_STRATEGY=layerwise` engine opt-in (default Legacy byte-neutral). Consumes ①'s shim + crate FFI unchanged (no new C entries, core logic zero-change) | `../patches/hipfire-layerwise-function.patch` |
 | MTP foundation (Phase 4.1 sub-patch ①): width-param multi-row driver/seam primitives (`LayerwiseDescStaging::new_with_width`, pure-host `bootstrap_layerwise_rows` n-row span, `accept_output_pressure` partial verify via the core `OutputPressure`), Main+aux composite-record Q8 layout adapter (`LayerwiseMtpQ8Layout`, head KV geometry), head bounded-pool geometry (`mtp_auxiliary_capacity` + `mtp_head_pool`, window + one scratch block), and aux-selection binding primitives (new `layerwise_mtp`: `LayerwiseMtpHistory` FirstLayer/UpstreamGlobal policy + `AuxiliarySelection` bind-once/exact-extent guards); additive host/pure, NOT wired into live serve, NO env toggle, width=1 byte-identical to AR, Legacy byte-neutral (no new C entries, core logic zero-change) | `../patches/hipfire-mtp-foundation.patch` |
+| MTP function (Phase 4.1 sub-patch ②): MTP-head (`--spec mtp`) KV write-through/restore + FirstLayer aux binding WIRED into live serve under `RecallStrategy::Layerwise` (head bounded pool window+scratch replaces full-resident `max_seq` ⇒ 2-slot×256k OOM-solved); A'-1 AR decode→`engine_carrier_rows` (OutputPressure Query-every-step + REPLACE) + continuation `sync_prefill` driver gate (ONE new shim C entry `hk_output_pressure_sync_prefill`, idempotent ⇒ Legacy byte-neutral); G7 cleanup (strip hh-trace/DIAG-53, remove dead `engine_carrier` + 4 head-coordinate primitives). C decision: seal basis = MTP capability + Legacy byte-neutral + G6 B-gate; layerwise D3 recall benefit decoupled/deferred (no recall-benefit claim) | `../patches/hipfire-mtp-function.patch` |
 
 The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
 `KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
@@ -386,6 +387,45 @@ kvmem core/shim change (the multi-row core transaction + `OutputPressure` FFI al
 exist upstream). Sub-patches ② (trunk+head offload/restore + FirstLayer + admission)
 and ③ (UpstreamGlobal probe + dual-policy exposure + guards) follow; each is Legacy
 byte-neutral and independently re-verified, rollback granularity = sub-patch.
+
+The thirteenth `mtp-function` patch wires the MTP-head (`--spec mtp`) KV recall
+FUNCTION into live serve under `RecallStrategy::Layerwise` — Phase 4.1 sub-patch ②
+of three, riding ①'s aux-plane infrastructure. Unlike ① (additive, not wired), ②
+is wired and adds ONE shim C ABI entry. Three pieces land:
+(1) G1–G5 + f2 MTP head write-through/restore/FirstLayer binding — `kvmem_ctl`
+head primitives (`plan_head_plane`/`restore_head_plane`/`accept_head_restore`/
+`seal_head_plane`), `layerwise_driver` `head_restore_guard` + carrier wiring,
+`mtp_head` forward, `serve_engine` AR+MTP carrier activation. The head bounded pool
+(window + one scratch block, `mtp_head_pool`) replaces the full-resident `max_seq`
+head allocation, solving the 2-slot×256k OOM (the MTP capability benefit).
+(2) A'-1 AR correctness — AR serve decode → `engine_carrier_rows` (OutputPressure,
+Query-every-step + REPLACE keep-set), and the continuation `sync_prefill` driver
+gate (`mtp.is_some() || prefill.is_none()`). The new shim entry
+`hk_output_pressure_sync_prefill` repositions the persistent output window's
+accepted feedback to the validated consumed frontier after an unsampled
+continuation prefill; idempotent (no-op when `accepted_end >= position`) so the
+Legacy/AR/within-turn paths stay byte-neutral.
+(3) G7 cleanup — strip `[hh-trace]`/`[DIAG-53]` `HIPFIRE_DIAG_NO_ACTIVATION`; remove
+dead `engine_carrier` (PrefillPressure AR, zero serve callers) + 4 dead
+head-coordinate primitives (`head_cache_positions`/`head_rope_positions`/
+`boundary_rope_delta`/`boundary_cache_coordinate`).
+
+C decision (2026-11-15): the 13th seal basis is MTP CAPABILITY benefit (2-slot×256k
+OOM-solved + acceptance parity) + Legacy byte-neutral + G6 B-gate; the layerwise D3
+recall BENEFIT gate is DECOUPLED/deferred (the compound probe is unreliable — both
+arms flip on near-tie GPU nondeterminism — and needs a deterministic discriminator)
+so NO recall-benefit claim is made. A'-1 is a correctness fix (Layerwise must not be
+worse than Legacy; continuation must not crash), not a feature-value claim.
+
+Verification: N-gate AR (`--spec off`) + MTP (`--spec mtp`) greedy sha256 ==
+`29e8a27d…`, VERIFY 0 mismatch; 62 unit tests pass, zero new warnings (arch-qwen35
+76==76, total 444==444). MTP capability: smoke recall=True, acceptance-parity A/B
+recall PASS, 2-slot×256k OOM_GATE_PASS (cold needle prompt=62629 tok recall=True,
+oom/poison/mismatch/http500=0). G6 B-gate: 7-SKU recall sweep 7/7 PASS (content
+byte-identical to stock v0.4.6, KVMEM=0 compute parity), escha×3 needle PASS, 3-SKU
+stock-v0.4.6 sustained decode parity ≤10% (mq4-xts +3.74%, tq2 −4.48%, bq1 −6.62%).
+One new shim C entry (`hk_output_pressure_sync_prefill`); rollback granularity =
+sub-patch. Sub-patch ③ (UpstreamGlobal private probe + dual-policy exposure) follows.
 
 ## Enabling
 

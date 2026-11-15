@@ -938,6 +938,12 @@ int hk_output_pressure_finish(hk_output_pressure * p, uint64_t request,
                               const hk_memory_catalog * accepted_history);
 hk_output_snapshot * hk_output_pressure_snapshot(const hk_output_pressure * p);
 int hk_output_pressure_restore(hk_output_pressure * p, const hk_output_snapshot * s, uint64_t position);
+// Reposition the persistent output window's accepted feedback to the validated
+// native consumed frontier `position` after an unsampled continuation prefill
+// (ninfer accept_prefill semantics). Idempotent: a no-op when accepted_end >=
+// position. Preserves accumulated scores + pending mass and clears the prepared
+// verifier so the next prepare_scope matches the new frontier. HK_OK/HK_ERR.
+int hk_output_pressure_sync_prefill(hk_output_pressure * p, uint64_t position);
 hk_pressure_choices * hk_output_pressure_select(const hk_output_pressure * p,
                                                 const hk_memory_catalog * catalog,
                                                 const hk_prefill_pressure * prefill,
