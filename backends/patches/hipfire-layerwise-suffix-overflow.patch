@@ -1,0 +1,429 @@
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index 0c394958562403aad0f545a430060e55a3f4c264..1936f9102b4757dfc9a411ae69f35126104992d1 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -309,6 +309,7 @@ impl LayerwiseArena {
+ fn encode_layer_block_table(
+     compact_slots: &[u32],
+     suffix_slot: Option<u32>,
++    suffix_slot_overflow: Option<u32>,
+     layer: usize,
+     n_layers: usize,
+     max_pages: usize,
+@@ -321,7 +322,9 @@ fn encode_layer_block_table(
+             "layerwise block table: layer {layer} >= n_layers {n_layers}"
+         ));
+     }
+-    let mapped = compact_slots.len() + usize::from(suffix_slot.is_some());
++    let mapped = compact_slots.len()
++        + usize::from(suffix_slot.is_some())
++        + usize::from(suffix_slot_overflow.is_some());
+     if mapped > max_pages {
+         return Err(format!(
+             "layerwise block table: {mapped} mapped pages > max_pages {max_pages}"
+@@ -352,6 +355,9 @@ fn encode_layer_block_table(
+     if let Some(slot) = suffix_slot {
+         bt[compact_slots.len()] = stripe(slot)?;
+     }
++    if let Some(slot) = suffix_slot_overflow {
++        bt[compact_slots.len() + 1] = stripe(slot)?;
++    }
+     Ok(bt)
+ }
+ 
+@@ -508,6 +514,7 @@ impl LayerwiseDescStaging {
+         layer: usize,
+         compact_slots: &[u32],
+         suffix_slot: Option<u32>,
++        suffix_slot_overflow: Option<u32>,
+         seq_len: i32,
+     ) -> Result<(), String> {
+         if layer >= self.n_layers {
+@@ -522,11 +529,14 @@ impl LayerwiseDescStaging {
+         let bt = encode_layer_block_table(
+             compact_slots,
+             suffix_slot,
++            suffix_slot_overflow,
+             layer,
+             self.n_layers,
+             self.max_pages,
+         )?;
+-        let mapped = compact_slots.len() + usize::from(suffix_slot.is_some());
++        let mapped = compact_slots.len()
++            + usize::from(suffix_slot.is_some())
++            + usize::from(suffix_slot_overflow.is_some());
+         let tiles = (seq_len as usize).div_ceil(LAYERWISE_BLOCK_TOKENS as usize);
+         if tiles > mapped {
+             return Err(format!(
+@@ -677,6 +687,13 @@ pub struct LayerwiseQuery<'a> {
+     /// a current token (the paged decode arm always writes, so the wired Path C
+     /// sets this). [`Self::restore_layer`] reads it to extend the block table.
+     pub suffix_slot: Option<u32>,
++    /// P4.4 keep-set fix: the SECOND suffix page, mapped only when the evaluation
++    /// span crosses a page boundary (`partial_tokens + width > 128`). The verify
++    /// span then occupies the partial page (suffix_slot) plus the next page
++    /// (suffix_slot_overflow); the compacted causal bound spans both. `None` when
++    /// the span fits one suffix page (the common case, byte-neutral). The overflow
++    /// page is fresh (only newly-written evaluation rows, no restore needed).
++    pub suffix_slot_overflow: Option<u32>,
+     /// Logical page holding the current token (the suffix page) = `fed / 128`
+     /// (design §3.9g). Per-query constant; set by the engine orchestration. The
+     /// suffix stripe is restored from this page's already-fed tokens before the
+@@ -1364,6 +1381,7 @@ impl<'a> LayerwiseQuery<'a> {
+             driver,
+             staging,
+             suffix_slot: None,
++            suffix_slot_overflow: None,
+             suffix_page: 0,
+             partial_tokens: 0,
+             activation: None,
+@@ -1477,6 +1495,12 @@ impl<'a> LayerwiseQuery<'a> {
+             let mut history: Vec<u64> =
+                 view.blocks.iter().map(|b| b.block.original_start).collect();
+             history.push(self.suffix_page as u64 * bt);
++            // P4.4 keep-set fix: a verify span crossing a page boundary attends a
++            // second suffix (overflow) page; the mass matrix gains a column for it,
++            // so the packet history must list it too (shape = history × rows).
++            if self.suffix_slot_overflow.is_some() {
++                history.push((self.suffix_page as u64 + 1) * bt);
++            }
+             let starts: Vec<u64> = (0..history.len() as u64).map(|i| i * bt).collect();
+             m.pages[ordinal] = Some(PressurePages { compact_slots: compact.clone(), history, starts });
+         }
+@@ -1505,7 +1529,7 @@ impl<'a> LayerwiseQuery<'a> {
+             format!("layerwise query: compacted extent {extent} exceeds i32")
+         })?;
+         self.staging
+-            .update_layer(gpu, ordinal, &compact, self.suffix_slot, seq_len)?;
++            .update_layer(gpu, ordinal, &compact, self.suffix_slot, self.suffix_slot_overflow, seq_len)?;
+         Ok(extent)
+     }
+ 
+@@ -1544,7 +1568,7 @@ impl<'a> LayerwiseQuery<'a> {
+         ordinal: usize,
+         q: &PageMassQuery,
+     ) -> Result<(), String> {
+-        let (mass_rows, local_begin, compact_slots, suffix_slot) = {
++        let (mass_rows, local_begin, compact_slots, suffix_slot, suffix_slot_overflow) = {
+             let m = match self.mass.as_ref() {
+                 Some(m) => m,
+                 None => return Ok(()),
+@@ -1555,7 +1579,7 @@ impl<'a> LayerwiseQuery<'a> {
+             let pages = m.pages[ordinal]
+                 .as_ref()
+                 .ok_or_else(|| format!("layerwise mass: layer {ordinal} not restored"))?;
+-            (m.mass_rows.clone(), m.local_begin, pages.compact_slots.clone(), self.suffix_slot)
++            (m.mass_rows.clone(), m.local_begin, pages.compact_slots.clone(), self.suffix_slot, self.suffix_slot_overflow)
+         };
+         let rows: Vec<i32> = mass_rows.iter().map(|&r| r as i32).collect();
+         let positions: Vec<i32> = mass_rows
+@@ -1568,6 +1592,7 @@ impl<'a> LayerwiseQuery<'a> {
+             q,
+             &compact_slots,
+             suffix_slot,
++            suffix_slot_overflow,
+             &rows,
+             &positions,
+         )?;
+@@ -1939,7 +1964,13 @@ impl<'a> LayerwiseQuery<'a> {
+         mass: Option<MassCapture>,
+     ) -> Result<Self, String> {
+         let selected_pages = (native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
+-        let max_pages = selected_pages + 1;
++        // P4.4 keep-set fix: the evaluation span (partial_tokens already-fed +
++        // width new rows) may cross a page boundary; map one suffix page per
++        // 128-token chunk of that span (1 in the common case, 2 when it crosses).
++        let suffix_pages = ((partial_tokens as usize + width)
++            .div_ceil(LAYERWISE_BLOCK_TOKENS as usize))
++            .max(1);
++        let max_pages = selected_pages + suffix_pages;
+         let staging = LayerwiseDescStaging::new_with_width(gpu, n_layers, max_pages, width)?;
+         let suffix_phys = driver
+             .arena_mut()
+@@ -1947,8 +1978,21 @@ impl<'a> LayerwiseQuery<'a> {
+             .alloc_slot()
+             .map_err(|e| format!("layerwise build: suffix slot: {e}"))?
+             .phys;
++        let suffix_overflow = if suffix_pages > 1 {
++            Some(
++                driver
++                    .arena_mut()
++                    .pool()
++                    .alloc_slot()
++                    .map_err(|e| format!("layerwise build: suffix overflow slot: {e}"))?
++                    .phys,
++            )
++        } else {
++            None
++        };
+         let mut carrier = Self::new(driver, staging);
+         carrier.suffix_slot = Some(suffix_phys);
++        carrier.suffix_slot_overflow = suffix_overflow;
+         carrier.suffix_page = suffix_page;
+         carrier.partial_tokens = partial_tokens;
+         carrier.pressure = pressure;
+@@ -2553,7 +2597,10 @@ pub fn engine_carrier_head<'a>(
+     // head staging to `window/128+1` PAGES × 128 (ctx_len = (window+128)*128),
+     // and the paged head attention would walk unmapped block-table tiles → GPU
+     // hang (the head forward never returns).
+-    let head_n_slots = ctl.head_pool_capacity(window_tokens)? / LAYERWISE_BLOCK_TOKENS as usize;
++    // P4.4 keep-set fix: +1 overflow scratch page so a draft span crossing a page
++    // boundary extends into a mapped page (the head analog of the trunk suffix
++    // overflow); beyond the causal bound when unused ⇒ masked, byte-neutral.
++    let head_n_slots = ctl.head_pool_capacity(window_tokens)? / LAYERWISE_BLOCK_TOKENS as usize + 1;
+     let carrier = LayerwiseQuery::build_head(
+         gpu,
+         keys,
+@@ -3095,6 +3142,9 @@ struct HeadSubsystem {
+     /// restores the boundary page's already-fed tokens here and binds it as the
+     /// staging suffix; history-only restores leave it reserved but unmapped.
+     suffix_slot: u32,
++    /// P4.4 keep-set fix: reserved overflow scratch page for a draft span that
++    /// crosses a page boundary (the head analog of the trunk suffix overflow).
++    suffix_slot_overflow: u32,
+     /// The head draft's base compact view captured at the suffix restore (ninfer
+     /// NL:10322 `visible` + NL:10335 `increment_i32_scalar(position)`). The serial
+     /// draft appends `max_n` rows into the reserved scratch page; each row advances
+@@ -3111,6 +3161,7 @@ struct HeadSubsystem {
+ struct HeadDraftBase {
+     compact: Vec<u32>,
+     suffix_slot: Option<u32>,
++    suffix_slot_overflow: Option<u32>,
+     base_seq: i32,
+ }
+ 
+@@ -3438,6 +3489,7 @@ impl<'a> LayerwiseDriver<'a> {
+         q: &PageMassQuery,
+         compact_slots: &[u32],
+         suffix_slot: Option<u32>,
++        suffix_slot_overflow: Option<u32>,
+         rows: &[i32],
+         positions: &[i32],
+     ) -> Result<Vec<f32>, String> {
+@@ -3446,7 +3498,9 @@ impl<'a> LayerwiseDriver<'a> {
+         }
+         let layout = self.arena.layout();
+         let k_plane = layout.k_plane_bytes();
+-        let pages = compact_slots.len() + usize::from(suffix_slot.is_some());
++        let pages = compact_slots.len()
++            + usize::from(suffix_slot.is_some())
++            + usize::from(suffix_slot_overflow.is_some());
+         if pages == 0 {
+             return Err("layerwise mass: empty page domain".to_string());
+         }
+@@ -3476,6 +3530,15 @@ impl<'a> LayerwiseDriver<'a> {
+                     .memcpy_dtod_at(&gather.buf, dst, &self.arena.arena().buf, src, k_plane)
+                     .map_err(|e| format!("layerwise mass: gather suffix K: {e:?}"))?;
+             }
++            if let Some(slot) = suffix_slot_overflow {
++                let src = layout
++                    .layer_k_offset(slot as usize, ordinal)
++                    .map_err(|e| format!("layerwise mass: suffix overflow k offset slot {slot}: {e}"))?;
++                let dst = (compact_slots.len() + 1) * k_plane;
++                gpu.hip
++                    .memcpy_dtod_at(&gather.buf, dst, &self.arena.arena().buf, src, k_plane)
++                    .map_err(|e| format!("layerwise mass: gather suffix overflow K: {e:?}"))?;
++            }
+             let table: Vec<i32> = (0..pages as i32).collect();
+             let mut out = vec![0f32; rows.len() * pages];
+             gpu.kvmem_page_mass(
+@@ -3837,6 +3900,15 @@ impl<'a> LayerwiseDriver<'a> {
+                 return Err(format!("layerwise head: scratch slot: {e}"));
+             }
+         };
++        // P4.4 keep-set fix: reserve a second scratch page for a draft span that
++        // crosses a page boundary (head_n_slots carries the extra page).
++        let suffix_slot_overflow = match arena.pool().alloc_slot() {
++            Ok(h) => h.phys,
++            Err(e) => {
++                let _ = arena.free(gpu);
++                return Err(format!("layerwise head: overflow scratch slot: {e}"));
++            }
++        };
+         let extent = (arena.layout().k_plane_bytes() + arena.layout().v_plane_bytes()) as usize;
+         let slab_bytes = match extent.checked_mul(head_n_slots) {
+             Some(b) => b,
+@@ -3864,7 +3936,7 @@ impl<'a> LayerwiseDriver<'a> {
+                 return Err(format!("layerwise head: desc staging: {e}"));
+             }
+         };
+-        self.head = Some(HeadSubsystem { arena, slab, staging, suffix_slot, draft_base: None });
++        self.head = Some(HeadSubsystem { arena, slab, staging, suffix_slot, suffix_slot_overflow, draft_base: None });
+         Ok(())
+     }
+ 
+@@ -3950,7 +4022,7 @@ impl<'a> LayerwiseDriver<'a> {
+         // causal bound at `visible_tokens` (byte-neutral with the pre-suffix seam).
+         // `Some` restores the boundary partial page into the scratch slot and binds
+         // it as the staging suffix, extending the bound by `partial_tokens + rows`.
+-        let (suffix_slot, suffix_extent) = if let Some(s) = suffix {
++        let (suffix_slot, suffix_slot_overflow, suffix_extent) = if let Some(s) = suffix {
+             let scratch = head.suffix_slot;
+             let session = plan
+                 .next_block(0)
+@@ -3972,16 +4044,19 @@ impl<'a> LayerwiseDriver<'a> {
+                 session,
+                 s,
+             )?;
+-            (Some(scratch), s.partial_tokens as u64 + s.rows as u64)
++            // P4.4 keep-set fix: map the reserved overflow scratch page so a draft
++            // span crossing a page boundary extends into it (beyond the causal
++            // bound when unused ⇒ masked, byte-neutral).
++            (Some(scratch), Some(head.suffix_slot_overflow), s.partial_tokens as u64 + s.rows as u64)
+         } else {
+-            (None, 0)
++            (None, None, 0)
+         };
+         let extent = view.visible_tokens + suffix_extent;
+         let seq_len = i32::try_from(extent).map_err(|_| {
+             format!("layerwise head restore: compacted extent {extent} exceeds i32")
+         })?;
+         head.staging
+-            .update_layer(gpu, 0, &compact, suffix_slot, seq_len)
++            .update_layer(gpu, 0, &compact, suffix_slot, suffix_slot_overflow, seq_len)
+             .map_err(|e| format!("layerwise head restore: staging: {e}"))?;
+         // Capture the serial-draft staging base (ninfer NL:10322/10335). A suffix
+         // restore binds the scratch page and the compacted extent the draft rows
+@@ -3991,6 +4066,7 @@ impl<'a> LayerwiseDriver<'a> {
+         head.draft_base = suffix_slot.map(|slot| HeadDraftBase {
+             compact: compact.clone(),
+             suffix_slot: Some(slot),
++            suffix_slot_overflow,
+             base_seq: seq_len,
+         });
+         Ok(view)
+@@ -4019,7 +4095,7 @@ impl<'a> LayerwiseDriver<'a> {
+             format!("layerwise head draft: base_seq {} + row {row} overflow i32", base.base_seq)
+         })?;
+         head.staging
+-            .update_layer(gpu, 0, &base.compact, base.suffix_slot, seq_len)
++            .update_layer(gpu, 0, &base.compact, base.suffix_slot, base.suffix_slot_overflow, seq_len)
+             .map_err(|e| format!("layerwise head draft: staging row {row}: {e}"))
+     }
+ 
+@@ -5931,36 +6007,53 @@ mod tests {
+     #[test]
+     fn encode_layer_block_table_maps_stripes_and_masks() {
+         // compact [2,0,3] + suffix 1, layer 1 of 2, max_pages 4 → all mapped.
+-        let bt = encode_layer_block_table(&[2, 0, 3], Some(1), 1, 2, 4).expect("encode");
++        let bt = encode_layer_block_table(&[2, 0, 3], Some(1), None, 1, 2, 4).expect("encode");
+         assert_eq!(bt, vec![10, 2, 14, 6]);
+         // No suffix → trailing logical pages padded -1.
+-        let bt = encode_layer_block_table(&[2, 0], None, 1, 2, 4).expect("encode");
++        let bt = encode_layer_block_table(&[2, 0], None, None, 1, 2, 4).expect("encode");
+         assert_eq!(bt, vec![10, 2, -1, -1]);
+         // Layer 0 of 2: stripe = 2*(slot*2) = 4*slot.
+-        let bt = encode_layer_block_table(&[3, 1], None, 0, 2, 3).expect("encode");
++        let bt = encode_layer_block_table(&[3, 1], None, None, 0, 2, 3).expect("encode");
+         assert_eq!(bt, vec![12, 4, -1]);
+         // Empty compact + no suffix → all -1 (fully masked layer).
+-        let bt = encode_layer_block_table(&[], None, 0, 2, 2).expect("encode");
++        let bt = encode_layer_block_table(&[], None, None, 0, 2, 2).expect("encode");
+         assert_eq!(bt, vec![-1, -1]);
+         // Single fa layer: stripe = 2*slot (n_layers 1).
+-        let bt = encode_layer_block_table(&[5], Some(0), 0, 1, 2).expect("encode");
++        let bt = encode_layer_block_table(&[5], Some(0), None, 0, 1, 2).expect("encode");
+         assert_eq!(bt, vec![10, 0]);
+ 
+         // ── fail-closed guards ──
+-        assert!(encode_layer_block_table(&[0], None, 0, 0, 4).is_err(), "n_layers 0");
+-        assert!(encode_layer_block_table(&[0], None, 2, 2, 4).is_err(), "layer >= n_layers");
++        assert!(encode_layer_block_table(&[0], None, None, 0, 0, 4).is_err(), "n_layers 0");
++        assert!(encode_layer_block_table(&[0], None, None, 2, 2, 4).is_err(), "layer >= n_layers");
+         assert!(
+-            encode_layer_block_table(&[0, 1, 2], Some(3), 0, 2, 3).is_err(),
++            encode_layer_block_table(&[0, 1, 2], Some(3), None, 0, 2, 3).is_err(),
+             "mapped > max_pages"
+         );
+         // u32::MAX slot × n_layers 2 × 2 overflows i32 → must fail, not wrap
+         // negative (a wrapped index would be read as a dropped page).
+         assert!(
+-            encode_layer_block_table(&[u32::MAX], None, 0, 2, 4).is_err(),
++            encode_layer_block_table(&[u32::MAX], None, None, 0, 2, 4).is_err(),
+             "stripe index overflow"
+         );
+     }
+ 
++    #[test]
++    fn encode_layer_block_table_maps_suffix_overflow() {
++        // P4.4 keep-set fix: a verify span crossing a page boundary maps a SECOND
++        // suffix page (overflow) after the first suffix. compact [2,0,3] + suffix
++        // 1 + overflow 4, layer 1 of 2 (stripe=4*slot+2), max_pages 5 → all mapped.
++        let bt = encode_layer_block_table(&[2, 0, 3], Some(1), Some(4), 1, 2, 5).expect("encode");
++        assert_eq!(bt, vec![10, 2, 14, 6, 18]);
++        // Overflow without a first suffix is still mapped at compact.len()+1.
++        let bt = encode_layer_block_table(&[2, 0], None, Some(4), 1, 2, 4).expect("encode");
++        assert_eq!(bt, vec![10, 2, -1, 18]);
++        // mapped (compact 3 + suffix + overflow = 5) > max_pages 4 → fail closed.
++        assert!(
++            encode_layer_block_table(&[0, 1, 2], Some(3), Some(4), 0, 2, 4).is_err(),
++            "overflow mapped > max_pages"
++        );
++    }
++
+     /// The staging uploads each layer's encoded table + a descriptor pointing at
+     /// the STABLE table address; re-updating a layer keeps the pointer fixed.
+     /// Also verifies the shifted V base view geometry and the fail-closed guards.
+@@ -6011,10 +6104,10 @@ mod tests {
+         let seq = [4 * 128i32, 2 * 128i32];
+         for layer in 0..NL {
+             staging
+-                .update_layer(&mut gpu, layer, &compact[layer], suffix[layer], seq[layer])
++                .update_layer(&mut gpu, layer, &compact[layer], suffix[layer], None, seq[layer])
+                 .expect("update");
+             let want =
+-                encode_layer_block_table(&compact[layer], suffix[layer], layer, NL, MAXP)
++                encode_layer_block_table(&compact[layer], suffix[layer], None, layer, NL, MAXP)
+                     .expect("encode");
+             assert_eq!(
+                 read_i32(&mut gpu, staging.block_table(layer).expect("bt"), MAXP),
+@@ -6042,7 +6135,7 @@ mod tests {
+ 
+         // Re-update layer 0 with a different view: pointer fixed, content changes.
+         let ptr0 = staging.block_table(0).expect("bt").buf.as_ptr() as u64;
+-        staging.update_layer(&mut gpu, 0, &[0], Some(2), 2 * 128).expect("re-update");
++        staging.update_layer(&mut gpu, 0, &[0], Some(2), None, 2 * 128).expect("re-update");
+         assert_eq!(
+             staging.block_table(0).expect("bt").buf.as_ptr() as u64,
+             ptr0,
+@@ -6053,7 +6146,7 @@ mod tests {
+         assert_eq!(d0.seq_len, 2 * 128);
+         assert_eq!(
+             read_i32(&mut gpu, staging.block_table(0).expect("bt"), MAXP),
+-            encode_layer_block_table(&[0], Some(2), 0, NL, MAXP).expect("encode")
++            encode_layer_block_table(&[0], Some(2), None, 0, NL, MAXP).expect("encode")
+         );
+         assert_eq!(
+             read_i32(&mut gpu, staging.positions(0).expect("pos"), 1),
+@@ -6072,10 +6165,10 @@ mod tests {
+         assert_eq!(v_view.buf.size(), arena_bytes - k_plane);
+ 
+         // ── fail-closed guards (all reject BEFORE any upload) ──
+-        assert!(staging.update_layer(&mut gpu, NL, &[0], None, 128).is_err(), "layer range");
+-        assert!(staging.update_layer(&mut gpu, 0, &[0], None, -1).is_err(), "negative seq_len");
++        assert!(staging.update_layer(&mut gpu, NL, &[0], None, None, 128).is_err(), "layer range");
++        assert!(staging.update_layer(&mut gpu, 0, &[0], None, None, -1).is_err(), "negative seq_len");
+         // seq_len needs 3 tiles but only 1 mapped page.
+-        assert!(staging.update_layer(&mut gpu, 0, &[0], None, 3 * 128).is_err(), "tiles > mapped");
++        assert!(staging.update_layer(&mut gpu, 0, &[0], None, None, 3 * 128).is_err(), "tiles > mapped");
+         assert!(staging.descs(NL).is_err(), "desc accessor range");
+         assert!(staging.block_table(NL).is_err(), "table accessor range");
+         assert!(staging.positions(NL).is_err(), "positions accessor range");
+@@ -6115,7 +6208,7 @@ mod tests {
+         let seq = [3 * 128i32, 2 * 128i32];
+         for layer in 0..NL {
+             staging
+-                .update_layer(&mut gpu, layer, &compact[layer], None, seq[layer])
++                .update_layer(&mut gpu, layer, &compact[layer], None, None, seq[layer])
+                 .expect("update");
+             // positions = [seq-W .. seq-1] (W compacted causal bounds).
+             let want: Vec<i32> = (0..W as i32).map(|i| seq[layer] - W as i32 + i).collect();
+@@ -6131,7 +6224,7 @@ mod tests {
+         let ar = LayerwiseDescStaging::new(&mut gpu, NL, MAXP).expect("ar staging");
+         assert_eq!(ar.width(), 1);
+         assert_eq!(read_i32(&mut gpu, ar.row_slot(), 1), vec![0i32]);
+-        ar.update_layer(&mut gpu, 0, &[0], None, 128).expect("ar update");
++        ar.update_layer(&mut gpu, 0, &[0], None, None, 128).expect("ar update");
+         assert_eq!(read_i32(&mut gpu, ar.positions(0).expect("pos"), 1), vec![127]);
+         ar.free_gpu(&mut gpu);
+ 
