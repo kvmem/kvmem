@@ -463,6 +463,8 @@ forward.
 | `HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB` | 8 | layerwise pinned Q D2H readback transfer budget (`PinnedHostBuffer`, the append/read_rows staging), MiB |
 | `HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB` | 1024 | layerwise source/feedback version-counter + frozen-index envelope (the `metadata_bytes`-derived account), MiB |
 | `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB` | 96 | layerwise tape descriptor/chunk-table finite-admission account (`HostKvStorage` + reservation), MiB |
+| `HIPFIRE_KVMEM_PREFIX_PIN` | off | P4.3 KVMem-native cross-session prefix sharing: page-aligned prefill boundaries freeze an immutable canonical archive (host `fork_prefix` + DeltaNet checkpoint); the shared sealed GPU pages stay PIN-resident (cache refs; residency selection skips them). A new session whose prompt matches a frozen prefix (full token provenance + geometry + incarnation) reuses it, skipping the prefix prefill. The radix stays off; Legacy AND Layerwise covered (Layerwise reuse keeps MTP — the draft carrier restores head history from the shared aux archive); generated rows are never shared; vision skips. Off = byte-neutral |
+| `HIPFIRE_KVMEM_PREFIX_PIN_BYTES` | 536870912 | DeltaNet checkpoint-pool ceiling for `PREFIX_PIN` (snapshots only, no radix pages), bytes; only read when `PREFIX_PIN` is on |
 
 With `cap ≤ budget` nothing ever spills, the tap kernels only copy, and the
 forward is bit-identical to an unpatched hipfire. Spill/restore moves arena

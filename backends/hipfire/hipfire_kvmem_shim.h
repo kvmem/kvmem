@@ -114,6 +114,53 @@ size_t hk_raw_store_mean_checkpoint(const hk_raw_store * st, uint32_t token_pos,
 void hk_raw_store_restore_mean_checkpoint(hk_raw_store * st, uint32_t token_pos,
                                           const float * state, size_t len);
 
+// ── P4.3 KVMem-native prefix fork / packed exchange (host-only, additive) ──
+// Packed-record selection descriptor (mirrors kvmem::PackedKvSelection).
+typedef struct hk_packed_selection {
+    uint32_t block;
+    uint32_t layer;
+    uint32_t valid_tokens;
+} hk_packed_selection;
+// Opaque immutable packed-record snapshot (mirrors kvmem::PackedKvSnapshot).
+typedef struct hk_packed_snapshot hk_packed_snapshot;
+// Fork a branch sharing the prefix's sealed packed GPU sources (raw rows and
+// mutable statistics stay private to the branch). Caller drains native writers
+// first. Returns a NEW hk_raw_store (caller destroys), or NULL on error.
+hk_raw_store * hk_raw_store_fork_prefix(hk_raw_store * st, uint32_t token_pos);
+// Fork a branch copying ONLY the mean-K index (no raw/packed KV); the branch's
+// payload lives in its separately shared page archive. Returns NEW hk_raw_store.
+hk_raw_store * hk_raw_store_fork_mean_prefix(const hk_raw_store * st, uint32_t token_pos);
+// Export the selected packed records into an immutable snapshot (full records
+// share storage; partial records are private copies). metadata_limit bounds the
+// caller metadata admission. Returns NEW hk_packed_snapshot, or NULL on error.
+hk_packed_snapshot * hk_raw_store_export_packed(hk_raw_store * st,
+                                                const hk_packed_selection * selections,
+                                                size_t n_selections, size_t metadata_limit);
+// Atomically replace ALL packed bindings from a snapshot (consumes it; unselected
+// packed planes vanish; raw rows/MeanK stay private). Rejects foreign storage.
+void hk_raw_store_import_packed(hk_raw_store * st, hk_packed_snapshot * snapshot,
+                                size_t metadata_limit);
+void hk_packed_snapshot_destroy(hk_packed_snapshot * snap);
+size_t hk_packed_snapshot_entry_count(const hk_packed_snapshot * snap);
+size_t hk_packed_snapshot_metadata_bytes(const hk_packed_snapshot * snap);
+
+// ── P4.3 prefix reuse anchors (host-only, additive; core prefix_checkpoint) ──
+// Indivisible input group (mirrors kvmem::PrefixRange): the anchor must not
+// split [begin, end). Vision token spans are the typical groups.
+typedef struct hk_prefix_range {
+    uint64_t begin;
+    uint64_t end;
+} hk_prefix_range;
+// Reusable-prefix anchor: clamp the observed LCP into [base, query] and floor
+// it to input-group boundaries (kvmem::prefix_anchor). Returns the anchor, or
+// (uint64_t)-1 on error (query < base, invalid group, group split below base).
+uint64_t hk_prefix_anchor(uint64_t base, uint64_t lcp, uint64_t query,
+                          const hk_prefix_range * indivisible, size_t n_groups);
+// Restorable frontier: min(lcp, live, eval_end - needs_logits)
+// (kvmem::prefix_restore_limit). Pure arithmetic, never fails.
+uint64_t hk_prefix_restore_limit(uint64_t lcp, uint64_t live, uint64_t eval_end,
+                                 int needs_logits);
+
 // ── block repository / selection ──
 hk_kv_store * hk_kv_store_create(const hk_kv_store_config * cfg);
 void hk_kv_store_destroy(hk_kv_store * ks);
