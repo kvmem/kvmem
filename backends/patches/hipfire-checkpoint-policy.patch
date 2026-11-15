@@ -1,0 +1,293 @@
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index 2302d7a38..c1900d960 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -1820,6 +1820,32 @@ mod ffi {
+             state: WindowState,
+             out: *mut HkLayerwiseImportStart,
+         ) -> c_int;
++
++        // ── checkpoint policy: capture plan + coverage retention ──
++        pub fn hk_checkpoint_plan_create(
++            base: u64,
++            stride: u64,
++            root_at: u64,
++            tail_at: u64,
++        ) -> *mut HkCheckpointPlan;
++        pub fn hk_checkpoint_plan_destroy(p: *mut HkCheckpointPlan);
++        pub fn hk_checkpoint_plan_cut(p: *const HkCheckpointPlan, begin: u64, end: u64) -> u64;
++        pub fn hk_checkpoint_plan_due(
++            p: *const HkCheckpointPlan,
++            frontier: u64,
++            purpose: *mut u32,
++        ) -> c_int;
++        pub fn hk_checkpoint_plan_saved(p: *mut HkCheckpointPlan, frontier: u64);
++        pub fn hk_checkpoint_coverage_retain(
++            infos: *const CoverageInfo,
++            n: usize,
++            count: u64,
++            bytes: u64,
++            interval: u64,
++            min_gap: u64,
++            out: *mut usize,
++            out_capacity: usize,
++        ) -> usize;
+     }
+ }
+ 
+@@ -4350,3 +4376,139 @@ impl Drop for WindowPlan {
+         unsafe { ffi::hk_layerwise_window_plan_destroy(self.ptr.as_ptr()) };
+     }
+ }
++
++// ── checkpoint policy: capture plan + coverage retention ──
++
++#[repr(C)]
++struct HkCheckpointPlan {
++    _private: [u8; 0],
++}
++
++/// Mirrors `kvmem::CoveragePurpose` (append-only ordinals).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u32)]
++pub enum CoveragePurpose {
++    Periodic = 0,
++    Tail = 1,
++    Root = 2,
++    Anchor = 3,
++    Input = 4,
++    Endpoint = 5,
++}
++
++impl CoveragePurpose {
++    pub fn from_ordinal(v: u32) -> Option<Self> {
++        match v {
++            0 => Some(Self::Periodic),
++            1 => Some(Self::Tail),
++            2 => Some(Self::Root),
++            3 => Some(Self::Anchor),
++            4 => Some(Self::Input),
++            5 => Some(Self::Endpoint),
++            _ => None,
++        }
++    }
++}
++
++/// Mirrors `kvmem::CoverageInfo`: planning metadata only. `identity == 0`
++/// marks an absent slot; any nonzero value is compared by equality.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct CoverageInfo {
++    pub frontier: u64,
++    pub bytes: u64,
++    pub used: u64,
++    pub identity: u64,
++    pub purpose: u32,
++    pub protections: u32,
++}
++
++/// Pure `kvmem::CheckpointCapturePlan`: semantic cut points plus periodic
++/// capture timing. The caller owns the checkpoint payload and its proof.
++pub struct CheckpointCapturePlan {
++    ptr: NonNull<HkCheckpointPlan>,
++}
++
++impl CheckpointCapturePlan {
++    pub fn new(base: u64, stride: u64, root_at: u64, tail_at: u64) -> Result<Self> {
++        clear_error();
++        let ptr = unsafe { ffi::hk_checkpoint_plan_create(base, stride, root_at, tail_at) };
++        NonNull::new(ptr)
++            .map(|ptr| Self { ptr })
++            .ok_or_else(err_from_last)
++    }
++
++    /// Clamp a native prefill chunk end to the next semantic cut.
++    pub fn cut(&self, begin: u64, end: u64) -> u64 {
++        unsafe { ffi::hk_checkpoint_plan_cut(self.ptr.as_ptr(), begin, end) }
++    }
++
++    pub fn due(&self, frontier: u64) -> Result<Option<CoveragePurpose>> {
++        let mut purpose = 0u32;
++        let p = self.ptr.as_ptr();
++        clear_error();
++        match unsafe { ffi::hk_checkpoint_plan_due(p, frontier, &mut purpose) } {
++            1 => CoveragePurpose::from_ordinal(purpose)
++                .map(Some)
++                .ok_or_else(|| KvMemError(format!("unknown coverage purpose {purpose}"))),
++            0 => Ok(None),
++            _ => Err(err_from_last()),
++        }
++    }
++
++    pub fn saved(&mut self, frontier: u64) {
++        unsafe { ffi::hk_checkpoint_plan_saved(self.ptr.as_ptr(), frontier) };
++    }
++}
++
++impl Drop for CheckpointCapturePlan {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_checkpoint_plan_destroy(self.ptr.as_ptr()) };
++    }
++}
++
++/// Select the retained checkpoint coverage (core
++/// `retain_checkpoint_coverage`): count/byte caps, interval spacing and
++/// `min_gap`, with root/anchor/input roles and the newest endpoint protected.
++pub fn retain_checkpoint_coverage(
++    infos: &[CoverageInfo],
++    count: u64,
++    bytes: u64,
++    interval: u64,
++    min_gap: u64,
++) -> Result<Vec<usize>> {
++    clear_error();
++    let n = unsafe {
++        ffi::hk_checkpoint_coverage_retain(
++            infos.as_ptr(),
++            infos.len(),
++            count,
++            bytes,
++            interval,
++            min_gap,
++            ptr::null_mut(),
++            0,
++        )
++    };
++    if n == usize::MAX {
++        return Err(err_from_last());
++    }
++    let mut out = vec![0usize; n];
++    let written = unsafe {
++        ffi::hk_checkpoint_coverage_retain(
++            infos.as_ptr(),
++            infos.len(),
++            count,
++            bytes,
++            interval,
++            min_gap,
++            out.as_mut_ptr(),
++            out.len(),
++        )
++    };
++    if written == usize::MAX {
++        return Err(err_from_last());
++    }
++    out.truncate(written.min(out.len()));
++    Ok(out)
++}
+diff --git a/crates/hipfire-kvmem/tests/checkpoint_policy_smoke.rs b/crates/hipfire-kvmem/tests/checkpoint_policy_smoke.rs
+new file mode 100644
+index 000000000..51f712616
+--- /dev/null
++++ b/crates/hipfire-kvmem/tests/checkpoint_policy_smoke.rs
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 The hipfire authors
++// hipfire — see LICENSE or NOTICE in the project root.
++
++//! Host-only smoke test for the core checkpoint policy wrappers: the causal
++//! capture plan (semantic cuts + periodic timing) and the coverage retention
++//! selector (count/bytes + interval spacing, protected roles). Pure metadata:
++//! no payload, catalog mutation or device work.
++
++use hipfire_kvmem::{
++    retain_checkpoint_coverage, CheckpointCapturePlan, CoverageInfo, CoveragePurpose,
++};
++
++fn info(frontier: u64, bytes: u64, identity: u64, purpose: CoveragePurpose) -> CoverageInfo {
++    CoverageInfo {
++        frontier,
++        bytes,
++        used: identity,
++        identity,
++        purpose: purpose as u32,
++        protections: 0,
++    }
++}
++
++#[test]
++fn capture_plan_cuts_at_semantic_boundaries_and_schedules_periodic() {
++    let mut plan = CheckpointCapturePlan::new(0, 256, 1024, 2048).expect("plan");
++    assert_eq!(plan.due(256).expect("due"), Some(CoveragePurpose::Periodic));
++    assert_eq!(plan.due(300).expect("due"), Some(CoveragePurpose::Periodic));
++    plan.saved(256);
++    // The periodic cursor advanced: 300 is now below the next 512 slot.
++    assert_eq!(plan.due(300).expect("due"), None);
++    assert_eq!(plan.due(512).expect("due"), Some(CoveragePurpose::Periodic));
++    // The root cut clamps a chunk that would run past it.
++    assert_eq!(plan.cut(512, 2000), 1024);
++    assert_eq!(plan.due(1024).expect("due"), Some(CoveragePurpose::Root));
++    plan.saved(1024);
++    // The tail cut is next, even with the periodic cursor behind it.
++    assert_eq!(plan.cut(1024, 3000), 2048);
++    assert_eq!(plan.due(2048).expect("due"), Some(CoveragePurpose::Tail));
++    plan.saved(2048);
++    assert_eq!(plan.cut(2048, 3000), 3000);
++    assert_eq!(plan.due(2048).expect("due"), None);
++}
++
++#[test]
++fn capture_plan_constructor_marks_passed_semantic_points_done() {
++    let plan = CheckpointCapturePlan::new(4096, 256, 0, 0).expect("plan");
++    // Both semantic points are at/below the base, so only periodic fires.
++    assert_eq!(plan.cut(4096, 8000), 8000);
++    assert_eq!(plan.due(4096).expect("due"), None, "the periodic cursor starts one stride ahead");
++    assert_eq!(plan.due(4352).expect("due"), Some(CoveragePurpose::Periodic));
++}
++
++#[test]
++fn retention_applies_count_and_keeps_the_newest() {
++    let infos: Vec<CoverageInfo> = (1..=6)
++        .map(|i| info(i * 100, 10, i as u64, CoveragePurpose::Periodic))
++        .collect();
++    let keep = retain_checkpoint_coverage(&infos, 1, 10_000, 100, 0).expect("retain");
++    assert_eq!(keep, vec![5], "one slot keeps the newest frontier");
++}
++
++#[test]
++fn retention_spaces_periodic_points_by_min_gap() {
++    let infos = vec![
++        info(10, 10, 1, CoveragePurpose::Periodic),
++        info(20, 10, 2, CoveragePurpose::Periodic),
++        info(30, 10, 3, CoveragePurpose::Periodic),
++        info(40, 10, 4, CoveragePurpose::Periodic),
++    ];
++    let keep = retain_checkpoint_coverage(&infos, 10, 10_000, 100, 15).expect("retain");
++    assert_eq!(keep, vec![0, 2], "10 and 30 survive a 15-token gap");
++}
++
++#[test]
++fn retention_skips_absent_identities_and_enforces_the_byte_budget() {
++    let infos = vec![
++        info(10, 10, 0, CoveragePurpose::Periodic),
++        info(20, 10, 2, CoveragePurpose::Periodic),
++    ];
++    assert_eq!(
++        retain_checkpoint_coverage(&infos, 10, 10_000, 100, 0).expect("retain"),
++        vec![1],
++        "absent slots are never retained"
++    );
++    let infos = vec![
++        info(10, 60, 1, CoveragePurpose::Periodic),
++        info(20, 60, 2, CoveragePurpose::Periodic),
++    ];
++    assert_eq!(
++        retain_checkpoint_coverage(&infos, 10, 100, 100, 0).expect("retain"),
++        vec![1],
++        "120 bytes cannot fit a 100-byte budget; the newest survives"
++    );
++}
++
++#[test]
++fn retention_protects_the_input_and_newest_endpoint_roles() {
++    let infos = vec![
++        info(10, 10, 1, CoveragePurpose::Input),
++        info(20, 10, 2, CoveragePurpose::Periodic),
++        info(30, 10, 3, CoveragePurpose::Periodic),
++        info(40, 10, 4, CoveragePurpose::Endpoint),
++    ];
++    // Two slots: the input role and the newest endpoint bypass ordinary
++    // cost-based eviction.
++    let keep = retain_checkpoint_coverage(&infos, 2, 10_000, 100, 0).expect("retain");
++    assert!(keep.contains(&0) && keep.contains(&3), "{keep:?}");
++}

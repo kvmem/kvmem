@@ -1099,6 +1099,47 @@ int hk_layerwise_import_plan(const hk_layerwise_window_plan * p,
                              hk_layerwise_window_state state,
                              hk_layerwise_import_start * out);
 
+// ── checkpoint policy: capture plan + coverage retention (host-only, additive) ──
+// Mirrors kvmem::CheckpointCapturePlan and kvmem::retain_checkpoint_coverage
+// (core checkpoint_policy.hpp). Pure planning over caller-supplied metadata:
+// no payload, native proof or mutation of a catalog is involved. Purpose
+// ordinals mirror CoveragePurpose (append-only).
+
+typedef enum hk_coverage_purpose {
+    HK_COVERAGE_PERIODIC = 0,
+    HK_COVERAGE_TAIL = 1,
+    HK_COVERAGE_ROOT = 2,
+    HK_COVERAGE_ANCHOR = 3,
+    HK_COVERAGE_INPUT = 4,
+    HK_COVERAGE_ENDPOINT = 5
+} hk_coverage_purpose;
+
+typedef struct hk_coverage_info {
+    uint64_t frontier;
+    uint64_t bytes;
+    uint64_t used;
+    uint64_t identity;   // 0 = absent
+    uint32_t purpose;    // hk_coverage_purpose
+    uint32_t protections; // bit0 Root, bit1 Anchor, bit2 Input
+} hk_coverage_info;
+
+typedef struct hk_checkpoint_plan hk_checkpoint_plan;
+
+// base/stride/root_at/tail_at mirror the core constructor (stride 0 disables
+// periodic cuts).
+hk_checkpoint_plan * hk_checkpoint_plan_create(uint64_t base, uint64_t stride,
+                                               uint64_t root_at, uint64_t tail_at);
+void hk_checkpoint_plan_destroy(hk_checkpoint_plan * p);
+uint64_t hk_checkpoint_plan_cut(const hk_checkpoint_plan * p, uint64_t begin, uint64_t end);
+// 1 = due (purpose stored), 0 = not due, -1 = error.
+int hk_checkpoint_plan_due(const hk_checkpoint_plan * p, uint64_t frontier, uint32_t * purpose);
+void hk_checkpoint_plan_saved(hk_checkpoint_plan * p, uint64_t frontier);
+// Retained indices in original order. Pass out=NULL/capacity=0 to query the
+// required count; (size_t)-1 on error.
+size_t hk_checkpoint_coverage_retain(const hk_coverage_info * infos, size_t n,
+                                     uint64_t count, uint64_t bytes, uint64_t interval,
+                                     uint64_t min_gap, size_t * out, size_t out_capacity);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
