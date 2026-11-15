@@ -1,0 +1,483 @@
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index 0b16c826b..2302d7a38 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -1776,6 +1776,50 @@ mod ffi {
+             start: *mut u64,
+             score: *mut f64,
+         ) -> c_int;
++
++        // ── layerwise window / import policy (additive) ──
++        pub fn hk_layerwise_window_plan_create(
++            envelope: *const HkLayerwiseEnvelope,
++            capacity_tokens: u64,
++        ) -> *mut HkLayerwiseWindowPlan;
++        pub fn hk_layerwise_window_plan_destroy(p: *mut HkLayerwiseWindowPlan);
++        pub fn hk_layerwise_window_action_at(
++            p: *const HkLayerwiseWindowPlan,
++            state: WindowState,
++        ) -> u32;
++        pub fn hk_layerwise_window_admit(
++            p: *const HkLayerwiseWindowPlan,
++            state: WindowState,
++            desired: u64,
++            out: *mut u64,
++        ) -> c_int;
++        pub fn hk_layerwise_window_selection_budget(
++            p: *const HkLayerwiseWindowPlan,
++            history: u64,
++            out: *mut u64,
++        ) -> c_int;
++        pub fn hk_layerwise_window_prefill_checkpoint(
++            p: *const HkLayerwiseWindowPlan,
++            out: *mut u64,
++        ) -> c_int;
++        pub fn hk_layerwise_window_generation_checkpoint(
++            p: *const HkLayerwiseWindowPlan,
++            out: *mut u64,
++        ) -> c_int;
++        pub fn hk_layerwise_window_prefill_boundary(
++            p: *const HkLayerwiseWindowPlan,
++            history: u64,
++            out: *mut i64,
++        ) -> c_int;
++        pub fn hk_layerwise_window_query_evaluation(
++            p: *const HkLayerwiseWindowPlan,
++            out: *mut QueryRange,
++        ) -> c_int;
++        pub fn hk_layerwise_import_plan(
++            p: *const HkLayerwiseWindowPlan,
++            state: WindowState,
++            out: *mut HkLayerwiseImportStart,
++        ) -> c_int;
+     }
+ }
+ 
+@@ -4078,3 +4122,231 @@ impl Drop for LayerwiseRequest {
+         unsafe { ffi::hk_layerwise_request_destroy(self.ptr.as_ptr()) };
+     }
+ }
++
++// ── layerwise window / import policy: safe wrappers ──
++
++#[repr(C)]
++struct HkLayerwiseWindowPlan {
++    _private: [u8; 0],
++}
++
++/// `hk_layerwise_window_state` — history is the complete accepted
++/// original-coordinate frontier; visible_tokens includes the accepted partial
++/// tail and never exceeds it.
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct WindowState {
++    pub history: u64,
++    pub visible_tokens: u64,
++}
++
++/// Mirrors `kvmem::LayerwiseWindowPolicy` (append-only ordinals).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u32)]
++pub enum WindowPolicy {
++    Pressure = 0,
++    KeepSelected = 1,
++    SemanticChunk = 2,
++}
++
++/// Mirrors `kvmem::LayerwiseWindowAction` (append-only ordinals).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u32)]
++pub enum WindowAction {
++    None = 0,
++    Query = 1,
++    Pressure = 2,
++    Chunk = 3,
++    Exhausted = 4,
++}
++
++impl WindowAction {
++    pub fn from_ordinal(v: u32) -> Option<Self> {
++        match v {
++            0 => Some(Self::None),
++            1 => Some(Self::Query),
++            2 => Some(Self::Pressure),
++            3 => Some(Self::Chunk),
++            4 => Some(Self::Exhausted),
++            _ => None,
++        }
++    }
++}
++
++/// Trusted request metadata, finalized before native allocation. `query` and
++/// `replay` describe the one atomic public evaluation in original coordinates.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct WindowEnvelope {
++    pub prompt_end: u64,
++    pub block_tokens: u32,
++    pub generation_tokens: u64,
++    pub output_tokens: u64,
++    pub rolling_active_window: bool,
++    pub prefill_window: WindowPolicy,
++    pub query: Option<QueryRange>,
++    pub replay: Option<QueryRange>,
++    pub reserve_query_output: bool,
++    pub probe_tokens: u64,
++    pub pressure_probe_tokens: u64,
++    pub has_query_mandatory: bool,
++}
++
++#[repr(C)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct HkLayerwiseEnvelope {
++    prompt_end: u64,
++    block_tokens: u32,
++    generation_tokens: u64,
++    output_tokens: u64,
++    rolling_active_window: c_int,
++    prefill_window: u32,
++    has_query: c_int,
++    query: QueryRange,
++    has_replay: c_int,
++    replay: QueryRange,
++    reserve_query_output: c_int,
++    probe_tokens: u64,
++    pressure_probe_tokens: u64,
++    has_query_mandatory: c_int,
++}
++
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++struct HkLayerwiseImportStart {
++    terminal_reserve_overflow: c_int,
++    prefill_probe_overflow: c_int,
++    query_replay_overflow: c_int,
++    budget_tokens: u64,
++    restore_tokens: u64,
++    selection_budget: u64,
++}
++
++/// Mirrors `kvmem::LayerwiseImportStart`: the three independent fenced-import
++/// admission tests plus the exact budgets the caller then executes.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct ImportStart {
++    pub terminal_reserve_overflow: bool,
++    pub prefill_probe_overflow: bool,
++    pub query_replay_overflow: bool,
++    pub budget_tokens: u64,
++    pub restore_tokens: u64,
++    pub selection_budget: u64,
++}
++
++impl ImportStart {
++    pub fn pressure(&self) -> bool {
++        self.terminal_reserve_overflow || self.prefill_probe_overflow || self.query_replay_overflow
++    }
++}
++
++/// Pure `kvmem::LayerwiseWindowPlan`: action/admit/selection policy only. It
++/// never executes native work or mutates a catalog; the owner proves the
++/// supplied prompt/checkpoint identity.
++pub struct WindowPlan {
++    ptr: NonNull<HkLayerwiseWindowPlan>,
++}
++
++impl WindowPlan {
++    pub fn new(envelope: &WindowEnvelope, capacity_tokens: u64) -> Result<Self> {
++        let c = HkLayerwiseEnvelope {
++            prompt_end: envelope.prompt_end,
++            block_tokens: envelope.block_tokens,
++            generation_tokens: envelope.generation_tokens,
++            output_tokens: envelope.output_tokens,
++            rolling_active_window: envelope.rolling_active_window as c_int,
++            prefill_window: envelope.prefill_window as u32,
++            has_query: envelope.query.is_some() as c_int,
++            query: envelope.query.unwrap_or(QueryRange { begin: 0, end: 0 }),
++            has_replay: envelope.replay.is_some() as c_int,
++            replay: envelope.replay.unwrap_or(QueryRange { begin: 0, end: 0 }),
++            reserve_query_output: envelope.reserve_query_output as c_int,
++            probe_tokens: envelope.probe_tokens,
++            pressure_probe_tokens: envelope.pressure_probe_tokens,
++            has_query_mandatory: envelope.has_query_mandatory as c_int,
++        };
++        clear_error();
++        let ptr = unsafe { ffi::hk_layerwise_window_plan_create(&c, capacity_tokens) };
++        NonNull::new(ptr)
++            .map(|ptr| Self { ptr })
++            .ok_or_else(err_from_last)
++    }
++
++    pub fn action(&self, state: WindowState) -> Result<WindowAction> {
++        clear_error();
++        let v = unsafe { ffi::hk_layerwise_window_action_at(self.ptr.as_ptr(), state) };
++        if v == u32::MAX {
++            return Err(err_from_last());
++        }
++        WindowAction::from_ordinal(v).ok_or_else(|| KvMemError(format!("unknown window action {v}")))
++    }
++
++    pub fn admit(&self, state: WindowState, desired: u64) -> Result<u64> {
++        let mut out = 0u64;
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_window_admit(p, state, desired, &mut out); })?;
++        Ok(out)
++    }
++
++    pub fn selection_budget(&self, history: u64) -> Result<u64> {
++        let mut out = 0u64;
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_window_selection_budget(p, history, &mut out); })?;
++        Ok(out)
++    }
++
++    pub fn prefill_checkpoint(&self) -> Result<Option<u64>> {
++        let mut out = 0u64;
++        let p = self.ptr.as_ptr();
++        clear_error();
++        match unsafe { ffi::hk_layerwise_window_prefill_checkpoint(p, &mut out) } {
++            1 => Ok(Some(out)),
++            0 => Ok(None),
++            _ => Err(err_from_last()),
++        }
++    }
++
++    pub fn generation_checkpoint(&self) -> Result<u64> {
++        let mut out = 0u64;
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_window_generation_checkpoint(p, &mut out); })?;
++        Ok(out)
++    }
++
++    pub fn prefill_boundary(&self, history: u64) -> Result<i64> {
++        let mut out = 0i64;
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_window_prefill_boundary(p, history, &mut out); })?;
++        Ok(out)
++    }
++
++    pub fn query_evaluation(&self) -> Result<Option<QueryRange>> {
++        let mut out: QueryRange = unsafe { std::mem::zeroed() };
++        let p = self.ptr.as_ptr();
++        clear_error();
++        match unsafe { ffi::hk_layerwise_window_query_evaluation(p, &mut out) } {
++            1 => Ok(Some(out)),
++            0 => Ok(None),
++            _ => Err(err_from_last()),
++        }
++    }
++
++    pub fn import_plan(&self, state: WindowState) -> Result<ImportStart> {
++        let mut raw = HkLayerwiseImportStart::default();
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_layerwise_import_plan(p, state, &mut raw); })?;
++        Ok(ImportStart {
++            terminal_reserve_overflow: raw.terminal_reserve_overflow != 0,
++            prefill_probe_overflow: raw.prefill_probe_overflow != 0,
++            query_replay_overflow: raw.query_replay_overflow != 0,
++            budget_tokens: raw.budget_tokens,
++            restore_tokens: raw.restore_tokens,
++            selection_budget: raw.selection_budget,
++        })
++    }
++}
++
++impl Drop for WindowPlan {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_layerwise_window_plan_destroy(self.ptr.as_ptr()) };
++    }
++}
+diff --git a/crates/hipfire-kvmem/tests/layerwise_window_import_smoke.rs b/crates/hipfire-kvmem/tests/layerwise_window_import_smoke.rs
+new file mode 100644
+index 000000000..d2a3fbba3
+--- /dev/null
++++ b/crates/hipfire-kvmem/tests/layerwise_window_import_smoke.rs
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 The hipfire authors
++// hipfire — see LICENSE or NOTICE in the project root.
++
++//! Host-only smoke test for the layerwise window/import policy wrappers: the
++//! literal 72a81cc action/admit/selection policy (`kvmem::LayerwiseWindowPlan`)
++//! and the fenced-import admission tests (`kvmem::plan_layerwise_import`).
++//! Pure host logic: no GPU, no model, no catalog mutation.
++
++use hipfire_kvmem::{
++    ImportStart, QueryRange, WindowAction, WindowEnvelope, WindowPlan, WindowPolicy, WindowState,
++};
++
++const BLOCK: u32 = 128;
++
++fn envelope(prompt_end: u64, generation: u64, output: u64, capacity: u64) -> WindowEnvelope {
++    WindowEnvelope {
++        prompt_end,
++        block_tokens: BLOCK,
++        generation_tokens: generation,
++        output_tokens: output,
++        rolling_active_window: false,
++        prefill_window: WindowPolicy::Pressure,
++        query: None,
++        replay: None,
++        reserve_query_output: false,
++        probe_tokens: 0,
++        pressure_probe_tokens: 0,
++        has_query_mandatory: false,
++    }
++}
++
++#[test]
++fn prefill_action_admit_and_checkpoints() {
++    let capacity = 2048;
++    let plan = WindowPlan::new(&envelope(1024, 256, 64, capacity), capacity).expect("plan");
++    let state = WindowState { history: 0, visible_tokens: 0 };
++    assert_eq!(plan.action(state).expect("action"), WindowAction::None);
++
++    // Admit tiles whole blocks up to the prompt end.
++    let first = plan.admit(state, 300).expect("admit");
++    assert_eq!(first, 256, "300 rows floor to two blocks");
++    let mut history = first;
++    let mut visible = first;
++    while history < 1024 {
++        let step = plan
++            .admit(WindowState { history, visible_tokens: visible }, 1024 - history)
++            .expect("admit");
++        assert!(step > 0 && step % BLOCK as u64 == 0, "step {step}");
++        history += step;
++        visible += step;
++    }
++    assert_eq!(history, 1024);
++    assert_eq!(plan.selection_budget(0).expect("budget"), capacity - 256);
++    assert_eq!(
++        plan.prefill_checkpoint().expect("checkpoint"),
++        Some(768),
++        "branch-safe prefill checkpoint"
++    );
++    assert_eq!(plan.generation_checkpoint().expect("gen"), 896);
++    assert_eq!(plan.prefill_boundary(0).expect("boundary"), 1792);
++    assert!(plan.query_evaluation().expect("evaluation").is_none());
++}
++
++#[test]
++fn query_boundary_is_atomic_and_action_dispatches() {
++    let capacity = 3072; // room for the 768-row query plus its reserve
++    let mut e = envelope(2048, 1920, 64, capacity);
++    e.query = Some(QueryRange { begin: 400, end: 600 });
++    e.replay = Some(QueryRange { begin: 256, end: 2048 });
++    e.reserve_query_output = true;
++    let plan = WindowPlan::new(&e, capacity).expect("plan");
++    assert_eq!(
++        plan.query_evaluation().expect("evaluation"),
++        Some(QueryRange { begin: 256, end: 2048 }),
++        "evaluation floors the replay begin and takes the replay end"
++    );
++    // Tiling stops exactly at the aligned evaluation origin.
++    let state = WindowState { history: 0, visible_tokens: 0 };
++    let mut history = 0;
++    while history < 256 {
++        let step = plan
++            .admit(WindowState { history, visible_tokens: history }, 512)
++            .expect("admit");
++        assert_eq!(step, 256 - history, "tile clipped to the query origin");
++        history += step;
++    }
++    let at = WindowState { history: 256, visible_tokens: 256 };
++    assert_eq!(plan.action(at).expect("action"), WindowAction::Query);
++    let rows = plan.admit(at, 4096).expect("admit");
++    assert_eq!(rows, 1792, "atomic query admits its complete evaluation");
++    // A short desired tile cannot start the atomic query.
++    let none = plan.admit(at, 100).expect("admit");
++    assert_eq!(none, 0);
++}
++
++#[test]
++fn keep_selected_exhausts_at_the_block_boundary() {
++    let capacity = 2048;
++    let mut e = envelope(1024, 256, 64, capacity);
++    e.prefill_window = WindowPolicy::KeepSelected;
++    let plan = WindowPlan::new(&e, capacity).expect("plan");
++    // Boundary = capacity - 1 * block for KeepSelected.
++    assert_eq!(plan.prefill_boundary(0).expect("boundary"), 1920);
++    // visible_tokens never exceeds history, so the boundary is reached on the
++    // decode side of the request (prompt_end == 1024 here).
++    let decode = WindowState { history: 1920, visible_tokens: 1920 };
++    assert_eq!(plan.action(decode).expect("action"), WindowAction::Exhausted);
++    let under = WindowState { history: 1792, visible_tokens: 1792 };
++    assert_eq!(plan.action(under).expect("action"), WindowAction::None);
++}
++
++#[test]
++fn semantic_chunk_steps_before_pressure() {
++    let capacity = 2048;
++    let mut e = envelope(1024, 256, 64, capacity);
++    e.prefill_window = WindowPolicy::SemanticChunk;
++    let plan = WindowPlan::new(&e, capacity).expect("plan");
++    assert_eq!(
++        plan.action(WindowState { history: 0, visible_tokens: 0 }).expect("action"),
++        WindowAction::Chunk
++    );
++    // SemanticChunk has no branch-safe prefill checkpoint.
++    assert_eq!(plan.prefill_checkpoint().expect("checkpoint"), None);
++}
++
++#[test]
++fn import_plan_imports_an_exact_prefix() {
++    let capacity = 2048;
++    let plan = WindowPlan::new(&envelope(1024, 1024, 64, capacity), capacity).expect("plan");
++    let start = plan
++        .import_plan(WindowState { history: 512, visible_tokens: 512 })
++        .expect("import");
++    assert_eq!(
++        start,
++        ImportStart {
++            terminal_reserve_overflow: false,
++            prefill_probe_overflow: false,
++            query_replay_overflow: false,
++            budget_tokens: 1024,
++            restore_tokens: 512,
++            // Only a Pressure import narrows the selection budget; an exact
++            // import keeps the ordinary selection path (core leaves it 0).
++            selection_budget: 0,
++        }
++    );
++    assert!(!start.pressure());
++}
++
++#[test]
++fn import_plan_reports_terminal_reserve_overflow_with_exact_budgets() {
++    let capacity = 1152;
++    let plan = WindowPlan::new(&envelope(1024, 256, 64, capacity), capacity).expect("plan");
++    let start = plan
++        .import_plan(WindowState { history: 1024, visible_tokens: 1024 })
++        .expect("import");
++    assert!(start.terminal_reserve_overflow, "{start:?}");
++    assert!(start.pressure());
++    // available = 1152 - 64 - 0 - 128 = 960 -> 896 aligned (startup bound)
++    assert_eq!(start.budget_tokens, 896);
++    assert_eq!(start.restore_tokens, 896);
++    assert_eq!(start.selection_budget, 896);
++}
++
++#[test]
++fn import_plan_reports_prefill_probe_overflow() {
++    let capacity = 1152;
++    let plan = WindowPlan::new(&envelope(2048, 256, 64, capacity), capacity).expect("plan");
++    let start = plan
++        .import_plan(WindowState { history: 1024, visible_tokens: 1024 })
++        .expect("import");
++    assert!(start.prefill_probe_overflow, "{start:?}");
++    assert!(!start.terminal_reserve_overflow);
++    assert_eq!(start.budget_tokens, capacity - 256);
++    assert_eq!(start.restore_tokens, start.budget_tokens);
++}
++
++#[test]
++fn invalid_envelopes_fail_closed() {
++    let capacity = 2048;
++    // Query outside the prompt is rejected at construction.
++    let mut e = envelope(1024, 512, 64, capacity);
++    e.query = Some(QueryRange { begin: 900, end: 1200 });
++    assert!(WindowPlan::new(&e, capacity).is_err());
++    // An import whose block remainders differ must fail closed.
++    let plan = WindowPlan::new(&envelope(1024, 1024, 64, capacity), capacity).expect("plan");
++    assert!(plan
++        .import_plan(WindowState { history: 512, visible_tokens: 500 })
++        .is_err());
++}
