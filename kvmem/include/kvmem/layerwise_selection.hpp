@@ -44,6 +44,14 @@ LayerwiseHistorySelection select_layerwise_history(const KvMemStore& policy,
     const RawKvStore& keys, CurrentLayerQuery query,
     const std::vector<uint32_t>& mandatory = {});
 
+struct LayerwisePrefillState;
+// Optional hybrid Query source. Rank only this layer's accepted resident pages
+// using the same mass/exposure signal and tie rule as Prefill Pressure. The
+// owner keeps the accepted source immutable; no question-dependent scorer runs.
+LayerwiseHistorySelection select_layerwise_prefill_history(const KvMemStore&,
+    const RawKvStore&, uint32_t statistics_layer, const MemorySnapshot&,
+    const LayerwisePrefillState&, const std::vector<uint32_t>& mandatory = {});
+
 struct LayerwiseQueryGeometry {
     uint32_t layer = 0;
     uint32_t query_heads = 0;

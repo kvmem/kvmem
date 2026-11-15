@@ -7,7 +7,7 @@ NInfer Layerwise 暂不支持同时加载 LoRA 或 control-vector，启动时会
 
 `legacy` 和 `layerwise` 是独立的召回执行策略。未填写策略的旧配置继续使用 Legacy。
 Layerwise 在目标模型每层 attention 前使用本轮刚产生的当前层 Q，恢复该层选择的历史 KV；
-目标模型不做 Query replay。普通工具续接仍是 append 加 accepted 驻留集合内的 Pressure，
+默认路径不做 Query replay；下述实验性全局 Mean-K 会额外执行一次私有探测。普通工具续接仍是 append 加 accepted 驻留集合内的 Pressure，
 不会因保存过旧 Q 而开启冷历史召回。请求沿用现有普通对话和 OpenAI 兼容接口，没有专用 ingest 状态。
 
 在控制台的「召回策略」页选择 **Layerwise · Current-layer Q**。每个后端也有单独的
@@ -19,6 +19,28 @@ Legacy 的评分器、聚合、graph alpha、LRFU 和 Query/replay 上限保存�
 检测中或检测失败时也暂不可选；检测失败后重新聚焦策略选择框会自动重试。
 可选只代表程序声明了分层能力，模型、KV 格式或草稿组合仍需检查配置。
 旧配置中的不可用策略（包括旧版 NInfer）保持原值并阻止启动；可切回 Legacy，已填写的参数仍会保留。
+
+## 实验性混合 Query 评分
+
+NInfer dense Qwen 27B 可设置 `NINFER_LAYERWISE_HYBRID_QUERY=1`：最终 Query 在模型层 **3、7、11、15**（从 0 编号）按各层已接受的 prefill attention `mass / exposure` 排序；沿用 Pressure 的衰减、曝光归一化和同分时偏向较新页的规则。候选仅限该层此时驻留的历史页，已淘汰的冷页不能借用残留统计重新进入。必选 sink／recent／显式保留页仍计入相同历史预算；统计缺失、必选页已不驻留或候选不足时明确报错。
+
+模型层 **19、23、…、63** 保留当前问题 Q 对该层 Mean-K 的评分。所有层仍正常计算最终 Query 的投影和 attention，前四层仅跳过问题 Mean-K 评分；它们改变 KV 后，后续层实际产生的 Q 和选页也可能改变。MTP `first-layer` 历史跟随第一目标层的结果。页大小和预算不变，未引入新 CUDA 内核或设备缓冲；不可变的 prefill 统计在整个 Query 事务期间保留原有元数据租约。
+
+该开关默认关闭，设置 `0` 或移除变量恢复全层 Mean-K；空历史沿用原路径。它只改变新的最终 Query 选页，普通 prefill 的 Pressure 规则不变。4090 上四道固定 NIAH 题的均分为全层 Mean-K 68.75、混合版 43.75；0 题提高、3 题同分、1 题降低，其中 UUID 检索题从 100 降至 0。它仍保持实验性、默认关闭；这不是整套 130 题得分。验证范围、逐题结果与选页对比见 [测量记录](benchmarks/ninfer-hybrid-query-20261114.json)。
+
+后续 UUID 单题诊断定位到第 15 层策略：仅此层改为 prefill 排序就会失分；混合版仅将此层改回 Mean-K 即恢复 100。给失败版本的第 15 层回补 UUID 所在页也能恢复，但基线只删除该页仍答对，因此不能把失败完全归结于单页缺失。全部干预保持 576 页预算，细节见 [逐层与单页对照](benchmarks/ninfer-uuid-diagnosis-20261114.json)。
+
+## 实验性前层全局 Mean-K
+
+设置 `NINFER_LAYERWISE_GLOBAL_QUERY=1`，并关闭 `NINFER_LAYERWISE_HYBRID_QUERY`，可让本模型的第 **3、7、11、15** 层共用一组全局 Mean-K 页（实现范围为编号不大于 15 的目标 attention 层）。第 **19、23、…、63** 层继续使用正式前向中各自当前问题 Q 选择历史。
+
+全局分数复用现有 `LayerwiseProbeSelection`：对当前问题进行一次独立的目标模型探测，每层按 Query token／head 计算 Mean-K softmax，平均 head、累加真正的问题 token，再平均所有目标 attention 层，最后做一次 TopK。没有先把 Q 向量跨 token／层平均。前四层共用这个 TopK，仍执行各自完整的真实投影和 attention；深层会受到它们输出变化的影响。
+
+探测读取原有驻留窗口，随后还原并逐字节验证 GDN 状态、恢复 KV frontier 和位置坐标，不发布探测产生的状态或统计。全局分数和选页保留独立的有限元数据配额。MTP 继续沿用所配置的历史策略；`first-layer` 跟随第一目标层选页。若同时使用 `upstream-global` MTP，两者复用同一次探测。历史全量能装入预算时不需要探测。
+
+该实验开关默认关闭，需要现有物理窗口能容纳完整探测的 Query 尾部；空间不足时明确拒绝，不扩大预算或静默改变 prefill 窗口。探测增加一次短前向和全局打分，不能视作零开销。四题验证结果与局限见 [实验记录](benchmarks/ninfer-global-query-20261114.json)。
+
+4090 同四题均分：全层逐层 Mean-K 68.75、前层累积 attention 43.75、前层全局 Mean-K 43.75。新方案未提高这四题的得分。UUID 页全局排名第 2，前四层均选中 key 和 UUID 页，但模型生成重复文本并在最终答案前结束，官方得分仍为 0。额外单题对照保留相同探测、丢弃全局选页，恢复全部逐层 Mean-K；16 层选页及最终答案与基线相同，得分 100，支持将本题退化归于共享选页路径而非探测本身。这只是四道固定题的小样本实验，暂不替换默认策略；没有重跑完整 130 题。
 
 ## 资源与命令行
 
@@ -238,3 +260,53 @@ PR #305 的作者另在 Linux / CUDA 13.1、`NINFER_SM120_NATIVE=OFF` 的兼容�
 PRO6000 的两项全开版本另完成 16K、98K IQ3 输入的集成验证。后两次仅为功能验证，不作为增量性能的统计结论。
 原有 #305 的实验测试保留不变，两个环境变量仍默认关闭。
 [增量构建、数值与模型验证记录](benchmarks/ninfer-prefill-architecture-integration-20261114.json)
+
+## NInfer 的 age-adjusted prefill Pressure（实验开关）
+
+设置 `NINFER_LAYERWISE_PRESSURE_SCORER=lift` 后，普通 prefill Pressure 按
+`decayed attention mass / decayed expected attention` 给每层的驻留历史页打分。
+默认仍为 `attention`，使用原来的 `mass / exposure`。开关只作用于 NInfer 的
+Layerwise prefill Pressure；最终 Query 的 Mean-K 和 rolling decode Pressure 保留各自策略。
+
+每个请求、每个目标 attention 层独立累计 14 个距离桶的 attention 和可见样本对数。
+距离是采样行在原始文档中的位置减去逻辑页末尾，页末尾按实际 `block_tokens`
+计算（NInfer 当前为 64）；窗口压缩后的物理坐标只判断可见性。
+桶边界为 32、64、128、…、131072 tokens，最后一桶容纳更远的历史。
+整个已接受 packet 先更新距离分布，再把每行的桶均值归一化为总和 1，累计 expected。
+重复物理片段分别贡献 mass/expected，exposure 仍按同一逻辑页、同一行去重。
+
+mass、exposure 和 expected 使用同一衰减；距离桶的累计分布不衰减。
+lift 默认半衰期 32768 tokens，attention 默认 8192。
+`NINFER_LAYERWISE_PREFILL_HALF_LIFE=<正有限数>` 可独立覆盖半衰期，供消融实验使用。
+从未获得 expected 的页按最高 lift 加 1 排序；没有正 lift 时保留原评分回退。
+sink、必选页、预算、只从当前驻留候选中整理的约束都保留。
+
+expected、完整距离分布及评分模式一起进入 accepted snapshot、原生检查点、fork、
+来源标识和元数据计费。恢复时校验模式；退回早于统计边界的位置会同时清空这些统计，
+避免混入未来信息。未接受或校验失败的 packet 不发布任何一层的新统计。
+rolling decode 的输出分数和 prefill fallback 继续使用原来的 ratio。
+
+可与 `NINFER_LAYERWISE_GLOBAL_QUERY=1` 组合：prefill 使用 lift，最终 Query 的
+3/7/11/15 层共享全局 Mean-K，19–63 层继续逐层 Mean-K。
+这些环境变量在启动服务前设置；同一服务的多个请求仍各自维护独立统计。
+该移植不新增 CUDA kernel，沿用已有 Ada/SM120 attention mass 采集路径。
+
+数值校验包含独立 long-double 参考实现、32/64-token 页、距离桶边界及大坐标、
+压缩前后坐标等价、重复片段、检查点恢复/回退，以及关闭 lift 后原统计逐位一致。
+原生测试另外用独立 FP64 attention 检查 expected，并通过真实 Program 检查点恢复
+验证统计完整性。GPU 正确性及小规模 RULER 结果以实际运行报告为准，不能由编译通过推断。
+
+与 kvmem-vllm 冻结实验 `runtime-step8-combined` 的 CPU 对照在相同 32-token
+输入和 32768 半衰期下，384 个 packet、27,904 个键的 mass、exposure、lift score
+逐位相同；由 vLLM 原生分数导出的 384 组 Top-K 与 NInfer 的实际 picker 一致。
+该对照使用合成 attention 数据，不等于两个推理后端端到端输出一致。实际 NInfer
+服务仍按 64-token 整页累计、计算 Mean-K 和选页，vLLM 实验副本按 32-token 页；
+分页本身会改变距离桶、softmax 域和可保留内容。vLLM 还需要显式把半衰期设置为 32768。
+
+vLLM 实验副本的 `from_values`、普通序列化恢复和 values-based GC 重建会丢弃
+lift 字段；快速 `StateRows` 对象共享路径可以保留，但旧的状态相等/行序列标识
+没有包含 expected/profile。NInfer 的检查点和身份校验已经纳入这些字段。
+
+本次移植的构建、数值与检查点验证，以及 4090 上的准确率测试结果见[实验记录](benchmarks/ninfer-lift-pressure-20261115.json)。
+
+本次提交基于最新主干重新集成，保留已有历史所有权和多架构修复。67 个后端补丁校验、4 项核心测试、2 项原生 CPU 测试和 97 个 SM120 主机编译单元检查通过。上述 4090 测量来自集成前的已记录实验树；本提交尚未重测 GPU 或吞吐，不能将旧测量视为这个提交的实测结果。[主干集成验证](benchmarks/ninfer-combined-pr-integration-20261115.json)

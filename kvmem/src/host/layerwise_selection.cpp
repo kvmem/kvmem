@@ -1,6 +1,8 @@
 #include "kvmem/layerwise_selection.hpp"
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/layerwise_options.hpp"
+#include "kvmem/layerwise_pressure.hpp"
+#include "kvmem/graph_recall.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -130,6 +132,55 @@ void pick_selection(const KvMemStore& policy, LayerwiseHistorySelection& result)
     result.charged_tokens = uint64_t(result.selected.size()) * policy.config().block_tokens;
 }
 } // namespace
+
+LayerwiseHistorySelection select_layerwise_prefill_history(const KvMemStore& policy,
+    const RawKvStore& keys, uint32_t layer, const MemorySnapshot& memory,
+    const LayerwisePrefillState& history, const std::vector<uint32_t>& mandatory) {
+    auto result = prepare_selection(policy,keys,layer,mandatory);
+    const auto count = policy.block_count(), block = policy.config().block_tokens;
+    if (memory.stamp.frontier!=policy.total_tokens() || history.end>memory.stamp.frontier ||
+        memory.blocks.size()!=count || layer>=keys.config().n_layer)
+        throw MemoryError(MemoryErrorCode::Stale,"hybrid Query prefill source differs from accepted history");
+    for (size_t i=0;i<history.values.size();++i) {
+        const auto& v=history.values[i];
+        if (v.original_start%block || v.original_start>=memory.stamp.frontier ||
+            (i && history.values[i-1].original_start>=v.original_start) ||
+            !std::isfinite(v.mass) || !std::isfinite(v.exposure) || v.mass<0 || v.exposure<0)
+            throw MemoryError(MemoryErrorCode::InvalidPlan,"invalid hybrid Query prefill attention state");
+    }
+    auto resident=memory.resident;std::sort(resident.begin(),resident.end());
+    std::vector<uint32_t> candidates;
+    std::vector<double> scores;
+    result.scores.assign(count,0.);
+    result.frame.score_mask.assign(count,0);
+    result.frame.transport_mask.assign(count,0);
+    bool positive=false;
+    for (uint32_t i=0;i<count;++i) {
+        const auto& b=memory.blocks[i].block;
+        if (b.original_start!=result.frame.starts[i] || b.valid_tokens!=block)
+            throw MemoryError(MemoryErrorCode::InvalidPlan,"hybrid Query lost canonical page geometry");
+        if (!std::binary_search(resident.begin(),resident.end(),b.id)) continue;
+        const auto found=std::lower_bound(history.values.begin(),history.values.end(),b.original_start,
+            [](const auto& value,uint64_t start){return value.original_start<start;});
+        const auto score=found!=history.values.end() && found->original_start==b.original_start && found->exposure>0
+            ? found->mass/found->exposure : 0.;
+        if (!std::isfinite(score)) throw MemoryError(MemoryErrorCode::InvalidPlan,"nonfinite hybrid Query score");
+        candidates.push_back(i);scores.push_back(score);result.scores[i]=score;positive|=score>0;
+        result.frame.score_mask[i]=result.frame.transport_mask[i]=1;
+    }
+    for (auto id:result.fixed) if (!std::binary_search(candidates.begin(),candidates.end(),id))
+        throw MemoryError(MemoryErrorCode::Stale,"hybrid Query fixed page is outside its resident lineage");
+    const auto keep=std::min(count,policy.budget_blocks());
+    if (candidates.size()<keep)
+        throw MemoryError(MemoryErrorCode::BudgetExceeded,"hybrid Query cannot fill its history budget from resident pages");
+    if (keep && !positive)
+        throw MemoryError(MemoryErrorCode::Pending,"hybrid Query lacks positive accepted prefill attention");
+    for (auto id:result.fixed) result.frame.transport_mask[id]=0;
+    if (keep) result.selected=pressure_selection(candidates,scores,result.fixed,keep);
+    for (auto id:result.selected) result.historical_tokens+=policy.blocks()[id].n_tokens;
+    result.charged_tokens=uint64_t(result.selected.size())*block;
+    return result;
+}
 
 LayerwiseHistorySelection select_layerwise_history(const KvMemStore& policy,
     const RawKvStore& keys, CurrentLayerQuery query,

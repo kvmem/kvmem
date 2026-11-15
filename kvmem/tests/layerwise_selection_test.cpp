@@ -1,5 +1,6 @@
 #include "kvmem/layerwise_selection.hpp"
 #include "kvmem/raw_kv_store.hpp"
+#include "kvmem/layerwise_pressure.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +33,50 @@ void populate(kvmem::RawKvStore& keys, uint32_t blocks) {
         keys.write_layer_mean_sum(id*4,4,1,sum);
     }
 }
+
+void accepted_prefill_resident_ranking() {
+    kvmem::KvMemStore policy(config(3,1)); policy.register_append(24);
+    kvmem::RawKvStore keys({2,1,0,4}); populate(keys,6);
+    kvmem::MemorySnapshot memory;
+    memory.stamp={true,{42,3},5,6,24,9};
+    for (uint32_t i=0;i<6;++i)
+        memory.blocks.push_back({{{42,3},100+10*i,uint64_t(i)*4,4,i+1,2},2});
+    memory.resident={100,110,130,140};
+    kvmem::LayerwisePrefillState state{7,{
+        {0,0.,1.},{4,8.,8.},{8,1e9,1.},{12,6.,2.},{16,6.,2.},{20,2e9,1.}},24,4,1};
+    const auto selected=kvmem::select_layerwise_prefill_history(policy,keys,1,memory,state);
+    // Independent ratio oracle: resident scores are [0,1,3,3]. Sink 0 is
+    // reserved; two stale cold scores must not resurrect the dropped pages.
+    require(selected.selected==std::vector<uint32_t>({0,3,4}),"prefill ratio/resident ranking differs");
+    require(selected.scores==std::vector<double>({0,1,0,3,3,0}),"prefill score normalization differs");
+    require(selected.historical_tokens==12 && selected.charged_tokens==12,"prefill page accounting differs");
+    require(selected.frame.score_mask==std::vector<uint8_t>({1,1,0,1,1,0}) &&
+            selected.frame.transport_mask==std::vector<uint8_t>({0,1,0,1,1,0}),"prefill candidate masks differ");
+    kvmem::KvMemStore tied(config(2,1));tied.register_append(24);
+    require(kvmem::select_layerwise_prefill_history(tied,keys,1,memory,state).selected==
+        std::vector<uint32_t>({0,4}),"prefill equal scores must keep the newer resident page");
+    require(kvmem::select_layerwise_prefill_history(policy,keys,1,memory,state,{1}).selected==
+        std::vector<uint32_t>({0,1,4}),"prefill explicit resident reservation was ignored");
+    rejects([&]{kvmem::select_layerwise_prefill_history(policy,keys,1,memory,state,{2});});
+    auto short_window=memory;short_window.resident={100,110};
+    rejects([&]{kvmem::select_layerwise_prefill_history(policy,keys,1,short_window,state);});
+    for (int failure=0;failure<5;++failure) {
+        auto bad=state;
+        if (failure==0) for (auto& v:bad.values) v.mass=0;
+        if (failure==1) bad.values[1].exposure=-1;
+        if (failure==2) bad.values[1].mass=INFINITY;
+        if (failure==3) bad.values[1].original_start=0;
+        if (failure==4) ++bad.end;
+        rejects([&]{kvmem::select_layerwise_prefill_history(policy,keys,1,memory,bad);});
+    }
+    // No Query math is used: changing valid Mean-K record granularity cannot
+    // change the accepted 4-token transport-page ranking.
+    kvmem::RawKvStore halves({2,1,0,2});
+    for (uint32_t i=0;i<12;++i) {const float mean=float(i);halves.write_layer_mean_sum(i*2,2,1,&mean);}
+    require(kvmem::select_layerwise_prefill_history(policy,halves,1,memory,state).selected==selected.selected,
+        "prefill source depended on Mean-K granularity");
+}
+
 void fixed_masks_and_current_query() {
     kvmem::KvMemStore policy(config(4,1,1)); policy.register_append(24);
     policy.set_retrieval_scores({100,80,60,40,20,0});
@@ -329,6 +374,7 @@ void tiled_bounds_geometry_and_owner() {
 
 int main() {
     try {
+        accepted_prefill_resident_ranking();
         fixed_masks_and_current_query();
         upstream_newer_first_ties();
         half_page_softmax_preserves_short_evidence();
