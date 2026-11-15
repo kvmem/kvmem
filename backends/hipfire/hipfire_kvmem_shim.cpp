@@ -21,6 +21,7 @@
 #include <kvmem/checkpoint_policy.hpp>
 #include <kvmem/cache_owner.hpp>
 #include <kvmem/content_cache.hpp>
+#include <kvmem/speculative.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -3293,4 +3294,47 @@ extern "C" int hk_content_group_publication(const hk_content_slot * slots, size_
         set_error("hk_content_group_publication: unknown C++ exception");
         return HK_ERR;
     }
+}
+
+// ── Speculative contract (kvmem include/kvmem/speculative.hpp) ────────────
+namespace {
+kvmem::SpeculativeStatistics to_spec_statistics(const hk_speculative_statistics & s) {
+    kvmem::SpeculativeStatistics v;
+    v.requests = s.requests;
+    v.rounds = s.rounds;
+    v.drafted_tokens = s.drafted_tokens;
+    v.accepted_tokens = s.accepted_tokens;
+    v.generated_tokens = s.generated_tokens;
+    v.fallback_steps = s.fallback_steps;
+    return v;
+}
+void from_spec_statistics(const kvmem::SpeculativeStatistics & v, hk_speculative_statistics * s) {
+    s->requests = v.requests;
+    s->rounds = v.rounds;
+    s->drafted_tokens = v.drafted_tokens;
+    s->accepted_tokens = v.accepted_tokens;
+    s->generated_tokens = v.generated_tokens;
+    s->fallback_steps = v.fallback_steps;
+}
+} // namespace
+
+uint32_t hk_speculative_schema_version(void) {
+    // speculative.hpp serializes `"schema_version": 1`.
+    return 1u;
+}
+
+const char * hk_speculative_algorithm_name(uint32_t algorithm) {
+    return kvmem::speculative_name(static_cast<kvmem::SpeculativeAlgorithm>(algorithm));
+}
+
+void hk_speculative_statistics_reset(hk_speculative_statistics * out) {
+    if (out) *out = hk_speculative_statistics{};
+}
+
+void hk_speculative_statistics_add(hk_speculative_statistics * dst,
+                                   const hk_speculative_statistics * src) {
+    if (!dst || !src) return;
+    auto acc = to_spec_statistics(*dst);
+    acc.add(to_spec_statistics(*src));
+    from_spec_statistics(acc, dst);
 }
