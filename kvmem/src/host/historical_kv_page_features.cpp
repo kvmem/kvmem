@@ -46,16 +46,17 @@ void HistoricalKvPageFeatures::publish_output_attention(uint32_t page, double ma
     if (page >= pages_.size() || !std::isfinite(mass) || mass < 0)
         throw std::invalid_argument("invalid historical output attention mass");
     std::lock_guard<std::mutex> lock(mu_);
-    if (page >= question_scores_.size() && !std::isfinite(output_peaks_[page]))
+    // Attention-only readers need this first observation even with a Query score.
+    if (!std::isfinite(output_peaks_[page]))
         observation_revision_.fetch_add(1, std::memory_order_release);
     output_peaks_[page] = std::max(output_peaks_[page], mass);
 }
 
-bool HistoricalKvPageFeatures::any_observed(const std::vector<uint32_t>& pages) const {
+bool HistoricalKvPageFeatures::any_observed(const std::vector<uint32_t>& pages, bool attention_only) const {
     std::lock_guard<std::mutex> lock(mu_);
     for (const auto id : pages)
         if (id < pages_.size() && pages_[id].size() == dimensions_ &&
-            (id < question_scores_.size() || std::isfinite(output_peaks_[id]))) return true;
+            ((!attention_only && id < question_scores_.size()) || std::isfinite(output_peaks_[id]))) return true;
     return false;
 }
 
@@ -82,6 +83,7 @@ void HistoricalKvPageFeatures::truncate_to(uint64_t token_frontier, uint32_t pag
 bool HistoricalKvPageFeatures::begin_round(uint64_t) {
     std::lock_guard<std::mutex> lock(mu_);
     frozen_importance_ = output_peaks_;
+    frozen_attention_ = output_peaks_;
     for (size_t id = 0; id < std::min(question_scores_.size(), frozen_importance_.size()); ++id)
         frozen_importance_[id] = std::max(frozen_importance_[id], question_scores_[id]);
     return true;
@@ -99,14 +101,15 @@ bool HistoricalKvPageFeatures::read(const HistoricalKvBlockMeta & meta,
 }
 
 bool HistoricalKvPageFeatures::read_observed(const HistoricalKvBlockMeta & meta,
-                                            float * descriptor, double & importance) {
+                                            float * descriptor, double & importance, bool attention_only) {
     if (!descriptor || meta.logical_id >= pages_.size()) return false;
     std::lock_guard<std::mutex> lock(mu_);
     const auto page = static_cast<size_t>(meta.logical_id);
-    if (pages_[page].size() != dimensions_ || page >= frozen_importance_.size() ||
-        !std::isfinite(frozen_importance_[page])) return false;
+    const auto& observed = attention_only ? frozen_attention_ : frozen_importance_;
+    if (pages_[page].size() != dimensions_ || page >= observed.size() ||
+        !std::isfinite(observed[page])) return false;
     std::copy(pages_[page].begin(), pages_[page].end(), descriptor);
-    importance = frozen_importance_[page];
+    importance = observed[page];
     return true;
 }
 

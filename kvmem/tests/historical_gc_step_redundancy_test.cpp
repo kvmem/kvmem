@@ -16,11 +16,13 @@ struct Fixture {
     HistoricalKvSnapshot snapshot{1,7,{}};
     size_t mark() { return evidence->commit_selection_boundary(std::vector<uint8_t>(16)); }
     Fixture(uint32_t sources=4,uint32_t witnesses=1,bool charge=true,uint32_t max_steps=64,
-            std::vector<uint8_t> witness_masks={}, bool observe=false) {
+            std::vector<uint8_t> witness_masks={}, bool observe=false, bool relaxed=false) {
         HistoricalKvStepEvidence::Config cfg;
         cfg.feature_gate=true;cfg.min_observations=1;cfg.min_cold_observations=0;cfg.max_importance=1;
         cfg.charge_result_pages=charge;
         cfg.observe_only=observe;
+        cfg.relaxed_attention_redundancy=relaxed;
+        if (relaxed) cfg.similarity=.85;
         cfg.max_steps=max_steps;
         evidence=std::make_shared<HistoricalKvStepEvidence>(16,64,cfg);
         evidence->publish({{"owned","thinking",0,sources*64,8*64,(8+witnesses)*64,1,1,false,true,
@@ -35,6 +37,43 @@ struct Fixture {
         features->publish_question_scores(std::vector<double>(16,.5));
     }
 };
+static void relaxed_attention_contract() {
+    Fixture f(4,1,false,64,{0,0,0,0},false,true);
+    f.features->truncate_to(512,64);
+    f.features->publish_page(8,{.86f,float(std::sqrt(1-.86*.86))});
+    auto query=std::vector<double>(16,.01);query[0]=.99;
+    f.features->publish_question_scores(query);
+    f.evidence->evaluate(f.features,f.snapshot);
+    check(f.mark()==0); // Query similarity is not a substitute for attention.
+    const auto revision=f.features->observation_revision();
+    for (uint32_t id=0;id<4;++id) f.features->publish_output_attention(id,id==1?.8:.2);
+    f.features->publish_output_attention(8,.3);
+    check(f.features->observation_revision()>revision);
+    f.evidence->evaluate(f.features,f.snapshot); // Newly observed attention retries this scope.
+    auto pins=std::vector<uint8_t>(16);pins[2]=2;
+    check(f.evidence->commit_selection_boundary(pins)==2);
+    check(f.evidence->selection_excluded(0) && f.evidence->selection_excluded(3));
+    check(!f.evidence->selection_excluded(1)); // More important source remains.
+    check(!f.evidence->selection_excluded(2)); // Reader/safety protection still wins.
+    double importance=0;float key[2];
+    check(f.features->read_observed(f.snapshot.blocks[0],key,importance,true) && importance==.2);
+    check(f.features->read_observed(f.snapshot.blocks[0],key,importance) && importance==.99);
+
+    for (const auto similarity : {.84,.86}) {
+        Fixture g(4,1,false,64,{0,0,0,0},false,true);
+        g.features->truncate_to(512,64);
+        g.features->publish_page(8,{float(similarity),float(std::sqrt(1-similarity*similarity))});
+        for (uint32_t id=0;id<4;++id) g.features->publish_output_attention(id,0);
+        g.features->publish_output_attention(8,0); // Measured zero differs from missing.
+        g.evidence->evaluate(g.features,g.snapshot);
+        check(g.mark()==(similarity>.85?4:0));
+    }
+    Fixture stale(4,1,false,64,{0,0,0,0},false,true);
+    for (uint32_t id=0;id<9;++id) stale.features->publish_output_attention(id,.3);
+    stale.evidence->evaluate(stale.features,stale.snapshot);
+    stale.features->clear_question();
+    check(stale.mark()==0);
+}
 static void literal_witness_contract() {
     // Digits 11 and 12 form one run across the source page seam. The first
     // result repeats the value with another label. The second repeats context.
@@ -347,6 +386,7 @@ static void marked_page_outlives_active_view() {
 }
 int main() {
     try {
+        relaxed_attention_contract();
         literal_witness_contract();
         duplicate_feedback_contract();
         selection_witness_lifetime();

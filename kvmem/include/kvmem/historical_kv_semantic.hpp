@@ -30,6 +30,9 @@ public:
         // In this mode application spans are scopes, never deletion approvals.
         bool feature_gate = false;
         double similarity = 0.9;
+        // Experimental content decision: actual output attention and Mean-K
+        // similarity only. Literal masks do not veto; native lifetime guards stay.
+        bool relaxed_attention_redundancy = false;
         uint32_t max_source_pages = historical_kv_max_source_pages;
         uint32_t max_result_pages = historical_kv_max_witness_pages;
         bool charge_result_pages = true;
