@@ -1,0 +1,272 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 8640656a9..3087678c9 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -1317,12 +1317,17 @@ impl KvMemCtl {
+         output_tokens: u64,
+         frontier: u32,
+     ) -> Result<ImportStart, String> {
++        // ninfer `state.visible_tokens` is the native extent at request start;
++        // hipfire's Layerwise driver materializes a compact view of at most the
++        // resident budget B, while the logical history may be longer.
++        let visible = (frontier as u64).min((self.budget_blocks as u64) * KV_BLOCK_TOKENS as u64);
+         layerwise_import_admission(
+             prompt_end,
+             output_tokens,
+             self.window_capacity_tokens(),
+             self.gen_reserve,
+             frontier,
++            visible,
+         )
+     }
+ 
+@@ -1499,6 +1504,20 @@ impl KvMemCtl {
+         hit
+     }
+ 
++    /// Look up the longest cataloged prefix fully proven by `prompt` whose
++    /// frontier is at most `max_frontier` (import narrowing fallback).
++    pub fn prefix_lookup_capped(&mut self, prompt: &[u32], max_frontier: u32) -> Option<u64> {
++        let hit = self
++            .prefix_catalog
++            .lookup_at_most(prompt, layout_fingerprint(&self.raw_cfg), max_frontier);
++        if hit.is_some() {
++            self.prefix_hits_total += 1;
++        } else {
++            self.prefix_misses_total += 1;
++        }
++        hit
++    }
++
+     /// Read a cataloged checkpoint (engine attaches GPU pages / reads the
+     /// frontier + mean_tail for the DeltaNet restore pairing).
+     pub fn prefix_checkpoint(&self, id: u64) -> Option<&PrefixCheckpoint> {
+@@ -3545,6 +3564,7 @@ pub fn layerwise_import_admission(
+     capacity_tokens: u64,
+     gen_reserve: u64,
+     frontier: u32,
++    visible_tokens: u64,
+ ) -> Result<ImportStart, String> {
+     let envelope = WindowEnvelope {
+         prompt_end,
+@@ -3562,7 +3582,7 @@ pub fn layerwise_import_admission(
+     };
+     let plan = WindowPlan::new(&envelope, capacity_tokens)
+         .map_err(|e| format!("kvmem import window: {e}"))?;
+-    plan.import_plan(WindowState { history: frontier as u64, visible_tokens: frontier as u64 })
++    plan.import_plan(WindowState { history: frontier as u64, visible_tokens })
+         .map_err(|e| format!("kvmem import plan: {e}"))
+ }
+ 
+@@ -5248,24 +5268,25 @@ mod tests {
+     #[test]
+     fn import_admission_maps_ninfer_window_semantics() {
+         // Non-pressure: the exact prefix starts inside the window.
+-        let ok = layerwise_import_admission(1024, 64, 4096 + 1024, 1024, 1024).expect("import");
++        let ok = layerwise_import_admission(1024, 64, 4096 + 1024, 1024, 1024, 1024).expect("import");
+         assert!(!ok.pressure());
+         assert_eq!(ok.budget_tokens, 4096);
+         assert_eq!(ok.restore_tokens, 1024);
+         assert_eq!(ok.selection_budget, 0, "exact import keeps ordinary selection");
+ 
+-        // Prefill-probe overflow: visible extent exceeds the prefill boundary.
+-        let probe = layerwise_import_admission(4096, 64, 1024 + 1024, 1024, 2048).expect("import");
++        // Prefill-probe overflow: a small generation reserve puts the prefill
++        // boundary below the compact visible extent.
++        let probe = layerwise_import_admission(4096, 64, 1024 + 128, 128, 2048, 1024).expect("import");
+         assert!(probe.prefill_probe_overflow, "{probe:?}");
+         assert!(probe.pressure());
+         assert_eq!(probe.budget_tokens, 1024);
+         assert_eq!(probe.restore_tokens, 1024, "narrows the imported extent");
+ 
+         // Terminal reserve overflow also narrows the exact prefix.
+-        let term = layerwise_import_admission(2048, 512, 1024 + 1024, 1024, 2048).expect("import");
++        let term = layerwise_import_admission(2048, 512, 1024 + 128, 128, 2048, 1024).expect("import");
+         assert!(term.terminal_reserve_overflow, "{term:?}");
+-        assert_eq!(term.budget_tokens, 1024);
+-        assert_eq!(term.restore_tokens, 1024);
++        assert_eq!(term.budget_tokens, 512);
++        assert_eq!(term.restore_tokens, 512);
+         assert!(term.restore_tokens < 2048, "this is the narrowing case");
+     }
+ 
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index 24427cbe3..fe129d9d2 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -295,6 +295,35 @@ impl PrefixCatalog {
+         }
+     }
+ 
++    /// Look up the LONGEST frozen prefix fully proven by `prompt` whose
++    /// frontier does not exceed `max_frontier`. Import narrowing uses this to
++    /// fall back to an earlier coverage checkpoint when the longest one cannot
++    /// start inside the layerwise window. Touches the winner (LRU).
++    pub fn lookup_at_most(&mut self, prompt: &[u32], dst_layout: u64, max_frontier: u32) -> Option<u64> {
++        let mut best: Option<(u64, u32)> = None;
++        for e in &self.entries {
++            if e.layout_id != dst_layout || e.frontier > max_frontier || e.frontier as usize > prompt.len() {
++                continue;
++            }
++            let f = e.frontier as usize;
++            if prefix_fingerprint(&prompt[..f]) != e.fingerprint {
++                continue;
++            }
++            if prompt[..f] != e.prefix_tokens[..] {
++                continue;
++            }
++            if best.map(|(_, bf)| e.frontier > bf).unwrap_or(true) {
++                best = Some((e.id, e.frontier));
++            }
++        }
++        if let Some((id, _)) = best {
++            self.touch(id);
++            Some(id)
++        } else {
++            None
++        }
++    }
++
+     pub fn get(&self, id: u64) -> Option<&PrefixCheckpoint> {
+         self.entries.iter().find(|e| e.id == id)
+     }
+@@ -496,6 +525,27 @@ mod tests {
+         assert_eq!(cat.lookup(&toks, layout ^ 1), None);
+     }
+ 
++    #[test]
++    fn catalog_lookup_at_most_caps_the_frontier() {
++        let st = storage();
++        let toks = tokens(512);
++        let mut cat = PrefixCatalog::new(4);
++        let short = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
++        let long = checkpoint(&st, cat.mint_id(), 384, &toks[..384]);
++        cat.insert(short).expect("insert short");
++        cat.insert(long).expect("insert long");
++        let layout = layout_fingerprint(&raw_config());
++        assert_eq!(cat.lookup_at_most(&toks, layout, 384), Some(2));
++        assert_eq!(cat.lookup_at_most(&toks, layout, 383), Some(1));
++        assert_eq!(cat.lookup_at_most(&toks, layout, 128), Some(1));
++        assert_eq!(cat.lookup_at_most(&toks, layout, 127), None);
++        // The full token proof still gates the capped lookup.
++        let mut bad = toks.clone();
++        bad[10] ^= 1;
++        assert_eq!(cat.lookup_at_most(&bad, layout, 512), None);
++        assert_eq!(cat.lookup_at_most(&toks, layout ^ 1, 512), None);
++    }
++
+     #[test]
+     fn catalog_lru_eviction_returns_displaced() {
+         let st = storage();
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 343ddbf20..9bf089278 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -8748,38 +8748,82 @@ fn admit(
+                     .ok_or_else(|| "kvmem reuse: no controller".to_string())?;
+                 // 1. Host fork: validates the FULL provenance (geometry +
+                 // fingerprint + token proof) before any mutation.
+-                let frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
+-                // 1b. P2.2a fenced-import admission (ninfer `prepare_import_start`):
+-                // the restored exact prefix is measured against the layerwise
+-                // window capacity B+R. A pressure import arms a one-shot
+-                // selection budget for the first Layerwise step. Narrowing the
+-                // prefix would need a DeltaNet checkpoint at the narrowed
+-                // frontier, which P4.3 does not capture — fail closed to cold.
++                let mut frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
++                let mut reuse_id = ckpt_id;
++                // 1b. P2.2a/P2.2b fenced-import admission (ninfer
++                // `prepare_import_start`): the restored exact prefix is measured
++                // against the layerwise window capacity B+R. A pressure import
++                // arms a one-shot selection budget for the first Layerwise step.
++                // When the FULL checkpoint would have to narrow, fall back to the
++                // longest coverage checkpoint at or below the narrowed extent
++                // (its DeltaNet state exists at its own page-aligned frontier);
++                // no such checkpoint closes the reuse to cold.
+                 if ctl.strategy().is_layerwise() {
+-                    let start = ctl
+-                        .import_window(
+-                            req.prompt_tokens.len() as u64,
+-                            req.max_tokens as u64,
+-                            frontier,
+-                        )
+-                        .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
+-                    if start.pressure() {
++                    let admission = (|| -> Result<Option<u32>, String> {
++                        let start = ctl
++                            .import_window(
++                                req.prompt_tokens.len() as u64,
++                                req.max_tokens as u64,
++                                frontier,
++                            )
++                            .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
++                        if !start.pressure() {
++                            return Ok(None);
++                        }
+                         if start.restore_tokens < frontier as u64 {
+-                            return Err(format!(
+-                                "kvmem reuse: import pressure narrows {} -> {} tokens                                  without a narrowed DeltaNet checkpoint",
+-                                frontier, start.restore_tokens
+-                            ));
++                            let cap = start.restore_tokens as u32;
++                            let shorter = ctl.prefix_lookup_capped(&req.prompt_tokens, cap);
++                            let Some(sid) = shorter.filter(|&sid| sid != reuse_id) else {
++                                return Err(format!(
++                                    "kvmem reuse: import pressure narrows {} -> {} tokens \
++                                     and no coverage checkpoint fits",
++                                    frontier, start.restore_tokens
++                                ));
++                            };
++                            frontier = ctl.fork_prefix_into(slot.0, sid, &req.prompt_tokens)?;
++                            reuse_id = sid;
++                            let retry = ctl
++                                .import_window(
++                                    req.prompt_tokens.len() as u64,
++                                    req.max_tokens as u64,
++                                    frontier,
++                                )
++                                .map_err(|e| format!("kvmem reuse: import retry: {e}"))?;
++                            if retry.pressure() {
++                                if retry.restore_tokens < frontier as u64 {
++                                    return Err(format!(
++                                        "kvmem reuse: coverage checkpoint {} narrows {} -> {} tokens",
++                                        reuse_id, frontier, retry.restore_tokens
++                                    ));
++                                }
++                                let blocks = (retry.selection_budget
++                                    / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
++                                    as u32;
++                                return Ok(Some(blocks));
++                            }
++                            return Ok(None);
+                         }
+-                        ctl.set_layerwise_import_blocks(
+-                            slot.0,
++                        let blocks =
+                             (start.selection_budget / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
+-                                as u32,
+-                        )
+-                        .map_err(|e| format!("kvmem reuse: import budget: {e}"))?;
++                                as u32;
++                        Ok(Some(blocks))
++                    })();
++                    match admission {
++                        Ok(Some(blocks)) => ctl
++                            .set_layerwise_import_blocks(slot.0, blocks)
++                            .map_err(|e| format!("kvmem reuse: import budget: {e}"))?,
++                        Ok(None) => {}
++                        Err(e) => {
++                            // The fork already reset this slot to the checkpoint
++                            // prefix; a refused admission must hand it back cold.
++                            let _ = ctl.reset_slot(slot.0);
++                            let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
++                            return Err(e);
++                        }
+                     }
+                 }
+                 let gpu_pages = ctl
+-                    .prefix_checkpoint(ckpt_id)
++                    .prefix_checkpoint(reuse_id)
+                     .map(|c| c.gpu_pages.clone())
+                     .unwrap_or_default();
+                 // 2. DeltaNet restore (fail-closed pairing, spec §5.4 S4):
