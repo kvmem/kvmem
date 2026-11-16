@@ -163,6 +163,12 @@ size_t hk_kv_snapshot_span_count(const hk_kv_snapshot * snap);
 int hk_kv_snapshot_ready(const hk_kv_snapshot * snap);
 uint64_t hk_kv_snapshot_missing_bytes(const hk_kv_snapshot * snap);
 size_t hk_kv_snapshot_metadata_bytes(const hk_kv_snapshot * snap);
+// This snapshot's private manifest bytes (capacity of the owned vectors; the
+// per-origin `SealedKvBlock` charge is separate so shared origins can be
+// accounted once across snapshots).
+size_t hk_kv_snapshot_manifest_bytes(const hk_kv_snapshot * snap);
+// Bytes charged per distinct snapshot origin (`sizeof(SealedKvBlock)`).
+size_t hk_kv_snapshot_origin_charge_bytes(void);
 // 1 when the image holds exactly one ready k+v record pair per (block, layer)
 // in block-major order for a `blocks`×`layers` grid.
 int hk_kv_snapshot_covers_packed(const hk_kv_snapshot * snap, uint32_t blocks, uint32_t layers);
