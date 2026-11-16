@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <new>
 #include <optional>
@@ -545,6 +546,226 @@ extern "C" int hk_raw_store_copy_prefix_to(hk_raw_store * dst, hk_raw_store * sr
         set_error(e.what());
     } catch (...) {
         set_error("hk_raw_store_copy_prefix_to: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+// ── Persistent prefix packs (期3 G3 P1.1) ──────────────────────────────────
+namespace {
+constexpr uint32_t HK_PACK_MAGIC = 0x50564b48u; // "HKVP"
+constexpr uint32_t HK_PACK_VERSION = 1u;
+struct PackHeader {
+    uint32_t magic = 0, version = 0;
+    uint64_t meta_len = 0;
+    uint32_t n_layer = 0, block_tokens = 0, n_embd_k = 0, n_embd_v = 0;
+    uint64_t k_row = 0, v_row = 0;
+    uint32_t blocks = 0;
+};
+template <class T> void pack_put(std::ofstream & f, const T & v) {
+    f.write(reinterpret_cast<const char *>(&v), sizeof(v));
+}
+template <class T> bool pack_get(std::ifstream & f, T & v) {
+    f.read(reinterpret_cast<char *>(&v), sizeof(v));
+    return bool(f);
+}
+bool pack_read_header(std::ifstream & f, PackHeader & h, std::vector<uint32_t> & n_tokens) {
+    if (!pack_get(f, h.magic) || !pack_get(f, h.version) || !pack_get(f, h.meta_len) ||
+        !pack_get(f, h.n_layer) || !pack_get(f, h.block_tokens) || !pack_get(f, h.n_embd_k) ||
+        !pack_get(f, h.n_embd_v) || !pack_get(f, h.k_row) || !pack_get(f, h.v_row) ||
+        !pack_get(f, h.blocks))
+        return false;
+    if (h.magic != HK_PACK_MAGIC || h.version != HK_PACK_VERSION || !h.blocks || !h.n_layer ||
+        !h.block_tokens)
+        return false;
+    n_tokens.resize(h.blocks);
+    for (auto & n : n_tokens)
+        if (!pack_get(f, n)) return false;
+    return true;
+}
+} // namespace
+
+extern "C" int hk_raw_store_write_prefix_pack(const hk_raw_store * st, uint32_t blocks,
+                                              const char * path, const uint8_t * meta,
+                                              size_t meta_len) {
+    clear_error();
+    if (!st || !st->impl || !path || !blocks || (!meta && meta_len)) {
+        set_error("hk_raw_store_write_prefix_pack: invalid arguments");
+        return HK_ERR;
+    }
+    std::string tmp;
+    try {
+        const auto & c = st->impl->config();
+        if (!c.k_gpu_row_bytes || !c.v_gpu_row_bytes) {
+            set_error("hk_raw_store_write_prefix_pack: store has no packed planes");
+            return HK_ERR;
+        }
+        tmp = std::string(path) + ".tmp";
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) throw std::runtime_error("cannot create pack file");
+        PackHeader h;
+        h.magic = HK_PACK_MAGIC; h.version = HK_PACK_VERSION; h.meta_len = meta_len;
+        h.n_layer = c.n_layer; h.block_tokens = c.block_tokens; h.n_embd_k = c.n_embd_k;
+        h.n_embd_v = c.n_embd_v; h.k_row = c.k_gpu_row_bytes; h.v_row = c.v_gpu_row_bytes;
+        h.blocks = blocks;
+        pack_put(f, h.magic); pack_put(f, h.version); pack_put(f, h.meta_len);
+        pack_put(f, h.n_layer); pack_put(f, h.block_tokens); pack_put(f, h.n_embd_k);
+        pack_put(f, h.n_embd_v); pack_put(f, h.k_row); pack_put(f, h.v_row); pack_put(f, h.blocks);
+        for (uint32_t b = 0; b < blocks; ++b) {
+            const uint32_t n = st->impl->n_tokens(b);
+            if (!n) throw std::runtime_error("empty source block");
+            pack_put(f, n);
+        }
+        if (meta_len) f.write(reinterpret_cast<const char *>(meta), std::streamsize(meta_len));
+        std::vector<uint8_t> k, v;
+        std::vector<float> sum(c.n_embd_k);
+        for (uint32_t b = 0; b < blocks; ++b) {
+            const uint32_t n = st->impl->n_tokens(b);
+            for (uint32_t l = 0; l < c.n_layer; ++l) {
+                if (!st->impl->has_k_gpu(b, l) || !st->impl->has_v_gpu(b, l))
+                    throw std::runtime_error("incomplete packed source");
+                uint8_t flags = 3; // K + V
+                const bool has_mean = st->impl->mean_sum(b, l, sum.data());
+                if (has_mean) flags |= 4;
+                pack_put(f, flags);
+                k.resize(size_t(n) * c.k_gpu_row_bytes);
+                v.resize(size_t(n) * c.v_gpu_row_bytes);
+                if (!st->impl->copy_k_gpu(b, l, k.data(), n) ||
+                    !st->impl->copy_v_gpu(b, l, v.data(), n))
+                    throw std::runtime_error("source read failed");
+                f.write(reinterpret_cast<const char *>(k.data()), std::streamsize(k.size()));
+                f.write(reinterpret_cast<const char *>(v.data()), std::streamsize(v.size()));
+                if (has_mean)
+                    f.write(reinterpret_cast<const char *>(sum.data()),
+                            std::streamsize(sum.size() * sizeof(float)));
+            }
+        }
+        f.flush();
+        if (!f) throw std::runtime_error("pack write failed");
+        f.close();
+        std::filesystem::rename(tmp, path);
+        return HK_OK;
+    } catch (const std::exception & e) {
+        if (!tmp.empty()) { std::error_code ec; std::filesystem::remove(tmp, ec); }
+        set_error(e.what());
+    } catch (...) {
+        if (!tmp.empty()) { std::error_code ec; std::filesystem::remove(tmp, ec); }
+        set_error("hk_raw_store_write_prefix_pack: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+extern "C" int hk_prefix_pack_info_read(const char * path, hk_prefix_pack_info * out) {
+    clear_error();
+    if (!path || !out) {
+        set_error("hk_prefix_pack_info_read: invalid arguments");
+        return HK_ERR;
+    }
+    try {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) throw std::runtime_error("cannot open pack file");
+        PackHeader h;
+        std::vector<uint32_t> n_tokens;
+        if (!pack_read_header(f, h, n_tokens)) throw std::runtime_error("invalid pack header");
+        out->n_layer = h.n_layer; out->block_tokens = h.block_tokens;
+        out->n_embd_k = h.n_embd_k; out->n_embd_v = h.n_embd_v;
+        out->blocks = h.blocks; out->k_row_bytes = h.k_row; out->v_row_bytes = h.v_row;
+        out->meta_bytes = h.meta_len;
+        out->file_bytes = std::filesystem::file_size(path);
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_prefix_pack_info_read: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+extern "C" int hk_prefix_pack_meta_read(const char * path, uint8_t * meta_out, size_t meta_cap,
+                                       size_t * meta_len) {
+    clear_error();
+    if (!path || !meta_len) {
+        set_error("hk_prefix_pack_meta_read: invalid arguments");
+        return HK_ERR;
+    }
+    try {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) throw std::runtime_error("cannot open pack file");
+        PackHeader h;
+        std::vector<uint32_t> n_tokens;
+        if (!pack_read_header(f, h, n_tokens)) throw std::runtime_error("invalid pack header");
+        *meta_len = size_t(h.meta_len);
+        if (meta_cap < h.meta_len || (!meta_out && h.meta_len)) {
+            set_error("hk_prefix_pack_meta_read: metadata capacity too small");
+            return HK_ERR_TRUNCATED;
+        }
+        if (h.meta_len) f.read(reinterpret_cast<char *>(meta_out), std::streamsize(h.meta_len));
+        if (!f) throw std::runtime_error("pack metadata read failed");
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_prefix_pack_meta_read: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+extern "C" int hk_raw_store_read_prefix_pack(hk_raw_store * st, const char * path,
+                                             uint8_t * meta_out, size_t meta_cap,
+                                             size_t * meta_len) {
+    clear_error();
+    if (!st || !st->impl || !path || !meta_len) {
+        set_error("hk_raw_store_read_prefix_pack: invalid arguments");
+        return HK_ERR;
+    }
+    try {
+        const auto & c = st->impl->config();
+        std::ifstream f(path, std::ios::binary);
+        if (!f) throw std::runtime_error("cannot open pack file");
+        PackHeader h;
+        std::vector<uint32_t> n_tokens;
+        if (!pack_read_header(f, h, n_tokens)) throw std::runtime_error("invalid pack header");
+        if (h.n_layer != c.n_layer || h.block_tokens != c.block_tokens ||
+            h.n_embd_k != c.n_embd_k || h.n_embd_v != c.n_embd_v ||
+            h.k_row != c.k_gpu_row_bytes || h.v_row != c.v_gpu_row_bytes) {
+            set_error("hk_raw_store_read_prefix_pack: geometry mismatch");
+            return HK_ERR;
+        }
+        *meta_len = size_t(h.meta_len);
+        if (meta_cap < h.meta_len || (!meta_out && h.meta_len)) {
+            set_error("hk_raw_store_read_prefix_pack: metadata capacity too small");
+            return HK_ERR_TRUNCATED;
+        }
+        if (h.meta_len) f.read(reinterpret_cast<char *>(meta_out), std::streamsize(h.meta_len));
+        if (!f) throw std::runtime_error("pack metadata read failed");
+        std::vector<uint8_t> k, v;
+        std::vector<float> sum(c.n_embd_k);
+        for (uint32_t b = 0; b < h.blocks; ++b) {
+            const uint32_t n = n_tokens[b];
+            if (!n) throw std::runtime_error("invalid block token count");
+            for (uint32_t l = 0; l < h.n_layer; ++l) {
+                uint8_t flags = 0;
+                if (!pack_get(f, flags) || (flags & 3) != 3)
+                    throw std::runtime_error("invalid pack record");
+                k.resize(size_t(n) * c.k_gpu_row_bytes);
+                v.resize(size_t(n) * c.v_gpu_row_bytes);
+                f.read(reinterpret_cast<char *>(k.data()), std::streamsize(k.size()));
+                f.read(reinterpret_cast<char *>(v.data()), std::streamsize(v.size()));
+                if (!f) throw std::runtime_error("pack payload read failed");
+                st->impl->write_layer_k_gpu(b * c.block_tokens, n, l, k.data());
+                st->impl->write_layer_v_gpu(b * c.block_tokens, n, l, v.data());
+                if (flags & 4) {
+                    f.read(reinterpret_cast<char *>(sum.data()),
+                           std::streamsize(sum.size() * sizeof(float)));
+                    if (!f) throw std::runtime_error("pack mean record read failed");
+                    st->impl->write_layer_mean_sum(b * c.block_tokens, n, l, sum.data());
+                }
+            }
+        }
+        return HK_OK;
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_raw_store_read_prefix_pack: unknown C++ exception");
     }
     return HK_ERR;
 }
