@@ -482,6 +482,11 @@ extern "C" uint64_t hk_kv_snapshot_missing_bytes(const hk_kv_snapshot * snap) {
 extern "C" size_t hk_kv_snapshot_metadata_bytes(const hk_kv_snapshot * snap) {
     return snap && snap->impl ? snap->impl->metadata_bytes() : 0;
 }
+extern "C" uint64_t hk_kv_snapshot_origin_id(const hk_kv_snapshot * snap, size_t block) {
+    if (!snap || !snap->impl || block >= snap->impl->blocks().size()) return 0;
+    return reinterpret_cast<uint64_t>(snap->impl->blocks()[block].get());
+}
+
 extern "C" int hk_kv_snapshot_covers_packed(const hk_kv_snapshot * snap, uint32_t blocks,
                                             uint32_t layers) {
     if (!snap || !snap->impl || !blocks || !layers) return 0;
