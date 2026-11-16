@@ -1,5 +1,8 @@
 #include "memory_test_support.hpp"
 #include "kvmem/layerwise_request.hpp"
+#include "kvmem/layerwise_pressure.hpp"
+#include "kvmem/layerwise_probe_selection.hpp"
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -363,6 +366,100 @@ void native_failure_boundaries() {
     }
 }
 
+
+void mixed_prefill_and_current_query() {
+    for (bool global:{false,true}) for (bool native_projection:{false,true}) for (uint32_t chunk:{1u,4u}) {
+        Fixture f;
+        LayerwisePrefillState accepted{2,{{0,1,1},{4,1000,1}},8,2,1};
+        HostKvStorage metadata(1u<<20);
+        std::optional<LayerwiseProbeHistorySelection> shared;
+        if (global) {
+            LayerwiseProbeSelection probe(f.policy,f.keys,f.identity,{{0,1,1,1,1.f},{1,1,1,1,1.f}},
+                [&]{return f.revision;},metadata);
+            const float negative[]{-1.f,-1.f};
+            for (uint32_t layer=0;layer<2;++layer) probe.append(f.identity,9,{negative,layer,2,1,1,1,1.f});
+            shared.emplace(probe.finish(f.identity));
+        } else f.specs[0].prefill=&accepted;
+        auto request=f.request();NativeReference native(f);
+        if (global) {
+            request->use_shared_history(f.identity,*shared,{2});
+            CHECK(request->uses_shared_history(2) && !request->uses_shared_history(7));
+        }
+        uint32_t score_calls=0;
+        for (size_t ordinal=0;ordinal<2;++ordinal) {
+            const uint32_t model=ordinal?7:2;
+            request->begin_layer(f.identity,model);
+            const auto q=native.projection(ordinal);
+            // Keeping negative V in layer 0 yields Q=4 at layer 1. Baseline
+            // restores positive V instead and yields Q=-2 (tested above).
+            CHECK(q[1]==(ordinal?4.f:1.f));
+            for (uint32_t first=0;first<evaluation_rows;first+=chunk) {
+                if (native_projection) {
+                    NativeCurrentLayerQuery tile{q.data()+first,chunk*sizeof(float),uint32_t(ordinal),chunk,1,1,1,1.f,
+                        NativeQueryScalar::Float32,sizeof(float),sizeof(float),sizeof(float)};
+                    request->projected_native(f.identity,8+first,tile,[&](const auto& keys,auto query,const auto& frame){
+                        ++score_calls;
+                        CHECK(ordinal==1); // the prefill layer must not invoke the Mean-K scorer
+                        return layerwise_mean_key_scores(keys,{static_cast<const float*>(query.data),query.layer,
+                            query.rows,query.query_heads,query.kv_heads,query.head_dim,query.attention_scale},frame);
+                    });
+                } else request->projected(f.identity,8+first,{q.data()+first,uint32_t(ordinal),chunk,1,1,1,1.f});
+            }
+            const auto& plan=request->prepare_restore(f.identity);
+            CHECK(request->selection().selected==std::vector<uint32_t>{uint32_t(ordinal)});
+            CHECK(plan.plan.next.blocks[0].block.id==(ordinal?200u:100u));
+            CHECK(plan.plan.restore.empty() && plan.restore_bytes==0);
+            if (!ordinal) {
+                if (global) CHECK(std::abs(request->selection().scores[0]-2./(1.+std::exp(-2.)))<1e-6);
+                else CHECK(request->selection().scores==std::vector<double>({1.,0.}));
+            } else {
+                const double expected=2./(1.+std::exp(-8.));
+                CHECK(std::abs(request->selection().scores[1]-expected)<1e-6);
+            }
+            auto& layer=native.layers[ordinal];layer.view=plan.plan.next;layer.fenced=true;
+            CHECK(layer.block==plan.plan.next.blocks[0].block.id); // actual bytes already resident
+            request->restored(f.identity,layer.view);
+            native.attention(ordinal,q,0,evaluation_rows);
+            request->attended(f.identity,8,evaluation_rows);
+            request->complete_layer(f.identity);
+        }
+        CHECK(score_calls==(native_projection?(chunk==1?2u:1u):0u));
+        CHECK(request->work().projected_rows==8 && request->work().attended_rows==8);
+        request->accepted(f.identity,native.accepted());
+        CHECK(request->accepted_layers()[0].memory.resident==std::vector<uint64_t>({100,300}));
+    }
+    for (int failure=0;failure<3;++failure) {
+        Fixture f;LayerwisePrefillState accepted{2,{{0,1,1}},8,2,1};f.specs[0].prefill=&accepted;
+        if (failure==0) {accepted.model_layer=7;rejects(MemoryErrorCode::InvalidPlan,[&]{f.request();});}
+        if (failure==1) {accepted.end=9;rejects(MemoryErrorCode::InvalidPlan,[&]{f.request();});}
+        if (failure==2) {
+            auto request=f.request();request->begin_layer(f.identity,2);
+            const float q[]{1,1,1,1};request->projected(f.identity,8,{q,0,4,1,1,1,1.f});
+            ++f.revision.history_revision;
+            rejects(MemoryErrorCode::Stale,[&]{request->prepare_restore(f.identity);});
+            CHECK(request->phase()==LayerwiseRequestPhase::Aborted);
+        }
+    }
+}
+
+void shared_history_admission() {
+    for (int failure=0;failure<7;++failure) {
+        Fixture f;HostKvStorage metadata(1u<<20);
+        LayerwiseProbeSelection probe(f.policy,f.keys,f.identity,{{0,1,1,1,1.f},{1,1,1,1,1.f}},
+            [&]{return f.revision;},metadata);
+        const float q[]{-1,-1};
+        for (uint32_t layer=0;layer<2;++layer) probe.append(f.identity,9,{q,layer,2,1,1,1,1.f});
+        auto shared=probe.finish(f.identity);auto request=f.request();
+        if (failure==0) {shared.selected={9};rejects(MemoryErrorCode::InvalidPlan,[&]{request->use_shared_history(f.identity,shared,{2});});}
+        if (failure==1) {--shared.frame.accepted_through;rejects(MemoryErrorCode::InvalidPlan,[&]{request->use_shared_history(f.identity,shared,{2});});}
+        if (failure==2) {shared.scores[0]=INFINITY;rejects(MemoryErrorCode::InvalidPlan,[&]{request->use_shared_history(f.identity,shared,{2});});}
+        if (failure==3) rejects(MemoryErrorCode::InvalidPlan,[&]{request->use_shared_history(f.identity,shared,{99});});
+        if (failure==4) {request->begin_layer(f.identity,2);rejects(MemoryErrorCode::InvalidPlan,[&]{request->use_shared_history(f.identity,shared,{2});});}
+        if (failure==5) {request->use_shared_history(f.identity,shared,{2});rejects(MemoryErrorCode::InvalidPlan,[&]{request->use_shared_history(f.identity,shared,{7});});}
+        if (failure==6) {++f.revision.history_revision;rejects(MemoryErrorCode::Stale,[&]{request->use_shared_history(f.identity,shared,{2});});}
+    }
+}
+
 void native_query_scoring_boundary() {
     for (int failure = 0; failure < 4; ++failure) {
         Fixture f; auto request = f.request(); NativeReference native(f);
@@ -419,6 +516,8 @@ int main() {
     current_forward_and_acceptance();
     admission_failures();
     native_failure_boundaries();
+    mixed_prefill_and_current_query();
+    shared_history_admission();
     native_query_scoring_boundary();
     std::puts("layerwise request: current-Q scalar reference, native byte restore, fences and acceptance passed");
 }
