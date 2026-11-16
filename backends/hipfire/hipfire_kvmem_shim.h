@@ -184,7 +184,6 @@ int hk_raw_store_has_packed(const hk_raw_store * st, uint32_t blocks);
 // `dst`. Geometry must match; the two stores must live in different storage
 // accounts (content-cache account copy, never a shared-record import).
 // Returns HK_OK / HK_ERR.
-int hk_raw_store_copy_prefix_to(hk_raw_store * dst, hk_raw_store * src, uint32_t blocks);
 
 // ── Persistent prefix packs (期3 G3 P1.1 restart persistence) ──────────────
 // One self-describing file: header (geometry + per-block tokens), opaque
