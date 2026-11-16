@@ -56,7 +56,7 @@ def model_profile(a, config):
     at=args.index('--num-speculative-tokens')+1
     depth=a.speculative_tokens
     if depth is None and mode=='mtp':depth=int(args[at])
-    selected=resolve_drafter(a.model,mode,depth)
+    selected=resolve_drafter(a.model,mode,depth,inspected=container)
     if config.get('allowed_drafters') and selected['expected_native'] not in config['allowed_drafters']:
         raise ValueError('the selected GPU profile has no compatible kernel path for this drafter')
     if selected['depth']>7:
@@ -64,6 +64,7 @@ def model_profile(a, config):
     if selected['depth']>config.get('max_draft_tokens',7):
         raise ValueError('the selected GPU profile has no compatible speculative kernel path')
     resolved=copy.deepcopy(config)
+    resolved.setdefault('environment',{})['KVMEM_RAD_MTP_HEAD']=selected.get('mtp_head_policy','shared')
     resolved['arguments'][at]=str(selected['depth'])
     for option,value in config.get('drafter_overrides',{}).get(selected['expected_native'],{}).items():
         resolved['arguments'][resolved['arguments'].index(option)+1]=str(value)
@@ -118,7 +119,8 @@ def child_environment(a, host, wsl, config, inherited=None):
             env['KVMEM_RAD_HIP_SINGLE_STREAM'] = '0'
         env['PATH'] = str(a.rocm.resolve() / 'bin') + os.pathsep + env.get('PATH', '')
     else:
-        env.update(KVMEM_RAD_MTP_HEAD='shared', KVMEM_CAPTURE_EARLY_SEAL='1', OMP_NUM_THREADS='2')
+        env.update(KVMEM_RAD_MTP_HEAD=config.get('environment',{}).get('KVMEM_RAD_MTP_HEAD','shared'),
+                   KVMEM_CAPTURE_EARLY_SEAL='1', OMP_NUM_THREADS='2')
         libraries = [a.rocm.resolve() / 'lib', a.rocm.resolve() / 'llvm/lib']
         if wsl:
             env['HSA_ENABLE_DXG_DETECTION'] = '1'

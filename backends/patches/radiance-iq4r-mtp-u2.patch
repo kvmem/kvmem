@@ -1,0 +1,75 @@
+--- a/arch/qwen35_fp8/qwen35_fp8.cpp
++++ b/arch/qwen35_fp8/qwen35_fp8.cpp
+@@ -1273,8 +1273,9 @@
+      *
+      * Also only when there is no DFlash2 drafter (`n_taps` == 0): a deployment drafts with one,
+      * and DFlash2 (one forward per block rather than one per token) is the better one here. */
+-    /* (A vocabulary-weighted head has no output.weight for the draft head to read.) */
+-    if (nextn > 0 && g.max_spec > 0 && m.n_taps == 0 && !m.n_vcls) {
++    /* A vocabulary-weighted target can draft with its own U2 projection. Target
++     * verification still uses the vocabulary-weighted output declared above. */
++    if (nextn > 0 && g.max_spec > 0 && m.n_taps == 0) {
+         /* Sized at max_tok, not max_logit_rows: a draft round is one row per sequence, but the
+          * history pass that fills the head's own K and V is one row per token over a whole prefill
+          * chunk (26 MiB at a 512-token chunk, beside 477 MiB of head weights). */
+@@ -1291,6 +1292,11 @@
+         const int head_choice = mtp_head_choice(std::getenv("KVMEM_RAD_MTP_HEAD"), has_u2_head);
+         if (head_choice < 0) {
+             rad_note(b, "invalid KVMEM_RAD_MTP_HEAD: expected auto or shared");
++            return RAD_E_INVAL;
++        }
++        if (m.n_vcls && head_choice != 1) {
++            rad_note(b, "MTP with a vocabulary-weighted target requires mtp.draft_head.weight in U2 and KVMEM_RAD_MTP_HEAD=auto");
++            std::fprintf(stderr, "E MTP with a vocabulary-weighted target requires a dedicated U2 draft head (policy auto)\n");
+             return RAD_E_INVAL;
+         }
+         rad_note(b, "KVMEM_MTP_HEAD policy=%s resolved=%s available_u2=%d",
+@@ -1321,6 +1327,17 @@
+          * prefill. */
+         AttnGatedFP8::Wire tw_attn = aw; tw_attn.x = m.b_mtp_x;
+         Ffn::Wire          tw_mlp  = mw; tw_mlp.x  = m.b_mtp_x;
++#if QWEN35_W8A8
++        if (m.n_vcls) {
++            /* A vocab-class target's MTP may use MXFP4 while the target uses
++             * rotated int8. Use the existing E4M3 producer planes for MTP;
++             * int8 MTP linears can still quantise the produced bf16 plane. */
++            tw_attn.h.q8_fed = tw_attn.h.q8_rot = false;
++            tw_attn.attn.q8_fed = tw_attn.attn.q8_rot = false;
++            tw_mlp.h.q8_fed = tw_mlp.h.q8_rot = false;
++            tw_mlp.ffn.q8_fed = tw_mlp.ffn.q8_rot = false;
++        }
++#endif
+ 
+         MtpHead::Wire tw{};
+         tw.src = m.a_h.x;   tw.hout = m.b_mtp_h; tw.logits = m.b_logits;
+--- a/arch/common/rad_block_mtp_fp8.h
++++ b/arch/common/rad_block_mtp_fp8.h
+@@ -188,7 +188,10 @@
+                                      const Src& src, const DenseFP8* mx_head) {
+     g = geom; w = wire; layer = l; w_tok = tok_embd; w_lm = lm_head;
+     rows = g.max_tok;
+-    if (rows <= 0 || !w_tok || !w_lm) return RAD_E_INVAL;
++    /* A dedicated U2 draft projection does not need a shared target head.
++     * Vocabulary-weighted targets intentionally have no single w_lm handle. */
++    q2 = src.lm && w.dq && w.ds && w.dsum && w.dlog && w.didx && w.dval;
++    if (rows <= 0 || !w_tok || (!w_lm && !q2)) return RAD_E_INVAL;
+ 
+     /* The normed embedding first, then the normed hidden state (see the header). */
+     off_e = 0;
+@@ -285,7 +288,7 @@
+     if (mx_head) {
+         RAD_ARCH_TRY(mx_logits.declare(b, nm, g, "mtp_mx_logits", *mx_head, w.hout, w.logits));
+         op_logits = mx_logits.cast;
+-    } else op_logits = rw(b, RAD_OP(b, "logits_gemm",
++    } else if (w_lm) op_logits = rw(b, RAD_OP(b, "logits_gemm",
+                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
+                                  RAD_INT("n_vocab", g.n_vocab),
+                                  RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
+@@ -311,7 +314,6 @@
+     enum { MTP_W2_GROUP = 128 };      /* libr4d's R4D_GEMM_W2A8_GROUP, and the layout's g128 tag */
+     /* The plugin declares the working set only when mtp_draft_head_q2 found a 2-bit head (and
+      * declared its name map). */
+-    q2 = src.lm && w.dq && w.ds && w.dsum && w.dlog && w.didx && w.dval;
+     if (q2) {
+         /* Replicated over the whole vocabulary. Without the sampler's cross-rank merge, a sharded
+          * plane would let each rank propose only its own vocabulary slice. Replication costs 341

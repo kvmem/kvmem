@@ -8,25 +8,33 @@
 
 namespace kvmem {
 
+enum class LayerwisePrefillScorer { Attention, Lift };
+inline constexpr size_t layerwise_lift_buckets = 14;
+
 struct LayerwisePrefillOptions {
     uint32_t block_tokens = 0;
     uint64_t select_tokens = 0, reserve_tokens = 0;
     uint64_t interval = 1024;
     uint32_t stride = 32; // zero samples the last row only, as upstream
     double half_life = 8192;
+    LayerwisePrefillScorer scorer = LayerwisePrefillScorer::Attention;
 };
 struct LayerwisePrefillValue {
     uint64_t original_start = 0;
-    double mass = 0, exposure = 0;
+    double mass = 0, exposure = 0, expected = 0;
 };
 struct LayerwisePrefillState {
     uint32_t model_layer = 0;
     std::vector<LayerwisePrefillValue> values; // ordered original logical block starts
     uint64_t end = 0, samples = 0, chunks = 0;
+    // Request-local distance profile; unlike per-block values these totals do
+    // not decay. Checkpoints retain the complete profile and expected values.
+    std::array<double, layerwise_lift_buckets> bucket_mass{}, bucket_pairs{};
 };
 struct LayerwisePrefillSnapshot {
     SessionIdentity session;
     std::vector<LayerwisePrefillState> layers;
+    LayerwisePrefillScorer scorer = LayerwisePrefillScorer::Attention;
 };
 struct LayerwisePrefillMass {
     uint32_t model_layer = 0;
@@ -44,7 +52,7 @@ enum class LayerwisePressureSource { Prefill, Output };
 struct LayerwisePressureChoice {
     uint32_t model_layer = 0;
     std::vector<uint64_t> candidates, fixed, selected; // native canonical IDs, chronological
-    std::vector<double> scores; // candidate-aligned mass / exposure
+    std::vector<double> scores; // candidate-aligned values of the selected pressure scorer
     uint64_t accepted_score_end = 0, samples = 0, chunks = 0;
     uint64_t selected_tokens = 0, charged_tokens = 0;
     LayerwisePressureSource source = LayerwisePressureSource::Prefill;

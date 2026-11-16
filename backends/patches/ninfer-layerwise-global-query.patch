@@ -1,0 +1,71 @@
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -903,6 +903,10 @@
+                 history_tokens/page_tokens, resources.sink_blocks, resources.recent_blocks);
+             query_pins.assign(anchor.pages.begin(), anchor.pages.begin()+anchor.count);
+         }
++        const auto* global_flag=std::getenv("NINFER_LAYERWISE_GLOBAL_QUERY");
++        if (global_flag && std::strcmp(global_flag,"0") && std::strcmp(global_flag,"1"))
++            throw std::invalid_argument("NINFER_LAYERWISE_GLOBAL_QUERY must be 0 or 1");
++        const bool global_query=global_flag && std::strcmp(global_flag,"1")==0;
+         std::vector<kvmem::LayerwiseRequestLayer> specs;
+         const kvmem::MemoryBudget target_budget{selected_budget,rows,
+             p.kvmem_window_tokens,p.memory_retained_budget};
+@@ -910,6 +914,8 @@
+         if (hybrid_flag && std::strcmp(hybrid_flag,"0") && std::strcmp(hybrid_flag,"1"))
+             throw std::invalid_argument("NINFER_LAYERWISE_HYBRID_QUERY must be 0 or 1");
+         const bool hybrid=begin && hybrid_flag && std::strcmp(hybrid_flag,"1")==0;
++        if (global_query && hybrid)
++            throw std::invalid_argument("global Mean-K and prefill hybrid Query sources are mutually exclusive");
+         if (hybrid) {
+             query_prefill_feedback=window.layer_views.feedback;
+             if (!query_prefill_feedback)
+@@ -1142,6 +1148,20 @@
+             } else {
+                 run_private_probe(context,resources.frozen_index_host_bytes,resources.attention_scale);
+                 bind_auxiliary_selection(probe_history->selected);
++            }
++        }
++        if (global_query && begin>history_tokens) {
++            // Reuse the qualified same-Query TARGET probe, including exact GDN,
++            // KV frontier and coordinate rollback. The all-layer score mean is
++            // shared only by early target layers; MTP still follows its option.
++            std::vector<std::uint32_t> early;
++            for (auto model:model_layers) if (model<=15) early.push_back(model);
++            if (!early.empty()) {
++                if (!probe_history) run_private_probe(context,resources.frozen_index_host_bytes,resources.attention_scale);
++                transaction->use_shared_history(identity,*probe_history,early);
++                std::fprintf(stderr,"KVMEM_GLOBAL_QUERY source_h=%u target_layers=%zu shared_layers=%zu selected_pages=%zu probe_rows=%llu restored=1\n",
++                    begin,model_layers.size(),early.size(),probe_history->selected.size(),
++                    static_cast<unsigned long long>(probe_work.scored_query_rows));
+             }
+         }
+         // A fresh Query creates a distinct accepted execution branch. All
+--- a/src/models/qwen3_5/program/native_query_owner.h
++++ b/src/models/qwen3_5/program/native_query_owner.h
+@@ -40,9 +40,10 @@
+ //
+ // The owner reserves resources, freezes native source bytes/index, establishes
+ // complete-address COW, then runs the real target layer-major forward and MTP.
+-// First-layer MTP uses no private probe. Explicit upstream-global MTP first
+-// runs the separate private target probe and restores its exact native source;
+-// both modes then perform the real fresh-Q layerwise Query exactly once.
++// First-layer MTP itself needs no private probe. Explicit upstream-global MTP
++// or optional shared early-target Mean-K first runs the private target probe
++// and restores its exact native source. The real layerwise forward runs once;
++// early targets may use the probe selection while deep targets use fresh Q.
+ // Failure drains native work and marks
+ // the attempted continuation invalid; old immutable source leases/checkpoints
+ // remain alive until this owner is retired by the Program.
+--- a/src/models/qwen3_5/program/native_layerwise_probe.h
++++ b/src/models/qwen3_5/program/native_layerwise_probe.h
+@@ -13,7 +13,8 @@
+     std::uint64_t scored_query_rows = 0;
+ };
+ 
+-// Private TARGET-only chunk-major forward for explicit upstream-global MTP.
++// Private TARGET-only chunk-major forward for global MTP or shared early-target
++// Mean-K selection. It is distinct from the later real layer-major Query.
+ // The owner admits the original per-layer resident view plus the complete
+ // evaluation, retains its exact native checkpoint, and supplies rollback.
+ // This function neither selects a preliminary B scaffold nor publishes any

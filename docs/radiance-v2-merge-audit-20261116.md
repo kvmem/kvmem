@@ -29,7 +29,11 @@ candidate's binaries.
    offload-budget patches. Shared validation checks all ordered hashes;
    packagers record the complete series and validate the source inventory.
    See [upstream replacement procedure](radiance-upstream-maintenance.md).
-5. Test isolation: the dry-run launcher test mocked input validation but still
+5. Mainline compatibility: preserved the newly merged IQ4R U2 MTP fix as a
+   fifth patch. Native v2 architecture compilation caught its dense-only `ffn`
+   field access in the shared MoE translation unit; the port now explicitly
+   limits the new vocabulary-class MTP behavior to dense Qwen.
+6. Test isolation: the dry-run launcher test mocked input validation but still
    detected the actual WSL environment, causing a missing-runtime-directory
    error only on WSL. It now mocks environment construction too; production
    WSL runtime validation remains intact.
@@ -82,10 +86,13 @@ is not a numerical proof for every geometry, model or platform.
 
 ## Completed checks and remaining gate
 
-- The four-patch series reconstructed all 1,857 candidate native files byte for
+- The final five-patch series reconstructed all 1,857 candidate native files byte for
   byte, with independent reverse-apply checks for each temporary component.
-- 102 adapter Python tests; 23 Radiance launcher and 27 launch-plan tests.
-- 72 portable CTest entries, including the new tensor-stride regression.
+- 106 adapter Python tests; 24 Radiance launcher and 27 launch-plan tests.
+- 73 portable CTest entries after syncing current master, including the new tensor-stride regression.
+- Native `arch_test`, `mem_test` and `sched_test` compile and pass after the
+  v2 MTP port (225/200/198 cases), using CTest-provided plugin paths. The initial direct invocation
+  of `mem_test` lacked that test environment; it was rerun through CTest.
 - 67 local console tests, rerun outside the sandbox after local loopback and
   hardlink permissions blocked the sandboxed run.
 - Public evidence scan and JavaScript syntax check pass. Raw historical
@@ -95,5 +102,6 @@ is not a numerical proof for every geometry, model or platform.
 
 Before merging: compile the changed plugin and test executable; run both the
 ordinary suite and `--audit`, rerun DFlash2 and model smoke checks, verify binary
-and source provenance, integrate the current KVMem master and pass required CI.
+and source provenance, pass required CI. The working branch has incorporated KVMem master
+`8ef684a`; the candidate has not been merged back or pushed.
 Linux ROCm/7900 XTX remains an explicit hardware qualification gap.

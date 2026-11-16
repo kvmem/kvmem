@@ -8,7 +8,7 @@ Performance follow-up: the initial IQR port below was a functional baseline and 
 
 Upstream v2.0.0 `ddcb9c69bb6c9ff270f8436bd4c059fba88ac6b7`, ABI39, was built and tested independently before beginning this KVMem migration. Windows core/architecture DLL loading and the gfx1101 kernel plugins passed. The original installed KVMem package remains unchanged.
 
-Hardware: RX7800M, gfx1101, PCI `0000:0c:00.0`, HIP UUID bytes `30303030303031323030303030303030`, approximately 12 GiB VRAM. Toolchain: Clang24/ROCm Core10.1, MSVC14.44, Windows SDK10.0.26100.0, Release.
+Hardware: RX7800M, gfx1101, approximately 12 GiB VRAM. Physical identifiers are retained in private validation evidence. Toolchain: Clang24/ROCm Core10.1, MSVC14.44, Windows SDK10.0.26100.0, Release.
 
 Requested model: `StillDeadcode/qwen3.8-27b-iqr-v4`, revision `e5f1b3ef70741d705a64a28b852acf3fcefcead7`, `qwen3.8-27b-iq2r-l-v4.rad`. Downloaded through HF Mirror; 11,990,364,160 bytes; SHA256 `89fb6bfbd602594ed8a79b655bee7e15e7732b7c2c78e34db3d145b2e58706bd`.
 
