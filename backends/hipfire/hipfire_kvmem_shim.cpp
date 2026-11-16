@@ -508,59 +508,6 @@ extern "C" int hk_kv_snapshot_covers_packed(const hk_kv_snapshot * snap, uint32_
     return 1;
 }
 
-extern "C" int hk_raw_store_copy_prefix_to(hk_raw_store * dst, hk_raw_store * src,
-                                              uint32_t blocks) {
-    clear_error();
-    if (!dst || !src || !dst->impl || !src->impl || !blocks) {
-        set_error("hk_raw_store_copy_prefix_to: invalid arguments");
-        return HK_ERR;
-    }
-    try {
-        const auto & c = src->impl->config();
-        const auto & d = dst->impl->config();
-        if (c.n_layer != d.n_layer || c.block_tokens != d.block_tokens ||
-            c.n_embd_k != d.n_embd_k || c.n_embd_v != d.n_embd_v ||
-            c.k_gpu_row_bytes != d.k_gpu_row_bytes || c.v_gpu_row_bytes != d.v_gpu_row_bytes ||
-            !c.k_gpu_row_bytes || !c.v_gpu_row_bytes) {
-            set_error("hk_raw_store_copy_prefix_to: geometry mismatch or no packed planes");
-            return HK_ERR;
-        }
-        std::vector<uint8_t> k, v;
-        std::vector<float> sum(c.n_embd_k);
-        for (uint32_t b = 0; b < blocks; ++b) {
-            const uint32_t n = src->impl->n_tokens(b);
-            if (!n) {
-                set_error("hk_raw_store_copy_prefix_to: empty source block");
-                return HK_ERR;
-            }
-            for (uint32_t l = 0; l < c.n_layer; ++l) {
-                if (!src->impl->has_k_gpu(b, l) || !src->impl->has_v_gpu(b, l)) {
-                    set_error("hk_raw_store_copy_prefix_to: incomplete packed source");
-                    return HK_ERR;
-                }
-                k.resize(size_t(n) * c.k_gpu_row_bytes);
-                v.resize(size_t(n) * c.v_gpu_row_bytes);
-                if (!src->impl->copy_k_gpu(b, l, k.data(), n) ||
-                    !src->impl->copy_v_gpu(b, l, v.data(), n)) {
-                    set_error("hk_raw_store_copy_prefix_to: source read failed");
-                    return HK_ERR;
-                }
-                dst->impl->write_layer_k_gpu(b * c.block_tokens, n, l, k.data());
-                dst->impl->write_layer_v_gpu(b * c.block_tokens, n, l, v.data());
-                const uint32_t mn = src->impl->mean_k_tokens(b, l);
-                if (mn && src->impl->mean_sum(b, l, sum.data()))
-                    dst->impl->write_layer_mean_sum(b * c.block_tokens, mn, l, sum.data());
-            }
-        }
-        return HK_OK;
-    } catch (const std::exception & e) {
-        set_error(e.what());
-    } catch (...) {
-        set_error("hk_raw_store_copy_prefix_to: unknown C++ exception");
-    }
-    return HK_ERR;
-}
-
 // ── Persistent prefix packs (期3 G3 P1.1) ──────────────────────────────────
 namespace {
 constexpr uint32_t HK_PACK_MAGIC = 0x50564b48u; // "HKVP"
