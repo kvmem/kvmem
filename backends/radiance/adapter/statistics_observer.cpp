@@ -173,10 +173,12 @@ int StatisticsObserver::configure(const rad::Config& cfg, rad::CtxDesc& desc) no
                 for (const auto& band : op.bands) {
                     const auto* row = band.dom[RAD_DOMAIN_DEVICE].row;
                     if (!row) continue;
-                    const auto* plugin = rad::rad_tools_registry().plugin(row->plugin);
-                    require(plugin && plugin->handle && plugin->kind==RAD_PLUGIN_KERNEL && plugin->name=="libr4d" &&
+                    require(desc.registry, "accepted recurrent state needs the engine's kernel registry");
+                    const auto* plugin = desc.registry->plugin(row->plugin);
+                    require(plugin && plugin->handle && plugin->kind==RAD_PLUGIN_KERNEL &&
+                            (plugin->name=="libr4d" || plugin->name=="libr3d") &&
                             (!producer || producer==plugin),
-                            "accepted recurrent state needs one libr4d producer across all kernel bands");
+                            "accepted recurrent state needs one supported producer across all kernel bands");
                     const auto abi = reinterpret_cast<uint32_t (*)()>(
                         rad::platform::module_symbol(plugin->handle,"rad_plugin_abi_version"));
                     const auto layout = reinterpret_cast<uint64_t (*)()>(

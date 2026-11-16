@@ -60,6 +60,12 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         raise ValueError('Radiance does not implement NInfer layer splitting or CUDA fast-prefill/device profiles')
     if p['EmbeddingPlacement'] not in ('ram','vram'):
         raise ValueError('Radiance EmbeddingPlacement must be ram or vram')
+    if p['WeightPlacement'] not in ('all_vram','layer_offload'):
+        raise ValueError('Radiance WeightPlacement must be all_vram or layer_offload')
+    if not 0<=p['WeightHostMiB']<=1048576:
+        raise ValueError('WeightHostMiB must be in [0,1048576]')
+    if p['WeightPlacement']=='layer_offload' and p['WeightHostMiB']==0:
+        raise ValueError('layer_offload requires a positive WeightHostMiB')
     if p.get('Vision'):
         if p.get('VisionResidency') not in ('resident','cpu'):
             raise ValueError('Radiance VisionResidency must be resident or cpu')
@@ -111,9 +117,11 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         ('--kvmem-budget','Budget'),('--kvmem-gen-reserve','Reserve'),('--kvmem-host-mib','HostMiB'),
         ('--kvmem-sink-tokens','SinkTokens'),('--kvmem-recent-tokens','RecentTokens'),('--kvmem-sessions','RetainedSessions'),
         ('--kv-cache-dtype','KvType'),('--state-cache-dtype','StateCacheType'),('--gpu-headroom-mib','VramReserveMiB'),('--num-speculative-tokens','MtpDrafts')]:pair(flag,p[key])
-    argv+=['--tp',str(len(gpu_ids)),'--tp-wire','exact','--no-prefix-cache','--host-pool-mib','0','--prefix-cache-mib','0',
-           '--placement','all_vram','--embedding-placement',p['EmbeddingPlacement'],
+    argv+=['--tp',str(len(gpu_ids)),'--tp-wire','exact','--no-prefix-cache','--host-pool-mib',str(p['WeightHostMiB']),'--prefix-cache-mib','0',
+           '--placement',p['WeightPlacement'],'--embedding-placement',p['EmbeddingPlacement'],
            '--draft-window',p['DraftPolicy'],'--kvmem','--kvmem-block-tokens','128']
+    if capability.get('build_profile') in ('qwen35-iqr-gfx1101','qwen35-iqr-rdna3'):
+        argv+=['--kernels','libr3diqr,libr3d','--kvmem-rolling-generation']
     pair('--kvmem-drafter','off' if mode=='none' else mode)
     if p['CacheMinTokens']:pair('--kvmem-cache-min-tokens',p['CacheMinTokens'])
     if p.get('Vision'):

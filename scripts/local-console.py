@@ -57,7 +57,7 @@ def media_type(name):
     return CONTENT_TYPES.get(Path(name).suffix.lower(), 'application/octet-stream')
 
 
-from launcher.config import (SPECULATIVE_PROFILES, DEFAULTS, ENGINE_DEFAULTS,
+from launcher.config import (SPECULATIVE_PROFILES, DEFAULTS, ENGINE_DEFAULTS, RDNA3_IQR_DEFAULTS,
     STRINGS, INTEGERS, BOOLEANS, DECIMALS, NATIVE, NATIVE_SWITCHES,
     without_secrets, normalize)
 from launcher.plan import build_plan, capabilities as launcher_capabilities, scoring_settings
@@ -368,7 +368,10 @@ class Controller:
                 saved['parameters'] = self.prefer_packaged_worker(saved['parameters'])
                 return saved
         backend = DEFAULTS['Backend'] if DEFAULTS['Backend'] in self.backends else self.backends[0]
-        return {'schema_version': 1, 'parameters': {**DEFAULTS, **copy.deepcopy(ENGINE_DEFAULTS[backend])}}
+        selected = ENGINE_DEFAULTS[backend]
+        if backend == 'radiance' and launcher_capabilities(self.backend_root)['backends'][backend].get('build_profile') in ('qwen35-iqr-gfx1101', 'qwen35-iqr-rdna3'):
+            selected = RDNA3_IQR_DEFAULTS
+        return {'schema_version': 1, 'parameters': {**DEFAULTS, **copy.deepcopy(selected)}}
 
     def save(self, data):
         clean = without_secrets(normalize(data, self.backends, path_root=self.backend_root))

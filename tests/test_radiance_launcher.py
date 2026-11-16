@@ -33,6 +33,20 @@ class RadiancePlanTest(unittest.TestCase):
         parameters.update(settings)
         return build_plan(dict(schema_version=1,parameters=parameters))
 
+    def test_rdna3_profile_selects_qualified_kernel_and_rolling_path(self):
+        from launcher.config import RDNA3_IQR_DEFAULTS
+        parameters={**RDNA3_IQR_DEFAULTS,'Model':str(self.model),'Worker':str(self.worker),
+                    'RadianceHome':str(self.home),'Gpu':'GPU-65471d75ce486b4f'}
+        for profile in ('qwen35-iqr-gfx1101','qwen35-iqr-rdna3'):
+            plan=build_radiance_plan(parameters,self.root,'windows',False,{'build_profile':profile})
+            args=plan['argv']
+            self.assertEqual(args[args.index('--kernels')+1],'libr3diqr,libr3d')
+            self.assertIn('--kvmem-rolling-generation',args)
+            self.assertEqual((plan['effective_parameters']['Budget'],plan['effective_parameters']['KvType']),(1024,'bf16'))
+        normal=build_radiance_plan(parameters,self.root,'windows',False,{})['argv']
+        self.assertNotIn('--kernels',normal)
+        self.assertNotIn('--kvmem-rolling-generation',normal)
+
     def test_prefill_default_and_explicit_override(self):
         for settings, expected in (({}, 256), ({'Prefill': 512}, 512)):
             with self.subTest(settings=settings):
@@ -279,6 +293,18 @@ class RadiancePlanTest(unittest.TestCase):
             self.assertEqual(plan['argv'][plan['argv'].index('--embedding-placement')+1],placement)
             self.assertEqual(plan['effective_parameters']['EmbeddingPlacement'],placement)
         with self.assertRaises(ValueError):self.plan(EmbeddingPlacement='disk')
+
+    def test_weight_offload_is_explicit_and_separate_from_kv_host_memory(self):
+        default=self.plan()['argv']
+        self.assertEqual(default[default.index('--placement')+1],'all_vram')
+        self.assertEqual(default[default.index('--host-pool-mib')+1],'0')
+        args=self.plan(WeightPlacement='layer_offload',WeightHostMiB=8192,HostMiB=512)['argv']
+        self.assertEqual(args[args.index('--placement')+1],'layer_offload')
+        self.assertEqual(args[args.index('--host-pool-mib')+1],'8192')
+        self.assertEqual(args[args.index('--kvmem-host-mib')+1],'512')
+        for p in (dict(WeightPlacement='layer_offload',WeightHostMiB=0),
+                  dict(WeightPlacement='disk'),dict(WeightHostMiB=1048577)):
+            with self.subTest(p=p),self.assertRaises(ValueError):self.plan(**p)
 
     def test_mtp_default_and_legacy_alias(self):
         for values in (dict(SpeculativeMode='mtp'),dict(MtpDrafts=3)):
