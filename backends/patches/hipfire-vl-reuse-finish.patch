@@ -1,0 +1,411 @@
+diff --git a/crates/hipfire-arch-qwen35/src/checkpoint.rs b/crates/hipfire-arch-qwen35/src/checkpoint.rs
+index 75c3e3c5f..d384ac0ad 100644
+--- a/crates/hipfire-arch-qwen35/src/checkpoint.rs
++++ b/crates/hipfire-arch-qwen35/src/checkpoint.rs
+@@ -15,6 +15,30 @@ pub use hipfire_runtime::checkpoint_pool::{
+ use hipfire_runtime::serve_contract::CacheDomain;
+ use rdna_compute::Gpu;
+ 
++/// G7: recurrent-state checkpoint key.
++///
++/// A media (vision) prefix cannot be identified by its token stream alone:
++/// every image renders the same `image_pad` ids, so two different images in
++/// the same text produce an identical `prefix_fingerprint`. Their recurrent
++/// states differ (different visual embeddings feed the hybrid layers), so the
++/// pool key must carry the media digest. `media_digest == None` is the
++/// historical text-only key (byte-neutral for every non-VL path).
++pub fn checkpoint_fingerprint(tokens: &[u32], media_digest: Option<u64>) -> u64 {
++    let fp = prefix_fingerprint(tokens);
++    match media_digest {
++        None => fp,
++        Some(digest) => {
++            // splitmix64-style avalanche over (fp, digest).
++            let mut x = fp ^ digest.wrapping_mul(0x9E37_79B9_7F4A_7C15);
++            x ^= x >> 30;
++            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
++            x ^= x >> 27;
++            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
++            x ^ (x >> 31)
++        }
++    }
++}
++
+ impl CheckpointBlob for DeltaNetSnapshot {
+     fn bytes_len(&self) -> u64 {
+         DeltaNetSnapshot::bytes_len(self)
+@@ -42,6 +66,7 @@ pub fn capture_checkpoint(
+     domain: &CacheDomain,
+     p: u64,
+     boundary_tokens: &[u32],
++    media_digest: Option<u64>,
+     state: &DeltaNetState,
+ ) -> HipResult<CheckpointId> {
+     if !CheckpointPool::<DeltaNetSnapshot>::is_aligned(p) {
+@@ -56,17 +81,15 @@ pub fn capture_checkpoint(
+     // soft refusal, indistinguishable from a hard failure only after the
+     // work is already spent.
+     let bytes = DeltaNetSnapshot::bytes_for(state);
+-    if !pool.can_afford(
+-        &(domain.clone(), p, prefix_fingerprint(boundary_tokens)),
+-        bytes,
+-    ) {
++    let fp = checkpoint_fingerprint(boundary_tokens, media_digest);
++    if !pool.can_afford(&(domain.clone(), p, fp), bytes) {
+         return Ok(CheckpointId::NONE);
+     }
+ 
+     let mut snap = DeltaNetSnapshot::new_for(gpu, state)?;
+     snap.save_from(state, gpu)?;
+ 
+-    let (id, displaced) = pool.insert(domain.clone(), p, prefix_fingerprint(boundary_tokens), snap);
++    let (id, displaced) = pool.insert(domain.clone(), p, fp, snap);
+     // Displaced blobs (LRU evictions / same-key replacement / a ceiling
+     // refusal of this very capture) own device memory with no freeing
+     // `Drop` — free them here or they leak for the process lifetime.
+@@ -104,3 +127,41 @@ pub fn restore_private(
+ // ───────────────────────────────────────────────────────────────────────────
+ // Tests (host-only — no GPU/HIP required)
+ // ───────────────────────────────────────────────────────────────────────────
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn text_checkpoint_key_is_the_historical_fingerprint() {
++        let toks: Vec<u32> = (0..256).map(|i| i * 7 + 3).collect();
++        assert_eq!(
++            checkpoint_fingerprint(&toks, None),
++            prefix_fingerprint(&toks)
++        );
++    }
++
++    #[test]
++    fn media_checkpoint_key_is_content_scoped() {
++        // One token stream, two images: identical proof, distinct states.
++        let toks: Vec<u32> = (0..300).map(|i| i % 5).collect();
++        let a = checkpoint_fingerprint(&toks, Some(0xA11CE));
++        let b = checkpoint_fingerprint(&toks, Some(0xB0B));
++        let a2 = checkpoint_fingerprint(&toks, Some(0xA11CE));
++        assert_ne!(a, b);
++        assert_eq!(a, a2);
++        assert_ne!(a, prefix_fingerprint(&toks));
++        assert_ne!(b, prefix_fingerprint(&toks));
++    }
++
++    #[test]
++    fn media_key_depends_on_both_halves() {
++        let t1: Vec<u32> = (0..256).collect();
++        let t2: Vec<u32> = (0..256).map(|i| i ^ 1).collect();
++        let d = Some(42);
++        assert_ne!(
++            checkpoint_fingerprint(&t1, d),
++            checkpoint_fingerprint(&t2, d)
++        );
++    }
++}
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 4d3e8923c..ab93332bf 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -1625,6 +1625,8 @@ impl KvMemCtl {
+         let original_query = st.request_query;
+         // Dedup BEFORE forking/sealing: an identical frontier+proof already
+         // pins the same pages; a second archive would double the cache refs.
++        // The catalog stays token-keyed; the media digest gates serving and
++        // scopes the pack path and the recurrent-state key.
+         if let Some(existing) = self.prefix_catalog.find_exact(frontier, fingerprint) {
+             return Ok((existing, Vec::new(), true));
+         }
+@@ -1709,8 +1711,15 @@ impl KvMemCtl {
+                 media_digest: entry.media_digest,
+                 media_spans: entry.media_spans.clone(),
+             };
++            // G7: the file name carries the media identity. Two images with
++            // the same token stream share the token fingerprint; without the
++            // digest suffix their packs would overwrite each other.
++            let media_tag = match media_digest {
++                None => String::new(),
++                Some(d) => format!("-m{d:016x}"),
++            };
+             let path = dir.join(format!(
+-                "p{layout_id:016x}-{frontier:08}-{fingerprint:016x}.hkpack"
++                "p{layout_id:016x}-{frontier:08}-{fingerprint:016x}{media_tag}.hkpack"
+             ));
+             let written = meta
+                 .encode()
+@@ -1803,6 +1812,23 @@ impl KvMemCtl {
+             let pack = self.cold_packs.packs()[index].clone();
+             match self.load_cold_pack(&pack) {
+                 Ok(id) => {
++                    // G7 Stage C: the hot catalog is token-keyed. A pack load
++                    // can dedup into a live entry that belongs to a DIFFERENT
++                    // image (identical `image_pad` token stream). Serving it
++                    // would hand over the other image's KV — stay a miss.
++                    let identity_ok = self
++                        .prefix_catalog
++                        .get(id)
++                        .map(|e| e.media_digest == pack.meta.media_digest)
++                        .unwrap_or(false);
++                    if !identity_ok {
++                        self.cold_pack_misses_total += 1;
++                        eprintln!(
++                            "[kvmem-pack] cold load identity mismatch \
++                             (media digest) — miss"
++                        );
++                        return None;
++                    }
+                     self.cold_pack_hits_total += 1;
+                     self.prefix_hits_total += 1;
+                     if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index ee4b0e395..09ce42035 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -559,7 +559,9 @@ impl PrefixCatalog {
+     /// Returns the displaced entries (caller releases their GPU refs).
+     /// Refuses a duplicate frontier+proof already present (the existing
+     /// entry is touched instead and returned as `Ok(None)` — no second
+-    /// archive for the same prefix).
++    /// archive for the same prefix). The catalog is token-keyed on purpose:
++    /// two images render the same token stream, and the media digest (not the
++    /// catalog slot) decides whether an entry may be served.
+     pub fn insert(&mut self, mut entry: PrefixCheckpoint) -> Result<Option<u64>, String> {
+         if self.max_entries == 0 {
+             return Err("kvmem prefix catalog: disabled (max_entries 0)".to_string());
+@@ -859,6 +861,8 @@ impl PrefixCatalog {
+     /// Exact-frontier dedup probe: an entry with the same frontier AND
+     /// fingerprint already exists (touch it). The engine uses this BEFORE
+     /// sealing GPU pages so a deduped freeze never doubles cache refs.
++    /// Exact (frontier, token proof) match. Media identity is checked by the
++    /// caller's [`PrefixCheckpoint::media_eligible`] gate, never here.
+     pub fn find_exact(&mut self, frontier: u32, fingerprint: u64) -> Option<u64> {
+         let id = self
+             .entries
+@@ -1337,6 +1341,38 @@ mod tests {
+         assert!(id.is_none() && none.is_empty() && deduped);
+     }
+ 
++    /// G7 Stage C: the media digest scopes whether an entry may be served.
++    /// Two images share the `image_pad` token stream, so the token proof alone
++    /// never authorizes a media-covered prefix.
++    #[test]
++    fn media_digest_gates_serving() {
++        let st = storage();
++        let toks = tokens(256);
++        let layout = layout_fingerprint(&raw_config());
++        let mut cat = PrefixCatalog::new(4);
++        let mut a = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
++        a.media_digest = Some(0xA);
++        a.media_spans = vec![(64, 128)];
++        let (ida, _) = cat.insert_displacing(a).expect("insert a");
++        let ida = ida.expect("stored");
++        assert_eq!(cat.lookup_media(&toks[..128], layout, Some(0xA)), Some(ida));
++        assert_eq!(cat.lookup_media(&toks[..128], layout, Some(0xB)), None);
++        assert_eq!(cat.lookup_media(&toks[..128], layout, None), None);
++        // A checkpoint frozen BEFORE the image carries no covered span and is
++        // reusable by any request (it holds no image rows).
++        let mut pre = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
++        pre.media_digest = Some(0xA);
++        pre.media_spans = vec![(200, 260)];
++        assert!(pre.media_eligible(Some(0xB)));
++        assert!(pre.media_eligible(None));
++        // A text checkpoint is never eligible for a media-covered span.
++        let mut t = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
++        t.media_digest = None;
++        t.media_spans = vec![(64, 128)];
++        assert!(!t.media_eligible(Some(0xA)));
++        assert!(!t.media_eligible(None));
++    }
++
+     /// 期3 G3 P1.1: the cold index scans pack files, proves by full token
+     /// equality (never fingerprint alone), and prunes by byte cap.
+     #[test]
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index ac2f319ed..132368c38 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -4490,6 +4490,7 @@ fn publish_generated_prefix(
+                 domain,
+                 new_boundary as u64,
+                 &tokens,
++                None, // radix path: text-only (vision is excluded from publishing)
+                 &rig.model.dn_states[s],
+             ) {
+                 Ok(id) if id.is_some() => Some(id),
+@@ -6795,6 +6796,7 @@ fn run_loop(
+                                     domain,
+                                     new_boundary as u64,
+                                     &tokens,
++                                    None, // radix path: text-only
+                                     &rig.model.dn_states[s],
+                                 ) {
+                                     Ok(id) if id.is_some() => Some(id),
+@@ -7776,6 +7778,7 @@ fn run_loop(
+                             domain,
+                             boundary as u64,
+                             &tokens,
++                            media_digest,
+                             &rig.model.dn_states[s],
+                         )
+                         .map_err(|e| format!("kvmem freeze DN capture: {e:?}"))?;
+@@ -8020,8 +8023,9 @@ fn kvmem_catalog_and_pin(
+                     .cache_domain
+                     .as_ref()
+                     .ok_or_else(|| "no cache domain".to_string())?;
+-                let fp = crate::checkpoint::prefix_fingerprint(
++                let fp = crate::checkpoint::checkpoint_fingerprint(
+                     &tokens[..boundary as usize],
++                    media_digest,
+                 );
+                 match rig
+                     .model
+@@ -8107,7 +8111,7 @@ fn kvmem_coverage_capture(rig: &mut Rig, slots: &mut [Option<InFlight>], work: &
+             continue;
+         }
+         let tokens: Vec<u32> = sess.tokens[..boundary as usize].to_vec();
+-        let fp = crate::checkpoint::prefix_fingerprint(&tokens);
++        let fp = crate::checkpoint::checkpoint_fingerprint(&tokens, None);
+         let model = &mut rig.model;
+         let Some(pool) = model.checkpoint_pool.as_mut() else {
+             continue;
+@@ -8116,7 +8120,15 @@ fn kvmem_coverage_capture(rig: &mut Rig, slots: &mut [Option<InFlight>], work: &
+             continue;
+         }
+         let state = &model.dn_states[s];
+-        match crate::checkpoint::capture_checkpoint(&mut rig.gpu, pool, &domain, fed, &tokens, state) {
++        match crate::checkpoint::capture_checkpoint(
++            &mut rig.gpu,
++            pool,
++            &domain,
++            fed,
++            &tokens,
++            None, // coverage is text-only (vision sessions skip it)
++            state,
++        ) {
+             Ok(id) if id == crate::checkpoint::CheckpointId::NONE => {
+                 // Pool ceiling refused capture; the boundary stays unreusable.
+             }
+@@ -8205,7 +8217,11 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
+         return;
+     };
+     if pool
+-        .peek(domain, boundary as u64, crate::checkpoint::prefix_fingerprint(&tokens))
++        .peek(
++            domain,
++            boundary as u64,
++            crate::checkpoint::checkpoint_fingerprint(&tokens, media_digest),
++        )
+         .is_none()
+     {
+         return;
+@@ -8894,8 +8910,15 @@ fn admit(
+                                             rig.model.checkpoint_pool.as_mut().ok_or_else(
+                                                 || "kvmem truncate: no checkpoint pool".to_string(),
+                                             )?;
+-                                        let fp = crate::checkpoint::prefix_fingerprint(
++                                        // G7: a visual session's recurrent state
++                                        // is keyed by its sticky media digest.
++                                        let media = rig
++                                            .sessions
++                                            .get(existing)
++                                            .and_then(|s| s.media_digest);
++                                        let fp = crate::checkpoint::checkpoint_fingerprint(
+                                             &extended[..plan.reused],
++                                            media,
+                                         );
+                                         let restored = ckpt_pool
+                                             .peek(domain, plan.reused as u64, fp)
+@@ -9450,6 +9473,45 @@ fn admit(
+         .as_ref()
+         .map(|vd| vd.media_digest())
+         .or_else(|| rig.sessions.get(id).and_then(|s| s.media_digest));
++    // G7 Stage C: the reuse frontier goes through the Stage A media anchor.
++    // The restored prefix must never split a vision span of the incoming
++    // prompt; a frozen checkpoint already satisfies this by construction, so a
++    // failure here is an invariant violation and the reuse closes to cold.
++    #[cfg(feature = "kvmem")]
++    let req_media_spans: Vec<crate::kvmem_media::MediaSpan> = {
++        let n_visual = req
++            .visual_data
++            .as_ref()
++            .map(|vd| vd.n_visual_tokens)
++            .or_else(|| rig.sessions.get(id).map(|s| s.media_n_visual))
++            .unwrap_or(0);
++        match (req_media, rig.tokenizer.special_token_id("<|image_pad|>")) {
++            (Some(_), Some(pad)) if n_visual > 0 => {
++                crate::kvmem_media::spans_from_pad_runs(&req.prompt_tokens, pad, n_visual)
++            }
++            _ => Vec::new(),
++        }
++    };
++    #[cfg(feature = "kvmem")]
++    let anchor_reuse = |frontier: u32| -> Result<u32, String> {
++        if req_media_spans.is_empty() {
++            return Ok(frontier);
++        }
++        let aligned = crate::kvmem_media::media_anchored_frontier(
++            0,
++            frontier as u64,
++            req.prompt_tokens.len() as u64,
++            &req_media_spans,
++            crate::kvmem_ctl::KV_BLOCK_TOKENS as u64,
++        )
++        .map_err(|e| format!("kvmem reuse: media anchor: {e}"))?;
++        if aligned != frontier as u64 {
++            return Err(format!(
++                "kvmem reuse: media anchor moves frontier {frontier} -> {aligned}"
++            ));
++        }
++        Ok(frontier)
++    };
+     #[cfg(feature = "kvmem")]
+     if rig.kvmem_prefix_pin {
+         // 期3 G3 P1.1: a cold pack hit publishes a catalog entry and may
+@@ -9476,6 +9538,15 @@ fn admit(
+                     .ok_or_else(|| "kvmem reuse: no controller".to_string())?;
+                 // 1. Host fork: validates the FULL provenance (geometry +
+                 // fingerprint + token proof) before any mutation.
++                // Stage C: the candidate frontier must pass the media anchor
++                // BEFORE the fork mutates the slot; a violation closes the
++                // reuse to a cold prefill (the slot is still the earlier
++                // reset state here).
++                let candidate = ctl
++                    .prefix_checkpoint(ckpt_id)
++                    .map(|c| c.frontier)
++                    .ok_or_else(|| format!("kvmem reuse: checkpoint {ckpt_id} missing"))?;
++                anchor_reuse(candidate)?;
+                 let mut frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
+                 let mut reuse_id = ckpt_id;
+                 // G3 cold-reuse fix: a page-less import (restart pack load or an
+@@ -9531,6 +9602,11 @@ fn admit(
+                                     frontier, start.restore_tokens
+                                 ));
+                             };
++                            let candidate = ctl
++                                .prefix_checkpoint(sid)
++                                .map(|c| c.frontier)
++                                .ok_or_else(|| format!("kvmem reuse: checkpoint {sid} missing"))?;
++                            anchor_reuse(candidate)?;
+                             frontier = ctl.fork_prefix_into(slot.0, sid, &req.prompt_tokens)?;
+                             reuse_id = sid;
+                             let prev = ctl.prefix_original_query(reuse_id);
+@@ -9616,8 +9692,17 @@ fn admit(
+                     .checkpoint_pool
+                     .as_mut()
+                     .ok_or_else(|| "kvmem reuse: no checkpoint pool".to_string())?;
+-                let fp = crate::checkpoint::prefix_fingerprint(
++                // G7 Stage C: the recurrent state is keyed by the checkpoint's
++                // media identity. The catalog gate proved it equals the
++                // request's digest when the prefix covers an image span; a
++                // pre-image/plain prefix carries no media and keeps the
++                // historical key.
++                let ckpt_media = ctl
++                    .prefix_checkpoint(reuse_id)
++                    .and_then(|c| c.media_digest);
++                let fp = crate::checkpoint::checkpoint_fingerprint(
+                     &req.prompt_tokens[..frontier as usize],
++                    ckpt_media,
+                 );
+                 // 期3 G3 P1.1 dn-persist: rebuild the recurrent checkpoint from
+                 // the pack sidecar when this process has no pool entry (restart).
