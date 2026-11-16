@@ -1,0 +1,116 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 681d94d81..370deea81 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -1120,47 +1120,33 @@ impl KvMemCtl {
+                 "kvmem: HIPFIRE_KVMEM_CONTENT_GROUPS={content_groups} out of range [0,1024]"
+             ));
+         }
+-        // 期3 G3-SSD: the content cache owns a SEPARATE tiered storage
+-        // account (期3 SSD 裁决), so spill and cache cannot squeeze each
+-        // other. Canonical copies are written here at freeze; reuse copies
+-        // them back into the session account (the core refuses cross-account
+-        // packed imports and a shared list would mix the ledgers).
+-        let content_storage = match env_raw("HIPFIRE_KVMEM_CACHE_DIR") {
+-            Some(dir) if !dir.is_empty() => {
+-                let dir = PathBuf::from(dir);
+-                std::fs::create_dir_all(&dir)
+-                    .map_err(|e| format!("kvmem cache dir {}: {e}", dir.display()))?;
+-                if let Some(spill) = env_raw("HIPFIRE_KVMEM_SPILL_DIR") {
+-                    if !spill.is_empty() && PathBuf::from(&spill) == dir {
+-                        return Err("kvmem: HIPFIRE_KVMEM_CACHE_DIR must differ from \
+-                                    HIPFIRE_KVMEM_SPILL_DIR (separate accounts)"
+-                            .to_string());
+-                    }
++        // 期3 G3 single-tier: `HIPFIRE_KVMEM_CACHE_DIR` owns the PERSISTENT
++        // pack tier. The second (account) storage was consolidated away —
++        // packs are the one persistent copy, still billed under
++        // `HIPFIRE_KVMEM_CACHE_BYTES` and separate from the spill account.
++        // `content_storage` stays None; the cache account metrics report 0.
++        let content_cache_dir = env_raw("HIPFIRE_KVMEM_CACHE_DIR").filter(|d| !d.is_empty());
++        if let Some(dir) = content_cache_dir.as_ref() {
++            let dir = PathBuf::from(dir);
++            std::fs::create_dir_all(&dir)
++                .map_err(|e| format!("kvmem cache dir {}: {e}", dir.display()))?;
++            if let Some(spill) = env_raw("HIPFIRE_KVMEM_SPILL_DIR") {
++                if !spill.is_empty() && PathBuf::from(&spill) == dir {
++                    return Err("kvmem: HIPFIRE_KVMEM_CACHE_DIR must differ from \
++                                HIPFIRE_KVMEM_SPILL_DIR (separate accounts)"
++                        .to_string());
+                 }
+-                let bytes = env_u64("HIPFIRE_KVMEM_CACHE_BYTES")
+-                    .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES)
+-                    .max(1);
+-                let ram = env_u64("HIPFIRE_KVMEM_CACHE_RAM_BYTES")
+-                    .unwrap_or(bytes.min(64 << 20))
+-                    .clamp(1, bytes);
+-                Some(
+-                    Storage::new_tiered(ram, &dir, bytes)
+-                        .map_err(|e| format!("kvmem cache storage: {e}"))?,
+-                )
+             }
+-            _ => None,
+-        };
++        }
++        let content_storage: Option<Storage> = None;
++        let content_cache_dir = content_cache_dir.map(PathBuf::from);
+ 
+         // 期3 G3 P1.1: pack files live beside the content account; scanning
+         // here rebuilds the cold index after a restart (metadata only).
+         let cold_bytes = env_u64("HIPFIRE_KVMEM_CACHE_BYTES")
+             .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES)
+             .max(1);
+-        let cold_dir = if content_storage.is_some() {
+-            env_raw("HIPFIRE_KVMEM_CACHE_DIR").map(PathBuf::from)
+-        } else {
+-            None
+-        };
++        let cold_dir = content_cache_dir;
+         let cold_packs = match cold_dir.as_ref() {
+             Some(dir) => ColdPackIndex::scan(
+                 dir,
+@@ -6009,11 +5995,11 @@ mod tests {
+         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+     }
+ 
+-    /// 期3 G3-SSD: a content-account freeze moves the canonical into the cache
+-    /// account (separately charged) and reuse copies it back into the session
+-    /// account, reproducing the Mean-K index exactly.
++    /// 期3 G3 single-tier: a freeze with a cache dir writes ONE persistent pack
++    /// (no second account copy), the canonical stays in the session account,
++    /// and reuse forks it directly (Mean-K preserved).
+     #[test]
+-    fn content_account_freeze_and_reuse_copy_out() {
++    fn single_tier_pack_freeze_and_reuse() {
+         std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+         let dir = std::env::temp_dir().join(format!("kvmem-cache-test-{}", std::process::id()));
+         std::env::set_var("HIPFIRE_KVMEM_CACHE_DIR", dir.to_str().unwrap());
+@@ -6028,17 +6014,22 @@ mod tests {
+         let (id, displaced, dup) = ctl.freeze_prefix(0, 128, &toks).expect("freeze");
+         assert!(!dup && displaced.is_empty());
+         assert!(
+-            ctl.prefix_checkpoint(id)
++            !ctl.prefix_checkpoint(id)
+                 .expect("ckpt")
+                 .canonical_on_content,
+-            "canonical moved to the content account"
++            "single tier: the canonical stays in the session account"
+         );
+         let cache_stats = ctl.stats();
+         assert!(
+-            cache_stats.content_cache_bytes > 0 || cache_stats.content_cache_disk_bytes > 0,
+-            "content account charged (ram {} disk {})",
+-            cache_stats.content_cache_bytes,
+-            cache_stats.content_cache_disk_bytes
++            cache_stats.content_packs >= 1 && cache_stats.content_pack_bytes > 0,
++            "persistent pack tier written (packs {} bytes {})",
++            cache_stats.content_packs,
++            cache_stats.content_pack_bytes
++        );
++        assert_eq!(
++            cache_stats.content_cache_bytes + cache_stats.content_cache_disk_bytes,
++            0,
++            "no second content account"
+         );
+         let frontier = ctl.fork_prefix_into(1, id, &toks).expect("fork");
+         assert_eq!(frontier, 128);
