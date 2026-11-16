@@ -166,6 +166,10 @@ size_t hk_kv_snapshot_metadata_bytes(const hk_kv_snapshot * snap);
 // 1 when the image holds exactly one ready k+v record pair per (block, layer)
 // in block-major order for a `blocks`×`layers` grid.
 int hk_kv_snapshot_covers_packed(const hk_kv_snapshot * snap, uint32_t blocks, uint32_t layers);
+// Identity of one snapshot block origin (the core SealedKvBlock object), or 0.
+// Captures that inherit a previous snapshot's origin report the same id for
+// the same sealed record (alias accounting / tests).
+uint64_t hk_kv_snapshot_origin_id(const hk_kv_snapshot * snap, size_t block);
 // 1 when any block in [0, blocks) carries sealed packed k+v records.
 int hk_raw_store_has_packed(const hk_raw_store * st, uint32_t blocks);
 
