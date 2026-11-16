@@ -1,0 +1,480 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 8c541f9e3..531a9b66c 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -634,6 +634,9 @@ struct SlotState {
+     /// Span of the PREVIOUS accepted request's question on this slot —
+     /// continuation identity for `layerwise_query_at_source`.
+     last_query: Option<(u64, u64)>,
++    /// 期3 G3: this request's internal content group (conversation-lineage
++    /// hash). Fairness hint only; a frozen checkpoint carries it as metadata.
++    convo_group: u64,
+     /// Pending output-scope acceptance snapshot for the in-flight MTP verify
+     /// (P4.1②, design §A.6). The orchestration extracts it from the verify carrier
+     /// after the forward (mass captured) and stores it here BEFORE freeing the
+@@ -901,6 +904,12 @@ pub struct KvMemCtl {
+     /// P3.4 retention policy `(count, bytes, interval, min_gap)` when the spread
+     /// checkpoint policy is active; `None` keeps the historical LRU-only catalog.
+     checkpoint_retention: Option<(usize, u64, u64, u64)>,
++    /// 期3 G3: `HIPFIRE_KVMEM_CONTENT_GROUPS` (0 = plain LRU catalog; N > 0
++    /// enables group-aware publication with `max_groups = N` and the physical
++    /// version limit `C = max(2N, 1)`).
++    content_groups: usize,
++    /// Entries retired by the group-aware publication plan.
++    content_retirements_total: u64,
+     /// Observability counters (`KvMemCtl::stats`). Pure bookkeeping: no path
+     /// reads them back into selection/residency, so they cannot change KV
+     /// bytes; `/metrics` exports them via `EngineStats.kvmem`.
+@@ -1085,6 +1094,14 @@ impl KvMemCtl {
+         let host_bytes = env_u64("HIPFIRE_KVMEM_HOST_BYTES")
+             .unwrap_or(DEFAULT_HOST_BYTES)
+             .max(1);
++        // 期3 G3: internal content groups (fairness-only; ninfer
++        // `--kvmem-sessions` analogue). 0 keeps the historical LRU catalog.
++        let content_groups = env_usize("HIPFIRE_KVMEM_CONTENT_GROUPS").unwrap_or(0);
++        if content_groups > 1024 {
++            return Err(format!(
++                "kvmem: HIPFIRE_KVMEM_CONTENT_GROUPS={content_groups} out of range [0,1024]"
++            ));
++        }
+         let storage = match env_raw("HIPFIRE_KVMEM_SPILL_DIR") {
+             Some(dir) => {
+                 let dir = PathBuf::from(dir);
+@@ -1125,6 +1142,7 @@ impl KvMemCtl {
+                 lw_query_due: false,
+                 request_query: None,
+                 last_query: None,
++                convo_group: 0,
+                 lw_import_blocks: Cell::new(None),
+                 lw_pending_output: None,
+                 lw_head: None,
+@@ -1166,7 +1184,7 @@ impl KvMemCtl {
+             eprintln!(
+                 "[kvmem] policy: strategy={strategy:?} select_method={select_method} lrfu={lrfu} \
+                  lambda={lrfu_lambda} top={lrfu_top} watermark={watermark:?} \
+-                 query_span={query_span} budget_blocks={}",
++                 query_span={query_span} budget_blocks={} content_groups={content_groups}",
+                 plan.budget_blocks
+             );
+         }
+@@ -1235,9 +1253,15 @@ impl KvMemCtl {
+             gen_reserve,
+             checkpoint_retention,
+             // P4.3: bounded frozen-prefix catalog; empty until the engine
+-            // freezes a prefix (PREFIX_PIN on). The bound is the retention
+-            // count ceiling (H5 exposes the env knob).
+-            prefix_catalog: PrefixCatalog::new(4),
++            // freezes a prefix (PREFIX_PIN on). 期3 G3: with content groups the
++            // bound is the core version limit C = max(2N, 1); otherwise 4.
++            prefix_catalog: PrefixCatalog::new(if content_groups > 0 {
++                (2 * content_groups).max(1)
++            } else {
++                4
++            }),
++            content_groups,
++            content_retirements_total: 0,
+             spill_pages_total: 0,
+             restore_pages_total: 0,
+             prefix_freezes_total: 0,
+@@ -1450,6 +1474,7 @@ impl KvMemCtl {
+             lw_query_due: false,
+                 request_query: None,
+                 last_query: None,
++                convo_group: 0,
+             lw_import_blocks: Cell::new(None),
+             lw_pending_output: None,
+             // P4.1② G3: a fresh session drops the head resident map and its
+@@ -1561,14 +1586,37 @@ impl KvMemCtl {
+             canonical,
+         );
+         entry.original_query = original_query;
++        entry.group = st.convo_group;
++        if self.content_groups > 0
++            && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++                .ok()
++                .is_some_and(|v| v == "1" || v == "on" || v == "true")
++        {
++            eprintln!(
++                "[kvmem-content] freeze slot={slot} frontier={frontier} group={} entries={}",
++                st.convo_group,
++                self.prefix_catalog.len()
++            );
++        }
+         entry.kv_snapshot = kv_snapshot;
+-        let (inserted, displaced) = self
+-            .prefix_catalog
+-            .insert_displacing(entry)
+-            .map_err(|e| format!("kvmem freeze_prefix catalog: {e}"))?;
++        // 期3 G3: group-aware publication retires the whole least-recently-used
++        // group before entry trimming; the plain LRU path stays the default.
++        let (inserted, displaced) = if self.content_groups > 0 && st.convo_group != 0 {
++            let (id, displaced, _deduped) = self
++                .prefix_catalog
++                .insert_group_aware(entry, self.content_groups)
++                .map_err(|e| format!("kvmem freeze_prefix catalog: {e}"))?;
++            self.content_retirements_total += displaced.len() as u64;
++            (id, displaced)
++        } else {
++            self.prefix_catalog
++                .insert_displacing(entry)
++                .map_err(|e| format!("kvmem freeze_prefix catalog: {e}"))?
++        };
+         if inserted.is_some() {
+             self.prefix_freezes_total += 1;
+         }
++
+         let mut displaced = displaced;
+         if let Some((count, bytes, interval, min_gap)) = self.checkpoint_retention {
+             let pruned = self.prefix_catalog.prune_policy(count, bytes, interval, min_gap);
+@@ -1678,6 +1726,8 @@ impl KvMemCtl {
+             prefix_hits: self.prefix_hits_total,
+             prefix_misses: self.prefix_misses_total,
+             prefix_evictions: self.prefix_evictions_total,
++            content_groups: self.prefix_catalog.group_count() as u64,
++            content_retirements: self.content_retirements_total,
+             draft_images: self.draft_images_total,
+             draft_image_hits: self.draft_image_hits_total,
+             draft_image_misses: self.draft_image_misses_total,
+@@ -1838,6 +1888,18 @@ impl KvMemCtl {
+         Ok(())
+     }
+ 
++    /// 期3 G3: install the request's internal content group (conversation
++    /// lineage hash). Group metadata is a capacity fairness hint only — the
++    /// reuse path still validates tokens/layout/native proofs.
++    pub fn set_request_group(&mut self, slot: usize, group: u64) -> Result<(), String> {
++        let st = self
++            .slots
++            .get_mut(slot)
++            .ok_or_else(|| format!("kvmem: set_request_group slot {slot} out of range"))?;
++        st.convo_group = group;
++        Ok(())
++    }
++
+     /// 期2.3: arm or clear the one-shot per-request scorer Query. The reuse
+     /// import uses it: a NEW question forces the Query at the first decode
+     /// step; KeepSelected (query already effective at the source) leaves it
+@@ -5642,4 +5704,32 @@ mod tests {
+         assert!(ctl.take_layerwise_query_due(0), "unproven keeps the historical Query");
+         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+     }
++
++    /// 期3 G3: the content-groups env switches the catalog to the core
++    /// group-aware publication plan; a third group retires the LRU whole group.
++    #[test]
++    fn content_groups_mode_retires_whole_groups() {
++        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
++        std::env::set_var("HIPFIRE_KVMEM_CONTENT_GROUPS", "2");
++        let mut ctl =
++            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
++                .expect("ctl");
++        for (seed, group) in [(1u32, 11u64), (2, 22), (3, 33)] {
++            ctl.reset_slot(0).expect("reset");
++            ctl.set_request_group(0, group).expect("group");
++            prefix_fill(&mut ctl, 0, 1, seed * 10);
++            let toks = prefix_tokens(128, seed * 10);
++            ctl.freeze_prefix(0, 128, &toks).expect("freeze");
++        }
++        let st = ctl.stats();
++        assert!(
++            st.content_groups >= 1 && st.content_groups <= 2,
++            "groups {}",
++            st.content_groups
++        );
++        assert!(st.content_retirements >= 1, "retirements {}", st.content_retirements);
++        std::env::remove_var("HIPFIRE_KVMEM_CONTENT_GROUPS");
++        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
++    }
+ }
++
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index 5ac3b3239..63cf08d23 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -26,7 +26,9 @@
+ //! default, `HIPFIRE_KVMEM_PREFIX_PIN` off) no path allocates or mutates
+ //! anything, keeping the Legacy serve byte-neutral.
+ 
+-use hipfire_kvmem::{RawStore, RawStoreConfig};
++use hipfire_kvmem::{
++    plan_content_group_publication, ContentSlot, PublicationReason, RawStore, RawStoreConfig,
++};
+ use hipfire_runtime::checkpoint_pool::prefix_fingerprint;
+ 
+ /// Page-aligned reuse granularity: GPU prefix sharing is page-granular
+@@ -125,6 +127,10 @@ pub struct PrefixCheckpoint {
+     /// equal and inside the frontier ⇒ the source's KV/score already covers
+     /// the question ⇒ KeepSelected. `None` = frozen without a proven span.
+     pub original_query: Option<(u64, u64)>,
++    /// 期3 G3: internal content group (conversation-lineage hash). A capacity
++    /// FAIRNESS hint only — it never authorizes reuse or overwrites a proof.
++    /// 0 = unknown origin (independent group, as in the core policy).
++    pub group: u64,
+     /// Immutable canonical archive: `source.fork_prefix(frontier)`. Packed
+     /// records are sealed shared sources; mean-K is private to this archive
+     /// and re-forked private into every branch. Never fed after freeze.
+@@ -168,6 +174,7 @@ impl PrefixCheckpoint {
+             layout_id,
+             gpu_pages: Vec::new(),
+             original_query: None,
++            group: 0,
+             canonical,
+             kv_snapshot: None,
+             draft_image: None,
+@@ -326,6 +333,79 @@ impl PrefixCatalog {
+         Ok((id, std::mem::take(&mut self.pending_displaced)))
+     }
+ 
++    /// 期3 G3: group-aware publication through the core content-directory
++    /// policy (`plan_content_group_publication`): internal content groups are a
++    /// capacity fairness hint; the whole least-recently-used group retires
++    /// before entry trimming, and a redundant version is trimmed before
++    /// another group's sole version. Reuse-proof semantics are unchanged (the
++    /// caller still validates tokens/layout). Returns the inserted id (None
++    /// when deduped), the retired entries (the engine releases their GPU
++    /// refs), and the dedup flag.
++    pub fn insert_group_aware(
++        &mut self,
++        mut entry: PrefixCheckpoint,
++        max_groups: usize,
++    ) -> Result<(Option<u64>, Vec<PrefixCheckpoint>, bool), String> {
++        if self.max_entries == 0 {
++            return Err("kvmem prefix catalog: disabled (max_entries 0)".to_string());
++        }
++        if let Some(existing) = self
++            .entries
++            .iter()
++            .find(|e| e.frontier == entry.frontier && e.fingerprint == entry.fingerprint)
++        {
++            let id = existing.id;
++            self.touch(id);
++            return Ok((None, Vec::new(), true));
++        }
++        let slots: Vec<ContentSlot> = self
++            .entries
++            .iter()
++            .map(|e| ContentSlot {
++                occupied: 1,
++                pinned: 0,
++                last_used: e.last_used,
++                identity: 0,
++                group: e.group,
++            })
++            .collect();
++        let (slot, reason, retired) =
++            plan_content_group_publication(&slots, self.max_entries, max_groups, entry.group)
++                .map_err(|e| format!("kvmem content directory: {e}"))?;
++        if slot.is_none() {
++            return Err(format!(
++                "kvmem content directory refused publication ({reason:?})"
++            ));
++        }
++        let mut displaced = Vec::with_capacity(retired.len());
++        for &index in retired.iter().rev() {
++            if index < self.entries.len() {
++                displaced.push(self.entries.remove(index));
++            }
++        }
++        if reason == PublicationReason::Deduplicated {
++            // The plan matched an identity this catalog does not mint (the
++            // dedup probe above is the authoritative one); never append twice.
++            return Ok((None, displaced, true));
++        }
++        self.clock += 1;
++        entry.last_used = self.clock;
++        let id = entry.id;
++        self.entries.push(entry);
++        Ok((Some(id), displaced, false))
++    }
++
++    /// Distinct non-zero content groups currently retained.
++    pub fn group_count(&self) -> usize {
++        let mut seen = std::collections::BTreeSet::new();
++        for e in &self.entries {
++            if e.group != 0 {
++                seen.insert(e.group);
++            }
++        }
++        seen.len()
++    }
++
+     /// Drain any displaced entries left by [`Self::insert`] (test-facing).
+     pub fn take_displaced(&mut self) -> Vec<PrefixCheckpoint> {
+         std::mem::take(&mut self.pending_displaced)
+@@ -545,6 +625,7 @@ mod tests {
+             layout_id: layout_fingerprint(&raw_config()),
+             gpu_pages: Vec::new(),
+             original_query: None,
++            group: 0,
+             canonical,
+             kv_snapshot: None,
+             draft_image: None,
+@@ -735,4 +816,37 @@ mod tests {
+         assert!(cat.is_empty());
+         assert!(cat.remove(1).is_none());
+     }
++
++    /// 期3 G3: group-aware publication retires the whole least-recently-used
++    /// group before entry trimming; reuse proofs are unchanged.
++    #[test]
++    fn content_groups_retire_the_lru_whole_group() {
++        let st = storage();
++        let mut cat = PrefixCatalog::new(4);
++        let mut publish = |cat: &mut PrefixCatalog, frontier: u32, seed: u32, group: u64| {
++            let mut ck = checkpoint(&st, cat.mint_id(), frontier, &tokens(frontier as usize + seed as usize));
++            ck.group = group;
++            cat.insert_group_aware(ck, 2).expect("group publish")
++        };
++        // Group A owns two versions, group B is the newer sole version.
++        let (a1, d1, dup1) = publish(&mut cat, 128, 0, 11);
++        assert!(a1.is_some() && d1.is_empty() && !dup1);
++        let (a2, d2, _) = publish(&mut cat, 256, 1, 11);
++        assert!(a2.is_some() && d2.is_empty());
++        let (b1, d3, _) = publish(&mut cat, 384, 2, 22);
++        assert!(b1.is_some() && d3.is_empty());
++        assert_eq!(cat.group_count(), 2);
++        // Publishing a third group retires the LRU whole group (A: used 2 < B: 3).
++        let (c1, retired, _) = publish(&mut cat, 512, 3, 33);
++        assert!(c1.is_some());
++        assert_eq!(retired.len(), 2, "both A versions retire with their group");
++        assert!(retired.iter().all(|e| e.group == 11));
++        assert_eq!(cat.group_count(), 2, "B and C remain");
++        assert_eq!(cat.len(), 2, "B + C");
++        // Dedup by exact frontier+proof still wins before the group plan.
++        let mut dup = checkpoint(&st, cat.mint_id(), 512, &tokens(512 + 3));
++        dup.group = 33;
++        let (id, none, deduped) = cat.insert_group_aware(dup, 2).expect("dedup");
++        assert!(id.is_none() && none.is_empty() && deduped);
++    }
+ }
+\ No newline at end of file
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 2d30f8722..0beeec83f 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -812,6 +812,18 @@ struct SpecCounters {
+     fallback: u64,
+ }
+ 
++/// 期3 G3: stable internal content group from the conversation identity.
++/// Fairness hint only (never a reuse proof); an empty convo is unknown (0).
++fn convo_group(convo: &[u64]) -> u64 {
++    if convo.is_empty() {
++        return 0;
++    }
++    use std::hash::{Hash, Hasher};
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    convo.hash(&mut h);
++    h.finish()
++}
++
+ struct Rig {
+     gpu: Gpu,
+     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
+@@ -8808,11 +8820,11 @@ fn admit(
+                             // `begin_request` decides whether the first
+                             // Layerwise step must re-score (Query) or may keep
+                             // the already-effective selection.
+-                            let _ = rig
+-                                .model
+-                                .kvmem
+-                                .as_mut()
+-                                .map(|ctl| ctl.set_request_query(slot.0, req.query));
++                            let _ = rig.model.kvmem.as_mut().map(|ctl| {
++                                ctl.set_request_query(slot.0, req.query).and_then(|_| {
++                                    ctl.set_request_group(slot.0, convo_group(&req.convo))
++                                })
++                            });
+                             let fed = rig
+                                 .model
+                                 .kvmem
+@@ -9285,12 +9297,15 @@ fn admit(
+         // 期2.3: the fresh session's question identity (the reuse import and
+         // any later checkpoint freeze both read it). reset_slot cleared the
+         // previous session's spans — this is the first request of a new one.
+-        if let Err(e) = ctl.set_request_query(slot.0, req.query) {
++        let request_meta = ctl
++            .set_request_query(slot.0, req.query)
++            .and_then(|_| ctl.set_request_group(slot.0, convo_group(&req.convo)));
++        if let Err(e) = request_meta {
+             let _ = send_event(
+                 &req.reply,
+                 Event::Rejected {
+                     class: RejectClass::Internal,
+-                    reason: format!("kvmem query span: {e}"),
++                    reason: format!("kvmem request metadata: {e}"),
+                 },
+             );
+             rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+@@ -11236,3 +11251,16 @@ mod speculative_contract_tests {
+         assert_eq!(dst.accepted_tokens, 2);
+     }
+ }
++
++#[cfg(test)]
++mod convo_group_tests {
++    /// 期3 G3: the conversation-lineage hash is stable per convo and empty is
++    /// the unknown group (independent, never merged).
++    #[test]
++    fn convo_group_is_stable_and_empty_is_unknown() {
++        assert_eq!(super::convo_group(&[]), 0);
++        let a = vec![1u64, 2, 3, 4];
++        assert_eq!(super::convo_group(&a), super::convo_group(&a));
++        assert_ne!(super::convo_group(&a), super::convo_group(&[1, 2, 3, 5]));
++    }
++}
+diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
+index c8524f6f4..dcbeee066 100644
+--- a/crates/hipfire-cli/src/serve/metrics.rs
++++ b/crates/hipfire-cli/src/serve/metrics.rs
+@@ -665,6 +665,18 @@ impl Metrics {
+                     "Prefix reuses with no restorable DFlash2 draft image (draft reseeds).",
+                     s.kvmem.draft_image_misses,
+                 );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_content_groups",
++                    "Distinct content groups retained in the prefix directory.",
++                    s.kvmem.content_groups as f64,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_content_retirements_total",
++                    "Prefix entries retired by the group-aware publication plan.",
++                    s.kvmem.content_retirements,
++                );
+             }
+         }
+ 
+@@ -1085,6 +1097,7 @@ mod tests {
+                 "prefix_freezes": 5, "prefix_hits": 4,
+                 "prefix_misses": 6, "prefix_evictions": 1,
+                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
++                "content_groups": 2, "content_retirements": 1,
+             },
+         });
+         let kvmeta = ServeMeta {
+@@ -1113,6 +1126,8 @@ mod tests {
+             "hipfire_kvmem_draft_images_total 2\n",
+             "hipfire_kvmem_draft_image_hits_total 1\n",
+             "hipfire_kvmem_draft_image_misses_total 1\n",
++            "hipfire_kvmem_content_groups 2\n",
++            "hipfire_kvmem_content_retirements_total 1\n",
+         ] {
+             assert!(out.contains(sample), "{sample}: {out}");
+         }
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index eab5f2224..c53acaf23 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -248,6 +248,10 @@ pub struct KvMemStats {
+     pub draft_images: u64,
+     pub draft_image_hits: u64,
+     pub draft_image_misses: u64,
++    /// 期3 G3: distinct content groups retained in the prefix directory.
++    pub content_groups: u64,
++    /// Entries retired by the group-aware publication plan.
++    pub content_retirements: u64,
+ }
+ 
+ /// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`
