@@ -21,6 +21,20 @@ EXE = '.exe' if os.name == 'nt' else ''
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_rdna3_package_starts_with_text_defaults_without_overwriting_saved_draft(self):
+        package=Path(self.tmp.name)/'rdna3-package'
+        scripts=package/'scripts';(scripts/'windows').mkdir(parents=True)
+        (scripts/'windows/start-backend.ps1').write_bytes((console.ROOT/'scripts/windows/start-backend.ps1').read_bytes())
+        manifest=json.loads((console.ROOT/'scripts/launcher-capabilities.json').read_text(encoding='utf8'))
+        manifest['backends']['radiance']['build_profile']='qwen35-iqr-rdna3'
+        (scripts/'launcher-capabilities.json').write_text(json.dumps(manifest),encoding='utf8')
+        (package/'console-build.json').write_text(json.dumps({'supported_backends':['radiance']}),encoding='utf8')
+        controller=console.Controller(package,package/'state',18197)
+        draft=controller.draft()['parameters']
+        self.assertEqual((draft['Backend'],draft['Budget'],draft['KvType'],draft['SpeculativeMode']),('radiance',1024,'bf16','none'))
+        controller.draft_path.write_text(json.dumps({'schema_version':1,'parameters':dict(draft,Budget=2048)}),encoding='utf8')
+        self.assertEqual(controller.draft()['parameters']['Budget'],2048)
+
     def test_ninfer_only_package_filters_backends_and_rejects_old_backend_drafts(self):
         package = Path(self.tmp.name) / 'ninfer-package'
         launcher = package / 'scripts/windows/start-backend.ps1'

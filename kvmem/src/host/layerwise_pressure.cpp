@@ -28,6 +28,18 @@ struct Sum {
 void finite(double x) {
     if (!std::isfinite(x) || x<0) fail(MemoryErrorCode::InvalidPlan,"invalid native prefill attention mass");
 }
+size_t distance_bucket(uint64_t position,uint64_t start,uint32_t block_tokens) {
+    // Subtract before comparing: original coordinates can be near UINT64_MAX,
+    // and a currently visible partial block can end after this sampled row.
+    uint64_t distance=position>start ? position-start : 0;
+    distance=distance>block_tokens ? distance-block_tokens : 0;
+    size_t bucket=0;
+    for (uint64_t end=32;bucket+1<layerwise_lift_buckets && distance>=end;end*=2) ++bucket;
+    return bucket;
+}
+bool valid_scorer(LayerwisePrefillScorer scorer) {
+    return scorer==LayerwisePrefillScorer::Attention || scorer==LayerwisePrefillScorer::Lift;
+}
 const LayerwisePrefillValue* find(const LayerwisePrefillState& state, uint64_t start) {
     const auto i=std::lower_bound(state.values.begin(),state.values.end(),start,
         [](const auto& x,uint64_t k){return x.original_start<k;});
@@ -42,10 +54,10 @@ LayerwisePrefillPressure::LayerwisePrefillPressure(SessionIdentity session,
         !std::is_sorted(layers_.begin(),layers_.end()) ||
         std::adjacent_find(layers_.begin(),layers_.end())!=layers_.end() ||
         !options.block_tokens || !options.select_tokens || options.select_tokens%options.block_tokens || !options.interval ||
-        !std::isfinite(options.half_life) || options.half_life<=0)
+        !std::isfinite(options.half_life) || options.half_life<=0 || !valid_scorer(options.scorer))
         fail(MemoryErrorCode::InvalidPlan,"invalid per-layer prefill policy");
     add(options.select_tokens,options.reserve_tokens);
-    state_.session=session;
+    state_.session=session;state_.scorer=options.scorer;
     for (auto layer:layers_) state_.layers.push_back({layer,{},0,0,0});
 }
 
@@ -94,34 +106,96 @@ bool LayerwisePrefillPressure::accept(const LayerwisePrefillAcceptance& packet) 
             input.masses.size()!=input.history.size()*packet.rows.size())
             fail(MemoryErrorCode::InvalidPlan,"missing native prefill matrix rows/columns");
         const double decay=std::exp2(-double(end-old.end)/options_.half_life);
-        std::map<uint64_t,LayerwisePrefillValue> updated;
+        struct Update {
+            LayerwisePrefillValue value;
+            size_t exposed_row=std::numeric_limits<size_t>::max();
+        };
+        std::map<uint64_t,Update> updated;
         for (auto key:input.history) {
             if (key%options_.block_tokens) fail(MemoryErrorCode::InvalidPlan,"unaligned prefill logical key");
             const auto* prior=find(old,key);
-            updated.emplace(key,LayerwisePrefillValue{key,multiply(decay,prior?prior->mass:0),
-                                                        multiply(decay,prior?prior->exposure:0)});
+            updated.emplace(key,Update{{key,multiply(decay,prior?prior->mass:0),
+                                           multiply(decay,prior?prior->exposure:0),
+                                           multiply(decay,prior?prior->expected:0)}});
         }
+        // Resolve logical identities once per layer. Duplicate physical
+        // segments share one accumulator and one exposure marker per row.
+        // Iterate the original columns below to retain every addition's order.
+        std::vector<Update*> columns;
+        columns.reserve(std::min(input.starts.size(),input.history.size()));
+        for (size_t p=0;p<std::min(input.starts.size(),input.history.size());++p)
+            columns.push_back(&updated.at(input.history[p]));
         const double inv=1./packet.rows.size();
-        for (size_t row=0;row<packet.rows.size();++row) {
-            Sum sum;
-            for (size_t p=0;p<input.history.size();++p) {
-                const auto value=input.masses[row*input.history.size()+p]; finite(value); sum.add(value);
+        const bool lift=options_.scorer==LayerwisePrefillScorer::Lift;
+        std::vector<std::array<uint32_t,layerwise_lift_buckets>> counts;
+        std::array<double,layerwise_lift_buckets> means{};
+        if (lift) {
+            counts.resize(packet.rows.size());
+            // First matrix read validates and includes this entire accepted
+            // packet in the profile before any of its expectations are used.
+            for (size_t row=0;row<packet.rows.size();++row) {
+                const auto physical=add(packet.local_begin,packet.rows[row]);
+                const auto original=add(end-packet.count,packet.rows[row]);
+                std::array<double,layerwise_lift_buckets> masses{};
+                Sum sum;
+                for (size_t p=0;p<input.history.size();++p) {
+                    const double value=input.masses[row*input.history.size()+p];finite(value);sum.add(value);
+                    if (p<columns.size() && input.starts[p]<=physical) {
+                        const auto bucket=distance_bucket(original,input.history[p],options_.block_tokens);
+                        masses[bucket]+=value;
+                        if (counts[row][bucket]==UINT32_MAX) fail(MemoryErrorCode::InvalidPlan,"lift pair count overflows");
+                        ++counts[row][bucket];
+                    }
+                }
+                if (std::abs(sum.value()-1.)>.005)
+                    fail(MemoryErrorCode::InvalidPlan,"invalid native prefill attention mass sum");
+                for (size_t b=0;b<layerwise_lift_buckets;++b) {
+                    target.bucket_mass[b]+=masses[b];target.bucket_pairs[b]+=counts[row][b];
+                    finite(target.bucket_mass[b]);finite(target.bucket_pairs[b]);
+                }
             }
-            if (std::abs(sum.value()-1.)>.005)
-                fail(MemoryErrorCode::InvalidPlan,"invalid native prefill attention mass sum");
+            for (size_t b=0;b<layerwise_lift_buckets;++b)
+                means[b]=target.bucket_pairs[b]>0 ? target.bucket_mass[b]/target.bucket_pairs[b] : 0.;
+        }
+        for (size_t row=0;row<packet.rows.size();++row) {
+            if (!lift) {
+                Sum sum;
+                for (size_t p=0;p<input.history.size();++p) {
+                    const auto value=input.masses[row*input.history.size()+p]; finite(value); sum.add(value);
+                }
+                if (std::abs(sum.value()-1.)>.005)
+                    fail(MemoryErrorCode::InvalidPlan,"invalid native prefill attention mass sum");
+            }
+            std::array<double,layerwise_lift_buckets> scaled{};
+            if (lift) {
+                double norm=0.;uint64_t visible=0;
+                for (size_t b=0;b<layerwise_lift_buckets;++b) {
+                    norm+=counts[row][b]*means[b];visible+=counts[row][b];
+                }
+                finite(norm);
+                for (size_t b=0;b<layerwise_lift_buckets;++b)
+                    scaled[b]=multiply(inv,norm>0 ? means[b]/norm : 1./std::max<uint64_t>(visible,1));
+            }
             const auto position=add(packet.local_begin,packet.rows[row]);
-            std::set<uint64_t> exposed;
             // Preserve upstream's starts/history zip boundary. Valid native
             // segment packets have one start per history entry.
-            for (size_t p=0;p<std::min(input.starts.size(),input.history.size());++p) {
+            for (size_t p=0;p<columns.size();++p) {
                 if (input.starts[p]>position) continue;
-                auto& value=updated.at(input.history[p]);
-                value.mass+=multiply(inv,input.masses[row*input.history.size()+p]);
-                if (exposed.insert(input.history[p]).second) value.exposure+=inv;
+                auto& update=*columns[p];
+                update.value.mass+=multiply(inv,input.masses[row*input.history.size()+p]);
+                if (lift) {
+                    const auto original=add(end-packet.count,packet.rows[row]);
+                    update.value.expected+=scaled[distance_bucket(original,input.history[p],options_.block_tokens)];
+                    finite(update.value.expected);
+                }
+                if (update.exposed_row!=row) {
+                    update.exposed_row=row;
+                    update.value.exposure+=inv;
+                }
             }
         }
         target.values.clear();
-        for (const auto& value:updated) target.values.push_back(value.second);
+        for (const auto& value:updated) target.values.push_back(value.second.value);
         target.end=end; target.samples=add(target.samples,packet.rows.size()); target.chunks=add(target.chunks,1);
     }
     state_=std::move(next);
@@ -130,22 +204,34 @@ bool LayerwisePrefillPressure::accept(const LayerwisePrefillAcceptance& packet) 
 
 void LayerwisePrefillPressure::restore(LayerwisePrefillSnapshot state,uint64_t position) {
     if (!(state.session==session_)) fail(MemoryErrorCode::Stale,"foreign prefill snapshot");
-    if (state.layers.size()!=layers_.size()) fail(MemoryErrorCode::InvalidPlan,"incomplete prefill snapshot");
+    if (state.layers.size()!=layers_.size() || state.scorer!=options_.scorer)
+        fail(MemoryErrorCode::InvalidPlan,"incomplete prefill snapshot or different scoring policy");
     for (size_t i=0;i<layers_.size();++i) {
         const auto& layer=state.layers[i];
         if (layer.model_layer!=layers_[i] || layer.end!=state.layers[0].end ||
             layer.samples!=state.layers[0].samples || layer.chunks!=state.layers[0].chunks)
             fail(MemoryErrorCode::InvalidPlan,"inconsistent accepted prefill sampling boundary");
+        for (size_t b=0;b<layerwise_lift_buckets;++b) {
+            finite(layer.bucket_mass[b]);finite(layer.bucket_pairs[b]);
+            if ((!layer.bucket_pairs[b] && layer.bucket_mass[b]) ||
+                (options_.scorer==LayerwisePrefillScorer::Attention && (layer.bucket_mass[b] || layer.bucket_pairs[b])))
+                fail(MemoryErrorCode::InvalidPlan,"invalid prefill lift profile");
+        }
         uint64_t prior=0; bool first=true;
         for (const auto& value:layer.values) {
-            finite(value.mass); finite(value.exposure);
+            finite(value.mass); finite(value.exposure);finite(value.expected);
+            if (options_.scorer==LayerwisePrefillScorer::Attention && value.expected)
+                fail(MemoryErrorCode::InvalidPlan,"unexpected lift values in attention snapshot");
             if (value.original_start%options_.block_tokens || (!first && value.original_start<=prior))
                 fail(MemoryErrorCode::InvalidPlan,"invalid prefill snapshot logical keys");
             first=false; prior=value.original_start;
         }
     }
     if (state.layers[0].end>position)
-        for (auto& layer:state.layers) { layer.values.clear(); layer.end=layer.samples=layer.chunks=0; }
+        for (auto& layer:state.layers) {
+            layer.values.clear();layer.end=layer.samples=layer.chunks=0;
+            layer.bucket_mass.fill(0.);layer.bucket_pairs.fill(0.);
+        }
     state_=std::move(state);
 }
 
@@ -153,7 +239,7 @@ namespace {
 std::vector<LayerwisePressureChoice> select_seeds(const LayerwiseMemoryCatalog& catalog,
     const SessionIdentity& session_,const std::vector<uint32_t>& layers_,
     const LayerwisePrefillOptions& options_,const LayerwisePrefillSnapshot& state_,
-    const std::vector<uint64_t>& mandatory,uint64_t budget,uint32_t sinks) {
+    const std::vector<uint64_t>& mandatory,uint64_t budget,uint32_t sinks,bool lift) {
     if (catalog.descriptor().layout.block_tokens!=options_.block_tokens ||
         catalog.layers().size()!=layers_.size() || !budget || budget%options_.block_tokens ||
         budget>options_.select_tokens || budget/options_.block_tokens>UINT32_MAX ||
@@ -178,13 +264,21 @@ std::vector<LayerwisePressureChoice> select_seeds(const LayerwiseMemoryCatalog& 
         LayerwisePressureChoice choice; choice.model_layer=layers_[l];
         choice.accepted_score_end=history.end; choice.samples=history.samples; choice.chunks=history.chunks;
         std::vector<uint32_t> candidates,required;
-        bool positive=false;
+        bool positive=false,have_lift=false;
+        double lift_top=0.;
+        if (lift) for (const auto& value:history.values) {
+            have_lift|=value.expected<=0 || value.mass>0;
+            if (value.expected>0) {const auto score=value.mass/value.expected;finite(score);lift_top=std::max(lift_top,score);}
+        }
+        lift_top+=1.;
         for (size_t i=0;i<memory.blocks.size();++i) {
             const auto& block=memory.blocks[i].block;
             if (!resident.count(block.id)) continue;
             candidates.push_back(uint32_t(i)); choice.candidates.push_back(block.id);
             const auto* value=find(history,block.original_start);
-            const double score=value && value->exposure>0 ? value->mass/value->exposure : 0;
+            const double score=lift && have_lift ?
+                (value && value->expected>0 ? value->mass/value->expected : lift_top) :
+                (value && value->exposure>0 ? value->mass/value->exposure : 0);
             finite(score); choice.scores.push_back(score); positive|=score>0;
             if (fixed.count(block.id)) {required.push_back(uint32_t(i)); choice.fixed.push_back(block.id);}
         }
@@ -221,7 +315,8 @@ void valid_stamp(const MemoryStamp& stamp,const SessionIdentity& session) {
 
 std::vector<LayerwisePressureChoice> LayerwisePrefillPressure::select(const LayerwiseMemoryCatalog& catalog,
     const std::vector<uint64_t>& mandatory,uint64_t budget,uint32_t sinks) const {
-    return select_seeds(catalog,session_,layers_,options_,state_,mandatory,budget,sinks);
+    return select_seeds(catalog,session_,layers_,options_,state_,mandatory,budget,sinks,
+        options_.scorer==LayerwisePrefillScorer::Lift);
 }
 
 LayerwiseOutputPressure::LayerwiseOutputPressure(SessionIdentity session,std::vector<uint32_t> layers,
@@ -449,9 +544,9 @@ std::vector<LayerwisePressureChoice> LayerwiseOutputPressure::select(const Layer
     const auto& config=prefill.options();
     if (!(fallback.session==session_) || fallback.layers.size()!=layers_.size())
         fail(MemoryErrorCode::Stale,"foreign output Pressure prefill fallback");
-    if (std::tie(config.block_tokens,config.select_tokens,config.reserve_tokens,config.interval,config.stride,config.half_life)!=
+    if (std::tie(config.block_tokens,config.select_tokens,config.reserve_tokens,config.interval,config.stride,config.half_life,config.scorer)!=
         std::tie(prefill_options_.block_tokens,prefill_options_.select_tokens,prefill_options_.reserve_tokens,
-                 prefill_options_.interval,prefill_options_.stride,prefill_options_.half_life))
+                 prefill_options_.interval,prefill_options_.stride,prefill_options_.half_life,prefill_options_.scorer))
         fail(MemoryErrorCode::InvalidPlan,"output Pressure fallback has another sampling policy");
     auto seed=fallback;
     std::vector<bool> output(layers_.size(),false);
@@ -471,7 +566,9 @@ std::vector<LayerwisePressureChoice> LayerwiseOutputPressure::select(const Layer
         }
         if (output[i]) { seed.layers[i].values=std::move(values); seed.layers[i].end=state_.accepted_end; }
     }
-    auto choices=select_seeds(catalog,session_,layers_,prefill_options_,seed,mandatory,budget,sinks);
+    // Output scores and their prefill fallback keep the ordinary ratio; only
+    // an ordinary prefill Pressure call uses the optional lift ranking.
+    auto choices=select_seeds(catalog,session_,layers_,prefill_options_,seed,mandatory,budget,sinks,false);
     for (size_t i=0;i<choices.size();++i) {
         choices[i].source=output[i]?LayerwisePressureSource::Output:LayerwisePressureSource::Prefill;
         choices[i].output_samples=state_.layers[i].samples; choices[i].output_rounds=state_.layers[i].rounds;

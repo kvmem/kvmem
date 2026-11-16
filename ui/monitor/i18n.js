@@ -89,6 +89,8 @@
     "{0} 卡协同 · {1}": "{0} GPUs · {1}", "{0} 张设备参与当前服务": "Devices assigned to this service: {0}",
     "设备绑定信息未提供": "Device assignment unavailable",
     "当前服务尚未提供设备绑定信息；不根据负载猜测推理显卡。": "This service has not provided device assignments. Inference GPUs are not inferred from load.",
+    "部分指标未采集": "Some metrics unavailable",
+    "驱动未提供整卡功耗读数": "The driver did not provide total board power readings",
     "当前模型未使用显卡。": "This model is not using a GPU.",
     "只显示当前服务绑定的显卡 · 整卡读数包含其他进程": "Only GPUs assigned to this service · Readings include other processes",
     "推理设备": "Inference device", "设备身份未采集": "Device identity unavailable", "读数未采集": "Readings unavailable",

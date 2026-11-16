@@ -10,7 +10,7 @@ from inspect_rad import inspect
 
 
 def container(path, names, metadata=(), arch='qwen35', quant='fp8_e4m3', vocab=True,
-              template='{{ messages }}'):
+              template='{{ messages }}', mtp_head_dtype=None):
     """Small valid directory fixture; no real model payload or GPU needed."""
     header = struct.Struct("<II30Q")
     entry = struct.Struct("<3Q2I6q3iI5Q")
@@ -28,6 +28,8 @@ def container(path, names, metadata=(), arch='qwen35', quant='fp8_e4m3', vocab=T
     for name in names:
         values = [0] * 20
         values[0], values[4], values[5], values[11] = string(name), 1, 1, -1
+        if name == 'mtp.draft_head.weight' and mtp_head_dtype is not None:
+            values[14] = 1
         entries.append(entry.pack(*values))
     meta = []
     for key, value in metadata:
@@ -41,6 +43,13 @@ def container(path, names, metadata=(), arch='qwen35', quant='fp8_e4m3', vocab=T
     h[10], h[11] = h[8] + h[9], len(meta)
     h[12], h[13] = h[10] + 24 * len(meta), len(entries)
     h[2] = h[12] + len(entries) * entry.size
+    encodings = b''
+    if mtp_head_dtype is not None:
+        encodings = bytearray(568)
+        struct.pack_into('<i', encodings, 48, 1)
+        struct.pack_into('<I', encodings, 80, mtp_head_dtype)
+        h[16], h[17] = h[2], 1
+        h[2] += len(encodings)
     tail = b''
     if vocab:
         padding = (-h[2]) % 8
@@ -50,7 +59,7 @@ def container(path, names, metadata=(), arch='qwen35', quant='fp8_e4m3', vocab=T
         values[0],values[1],values[4],values[17]=1,1,h[18]+vh.size,template_offset
         tail=b'\0'*padding+vh.pack(*values)+struct.pack('<Q',token_offset)
         h[2]+=len(tail)
-    path.write_bytes(header.pack(*h) + strings + b"".join(meta) + b"".join(entries) + tail)
+    path.write_bytes(header.pack(*h) + strings + b"".join(meta) + b"".join(entries) + encodings + tail)
 
 
 class DraftControlTest(unittest.TestCase):
@@ -76,9 +85,40 @@ class DraftControlTest(unittest.TestCase):
     def test_mtp_uses_existing_native_path(self):
         container(self.model, ["mtp.fc.weight"], [("mtp_num_hidden_layers", 1)])
         self.assertEqual(resolve(self.model, "mtp")["depth"], 3)
+        self.assertEqual(resolve(self.model, "mtp")["mtp_head_policy"], "shared")
         self.assertEqual(resolve(self.model, "mtp", 2)["depth"], 2)
         with self.assertRaisesRegex(ValueError, "positive depth"):
             resolve(self.model, "mtp", 0)
+
+    def test_vocab_weighted_mtp_requires_dedicated_u2_head(self):
+        names=['output.k3.weight', 'output.vrow', 'mtp.fc.weight', 'mtp.draft_head.weight']
+        meta=[('mtp_num_hidden_layers', 1)]
+        container(self.model, names, meta, quant='w8a8_fwht128', mtp_head_dtype=20)
+        info=inspect(self.model)
+        self.assertEqual(info['draft_features'], {'vocab_weighted_output':True,'mtp_u2_output':True})
+        self.assertEqual(resolve(self.model,'mtp',3)['mtp_head_policy'],'auto')
+        container(self.model, names, meta, quant='w8a8_fwht128', mtp_head_dtype=2)
+        with self.assertRaisesRegex(ValueError,'requires a dedicated U2'):
+            resolve(self.model,'mtp')
+        container(self.model, names[:-1], meta, quant='w8a8_fwht128')
+        with self.assertRaisesRegex(ValueError,'requires a dedicated U2'):
+            resolve(self.model,'mtp')
+
+    def test_u2_head_does_not_change_ordinary_shared_head_policy(self):
+        container(self.model, ['output.weight','mtp.fc.weight','mtp.draft_head.weight'],
+                  [('mtp_num_hidden_layers', 1)], mtp_head_dtype=20)
+        self.assertEqual(resolve(self.model,'mtp')['mtp_head_policy'],'shared')
+
+    def test_partial_directory_can_report_an_unavailable_head_encoding(self):
+        container(self.model,['output.k3.weight','mtp.draft_head.weight'],
+                  [('mtp_num_hidden_layers',1)],mtp_head_dtype=20)
+        data=self.model.read_bytes()
+        enc_offset=struct.unpack_from('<II30Q',data)[16]
+        self.model.write_bytes(data[:enc_offset])
+        info=inspect(self.model,allow_partial=True)
+        self.assertFalse(info['complete_container'])
+        self.assertTrue(info['draft_features']['vocab_weighted_output'])
+        self.assertIsNone(info['draft_features']['mtp_u2_output'])
 
     def test_native_converter_string_integers(self):
         container(self.model, ["mtp.fc.weight"], [("mtp_num_hidden_layers", "1")])

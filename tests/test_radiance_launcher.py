@@ -33,6 +33,20 @@ class RadiancePlanTest(unittest.TestCase):
         parameters.update(settings)
         return build_plan(dict(schema_version=1,parameters=parameters))
 
+    def test_rdna3_profile_selects_qualified_kernel_and_rolling_path(self):
+        from launcher.config import RDNA3_IQR_DEFAULTS
+        parameters={**RDNA3_IQR_DEFAULTS,'Model':str(self.model),'Worker':str(self.worker),
+                    'RadianceHome':str(self.home),'Gpu':'GPU-65471d75ce486b4f'}
+        for profile in ('qwen35-iqr-gfx1101','qwen35-iqr-rdna3'):
+            plan=build_radiance_plan(parameters,self.root,'windows',False,{'build_profile':profile})
+            args=plan['argv']
+            self.assertEqual(args[args.index('--kernels')+1],'libr3diqr,libr3d')
+            self.assertIn('--kvmem-rolling-generation',args)
+            self.assertEqual((plan['effective_parameters']['Budget'],plan['effective_parameters']['KvType']),(1024,'bf16'))
+        normal=build_radiance_plan(parameters,self.root,'windows',False,{})['argv']
+        self.assertNotIn('--kernels',normal)
+        self.assertNotIn('--kvmem-rolling-generation',normal)
+
     def test_prefill_default_and_explicit_override(self):
         for settings, expected in (({}, 256), ({'Prefill': 512}, 512)):
             with self.subTest(settings=settings):
@@ -123,6 +137,18 @@ class RadiancePlanTest(unittest.TestCase):
             with self.subTest(values=values),self.assertRaises(ValueError):
                 self.plan(SpeculativeMode='mtp',**values)
 
+    def test_vocab_weighted_mtp_selects_u2_without_changing_other_models(self):
+        meta=[('mtp_num_hidden_layers',1)]
+        names=['output.k3.weight','output.vrow','mtp.fc.weight','mtp.draft_head.weight']
+        container(self.model,names,meta,quant='w8a8_fwht128',mtp_head_dtype=20)
+        self.assertEqual(self.plan(SpeculativeMode='mtp')['environment']['KVMEM_RAD_MTP_HEAD'],'auto')
+        self.assertEqual(self.plan(SpeculativeMode='none')['environment']['KVMEM_RAD_MTP_HEAD'],'shared')
+        container(self.model,names,meta,quant='w8a8_fwht128',mtp_head_dtype=2)
+        with self.assertRaisesRegex(ValueError,'requires a dedicated U2'):
+            self.plan(SpeculativeMode='mtp')
+        container(self.model,['output.weight','mtp.fc.weight','mtp.draft_head.weight'],meta,mtp_head_dtype=20)
+        self.assertEqual(self.plan(SpeculativeMode='mtp')['environment']['KVMEM_RAD_MTP_HEAD'],'shared')
+
     def test_embedded_dflash_uses_its_trained_depth(self):
         container(self.model,['dflash.fc.weight'],[
             ('draft.architectures','DFlash2Model'),('draft.dflash_config.block_size',8)])
@@ -205,11 +231,14 @@ class RadiancePlanTest(unittest.TestCase):
         first, second = ('GPU-' + x * 32 for x in ('a', 'b'))
         parameters = dict(Backend='radiance', Model=str(self.model), Worker=str(self.worker),
                           RadianceHome=str(self.home), Gpu=second + ',' + first)
-        devices = [dict(uuid=first, ordinal=0), dict(uuid=second, ordinal=2)]
+        devices = [dict(uuid=first, ordinal=0, name='AMD GPU', pci_bus_id='0000:01:00.0'),
+                   dict(uuid=second, ordinal=2, name='AMD GPU', pci_bus_id='0000:24:00.0')]
         with mock.patch('console_hardware.windows_hip_inventory', return_value=devices):
             plan = build_radiance_plan(parameters, self.root, 'windows', False, {})
             self.assertEqual(plan['environment']['HIP_VISIBLE_DEVICES'], '2,0')
             self.assertNotIn('ROCR_VISIBLE_DEVICES', plan['environment'])
+            self.assertEqual([d['pci_bus_id'] for d in plan['monitor_devices']], ['0000:24:00.0','0000:01:00.0'])
+            self.assertEqual([d['hip_ordinal'] for d in plan['monitor_devices']], [0,1])
             with self.assertRaisesRegex(ValueError, 'distinct AMD GPUs'):
                 build_radiance_plan({**parameters, 'Gpu': first + ',' + first.upper()}, self.root, 'windows', False, {})
         for invalid in (devices[:1], devices + [devices[1]]):
@@ -264,6 +293,18 @@ class RadiancePlanTest(unittest.TestCase):
             self.assertEqual(plan['argv'][plan['argv'].index('--embedding-placement')+1],placement)
             self.assertEqual(plan['effective_parameters']['EmbeddingPlacement'],placement)
         with self.assertRaises(ValueError):self.plan(EmbeddingPlacement='disk')
+
+    def test_weight_offload_is_explicit_and_separate_from_kv_host_memory(self):
+        default=self.plan()['argv']
+        self.assertEqual(default[default.index('--placement')+1],'all_vram')
+        self.assertEqual(default[default.index('--host-pool-mib')+1],'0')
+        args=self.plan(WeightPlacement='layer_offload',WeightHostMiB=8192,HostMiB=512)['argv']
+        self.assertEqual(args[args.index('--placement')+1],'layer_offload')
+        self.assertEqual(args[args.index('--host-pool-mib')+1],'8192')
+        self.assertEqual(args[args.index('--kvmem-host-mib')+1],'512')
+        for p in (dict(WeightPlacement='layer_offload',WeightHostMiB=0),
+                  dict(WeightPlacement='disk'),dict(WeightHostMiB=1048577)):
+            with self.subTest(p=p),self.assertRaises(ValueError):self.plan(**p)
 
     def test_mtp_default_and_legacy_alias(self):
         for values in (dict(SpeculativeMode='mtp'),dict(MtpDrafts=3)):

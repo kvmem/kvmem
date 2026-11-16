@@ -1685,16 +1685,29 @@ static std::string trim_copy(const std::string & s) {
     return s.substr(a, b - a);
 }
 
-// Last ChatML user *role block* in the rendered prompt, not rfind(content).
-// Thinking/tool text can quote last_user; only <|im_start|>user ... <|im_end|>
-// counts. If last_user is set, pick the last block whose content equals it
+// Gemma-4's native template has different role delimiters from ChatML. Keep
+// explicitly overridden ChatML templates on their existing path.
+static bool uses_gemma4_turns(const LlamaEngineState & st) {
+    char arch[32] = {};
+    if (!st.model || !st.tmpls ||
+            llama_model_meta_val_str(st.model, "general.architecture", arch, sizeof(arch)) < 0 ||
+            std::strcmp(arch, "gemma4") != 0) return false;
+    const auto source = common_chat_templates_source(st.tmpls.get());
+    return source.find("<|turn>") != std::string::npos && source.find("<turn|>") != std::string::npos &&
+        source.find("<|im_start|>") == std::string::npos;
+}
+
+// Last user role block in the rendered prompt, not rfind(content).
+// Thinking/tool text can quote last_user. If last_user is set, pick the last
+// block whose content equals it
 // (two identical user turns → the later block).
 static bool find_last_user_role_block(const std::string & prompt, const std::string & last_user,
-                                      size_t & content0, size_t & content1, int & n_blocks, int & pick) {
-    static const char * hdrs[] = {
-        "<|im_start|>user\n",
-        "<|im_start|>user\r\n",
-        "<|im_start|>user",
+                                      size_t & content0, size_t & content1, int & n_blocks, int & pick,
+                                      bool gemma4) {
+    const char * hdrs[] = {
+        gemma4 ? "<|turn>user\n"   : "<|im_start|>user\n",
+        gemma4 ? "<|turn>user\r\n" : "<|im_start|>user\r\n",
+        gemma4 ? "<|turn>user"     : "<|im_start|>user",
     };
     struct Blk {
         size_t c0;
@@ -1720,7 +1733,7 @@ static bool find_last_user_role_block(const std::string & prompt, const std::str
             break;
         }
         const size_t c0 = best + best_len;
-        const size_t end = prompt.find("<|im_end|>", c0);
+        const size_t end = prompt.find(gemma4 ? "<turn|>" : "<|im_end|>", c0);
         if (end == std::string::npos) {
             break;
         }
@@ -1765,7 +1778,7 @@ void llama_driver_query_span(LlamaEngineState & st, const std::string & prompt, 
     size_t c1 = 0;
     int n_blocks = 0;
     int pick = -1;
-    if (find_last_user_role_block(prompt, last_user, c0, c1, n_blocks, pick)) {
+    if (find_last_user_role_block(prompt, last_user, c0, c1, n_blocks, pick, uses_gemma4_turns(st))) {
         const std::string prefix = prompt.substr(0, c0);
         const std::string through = prompt.substr(0, c1);
         qbegin = (int) llama_driver_tokenize(st.vocab, prefix, true).size();
@@ -1791,11 +1804,12 @@ void llama_driver_query_span(LlamaEngineState & st, const std::string & prompt, 
 
 std::vector<kvmem::GraphMessageSpan> llama_driver_graph_messages(const LlamaEngineState& st,
     const common_chat_templates_inputs& inputs,const common_chat_params& formatted,const kvmem_prompt& prompt) {
-    // Recover ChatML headers only from template-origin text, never from user
+    // Recover role headers only from template-origin text, never from user
     // content. Unsupported templates/media retain the specified unknown weight.
     if(prompt.has_media()) return {};
     const auto text=formatted.prompt.str();
-    const std::string marker="<|im_start|>";
+    const bool gemma4=uses_gemma4_turns(st);
+    const std::string marker=gemma4 ? "<|turn>" : "<|im_start|>";
     std::vector<size_t> boundaries;
     size_t base=0;
     for(const auto& part:formatted.prompt.parts) {
@@ -1808,7 +1822,9 @@ std::vector<kvmem::GraphMessageSpan> llama_driver_graph_messages(const LlamaEngi
         const auto begin=boundaries[i]+marker.size();
         const auto end=text.find_first_of(" \n\r",begin);
         const auto role=text.substr(begin,end-begin);
-        if(role!=(i<inputs.messages.size()?inputs.messages[i].role:"assistant")) return {};
+        auto expected=i<inputs.messages.size()?inputs.messages[i].role:"assistant";
+        if(gemma4 && expected=="assistant") expected="model";
+        if(role!=expected) return {};
     }
     std::vector<uint64_t> rows(boundaries.size(),UINT64_MAX);
     size_t cursor=0,next=0;
@@ -1848,13 +1864,14 @@ bool llama_driver_native_query_span(const LlamaEngineState & st, const std::stri
     }
     size_t c0 = 0, c1 = 0;
     int count = 0, pick = -1;
-    if (!find_last_user_role_block(prefix, "", c0, c1, count, pick) ||
+    const bool gemma4 = uses_gemma4_turns(st);
+    if (!find_last_user_role_block(prefix, "", c0, c1, count, pick, gemma4) ||
             formatted.compare(0, c1, prefix, 0, c1) != 0) return false;
     int full_count = 0, unused = -1;
-    if (!find_last_user_role_block(formatted, "", c0, c1, full_count, unused)) return false;
+    if (!find_last_user_role_block(formatted, "", c0, c1, full_count, unused, gemma4)) return false;
     common_chat_msg_delimiters delimiters;
-    delimiters.add(COMMON_CHAT_ROLE_USER, "<|im_start|>user");
-    delimiters.add(COMMON_CHAT_ROLE_UNKNOWN, "<|im_end|>");
+    delimiters.add(COMMON_CHAT_ROLE_USER, gemma4 ? "<|turn>user" : "<|im_start|>user");
+    delimiters.add(COMMON_CHAT_ROLE_UNKNOWN, gemma4 ? "<turn|>" : "<|im_end|>");
     delimiters.tokenize(st.vocab);
     const auto spans = prompt.message_spans(delimiters);
     std::vector<common_chat_msg_span> users;
