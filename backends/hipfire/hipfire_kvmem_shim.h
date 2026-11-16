@@ -169,6 +169,13 @@ int hk_kv_snapshot_covers_packed(const hk_kv_snapshot * snap, uint32_t blocks, u
 // 1 when any block in [0, blocks) carries sealed packed k+v records.
 int hk_raw_store_has_packed(const hk_raw_store * st, uint32_t blocks);
 
+// 期3 G3-SSD: copy the sealed packed prefix of `blocks` complete blocks (all
+// layers, K and V) and the exact Mean-K sums from `src` into the EMPTY store
+// `dst`. Geometry must match; the two stores must live in different storage
+// accounts (content-cache account copy, never a shared-record import).
+// Returns HK_OK / HK_ERR.
+int hk_raw_store_copy_prefix_to(hk_raw_store * dst, hk_raw_store * src, uint32_t blocks);
+
 // ── P4.3 prefix reuse anchors (host-only, additive; core prefix_checkpoint) ──
 // Indivisible input group (mirrors kvmem::PrefixRange): the anchor must not
 // split [begin, end). Vision token spans are the typical groups.

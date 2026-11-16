@@ -538,6 +538,16 @@ uint32_t RawKvStore::mean_k_tokens(uint32_t block_id, uint32_t il) const {
     return k_is_f16() && !lb.k.empty() ? lb.n_tokens : 0;
 }
 
+bool RawKvStore::mean_sum(uint32_t block_id, uint32_t il, float * out) const {
+    if (!out || !cfg_.n_embd_k) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (block_id >= blocks_.size() || il >= cfg_.n_layer) return false;
+    const auto & lb = blocks_[block_id].layers[il];
+    if (!lb.mean_tokens || lb.k_sum.size() != cfg_.n_embd_k) return false;
+    std::copy(lb.k_sum.begin(), lb.k_sum.end(), out);
+    return true;
+}
+
 bool RawKvStore::copy_k(uint32_t block_id, uint32_t il, float * out) const {
     if (!out || !k_is_f16()) return false;
     std::lock_guard<std::mutex> lk(mu_);
