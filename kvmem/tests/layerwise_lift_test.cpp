@@ -7,11 +7,18 @@
 #include <map>
 
 namespace {
-void near(double a,long double b) {CHECK(std::abs(static_cast<long double>(a)-b)<1e-12L*std::max(1.L,std::abs(b)));}
+void near(double a,long double b) {
+    if (!(std::abs(static_cast<long double>(a)-b)<1e-12L*std::max(1.L,std::abs(b))))
+        std::fprintf(stderr,"lift reference mismatch: actual=%.17g expected=%.21Lg long_double_digits=%d\n",a,b,std::numeric_limits<long double>::digits);
+    CHECK(std::abs(static_cast<long double>(a)-b)<1e-12L*std::max(1.L,std::abs(b)));
+}
 size_t bucket(uint64_t row,uint64_t key,uint32_t block) {
-    long double distance=std::max(0.L,static_cast<long double>(row)-key-block);
+    // Coordinates are exact integers. MSVC long double has only 53 value bits:
+    // converting positions before subtraction can move a row across a bucket
+    // edge. Compare the integer gap directly with each page-end threshold.
+    if (row<=key) return 0;
     const uint64_t limits[]={32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536,131072};
-    for (size_t i=0;i<13;++i) if (distance<limits[i]) return i;
+    for (size_t i=0;i<13;++i) if (row-key<uint64_t(block)+limits[i]) return i;
     return 13;
 }
 struct Oracle {
@@ -143,6 +150,15 @@ void numerical_and_coordinates() {
     }
 }
 void bucket_boundaries_and_large_coordinates() {
+    // Exact boundary assertions keep the independent oracle portable even
+    // where long double has no extra precision over double.
+    for (const uint64_t key:{0ull,1ull<<54,UINT64_MAX-(1ull<<20)}) {
+        const uint64_t limits[]={32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536,131072};
+        for (const uint32_t block:{32u,64u}) for (size_t i=0;i<13;++i) {
+            CHECK(bucket(key+block+limits[i]-1,key,block)==i);
+            CHECK(bucket(key+block+limits[i],key,block)==i+1);
+        }
+    }
     for (const uint32_t block:{32u,64u}) {
         const uint64_t begin=(UINT64_MAX/1024-4)*1024;
         auto config=options(block);config.stride=1;
