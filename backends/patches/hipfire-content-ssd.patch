@@ -1,0 +1,403 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 531a9b66c..9d346ad2e 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -86,6 +86,8 @@ const DEFAULT_HOST_BYTES: u64 = 16 << 30;
+ 
+ /// Disk-tier capacity when `HIPFIRE_KVMEM_SPILL_DIR` is set.
+ const DEFAULT_SPILL_BYTES: u64 = 64 << 30;
++/// 期3 G3-SSD: default content-cache disk allowance (independent account).
++const DEFAULT_CONTENT_CACHE_BYTES: u64 = 2 << 30;
+ 
+ /// Generation reserve R added on top of the resident budget B to form the
+ /// layerwise window capacity (ninfer `device_tokens = selected + reserve`,
+@@ -910,6 +912,9 @@ pub struct KvMemCtl {
+     content_groups: usize,
+     /// Entries retired by the group-aware publication plan.
+     content_retirements_total: u64,
++    /// 期3 G3-SSD: separate tiered account for canonical content copies
++    /// (`HIPFIRE_KVMEM_CACHE_DIR/_BYTES`, independent of the spill account).
++    content_storage: Option<Storage>,
+     /// Observability counters (`KvMemCtl::stats`). Pure bookkeeping: no path
+     /// reads them back into selection/residency, so they cannot change KV
+     /// bytes; `/metrics` exports them via `EngineStats.kvmem`.
+@@ -1102,6 +1107,36 @@ impl KvMemCtl {
+                 "kvmem: HIPFIRE_KVMEM_CONTENT_GROUPS={content_groups} out of range [0,1024]"
+             ));
+         }
++        // 期3 G3-SSD: the content cache owns a SEPARATE tiered storage
++        // account (期3 SSD 裁决), so spill and cache cannot squeeze each
++        // other. Canonical copies are written here at freeze; reuse copies
++        // them back into the session account (the core refuses cross-account
++        // packed imports and a shared list would mix the ledgers).
++        let content_storage = match env_raw("HIPFIRE_KVMEM_CACHE_DIR") {
++            Some(dir) if !dir.is_empty() => {
++                let dir = PathBuf::from(dir);
++                std::fs::create_dir_all(&dir)
++                    .map_err(|e| format!("kvmem cache dir {}: {e}", dir.display()))?;
++                if let Some(spill) = env_raw("HIPFIRE_KVMEM_SPILL_DIR") {
++                    if !spill.is_empty() && PathBuf::from(&spill) == dir {
++                        return Err("kvmem: HIPFIRE_KVMEM_CACHE_DIR must differ from \
++                                    HIPFIRE_KVMEM_SPILL_DIR (separate accounts)"
++                            .to_string());
++                    }
++                }
++                let bytes = env_u64("HIPFIRE_KVMEM_CACHE_BYTES")
++                    .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES)
++                    .max(1);
++                let ram = env_u64("HIPFIRE_KVMEM_CACHE_RAM_BYTES")
++                    .unwrap_or(bytes.min(64 << 20))
++                    .clamp(1, bytes);
++                Some(
++                    Storage::new_tiered(ram, &dir, bytes)
++                        .map_err(|e| format!("kvmem cache storage: {e}"))?,
++                )
++            }
++            _ => None,
++        };
+         let storage = match env_raw("HIPFIRE_KVMEM_SPILL_DIR") {
+             Some(dir) => {
+                 let dir = PathBuf::from(dir);
+@@ -1262,6 +1297,7 @@ impl KvMemCtl {
+             }),
+             content_groups,
+             content_retirements_total: 0,
++            content_storage,
+             spill_pages_total: 0,
+             restore_pages_total: 0,
+             prefix_freezes_total: 0,
+@@ -1545,24 +1581,37 @@ impl KvMemCtl {
+         // mean-K stays private to the archive; the branch is truncated to the
+         // frontier (core fork_prefix contract). The source store keeps its
+         // own mutable statistics for blocks beyond the frontier.
+-        let canonical = st
++        let mut canonical = st
+             .raw
+             .fork_prefix(frontier)
+             .map_err(|e| format!("kvmem freeze_prefix fork: {e}"))?;
++        let blocks = frontier / KV_BLOCK_TOKENS as u32;
++        // 期3 G3-SSD: move the canonical archive into the separate content
++        // account (exact packed bytes + Mean-K sums copied; the session fork
++        // drops). Reuse materializes a session-account copy instead of sharing
++        // records across accounts (the core refuses cross-account imports and a
++        // shared list would mix the ledgers).
++        let mut canonical_on_content = false;
++        if let Some(content) = self.content_storage.as_ref() {
++            let copied = RawStore::new(self.raw_cfg, Some(content))
++                .map_err(|e| format!("kvmem content store: {e}"))?;
++            canonical
++                .copy_prefix_to(&copied, blocks)
++                .map_err(|e| format!("kvmem content copy: {e}"))?;
++            canonical = copied;
++            canonical_on_content = true;
++        }
+         let mean_tail = st
+             .raw
+             .mean_checkpoint(frontier)
+             .map_err(|e| format!("kvmem freeze_prefix mean checkpoint: {e}"))?;
+         // 期3 G4: the canonical side is also the core `KvSnapshot` over the
+-        // sealed packed records `fork_prefix` just shared (block-major,
+-        // layer-major, K then V). `fork_prefix` stays the fast reuse path; the
+-        // snapshot is the catalog-visible immutable object the G2/G3
+-        // directories share. Host-only fixtures without a packed archive carry
+-        // no snapshot (missing packed records are not an error there).
+-        let blocks = frontier / KV_BLOCK_TOKENS as u32;
+-        let kv_snapshot = if st.raw.has_packed(blocks) {
+-            let snapshot = st
+-                .raw
++        // sealed packed records of the canonical's account (block-major,
++        // layer-major, K then V). The snapshot is the catalog-visible immutable
++        // object the G2/G3 directories share. Host-only fixtures without a
++        // packed archive carry no snapshot (missing records are not an error).
++        let kv_snapshot = if canonical.has_packed(blocks) {
++            let snapshot = canonical
+                 .capture_snapshot(blocks, None)
+                 .map_err(|e| format!("kvmem freeze_prefix snapshot: {e}"))?;
+             if !snapshot.covers_packed(blocks, self.n_record_layers as u32) {
+@@ -1587,6 +1636,7 @@ impl KvMemCtl {
+         );
+         entry.original_query = original_query;
+         entry.group = st.convo_group;
++        entry.canonical_on_content = canonical_on_content;
+         if self.content_groups > 0
+             && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                 .ok()
+@@ -1624,6 +1674,11 @@ impl KvMemCtl {
+             displaced.extend(pruned);
+         }
+         self.prefix_evictions_total += 0;
++        // Idle sealed content payloads move to the content disk tier; the
++        // canonical records stay readable through leases on reuse.
++        if let Some(content) = self.content_storage.as_mut() {
++            let _ = content.trim(0);
++        }
+         Ok((inserted.unwrap_or(id), displaced, false))
+     }
+ 
+@@ -1728,6 +1783,11 @@ impl KvMemCtl {
+             prefix_evictions: self.prefix_evictions_total,
+             content_groups: self.prefix_catalog.group_count() as u64,
+             content_retirements: self.content_retirements_total,
++            content_cache_bytes: self
++                .content_storage
++                .as_ref()
++                .map_or(0, |s| s.charged_bytes()),
++            content_cache_disk_bytes: self.content_storage.as_ref().map_or(0, |s| s.disk_bytes()),
+             draft_images: self.draft_images_total,
+             draft_image_hits: self.draft_image_hits_total,
+             draft_image_misses: self.draft_image_misses_total,
+@@ -1812,10 +1872,23 @@ impl KvMemCtl {
+         ckpt.validate_reuse(prompt, layout_fingerprint(&self.raw_cfg))
+             .map_err(|e| format!("kvmem fork_prefix_into: {e}"))?;
+         let frontier = ckpt.frontier;
+-        let branch = ckpt
+-            .canonical()
+-            .fork_prefix(frontier)
+-            .map_err(|e| format!("kvmem fork_prefix_into fork: {e}"))?;
++        // 期3 G3-SSD: a content-account canonical cannot be forked into the
++        // session account (import/fork share allocations, mixing ledgers), so
++        // reuse copies the exact packed prefix + Mean-K sums back into a fresh
++        // session-account store. The plain fast path stays for session-account
++        // canonicals.
++        let branch = if ckpt.canonical_on_content {
++            let branch = RawStore::new(self.raw_cfg, Some(&self.storage))
++                .map_err(|e| format!("kvmem fork_prefix_into store: {e}"))?;
++            ckpt.canonical()
++                .copy_prefix_to(&branch, frontier / KV_BLOCK_TOKENS as u32)
++                .map_err(|e| format!("kvmem fork_prefix_into content copy: {e}"))?;
++            branch
++        } else {
++            ckpt.canonical()
++                .fork_prefix(frontier)
++                .map_err(|e| format!("kvmem fork_prefix_into fork: {e}"))?
++        };
+         if let Some(tail) = ckpt.mean_tail.as_ref() {
+             branch
+                 .restore_mean_checkpoint(frontier, tail)
+@@ -5731,5 +5804,50 @@ mod tests {
+         std::env::remove_var("HIPFIRE_KVMEM_CONTENT_GROUPS");
+         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+     }
++
++    /// 期3 G3-SSD: a content-account freeze moves the canonical into the cache
++    /// account (separately charged) and reuse copies it back into the session
++    /// account, reproducing the Mean-K index exactly.
++    #[test]
++    fn content_account_freeze_and_reuse_copy_out() {
++        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
++        let dir = std::env::temp_dir().join(format!("kvmem-cache-test-{}", std::process::id()));
++        std::env::set_var("HIPFIRE_KVMEM_CACHE_DIR", dir.to_str().unwrap());
++        std::env::set_var("HIPFIRE_KVMEM_CACHE_BYTES", "16777216");
++        std::env::set_var("HIPFIRE_KVMEM_CACHE_RAM_BYTES", "1048576");
++        let mut ctl =
++            KvMemCtl::new_with_strategy(2, &plan(), &geom(), RecallStrategy::Legacy)
++                .expect("ctl");
++        ctl.set_request_group(0, 42).expect("group");
++        prefix_fill(&mut ctl, 0, 1, 5);
++        let toks = prefix_tokens(128, 5);
++        let (id, displaced, dup) = ctl.freeze_prefix(0, 128, &toks).expect("freeze");
++        assert!(!dup && displaced.is_empty());
++        assert!(
++            ctl.prefix_checkpoint(id)
++                .expect("ckpt")
++                .canonical_on_content,
++            "canonical moved to the content account"
++        );
++        let cache_stats = ctl.stats();
++        assert!(
++            cache_stats.content_cache_bytes > 0 || cache_stats.content_cache_disk_bytes > 0,
++            "content account charged (ram {} disk {})",
++            cache_stats.content_cache_bytes,
++            cache_stats.content_cache_disk_bytes
++        );
++        let frontier = ctl.fork_prefix_into(1, id, &toks).expect("fork");
++        assert_eq!(frontier, 128);
++        let width = ctl.raw_cfg.n_embd_k as usize;
++        let mut m0 = vec![0f32; width];
++        let mut m1 = vec![0f32; width];
++        ctl.slots[0].raw.mean_k(0, 0, &mut m0);
++        ctl.slots[1].raw.mean_k(0, 0, &mut m1);
++        assert_eq!(m0, m1, "reused Mean-K copied exactly");
++        std::env::remove_var("HIPFIRE_KVMEM_CACHE_RAM_BYTES");
++        std::env::remove_var("HIPFIRE_KVMEM_CACHE_BYTES");
++        std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
++        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
++    }
+ }
+ 
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index 63cf08d23..c0139f5fb 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -131,6 +131,11 @@ pub struct PrefixCheckpoint {
+     /// FAIRNESS hint only — it never authorizes reuse or overwrites a proof.
+     /// 0 = unknown origin (independent group, as in the core policy).
+     pub group: u64,
++    /// 期3 G3-SSD: the canonical archive lives in the separate content-cache
++    /// storage account, so reuse materializes a session-account copy instead
++    /// of sharing records across accounts (core `import_packed` refuses a
++    /// foreign account and `fork_prefix` would mix the ledgers).
++    pub canonical_on_content: bool,
+     /// Immutable canonical archive: `source.fork_prefix(frontier)`. Packed
+     /// records are sealed shared sources; mean-K is private to this archive
+     /// and re-forked private into every branch. Never fed after freeze.
+@@ -175,6 +180,7 @@ impl PrefixCheckpoint {
+             gpu_pages: Vec::new(),
+             original_query: None,
+             group: 0,
++            canonical_on_content: false,
+             canonical,
+             kv_snapshot: None,
+             draft_image: None,
+@@ -626,6 +632,7 @@ mod tests {
+             gpu_pages: Vec::new(),
+             original_query: None,
+             group: 0,
++            canonical_on_content: false,
+             canonical,
+             kv_snapshot: None,
+             draft_image: None,
+diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
+index dcbeee066..ad8ba5568 100644
+--- a/crates/hipfire-cli/src/serve/metrics.rs
++++ b/crates/hipfire-cli/src/serve/metrics.rs
+@@ -677,6 +677,18 @@ impl Metrics {
+                     "Prefix entries retired by the group-aware publication plan.",
+                     s.kvmem.content_retirements,
+                 );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_content_cache_bytes",
++                    "Content-cache account bytes (separate from the spill account).",
++                    s.kvmem.content_cache_bytes as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_content_cache_disk_bytes",
++                    "Content-cache disk-tier bytes.",
++                    s.kvmem.content_cache_disk_bytes as f64,
++                );
+             }
+         }
+ 
+@@ -1098,6 +1110,7 @@ mod tests {
+                 "prefix_misses": 6, "prefix_evictions": 1,
+                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
+                 "content_groups": 2, "content_retirements": 1,
++                "content_cache_bytes": 4096, "content_cache_disk_bytes": 2048,
+             },
+         });
+         let kvmeta = ServeMeta {
+@@ -1128,6 +1141,8 @@ mod tests {
+             "hipfire_kvmem_draft_image_misses_total 1\n",
+             "hipfire_kvmem_content_groups 2\n",
+             "hipfire_kvmem_content_retirements_total 1\n",
++            "hipfire_kvmem_content_cache_bytes 4096\n",
++            "hipfire_kvmem_content_cache_disk_bytes 2048\n",
+         ] {
+             assert!(out.contains(sample), "{sample}: {out}");
+         }
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index 0b007fecd..ad4f7b181 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -1109,6 +1109,11 @@ mod ffi {
+ 
+         // 期3 G4: immutable core KvSnapshot over sealed packed records.
+         pub fn hk_raw_store_has_packed(st: *const HkRawStore, blocks: u32) -> c_int;
++        pub fn hk_raw_store_copy_prefix_to(
++            dst: *mut HkRawStore,
++            src: *const HkRawStore,
++            blocks: u32,
++        ) -> c_int;
+         pub fn hk_raw_store_capture_snapshot(
+             st: *const HkRawStore,
+             blocks: u32,
+@@ -2265,6 +2270,19 @@ impl RawStore {
+         unsafe { ffi::hk_raw_store_has_packed(self.ptr.as_ptr(), blocks) != 0 }
+     }
+ 
++    /// 期3 G3-SSD: copy this store's sealed packed prefix of `blocks` complete
++    /// blocks (all layers, K and V) plus exact Mean-K sums into the EMPTY store
++    /// `dst` in a DIFFERENT storage account (content-cache SSD copy). Packed
++    /// bytes and the retrieval index are reproduced exactly; the session
++    /// account and the content account stay separately billed.
++    pub fn copy_prefix_to(&self, dst: &RawStore, blocks: u32) -> Result<()> {
++        let src = self.ptr.as_ptr();
++        let out = dst.ptr.as_ptr();
++        checked(|| unsafe {
++            let _ = ffi::hk_raw_store_copy_prefix_to(out, src, blocks);
++        })
++    }
++
+     /// 期3 G4: capture one immutable core `KvSnapshot` over the sealed packed
+     /// records of blocks `[0, blocks)` (block-major, layer-major, K then V).
+     /// `previous` lets the capture inherit a block origin when the record's
+diff --git a/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs b/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs
+index 2cc448ce9..352c6b221 100644
+--- a/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs
++++ b/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs
+@@ -204,3 +204,49 @@ fn snapshot_capture_refuses_a_store_without_packed_records() {
+     assert!(!raw.has_packed(1));
+     assert!(raw.capture_snapshot(1, None).is_err());
+ }
++
++#[test]
++fn copy_prefix_to_reproduces_packed_bytes_and_mean_and_separates_accounts() {
++    let a = Storage::new_ram(1 << 30).expect("a");
++    let b = Storage::new_ram(1 << 30).expect("b");
++    let src = RawStore::new(raw_config(), Some(&a)).expect("src");
++    fill(&src, 3);
++    let canonical = src.fork_prefix(2 * BLOCK).expect("fork");
++    let dst = RawStore::new(raw_config(), Some(&b)).expect("dst");
++    assert!(!dst.has_packed(1));
++    canonical.copy_prefix_to(&dst, 2).expect("copy");
++    assert!(dst.has_packed(2));
++    assert!(!dst.has_k_gpu(2, 0, BLOCK), "only the prefix blocks copy");
++    for blk in 0..2 {
++        for il in 0..LAYERS {
++            let mut k0 = vec![0u8; BLOCK as usize * ROW_BYTES];
++            let mut k1 = vec![0u8; BLOCK as usize * ROW_BYTES];
++            assert!(canonical.copy_k_gpu(blk, il, &mut k0, BLOCK));
++            assert!(dst.copy_k_gpu(blk, il, &mut k1, BLOCK));
++            assert_eq!(k0, k1, "packed K block {blk} layer {il}");
++            let mut v0 = vec![0u8; BLOCK as usize * ROW_BYTES];
++            let mut v1 = vec![0u8; BLOCK as usize * ROW_BYTES];
++            assert!(canonical.copy_v_gpu(blk, il, &mut v0, BLOCK));
++            assert!(dst.copy_v_gpu(blk, il, &mut v1, BLOCK));
++            assert_eq!(v0, v1, "packed V block {blk} layer {il}");
++            let mut m0 = vec![0f32; K_WIDTH];
++            let mut m1 = vec![0f32; K_WIDTH];
++            canonical.mean_k(blk, il, &mut m0);
++            dst.mean_k(blk, il, &mut m1);
++            assert_eq!(m0, m1, "Mean-K block {blk} layer {il}");
++            assert_eq!(
++                canonical.mean_k_tokens(blk, il),
++                dst.mean_k_tokens(blk, il),
++                "Mean-K token count block {blk} layer {il}"
++            );
++        }
++    }
++    // Separate accounts: both carry their own bytes, and later destination
++    // writes never charge the source account.
++    assert!(a.charged_bytes() > 0, "source account charged");
++    assert!(b.charged_bytes() > 0, "content account charged");
++    let before = a.charged_bytes();
++    dst.write_layer_k_gpu(2 * BLOCK, BLOCK, 0, &vec![7u8; BLOCK as usize * ROW_BYTES])
++        .expect("dst write");
++    assert_eq!(a.charged_bytes(), before, "writes stay in the destination account");
++}
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index c53acaf23..95784a3a0 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -252,6 +252,9 @@ pub struct KvMemStats {
+     pub content_groups: u64,
+     /// Entries retired by the group-aware publication plan.
+     pub content_retirements: u64,
++    /// 期3 G3-SSD: content-cache account bytes (charged) and its disk tier.
++    pub content_cache_bytes: u64,
++    pub content_cache_disk_bytes: u64,
+ }
+ 
+ /// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`
