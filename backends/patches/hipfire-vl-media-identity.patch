@@ -1,0 +1,787 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 1bc9ee680..4d3e8923c 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -1581,6 +1581,21 @@ impl KvMemCtl {
+         slot: usize,
+         frontier: u32,
+         prefix_tokens: &[u32],
++    ) -> Result<(u64, Vec<PrefixCheckpoint>, bool), String> {
++        self.freeze_prefix_with_media(slot, frontier, prefix_tokens, None, Vec::new())
++    }
++
++    /// G7: freeze with the image-turn media identity (digest + image token
++    /// spans) recorded in the checkpoint and the persistent pack meta. The
++    /// engine passes the session's sticky digest on image turns; text-only
++    /// freezes pass `(None, vec![])`.
++    pub fn freeze_prefix_with_media(
++        &mut self,
++        slot: usize,
++        frontier: u32,
++        prefix_tokens: &[u32],
++        media_digest: Option<u64>,
++        media_spans: Vec<(u32, u32)>,
+     ) -> Result<(u64, Vec<PrefixCheckpoint>, bool), String> {
+         let st = self
+             .slots
+@@ -1664,6 +1679,8 @@ impl KvMemCtl {
+         );
+         entry.original_query = original_query;
+         entry.group = st.convo_group;
++        entry.media_digest = media_digest;
++        entry.media_spans = media_spans.clone();
+         if self.content_groups > 0
+             && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                 .ok()
+@@ -1689,6 +1706,8 @@ impl KvMemCtl {
+                 group: entry.group,
+                 original_query: entry.original_query,
+                 n_record_layers: self.n_record_layers as u32,
++                media_digest: entry.media_digest,
++                media_spans: entry.media_spans.clone(),
+             };
+             let path = dir.join(format!(
+                 "p{layout_id:016x}-{frontier:08}-{fingerprint:016x}.hkpack"
+@@ -1765,8 +1784,14 @@ impl KvMemCtl {
+     /// Look up the longest cataloged prefix fully proven by `prompt`.
+     /// Returns the checkpoint id (engine then validates + forks).
+     pub fn prefix_lookup(&mut self, prompt: &[u32]) -> Option<u64> {
++        self.prefix_lookup_media(prompt, None)
++    }
++
++    /// G7: media-aware prefix lookup. A checkpoint covering an image span is
++    /// eligible only when the incoming request's media digest matches it.
++    pub fn prefix_lookup_media(&mut self, prompt: &[u32], media: Option<u64>) -> Option<u64> {
+         let layout = layout_fingerprint(&self.raw_cfg);
+-        if let Some(hit) = self.prefix_catalog.lookup(prompt, layout) {
++        if let Some(hit) = self.prefix_catalog.lookup_media(prompt, layout, media) {
+             self.prefix_catalog_hits_total += 1;
+             self.prefix_hits_total += 1;
+             return Some(hit);
+@@ -1774,7 +1799,7 @@ impl KvMemCtl {
+         // 期3 G3 P1.1: a cold pack hit loads the payload and publishes a
+         // normal catalog entry; the caller then reuses it through the usual
+         // proof path (restart reuse still needs the DN checkpoint, patch 35).
+-        if let Some(index) = self.cold_packs.lookup(prompt, layout) {
++        if let Some(index) = self.cold_packs.lookup_media(prompt, layout, media) {
+             let pack = self.cold_packs.packs()[index].clone();
+             match self.load_cold_pack(&pack) {
+                 Ok(id) => {
+@@ -1854,6 +1879,8 @@ impl KvMemCtl {
+         );
+         entry.original_query = meta.original_query;
+         entry.group = meta.group;
++        entry.media_digest = meta.media_digest;
++        entry.media_spans = meta.media_spans.clone();
+         entry.kv_snapshot = kv_snapshot;
+         entry.pack_path = Some(pack.path.clone());
+         let (inserted, displaced) = if self.content_groups > 0 && entry.group != 0 {
+@@ -1875,9 +1902,22 @@ impl KvMemCtl {
+     /// Look up the longest cataloged prefix fully proven by `prompt` whose
+     /// frontier is at most `max_frontier` (import narrowing fallback).
+     pub fn prefix_lookup_capped(&mut self, prompt: &[u32], max_frontier: u32) -> Option<u64> {
+-        let hit = self
+-            .prefix_catalog
+-            .lookup_at_most(prompt, layout_fingerprint(&self.raw_cfg), max_frontier);
++        self.prefix_lookup_capped_media(prompt, max_frontier, None)
++    }
++
++    /// G7: media-aware capped lookup for import narrowing.
++    pub fn prefix_lookup_capped_media(
++        &mut self,
++        prompt: &[u32],
++        max_frontier: u32,
++        media: Option<u64>,
++    ) -> Option<u64> {
++        let hit = self.prefix_catalog.lookup_at_most_media(
++            prompt,
++            layout_fingerprint(&self.raw_cfg),
++            max_frontier,
++            media,
++        );
+         if hit.is_some() {
+             self.prefix_catalog_hits_total += 1;
+             self.prefix_hits_total += 1;
+@@ -6159,6 +6199,46 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    /// G7: media identity rides the pack round trip and gates both hot and
++    /// cold lookup (text-only requests never reuse an image prefix; a
++    /// different image digest never does).
++    #[test]
++    fn vl_media_pack_roundtrip_and_gated_reuse() {
++        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
++        let dir = std::env::temp_dir().join(format!("kvmem-vl-media-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::env::set_var("HIPFIRE_KVMEM_CACHE_DIR", dir.to_str().unwrap());
++        std::env::set_var("HIPFIRE_KVMEM_CACHE_BYTES", "268435456");
++        let toks = prefix_tokens(128, 11);
++        {
++            let mut ctl =
++                KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
++                    .expect("ctl");
++            prefix_fill(&mut ctl, 0, 1, 11);
++            let (id, _, _) = ctl
++                .freeze_prefix_with_media(0, 128, &toks, Some(0xabc), vec![(4, 36)])
++                .expect("freeze with media");
++            let ckpt = ctl.prefix_checkpoint(id).expect("ckpt");
++            assert_eq!(ckpt.media_digest, Some(0xabc));
++            assert_eq!(ckpt.media_spans, vec![(4, 36)]);
++        }
++        let mut ctl2 =
++            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
++                .expect("ctl2");
++        assert_eq!(ctl2.prefix_lookup_media(&toks, None), None);
++        assert_eq!(ctl2.prefix_lookup_media(&toks, Some(0xdef)), None);
++        let hit = ctl2
++            .prefix_lookup_media(&toks, Some(0xabc))
++            .expect("same media cold hit");
++        let ckpt = ctl2.prefix_checkpoint(hit).expect("entry");
++        assert_eq!(ckpt.media_digest, Some(0xabc));
++        assert_eq!(ckpt.media_spans, vec![(4, 36)]);
++        std::env::remove_var("HIPFIRE_KVMEM_CACHE_BYTES");
++        std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
++        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     /// 期3 G3 follow-up: captures inherit the previous checkpoint's sealed
+     /// block origins when the record storage identity matches.
+     #[test]
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_media.rs b/crates/hipfire-arch-qwen35/src/kvmem_media.rs
+index 626417ff2..52746beb2 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_media.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_media.rs
+@@ -30,6 +30,42 @@ pub fn spans_from_runs(runs: &[(usize, usize)]) -> Vec<MediaSpan> {
+     spans
+ }
+ 
++/// True when `boundary` would cut a media span (strictly inside it).
++pub fn media_split(spans: &[MediaSpan], boundary: u64) -> bool {
++    spans.iter().any(|s| s.begin < boundary && boundary < s.end)
++}
++
++/// True when any media span is fully inside the prefix (`end <= frontier`).
++pub fn media_inside(spans: &[MediaSpan], frontier: u64) -> bool {
++    spans.iter().any(|s| s.end <= frontier)
++}
++
++/// `image_pad` runs of `tokens` (absolute prompt coordinates), capped at
++/// `n_visual` rows — the engine-side mirror of `vl_prefill::image_spans`
++/// without its embedding-row bookkeeping.
++pub fn spans_from_pad_runs(tokens: &[u32], pad: u32, n_visual: usize) -> Vec<MediaSpan> {
++    let mut spans: Vec<MediaSpan> = Vec::new();
++    let mut used = 0usize;
++    let mut i = 0usize;
++    while i < tokens.len() && used < n_visual {
++        if tokens[i] != pad {
++            i += 1;
++            continue;
++        }
++        let start = i;
++        while i < tokens.len() && tokens[i] == pad && used + (i - start) < n_visual {
++            i += 1;
++        }
++        let len = i - start;
++        spans.push(MediaSpan {
++            begin: start as u64,
++            end: (start + len) as u64,
++        });
++        used += len;
++    }
++    spans
++}
++
+ /// nInfer `validate_layerwise_media` for one flat, ordered span list.
+ pub fn validate_spans(prompt_len: u64, spans: &[MediaSpan], block: u64) -> Result<(), String> {
+     if block == 0 {
+@@ -130,6 +166,41 @@ mod tests {
+ 
+     const BLOCK: u64 = 128;
+ 
++    #[test]
++    fn split_and_inside_predicates() {
++        let spans = [MediaSpan { begin: 200, end: 300 }];
++        assert!(!media_split(&spans, 200));
++        assert!(media_split(&spans, 256));
++        assert!(!media_split(&spans, 300));
++        assert!(!media_inside(&spans, 299));
++        assert!(media_inside(&spans, 300));
++        assert!(!media_inside(&[], 1000));
++    }
++
++    #[test]
++    fn pad_runs_respect_n_visual() {
++        let toks = [1u32, 9, 9, 9, 2, 9, 9];
++        let spans = spans_from_pad_runs(&toks, 9, 5);
++        // 3 + 2 rows used; both runs kept.
++        assert_eq!(
++            spans,
++            vec![
++                MediaSpan { begin: 1, end: 4 },
++                MediaSpan { begin: 5, end: 7 },
++            ]
++        );
++        // Cap inside the second run.
++        let spans = spans_from_pad_runs(&toks, 9, 4);
++        assert_eq!(
++            spans,
++            vec![
++                MediaSpan { begin: 1, end: 4 },
++                MediaSpan { begin: 5, end: 6 },
++            ]
++        );
++        assert!(spans_from_pad_runs(&toks, 9, 0).is_empty());
++    }
++
+     #[test]
+     fn spans_from_runs_drops_empty_and_sorts() {
+         let spans = spans_from_runs(&[(400, 0), (300, 5), (100, 7)]);
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index 422074adf..ee4b0e395 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -109,6 +109,13 @@ pub struct ContentPackMeta {
+     pub group: u64,
+     pub original_query: Option<(u64, u64)>,
+     pub n_record_layers: u32,
++    /// G7: media identity of the image turn inside this prefix (`None` for
++    /// text-only checkpoints) and its image token spans (absolute prompt
++    /// coordinates). Older packs decode as text-only (serde defaults).
++    #[serde(default)]
++    pub media_digest: Option<u64>,
++    #[serde(default)]
++    pub media_spans: Vec<(u32, u32)>,
+ }
+ 
+ impl ContentPackMeta {
+@@ -228,11 +235,30 @@ impl ColdPackIndex {
+     /// Longest pack whose FULL token proof matches `prompt` (same rule as the
+     /// hot catalog; a fingerprint alone is never the admission proof).
+     pub fn lookup(&self, prompt: &[u32], layout_id: u64) -> Option<usize> {
++        self.lookup_media(prompt, layout_id, None)
++    }
++
++    /// Media-aware cold-pack lookup (G7): same full token proof, plus the
++    /// pack's media digest must match when it covers a media span.
++    pub fn lookup_media(
++        &self,
++        prompt: &[u32],
++        layout_id: u64,
++        media: Option<u64>,
++    ) -> Option<usize> {
+         let mut best: Option<usize> = None;
+         for (i, p) in self.packs.iter().enumerate() {
+             if p.meta.layout_id != layout_id || p.meta.frontier as usize > prompt.len() {
+                 continue;
+             }
++            if !meta_media_eligible(
++                p.meta.frontier,
++                &p.meta.media_spans,
++                p.meta.media_digest,
++                media,
++            ) {
++                continue;
++            }
+             let f = p.meta.frontier as usize;
+             if prefix_fingerprint(&prompt[..f]) != p.fingerprint {
+                 continue;
+@@ -324,6 +350,13 @@ pub struct PrefixCheckpoint {
+     /// FAIRNESS hint only — it never authorizes reuse or overwrites a proof.
+     /// 0 = unknown origin (independent group, as in the core policy).
+     pub group: u64,
++    /// G7: media identity of the image turn inside this prefix (`None` for
++    /// text-only checkpoints). A token proof cannot distinguish two images, so
++    /// a checkpoint covering a media span is eligible only when the incoming
++    /// request's digest equals this one.
++    pub media_digest: Option<u64>,
++    /// G7: image token spans (absolute prompt coordinates) inside the prefix.
++    pub media_spans: Vec<(u32, u32)>,
+     /// 期3 G3 P1.1: persistent pack file backing this checkpoint (set at
+     /// freeze when the live frontier matches, and on a cold load). The DN
+     /// sidecar sits beside it (`<pack>.dn`).
+@@ -346,7 +379,24 @@ pub struct PrefixCheckpoint {
+     last_used: u64,
+ }
+ 
++/// G7 media eligibility: a prefix without a fully-inside media span is
++/// reusable by any request; a prefix covering an image span requires an
++/// identical, present media digest (token proofs cannot distinguish images).
++pub fn meta_media_eligible(
++    frontier: u32,
++    spans: &[(u32, u32)],
++    digest: Option<u64>,
++    media: Option<u64>,
++) -> bool {
++    let covers = spans.iter().any(|&(_, end)| end <= frontier);
++    !covers || (digest.is_some() && digest == media)
++}
++
+ impl PrefixCheckpoint {
++    /// G7: see [`meta_media_eligible`].
++    pub fn media_eligible(&self, media: Option<u64>) -> bool {
++        meta_media_eligible(self.frontier, &self.media_spans, self.media_digest, media)
++    }
+     /// Build a frozen checkpoint around an immutable canonical archive
+     /// (`source.fork_prefix(frontier)`). The fingerprint is derived from the
+     /// full token proof; `gpu_pages` starts empty (the engine attaches the
+@@ -372,6 +422,8 @@ impl PrefixCheckpoint {
+             gpu_pages: Vec::new(),
+             original_query: None,
+             group: 0,
++            media_digest: None,
++            media_spans: Vec::new(),
+             pack_path: None,
+             canonical,
+             kv_snapshot: None,
+@@ -633,13 +685,28 @@ impl PrefixCatalog {
+ 
+     /// Look up the LONGEST frozen prefix fully proven by `prompt`
+     /// (fingerprint fast reject + full token equality). Touches the winner
+-    /// (LRU). Returns the checkpoint id.
++    /// (LRU). Returns the checkpoint id. Text-only lookup (`media` None):
++    /// checkpoints covering an image span are never eligible.
+     pub fn lookup(&mut self, prompt: &[u32], dst_layout: u64) -> Option<u64> {
++        self.lookup_media(prompt, dst_layout, None)
++    }
++
++    /// Media-aware lookup (G7): identical proof, additionally requiring the
++    /// checkpoint's media digest to match when the prefix covers a media span.
++    pub fn lookup_media(
++        &mut self,
++        prompt: &[u32],
++        dst_layout: u64,
++        media: Option<u64>,
++    ) -> Option<u64> {
+         let mut best: Option<(u64, u32)> = None;
+         for e in &self.entries {
+             if e.layout_id != dst_layout || e.frontier as usize > prompt.len() {
+                 continue;
+             }
++            if !e.media_eligible(media) {
++                continue;
++            }
+             let f = e.frontier as usize;
+             if prefix_fingerprint(&prompt[..f]) != e.fingerprint {
+                 continue;
+@@ -664,11 +731,25 @@ impl PrefixCatalog {
+     /// fall back to an earlier coverage checkpoint when the longest one cannot
+     /// start inside the layerwise window. Touches the winner (LRU).
+     pub fn lookup_at_most(&mut self, prompt: &[u32], dst_layout: u64, max_frontier: u32) -> Option<u64> {
++        self.lookup_at_most_media(prompt, dst_layout, max_frontier, None)
++    }
++
++    /// Media-aware [`Self::lookup_at_most`] (G7).
++    pub fn lookup_at_most_media(
++        &mut self,
++        prompt: &[u32],
++        dst_layout: u64,
++        max_frontier: u32,
++        media: Option<u64>,
++    ) -> Option<u64> {
+         let mut best: Option<(u64, u32)> = None;
+         for e in &self.entries {
+             if e.layout_id != dst_layout || e.frontier > max_frontier || e.frontier as usize > prompt.len() {
+                 continue;
+             }
++            if !e.media_eligible(media) {
++                continue;
++            }
+             let f = e.frontier as usize;
+             if prefix_fingerprint(&prompt[..f]) != e.fingerprint {
+                 continue;
+@@ -898,6 +979,8 @@ mod tests {
+             gpu_pages: Vec::new(),
+             original_query: None,
+             group: 0,
++            media_digest: None,
++            media_spans: Vec::new(),
+             pack_path: None,
+             canonical,
+             kv_snapshot: None,
+@@ -1034,6 +1117,40 @@ mod tests {
+         assert!(cat.prune_policy(1, 1 << 30, 4096, 0).is_empty());
+     }
+ 
++    /// G7: a checkpoint covering an image span is eligible only for the same
++    /// media digest; text-only checkpoints stay eligible for everyone.
++    #[test]
++    fn catalog_media_gate_requires_the_same_digest() {
++        let st = storage();
++        let toks = tokens(256);
++        let mut cat = PrefixCatalog::new(4);
++        let layout = layout_fingerprint(&raw_config());
++        let mut imaged = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
++        imaged.media_digest = Some(0x11);
++        imaged.media_spans = vec![(0, 64)];
++        let plain = checkpoint(&st, cat.mint_id(), 256, &toks);
++        cat.insert(imaged).expect("insert imaged");
++        cat.insert(plain).expect("insert plain");
++        assert_eq!(
++            cat.lookup_media(&toks[..128], layout, None),
++            None,
++            "text-only requests must not reuse an image checkpoint"
++        );
++        assert_eq!(cat.lookup_media(&toks[..128], layout, Some(0x11)), Some(1));
++        assert_eq!(cat.lookup_media(&toks[..128], layout, Some(0x22)), None);
++        assert_eq!(
++            cat.lookup(&toks, layout),
++            Some(2),
++            "text-only checkpoints remain eligible"
++        );
++        // The capped variant applies the same gate.
++        assert_eq!(cat.lookup_at_most_media(&toks, layout, 128, None), None);
++        assert_eq!(
++            cat.lookup_at_most_media(&toks, layout, 128, Some(0x11)),
++            Some(1)
++        );
++    }
++
+     /// 期3 G3 follow-up: catalog accounting charges a `SealedKvBlock` origin
+     /// once across entries that inherited it, and the retention byte cap sees
+     /// that unique total (gross per-entry bytes would prune a sharer).
+@@ -1244,6 +1361,8 @@ mod tests {
+                 group: 7,
+                 original_query: Some((0, 10)),
+                 n_record_layers: LAYERS,
++                media_digest: None,
++                media_spans: Vec::new(),
+             };
+             let path = dir.join(name);
+             canonical
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index ae1a23913..e622f2168 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -7667,11 +7667,13 @@ fn run_loop(
+             // the branch's composite export fails closed). Freeze
+             // the newly completed page-aligned prefix into the canonical
+             // catalog: DeltaNet checkpoint + immutable host fork + sealed GPU
+-            // page PIN (cache refs). Prefill chunks of text-only sessions only;
+-            // the chunk must END page-aligned (the live recurrent state sits at
+-            // next_pos and cannot be relabelled to an earlier boundary, spec
+-            // §4.5). Generated rows are never frozen — the shared prefix is
+-            // prompt content; generation stays session-private. Opportunistic:
++            // page PIN (cache refs). The chunk must END page-aligned (the live
++            // recurrent state sits at next_pos and cannot be relabelled to an
++            // earlier boundary, spec §4.5). G7: vision sessions freeze too; a
++            // boundary that would split an image span is skipped below, and the
++            // checkpoint carries the image identity. Generated rows are never
++            // frozen — the shared prefix is prompt content; generation stays
++            // session-private. Opportunistic:
+             // a failed freeze skips the boundary (the request continues cold-
+             // reusable at earlier anchors), it never poisons the serve loop.
+             #[cfg(feature = "kvmem")]
+@@ -7680,9 +7682,11 @@ fn run_loop(
+                     if batch.m_per_slot[s] == 0 || !freeze_snapshot[s].0 {
+                         continue;
+                     }
+-                    if work[s].vl_prefill.is_some() {
+-                        continue;
+-                    }
++                    // G7 Stage B2 pending: vision rows are not yet fed into the
++                    // KVMem packed store, so a VL freeze would fork an
++                    // incomplete canonical (the pack write already fails closed
++                    // with "incomplete packed source"). Keep VL freezes off
++                    // until the feed lands.
+                     if slots[s]
+                         .as_ref()
+                         .and_then(|f| rig.sessions.get(f.session))
+@@ -7712,6 +7716,26 @@ fn run_loop(
+                         }
+                         _ => continue,
+                     };
++                    // G7: never freeze a boundary that splits an image span;
++                    // carry the session's media identity into the checkpoint.
++                    let (media_digest, all_spans) = kvmem_session_media(&rig, session);
++                    if all_spans
++                        .iter()
++                        .any(|&(b, e)| (b as usize) < boundary && boundary < e as usize)
++                    {
++                        if rig.gpu.slot_trace() {
++                            eprintln!(
++                                "[kvmem-prefix] slot {s} boundary {boundary} not frozen: \
++                                 splits a media span"
++                            );
++                        }
++                        continue;
++                    }
++                    let media_spans: Vec<(u32, u32)> = all_spans
++                        .iter()
++                        .copied()
++                        .filter(|&(_, e)| (e as usize) <= boundary)
++                        .collect();
+                     // PIN requires residency: every prefix page must still be
+                     // bound (a spilled page has no physical handle to pin).
+                     let n_pages = boundary / PAGE_TOKENS;
+@@ -7775,7 +7799,15 @@ fn run_loop(
+                             );
+                         }
+                         // 2-4. Host freeze + displaced release + page PIN.
+-                        kvmem_catalog_and_pin(&mut rig, s, boundary as u32, &tokens, &page_indices)
++                        kvmem_catalog_and_pin(
++                            &mut rig,
++                            s,
++                            boundary as u32,
++                            &tokens,
++                            &page_indices,
++                            media_digest,
++                            media_spans.clone(),
++                        )
+                     })();
+                     match freeze_result {
+                         Ok(()) => {
+@@ -7864,6 +7896,29 @@ fn run_loop(
+     }
+ }
+ 
++/// G7: the session's media identity + image spans over `tokens` (the frozen
++/// prefix). Text-only sessions and pre-image prefixes yield `(None, vec![])`.
++#[cfg(feature = "kvmem")]
++fn kvmem_session_media(rig: &Rig, session: SessionId) -> (Option<u64>, Vec<(u32, u32)>) {
++    let Some(sess) = rig.sessions.get(session) else {
++        return (None, Vec::new());
++    };
++    if !sess.has_image || sess.media_n_visual == 0 {
++        return (sess.media_digest.filter(|_| sess.has_image), Vec::new());
++    }
++    let Some(pad) = rig.tokenizer.special_token_id("<|image_pad|>") else {
++        return (sess.media_digest, Vec::new());
++    };
++    // Spans over the FULL session token stream: a mid-image boundary must be
++    // recognized as a split even though the prefix truncates the run.
++    let spans: Vec<(u32, u32)> =
++        crate::kvmem_media::spans_from_pad_runs(&sess.tokens, pad, sess.media_n_visual)
++            .into_iter()
++            .map(|s| (s.begin as u32, s.end as u32))
++            .collect();
++    (sess.media_digest, spans)
++}
++
+ /// P2.2b2: freeze the canonical host prefix, release displaced GPU refs and PIN
+ /// this prefix's pages. Shared by the prefill-boundary freeze (after its
+ /// DeltaNet capture) and the terminal endpoint freeze (which reuses a coverage
+@@ -7876,13 +7931,16 @@ fn kvmem_catalog_and_pin(
+     boundary: u32,
+     tokens: &[u32],
+     page_indices: &[u32],
++    media_digest: Option<u64>,
++    media_spans: Vec<(u32, u32)>,
+ ) -> Result<(), String> {
+     let ctl = rig
+         .model
+         .kvmem
+         .as_mut()
+         .ok_or_else(|| "kvmem freeze: no controller".to_string())?;
+-    let (id, displaced, deduped) = ctl.freeze_prefix(s, boundary, tokens)?;
++    let (id, displaced, deduped) =
++        ctl.freeze_prefix_with_media(s, boundary, tokens, media_digest, media_spans)?;
+     for d in displaced {
+         if let Some(pp) = rig.pool.page_pool_mut() {
+             for &phys in &d.gpu_pages {
+@@ -8105,6 +8163,7 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
+     let Some(sess) = rig.sessions.get(session) else {
+         return;
+     };
++    // G7 Stage B2 pending (see the prefill freeze note): no VL freezes yet.
+     if sess.has_image {
+         return;
+     }
+@@ -8145,6 +8204,17 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
+         return;
+     }
+     let tokens: Vec<u32> = sess.tokens[..boundary as usize].to_vec();
++    // G7: the endpoint frontier must not split an image span; carry the
++    // session's media identity into the checkpoint.
++    let (media_digest, all_spans) = kvmem_session_media(rig, session);
++    if all_spans.iter().any(|&(b, e)| b < boundary && boundary < e) {
++        return;
++    }
++    let media_spans: Vec<(u32, u32)> = all_spans
++        .iter()
++        .copied()
++        .filter(|&(_, e)| e <= boundary)
++        .collect();
+     let Some(domain) = rig.cache_domain.as_ref() else {
+         return;
+     };
+@@ -8157,7 +8227,15 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
+     {
+         return;
+     }
+-    match kvmem_catalog_and_pin(rig, s, boundary, &tokens, &page_indices) {
++    match kvmem_catalog_and_pin(
++        rig,
++        s,
++        boundary,
++        &tokens,
++        &page_indices,
++        media_digest,
++        media_spans,
++    ) {
+         Ok(()) => {
+             if let Some(f) = slots[s].as_mut() {
+                 f.last_frozen_boundary = boundary as usize;
+@@ -9374,17 +9452,28 @@ fn admit(
+     // Cross-session reuse from the canonical catalog (the radix stays OFF
+     // under KVMem). Order: provenance-validated host fork → DeltaNet restore
+     // → GPU page share. Any failure unwinds to the cold state (host reset +
+-    // DN reset; a refused share is non-mutating by contract). Vision requests
+-    // skip reuse (their KV carries M-RoPE phases the shared prefix lacks).
++    // DN reset; a refused share is non-mutating by contract).
++    //
++    // G7: vision requests participate too, gated by the media identity. A
++    // checkpoint covering an image span is eligible only when the incoming
++    // request's digest (this turn's image, or the session's sticky digest for
++    // a text continuation) equals it — token proofs cannot distinguish two
++    // images (identical `image_pad` ids).
+     let mut prefix_reused: usize = 0;
+     let mut prefix_hit = false;
+     #[cfg(feature = "kvmem")]
++    let req_media: Option<u64> = req
++        .visual_data
++        .as_ref()
++        .map(|vd| vd.media_digest())
++        .or_else(|| rig.sessions.get(id).and_then(|s| s.media_digest));
++    #[cfg(feature = "kvmem")]
+     if rig.kvmem_prefix_pin && req.visual_data.is_none() {
+         // 期3 G3 P1.1: a cold pack hit publishes a catalog entry and may
+         // displace others; release their GPU cache refs outside the borrow.
+         let mut cold_displaced = Vec::new();
+         let hit = rig.model.kvmem.as_mut().and_then(|ctl| {
+-            let hit = ctl.prefix_lookup(&req.prompt_tokens);
++            let hit = ctl.prefix_lookup_media(&req.prompt_tokens, req_media);
+             cold_displaced = ctl.take_cold_displaced();
+             hit
+         });
+@@ -9450,7 +9539,8 @@ fn admit(
+                         }
+                         if start.restore_tokens < frontier as u64 {
+                             let cap = start.restore_tokens as u32;
+-                            let shorter = ctl.prefix_lookup_capped(&req.prompt_tokens, cap);
++                            let shorter =
++                                ctl.prefix_lookup_capped_media(&req.prompt_tokens, cap, req_media);
+                             let Some(sid) = shorter.filter(|&sid| sid != reuse_id) else {
+                                 return Err(format!(
+                                     "kvmem reuse: import pressure narrows {} -> {} tokens \
+@@ -10097,6 +10187,13 @@ fn admit(
+         // image turn". `has_image` is the publish/lookup gate for the prefix
+         // cache (spec §6 X2).
+         sess.has_image = sess.has_image || req.visual_data.is_some();
++        // G7: sticky media identity of the newest image turn. A text
++        // continuation inherits it so a checkpoint covering the image span
++        // stays eligible only for the same image.
++        if let Some(vd) = req.visual_data.as_ref() {
++            sess.media_digest = Some(vd.media_digest());
++            sess.media_n_visual = vd.n_visual_tokens;
++        }
+     }
+ 
+     if send_event(
+@@ -10177,8 +10274,22 @@ fn admit(
+     }
+     let grammar_constrained = grammar_constraint.is_some();
+     if let Some(vd) = req.visual_data {
+-        work[slot.0].remaining_prompt = req.prompt_tokens.clone();
+-        work[slot.0].next_pos = 0;
++        // G7: a converted prefix hit prefills only the suffix. The M-RoPE
++        // table stays absolute (`base = 0`, indexed by the absolute `pos`),
++        // and visual_idx skips the image pads that already live in the
++        // imported prefix (freeze never splits an image span, so the prefix
++        // holds the whole image or none of it).
++        let pad = rig
++            .tokenizer
++            .special_token_id("<|image_pad|>")
++            .unwrap_or(u32::MAX);
++        let prefix_pads = req.prompt_tokens[..reused]
++            .iter()
++            .filter(|&&t| t == pad)
++            .count()
++            .min(vd.n_visual_tokens);
++        work[slot.0].remaining_prompt = req.prompt_tokens[reused..].to_vec();
++        work[slot.0].next_pos = reused;
+         work[slot.0].pos3_delta = 0; // phases come from the VL table below
+                                      // Drop any previous request's vision state: the new request's
+                                      // embeddings are not produced until its first batched chunk, and the
+@@ -10193,11 +10304,8 @@ fn admit(
+             n_visual_tokens: vd.n_visual_tokens,
+             embeddings: Vec::new(),
+             dim: rig.model.config.dim,
+-            visual_idx: 0,
+-            image_pad_id: rig
+-                .tokenizer
+-                .special_token_id("<|image_pad|>")
+-                .unwrap_or(u32::MAX),
++            visual_idx: prefix_pads,
++            image_pad_id: pad,
+             mrope_positions: vd.mrope_positions,
+             rope_delta: vd.rope_delta,
+             base: 0,
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index cf6c2fb63..c6535a5b2 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -49,6 +49,34 @@ pub struct VisualData {
+     pub rope_delta: i32,
+ }
+ 
++impl VisualData {
++    /// G7: stable content digest of this media turn (FNV-1a over the vision
++    /// patch tensor, grid, visual-token count and rope delta). Content-only:
++    /// the per-prompt M-RoPE phase table is deliberately excluded — it depends
++    /// on the surrounding text length, while two requests carrying the SAME
++    /// image must share an identity. A token proof cannot distinguish two
++    /// images (identical `image_pad` ids), so prefix reuse requires this digest
++    /// to match whenever a checkpoint covers a media span.
++    pub fn media_digest(&self) -> u64 {
++        const OFFSET: u64 = 0xcbf29ce484222325;
++        const PRIME: u64 = 0x100000001b3;
++        let mut h = OFFSET;
++        let mut mix = |bytes: &[u8]| {
++            for &b in bytes {
++                h ^= b as u64;
++                h = h.wrapping_mul(PRIME);
++            }
++        };
++        mix(&(self.grid_h as u64).to_le_bytes());
++        mix(&(self.grid_w as u64).to_le_bytes());
++        mix(&(self.n_visual_tokens as u64).to_le_bytes());
++        mix(&self.rope_delta.to_le_bytes());
++        let patch_bytes: Vec<u8> = self.patches.iter().flat_map(|f| f.to_le_bytes()).collect();
++        mix(&patch_bytes);
++        h
++    }
++}
++
+ /// One request handed to the engine.
+ ///
+ /// `reply` is the client's own channel: the engine streams this request's
+diff --git a/crates/hipfire-runtime/src/session_table.rs b/crates/hipfire-runtime/src/session_table.rs
+index a944f8c6d..f3d2a457c 100644
+--- a/crates/hipfire-runtime/src/session_table.rs
++++ b/crates/hipfire-runtime/src/session_table.rs
+@@ -79,6 +79,14 @@ pub struct Session {
+     /// KV to the radix and a later text request could restore it — silent
+     /// wrong output (spec §6 X2). `has_image` is the positive marker.
+     pub has_image: bool,
++    /// G7: sticky media identity of the newest image turn in this
++    /// conversation (FNV digest of the vision patches + M-RoPE). A text
++    /// continuation inherits it; prefix reuse requires it to match any
++    /// checkpoint that covers the image span.
++    pub media_digest: Option<u64>,
++    /// G7: visual-token count of the newest image turn (bounds the
++    /// `image_pad` runs that form the media spans).
++    pub media_n_visual: usize,
+     /// Highest page-aligned token boundary of this session's KV that has
+     /// been published to the cross-session prefix cache (spec §4.6 C6).
+     ///
+@@ -149,6 +157,8 @@ impl SessionTable {
+                 convo: Vec::new(),
+                 rope_delta: 0,
+                 has_image: false,
++                media_digest: None,
++                media_n_visual: 0,
+                 published_boundary: 0,
+                 admitted: true,
+                 last_used: {
