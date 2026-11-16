@@ -579,8 +579,14 @@ extern "C" int hk_raw_store_write_prefix_pack(const hk_raw_store * st, uint32_t 
         for (uint32_t b = 0; b < blocks; ++b) {
             const uint32_t n = st->impl->n_tokens(b);
             for (uint32_t l = 0; l < c.n_layer; ++l) {
-                if (!st->impl->has_k_gpu(b, l) || !st->impl->has_v_gpu(b, l))
-                    throw std::runtime_error("incomplete packed source");
+                const bool has_k = st->impl->has_k_gpu(b, l);
+                const bool has_v = st->impl->has_v_gpu(b, l);
+                if (!has_k || !has_v)
+                    throw std::runtime_error(
+                        "incomplete packed source: first missing block " + std::to_string(b) +
+                        " layer " + std::to_string(l) + " (k=" + (has_k ? "y" : "n") +
+                        " v=" + (has_v ? "y" : "n") + " n_tokens=" + std::to_string(n) +
+                        " n_layer=" + std::to_string(c.n_layer) + ")");
                 uint8_t flags = 3; // K + V
                 const bool has_mean = st->impl->mean_sum(b, l, sum.data());
                 if (has_mean) flags |= 4;
