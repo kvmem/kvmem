@@ -18,8 +18,9 @@ GIB = 1024 ** 3
 WSL_RUNTIME_SHA256 = '2b2a082ede46324a5e3771b4b14f2850fdb9bd38348abfbeedee83966bbd6088'
 
 
-def profile():
-    return json.loads((Path(__file__).resolve().parents[1] / 'windows-profile.json').read_text(encoding='utf-8'))
+def profile(name='rdna4'):
+    filename='windows-rx7800m-iq2r-profile.json' if name=='rx7800m-iq2r' else 'windows-profile.json'
+    return json.loads((Path(__file__).resolve().parents[1] / filename).read_text(encoding='utf-8'))
 
 
 def command_for(a, config):
@@ -37,7 +38,10 @@ def model_profile(a, config):
     key=(container['arch_id'],container['quant'])
     if key not in plugins:
         raise ValueError(f'no supervised KVMem profile for architecture/quantization {key!r}')
+    if config.get('architecture_plugins') and plugins[key] not in config['architecture_plugins']:
+        raise ValueError(f'the selected GPU profile has no compatible model plugin for {key!r}')
     mode=a.drafter
+    if mode=='auto' and config.get('default_drafter'):mode=config['default_drafter']
     if mode=='auto':
         meta=container['draft_metadata']
         groups=container['entries_by_name_prefix']
@@ -53,10 +57,16 @@ def model_profile(a, config):
     depth=a.speculative_tokens
     if depth is None and mode=='mtp':depth=int(args[at])
     selected=resolve_drafter(a.model,mode,depth)
+    if config.get('allowed_drafters') and selected['expected_native'] not in config['allowed_drafters']:
+        raise ValueError('the selected GPU profile has no compatible kernel path for this drafter')
     if selected['depth']>7:
         raise ValueError('Radiance KVMem supports at most 7 speculative draft tokens')
+    if selected['depth']>config.get('max_draft_tokens',7):
+        raise ValueError('the selected GPU profile has no compatible speculative kernel path')
     resolved=copy.deepcopy(config)
     resolved['arguments'][at]=str(selected['depth'])
+    for option,value in config.get('drafter_overrides',{}).get(selected['expected_native'],{}).items():
+        resolved['arguments'][resolved['arguments'].index(option)+1]=str(value)
     resolved['arguments']+=['--kvmem-drafter',selected['expected_native']]
     return resolved,plugins[key]
 
@@ -68,10 +78,11 @@ def validate_runtime(directory):
             raise ValueError(f'{path}: expected the historically qualified scratch runtime and valid aliases; see wsl-runtime/README.md')
 
 
-def validate_inputs(a, host, wsl, architecture_plugin='qwen35_fp8'):
+def validate_inputs(a, host, wsl, architecture_plugin='qwen35_fp8', kernel_plugins=None):
     suffix = 'dll' if host == 'windows' else 'so'
-    required = [a.exe, a.model, a.home / 'kernels.rkb', a.home / f'kernels/libr4d.{suffix}',
+    required = [a.exe, a.model, a.home / 'kernels.rkb',
                 a.home / f'architectures/{architecture_plugin}.{suffix}']
+    required += [a.home/f'kernels/{name}.{suffix}' for name in (kernel_plugins or ['libr4d'])]
     required += ([a.rocm / 'bin/amdhip64_7.dll'] if host == 'windows' else
                  [a.rocm / 'lib/libamdhip64.so', a.rocm / 'lib/libhsa-runtime64.so'])
     for path in required:
@@ -184,6 +195,7 @@ def main(argv=None):
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--wsl-runtime-dir', type=Path)
     p.add_argument('--port', type=int, default=18380)
+    p.add_argument('--profile', choices=('rdna4','rx7800m-iq2r'), default='rdna4')
     p.add_argument('--drafter', choices=('auto','off','mtp','dflash','dflash2'), default='auto',
                    help='Embedded drafter, selected from container metadata by default')
     p.add_argument('--speculative-tokens', type=int,
@@ -195,8 +207,10 @@ def main(argv=None):
         if not 1 <= a.port <= 65535:
             raise ValueError('port must be in 1..65535')
         wsl = host == 'linux' and Path('/dev/dxg').exists()
-        config,architecture_plugin = model_profile(a,profile())
-        validate_inputs(a, host, wsl,architecture_plugin)
+        if a.profile=='rx7800m-iq2r' and host!='windows':
+            raise ValueError('the RX7800M IQR plugin currently requires native Windows')
+        config,architecture_plugin = model_profile(a,profile(a.profile))
+        validate_inputs(a, host, wsl,architecture_plugin,kernel_plugins=config.get('kernel_plugins'))
         env = child_environment(a, host, wsl, config)
         command = command_for(a, config)
         print(subprocess.list2cmdline(command) if host == 'windows' else shlex.join(command), flush=True)

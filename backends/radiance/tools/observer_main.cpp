@@ -1,5 +1,8 @@
 #include "batched_observer.hpp"
 #include "engine.h"
+#include "fleet/config.h"
+#include "fleet/fleet.h"
+#include "fleet_options.hpp"
 #include "hf_model.h"
 #include "radiance_capabilities.hpp"
 #include <charconv>
@@ -139,10 +142,19 @@ int main(int argc, char** argv) {
                   << " speculative draft tokens; larger GDN deployment windows are not supported\n";
         return 2;
     }
+    // Keep the launcher's command-line contract while using v2's native Front/Fleet lifecycle.
+    rad::fleet::FleetConfig fleet;
+    try {
+        fleet=kvmem::radiance::single_model_fleet(cfg,int(engine_args.size())-1,engine_args.data());
+    } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 2; }
 #ifdef KVMEM_RADIANCE_ARGV_PARSE_TEST
     std::cout << "KVMEM_NATIVE_ARGV_VALID\n";
     return 0;
 #else
+    if (!cfg.debug_graph && !cfg.kld() && !cfg.calib())
+        return rad::fleet::run(fleet, [options](const rad::Config&) {
+            return std::make_unique<kvmem::radiance::BatchedStatisticsObserver>(options);
+        });
     if (!rad::resolve_hf_model(cfg)) return 1;
     rad::Engine engine(std::move(cfg), std::make_unique<kvmem::radiance::BatchedStatisticsObserver>(options));
     if (engine.start() < 0) return 1;
