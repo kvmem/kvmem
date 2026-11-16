@@ -176,6 +176,38 @@ int hk_raw_store_has_packed(const hk_raw_store * st, uint32_t blocks);
 // Returns HK_OK / HK_ERR.
 int hk_raw_store_copy_prefix_to(hk_raw_store * dst, hk_raw_store * src, uint32_t blocks);
 
+// ── Persistent prefix packs (期3 G3 P1.1 restart persistence) ──────────────
+// One self-describing file: header (geometry + per-block tokens), opaque
+// metadata bytes supplied by the adapter (token proof/frontier/query/mean
+// tail), then per (block, layer) packed K/V rows and the exact Mean-K sum.
+// Atomic: written to `<path>.tmp` and renamed. Files survive restarts; the
+// adapter scans them to rebuild its cold content index.
+typedef struct hk_prefix_pack_info {
+    uint32_t n_layer;
+    uint32_t block_tokens;
+    uint32_t n_embd_k;
+    uint32_t n_embd_v;
+    uint32_t blocks;
+    uint64_t k_row_bytes;
+    uint64_t v_row_bytes;
+    uint64_t meta_bytes;
+    uint64_t file_bytes;
+} hk_prefix_pack_info;
+
+int hk_raw_store_write_prefix_pack(const hk_raw_store * st, uint32_t blocks, const char * path,
+                                   const uint8_t * meta, size_t meta_len);
+// Header-only read (does not load the payload). HK_OK / HK_ERR.
+int hk_prefix_pack_info_read(const char * path, hk_prefix_pack_info * out);
+// Load the payload into an EMPTY store whose geometry must match the pack.
+// The opaque metadata is returned through `meta_out` (capacity `meta_cap`);
+// `*meta_len` always reports the stored length (HK_ERR_TRUNCATED when the
+// capacity is too small — the payload is then NOT loaded).
+int hk_raw_store_read_prefix_pack(hk_raw_store * st, const char * path,
+                                  uint8_t * meta_out, size_t meta_cap, size_t * meta_len);
+// Metadata-only read (cold-index scans; never loads the payload).
+int hk_prefix_pack_meta_read(const char * path, uint8_t * meta_out, size_t meta_cap,
+                             size_t * meta_len);
+
 // ── P4.3 prefix reuse anchors (host-only, additive; core prefix_checkpoint) ──
 // Indivisible input group (mirrors kvmem::PrefixRange): the anchor must not
 // split [begin, end). Vision token spans are the typical groups.
