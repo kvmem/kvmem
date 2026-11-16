@@ -144,6 +144,31 @@ void hk_packed_snapshot_destroy(hk_packed_snapshot * snap);
 size_t hk_packed_snapshot_entry_count(const hk_packed_snapshot * snap);
 size_t hk_packed_snapshot_metadata_bytes(const hk_packed_snapshot * snap);
 
+// ── Immutable KvSnapshot (期3 G4: core kv_snapshot.hpp) ─────────────────────
+//
+// One provenance-preserving image over a raw store's SEALED packed records:
+// block-major, layer-major, K then V. Origins are core SealedKvBlocks; a
+// capture may inherit an origin from `previous` when the record's storage
+// identity matches (no byte copy, quota charged once). The adapter creates
+// origins only after the caller has drained native writers — `fork_prefix`
+// already seals the packed sources.
+typedef struct hk_kv_snapshot hk_kv_snapshot;
+
+hk_kv_snapshot * hk_raw_store_capture_snapshot(hk_raw_store * st, uint32_t blocks,
+                                               const hk_kv_snapshot * previous);
+void hk_kv_snapshot_destroy(hk_kv_snapshot * snap);
+uint64_t hk_kv_snapshot_bytes(const hk_kv_snapshot * snap);
+size_t hk_kv_snapshot_block_count(const hk_kv_snapshot * snap);
+size_t hk_kv_snapshot_span_count(const hk_kv_snapshot * snap);
+int hk_kv_snapshot_ready(const hk_kv_snapshot * snap);
+uint64_t hk_kv_snapshot_missing_bytes(const hk_kv_snapshot * snap);
+size_t hk_kv_snapshot_metadata_bytes(const hk_kv_snapshot * snap);
+// 1 when the image holds exactly one ready k+v record pair per (block, layer)
+// in block-major order for a `blocks`×`layers` grid.
+int hk_kv_snapshot_covers_packed(const hk_kv_snapshot * snap, uint32_t blocks, uint32_t layers);
+// 1 when any block in [0, blocks) carries sealed packed k+v records.
+int hk_raw_store_has_packed(const hk_raw_store * st, uint32_t blocks);
+
 // ── P4.3 prefix reuse anchors (host-only, additive; core prefix_checkpoint) ──
 // Indivisible input group (mirrors kvmem::PrefixRange): the anchor must not
 // split [begin, end). Vision token spans are the typical groups.
