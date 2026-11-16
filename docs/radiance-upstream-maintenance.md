@@ -10,7 +10,6 @@ do not copy files over a newer Radiance tree or mix plugin DLLs from another ABI
 | `radiance-v2-rdna3.patch` | Changes within `libr3d`: attention H256/GQA6, device support and the required general Qwen/DFlash2 operators. Retire matching hunks as upstream acquires equivalent support. |
 | `radiance-v2-rdna3-iqr.patch` | The separate `libr3diqr` extension and its root CMake registration. Can be removed as one component when upstream RDNA3 IQR coverage is qualified. |
 | `radiance-v2-offload-budget.patch` | Layer-offload KV-budget rounding fix and native regression test. Retire independently when fixed upstream. |
-
 | `radiance-v2-iq4r-mtp-u2.patch` | Preserve the current KVMem mainline fix for a dedicated U2 MTP draft head with a vocabulary-class target; retire independently when upstream covers it. |
 
 Every temporary component also records its retirement condition in `upstream.json`.

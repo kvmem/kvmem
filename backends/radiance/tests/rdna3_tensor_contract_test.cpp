@@ -23,5 +23,8 @@ int main() {
     if(!check(128,3))return 1;
     t.stride[2]=2;
     if(!check(-1,0))return 1;
+    t=RadTensor{};t.rank=2;t.shape[0]=1;t.shape[1]=128;rad_tensor_pack(&t);
+    t.stride[0]=1;
+    if(!check(1,1))return 1; // retain invalid explicit pitch for launch rejection
     std::puts("RDNA3 tensor pitch contracts passed");
 }
