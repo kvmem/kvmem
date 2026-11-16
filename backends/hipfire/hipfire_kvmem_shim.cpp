@@ -22,6 +22,7 @@
 #include <kvmem/cache_owner.hpp>
 #include <kvmem/content_cache.hpp>
 #include <kvmem/speculative.hpp>
+#include <kvmem/kv_snapshot.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -31,6 +32,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -383,6 +385,115 @@ extern "C" size_t hk_packed_snapshot_entry_count(const hk_packed_snapshot * snap
 extern "C" size_t hk_packed_snapshot_metadata_bytes(const hk_packed_snapshot * snap) {
     if (!snap || !snap->impl) return 0;
     return snap->impl->metadata_bytes();
+}
+
+// ── Immutable KvSnapshot (期3 G4: core kv_snapshot.hpp) ──────────────────
+
+struct hk_kv_snapshot {
+    std::shared_ptr<const kvmem::KvSnapshot> impl;
+};
+
+extern "C" int hk_raw_store_has_packed(const hk_raw_store * st, uint32_t blocks) {
+    if (!st || !st->impl || !blocks) return 0;
+    const uint32_t layers = st->impl->config().n_layer;
+    for (uint32_t b = 0; b < blocks; ++b)
+        for (uint32_t l = 0; l < layers; ++l)
+            if (st->impl->has_k_gpu(b, l) && st->impl->has_v_gpu(b, l)) return 1;
+    return 0;
+}
+
+extern "C" hk_kv_snapshot * hk_raw_store_capture_snapshot(hk_raw_store * st, uint32_t blocks,
+                                                          const hk_kv_snapshot * previous) {
+    clear_error();
+    if (!st || !st->impl || !blocks) {
+        set_error("hk_raw_store_capture_snapshot: invalid arguments");
+        return nullptr;
+    }
+    try {
+        const uint32_t layers = st->impl->config().n_layer;
+        std::vector<kvmem::PackedKvSelection> selection;
+        selection.reserve(size_t(blocks) * layers);
+        for (uint32_t b = 0; b < blocks; ++b) {
+            if (!st->impl->has_block(b)) continue;
+            const uint32_t valid = st->impl->n_tokens(b);
+            for (uint32_t l = 0; l < layers; ++l)
+                if (st->impl->has_k_gpu(b, l) && st->impl->has_v_gpu(b, l))
+                    selection.push_back({b, l, valid});
+        }
+        if (selection.empty()) {
+            set_error("hk_raw_store_capture_snapshot: no sealed packed records");
+            return nullptr;
+        }
+        auto packed = st->impl->export_packed(selection, {});
+        std::unordered_map<const void *, std::shared_ptr<kvmem::SealedKvBlock>> inherited;
+        if (previous && previous->impl)
+            for (const auto & origin : previous->impl->blocks()) {
+                auto record = origin->record();
+                if (record) inherited.emplace(record.storage_identity(), origin);
+            }
+        std::vector<std::shared_ptr<kvmem::SealedKvBlock>> out_blocks;
+        std::vector<kvmem::KvSnapshot::Span> spans;
+        out_blocks.reserve(packed.entries().size() * 2);
+        spans.reserve(packed.entries().size() * 2);
+        size_t bytes = 0;
+        const auto push = [&](const kvmem::HostKvRecord & record) {
+            std::shared_ptr<kvmem::SealedKvBlock> origin;
+            auto found = inherited.find(record.storage_identity());
+            if (found != inherited.end()) origin = found->second;
+            if (!origin) origin = std::make_shared<kvmem::SealedKvBlock>(record);
+            const size_t index = out_blocks.size();
+            out_blocks.push_back(std::move(origin));
+            spans.push_back({index, 0, bytes, record.size()});
+            bytes += record.size();
+        };
+        for (const auto & entry : packed.entries()) {
+            push(entry.k);
+            push(entry.v);
+        }
+        auto snapshot =
+            std::make_shared<kvmem::KvSnapshot>(std::move(out_blocks), std::move(spans), bytes);
+        return new hk_kv_snapshot{std::move(snapshot)};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_raw_store_capture_snapshot: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_kv_snapshot_destroy(hk_kv_snapshot * snap) { delete snap; }
+
+extern "C" uint64_t hk_kv_snapshot_bytes(const hk_kv_snapshot * snap) {
+    return snap && snap->impl ? snap->impl->size() : 0;
+}
+extern "C" size_t hk_kv_snapshot_block_count(const hk_kv_snapshot * snap) {
+    return snap && snap->impl ? snap->impl->blocks().size() : 0;
+}
+extern "C" size_t hk_kv_snapshot_span_count(const hk_kv_snapshot * snap) {
+    return snap && snap->impl ? snap->impl->spans().size() : 0;
+}
+extern "C" int hk_kv_snapshot_ready(const hk_kv_snapshot * snap) {
+    return snap && snap->impl && snap->impl->ready() ? 1 : 0;
+}
+extern "C" uint64_t hk_kv_snapshot_missing_bytes(const hk_kv_snapshot * snap) {
+    return snap && snap->impl ? snap->impl->missing_bytes() : 0;
+}
+extern "C" size_t hk_kv_snapshot_metadata_bytes(const hk_kv_snapshot * snap) {
+    return snap && snap->impl ? snap->impl->metadata_bytes() : 0;
+}
+extern "C" int hk_kv_snapshot_covers_packed(const hk_kv_snapshot * snap, uint32_t blocks,
+                                            uint32_t layers) {
+    if (!snap || !snap->impl || !blocks || !layers) return 0;
+    const auto & s = *snap->impl;
+    const size_t expect = size_t(blocks) * layers * 2;
+    if (s.blocks().size() != expect || s.spans().size() != expect) return 0;
+    for (size_t i = 0; i < expect; ++i) {
+        const auto & block = s.blocks()[i];
+        const auto & span = s.spans()[i];
+        if (!block || !block->ready() || span.block != i || span.source != 0 || span.bytes != block->size())
+            return 0;
+    }
+    return 1;
 }
 
 // ── P4.3 prefix reuse anchors ──

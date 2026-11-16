@@ -1,0 +1,250 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 7ae2897d5..8c541f9e3 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -1528,6 +1528,28 @@ impl KvMemCtl {
+             .raw
+             .mean_checkpoint(frontier)
+             .map_err(|e| format!("kvmem freeze_prefix mean checkpoint: {e}"))?;
++        // 期3 G4: the canonical side is also the core `KvSnapshot` over the
++        // sealed packed records `fork_prefix` just shared (block-major,
++        // layer-major, K then V). `fork_prefix` stays the fast reuse path; the
++        // snapshot is the catalog-visible immutable object the G2/G3
++        // directories share. Host-only fixtures without a packed archive carry
++        // no snapshot (missing packed records are not an error there).
++        let blocks = frontier / KV_BLOCK_TOKENS as u32;
++        let kv_snapshot = if st.raw.has_packed(blocks) {
++            let snapshot = st
++                .raw
++                .capture_snapshot(blocks, None)
++                .map_err(|e| format!("kvmem freeze_prefix snapshot: {e}"))?;
++            if !snapshot.covers_packed(blocks, self.n_record_layers as u32) {
++                return Err(format!(
++                    "kvmem freeze_prefix snapshot: incomplete {blocks}×{} packed grid",
++                    self.n_record_layers
++                ));
++            }
++            Some(snapshot)
++        } else {
++            None
++        };
+         let id = self.prefix_catalog.mint_id();
+         let mut entry = PrefixCheckpoint::new(
+             id,
+@@ -1539,6 +1561,7 @@ impl KvMemCtl {
+             canonical,
+         );
+         entry.original_query = original_query;
++        entry.kv_snapshot = kv_snapshot;
+         let (inserted, displaced) = self
+             .prefix_catalog
+             .insert_displacing(entry)
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index e5b0772a7..5ac3b3239 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -129,6 +129,12 @@ pub struct PrefixCheckpoint {
+     /// records are sealed shared sources; mean-K is private to this archive
+     /// and re-forked private into every branch. Never fed after freeze.
+     canonical: RawStore,
++    /// 期3 G4: the same canonical bytes as a core `KvSnapshot` (native-proven
++    /// sealed block origins + exact spans). The fast reuse path stays
++    /// `fork_prefix`; the snapshot is the catalog-visible immutable object the
++    /// G2/G3 directories share. `None` when the store had no packed archive
++    /// (host-only fixtures) — production q8/non-q8 archives always carry one.
++    pub kv_snapshot: Option<hipfire_kvmem::KvSnapshot>,
+     /// 期4: DFlash2 draft conditioning image captured with this checkpoint
+     /// (`None` for AR/MTP sessions, non-windowed drafts, or a frontier that
+     /// did not equal the draft's live seeded frontier — those reseed).
+@@ -163,6 +169,7 @@ impl PrefixCheckpoint {
+             gpu_pages: Vec::new(),
+             original_query: None,
+             canonical,
++            kv_snapshot: None,
+             draft_image: None,
+             last_used: 0,
+         }
+@@ -172,6 +179,7 @@ impl PrefixCheckpoint {
+     /// optional draft image).
+     pub fn host_bytes(&self) -> u64 {
+         self.canonical.payload_bytes()
++            + self.kv_snapshot.as_ref().map_or(0, |snap| snap.metadata_bytes() as u64)
+             + self.draft_image.as_ref().map_or(0, |img| img.nbytes())
+     }
+ 
+@@ -538,6 +546,7 @@ mod tests {
+             gpu_pages: Vec::new(),
+             original_query: None,
+             canonical,
++            kv_snapshot: None,
+             draft_image: None,
+             last_used: 0,
+         }
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index d725b4a80..0b007fecd 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -132,6 +132,12 @@ struct HkPackedSnapshot {
+     _private: [u8; 0],
+ }
+ 
++/// Opaque `kvmem::KvSnapshot` handle (期3 G4).
++#[repr(C)]
++struct HkKvSnapshot {
++    _private: [u8; 0],
++}
++
+ #[repr(C)]
+ struct HkKvStore {
+     _private: [u8; 0],
+@@ -1101,6 +1107,26 @@ mod ffi {
+         pub fn hk_packed_snapshot_entry_count(snap: *const HkPackedSnapshot) -> usize;
+         pub fn hk_packed_snapshot_metadata_bytes(snap: *const HkPackedSnapshot) -> usize;
+ 
++        // 期3 G4: immutable core KvSnapshot over sealed packed records.
++        pub fn hk_raw_store_has_packed(st: *const HkRawStore, blocks: u32) -> c_int;
++        pub fn hk_raw_store_capture_snapshot(
++            st: *const HkRawStore,
++            blocks: u32,
++            previous: *const HkKvSnapshot,
++        ) -> *mut HkKvSnapshot;
++        pub fn hk_kv_snapshot_destroy(snap: *mut HkKvSnapshot);
++        pub fn hk_kv_snapshot_bytes(snap: *const HkKvSnapshot) -> u64;
++        pub fn hk_kv_snapshot_block_count(snap: *const HkKvSnapshot) -> usize;
++        pub fn hk_kv_snapshot_span_count(snap: *const HkKvSnapshot) -> usize;
++        pub fn hk_kv_snapshot_ready(snap: *const HkKvSnapshot) -> c_int;
++        pub fn hk_kv_snapshot_missing_bytes(snap: *const HkKvSnapshot) -> u64;
++        pub fn hk_kv_snapshot_metadata_bytes(snap: *const HkKvSnapshot) -> usize;
++        pub fn hk_kv_snapshot_covers_packed(
++            snap: *const HkKvSnapshot,
++            blocks: u32,
++            layers: u32,
++        ) -> c_int;
++
+         // P4.3 prefix reuse anchors (core prefix_checkpoint).
+         pub fn hk_prefix_anchor(
+             base: u64,
+@@ -2233,6 +2259,30 @@ impl RawStore {
+         std::mem::forget(snapshot);
+         checked(|| unsafe { ffi::hk_raw_store_import_packed(p, snap, metadata_limit) })
+     }
++
++    /// 期3 G4: any sealed packed record in blocks `[0, blocks)`.
++    pub fn has_packed(&self, blocks: u32) -> bool {
++        unsafe { ffi::hk_raw_store_has_packed(self.ptr.as_ptr(), blocks) != 0 }
++    }
++
++    /// 期3 G4: capture one immutable core `KvSnapshot` over the sealed packed
++    /// records of blocks `[0, blocks)` (block-major, layer-major, K then V).
++    /// `previous` lets the capture inherit a block origin when the record's
++    /// storage identity matches (no byte copy, quota charged once). The caller
++    /// has drained native writers — `fork_prefix` sealed the records.
++    pub fn capture_snapshot(
++        &self,
++        blocks: u32,
++        previous: Option<&KvSnapshot>,
++    ) -> Result<KvSnapshot> {
++        clear_error();
++        let prev = previous.map_or(ptr::null(), |s| s.ptr.as_ptr() as *const _);
++        let ptr =
++            unsafe { ffi::hk_raw_store_capture_snapshot(self.ptr.as_ptr(), blocks, prev) };
++        NonNull::new(ptr)
++            .map(|ptr| KvSnapshot { ptr })
++            .ok_or_else(err_from_last)
++    }
+ }
+ 
+ /// P4.3 packed-record selection descriptor (mirrors `hk_packed_selection`).
+@@ -2264,6 +2314,46 @@ impl Drop for PackedSnapshot {
+     }
+ }
+ 
++/// 期3 G4: one immutable, native-proven KV image (core `KvSnapshot`): sealed
++/// block origins + exact spans. Copies of the handle are not needed; the
++/// catalog owns it alongside the fast `fork_prefix` path.
++pub struct KvSnapshot {
++    ptr: NonNull<HkKvSnapshot>,
++}
++
++impl KvSnapshot {
++    /// Total image bytes (the mapped payload; shared with the source records).
++    pub fn bytes(&self) -> u64 {
++        unsafe { ffi::hk_kv_snapshot_bytes(self.ptr.as_ptr()) }
++    }
++    pub fn block_count(&self) -> usize {
++        unsafe { ffi::hk_kv_snapshot_block_count(self.ptr.as_ptr()) }
++    }
++    pub fn span_count(&self) -> usize {
++        unsafe { ffi::hk_kv_snapshot_span_count(self.ptr.as_ptr()) }
++    }
++    pub fn ready(&self) -> bool {
++        unsafe { ffi::hk_kv_snapshot_ready(self.ptr.as_ptr()) != 0 }
++    }
++    pub fn missing_bytes(&self) -> u64 {
++        unsafe { ffi::hk_kv_snapshot_missing_bytes(self.ptr.as_ptr()) }
++    }
++    /// Manifest + origin metadata (payload is accounted by the source store).
++    pub fn metadata_bytes(&self) -> usize {
++        unsafe { ffi::hk_kv_snapshot_metadata_bytes(self.ptr.as_ptr()) }
++    }
++    /// Complete `blocks`×`layers` k+v record coverage (hipfire grid layout).
++    pub fn covers_packed(&self, blocks: u32, layers: u32) -> bool {
++        unsafe { ffi::hk_kv_snapshot_covers_packed(self.ptr.as_ptr(), blocks, layers) != 0 }
++    }
++}
++
++impl Drop for KvSnapshot {
++    fn drop(&mut self) {
++        unsafe { ffi::hk_kv_snapshot_destroy(self.ptr.as_ptr()) };
++    }
++}
++
+ /// P4.3 indivisible input group (mirrors `hk_prefix_range` / `kvmem::PrefixRange`):
+ /// a reusable-prefix anchor must not split `[begin, end)`. Vision token spans
+ /// are the typical groups.
+diff --git a/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs b/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs
+index 273183b94..2cc448ce9 100644
+--- a/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs
++++ b/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs
+@@ -168,4 +168,39 @@ fn prefix_restore_limit_arithmetic() {
+     assert_eq!(prefix_restore_limit(100, 300, 300, true), 100);
+     // eval_end 0 stays 0 (no subtraction underflow).
+     assert_eq!(prefix_restore_limit(0, 0, 0, true), 0);
+-}
+\ No newline at end of file
++}
++#[test]
++fn capture_snapshot_covers_the_sealed_packed_grid() {
++    let storage = Storage::new_ram(1 << 30).expect("storage");
++    let raw = RawStore::new(raw_config(), Some(&storage)).expect("raw");
++    fill(&raw, 3);
++    assert!(raw.has_packed(2));
++    // The freeze contract seals the records via fork_prefix; capture that
++    // canonical prefix (block-major, layer-major, K then V).
++    let canonical = raw.fork_prefix(2 * BLOCK).expect("fork");
++    let snap = canonical.capture_snapshot(2, None).expect("capture");
++    assert!(snap.ready());
++    assert_eq!(snap.block_count(), (2 * LAYERS * 2) as usize);
++    assert_eq!(snap.span_count(), snap.block_count());
++    assert!(snap.covers_packed(2, LAYERS));
++    assert!(!snap.covers_packed(2, LAYERS + 1));
++    let per_record = BLOCK as u64 * ROW_BYTES as u64;
++    assert_eq!(snap.bytes(), (2 * LAYERS) as u64 * 2 * per_record);
++    assert!(snap.metadata_bytes() > 0);
++    assert_eq!(snap.missing_bytes(), 0);
++    // Origin inheritance: re-capturing the same sealed records reuses the
++    // proven origins (same grid and bytes, no payload copy).
++    let snap2 = canonical.capture_snapshot(2, Some(&snap)).expect("capture 2");
++    assert!(snap2.covers_packed(2, LAYERS));
++    assert_eq!(snap2.bytes(), snap.bytes());
++}
++
++#[test]
++fn snapshot_capture_refuses_a_store_without_packed_records() {
++    let storage = Storage::new_ram(1 << 20).expect("storage");
++    let raw = RawStore::new(raw_config(), Some(&storage)).expect("raw");
++    let k: Vec<f32> = (0..BLOCK as usize * K_WIDTH).map(|i| i as f32).collect();
++    raw.write_layer_mean_k(0, BLOCK, 0, &k).expect("mean k");
++    assert!(!raw.has_packed(1));
++    assert!(raw.capture_snapshot(1, None).is_err());
++}
