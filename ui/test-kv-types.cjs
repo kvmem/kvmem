@@ -5,7 +5,7 @@ const path=require('node:path');
 module.exports=async({browser,base,info})=>{
  const context=await browser.newContext({viewport:{width:1366,height:900}});
  const page=await context.newPage(),errors=[],previews=[],mutations=[];
- const parameters={...info.draft.parameters,Backend:'llamacpp',Model:'C:/models/kv-test.gguf',Worker:'C:/workers/llama.exe',Gpu:'GPU-kv-fixture',KvType:'q5_0'};
+ const parameters={...info.draft.parameters,QueryMaxTokens:512,QueryReplayMaxTokens:2048,Backend:'llamacpp',Model:'C:/models/kv-test.gguf',Worker:'C:/workers/llama.exe',Gpu:'GPU-kv-fixture',KvType:'q5_0'};
  const fixture={...info,gpus:[{uuid:parameters.Gpu,name:'NVIDIA GeForce KV test GPU'}],status:{state:'stopped'},draft:{schema_version:1,parameters}};
  page.on('pageerror',error=>errors.push(error.message));
  page.on('request',request=>{if(request.method()==='POST')mutations.push(new URL(request.url()).pathname);});

@@ -3,7 +3,7 @@ const assert=require('node:assert/strict'),path=require('node:path'),fs=require(
 module.exports=async({browser,base,info,stage})=>{
   const context=await browser.newContext({viewport:{width:1440,height:1050}}),page=await context.newPage(),errors=[],sent=[];
   const gpu={uuid:'GPU-engine-settings-fixture',name:'Fixture GPU'};
-  const p={...info.draft.parameters,Backend:'polystrata',Model:'C:/fixture/model.gguf',Gpu:gpu.uuid,Context:8192,Budget:2048,Reserve:1024,Prefill:128,MaxTokens:128,HostMiB:256,SinkTokens:128,RecentTokens:64,Concurrency:1,RetainedSessions:1,ThinkingMode:'on',DraftTokens:2,Worker:'',Python:'',Tokenizer:'',PolystrataSource:'',WorkerArgs:['--threads','4']};
+  const p={...info.draft.parameters,QueryMaxTokens:512,QueryReplayMaxTokens:2048,Backend:'polystrata',Model:'C:/fixture/model.gguf',Gpu:gpu.uuid,Context:8192,Budget:2048,Reserve:1024,Prefill:128,MaxTokens:128,HostMiB:256,SinkTokens:128,RecentTokens:64,Concurrency:1,RetainedSessions:1,ThinkingMode:'on',DraftTokens:2,Worker:'',Python:'',Tokenizer:'',PolystrataSource:'',WorkerArgs:['--threads','4']};
   let status={state:'stopped'};
   page.on('pageerror',error=>errors.push(error.message));
   await page.route('**/api/launcher/info',r=>r.fulfill({json:{...info,gpus:[gpu],status,draft:{schema_version:1,parameters:p},workers:Object.fromEntries(['polystrata','ninfer','llamacpp'].map(b=>[b,{available:true,path:'C:/runtime/'+b+'.exe'}]))}}));

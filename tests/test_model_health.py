@@ -400,6 +400,81 @@ class RadianceHealthTest(unittest.TestCase):
                 health.request_parameters(dict(schema_version=1,parameters=dict(
                     Backend='radiance', DraftTokens=bad)))
 
+    def test_embedded_tokenizer_and_template_are_reported(self):
+        self.dflash()
+        report=self.inspect()
+        self.assertEqual(report['features']['tokenizer'],'present')
+        self.assertEqual(report['features']['template'],'present')
+        self.assertEqual(report['model']['tokenizer_kind'],'BPE')
+        self.assertEqual(report['model']['vocab_size'],1)
+        self.assertEqual(report['model']['chat_template_bytes'],len('{{ messages }}'))
+        self.assertEqual(report['status'],'ready')
+
+    def test_missing_tokenizer_blocks_text_chat(self):
+        self.container(self.model,['blk.0.weight'],vocab=False)
+        report=self.inspect()
+        self.assertFalse(report['can_start'])
+        self.assertEqual(report['features']['tokenizer'],'absent')
+        self.assertEqual(report['features']['template'],'absent')
+        self.assertTrue(any(c['code']=='rad_tokenizer' and c['status']=='error' for c in report['checks']))
+
+    def test_missing_template_explains_fallback_and_selected_override(self):
+        self.container(self.model,['blk.0.weight'],template='')
+        report=self.inspect()
+        self.assertTrue(report['can_start'])
+        self.assertEqual(report['status'],'warning')
+        self.assertEqual(report['features']['template'],'absent')
+        self.assertTrue(any('ChatML' in c['en'] for c in report['checks']))
+        external=self.root/'custom.jinja';external.write_text('{{ messages }}',encoding='utf8')
+        report=self.inspect(ChatTemplateFile=str(external))
+        self.assertEqual(report['features']['template'],'external_ready')
+        self.assertEqual(report['status'],'ready')
+        external.write_text('',encoding='utf8')
+        report=self.inspect(ChatTemplateFile=str(external))
+        self.assertFalse(report['can_start'])
+        self.assertNotEqual(report['features']['template'],'external_ready')
+
+    def test_invalid_vocab_ranges_and_template_reference_are_blocked(self):
+        for corruption in ('section','short','unaligned','token_array','score_array','type_array',
+                           'merge_array','step_array','template_ref'):
+            with self.subTest(corruption=corruption):
+                self.dflash()
+                raw=bytearray(self.model.read_bytes());header=struct.Struct('<II30Q')
+                h=list(header.unpack_from(raw));voff=h[18]
+                if corruption=='section':h[19]=len(raw)
+                elif corruption=='short':h[19]=127
+                elif corruption=='unaligned':h[18]+=1
+                else:
+                    vh=struct.Struct('<4I5Q6i2I5Q');v=list(vh.unpack_from(raw,voff))
+                    if corruption=='token_array':v[4]=len(raw)+8
+                    elif corruption=='score_array':v[5]=len(raw)
+                    elif corruption=='type_array':v[6]=len(raw)
+                    elif corruption=='merge_array':v[2]=1;v[7]=0
+                    elif corruption=='step_array':v[3]=1;v[8]=voff+1
+                    else:v[17]=h[9]
+                    vh.pack_into(raw,voff,*v)
+                header.pack_into(raw,0,*h);self.model.write_bytes(raw)
+                self.assertFalse(self.inspect()['can_start'])
+
+    def test_vocab_payload_is_not_read_during_static_inspection(self):
+        self.dflash();raw=self.model.read_bytes();h=struct.unpack_from('<II30Q',raw)
+        forbidden=(h[18]+128,h[18]+h[19]);original=Path.open;reads=[]
+        class Tracked:
+            def __init__(self,stream):self.stream=stream
+            def __enter__(self):return self
+            def __exit__(self,*args):self.stream.close()
+            def seek(self,*args):return self.stream.seek(*args)
+            def read(self,count=-1):
+                begin=self.stream.tell();reads.append((begin,count))
+                if count < 0 or not (begin+count<=forbidden[0] or begin>=forbidden[1]):
+                    raise AssertionError('Unbounded or vocabulary payload read')
+                return self.stream.read(count)
+        def opened(path,*args,**kwargs):
+            stream=original(path,*args,**kwargs)
+            return Tracked(stream) if path==self.model else stream
+        with patch.object(Path,'open',opened):report=self.inspect()
+        self.assertTrue(report['can_start']);self.assertTrue(reads)
+
     def test_selected_drafter_reuses_the_bounded_directory_read(self):
         self.dflash()
         reads = []

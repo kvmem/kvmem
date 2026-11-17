@@ -166,13 +166,29 @@ existing Windows service launcher is portable. Windows distributions bundle psut
 and all three backends, even when no inference service is running. The collector uses
 cumulative psutil disk read/write bytes and monotonic elapsed time, approximately once
 per second. Values are bytes/s, rendered as MiB/s. They include other processes, unlike
-the separate backend cache I/O counters. GPU and engine metrics remain backend-owned.
+the separate backend cache I/O counters. Engine metrics remain backend-owned.
 First samples, unavailable counters, reset counters and expired readings display a dash.
 The API reports its scope, status, sample time and actual interval. Unsupported or
 permission-restricted OS counters are unavailable, never fabricated zeroes.
 Standalone/older workers without this console endpoint retain native disk readings.
 New controller code takes effect on console restart; replacing UI files alone cannot
 activate the collector inside an already-running Python process.
+
+On Windows, the console also supplies CPU/RAM and AMD GPU telemetry when Radiance
+has no native hardware sampler. GPU readings are joined by PCI address to the
+physical HIP UUIDs captured at launch, with the worker's rank/ordinal report checked
+against that mapping. A device name or high utilization alone never establishes a
+binding. The read-only helper uses WDDM/DXGI/PDH, with supported ADLX metrics from
+the driver DLL in System32; no additional SDK is required. These are whole-adapter
+readings and include other processes. ADLX uses AMD's compatibility initialization
+entry when available: some drivers return an empty GPU list from the normal entry.
+The helper initializes ADLX once per process and checks metric support before reading.
+
+The helper is isolated from HTTP handlers, restarts after a crash or timeout, and
+exits when its owning console closes. Samples older than five seconds are discarded.
+Missing metrics remain unavailable: in particular, WDDM's power percentage is not
+converted into watts. Total board power is shown only when ADLX reports that metric.
+The monitor indicates partial readings when a driver omits any of these GPU metrics.
 
 ## Native metric details
 

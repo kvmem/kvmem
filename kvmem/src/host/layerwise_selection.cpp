@@ -1,13 +1,84 @@
 #include "kvmem/layerwise_selection.hpp"
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/layerwise_options.hpp"
+#include "kvmem/layerwise_pressure.hpp"
+#include "kvmem/graph_recall.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
 
 namespace kvmem {
+bool layerwise_score_geometry(uint32_t page_tokens, uint32_t mean_tokens) {
+    return mean_tokens && (page_tokens == mean_tokens || uint64_t(mean_tokens) * 2 == page_tokens);
+}
+
+std::size_t layerwise_score_slots(const QueryScoreFrame& pages, bool keep_halves) {
+    if (keep_halves && pages.starts.size() > SIZE_MAX/2)
+        throw std::length_error("layerwise half-page score count overflows");
+    return pages.starts.size() * (keep_halves ? 2 : 1);
+}
+
+std::vector<double> layerwise_max_page_scores(const std::vector<double>& halves) {
+    if (halves.size()%2) throw std::invalid_argument("incomplete layerwise half-page pair");
+    std::vector<double> pages(halves.size()/2);
+    for (std::size_t i=0; i<pages.size(); ++i)
+        pages[i] = std::max(halves[2*i], halves[2*i+1]);
+    return pages;
+}
+
+std::vector<double> layerwise_tile_scores(const QueryScoreFrame& pages, uint32_t page_tokens,
+    uint32_t mean_tokens, bool keep_halves, const std::function<std::vector<double>(const QueryScoreFrame&)>& score) {
+    if (!layerwise_score_geometry(page_tokens, mean_tokens))
+        throw std::invalid_argument("incompatible layerwise Mean-K and transport page sizes");
+    if (mean_tokens == page_tokens) {
+        if (keep_halves) throw std::invalid_argument("half-page max requires two Mean-K records per page");
+        return score(pages);
+    }
+
+    const auto count = pages.starts.size();
+    if (pages.counts.size() != count || pages.score_mask.size() != count ||
+        pages.transport_mask.size() != count || count > SIZE_MAX / 2)
+        throw std::invalid_argument("invalid layerwise transport page frame");
+    QueryScoreFrame halves;
+    halves.accepted_through = pages.accepted_through;
+    halves.starts.reserve(2 * count);
+    halves.counts.assign(2 * count, mean_tokens);
+    halves.score_mask.reserve(2 * count);
+    halves.transport_mask.reserve(2 * count);
+    for (size_t i = 0; i < count; ++i) {
+        const auto start = pages.starts[i];
+        if (pages.counts[i] != page_tokens || start % page_tokens ||
+            start > pages.accepted_through || page_tokens > pages.accepted_through - start)
+            throw std::invalid_argument("layerwise half-page scores require aligned sealed transport pages");
+        halves.starts.push_back(start);
+        halves.starts.push_back(start + mean_tokens);
+        halves.score_mask.insert(halves.score_mask.end(), 2, pages.score_mask[i]);
+        halves.transport_mask.insert(halves.transport_mask.end(), 2, pages.transport_mask[i]);
+    }
+    auto mass = score(halves);
+    if (mass.size() != halves.starts.size())
+        throw std::invalid_argument("incomplete layerwise half-page probability vector");
+    // Legacy sum is linear: collapse this tile in place, retaining its
+    // original floating-point order. Max must wait until all tiles arrive.
+    for (size_t i = 0; i < count; ++i) {
+        const double left = mass[2*i], right = mass[2*i+1];
+        const double sum = left + right;
+        if (left < 0 || right < 0 || !std::isfinite(sum) || (!pages.score_mask[i] && sum != 0))
+            throw std::invalid_argument("invalid layerwise half-page probability mass");
+        if (!keep_halves) mass[i] = sum;
+    }
+    if (!keep_halves) mass.resize(count);
+    return mass;
+}
+
+std::vector<double> layerwise_page_scores(const QueryScoreFrame& pages, uint32_t page_tokens,
+    uint32_t mean_tokens, const std::function<std::vector<double>(const QueryScoreFrame&)>& score) {
+    return layerwise_tile_scores(pages, page_tokens, mean_tokens, false, score);
+}
+
 namespace {
 LayerwiseHistorySelection prepare_selection(const KvMemStore& policy,
     const RawKvStore& keys, uint32_t layer,
@@ -16,7 +87,7 @@ LayerwiseHistorySelection prepare_selection(const KvMemStore& policy,
     const auto block = cfg.block_tokens;
     const auto budget_tokens = policy.select_budget_tokens();
     if (!block || !budget_tokens || budget_tokens % block ||
-        keys.config().block_tokens != block || policy.total_tokens() % block ||
+        !layerwise_score_geometry(block, keys.config().block_tokens) || policy.total_tokens() % block ||
         uint64_t(policy.block_count()) * block != policy.total_tokens()) {
         throw std::invalid_argument("layerwise selection requires an aligned canonical prefix and budget");
     }
@@ -62,6 +133,55 @@ void pick_selection(const KvMemStore& policy, LayerwiseHistorySelection& result)
 }
 } // namespace
 
+LayerwiseHistorySelection select_layerwise_prefill_history(const KvMemStore& policy,
+    const RawKvStore& keys, uint32_t layer, const MemorySnapshot& memory,
+    const LayerwisePrefillState& history, const std::vector<uint32_t>& mandatory) {
+    auto result = prepare_selection(policy,keys,layer,mandatory);
+    const auto count = policy.block_count(), block = policy.config().block_tokens;
+    if (memory.stamp.frontier!=policy.total_tokens() || history.end>memory.stamp.frontier ||
+        memory.blocks.size()!=count || layer>=keys.config().n_layer)
+        throw MemoryError(MemoryErrorCode::Stale,"hybrid Query prefill source differs from accepted history");
+    for (size_t i=0;i<history.values.size();++i) {
+        const auto& v=history.values[i];
+        if (v.original_start%block || v.original_start>=memory.stamp.frontier ||
+            (i && history.values[i-1].original_start>=v.original_start) ||
+            !std::isfinite(v.mass) || !std::isfinite(v.exposure) || v.mass<0 || v.exposure<0)
+            throw MemoryError(MemoryErrorCode::InvalidPlan,"invalid hybrid Query prefill attention state");
+    }
+    auto resident=memory.resident;std::sort(resident.begin(),resident.end());
+    std::vector<uint32_t> candidates;
+    std::vector<double> scores;
+    result.scores.assign(count,0.);
+    result.frame.score_mask.assign(count,0);
+    result.frame.transport_mask.assign(count,0);
+    bool positive=false;
+    for (uint32_t i=0;i<count;++i) {
+        const auto& b=memory.blocks[i].block;
+        if (b.original_start!=result.frame.starts[i] || b.valid_tokens!=block)
+            throw MemoryError(MemoryErrorCode::InvalidPlan,"hybrid Query lost canonical page geometry");
+        if (!std::binary_search(resident.begin(),resident.end(),b.id)) continue;
+        const auto found=std::lower_bound(history.values.begin(),history.values.end(),b.original_start,
+            [](const auto& value,uint64_t start){return value.original_start<start;});
+        const auto score=found!=history.values.end() && found->original_start==b.original_start && found->exposure>0
+            ? found->mass/found->exposure : 0.;
+        if (!std::isfinite(score)) throw MemoryError(MemoryErrorCode::InvalidPlan,"nonfinite hybrid Query score");
+        candidates.push_back(i);scores.push_back(score);result.scores[i]=score;positive|=score>0;
+        result.frame.score_mask[i]=result.frame.transport_mask[i]=1;
+    }
+    for (auto id:result.fixed) if (!std::binary_search(candidates.begin(),candidates.end(),id))
+        throw MemoryError(MemoryErrorCode::Stale,"hybrid Query fixed page is outside its resident lineage");
+    const auto keep=std::min(count,policy.budget_blocks());
+    if (candidates.size()<keep)
+        throw MemoryError(MemoryErrorCode::BudgetExceeded,"hybrid Query cannot fill its history budget from resident pages");
+    if (keep && !positive)
+        throw MemoryError(MemoryErrorCode::Pending,"hybrid Query lacks positive accepted prefill attention");
+    for (auto id:result.fixed) result.frame.transport_mask[id]=0;
+    if (keep) result.selected=pressure_selection(candidates,scores,result.fixed,keep);
+    for (auto id:result.selected) result.historical_tokens+=policy.blocks()[id].n_tokens;
+    result.charged_tokens=uint64_t(result.selected.size())*block;
+    return result;
+}
+
 LayerwiseHistorySelection select_layerwise_history(const KvMemStore& policy,
     const RawKvStore& keys, CurrentLayerQuery query,
     const std::vector<uint32_t>& mandatory) {
@@ -71,7 +191,10 @@ LayerwiseHistorySelection select_layerwise_history(const KvMemStore& policy,
     auto plain_policy=policy;
     plain_policy.set_media_ranges({});
     auto result = prepare_selection(plain_policy,keys,query.layer,mandatory);
-    result.scores = layerwise_mean_key_scores(keys,query,result.frame);
+    const bool keep_halves = policy.config().layerwise_half_max;
+    result.scores = layerwise_tile_scores(result.frame, policy.config().block_tokens, keys.config().block_tokens, keep_halves,
+        [&](const auto& frame) { return layerwise_mean_key_scores(keys,query,frame); });
+    if (keep_halves) result.scores = layerwise_max_page_scores(result.scores);
     pick_selection(plain_policy,result);
     return result;
 }
@@ -97,7 +220,7 @@ LayerwiseQuerySelection::LayerwiseQuerySelection(const KvMemStore& policy,
     policy_.set_media_ranges({});
     check_source();
     result_ = prepare_selection(policy_,keys_,geometry.layer,mandatory);
-    result_.scores.assign(result_.frame.starts.size(),0.);
+    result_.scores.assign(layerwise_score_slots(result_.frame, policy_.config().layerwise_half_max),0.);
     check_source();
 }
 
@@ -124,7 +247,9 @@ void LayerwiseQuerySelection::append(const LayerwiseQueryIdentity& identity,
     check_tile(identity,begin,tile.rows,tile.layer,tile.query_heads,tile.kv_heads,
                tile.head_dim,tile.attention_scale);
     check_source();
-    const auto scores = layerwise_mean_key_scores(keys_,tile,result_.frame);
+    const auto scores = layerwise_tile_scores(result_.frame, policy_.config().block_tokens, keys_.config().block_tokens,
+        policy_.config().layerwise_half_max,
+        [&](const auto& frame) { return layerwise_mean_key_scores(keys_,tile,frame); });
     check_source();
     accumulate(tile.rows,scores);
 }
@@ -148,7 +273,9 @@ void LayerwiseQuerySelection::append_native(const LayerwiseQueryIdentity& identi
     validate_native_layer_query(tile);
     if (!scorer) throw MemoryError(MemoryErrorCode::InvalidPlan,"native Query scorer is missing");
     check_source();
-    const auto scores = scorer(keys_,tile,result_.frame);
+    const auto scores = layerwise_tile_scores(result_.frame, policy_.config().block_tokens, keys_.config().block_tokens,
+        policy_.config().layerwise_half_max,
+        [&](const auto& frame) { return scorer(keys_,tile,frame); });
     check_source();
     accumulate(tile.rows,scores);
 }
@@ -156,8 +283,11 @@ void LayerwiseQuerySelection::append_native(const LayerwiseQueryIdentity& identi
 void LayerwiseQuerySelection::accumulate(uint32_t rows, const std::vector<double>& scores) {
     if (scores.size() != result_.scores.size())
         throw MemoryError(MemoryErrorCode::InvalidPlan,"native Query score extent differs from frozen frame");
+    const std::size_t slots_per_page = policy_.config().layerwise_half_max ? 2 : 1;
     for (size_t i=0;i<scores.size();++i)
-        if (!std::isfinite(scores[i]) || scores[i] < 0 || (!result_.frame.score_mask[i] && scores[i] != 0))
+        if (!std::isfinite(scores[i]) || scores[i] < 0 ||
+            !std::isfinite(result_.scores[i]+scores[i]) ||
+            (!result_.frame.score_mask[i/slots_per_page] && scores[i] != 0))
             throw MemoryError(MemoryErrorCode::InvalidPlan,"invalid raw native Query page mass");
     // No Query-token mean: upstream sums tile masses over the same denominator.
     for (size_t i=0;i<scores.size();++i) result_.scores[i] += scores[i];
@@ -170,6 +300,8 @@ LayerwiseHistorySelection LayerwiseQuerySelection::finish(const LayerwiseQueryId
         throw MemoryError(MemoryErrorCode::Pending,"complete Query scores are required before selection");
     check_source();
     auto result = result_;
+    if (policy_.config().layerwise_half_max)
+        result.scores = layerwise_max_page_scores(result.scores);
     pick_selection(policy_,result);
     check_source();
     phase_ = LayerwiseSelectionPhase::Complete;

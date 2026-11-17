@@ -49,6 +49,7 @@ struct CliOptions {
         if (lrfu_tuning_set && !lrfu)
             throw std::invalid_argument("LRFU tuning requires enabled LRFU");
     }
+    uint32_t cache_min_tokens = 0;
     bool budget_set = false, sessions_set = false, auxiliary_set = false;
     LayerwiseMtpHistory layerwise_mtp_history = LayerwiseMtpHistory::Unspecified;
 
@@ -94,6 +95,11 @@ struct CliOptions {
         else if (arg == "--kvmem-gen-reserve") gen_reserve = integer(arg, need(arg.c_str()), 1);
         else if (arg == "--kvmem-sink-tokens") {sink_tokens = integer(arg, need(arg.c_str()), 0);sink_tokens_set=true;}
         else if (arg == "--kvmem-recent-tokens") {recent_tokens = integer(arg, need(arg.c_str()), 0);recent_tokens_set=true;}
+        else if (arg == "--kvmem-cache-min-tokens") {
+            cache_min_tokens = integer(arg, need(arg.c_str()), 0);
+            auxiliary_set |= cache_min_tokens != 0;
+            return true;
+        }
         else if (arg == "--kvmem-sessions") {
             sessions = integer(arg, need(arg.c_str()), 1);
             sessions_set = true;

@@ -61,7 +61,7 @@ class LayerwiseLauncherTest(unittest.TestCase):
         argv = build_plan(old)['argv']
         self.assertNotIn('--kvmem-recall-strategy', argv)
         self.assertIn('--kvmem-query-replay-max-tokens', argv)
-        require_launch_features({}, old['parameters'])
+        require_launch_features({}, dict(old['parameters'], QueryMaxTokens=512, QueryReplayMaxTokens=2048))
 
     def test_hot_checkpoint_target_is_a_count_and_requires_worker_support(self):
         flag = '--kvmem-layerwise-checkpoint-target'
@@ -155,7 +155,7 @@ class LayerwiseLauncherTest(unittest.TestCase):
         # Older profiles that do not declare an architecture restriction retain
         # their existing contract. Legacy does not acquire a new model gate.
         require_launch_features(contract(), p)
-        require_launch_features(cap, dict(p, RecallStrategy='legacy'))
+        require_launch_features(cap, dict(p, RecallStrategy='legacy', QueryMaxTokens=512, QueryReplayMaxTokens=2048))
 
     def test_layerwise_draft_width_has_no_implicit_backend_default(self):
         for mode in ('mtp', 'dflash2'):

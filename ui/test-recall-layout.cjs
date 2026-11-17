@@ -39,7 +39,7 @@ module.exports=async({browser,base,info,task})=>{
   assert.equal(await page.locator('[data-layerwise-budgets]').isVisible(),false);
   assert.equal(await field('QueryMaxTokens').isVisible(),false,'low-frequency scoring limits are collapsed');
   await snapshot('recall-legacy');
-  await page.locator('[data-recall-advanced=scoring] > summary').click();await field('QueryMaxTokens').fill('0');
+  await page.locator('[data-recall-advanced=scoring] > summary').click();await field('QueryMaxTokens').fill('-1');
   await page.locator('[data-recall-advanced=scoring] > summary').click();await page.locator('#launch-tab-0').click();
   await page.locator('[data-action=preview]').click();await page.locator('[data-check-summary]').waitFor();
   assert.equal(await page.locator('#launch-tab-0').getAttribute('aria-selected'),'true','passive configuration checks do not switch tabs');
@@ -49,7 +49,7 @@ module.exports=async({browser,base,info,task})=>{
   assert.equal(await field('QueryMaxTokens').isVisible(),true,'invalid collapsed setting is revealed with its tab');
   await field('QueryMaxTokens').fill('256');
   // A later invalid recall control must not hide the first invalid field.
-  await field('QueryMaxTokens').fill('0');
+  await field('QueryMaxTokens').fill('-1');
   await page.locator('[data-recall-advanced=scoring] > summary').click();
   await page.locator('#launch-tab-1').click();await field('Prefill').fill('-1');
   await page.locator('[data-action=start]').click();

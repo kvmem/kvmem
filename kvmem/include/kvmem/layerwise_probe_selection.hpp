@@ -26,7 +26,8 @@ private:
     std::shared_ptr<HostKvReservation> metadata_;
 };
 
-// Pinned upstream72a81cc's private-probe global Mean-K reduction for MTP.
+// Pinned upstream72a81cc's private-probe global Mean-K reduction, reusable by
+// MTP or an explicit shared early-target Query selection.
 // Each append supplies the private TARGET forward's normalized pre-RoPE Q,
 // never Q from the later real fresh-layer forward. The owner independently
 // preserves the real resident operand, exact model state and accepted boundary,
@@ -43,7 +44,7 @@ class LayerwiseProbeSelection {
 public:
     using SourceRevision = LayerwiseQuerySelection::SourceRevision;
     using NativeScorer = LayerwiseQuerySelection::NativeScorer;
-    static uint64_t metadata_bound(const KvMemStore&, uint32_t target_layers);
+    static uint64_t metadata_bound(const KvMemStore&, uint32_t target_layers, bool half_pages = false);
     LayerwiseProbeSelection(const KvMemStore&, const RawKvStore&,
         LayerwiseQueryIdentity, const std::vector<LayerwiseQueryGeometry>& target_order,
         SourceRevision, HostKvStorage& metadata,

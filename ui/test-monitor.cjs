@@ -99,7 +99,8 @@ const server = http.createServer((req, res) => {
               recent: fixture.empty ? [] : fixture.idle ? [{...record(), status:"completed"}] : recent,
               hardware: {
                 sampled_at_ms: Date.now() - (fixture.stale ? 10000 : 0),
-                gpus: [
+                ...(fixture.gpuStale ? {gpu_sampled_at_ms: Date.now() - 10000} : {}),
+                gpus: fixture.gpus || [
                   {
                     uuid: "GPU-test-a",
                     name: "NVIDIA GeForce RTX 5060 Ti",
@@ -529,6 +530,26 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     fixtureScenario = {unknown: true};
     await page.waitForFunction(() => document.querySelectorAll("[data-gpus] article").length === 0);
     assert.match(await page.locator("[data-device-note]").textContent(), /不根据负载猜测/);
+    fixtureScenario = {backend:'radiance',props:{execution:{mode:'single',monitor_devices:[
+      {name:'AMD Radeon RX 9070 XT',uuid:'GPU-launch-identity',pci_bus_id:'0000:24:00.0'}]}},gpus:[
+      {name:'AMD Radeon RX 9070 XT',pci_bus_id:'00000000:24:00.0',used_bytes:14*1024**3,total_bytes:16*1024**3,
+        utilization_percent:81,temperature_c:54,power_w:null,unavailable_metrics:['power_w']},
+      {name:'AMD Radeon RX 9070 XT',pci_bus_id:'0000:25:00.0',utilization_percent:99,power_w:200}]};
+    await page.waitForFunction(() => document.querySelector('[data-gpu="load"]')?.textContent === '81');
+    assert.equal(await page.locator('[data-gpu="vram"]').textContent(),'14.0');
+    assert.equal(await page.locator('[data-gpu="status"]').textContent(),'部分指标未采集');
+    assert.equal(await page.locator('[data-gpu="power"]').textContent(),'—');
+    assert.equal(await page.locator('[data-gpu="power"]').getAttribute('title'),'驱动未提供整卡功耗读数');
+    assert.ok(!(await page.locator('[data-about="devices"]').textContent()).includes('undefined'));
+    fixtureScenario.gpuStale = true;
+    await page.waitForFunction(() => document.querySelector('[data-gpu="status"]')?.textContent === '读数已过期');
+    assert.equal(await page.locator('[data-gpu="load"]').textContent(),'—');
+    fixtureScenario.gpuStale = false;
+    fixtureScenario.gpus[0].power_w = 46;
+    fixtureScenario.gpus[0].unavailable_metrics = [];
+    await page.waitForFunction(() => document.querySelector('[data-gpu="power"]')?.textContent === '46.0');
+    assert.equal(await page.locator('[data-gpu="status"]').textContent(),'本服务');
+    assert.equal(await page.locator('[data-gpu="power"]').getAttribute('title'),'');
     fixtureScenario = {};
     await page.waitForFunction(() => document.querySelectorAll("[data-gpus] article").length === 1);
     assert.equal(await page.evaluate(() => window.injected), undefined);

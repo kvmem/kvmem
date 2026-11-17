@@ -47,6 +47,7 @@ param(
     [ValidateRange(4, 64)][int]$NgramMinMatch = 12,
     [ValidateRange(1, 8)][int]$Concurrency = 1,
     [ValidateRange(1, 16)][int]$RetainedSessions = 4,
+    [ValidateRange(0, 2147483647)][int]$CacheMinTokens = 0,
     [switch]$Vision,
     [ValidateSet('resident', 'cpu')][string]$VisionResidency = 'resident',
     [ValidateRange(0, 2147483647)][int]$CpuVisionIdleSeconds = 300,
@@ -65,8 +66,8 @@ param(
     [ValidateRange(1, 2147483647)][int]$LayerwiseActivationMetadataMiB,
     [ValidateSet('page-softmax', 'meanq-cosine')][string]$QueryScorer = 'page-softmax',
     [ValidateRange(0.0, 1.0)][double]$GraphAlpha,
-    [ValidateRange(1, 2147483647)][int]$QueryMaxTokens,
-    [ValidateRange(1, 2147483647)][int]$QueryReplayMaxTokens,
+    [ValidateRange(0, 2147483647)][int]$QueryMaxTokens,
+    [ValidateRange(0, 2147483647)][int]$QueryReplayMaxTokens,
     [ValidateRange(0, 2147483647)][int]$CheckpointExtraRecomputeTokens = 0,
     [switch]$Lrfu,
     [switch]$NoLrfu,
@@ -241,7 +242,10 @@ if ($Backend -eq 'ninfer' -and $ThinkingMode -eq 'off' -and
     ($ReasoningEffort -or @($WorkerArgs | Where-Object { $_ -match '^--default-reasoning-effort(=|$)' }).Count)) {
     throw 'ReasoningEffort conflicts with ThinkingMode off'
 }
-if (@($WorkerArgs | Where-Object { $_ -match '^--(no-)?kvmem($|-(budget|gen-reserve|host-mib|sessions|sink-tokens|recent-tokens|lrfu|lrfu-lambda|lrfu-top-frac|score-agg|query-scorer|graph-alpha|recall-strategy|layerwise-[a-z-]+)(=|$))' }).Count) {
+if ($Backend -eq 'ninfer' -and @($WorkerArgs | Where-Object { $_ -match '^--kvmem-query-(max-tokens|replay-max-tokens)(=|$)' }).Count) {
+    throw 'Use -QueryMaxTokens and -QueryReplayMaxTokens; WorkerArgs cannot override the checked NInfer Query limits'
+}
+if (@($WorkerArgs | Where-Object { $_ -match '^--(no-)?kvmem($|-(budget|gen-reserve|host-mib|sessions|cache-min-tokens|sink-tokens|recent-tokens|lrfu|lrfu-lambda|lrfu-top-frac|score-agg|query-scorer|graph-alpha|recall-strategy|layerwise-[a-z-]+)(=|$))' }).Count) {
     throw 'KVMem common options are owned by the launcher; use its named parameters instead of WorkerArgs'
 }
 if (!$Worker) {
@@ -410,16 +414,29 @@ if ($LogLevel) {
 if ($ThinkingMode -eq 'off') { $nativeArgs += $(if ($Backend -eq 'ninfer') { '--no-thinking' } else { '--no-think' }) }
 if ($ThinkingMode -eq 'on') { $nativeArgs += '--enable-thinking' }
 $nativeArgs += '--kvmem'
+if ($CacheMinTokens -gt 0) { $nativeArgs += @('--kvmem-cache-min-tokens', "$CacheMinTokens") }
 if ($Backend -eq 'llamacpp') { $nativeArgs += @('--kvmem-block-tokens', "$resolvedBlock") }
 if ($Backend -eq 'llamacpp') { $nativeArgs += $nativeArgsSpec }
 if ($DiskPath) { $nativeArgs += @('--kvmem-disk-path', $DiskPath, '--kvmem-disk-mib', "$DiskMiB") }
-$nativeArgs += @(Get-KVMemQueryScoringArgs $PSBoundParameters)
+$scoringParameters = @{} + $PSBoundParameters
+if ($RecallStrategy -ne 'layerwise') {
+    foreach ($limitName in @('QueryMaxTokens','QueryReplayMaxTokens')) {
+        if ($Backend -eq 'ninfer' -and !$scoringParameters.ContainsKey($limitName)) {
+            $scoringParameters[$limitName] = 0
+        } elseif ($Backend -ne 'ninfer' -and $scoringParameters.ContainsKey($limitName) -and
+                  $scoringParameters[$limitName] -eq 0) {
+            throw "$limitName must be positive for $Backend"
+        }
+    }
+}
+$nativeArgs += @(Get-KVMemQueryScoringArgs $scoringParameters)
 $nativeArgs = @(Remove-KVMemImplicitRecallBands $nativeArgs $PSBoundParameters)
 if($RecallStrategy -eq 'layerwise' -and @($WorkerArgs | Where-Object {$_ -match '^--(kvmem-mtp-state|spec[^=]*|draft[^=]*|mtp[^=]*|adaptive-mtp|ngram[^=]*)(=|$)'}).Count) {throw 'Use named layerwise speculative settings; WorkerArgs cannot override the qualified draft owner'}
 $nativeArgs += $WorkerArgs
 $effective=@{};foreach($entry in $PSBoundParameters.GetEnumerator()) {if($entry.Key -ne 'ApiKey'){$effective[$entry.Key]=$entry.Value}}
 foreach($name in @('Backend','Model','Worker','Gpu','Concurrency','KvType','Budget','Reserve','HostMiB','RetainedSessions','MaxTokens','Context','Prefill','Vision','VisionResidency','NgramDrafts','TensorParallel')) {$effective[$name]=Get-Variable -Name $name -ValueOnly}
 $effective.BlockTokens=$resolvedBlock;$effective.SpeculativeMode=$SpeculativeMode;$effective.DraftTokens=$MtpDrafts
+$effective.CacheMinTokens=$CacheMinTokens
 $effective.DraftPolicy=if($AdaptiveMtp){'adaptive'}else{'fixed'}
 $effective.Vision=[bool]$Vision;$effective.TensorParallel=[bool]$TensorParallel;$effective.AdaptiveMtp=[bool]$AdaptiveMtp
 if ($DiskPath) { $effective.DiskPath=$DiskPath; $effective.DiskMiB=$DiskMiB }
@@ -442,7 +459,9 @@ if ($DryRun) {
     return
 }
 Invoke-KVMemRecallWorkerCheck $Worker $effective $root
-if ($Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0) {
+$fullQueryReplay = $Backend -eq 'ninfer' -and $RecallStrategy -ne 'layerwise' -and
+    ($scoringParameters.QueryMaxTokens -eq 0 -or $scoringParameters.QueryReplayMaxTokens -eq 0)
+if ($fullQueryReplay -or $Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0 -or $CacheMinTokens -gt 0) {
     $probeInfo = New-KVMemProcessInfo $Worker @('--kvmem-capabilities')
     $probeInfo.RedirectStandardOutput = $true
     $probeInfo.RedirectStandardError = $true
@@ -457,6 +476,12 @@ if ($Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0) {
         $contract = $stdout.Result | ConvertFrom-Json
         $revision = if ($contract) { $contract.PSObject.Properties['heads_tensor_parallel_revision'] } else { $null }
         if ($probe.ExitCode -ne 0) { throw 'NInfer capability probe failed' }
+        $queryRevision = if ($contract) { $contract.PSObject.Properties['legacy_query_replay_revision'] } else { $null }
+        $workerBackend = if ($contract) { $contract.PSObject.Properties['backend'] } else { $null }
+        if ($fullQueryReplay -and (!$workerBackend -or $workerBackend.Value -ne 'ninfer' -or !$queryRevision -or
+            ($queryRevision.Value -isnot [int] -and $queryRevision.Value -isnot [long]) -or $queryRevision.Value -lt 1)) {
+            throw 'This worker does not support NInfer full Query/replay (zero token limits); update the complete NInfer package, or explicitly set both QueryMaxTokens and QueryReplayMaxTokens to positive limits'
+        }
         $loraCapability = if ($contract) { $contract.PSObject.Properties['fixed_lora'] } else { $null }
         if ($Lora -and (!$loraCapability -or $loraCapability.Value -isnot [bool] -or !$loraCapability.Value)) {
             throw 'Worker does not support fixed LoRA; update the llama.cpp worker'
@@ -466,6 +491,11 @@ if ($Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0) {
             throw 'Worker does not support KVMem heads tensor parallelism; update the complete NInfer package'
         }
         $checkpointRevision = if ($contract) { $contract.PSObject.Properties['checkpoint_recompute_revision'] } else { $null }
+        $admissionRevision = if ($contract) { $contract.PSObject.Properties['cache_admission_revision'] } else { $null }
+        if ($CacheMinTokens -gt 0 -and (!$admissionRevision -or
+            ($admissionRevision.Value -isnot [int] -and $admissionRevision.Value -isnot [long]) -or $admissionRevision.Value -lt 1)) {
+            throw 'Worker does not support CacheMinTokens; update the complete backend package'
+        }
         if ($CheckpointExtraRecomputeTokens -gt 0 -and (!$checkpointRevision -or
             ($checkpointRevision.Value -isnot [int] -and $checkpointRevision.Value -isnot [long]) -or $checkpointRevision.Value -lt 1)) {
             throw 'Worker does not support checkpoint recompute limits; update the complete NInfer package'

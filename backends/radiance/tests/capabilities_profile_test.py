@@ -28,8 +28,8 @@ class ProfileCapabilitiesTest(unittest.TestCase):
         for mode in ('mtp','dflash2'):
             self.assertEqual(result['speculative']['modes'][mode]['max_devices'],1)
         self.assertEqual(result['supported_combinations']['text']['tensor_parallel'],[1])
-        self.assertEqual(result['qualification']['tensor_parallel'],[1])
-        self.assertNotIn('tp2_mtp_depths',result['qualification'])
+        self.assertEqual(result['qualification']['status'],'not-requalified-on-v2')
+        self.assertEqual(result['historical_qualification'],self.manifest['backends']['radiance']['historical_qualification'])
         self.assertEqual(result['build_profile'],'qwen35-dense-tp1')
         self.assertEqual(result['speculative']['modes']['mtp']['max_draft_tokens'],7)
         self.assertEqual(self.manifest,original)
@@ -41,6 +41,32 @@ class ProfileCapabilitiesTest(unittest.TestCase):
 
     def test_unknown_profile_is_rejected(self):
         with self.assertRaises(ValueError):for_profile(self.manifest,'unsupported-profile')
+
+    def test_rdna3_profile_distinguishes_targets_from_hardware_evidence(self):
+        result=for_profile(self.manifest,'qwen35-iqr-rdna3')
+        q=result['qualification']
+        self.assertEqual(q['status'],'per-device-qualification-required')
+        self.assertEqual(q['target_family'],['gfx1100','gfx1101','gfx1102','gfx1103'])
+        self.assertEqual(q['runtime_evidence']['gpu'],'gfx1101')
+        self.assertEqual(set(result['speculative']['modes']),{'none','dflash2'})
+        self.assertEqual(result['supported_combinations']['text']['max_devices'],1)
+
+    def test_7800m_profile_does_not_advertise_unavailable_kernel_paths(self):
+        original=copy.deepcopy(self.manifest)
+        result=for_profile(self.manifest,'qwen35-iqr-gfx1101')
+        self.assertEqual(set(result['speculative']['modes']),{'none','dflash2'})
+        self.assertEqual(result['speculative']['modes']['dflash2']['max_draft_tokens'],7)
+        self.assertEqual(result['speculative']['modes']['dflash2']['max_devices'],1)
+        self.assertTrue(result['speculative_decoding'])
+        self.assertFalse(result['multimodal'])
+        text=result['supported_combinations']['text']
+        self.assertEqual(text['kv'],['bf16','fp8'])
+        self.assertEqual(text['tensor_parallel'],[1])
+        self.assertEqual(text['max_concurrency'],1)
+        self.assertNotIn('packed_kv_geometry',result)
+        self.assertEqual(result['qualification']['gpu'],'gfx1101')
+        self.assertEqual(result['qualification']['kv'],'bf16')
+        self.assertEqual(self.manifest,original)
 
 
 if __name__=='__main__':unittest.main()

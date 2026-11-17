@@ -1,0 +1,67 @@
+diff --git a/tests/models/qwen3_5/test_layerwise_program_query.cpp b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+index 5ba4096..6c44ab5 100644
+--- a/tests/models/qwen3_5/test_layerwise_program_query.cpp
++++ b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+@@ -535,11 +535,19 @@ public:
+             auto held=account->reserve(account->limit()-account->charged_bytes());
+             request.prefill.emplace();
+             request.prefill->memory_restore_generation=idle->stamp.session.id;
++            // A retained directory is borrowed by an actual materialization
++            // transaction. A detached Prefill field alone is not a restore.
++            auto& restoring=program.context_transaction_.emplace<ProgramImpl::MaterializationTransaction>();
++            restoring.destination=runtime::LaneId{sequence.lane};
++            check(program.borrowed_memory_history()==idle->stamp.session.id,
++                "endpoint fixture did not establish its active restore borrow");
+             const auto count=program.memory_history_evictions;
+             program.capture_memory_endpoint(sequence,request);
+             check(idle && program.memory_history_evictions==count &&
+                 !program.memory_checkpoint(sequence.window,KvmemCheckpointKind::Endpoint),
+                 "endpoint evicted a protected restore or published a partial checkpoint");
++            program.context_transaction_.emplace<std::monostate>();
++            check(!program.borrowed_memory_history(),"retired restore retained its directory borrow");
+             request.prefill.reset();
+             program.capture_memory_endpoint(sequence,request);
+             const auto* endpoint=program.memory_checkpoint(sequence.window,KvmemCheckpointKind::Endpoint);
+@@ -671,7 +679,9 @@ public:
+             ProgramImpl program(parameters,*plan,device,{},{},nullptr);auto& sequence=program.continuation_states[0];sequence.lane=0;
+             const auto state=program.state_store->reserve_reset(program.compute_streams);
+             const auto address=program.text_kv_addresses->create_active(capacity/64,0,program.compute_streams);
+-            const auto auxiliary=program.backend_kv_addresses->create_active(capacity/64,0,program.compute_streams);
++            // MTP's physical verifier owns one private scratch page beyond
++            // the logical window, matching the public Engine's entitlement.
++            const auto auxiliary=program.backend_kv_addresses->create_active(capacity/64+1,0,program.compute_streams);
+             check(bool(state)&&bool(address)&&bool(auxiliary),"MTP fixture could not reserve native state and both pools");
+             sequence.state.read=sequence.state.write=*state;sequence.kv=SequenceKVBundle{*address,*auxiliary};program.refresh_state_views(sequence);
+             auto& request=program.requests[0];request.prefill.emplace();request.lifecycle=Lifecycle::Prefilling;auto& staged=*request.prefill;
+@@ -927,11 +937,27 @@ public:
+                 const auto probe=query.probe_work();probe_rows=probe.evaluated_rows;probe_projected=probe.projected_target_rows;
+                 query.accept();staged.layerwise_query.reset();
+             }
+-            check(projected==full_layers*T && attended==full_layers*T && scored==full_layers*T,
++            // Experimental early-layer selectors still project and attend
++            // every real row, but deliberately omit independent Q scoring.
++            const auto enabled=[](const char* name) {
++                const auto* value=std::getenv(name);return value && std::strcmp(value,"1")==0;
++            };
++            const bool shared=enabled("NINFER_LAYERWISE_GLOBAL_QUERY") && A>capacity-generation;
++            const bool hybrid=enabled("NINFER_LAYERWISE_HYBRID_QUERY");
++            std::uint64_t independent_layers=full_layers;
++            for (const auto& layer:sequence.window.layer_views.target) {
++                const auto id=layer.model_layer;
++                if ((shared && id<=15) || (hybrid && (id==3 || id==7 || id==11 || id==15)))
++                    --independent_layers;
++            }
++            const bool needs_probe=shared || strategy==kvmem::LayerwiseMtpHistory::UpstreamGlobal;
++            std::cout<<"MTP Query counters: projected="<<projected<<" attended="<<attended
++                <<" scored="<<scored<<" independent_layers="<<independent_layers
++                <<" probe_rows="<<probe_rows<<" probe_projected="<<probe_projected<<'\n';
++            check(projected==full_layers*T && attended==full_layers*T && scored==independent_layers*T,
+                 "MTP auxiliary execution repeated real target Query projection/scoring");
+-            check(probe_rows==(strategy==kvmem::LayerwiseMtpHistory::UpstreamGlobal?T:0) &&
+-                probe_projected==(strategy==kvmem::LayerwiseMtpHistory::UpstreamGlobal?full_layers*T:0),
+-                "explicit MTP history policy ran the wrong private target probe");
++            check(probe_rows==(needs_probe?T:0) && probe_projected==(needs_probe?full_layers*T:0),
++                "MTP and target Query selectors did not share exactly one required private probe");
+             if (strategy==kvmem::LayerwiseMtpHistory::FirstLayer)
+                 check(sequence.window.layer_views.auxiliary_pages==sequence.window.layer_views.target.front().pages,
+                     "first-layer MTP did not restore its own K/V for first-target historical IDs");

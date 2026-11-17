@@ -35,6 +35,14 @@ class WrapperTest(unittest.TestCase):
             self.assertEqual(json.loads(valid.stdout)['env']['STRATA_FATTN'], '1')
             self.assertEqual(json.loads(valid.stdout)['env']['STRATA_FDEC'], '1')
             native_args = json.loads(valid.stdout)['args']
+            self.assertNotIn('--kvmem-cache-min-tokens',native_args)
+            for minimum in ('0','4095','4096','4097','2147483647'):
+                result=run(['--cache-min-tokens',minimum]);self.assertEqual(result.returncode,0,result.stderr)
+                argv=json.loads(result.stdout)['args']
+                if minimum=='0':self.assertNotIn('--kvmem-cache-min-tokens',argv)
+                else:self.assertEqual(argv[argv.index('--kvmem-cache-min-tokens')+1],minimum)
+            for minimum in ('-1','2147483648','1.5'):
+                self.assertEqual(run(['--cache-min-tokens',minimum]).returncode,2)
             self.assertEqual(native_args[native_args.index('--ram-experts-mib') + 1], '-1')
             for value in ('-2', '-1', '0', '4096'):
                 explicit = run(['--', '--ram-experts-mib', value])

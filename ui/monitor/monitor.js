@@ -423,7 +423,7 @@
       const values = {
         name: (device.name || matched?.name || t("推理设备")).replace(/^NVIDIA GeForce /, ""),
         id: device.uuid ? `UUID · ${device.uuid.slice(-8)}` : matched?.uuid ? `UUID · ${matched.uuid.slice(-8)}` : device.pci_bus_id ? `PCI · ${device.pci_bus_id}` : logicalId,
-        status: !matched ? t("读数未采集") : !fresh ? t("读数已过期") : t("本服务"),
+        status: !matched ? t("读数未采集") : !fresh ? t("读数已过期") : g.unavailable_metrics?.length ? t("部分指标未采集") : t("本服务"),
         load: fmt(g.utilization_percent),
         vram: fmt(number(g.used_bytes) ? g.used_bytes / GiB : null, 1),
         total: number(total) ? t("共 {0} GiB", fmt(total / GiB, 1)) : t("容量未采集"),
@@ -433,6 +433,7 @@
         rx: fmt(number(g.pcie_rx_bytes_per_second) ? g.pcie_rx_bytes_per_second / MiB : null, 1),
       };
       for (const [key, value] of Object.entries(values)) card.querySelector(`[data-gpu="${key}"]`).textContent = value;
+      card.querySelector('[data-gpu="power"]').title = fresh && matched && !number(g.power_w) ? t("驱动未提供整卡功耗读数") : "";
       gauge(card.querySelector('[data-dial="load"]'), g.utilization_percent, t("GPU 负载 {0}%", fmt(g.utilization_percent)));
       gauge(card.querySelector('[data-dial="vram"]'), usage, t("整卡显存 {0} / {1} GiB", values.vram, fmt(number(total) ? total / GiB : null, 1)));
       chart(`gpu:${card.dataset.device}`, g.utilization_percent, append, card.querySelector("[data-gpu-chart]"), 100);
@@ -442,7 +443,7 @@
       const item = document.createElement("p");
       const matches = bound.map((device) => matchesDevice(device, g));
       const role = matches.includes(true) ? t("参与当前服务") : !known || matches.includes(null) ? t("绑定待确认") : t("未参与当前服务");
-      item.textContent = `${g.name} · ${role}\n${g.uuid}\n${fresh ? t("{0}% 负载 · {1} / {2} GiB", fmt(g.utilization_percent), fmt(number(g.used_bytes) ? g.used_bytes / GiB : null, 1), fmt(number(g.total_bytes) ? g.total_bytes / GiB : null, 1)) : t("读数已过期")}`;
+      item.textContent = `${g.name} · ${role}\n${g.uuid || g.pci_bus_id || t("设备身份未采集")}\n${fresh ? t("{0}% 负载 · {1} / {2} GiB", fmt(g.utilization_percent), fmt(number(g.used_bytes) ? g.used_bytes / GiB : null, 1), fmt(number(g.total_bytes) ? g.total_bytes / GiB : null, 1)) : t("读数已过期")}`;
       return item;
     }));
     if (!gpus.length) hardwareList.textContent = t("硬件读数未采集");
@@ -977,7 +978,9 @@
     const hardwareFresh =
       number(hardware.sampled_at_ms) &&
       state.sampled_at_ms - hardware.sampled_at_ms < 5000;
-    renderGpus(gpus, hardwareFresh, append);
+    const gpuStamp = Object.hasOwn(hardware, 'gpu_sampled_at_ms') ? hardware.gpu_sampled_at_ms : hardware.sampled_at_ms;
+    const gpuFresh = number(gpuStamp) && state.sampled_at_ms - gpuStamp >= -1000 && state.sampled_at_ms - gpuStamp < 5000;
+    renderGpus(gpus, gpuFresh, append);
     const cpu = hardwareFresh ? hardware.cpu_percent : null;
     text("cpu", fmt(cpu));
     bar("cpu", cpu);

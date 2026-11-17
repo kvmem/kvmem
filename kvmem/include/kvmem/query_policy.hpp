@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace kvmem {
@@ -48,6 +49,26 @@ inline QueryReplayPlan query_replay_plan(QueryRange query, uint64_t restore_begi
         plan.reason = "replay_device_capacity"; return plan;
     }
     plan.admitted = true; plan.reason = "bounded_replay";
+    return plan;
+}
+
+// NInfer can rebuild a causal suffix over several B+R windows. The frozen
+// first-pass Query scores only the prefix evaluated so far in the second pass.
+// Zero removes the token cap; the context, checkpoint and physical budgets still
+// apply. Other backends retain query_replay_plan's bounded admission contract.
+inline QueryReplayPlan streaming_query_replay_plan(QueryRange query, uint64_t restore_begin,
+    uint64_t end, uint32_t limit, uint32_t block, uint64_t history_pages,
+    uint64_t device_pages, uint32_t workspace = 0) noexcept {
+    auto plan = query_replay_plan(query, restore_begin, end, limit ? limit : UINT32_MAX,
+                                 block, history_pages, device_pages, workspace);
+    if (plan.admitted || std::strcmp(plan.reason, "replay_device_capacity") != 0) return plan;
+    // A refresh must leave room for an append and the native draft workspace.
+    // Do not turn invalid boundaries, explicit token limits or an oversized
+    // historical view into a streaming admission.
+    const uint64_t minimum = (uint64_t(workspace) + 1 + block - 1) / block;
+    if (history_pages > device_pages || minimum > device_pages - history_pages) return plan;
+    plan.admitted = true;
+    plan.reason = "streaming_query_replay";
     return plan;
 }
 

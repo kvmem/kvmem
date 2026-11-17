@@ -19,6 +19,10 @@ module.exports=async({browser,base,info})=>{
   assert.equal(await page.locator('[data-scoring-migration]').count(),1);
   await page.locator('[data-language-select]').selectOption('zh-CN');await openAdvanced();
   assert.equal(await field('QueryScorer').inputValue(),'meanq-cosine');assert.equal(await field('GraphAlpha').inputValue(),'0');assert.equal(await field('Lrfu').isChecked(),true);
+  assert.equal(await field('QueryMaxTokens').getAttribute('min'),'0');
+  assert.equal(await field('QueryReplayMaxTokens').getAttribute('min'),'0');
+  await field('QueryMaxTokens').fill('0');await field('QueryReplayMaxTokens').fill('0');
+  const unlimited=await preview();assert.equal(unlimited.QueryMaxTokens,0);assert.equal(unlimited.QueryReplayMaxTokens,0);
   await field('QueryScorer').selectOption('page-softmax');assert.equal(await field('Lrfu').isChecked(),true,'scorer must not toggle history');
   await field('GraphAlpha').fill('.2');await field('ScoreAggregation').selectOption('mean');await field('LrfuLambda').fill('.3');await field('LrfuTopFraction').fill('.5');
   await field('QueryMaxTokens').fill('128');await field('QueryReplayMaxTokens').fill('512');
@@ -39,6 +43,10 @@ module.exports=async({browser,base,info})=>{
   await openAdvanced();assert.equal(await field('GraphAlpha').isDisabled(),true);
   assert.equal(await field('GraphAlpha').inputValue(),'0.2','locked launch settings retain the submitted value');
   assert.equal(await page.locator('[data-runtime-key="GraphAlpha"] .s-runtime-value').textContent(),'0.7','the observed report remains distinct from launch settings');
+  runtime={state:'stopped'};await page.reload();await field('Backend').waitFor();
+  await page.locator('[data-preset=ninfer-quality]').click();
+  assert.equal(await field('QueryMaxTokens').inputValue(),'0','built-in NInfer recipe uses full Query');
+  assert.equal(await field('QueryReplayMaxTokens').inputValue(),'0','built-in NInfer recipe uses complete replay');
   if(process.env.SCREENSHOT_DIR)await page.screenshot({path:process.env.SCREENSHOT_DIR+'/query-scoring.png',fullPage:true});
   assert.deepEqual(errors,[]);
  }finally{await context.close();}

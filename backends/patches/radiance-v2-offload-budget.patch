@@ -1,0 +1,48 @@
+diff --git a/core/mem/vram_budget.cpp b/core/mem/vram_budget.cpp
+--- a/core/mem/vram_budget.cpp
++++ b/core/mem/vram_budget.cpp
+@@ -294,10 +294,11 @@
+     cfg.vram_weights_mib = to_mib_up(b.weights);
+     const int64_t w_over = cfg.vram_weights_mib * kMiB - b.weights;
+     cfg.vram_kv_mib      = to_mib(std::max<int64_t>(b.kv - w_over, 0));
+-    /* A streamed plan's maps are charged in kv_one but reserved outside the paged split, so the MiB
+-     * truncation would leave the pool short of the one conversation kv_one was sized for. Under
+-     * streaming kv_one is a requirement, so it is rounded up. */
+-    if (cfg.kv_streams && kv_one > 0 &&
++    /* A streaming or layer-offloaded plan requires the whole kv_one floor. Rounding the weight
++     * pool up and subtracting its fractional MiB from KV can otherwise leave the cache one MiB
++     * short, even though the split explicitly spilled weights to make that floor fit. Take this
++     * small rounding difference from the headroom, as for a complete cache ceiling below. */
++    if ((cfg.kv_streams || cfg.placement == "layer_offload") && kv_one > 0 &&
+         b.kv >= kv_one && cfg.vram_kv_mib * kMiB < kv_one)
+         cfg.vram_kv_mib = to_mib_up(kv_one);
+     /* A cache given its whole ceiling is rounded up to cover it, out of the headroom as the
+diff --git a/tests/mem_test.cpp b/tests/mem_test.cpp
+--- a/tests/mem_test.cpp
++++ b/tests/mem_test.cpp
+@@ -485,6 +485,25 @@
+             CHECK_EQ(b.weights, b.statics);
+         }
+     }
++}
++
++TEST(layer_offload_preserves_the_kv_floor_when_weights_round_up) {
++    const int64_t MiB = 1024 * 1024;
++    VramFacts f{};
++    f.capacity = 12LL << 30;
++    f.free = f.capacity - 1234;  /* the resulting weight floor is not MiB-aligned */
++    f.arena = 200 * MiB;
++    f.statics = 20LL << 30;
++    f.kv_ceiling = 4LL << 30;
++    f.kv_one = 227 * MiB;
++    Config c = derive_config();
++    c.placement = "layer_offload";
++    VramBudget b;
++    CHECK_OK(vram_budget_resolve(c, { f }, &b));
++    CHECK_EQ(b.kv, f.kv_one);
++    CHECK_EQ(c.vram_kv_mib * MiB, f.kv_one);
++    CHECK(f.capacity - (f.capacity - f.free) - f.arena -
++          (c.vram_weights_mib + c.vram_kv_mib) * MiB >= 16 * MiB);
+ }
+ 
+ /* With a lending cache at its floor, the prefill staging region is paid by expert residency

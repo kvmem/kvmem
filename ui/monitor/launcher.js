@@ -97,7 +97,7 @@
     SinkTokens:12288,RecentTokens:1024,Concurrency:1,RetainedSessions:1,ThinkingBudget:16384,
     ReasoningEffort:'xhigh',PreserveThinking:true,SpeculativeMode:'mtp',VisionResidency:'cpu',VisionTokens:1024,
     QueryScorer:'page-softmax',GraphAlpha:0.2,Lrfu:false,ScoreAggregation:'mean',QueryMaxTokens:512,QueryReplayMaxTokens:2048};
-  const ninferDefaultPreset={...commonPreset,Backend:'ninfer',ThinkingMode:'default',ThinkingBudget:0,KvType:'int8',Prefill:256,DraftTokens:4,DraftPolicy:'adaptive',NgramDrafts:31,NgramMinMatch:12,FastPrefill:true,DeviceProfile:'auto',Vision:true};
+  const ninferDefaultPreset={...commonPreset,Backend:'ninfer',QueryMaxTokens:0,QueryReplayMaxTokens:0,ThinkingMode:'default',ThinkingBudget:0,KvType:'int8',Prefill:256,DraftTokens:4,DraftPolicy:'adaptive',NgramDrafts:31,NgramMinMatch:12,FastPrefill:true,DeviceProfile:'auto',Vision:true};
   const presets = [
     {id:'radiance',title:['RX 9000 系列 16GB · 极速档','RX 9000 Series 16GB · Speed'],note:['256K 上下文 · 36K KV · CPU 视觉','256K context · 36K KV · CPU vision'],parameters:{...commonPreset,"Backend":"radiance","Budget":36864,"Reserve":4096,"KvType":"fp8","StateCacheType":"f32","Prefill":256,"SpeculativeMode":"dflash2","DraftTokens":7,"DraftPolicy":"fixed","Vision":true,"ThinkingMode":"default","ThinkingBudget":0,"VramReserveMiB":256,"EmbeddingPlacement":"ram","CpuThreads":8,"VisionCacheMiB":64,"VisionTokens":256,"NgramDrafts":0,"NgramMinMatch":12}},
     {id:'ninfer-speed',title:['NInfer · 极速档','NInfer · Speed'],
@@ -120,6 +120,22 @@
         ...(backend==='llamacpp'?{KvTypeK:'q8_0',KvTypeV:'q8_0'}:{}),...(explicitLayerwiseRecipeResources[backend]||{})}
     })),
   ].map(p=>({...p,note:p.note||['256K 上下文 · 46K 驻留 · 2K 生成预留','256K context · 46K resident · 2K reserve']}));
+  function configureRadianceTemplates() {
+    const profile=info?.backend_capabilities?.radiance?.build_profile;
+    if(!['qwen35-iqr-gfx1101','qwen35-iqr-rdna3'].includes(profile))return;
+    const base={Backend:'radiance',Context:8192,Budget:1024,Reserve:512,HostMiB:2048,SinkTokens:128,RecentTokens:256,
+      Concurrency:1,RetainedSessions:1,QueryScorer:'page-softmax',ScoreAggregation:'mean',GraphAlpha:.2,Lrfu:false,
+      QueryMaxTokens:256,QueryReplayMaxTokens:512,KvType:'bf16',StateCacheType:'f32',Prefill:256,
+      SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',Vision:false,MaxTokens:0,ThinkingMode:'default',ThinkingBudget:0,
+      VramReserveMiB:256,EmbeddingPlacement:'vram',CpuThreads:2,VisionResidency:'resident',VisionTokens:256,VisionCacheMiB:0,
+      NgramDrafts:0,NgramMinMatch:12,WeightPlacement:'all_vram',WeightHostMiB:0};
+    const at=presets.findIndex(p=>p.id==='radiance');
+    presets.splice(at,1,
+      {id:'radiance-rdna3',title:['RDNA3 · 文本测试','RDNA3 · Text preview'],note:['BF16 KV · 1K 预算 · 不启用草稿','BF16 KV · 1K budget · no drafts'],parameters:base},
+      {id:'radiance-rdna3-dflash2',title:['RDNA3 · DFlash2 测试','RDNA3 · DFlash2 preview'],note:['需包含 DFlash2 的兼容模型 · 3K 预算','Requires a compatible DFlash2 model · 3K budget'],parameters:{...base,Budget:3072,RecentTokens:2176,SpeculativeMode:'dflash2',DraftTokens:7}},
+      {id:'radiance-rdna3-offload',title:['RDNA3 · 主存卸载','RDNA3 · RAM offload'],note:['显存不足时使用 · 模型权重 RAM 预算 8 GiB','For limited VRAM · 8 GiB RAM for model weights'],parameters:{...base,Context:2048,Budget:512,Reserve:384,HostMiB:512,Prefill:128,RecentTokens:128,QueryMaxTokens:128,QueryReplayMaxTokens:256,EmbeddingPlacement:'ram',WeightPlacement:'layer_offload',WeightHostMiB:8192}},
+      {id:'radiance-rdna3-offload-dflash2',title:['RDNA3 · 主存卸载 + DFlash2','RDNA3 · RAM offload + DFlash2'],note:['需兼容的 DFlash2 模型 · 8 GiB 权重 RAM 预算','Requires compatible DFlash2 model · 8 GiB weight RAM'],parameters:{...base,Context:4096,Budget:3072,RecentTokens:2176,HostMiB:512,Prefill:128,EmbeddingPlacement:'ram',WeightPlacement:'layer_offload',WeightHostMiB:8192,SpeculativeMode:'dflash2',DraftTokens:7}});
+  }
   const enginePreset=backend=>structuredClone(presets.find(p=>p.parameters.Backend===backend).parameters);
   const BACKENDS_KEY='kvmem-launch-backends-v1';
   const defaults={Backend:'ninfer',Model:'',Worker:'',Gpu:'',Context:262144,Budget:32768,HostMiB:16384,Reserve:1024,Prefill:128,MaxTokens:1024,Port:18200,ListenHost:'127.0.0.1',SinkTokens:12288,RecentTokens:1024};
@@ -276,7 +292,7 @@
     const model=health?.model||{},facts=[model.format,model.architecture,model.files?tr(`${model.files} 个文件`,`${model.files} file(s)`):'',model.bytes?`${(model.bytes/1024**3).toFixed(2)} GiB`:''].filter(Boolean);
     if(facts.length)box.append(make('p',{class:'l-health-meta'},facts.join(' · ')));
     box.append(make('p',{class:'l-health-note'},tr('仅检查文件与资源；worker 加载、显存用量与推理结果尚未验证。','Files and resources only; worker loading, VRAM use and inference remain unverified.')));
-    const features=make('div',{class:'l-health-features'}),states={present:['已包含','Included'],absent:['未包含','Absent'],unknown:['未确认','Unverified'],external:['需外部文件','External file']};
+    const features=make('div',{class:'l-health-features'}),states={present:['已包含','Included'],absent:['未包含','Absent'],unknown:['未确认','Unverified'],external:['需外部文件','External file'],external_ready:['外部文件已选','External file selected']};
     for(const [key,zh,en] of [['text','文本','Text'],['vision','图像','Vision'],['mtp','MTP','MTP'],['dflash2','DFlash2','DFlash2'],['tokenizer','分词器','Tokenizer'],['template','聊天模板','Chat template']]){
       const state=health?.features?.[key];if(!state)continue;
       features.append(make('span',{'data-feature':key,'data-state':state},tr(zh,en)+' · '+tr(...(states[state]||states.unknown))));
@@ -970,13 +986,14 @@
     const scorer=p.QueryScorer||(legacyScoring&&(!p.NoLrfu||p.ScoreAggregation==='max'||'LrfuLambda' in p||'LrfuTopFraction' in p)?'meanq-cosine':'page-softmax');
     p={...p,QueryScorer:scorer,ScoreAggregation:p.ScoreAggregation??(scorer==='meanq-cosine'?'max':'mean'),
       GraphAlpha:p.GraphAlpha??(scorer==='meanq-cosine'?0:0.2),Lrfu:p.Lrfu??('NoLrfu' in p?!p.NoLrfu:scorer==='meanq-cosine'),
-      QueryMaxTokens:p.QueryMaxTokens??512,QueryReplayMaxTokens:p.QueryReplayMaxTokens??2048};
+      QueryMaxTokens:p.QueryMaxTokens??(p.Backend==='ninfer'?0:512),QueryReplayMaxTokens:p.QueryReplayMaxTokens??(p.Backend==='ninfer'?0:2048)};
     let refreshGpuOrder=()=>{};
     const b=p.Backend,n=b==='ninfer',l=b==='llamacpp',poly=b==='polystrata',rad=b==='radiance';
     if(n)p.CheckpointExtraRecomputeTokens??=0;
+    p.CacheMinTokens??=0;
     // Resolve the launcher's omitted values before rendering; keep explicit 0/false.
     const concreteDefaults={Prefill:rad?256:poly?512:defaults.Prefill,ThinkingBudget:0,Concurrency:1,VisionTokens:1024,NgramDrafts:0,NgramMinMatch:12,
-      DeviceProfile:'off',LogLevel:'info',QueryMaxTokens:512,ReplayMaxTokens:2048};
+      DeviceProfile:'off',LogLevel:'info',QueryMaxTokens:n?0:512,ReplayMaxTokens:2048};
     for(const [key,value] of Object.entries(concreteDefaults))if(p[key]===undefined||p[key]===null||p[key]==='')p[key]=value;
     if(p.RetainedSessions===undefined||p.RetainedSessions===null||p.RetainedSessions==='')p.RetainedSessions=poly?Math.max(4,Number(p.Concurrency)+1):4;
     if(!p.ThinkingMode||p.ThinkingMode==='default')p.ThinkingMode=(n||rad)?'default':poly?(p.ReasoningEffort==='none'?'off':'on'):'off';
@@ -1178,6 +1195,7 @@
     ['SinkTokens','RecentTokens','RetainedSessions'].forEach(k=>{const el=panels[0].querySelector(`[data-param="${k}"]`);if(el)retention.append(el.closest('label'));});
     const target=field(retention,p,'LayerwiseCheckpointTarget','实例热检查点目标','Hot checkpoints per instance','number');
     target.min='1';target.required=false;
+    {const minimum=field(retention,p,'CacheMinTokens','会话缓存最低长度 · tokens','Minimum cached history · tokens','number',null,['0 关闭。保存时按可恢复的完整会话长度判断，包含历史输入和已提交的输出；短会话不占保留名额，仍可读取已有缓存。','0 disables filtering. At save time, count the complete restorable history, including input and committed output. Short histories do not use a retention slot; existing prefixes remain reusable.']);minimum.min='0';minimum.max='2147483647';minimum.required=true;}
     if(n){const extra=field(retention,p,'CheckpointExtraRecomputeTokens','快照额外重算上限 · tokens','Checkpoint extra recompute limit · tokens','number',null,['0 关闭。允许用附近较早点替代低收益快照；执行中的 Query 回放点仍受保护。重试可能需要重新保存快照或读取 SSD，因此该值不是耗时上限。','0 disables this optimization. Nearby earlier states can replace low-value checkpoints; active Query replay points remain protected. Retries may rebuild checkpoints or read SSD, so this is not a latency limit.']);extra.min='0';extra.max='2147483647';extra.required=true;}
     if(legacyScoring)scoring.before(make('p',{class:'l-muted','data-scoring-migration':''},tr('已将旧检索设置转换为明确参数；请检查下方评分器和历史累计选项。','Legacy retrieval settings were converted to explicit controls. Review the scorer and LRFU settings below.')));
     field(scoring,p,'QueryScorer','召回评分算法','Recall scoring algorithm','text',[['page-softmax','Page softmax'],['meanq-cosine','Mean-Q cosine']],['评分器、图传播与历史累计可以独立组合。','Scorer, graph propagation and LRFU can be combined independently.']);
@@ -1186,7 +1204,7 @@
     const history=field(scoring,p,'Lrfu','历史累计 · LRFU','LRFU history','checkbox',null,['对历次问题的重要性做衰减累计。top-fraction 只筛正向奖励，负分仍保留。','Accumulate decayed relevance across queries. Top-fraction gates positive rewards while retaining negative evidence.']);history.dataset.explicitBoolean='true';
     const decay=field(scoring,{LrfuLambda:0.5,...p},'LrfuLambda','历史衰减系数','History decay','number');decay.max='1';decay.step='any';decay.required=true;
     const fraction=field(scoring,{LrfuTopFraction:0.9,...p},'LrfuTopFraction','正向奖励候选比例','Positive reward fraction','number');fraction.min='0';fraction.max='1';fraction.step='any';fraction.required=true;
-    for(const [key,zh,en,note] of [['QueryMaxTokens','问题评分上限 · tokens','Query score limit · tokens',['仅使用当前问题末尾的这些 tokens 评分。','Score with at most this many trailing tokens of the current question.']],['QueryReplayMaxTokens','完整回放上限 · tokens','Causal replay limit · tokens',['超过上限时保持驻留视图并使用 Pressure；不会截断因果回放。','Above this limit, retain the resident view with Pressure; causal replay is not truncated.']]]){const limit=field(scoring,p,key,zh,en,'number',null,note);limit.min='1';limit.required=true;}
+    for(const [key,zh,en,note] of [['QueryMaxTokens','问题评分上限 · tokens','Query score limit · tokens',['仅使用当前问题末尾的这些 tokens 评分。','Score with at most this many trailing tokens of the current question.']],['QueryReplayMaxTokens','完整回放上限 · tokens','Causal replay limit · tokens',['超过上限时保持驻留视图并使用 Pressure；不会截断因果回放。','Above this limit, retain the resident view with Pressure; causal replay is not truncated.']]]){const limit=field(scoring,p,key,zh,en,'number',null,note);limit.min=p.Backend==='ninfer'?'0':'1';limit.required=true;if(p.Backend==='ninfer')limit.title=tr('0 表示不限制长度；正数设置上限。','0 means unlimited; a positive value sets a cap.');}
     const scoringAdvanced=recallAdvanced(scoring,'scoring','评分与回放细节','Scoring and replay details');
     for(const key of ['ScoreAggregation','LrfuLambda','LrfuTopFraction','QueryMaxTokens','QueryReplayMaxTokens'])scoringAdvanced.append(scoring.querySelector(`[data-param=${key}]`).closest('label'));
     field(panels[1],p,'Prefill','预填充块大小 · tokens','Prefill chunk · tokens','number');
@@ -1282,6 +1300,8 @@
       field(panels[4],{CpuThreads:2,...p},'CpuThreads','CPU 编码线程数','CPU encoder threads','number');
       field(panels[4],{VisionCacheMiB:256,...p},'VisionCacheMiB','图片编码缓存 MiB','Image embedding cache MiB','number',null,['0 关闭；包含图片身份数据，独立于 KV 缓存预算。','0 disables; includes image identity data and has a separate budget from KV.']);
       field(panels[0],{EmbeddingPlacement:'vram',...p},'EmbeddingPlacement','文本嵌入表位置','Text embedding placement','text',[['vram','GPU'],['ram','RAM']],['RAM 可为视觉和 KV 释放显存。','RAM frees GPU memory for vision and KV.']);
+      field(panels[0],{WeightPlacement:'all_vram',...p},'WeightPlacement','模型权重位置','Model weight placement','text',[['all_vram','GPU'],['layer_offload',tr('主存卸载','RAM offload')]],['主存卸载需要足够的 RAM，推理速度取决于 GPU 连接带宽。','RAM offload requires available RAM; speed depends on the GPU link.']);
+      field(panels[0],{WeightHostMiB:0,...p},'WeightHostMiB','模型权重主存预算 · MiB','Model weight RAM budget · MiB','number',null,['主存卸载时填写；与 KV 主存预算分开。','Set for RAM offload; separate from the KV host budget.']);
       for(const [key,zh,en] of [['RadianceHome','Radiance 资源目录','Radiance resource directory'],['RocmPath','ROCm 运行库目录','ROCm runtime directory']])field(ng,p,key,zh,en);
     }
     if(poly){
@@ -1553,7 +1573,7 @@
   async function poll(){if(info&&!busy){try{updateStatus(await api('status'),true);}catch(e){message(e.message,true);}}setTimeout(poll,document.hidden?5000:2000);}
   // The shared i18n bindings translate navigation, including its mobile label.
   window.addEventListener('kvmem-language-change',()=>{if(info){try{restoreDraft(captureDraft());}catch(e){message(e.message,true);}}});
-  async function init(){try{info=await api('info');let saved;try{saved=JSON.parse(localStorage.getItem(DRAFT_KEY)||'null');}catch{saveError=true;}try{const drafts=JSON.parse(localStorage.getItem(BACKENDS_KEY)||'{}');for(const [key,value] of Object.entries(drafts))if(usableDraft(value)&&value.parameters.Backend===key)perBackend[key]=value;}catch{saveError=true;}if(usableDraft(saved))restoreDraft(saved);else render(info.draft.parameters);updateStatus(info.status,true);if(location.pathname!=='/chat/'&&!location.hash&&!['starting','ready'].includes(info.status.state))document.querySelector('[data-page=config]').click();poll();}catch(e){root.replaceChildren(make('section',{class:'s-card'},tr('启动配置需要独立的本地控制台。请运行 scripts/local-console.py，然后打开它显示的地址；推理服务停止后，这个控制台仍然可用。','Launch settings require the independent local console. Run scripts/local-console.py and open its printed URL; the console remains available when inference stops.')));}}
+  async function init(){try{info=await api('info');configureRadianceTemplates();let saved;try{saved=JSON.parse(localStorage.getItem(DRAFT_KEY)||'null');}catch{saveError=true;}try{const drafts=JSON.parse(localStorage.getItem(BACKENDS_KEY)||'{}');for(const [key,value] of Object.entries(drafts))if(usableDraft(value)&&value.parameters.Backend===key)perBackend[key]=value;}catch{saveError=true;}if(usableDraft(saved))restoreDraft(saved);else render(info.draft.parameters);updateStatus(info.status,true);if(location.pathname!=='/chat/'&&!location.hash&&!['starting','ready'].includes(info.status.state))document.querySelector('[data-page=config]').click();poll();}catch(e){root.replaceChildren(make('section',{class:'s-card'},tr('启动配置需要独立的本地控制台。请运行 scripts/local-console.py，然后打开它显示的地址；推理服务停止后，这个控制台仍然可用。','Launch settings require the independent local console. Run scripts/local-console.py and open its printed URL; the console remains available when inference stops.')));}}
   init();
   document.documentElement.dataset.launcherReady = "true";
 })();

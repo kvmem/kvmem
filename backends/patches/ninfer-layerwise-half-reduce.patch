@@ -1,0 +1,93 @@
+diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
+index de393ab00059afe8491610533a1940bc9e66d3d0..a53a04860deea15856b245aeed24bc2ccfd36cf4 100644
+--- a/apps/cli/options.cpp
++++ b/apps/cli/options.cpp
+@@ -177,6 +177,7 @@ std::string usage_text(const char* argv0) {
+            "  --kvmem-layerwise-activation-disk-mib N  Query tape SSD (default 0)\n"
+            "  --kvmem-layerwise-staging-mib N          bounded transfer staging (default 16)\n"
+            "  --kvmem-layerwise-score-tokens N   Mean-K statistics per 64-token page: 32 or 64 (default 64)\n"
++           "  --kvmem-layerwise-half-reduce MODE   32-token half-page scores: sum (default) or max\n"
+            "  --kvmem-layerwise-unique-query-anchor    keep a long unique exact match within the history budget\n"
+            "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
+            "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+@@ -775,6 +776,8 @@ Options parse_options(int argc, char** argv) {
+     options.kvmem.checkpoint_target = retention.target;
+     options.kvmem.layerwise_unique_query_anchor = retention.query_anchor;
+     options.kvmem.layerwise_score_tokens = retention.score_tokens;
++    options.kvmem.layerwise_half_max = retention.half_max;
++    (void)options.kvmem.mean_key_block_tokens();
+     if (memory.enabled) {
+         const auto window=options.kvmem.device_tokens();
+         if (window>options.max_context || window>std::numeric_limits<std::uint32_t>::max() ||
+diff --git a/include/ninfer/engine_options.h b/include/ninfer/engine_options.h
+index a26aa6c9249c90a34438d190dc6a5c9f8d60722d..02fc861791ff0c0c8cce7d59e004aac4e39fe6b5 100644
+--- a/include/ninfer/engine_options.h
++++ b/include/ninfer/engine_options.h
+@@ -472,7 +472,10 @@ struct KvmemOptions {
+     std::uint32_t checkpoint_target = kDefaultLayerwiseCheckpointTarget;
+     bool layerwise_unique_query_anchor = false;
+     std::uint32_t layerwise_score_tokens = 64;
++    bool layerwise_half_max = false;
+     [[nodiscard]] std::uint32_t mean_key_block_tokens() const {
++        if (layerwise_half_max && (recall_strategy != kvmem::RecallStrategy::Layerwise || layerwise_score_tokens != 32))
++            throw std::invalid_argument("half-page max requires layerwise recall and 32-token Mean-K");
+         if (recall_strategy != kvmem::RecallStrategy::Layerwise) return 64;
+         if (layerwise_score_tokens != 32 && layerwise_score_tokens != 64)
+             throw std::invalid_argument("native layerwise score tokens must be 32 or 64");
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index 3b16cd45b8557b5adff2d37a35279c376c88a530..5f29eb9522611a9b4ee0c420ff2aea1468523f6c 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -890,6 +890,7 @@ struct NativeLayerwiseProgramQuery::Impl {
+         kvmem::KvMemStoreConfig configuration;
+         kvmem::validate_layerwise_selection_bands({resources.sink_blocks,resources.recent_blocks},64,selected_budget);
+         configuration.block_tokens=64;configuration.select_budget=static_cast<std::uint32_t>(selected_budget);
++        configuration.layerwise_half_max=p.kvmem_options.layerwise_half_max;
+         configuration.sink_blocks=resources.sink_blocks;configuration.recent_blocks=resources.recent_blocks;
+         policy=std::make_unique<kvmem::KvMemStore>(configuration);policy->register_append(begin);
+         // A new layerwise mode has its own literal Mean-K/TopK policy. Legacy
+diff --git a/src/product/kvmem_cli_options.h b/src/product/kvmem_cli_options.h
+index 3b19bebc91853aac81d410eb6a0caf8a30f84ed3..5392f73cf12f047ddd75eea668d99e18b01154fd 100644
+--- a/src/product/kvmem_cli_options.h
++++ b/src/product/kvmem_cli_options.h
+@@ -14,6 +14,7 @@ struct NativeRetentionOptions {
+     std::uint32_t target = kDefaultLayerwiseCheckpointTarget;
+     bool query_anchor = false;
+     std::uint32_t score_tokens = 64;
++    bool half_max = false;
+ 
+     template<class Need>
+     bool parse(const std::string& arg, const Need& need, kvmem::CliOptions& memory) {
+@@ -23,6 +24,11 @@ struct NativeRetentionOptions {
+             target = memory.integer(arg, need(arg.c_str()), 1);
+             if (target > kMaxLayerwiseCheckpointTarget)
+                 throw std::invalid_argument("checkpoint target exceeds 256");
++        } else if (arg == "--kvmem-layerwise-half-reduce") {
++            const std::string value(need(arg.c_str()));
++            if (value != "sum" && value != "max")
++                throw std::invalid_argument("--kvmem-layerwise-half-reduce must be sum or max");
++            half_max = value == "max";
+         } else if (arg == "--kvmem-layerwise-score-tokens") {
+             score_tokens = memory.integer(arg, need(arg.c_str()), 1);
+             if (score_tokens != 32 && score_tokens != 64)
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 75d0e833ce6e3158f606833e004eadd8612bbb32..106c70c07546758091c2422b00c791fd059ef0ac 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -128,6 +128,7 @@ std::string serve_usage_text(const char* argv0) {
+            "  --kvmem-layerwise-activation-disk-mib N bounded Query activation SSD (default 0)\n"
+            "  --kvmem-layerwise-staging-mib N bounded Query/KV transfer staging (default 16)\n"
+            "  --kvmem-layerwise-score-tokens N   Mean-K statistics per 64-token page: 32 or 64 (default 64)\n"
++           "  --kvmem-layerwise-half-reduce MODE   32-token half-page scores: sum (default) or max\n"
+            "  --kvmem-layerwise-unique-query-anchor    keep a long unique exact match within the history budget\n"
+            "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
+            "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+@@ -1831,6 +1832,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+     options.kvmem.checkpoint_target = retention.target;
+     options.kvmem.layerwise_unique_query_anchor = retention.query_anchor;
+     options.kvmem.layerwise_score_tokens = retention.score_tokens;
++    options.kvmem.layerwise_half_max = retention.half_max;
++    (void)options.kvmem.mean_key_block_tokens();
+     kvmem::validate_layerwise_mtp_history(memory.recall_strategy,
+         options.speculative.backend==SpeculativeBackend::Mtp,memory.layerwise_mtp_history);
+     if (options.kvmem.selected_tokens != 0 &&

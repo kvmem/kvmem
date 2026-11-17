@@ -48,7 +48,8 @@ function Remove-KVMemImplicitRecallBands([string[]]$Arguments,$Bound) {
 }
 
 function Invoke-KVMemRecallWorkerCheck([string]$Worker,$Parameters,[string]$Root) {
-    if(!$Parameters.ContainsKey('RecallStrategy') -or $Parameters.RecallStrategy -ne 'layerwise') {return}
+    if((!$Parameters.ContainsKey('RecallStrategy') -or $Parameters.RecallStrategy -ne 'layerwise') -and
+       (!$Parameters.ContainsKey('CacheMinTokens') -or !$Parameters.CacheMinTokens)) {return}
     $python=if($Parameters.ContainsKey('Python')){$Parameters.Python}else{''}
     $pythonArgs=@()
     if(!$python) {

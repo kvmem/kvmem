@@ -4,7 +4,7 @@ module.exports=async({browser,base,info})=>{
   const context=await browser.newContext({viewport:{width:1440,height:960}}),page=await context.newPage(),errors=[];
   page.on('pageerror',e=>errors.push(e.message));
   const gpu={uuid:'GPU-running-config-fixture',name:'Fixture GPU'};
-  const parameters={...info.draft.parameters,Backend:'polystrata',Model:'C:/models/current.gguf',Gpu:gpu.uuid,Context:65536,Prefill:512,Reserve:2048,RetainedSessions:4,SpeculativeMode:'mtp',DraftTokens:1,DraftPolicy:'adaptive',ThinkingMode:'on',PreserveThinking:true,WorkerArgs:['--elastic-experts']};
+  const parameters={...info.draft.parameters,QueryMaxTokens:512,QueryReplayMaxTokens:2048,Backend:'polystrata',Model:'C:/models/current.gguf',Gpu:gpu.uuid,Context:65536,Prefill:512,Reserve:2048,RetainedSessions:4,SpeculativeMode:'mtp',DraftTokens:1,DraftPolicy:'adaptive',ThinkingMode:'on',PreserveThinking:true,WorkerArgs:['--elastic-experts']};
   let status={state:'ready',instance:'first',pid:123,url:'http://127.0.0.1:18200',api_key_configured:true,active_config:{schema_version:1,parameters}};
   let stopMode='fail',startMode='normal',statusFails=false,releaseStop,releaseStart,startPayload;
   await context.addInitScript(()=>localStorage.setItem('kvmem-launch-draft-v2',JSON.stringify({version:2,parameters:{Backend:'ninfer',Model:'C:/stale.ninfer',Context:9999},raw:{WorkerArgs:'["stale"]'}})));

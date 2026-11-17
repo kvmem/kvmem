@@ -1,5 +1,8 @@
 #include "kvmem/layerwise_request.hpp"
 #include "kvmem/raw_kv_store.hpp"
+#include "kvmem/layerwise_pressure.hpp"
+#include "kvmem/layerwise_probe_selection.hpp"
+#include <cmath>
 #include <algorithm>
 #include <limits>
 #include <set>
@@ -37,7 +40,7 @@ LayerwiseQueryRequest::LayerwiseQueryRequest(LayerwiseQueryIdentity identity,
     if (!revision_ || specs_.size() != catalog_.layers().size() ||
         identity_.history.frontier != policy_.total_tokens() || policy_.config().block_tokens != block ||
         identity_.history.frontier % block || tokens % block || tokens > identity_.history.frontier ||
-        keys_.config().block_tokens != block)
+        !layerwise_score_geometry(block, keys_.config().block_tokens))
         fail(MemoryErrorCode::InvalidPlan,"invalid native layerwise Query admission");
     source();
     completed_views_.reserve(specs_.size());
@@ -49,6 +52,12 @@ LayerwiseQueryRequest::LayerwiseQueryRequest(LayerwiseQueryIdentity identity,
             tokens > spec.budget.selected_tokens || spec.query.layer >= keys_.config().n_layer ||
             !statistics.insert(spec.query.layer).second)
             fail(MemoryErrorCode::InvalidPlan,"layerwise Query layer identity or budget mismatch");
+        if (spec.prefill && (spec.prefill->model_layer!=spec.model_layer ||
+            spec.prefill->end>identity_.history.frontier || !spec.query.query_heads ||
+            !spec.query.kv_heads || !spec.query.head_dim || spec.query.query_heads%spec.query.kv_heads ||
+            uint64_t(spec.query.kv_heads)*spec.query.head_dim!=keys_.config().n_embd_k ||
+            !std::isfinite(spec.query.attention_scale) || spec.query.attention_scale<0))
+            fail(MemoryErrorCode::InvalidPlan,"hybrid Query prefill owner or projection geometry mismatch");
         // Publish-sealed is a real admission requirement. Replacing just one
         // stripe must never establish a complete all-layer Host record.
         for (const auto& item : snapshot.blocks)
@@ -76,13 +85,52 @@ const LayerwiseRequestLayer& LayerwiseQueryRequest::current() const {
     if (next_ >= specs_.size()) fail(MemoryErrorCode::InvalidPlan,"layerwise Query has no current layer");
     return specs_[next_];
 }
+bool LayerwiseQueryRequest::uses_shared_history(uint32_t model) const noexcept {
+    return std::find(shared_models_.begin(),shared_models_.end(),model)!=shared_models_.end();
+}
+void LayerwiseQueryRequest::use_shared_history(const LayerwiseQueryIdentity& i,
+    const LayerwiseProbeHistorySelection& history,const std::vector<uint32_t>& models) {
+    check(i);require(LayerwiseRequestPhase::BetweenLayers);source();
+    if (next_ || shared_history_ || models.empty())
+        fail(MemoryErrorCode::InvalidPlan,"shared Query history must bind once before native projection");
+    const auto count=policy_.block_count(),block=policy_.config().block_tokens;
+    if (history.frame.accepted_through!=identity_.history.frontier || history.scores.size()!=count ||
+        history.selected.size()!=std::min(count,policy_.budget_blocks()) ||
+        history.historical_tokens!=native_history_tokens_ || history.charged_tokens!=native_history_tokens_ ||
+        !std::is_sorted(history.selected.begin(),history.selected.end()) ||
+        std::adjacent_find(history.selected.begin(),history.selected.end())!=history.selected.end())
+        fail(MemoryErrorCode::InvalidPlan,"shared Query history has a foreign frame or budget");
+    for (auto id:history.selected) if (id>=count)
+        fail(MemoryErrorCode::InvalidPlan,"shared Query page is outside canonical history");
+    std::set<uint32_t> seen;
+    for (auto model:models) {
+        const auto spec=std::find_if(specs_.begin(),specs_.end(),[&](const auto& x){return x.model_layer==model;});
+        if (spec==specs_.end() || !seen.insert(model).second || spec->prefill)
+            fail(MemoryErrorCode::InvalidPlan,"shared Query layer has an invalid or conflicting source");
+        const auto& q=spec->query;
+        if (!q.query_heads || !q.kv_heads || !q.head_dim || q.query_heads%q.kv_heads ||
+            uint64_t(q.kv_heads)*q.head_dim!=keys_.config().n_embd_k || !std::isfinite(q.attention_scale) || q.attention_scale<0)
+            fail(MemoryErrorCode::InvalidPlan,"shared Query projection geometry differs from native history");
+        const auto fixed=policy_.query_fixed_blocks(spec->mandatory);
+        const auto frame=query_score_frame(policy_.total_tokens(),block,policy_.budget_blocks(),
+            policy_.config().sink_blocks,policy_.config().recent_blocks,fixed);
+        if (fixed!=history.fixed || frame.starts!=history.frame.starts || frame.counts!=history.frame.counts ||
+            frame.score_mask!=history.frame.score_mask || frame.transport_mask!=history.frame.transport_mask ||
+            !std::includes(history.selected.begin(),history.selected.end(),fixed.begin(),fixed.end()))
+            fail(MemoryErrorCode::InvalidPlan,"shared Query fixed pages or score domain differ");
+    }
+    for (uint32_t n=0;n<count;++n) if (!std::isfinite(history.scores[n]) || history.scores[n]<0 ||
+        (!history.frame.score_mask[n] && history.scores[n]!=0))
+        fail(MemoryErrorCode::InvalidPlan,"shared Query has invalid page scores");
+    source();shared_models_=models;shared_history_=&history;
+}
 void LayerwiseQueryRequest::begin_layer(const LayerwiseQueryIdentity& i, uint32_t model_layer) {
     check(i); require(LayerwiseRequestPhase::BetweenLayers);
     const auto& spec = current();
     if (model_layer != spec.model_layer) fail(MemoryErrorCode::InvalidPlan,"future native layer Query requested");
     source();
-    auto scoring = std::make_unique<LayerwiseQuerySelection>(policy_,keys_,identity_,spec.query,
-                                                           revision_,spec.mandatory);
+    auto scoring = (spec.prefill || uses_shared_history(spec.model_layer)) ? nullptr : std::make_unique<LayerwiseQuerySelection>(
+        policy_,keys_,identity_,spec.query,revision_,spec.mandatory);
     progress_.begin_layer(i,model_layer);
     scoring_ = std::move(scoring);
     phase_ = LayerwiseRequestPhase::Projecting;
@@ -105,7 +153,7 @@ void LayerwiseQueryRequest::projected(const LayerwiseQueryIdentity& i, uint64_t 
         progress_.projected(i,spec.model_layer,begin,q.rows);
         const auto first = std::max(begin,identity_.query.begin);
         const auto last = std::min(begin+q.rows,identity_.query.end);
-        if (first < last) {
+        if (first < last && !spec.prefill && !uses_shared_history(spec.model_layer)) {
             q.data += size_t(first-begin)*size_t(width);
             q.rows = uint32_t(last-first);
             scoring_->append(i,first,q);
@@ -128,7 +176,7 @@ void LayerwiseQueryRequest::projected_native(const LayerwiseQueryIdentity& i, ui
         progress_.projected(i,spec.model_layer,begin,q.rows);
         const auto first = std::max(begin,identity_.query.begin);
         const auto last = std::min(begin+q.rows,identity_.query.end);
-        if (first < last)
+        if (first < last && !spec.prefill && !uses_shared_history(spec.model_layer))
             scoring_->append_native(i,first,native_layer_query_rows(q,uint32_t(first-begin),uint32_t(last-first)),scorer);
     } catch (...) { abort(); throw; }
 }
@@ -139,7 +187,18 @@ const LayerWorkingSetPlan& LayerwiseQueryRequest::prepare_restore(const Layerwis
         fail(MemoryErrorCode::Pending,"native full-Query projection is incomplete");
     const auto& spec = current();
     try {
-        auto selected = std::make_unique<LayerwiseHistorySelection>(scoring_->finish(i));
+        source();
+        std::unique_ptr<LayerwiseHistorySelection> selected;
+        if (uses_shared_history(spec.model_layer)) {
+            const auto& shared=*shared_history_;
+            selected=std::make_unique<LayerwiseHistorySelection>(LayerwiseHistorySelection{
+                spec.query.layer,shared.frame,shared.scores,shared.fixed,shared.selected,
+                shared.historical_tokens,shared.charged_tokens});
+        } else selected=std::make_unique<LayerwiseHistorySelection>(spec.prefill
+            ? select_layerwise_prefill_history(policy_,keys_,spec.query.layer,
+                catalog_.snapshot(spec.model_layer),*spec.prefill,spec.mandatory)
+            : scoring_->finish(i));
+        source();
         if (selected->historical_tokens != native_history_tokens_)
             fail(MemoryErrorCode::InvalidPlan,"layerwise selection changed admitted native history extent");
         const auto& snapshot = catalog_.snapshot(spec.model_layer);

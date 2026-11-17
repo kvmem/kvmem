@@ -27,6 +27,20 @@ int main() {
     CHECK(!query_replay_plan({UINT64_MAX-1,UINT64_MAX},UINT64_MAX-1,UINT64_MAX,
         2048,64,1,100,1).admitted);
 
+    // A full 256K Query is replayed through a 36K+16K physical window.
+    const auto full_replay = streaming_query_replay_plan({66,262139},66,262148,0,64,2,832,34);
+    CHECK(full_replay.admitted && full_replay.begin==66 && full_replay.end==262148);
+    CHECK(std::strcmp(full_replay.reason,"streaming_query_replay")==0);
+    CHECK(!query_replay_plan({66,262139},66,262148,UINT32_MAX,64,2,832,34).admitted);
+    CHECK(!streaming_query_replay_plan({66,262139},66,262148,2048,64,2,832,34).admitted);
+    CHECK(streaming_query_replay_plan({100,120},100,140,0,64,2,3,4).admitted);
+    CHECK(!streaming_query_replay_plan({100,120},101,140,0,64,2,3).admitted);
+    CHECK(!streaming_query_replay_plan({64,256},64,256,0,0,1,8).admitted);
+    CHECK(!streaming_query_replay_plan({64,256},64,256,0,64,8,8).admitted);
+    CHECK(!streaming_query_replay_plan({64,256},64,256,0,64,7,8,64).admitted);
+    CHECK(!streaming_query_replay_plan({64,256},64,256,0,64,9,8).admitted);
+    CHECK(!streaming_query_replay_plan({},0,256,0,64,0,8).admitted);
+
     // Independent prefix oracle: a probe grows the partially filled history
     // page, but neither its new K nor its extra page belongs in Query scoring.
     RawKvStoreConfig config;

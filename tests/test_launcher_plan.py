@@ -41,6 +41,43 @@ class PlanTest(unittest.TestCase):
     def plan(self, backend='ninfer', **values):
         return build_plan(self.config(backend, **values))
 
+    def test_full_query_limits_require_new_worker_without_changing_requested_values(self):
+        cases = ({}, {'QueryMaxTokens': 512}, {'QueryReplayMaxTokens': 2048},
+                 {'QueryMaxTokens': 0, 'QueryReplayMaxTokens': 2048},
+                 {'QueryMaxTokens': 512, 'QueryReplayMaxTokens': 0},
+                 {'QueryMaxTokens': 0, 'QueryReplayMaxTokens': 0})
+        for limits in cases:
+            parameters = self.plan(**limits)['effective_parameters']
+            for capabilities in ({}, *({'legacy_query_replay_revision': value}
+                                      for value in (None, False, True, 0, -1, '1', 1.0))):
+                with self.subTest(limits=limits, capabilities=capabilities), self.assertRaisesRegex(
+                        ValueError, 'both QueryMaxTokens and QueryReplayMaxTokens'):
+                    require_launch_features(capabilities, parameters)
+            for revision in (1, 2):
+                with self.subTest(limits=limits, revision=revision):
+                    before = dict(parameters)
+                    require_launch_features({'legacy_query_replay_revision': revision}, parameters)
+                    self.assertEqual(parameters, before)
+            argv = self.plan(**limits)['argv']
+            for key, flag in (('QueryMaxTokens', '--kvmem-query-max-tokens'),
+                              ('QueryReplayMaxTokens', '--kvmem-query-replay-max-tokens')):
+                self.assertEqual(argv[argv.index(flag) + 1], str(limits.get(key, 0)))
+        # Direct callers may supply an unexpanded parameter set.
+        with self.assertRaisesRegex(ValueError, 'full Query/replay'):
+            require_launch_features({}, {'Backend': 'ninfer'})
+
+    def test_explicit_bounded_query_remains_compatible_with_old_workers(self):
+        for backend in ('ninfer', 'llamacpp'):
+            for limits in ((1, 1), (512, 2048)):
+                p = self.plan(backend, QueryMaxTokens=limits[0], QueryReplayMaxTokens=limits[1])['effective_parameters']
+                require_launch_features({}, p)
+        for backend in ('llamacpp', 'polystrata', 'radiance'):
+            require_launch_features({}, {'Backend': backend})
+        for flag in ('--kvmem-query-max-tokens', '--kvmem-query-replay-max-tokens'):
+            for args in ([flag, '0'], [flag + '=0']):
+                with self.subTest(args=args), self.assertRaisesRegex(ValueError, 'native option'):
+                    self.plan(QueryMaxTokens=512, QueryReplayMaxTokens=2048, WorkerArgs=args)
+
     def test_token_invariants_cover_page_boundaries(self):
         for backend in ('ninfer', 'llamacpp', 'polystrata'):
             for reserve in (128, 129, 255, 256, 1023, 1024):
@@ -126,6 +163,17 @@ class PlanTest(unittest.TestCase):
                             ('--kvmem-query-max-tokens', '128'), ('--kvmem-query-replay-max-tokens', '1024')]:
             self.assertEqual(args[args.index(flag) + 1], value)
         self.assertIn('--no-kvmem-lrfu', args)
+
+    def test_ninfer_full_query_and_unlimited_replay_defaults(self):
+        for values in ({}, {'QueryMaxTokens': 0, 'QueryReplayMaxTokens': 0}):
+            result = self.plan(**values)
+            for key in ('query_max_tokens', 'query_replay_max_tokens'):
+                self.assertEqual(result['resolved_scoring'][key], 0)
+        for key in ('QueryMaxTokens', 'QueryReplayMaxTokens'):
+            with self.assertRaises(ValueError):
+                self.plan(**{key: -1})
+            with self.assertRaises(ValueError):
+                self.plan('llamacpp', **{key: 0})
 
     def test_speculative_capability_boundaries(self):
         for backend, values in [('ninfer', dict(SpeculativeMode='dflash2', DraftPolicy='adaptive')),
@@ -253,6 +301,37 @@ class PlanTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'MIN_GAP=0'):
                 self.plan(CheckpointExtraRecomputeTokens=16)
 
+    def test_cache_minimum_preserves_disabled_argv(self):
+        self.assertEqual(self.plan()['argv'], self.plan(CacheMinTokens=0)['argv'])
+        self.assertEqual(self.plan()['effective_parameters']['CacheMinTokens'], 0)
+        for value in (1, 4096, 2147483647):
+            plan = self.plan(CacheMinTokens=value)
+            index = plan['argv'].index('--kvmem-cache-min-tokens')
+            self.assertEqual(plan['argv'][index + 1], str(value))
+            self.assertEqual(plan['effective_parameters']['CacheMinTokens'], value)
+            plan['target_platform'] = 'linux'
+            self.assertIn('--kvmem-cache-min-tokens', render_script(plan, '/tmp/worker.lock'))
+        for value in (-1, 2147483648, True, 1.5, '4096'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.plan(CacheMinTokens=value)
+        for backend in ('llamacpp', 'polystrata', 'radiance'):
+            with self.subTest(backend=backend):
+                normalize({'schema_version': 1, 'parameters': {'Backend': backend, 'CacheMinTokens': 4096}},
+                          capabilities()['backends'])
+        self.assertEqual(self.plan('llamacpp')['argv'], self.plan('llamacpp', CacheMinTokens=0)['argv'])
+        argv=self.plan('llamacpp', CacheMinTokens=4096)['argv']
+        self.assertEqual(argv[argv.index('--kvmem-cache-min-tokens')+1], '4096')
+        with self.assertRaises(ValueError):
+            self.plan(WorkerArgs=['--kvmem-cache-min-tokens', '4096'])
+
+    def test_cache_minimum_requires_worker_support_only_when_enabled(self):
+        for value in (None, False, True, 0, -1, '1', 1.0):
+            contract = {'cache_admission_revision': value}
+            require_launch_features(contract, {'CacheMinTokens': 0})
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'CacheMinTokens'):
+                require_launch_features(contract, {'CacheMinTokens': 4096})
+        require_launch_features({'cache_admission_revision': 1}, {'CacheMinTokens': 4096})
+
     def test_checkpoint_recompute_requires_worker_support_only_when_enabled(self):
         for value in (None, False, True, 0, -1, '1', 1.0):
             contract = {'checkpoint_recompute_revision': value}
@@ -322,6 +401,7 @@ class PlanTest(unittest.TestCase):
         cases = [('ninfer', {}), ('llamacpp', {}),
                  ('llamacpp', dict(Lora=str(self.models['llamacpp']), LoraScale=-0.5)),
                  ('ninfer', dict(CheckpointExtraRecomputeTokens=16)),
+                 ('ninfer', dict(CacheMinTokens=4096)),
                  ('ninfer', dict(TensorParallel=True, TensorSplit=[3.5, 1],
                      Gpu=GPU+',GPU-00000000-0000-0000-0000-000000000002')),
                  ('ninfer', dict(SpeculativeMode='mtp', DraftTokens=4, DraftPolicy='adaptive',

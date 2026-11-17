@@ -86,9 +86,23 @@ async function until(fn){for(let i=0;i<100;i++){try{if(await fn())return;}catch{
  assert.equal(await draftFeature.getAttribute('data-state'),'present');
  assert.match(await draftFeature.textContent(),/已包含/);
  assert.equal(await card.locator('[data-feature=mtp]').getAttribute('data-state'),'absent');
+ for(const feature of ['tokenizer','template']){
+   assert.equal(await card.locator(`[data-feature=${feature}]`).getAttribute('data-state'),'present');
+   assert.match(await card.locator(`[data-feature=${feature}]`).textContent(),/已包含/);
+ }
  await page.locator('[data-language-select]').selectOption('en');
  await until(async()=>await card.getAttribute('data-state')==='ready');
  assert.match(await draftFeature.textContent(),/Included/);
+ for(const feature of ['tokenizer','template'])assert.match(await card.locator(`[data-feature=${feature}]`).textContent(),/Included/);
+ // A verified external override must update the feature badge, not claim it is missing.
+ const customTemplate=path.join(state,'custom.jinja');fs.writeFileSync(customTemplate,'{{ messages }}');
+ await page.getByRole('tab',{name:'Templates & vision'}).click();
+ await page.locator('[data-param=ChatTemplateFile]').evaluate((el,value)=>{el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));},customTemplate);
+ await until(async()=>await card.locator('[data-feature=template]').getAttribute('data-state')==='external_ready');
+ assert.match(await card.locator('[data-feature=template]').textContent(),/External file selected/);
+ await page.locator('[data-param=ChatTemplateFile]').evaluate(el=>{el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));});
+ await until(async()=>await card.locator('[data-feature=template]').getAttribute('data-state')==='present');
+ await page.getByRole('tab',{name:'Hardware & acceleration'}).click();
  await page.locator('[data-param=DraftTokens]').fill('3');
  await until(async()=>await card.getAttribute('data-state')==='blocked');
  assert.match(await card.textContent(),/requires 7/);

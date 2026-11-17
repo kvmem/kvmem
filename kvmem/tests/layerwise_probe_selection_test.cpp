@@ -149,6 +149,30 @@ void invalid_operations_are_atomic() {
     check(s.phase()==kvmem::LayerwiseSelectionPhase::Aborted,"changed native source did not abort probe selection");
     rejects([&]{s.finish(id);});
 }
+void half_max_after_probe_layer_and_query_reduction() {
+    auto cfg=config(1);cfg.layerwise_half_max=true;
+    kvmem::KvMemStore policy(cfg);policy.register_append(8);
+    kvmem::RawKvStore keys({2,1,0,2});
+    const float query=1.f;
+    for(uint32_t layer=0;layer<2;++layer)
+        for(uint32_t half=0;half<4;++half) keys.write_layer_mean_sum(2*half,2,layer,&query);
+    const auto id=identity(2,2);
+    const std::vector<kvmem::LayerwiseQueryGeometry> g{{0,1,1,1,1},{1,1,1,1,1}};
+    kvmem::HostKvStorage metadata(kvmem::LayerwiseProbeSelection::metadata_bound(policy,2,true));
+    kvmem::LayerwiseProbeSelection selection(policy,keys,id,g,[&]{return id.history;},metadata);
+    for(uint32_t i=0;i<2;++i) for(uint32_t layer=0;layer<2;++layer) {
+        kvmem::NativeCurrentLayerQuery tile{&query,sizeof(query),layer,1,1,1,1,1,
+            kvmem::NativeQueryScalar::Float32,sizeof(query),sizeof(query),sizeof(query)};
+        selection.append_native(id,id.query.begin+i,tile,[&](const auto&,auto,const auto& frame) {
+            check(frame.starts==std::vector<uint64_t>({0,2,4,6}),"incomplete probe half-page frame");
+            return ((i+layer)%2)?std::vector<double>{.01,.40,.30,.29}:std::vector<double>{.40,.01,.30,.29};
+        });
+    }
+    auto x=selection.finish(id);
+    check(x.selected==std::vector<uint32_t>{1} && x.charged_tokens==4 && x.scores.size()==2 &&
+          std::abs(x.scores[0]-.41)<1e-12 && std::abs(x.scores[1]-.60)<1e-12,
+          "probe took max before layer or query reduction");
+}
 void construction_and_quota() {
     kvmem::KvMemStore policy(config(1));policy.register_append(12);
     kvmem::RawKvStore keys({4,1,0,4});populate(keys,3);
@@ -187,7 +211,7 @@ void construction_and_quota() {
 int main() {
     try {
         global_differs_from_first_and_tiles();masks_pins_heads_scale_and_native();
-        invalid_operations_are_atomic();construction_and_quota();
+        invalid_operations_are_atomic();construction_and_quota();half_max_after_probe_layer_and_query_reduction();
         std::cout<<"PASS pinned private-probe global probability oracle, token-major coverage, mask/pin priority, native mass validation and finite metadata lifecycle\n";
     }catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
 }
