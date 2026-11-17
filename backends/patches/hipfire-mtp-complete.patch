@@ -1,0 +1,1658 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 124cbfd1124617824450eb2d32b115b5b6b53d9f..981e0e4e45a144f7cd159047d439434754d6cf52 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -65,7 +65,9 @@ use crate::kvmem_prefix::{
+ };
+ use crate::layerwise_driver::{layerwise_backend, layerwise_capabilities, OutputAcceptanceSnapshot};
+ use crate::layerwise_layout::LayerwiseMtpQ8Layout;
+-use crate::layerwise_mtp::{auxiliary_removed_tokens, auxiliary_visible_tokens, AuxiliarySelection};
++use crate::layerwise_mtp::{
++    auxiliary_removed_tokens, auxiliary_visible_tokens, AuxiliarySelection, LayerwiseMtpHistory,
++};
+ 
+ /// KVMem blocks are 128 tokens — the engine's page size (`PAGE_TOKENS`).
+ pub const KV_BLOCK_TOKENS: usize = 128;
+@@ -84,6 +86,16 @@ const DEFAULT_SELECT_INTERVAL: usize = 4;
+ /// pool grows past `DEFAULT_POOL_BLOCKS_PER_SLOT` instead of starving it.
+ const DEFAULT_RESIDENT_FLOOR: usize = 32;
+ 
++/// P4.1③ A1 starvation guard: UpstreamGlobal head-history selection only engages
++/// when the head budget is at least this many blocks; below it the policy falls
++/// back to FirstLayer (the trunk keep-set). Grounded by the recite benefit sweep
++/// (2026-11-17): at 8 blocks (BUDGET=1024) the global Mean-K reduction dilutes the
++/// draft-critical signal and UG acceptance regresses (0.381 vs FL 0.782, early
++/// EOS); at 16 blocks (BUDGET=2048) UG wins (+16.7%, 5/5). The UG core algorithm
++/// is unchanged when engaged (faithful to ninfer's literal Mean-K/TopK picker);
++/// this is an operational envelope guard, not a selection-semantics change.
++const MTP_HISTORY_UG_MIN_BLOCKS: usize = 16;
++
+ /// Host payload capacity for the packed Q8 pages (RAM tier).
+ const DEFAULT_HOST_BYTES: u64 = 16 << 30;
+ 
+@@ -288,6 +300,30 @@ fn resolve_layerwise_policy(
+     Ok(())
+ }
+ 
++/// Resolve `HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY` (P4.1③ H5): `first-layer` |
++/// `upstream-global`. Absent → the ninfer FirstLayer auto-default under
++/// Layerwise+MTP (else Unspecified, carried unread). An unrecognised spelling is
++/// rejected loudly; a resolved policy off the Layerwise+MTP path is rejected by
++/// the core mirror `validate` (no silent fallback). Pure so the resolution
++/// contract is testable without the process-start config snapshot (same rationale
++/// as [`resolve_recall_strategy`]). Legacy / AR-only never read it ⇒ byte-neutral.
++fn resolve_layerwise_mtp_history(
++    raw: Option<String>,
++    strategy: RecallStrategy,
++    mtp_enabled: bool,
++) -> Result<LayerwiseMtpHistory, String> {
++    let parsed = match raw {
++        Some(v) => LayerwiseMtpHistory::parse(v.trim()).map_err(|_| {
++            format!(
++                "kvmem: HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY={v} invalid \
++                 (first-layer|upstream-global)"
++            )
++        })?,
++        None => LayerwiseMtpHistory::Unspecified,
++    };
++    parsed.resolve_default(strategy, mtp_enabled)
++}
++
+ /// Ninfer-faithful layerwise activation quotas (design §3.11, ③-E1). Five
+ /// explicit host-resource envelopes backing the projected-Q history tapes and
+ /// their transfer/metadata staging. Resolved once at controller construction
+@@ -892,6 +928,13 @@ pub struct KvMemCtl {
+     /// ordinals) and every head-plane path. False under Legacy / AR-only, so the
+     /// default serve keeps the historical `n_fa_layers` record byte-neutral.
+     head_plane: bool,
++    /// P4.1③ H5: resolved `HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY` head-history
++    /// policy. FirstLayer (the ninfer auto-default) binds the head aux from the
++    /// trunk's first-layer restored view; UpstreamGlobal runs the global Mean-K
++    /// private-probe selection (`layerwise_probe`). Only meaningful when
++    /// `head_plane`; under Legacy / AR-only it is Unspecified and never read, so
++    /// the default serve stays byte-neutral.
++    layerwise_mtp_history: LayerwiseMtpHistory,
+     /// P4.1② G3: the head aux plane's ordinal in the composite host record
+     /// (`= n_fa_layers`, the appended LAST ordinal; ninfer
+     /// `model = layer_types.size()`, NL:10577). Only meaningful when `head_plane`;
+@@ -1094,6 +1137,15 @@ impl KvMemCtl {
+         // already ran), so the default serve stays byte-neutral.
+         resolve_layerwise_policy(strategy, select_method, lrfu, watermark_enabled, query_span)?;
+ 
++        // P4.1③ H5: resolve the head-history policy (FirstLayer auto-default under
++        // Layerwise+MTP; UpstreamGlobal opt-in via env). Legacy / AR-only carry
++        // Unspecified unread, so the default serve stays byte-neutral.
++        let layerwise_mtp_history = resolve_layerwise_mtp_history(
++            env_raw("HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY"),
++            strategy,
++            geom.mtp_head,
++        )?;
++
+         // Recall execution model. Legacy (the default) keeps the historical
+         // whole-working-set path byte-identical. Layerwise enables the per-layer
+         // composite-slot subsystem: D2 adds the write-through sealed host
+@@ -1310,6 +1362,7 @@ impl KvMemCtl {
+             q_span: vec![0f32; ring_cap],
+             q_layer_rows: vec![0u32; if query_span > 1 { n_record_layers } else { 0 }],
+             head_plane,
++            layerwise_mtp_history,
+             aux_ordinal: geom.n_fa_layers as u32,
+             n_record_layers,
+             gen_reserve,
+@@ -2675,6 +2728,30 @@ impl KvMemCtl {
+         self.head_plane
+     }
+ 
++    /// P4.1③ H5: the resolved head-history policy (FirstLayer auto-default under
++    /// Layerwise+MTP; UpstreamGlobal opt-in). The orchestration branches the head
++    /// aux binding on this at the prefill-seed and the decode/verify carrier
++    /// restore-hooks. Unspecified under Legacy / AR-only (never read there).
++    ///
++    /// A1 starvation guard (single source of truth): below
++    /// [`MTP_HISTORY_UG_MIN_BLOCKS`] the global Mean-K reduction dilutes the
++    /// draft-critical signal at tiny head budgets (recite sweep 8-block
++    /// regression 0.381 vs FL 0.782), so an opted-in UpstreamGlobal is reported
++    /// as FirstLayer here. EVERY decision point (prefill-seed aux binding plus
++    /// the AR-decode and MTP-verify carrier restore-hooks in serve_engine) reads
++    /// this accessor, so the fallback is uniform and the UG core algorithm is
++    /// untouched when engaged (≥ floor). ninfer-faithful operational guard, not
++    /// a core-algorithm change.
++    pub fn layerwise_mtp_history(&self) -> LayerwiseMtpHistory {
++        if self.layerwise_mtp_history == LayerwiseMtpHistory::UpstreamGlobal
++            && self.budget_blocks < MTP_HISTORY_UG_MIN_BLOCKS
++        {
++            LayerwiseMtpHistory::FirstLayer
++        } else {
++            self.layerwise_mtp_history
++        }
++    }
++
+     /// P4.1② G3: the head aux plane's ordinal in the composite host record
+     /// (`= n_fa_layers`, the appended LAST ordinal). The head aux-plane
+     /// write-through gathers the head's `k_gpu[0]`/`v_gpu[0]` into this ordinal;
+@@ -3534,7 +3611,7 @@ impl KvMemCtl {
+ 
+     pub fn prepare_step(
+         &mut self,
+-        gpu: &Gpu,
++        gpu: &mut Gpu,
+         pool: &mut SlotPool,
+         taps: &KvMemTaps,
+         active: &[bool],
+@@ -3792,12 +3869,81 @@ impl KvMemCtl {
+                     .collect();
+                 sel.sort_unstable();
+                 sel.dedup();
+-                let aux = crate::layerwise_mtp::bind_first_layer_auxiliary(
+-                    &sel,
+-                    frontier,
+-                    KV_BLOCK_TOKENS as u64,
+-                )
+-                .map_err(|e| format!("kvmem head aux seed (slot {s}): {e}"))?;
++                // P4.1③ H4: branch the head-history policy. FirstLayer (the
++                // auto-default) binds the trunk working set's full pages (② G5).
++                // The A1 starvation floor is applied centrally in
++                // `layerwise_mtp_history()` (below-floor UpstreamGlobal reports
++                // FirstLayer), so this site and the serve_engine carrier hooks
++                // fall back uniformly; the UG algorithm is unchanged when engaged.
++                // UpstreamGlobal restores ALL canonical pages when the whole
++                // history fits the budget (ninfer `begin==history_tokens` fast
++                // path, NL:10058), else runs the global Mean-K probe over the
++                // captured prefill Q tap (H2b — no private forward, no rollback).
++                // The probe needs a fresh Q tap (`final_prefill`/`first_decode`
++                // ran `refresh_scores`); an intermediate prefill step with a stale
++                // tap keeps the picked seed, overwritten by the prompt-completing
++                // step's probe before the first draft. Legacy / AR-only never
++                // reach this block (byte-neutral); zero core C++ change.
++                let aux = if self.layerwise_mtp_history() == LayerwiseMtpHistory::UpstreamGlobal
++                {
++                    if full_pages <= self.budget_blocks as u64 {
++                        let all: Vec<u64> = (0..full_pages).collect();
++                        crate::layerwise_mtp::bind_first_layer_auxiliary(
++                            &all,
++                            frontier,
++                            KV_BLOCK_TOKENS as u64,
++                        )
++                        .map_err(|e| format!("kvmem head aux restore-all (slot {s}): {e}"))?
++                    } else if final_prefill || first_decode {
++                        // The probe admits against a FRESH page-aligned sealed
++                        // Mean-K TopK index (the same `layerwise_policy` the trunk
++                        // carrier uses), NOT the slot's shared Legacy `kv` store
++                        // (which tracks all fed tokens and carries retrieval-round
++                        // state — the core rejects it as a probe index). The
++                        // identity frontier is the page-aligned `full_pages*128`
++                        // (== policy.total_tokens); the bind clips to the native
++                        // `frontier` (fed) exactly like the FirstLayer seed.
++                        let probe_frontier = full_pages * KV_BLOCK_TOKENS as u64;
++                        let probe_policy = self
++                            .layerwise_policy(self.slots[s].fed)
++                            .map_err(|e| format!("kvmem head aux probe policy (slot {s}): {e}"))?;
++                        let id = crate::layerwise_probe::probe_identity(
++                            probe_frontier,
++                            s as u64,
++                            self.slots[s].lw_incarnation,
++                            self.slots[s].lw_seq,
++                        );
++                        let q_rows = &self.sums[..self.n_fa_layers * self.q_width];
++                        crate::layerwise_probe::probe_head_history_qrows(
++                            gpu,
++                            q_rows,
++                            &id,
++                            &probe_policy,
++                            &self.slots[s].raw,
++                            self.n_heads as u32,
++                            self.n_kv_heads as u32,
++                            self.head_dim as u32,
++                            0.0, // → 1/sqrt(head_dim), the trunk scorer's default scale
++                            KV_BLOCK_TOKENS as u32,
++                            frontier,
++                        )
++                        .map_err(|e| format!("kvmem head aux probe (slot {s}): {e}"))?
++                    } else {
++                        crate::layerwise_mtp::bind_first_layer_auxiliary(
++                            &sel,
++                            frontier,
++                            KV_BLOCK_TOKENS as u64,
++                        )
++                        .map_err(|e| format!("kvmem head aux seed (slot {s}): {e}"))?
++                    }
++                } else {
++                    crate::layerwise_mtp::bind_first_layer_auxiliary(
++                        &sel,
++                        frontier,
++                        KV_BLOCK_TOKENS as u64,
++                    )
++                    .map_err(|e| format!("kvmem head aux seed (slot {s}): {e}"))?
++                };
+                 self.set_aux_selection(s, aux);
+             }
+         }
+@@ -4482,6 +4628,101 @@ mod tests {
+ 
+     /// Host-only: the strategy parser/resolver mirror the core ordinals and
+     /// reject unknown spellings loudly, and the write-through staging is
++    /// P4.1③ H5: the head-history policy resolution contract (pure, env-snapshot
++    /// independent). FirstLayer auto-default under Layerwise+MTP; UpstreamGlobal
++    /// opt-in; invalid spelling rejected; a resolved policy off the Layerwise+MTP
++    /// path rejected (no silent fallback). Legacy / AR-only carry Unspecified.
++    #[test]
++    fn layerwise_mtp_history_resolution() {
++        use crate::layerwise_mtp::LayerwiseMtpHistory::{FirstLayer, Unspecified, UpstreamGlobal};
++        // Absent → FirstLayer auto-default under Layerwise+MTP.
++        assert_eq!(
++            resolve_layerwise_mtp_history(None, RecallStrategy::Layerwise, true).unwrap(),
++            FirstLayer
++        );
++        // Explicit opt-in + trimming.
++        assert_eq!(
++            resolve_layerwise_mtp_history(
++                Some("upstream-global".into()),
++                RecallStrategy::Layerwise,
++                true
++            )
++            .unwrap(),
++            UpstreamGlobal
++        );
++        assert_eq!(
++            resolve_layerwise_mtp_history(
++                Some("  first-layer  ".into()),
++                RecallStrategy::Layerwise,
++                true
++            )
++            .unwrap(),
++            FirstLayer
++        );
++        // Invalid spelling rejected loudly.
++        assert!(resolve_layerwise_mtp_history(
++            Some("bogus".into()),
++            RecallStrategy::Layerwise,
++            true
++        )
++        .is_err());
++        // A resolved policy requires Layerwise + MTP (no silent fallback).
++        assert!(resolve_layerwise_mtp_history(
++            Some("upstream-global".into()),
++            RecallStrategy::Legacy,
++            true
++        )
++        .is_err());
++        assert!(resolve_layerwise_mtp_history(
++            Some("first-layer".into()),
++            RecallStrategy::Layerwise,
++            false
++        )
++        .is_err());
++        // Legacy / AR-only carry Unspecified unread (byte-neutral).
++        assert_eq!(
++            resolve_layerwise_mtp_history(None, RecallStrategy::Legacy, false).unwrap(),
++            Unspecified
++        );
++        assert_eq!(
++            resolve_layerwise_mtp_history(None, RecallStrategy::Legacy, true).unwrap(),
++            Unspecified
++        );
++    }
++
++    /// A1 starvation floor (single source of truth): the `layerwise_mtp_history()`
++    /// accessor reports FirstLayer for an opted-in UpstreamGlobal whenever
++    /// `budget_blocks < MTP_HISTORY_UG_MIN_BLOCKS`, so EVERY decision point
++    /// (prefill-seed aux binding + the serve_engine AR-decode / MTP-verify carrier
++    /// restore-hooks) falls back uniformly. At/above the floor UG is reported
++    /// unchanged; FirstLayer / Unspecified are never altered. Host-only.
++    #[test]
++    fn layerwise_mtp_history_starvation_floor() {
++        use crate::layerwise_mtp::LayerwiseMtpHistory::{FirstLayer, Unspecified, UpstreamGlobal};
++        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
++        let mut ctl =
++            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
++                .expect("layerwise mtp ctl");
++        // plan() budget_blocks=4 (< floor). Opted-in UG reports FirstLayer.
++        ctl.layerwise_mtp_history = UpstreamGlobal;
++        assert!(ctl.budget_blocks < MTP_HISTORY_UG_MIN_BLOCKS);
++        assert_eq!(ctl.layerwise_mtp_history(), FirstLayer, "below-floor UG falls back");
++        // Exactly at the floor UG engages (>= guard).
++        ctl.budget_blocks = MTP_HISTORY_UG_MIN_BLOCKS;
++        assert_eq!(ctl.layerwise_mtp_history(), UpstreamGlobal, "at-floor UG engages");
++        // Above the floor UG engages.
++        ctl.budget_blocks = MTP_HISTORY_UG_MIN_BLOCKS + 8;
++        assert_eq!(ctl.layerwise_mtp_history(), UpstreamGlobal, "above-floor UG engages");
++        // One below the floor falls back again.
++        ctl.budget_blocks = MTP_HISTORY_UG_MIN_BLOCKS - 1;
++        assert_eq!(ctl.layerwise_mtp_history(), FirstLayer, "one-below-floor falls back");
++        // FirstLayer / Unspecified are never altered by the floor.
++        ctl.layerwise_mtp_history = FirstLayer;
++        assert_eq!(ctl.layerwise_mtp_history(), FirstLayer);
++        ctl.layerwise_mtp_history = Unspecified;
++        assert_eq!(ctl.layerwise_mtp_history(), Unspecified);
++    }
++
+     /// allocated ONLY under Layerwise (Legacy stays byte-neutral — no extra
+     /// host buffer, no arena touch). The strategy is INJECTED, not `set_var`d:
+     /// the process config is a start-time snapshot, so a runtime env write after
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index f66a6091441fd9e97640ae6eb02cd8e6b50eeca1..1b621a1f959e2f9fd718bdd50eb1d92f72eaae8e 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -87,7 +87,9 @@ fn page_scalar(scalar: u32) -> Result<PageQueryScalar, KvMemError> {
+ /// model-layer ↔ ordinal mapping). Called synchronously by
+ /// [`hipfire_kvmem::LayerwiseRequest::projected_native`]'s trampoline, which drops
+ /// the borrowed `keys` pointer — so the driver captures its own `&RawStore`.
+-fn score_current_layer_native(
++/// Also reused by the P4.1③ UpstreamGlobal private-probe accumulator
++/// ([`crate::layerwise_probe::probe_head_history`]) over the captured Q tapes.
++pub(crate) fn score_current_layer_native(
+     gpu: &mut Gpu,
+     keys: &RawStore,
+     il: u32,
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_probe.rs b/crates/hipfire-arch-qwen35/src/layerwise_probe.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a70a1e1684bd76030ab3cfe2c0094614950c5c3
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/layerwise_probe.rs
+@@ -0,0 +1,493 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! P4.1③ UpstreamGlobal MTP head-history private-probe selection.
++//!
++//! The UpstreamGlobal history policy selects the MTP head's draft-owned K/V
++//! history by a GLOBAL Mean-K reduction over the target's pre-RoPE Q (core
++//! `kvmem::LayerwiseProbeSelection`, wrapped by [`hipfire_kvmem::ProbeSelection`]),
++//! rather than FirstLayer's reuse of the trunk's first-layer restored view. Both
++//! leave the target's fresh-Q trunk selection unchanged and restore the head's
++//! OWN canonical K/V for the selected original token IDs; only the head-history
++//! SELECTION differs (design §A.9, Q10=dual).
++//!
++//! ## hipfire adaptation (documented architectural deviation, Q4=b)
++//!
++//! ninfer runs a separate private target-layer-major prefill forward per Query
++//! (`native_layerwise_probe`, NL:4166-4398) to produce the probe Q. hipfire's ②
++//! trunk carrier ALREADY captures the identical post-RMSNorm/pre-RoPE Q into its
++//! per-FA-ordinal activation tapes during `restore_layer` (the same `native_q`
++//! the trunk scorer reads). [`probe_head_history`] reuses those captured Q tapes
++//! — byte-identical to what a private forward would produce — so the global
++//! reduction picks the same head history without a second forward per draft.
++//! The probe is a pure host selection over already-captured Q: it mutates NO KV
++//! and needs NO rollback (unlike ninfer's private forward). The first draft of a
++//! request (before any trunk carrier has captured Q) is handled by the
++//! probe-window / restore-all fast path in the engine orchestration (H2b/H3).
++//!
++//! Additive and gated: only the UpstreamGlobal policy reaches this module; the
++//! default Legacy serve and the FirstLayer policy never construct a probe, so
++//! both stay byte-neutral. ZERO core C++ change.
++
++use crate::layerwise_driver::{score_current_layer_native, LayerwiseActivation};
++use crate::layerwise_mtp::{auxiliary_visible_tokens, AuxiliarySelection};
++use hipfire_kvmem::{
++    KvStore, LayerQueryGeometry, LayerwiseIdentity, MemoryStamp, NativeCurrentLayerQuery,
++    ProbeSelection, QueryRange, RawStore, SessionIdentity, Storage,
++};
++use rdna_compute::{DType, Gpu};
++
++/// Synthesize the page-aligned probe identity for a prefill-seed / carrier
++/// head-history selection at accepted frontier `frontier` (mirrors
++/// `bootstrap_layerwise_rows`' 1-based logical identity mapping: the core
++/// requires non-zero session/revision/request). The evaluation span is the single
++/// frontier token `[frontier, frontier+1)`; the probe Q source (activation tape
++/// or prefill Q tap) supplies that token's per-layer pre-RoPE Q. `history.frontier
++/// == policy.total_tokens()` must hold (the caller passes the accepted `fed`).
++pub fn probe_identity(
++    frontier: u64,
++    session_id: u64,
++    incarnation: u64,
++    seq: u64,
++) -> LayerwiseIdentity {
++    let session = SessionIdentity { id: session_id + 1, incarnation: incarnation + 1 };
++    let revision = seq + 1;
++    LayerwiseIdentity {
++        history: MemoryStamp {
++            valid: 1,
++            session,
++            history_revision: revision,
++            view_version: revision,
++            frontier,
++            execution_history: revision,
++        },
++        request: session_id + 1,
++        evaluation: QueryRange { begin: frontier, end: frontier + 1 },
++        query: QueryRange { begin: frontier, end: frontier + 1 },
++    }
++}
++
++/// Upper bound on the probe Q tile rows uploaded to the device per append. The
++/// head verify width is small (≤64); chunking bounds the transient device Q
++/// buffer regardless of the evaluation span. Token-major coverage is preserved
++/// (the core accumulates across tiles before the single global pick).
++const PROBE_Q_CHUNK: u64 = 64;
++
++/// Shared UpstreamGlobal probe orchestration over an arbitrary per-layer Q
++/// source. `read_q(il, begin, rows)` returns the packed F32 Q tile bytes for FA
++/// ordinal `il` over the token span `[begin, begin+rows)` (row width
++/// `q_row_bytes`). The core accumulator averages the L layers (one global Mean-K
++/// reduction) before the single head-history pick; this driver owns the abort
++/// envelope (the `ProbeSelection` is dropped on every error path, retiring its
++/// metadata lease), mirroring ninfer `native_layerwise_probe`'s try/catch →
++/// `abort()`. Fails closed (returning `Err`, never publishing a partial
++/// selection) on any core/scorer/geometry error.
++#[allow(clippy::too_many_arguments)]
++fn run_probe_selection<F>(
++    gpu: &mut Gpu,
++    id: &LayerwiseIdentity,
++    policy: &KvStore,
++    keys: &RawStore,
++    n_layers: usize,
++    n_heads: u32,
++    n_kv_heads: u32,
++    head_dim: u32,
++    attention_scale: f32,
++    block_tokens: u32,
++    frontier: u64,
++    q_row_bytes: usize,
++    mut read_q: F,
++) -> Result<AuxiliarySelection, String>
++where
++    F: FnMut(usize, u64, u64) -> Result<Vec<u8>, String>,
++{
++    if n_layers == 0 {
++        return Err("layerwise probe: no target layers".to_string());
++    }
++    if block_tokens == 0 {
++        return Err("layerwise probe: zero block_tokens".to_string());
++    }
++    if q_row_bytes == 0 {
++        return Err("layerwise probe: zero Q row width".to_string());
++    }
++    let qb = id.query.begin;
++    let qe = id.query.end;
++    if qe <= qb {
++        return Err("layerwise probe: empty query span".to_string());
++    }
++
++    // One target geometry per FA ordinal (token-major scoring order). All layers
++    // share the frozen page denominator and the same represented head geometry.
++    let targets: Vec<LayerQueryGeometry> = (0..n_layers)
++        .map(|il| LayerQueryGeometry {
++            layer: il as u32,
++            query_heads: n_heads,
++            kv_heads: n_kv_heads,
++            head_dim,
++            attention_scale,
++        })
++        .collect();
++
++    // Admit the probe accumulator against an independent FINITE metadata account
++    // sized to the conservative core bound (ninfer `probe_metadata`, NL:10125).
++    let bound = ProbeSelection::metadata_bound(policy, n_layers as u32)
++        .map_err(|e| format!("layerwise probe: metadata bound: {e}"))?;
++    let metadata =
++        Storage::new_ram(bound).map_err(|e| format!("layerwise probe: metadata account: {e}"))?;
++    let rev = id.history;
++    let probe = ProbeSelection::new(id, policy, keys, &targets, move || rev, &metadata, &[])
++        .map_err(|e| format!("layerwise probe: admit: {e}"))?;
++
++    // Token-major: for each Query tile [begin, begin+rows), append every target
++    // layer in geometry order. The core slices each tile to the query intersection
++    // and averages the L layers (one global reduction) before the single pick.
++    let mut begin = qb;
++    while begin < qe {
++        let rows = (qe - begin).min(PROBE_Q_CHUNK);
++        for il in 0..n_layers {
++            let host = read_q(il, begin, rows)
++                .map_err(|e| format!("layerwise probe: read Q layer {il}: {e}"))?;
++            let tile = gpu
++                .alloc_tensor(&[host.len()], DType::Raw)
++                .map_err(|e| format!("layerwise probe: Q tile alloc: {e:?}"))?;
++            let upload = gpu.hip.memcpy_htod(&tile.buf, &host);
++            if let Err(e) = upload {
++                let _ = gpu.free_tensor(tile);
++                return Err(format!("layerwise probe: Q tile H2D layer {il}: {e:?}"));
++            }
++            let q = NativeCurrentLayerQuery {
++                data: tile.buf.as_ptr() as *const std::ffi::c_void,
++                bytes: host.len(),
++                layer: il as u32,
++                rows: rows as u32,
++                query_heads: n_heads,
++                kv_heads: n_kv_heads,
++                head_dim,
++                attention_scale,
++                scalar: 0, // NativeQueryScalar::Float32 (the Q source stores F32)
++                row_stride: q_row_bytes,
++                head_stride: (head_dim as usize) * 4,
++                dimension_stride: 4,
++            };
++            let il32 = il as u32;
++            let appended = probe.append_native(id, begin, &q, |query, frame| {
++                score_current_layer_native(gpu, keys, il32, block_tokens, query, frame)
++            });
++            // The scorer read the tile synchronously; release it on every path.
++            let freed = gpu.free_tensor(tile);
++            appended.map_err(|e| format!("layerwise probe: append layer {il}: {e}"))?;
++            freed.map_err(|e| format!("layerwise probe: Q tile free: {e:?}"))?;
++        }
++        begin += rows;
++    }
++
++    probe
++        .finish(id)
++        .map_err(|e| format!("layerwise probe: finish: {e}"))?;
++    let selected = probe.selected_ids();
++
++    // Bind the picked head history against the accepted extent (mirrors
++    // FirstLayer): the visible extent is derived from the selected canonical
++    // pages clipped to `frontier`, then re-validated chronological/unique/exact.
++    let history_tokens = auxiliary_visible_tokens(&selected, frontier, block_tokens as u64)
++        .map_err(|e| format!("layerwise probe: head extent: {e}"))?;
++    let mut sel = AuxiliarySelection::new(history_tokens, block_tokens as u64, true);
++    sel.bind(&selected, frontier)
++        .map_err(|e| format!("layerwise probe: bind head history: {e}"))?;
++    Ok(sel)
++}
++
++/// Run the UpstreamGlobal private-probe head-history selection over the trunk
++/// carrier's captured activation Q tapes, returning the bound auxiliary(head)
++/// selection for [`crate::kvmem_ctl::KvMemCtl::set_aux_selection`].
++///
++/// `activation` is the trunk carrier's attached [`LayerwiseActivation`] (its
++/// per-FA-ordinal Q tapes hold the target's post-norm/pre-RoPE Q over the
++/// evaluation span; its identity is the page-aligned Query identity whose
++/// `history.frontier == policy.total_tokens()`). `policy`/`keys` are the SAME
++/// page-aligned sealed Mean-K TopK index the trunk Query admitted. `frontier` is
++/// the accepted native frontier (`fed`) the head history extent is clipped to
++/// (mirrors FirstLayer's `bind_first_layer_auxiliary`). The geometry
++/// (`n_heads`/`n_kv_heads`/`head_dim`/`attention_scale`) must match the keys
++/// store (`kv_heads * head_dim == n_embd_k`) and the real forward's Q.
++///
++/// Fails closed (returning `Err`, never publishing a partial selection) on any
++/// core/scorer/geometry error; the caller aborts the step. The core accumulator
++/// does NOT auto-abort on a scorer throw — this driver owns the abort envelope
++/// (the `ProbeSelection` is dropped on every error path, retiring its metadata
++/// lease), mirroring ninfer `native_layerwise_probe`'s try/catch → `abort()`.
++pub fn probe_head_history(
++    gpu: &mut Gpu,
++    activation: &LayerwiseActivation,
++    policy: &KvStore,
++    keys: &RawStore,
++    n_heads: u32,
++    n_kv_heads: u32,
++    head_dim: u32,
++    attention_scale: f32,
++    block_tokens: u32,
++    frontier: u64,
++) -> Result<AuxiliarySelection, String> {
++    let id = activation.identity();
++    let n_layers = activation.n_layers();
++    let q_row_bytes = activation.q_row_bytes();
++    run_probe_selection(
++        gpu, &id, policy, keys, n_layers, n_heads, n_kv_heads, head_dim, attention_scale,
++        block_tokens, frontier, q_row_bytes,
++        |il, begin, rows| {
++            let mut host = vec![0u8; (rows as usize) * q_row_bytes];
++            activation.read_layer(il, begin, rows, &mut host)?;
++            Ok(host)
++        },
++    )
++}
++
++/// Run the UpstreamGlobal head-history selection over already-captured host Q
++/// rows (the hipfire prefill-seed Q tap, H2b). `q_rows` is layer-major
++/// `[il][span_token][q_width]` packed F32 (post-RMSNorm/pre-RoPE — the same
++/// representation as the activation tape Q), with `span_rows = id.query.end -
++/// id.query.begin` tokens per layer and `q_width = n_heads * head_dim`. `id` is
++/// the page-aligned probe identity whose `history.frontier == policy.total_tokens()`
++/// and `evaluation.begin == frontier`; the caller synthesizes it from the slot's
++/// layerwise counters + accepted frontier (mirroring `bootstrap_layerwise_rows`).
++///
++/// This is the prefill-seed analog of [`probe_head_history`]: hipfire's prefill
++/// is full-resident with no trunk carrier, but the Legacy Q tap already captures
++/// the per-layer pre-RoPE Q the trunk recall scores against. Reusing it makes the
++/// probe a pure host selection — NO private forward, NO KV mutation, NO rollback
++/// (documented Q4=b adaptation; ninfer instead re-runs a private prefill forward
++/// over the Query evaluation span, `run_private_probe` NL:10112). Only the
++/// UpstreamGlobal policy reaches this; Legacy / FirstLayer never construct a
++/// probe (byte-neutral). ZERO core C++ change.
++#[allow(clippy::too_many_arguments)]
++pub fn probe_head_history_qrows(
++    gpu: &mut Gpu,
++    q_rows: &[f32],
++    id: &LayerwiseIdentity,
++    policy: &KvStore,
++    keys: &RawStore,
++    n_heads: u32,
++    n_kv_heads: u32,
++    head_dim: u32,
++    attention_scale: f32,
++    block_tokens: u32,
++    frontier: u64,
++) -> Result<AuxiliarySelection, String> {
++    let q_width = (n_heads as usize) * (head_dim as usize);
++    let q_row_bytes = q_width * 4;
++    let qb = id.query.begin;
++    let qe = id.query.end;
++    if qe <= qb {
++        return Err("layerwise probe: empty query span".to_string());
++    }
++    if q_width == 0 {
++        return Err("layerwise probe: zero Q geometry".to_string());
++    }
++    let span_rows = (qe - qb) as usize;
++    let per_layer = span_rows * q_width;
++    if q_rows.len() % per_layer != 0 {
++        return Err(format!(
++            "layerwise probe: Q rows {} not a multiple of per-layer span {per_layer}",
++            q_rows.len()
++        ));
++    }
++    let n_layers = q_rows.len() / per_layer;
++    let eval_begin = id.evaluation.begin;
++    run_probe_selection(
++        gpu, id, policy, keys, n_layers, n_heads, n_kv_heads, head_dim, attention_scale,
++        block_tokens, frontier, q_row_bytes,
++        |il, begin, rows| {
++            // Token-major tile for layer il: tokens [begin, begin+rows) relative
++            // to the evaluation span start. q_rows is layer-major [il][token][qw].
++            let t0 = (begin - eval_begin) as usize;
++            let mut host = Vec::with_capacity((rows as usize) * q_row_bytes);
++            for t in t0..t0 + (rows as usize) {
++                let s0 = (il * span_rows + t) * q_width;
++                let row = &q_rows[s0..s0 + q_width];
++                let bytes =
++                    unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, q_width * 4) };
++                host.extend_from_slice(bytes);
++            }
++            Ok(host)
++        },
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::kvmem_ctl::LayerwiseQuotas;
++    use hipfire_kvmem::{
++        KvStoreConfig, LayerwiseIdentity, MemoryStamp, QueryRange, RawStoreConfig, SessionIdentity,
++    };
++
++    // Q8-ish geometry mirroring the ② activation fixture: 2 KV heads × 64 dim →
++    // kw 128; 4 query heads → qw 256; 128-token pages; 2-page accepted frontier.
++    const KV_HEADS: u32 = 2;
++    const Q_HEADS: u32 = 4;
++    const HEAD_DIM: u32 = 64;
++    const KW: usize = (KV_HEADS * HEAD_DIM) as usize;
++    const QW: usize = (Q_HEADS * HEAD_DIM) as usize;
++    const BT: u32 = 128;
++    const FRONTIER: u64 = 2 * BT as u64; // 256
++
++    fn stamp() -> MemoryStamp {
++        MemoryStamp {
++            valid: 1,
++            session: SessionIdentity { id: 42, incarnation: 3 },
++            history_revision: 5,
++            view_version: 6,
++            frontier: FRONTIER,
++            execution_history: 9,
++        }
++    }
++
++    fn identity() -> LayerwiseIdentity {
++        LayerwiseIdentity {
++            history: stamp(),
++            request: 92,
++            evaluation: QueryRange { begin: FRONTIER, end: FRONTIER + 1 },
++            query: QueryRange { begin: FRONTIER, end: FRONTIER + 1 },
++        }
++    }
++
++    /// GPU end-to-end: capture each FA layer's pre-RoPE Q into the activation
++    /// tapes (the ② trunk carrier's capture path), then run the UpstreamGlobal
++    /// probe over those tapes. Both layers' Q favor block1 (mean_k +1 vs -1), so
++    /// the global L-layer reduction picks canonical block1 and binds a 128-token
++    /// head history. Proves the tape→device→scorer→global-pick→bind wiring with
++    /// no model and no live serve (additive; Legacy/FirstLayer never reach it).
++    #[test]
++    #[ignore]
++    fn probe_head_history_global_reduction_gpu() {
++        let mut gpu = Gpu::init().expect("gpu");
++        let id = identity();
++        let n_layers = 2usize;
++        let q_row_bytes = QW * 4;
++        let quotas = LayerwiseQuotas::default();
++        let mut act =
++            LayerwiseActivation::new(&mut gpu, id, n_layers, 2, q_row_bytes, &quotas)
++                .expect("activation");
++
++        // Capture a positive-Q oracle (favors mean_k +1) for both target layers.
++        let mut tiles = Vec::new();
++        for ordinal in 0..n_layers {
++            let host = vec![0.1f32; QW];
++            let bytes = unsafe {
++                std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
++            }
++            .to_vec();
++            let t = gpu.alloc_tensor(&[bytes.len()], DType::Raw).expect("q alloc");
++            gpu.hip.memcpy_htod(&t.buf, &bytes).expect("q h2d");
++            let q = NativeCurrentLayerQuery {
++                data: t.buf.as_ptr() as *const std::ffi::c_void,
++                bytes: bytes.len(),
++                layer: ordinal as u32,
++                rows: 1,
++                query_heads: Q_HEADS,
++                kv_heads: KV_HEADS,
++                head_dim: HEAD_DIM,
++                attention_scale: 1.0,
++                scalar: 0,
++                row_stride: QW * 4,
++                head_stride: HEAD_DIM as usize * 4,
++                dimension_stride: 4,
++            };
++            act.capture_layer(&mut gpu, ordinal, &q).expect("capture");
++            tiles.push(t);
++        }
++
++        // Sealed plain Mean-K TopK index: 2 canonical 128-token pages, budget 1.
++        let cfg = KvStoreConfig {
++            block_tokens: BT,
++            select_budget: BT,
++            sink_blocks: 0,
++            recent_blocks: 0,
++            ..KvStoreConfig::default()
++        };
++        let policy = KvStore::new(&cfg).expect("policy");
++        policy.register_append(2 * BT).expect("append");
++        let keys = RawStore::new(
++            RawStoreConfig {
++                n_layer: n_layers as u32,
++                n_embd_k: KW as u32,
++                n_embd_v: KW as u32,
++                block_tokens: BT,
++                k_row_bytes: 0,
++                k_gpu_row_bytes: 136,
++                v_gpu_row_bytes: 136,
++            },
++            None,
++        )
++        .expect("keys");
++        for il in 0..n_layers as u32 {
++            keys.write_layer_mean_k(0, BT, il, &[-1.0; BT as usize * KW]).expect("mean k block0");
++            keys.write_layer_mean_k(BT, BT, il, &[1.0; BT as usize * KW]).expect("mean k block1");
++        }
++
++        let sel = probe_head_history(
++            &mut gpu, &act, &policy, &keys, Q_HEADS, KV_HEADS, HEAD_DIM, 1.0, BT, FRONTIER,
++        )
++        .expect("probe head history");
++        assert_eq!(sel.selected(), Some(&[1u32][..]), "global reduction picks block1");
++        assert_eq!(sel.history_tokens(), BT as u64, "one 128-token head history page");
++        assert!(sel.is_bound());
++
++        for t in tiles {
++            let _ = gpu.free_tensor(t);
++        }
++    }
++
++    /// GPU end-to-end for the H2b prefill-seed host-Q-tap variant: the same
++    /// 2-page Mean-K index (block0 -1 / block1 +1) and a positive-Q oracle, but
++    /// the Q comes from packed host rows (the Legacy tap representation) instead
++    /// of activation tapes. The global L-layer reduction must pick block1 and
++    /// bind a 128-token head history — proving the tap→device→scorer→global-pick
++    /// →bind wiring with no model, no carrier and no live serve.
++    #[test]
++    #[ignore]
++    fn probe_head_history_qrows_global_reduction_gpu() {
++        let mut gpu = Gpu::init().expect("gpu");
++        let id = identity();
++        let n_layers = 2usize;
++
++        // Sealed plain Mean-K TopK index: 2 canonical 128-token pages, budget 1.
++        let cfg = KvStoreConfig {
++            block_tokens: BT,
++            select_budget: BT,
++            sink_blocks: 0,
++            recent_blocks: 0,
++            ..KvStoreConfig::default()
++        };
++        let policy = KvStore::new(&cfg).expect("policy");
++        policy.register_append(2 * BT).expect("append");
++        let keys = RawStore::new(
++            RawStoreConfig {
++                n_layer: n_layers as u32,
++                n_embd_k: KW as u32,
++                n_embd_v: KW as u32,
++                block_tokens: BT,
++                k_row_bytes: 0,
++                k_gpu_row_bytes: 136,
++                v_gpu_row_bytes: 136,
++            },
++            None,
++        )
++        .expect("keys");
++        for il in 0..n_layers as u32 {
++            keys.write_layer_mean_k(0, BT, il, &[-1.0; BT as usize * KW]).expect("mean k block0");
++            keys.write_layer_mean_k(BT, BT, il, &[1.0; BT as usize * KW]).expect("mean k block1");
++        }
++
++        // Layer-major host Q rows: [il][span_token=1][QW], positive (favors +1).
++        let q_rows = vec![0.1f32; n_layers * QW];
++        let sel = probe_head_history_qrows(
++            &mut gpu, &q_rows, &id, &policy, &keys, Q_HEADS, KV_HEADS, HEAD_DIM, 1.0, BT, FRONTIER,
++        )
++        .expect("probe head history qrows");
++        assert_eq!(sel.selected(), Some(&[1u32][..]), "global reduction picks block1");
++        assert_eq!(sel.history_tokens(), BT as u64, "one 128-token head history page");
++        assert!(sel.is_bound());
++    }
++}
+\ No newline at end of file
+diff --git a/crates/hipfire-arch-qwen35/src/lib.rs b/crates/hipfire-arch-qwen35/src/lib.rs
+index e2445a96be2c3dc504a92fbb58c2a230bfafdc47..7008d7f775182d680de3963b1d22611cca663e1d 100644
+--- a/crates/hipfire-arch-qwen35/src/lib.rs
++++ b/crates/hipfire-arch-qwen35/src/lib.rs
+@@ -146,6 +146,12 @@ pub mod layerwise_driver;
+ /// default Legacy serve never constructs it and stays byte-neutral.
+ #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+ pub mod layerwise_mtp;
++/// P4.1③ UpstreamGlobal MTP head-history private-probe selection: the global
++/// Mean-K reduction over the trunk carrier's captured activation Q tapes
++/// (core `LayerwiseProbeSelection`). Additive sibling to `layerwise_mtp`; only
++/// the UpstreamGlobal policy reaches it, so Legacy/FirstLayer stay byte-neutral.
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++pub mod layerwise_probe;
+ /// Threaded Layerwise forward handle (Phase 3.2 ②-D4b). With `kvmem` it carries
+ /// the per-query driver+staging bundle through the shared forward spine exactly
+ /// like `SpecVerifyCapture`; without it, a zero-sized placeholder so the
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index cb809f54ef9f4ed18ed41684a353eeec070817b4..ba8b01a849442ffa6106f7d25e04a1cde4f28404 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -5897,7 +5897,7 @@ fn run_loop(
+                         .as_ref()
+                         .expect("kvmem controller without statistics taps");
+                     ctl.prepare_step(
+-                        &rig.gpu,
++                        &mut rig.gpu,
+                         &mut rig.pool,
+                         taps,
+                         &active,
+@@ -6347,6 +6347,48 @@ fn run_loop(
+                                 // restored view re-admits cold-recalled needle pages, and a
+                                 // growing union would diverge per-layer extents (bug #8).
+                                 let head_plane = ctl.head_plane_enabled();
++                                // P4.1③ H2a/H4: UpstreamGlobal head-history probe
++                                // over the carrier's CAPTURED activation Q tapes,
++                                // run BEFORE `free` ends the carrier borrow (the
++                                // tapes live in the per-step carrier). Pure host
++                                // selection — no KV mutation, no rollback. FirstLayer
++                                // (the auto-default) skips this and binds from the
++                                // first restored ordinal after free (② G5). Legacy /
++                                // AR-only never reach it (byte-neutral).
++                                let mtp_history = ctl.layerwise_mtp_history();
++                                let probe_aux: Option<Result<crate::layerwise_mtp::AuxiliarySelection, String>> =
++                                    if head_plane
++                                        && mtp_history
++                                            == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
++                                    {
++                                        Some(match carrier.activation() {
++                                            Some(act) => match ctl.layerwise_stores(slot) {
++                                                Some((keys, _)) => {
++                                                    crate::layerwise_probe::probe_head_history(
++                                                        &mut rig.gpu,
++                                                        act,
++                                                        &lw_policy,
++                                                        keys,
++                                                        rig.model.config.n_heads as u32,
++                                                        rig.model.config.n_kv_heads as u32,
++                                                        rig.model.config.head_dim as u32,
++                                                        0.0,
++                                                        crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u32,
++                                                        begin,
++                                                    )
++                                                }
++                                                None => Err(
++                                                    "layerwise probe: slot has no keys store".to_string(),
++                                                ),
++                                            },
++                                            None => Err(
++                                                "layerwise probe: UpstreamGlobal carrier has no activation"
++                                                    .to_string(),
++                                            ),
++                                        })
++                                    } else {
++                                        None
++                                    };
+                                 let prev_keep: Vec<Vec<u64>> = ctl
+                                     .layerwise_keep_set(slot)
+                                     .map(|s| s.to_vec())
+@@ -6397,16 +6439,22 @@ fn run_loop(
+                                 // FirstLayer under ②. `Ok(None)` when the head plane is
+                                 // inactive (AR-only) or the restore errored (handled below).
+                                 let aux_res = if head_plane {
+-                                    aux_first
+-                                        .as_deref()
+-                                        .map(|first| {
+-                                            crate::layerwise_mtp::bind_first_layer_auxiliary(
+-                                                first,
+-                                                begin,
+-                                                crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u64,
+-                                            )
+-                                        })
+-                                        .transpose()
++                                    if mtp_history
++                                        == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
++                                    {
++                                        probe_aux.transpose()
++                                    } else {
++                                        aux_first
++                                            .as_deref()
++                                            .map(|first| {
++                                                crate::layerwise_mtp::bind_first_layer_auxiliary(
++                                                    first,
++                                                    begin,
++                                                    crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u64,
++                                                )
++                                            })
++                                            .transpose()
++                                    }
+                                 } else {
+                                     Ok(None)
+                                 };
+@@ -6586,6 +6634,47 @@ fn run_loop(
+                                         Some(&mut carrier),
+                                     );
+                                     let head_plane = ctl.head_plane_enabled();
++                                    // P4.1③ H2a/H4: UpstreamGlobal head-history probe
++                                    // over the carrier's CAPTURED activation Q tapes,
++                                    // run BEFORE `free` (the tapes live in the per-step
++                                    // carrier). Pure host selection — no KV mutation, no
++                                    // rollback. FirstLayer binds from the first restored
++                                    // ordinal after free (② G5). Legacy / AR-only never
++                                    // reach it (byte-neutral).
++                                    let mtp_history = ctl.layerwise_mtp_history();
++                                    let probe_aux: Option<Result<crate::layerwise_mtp::AuxiliarySelection, String>> =
++                                        if head_plane
++                                            && mtp_history
++                                                == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
++                                        {
++                                            Some(match carrier.activation() {
++                                                Some(act) => match ctl.layerwise_stores(slot) {
++                                                    Some((keys, _)) => {
++                                                        crate::layerwise_probe::probe_head_history(
++                                                            &mut rig.gpu,
++                                                            act,
++                                                            &lw_policy,
++                                                            keys,
++                                                            rig.model.config.n_heads as u32,
++                                                            rig.model.config.n_kv_heads as u32,
++                                                            rig.model.config.head_dim as u32,
++                                                            0.0,
++                                                            crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u32,
++                                                            begin,
++                                                        )
++                                                    }
++                                                    None => Err(
++                                                        "layerwise probe: slot has no keys store".to_string(),
++                                                    ),
++                                                },
++                                                None => Err(
++                                                    "layerwise probe: UpstreamGlobal carrier has no activation"
++                                                        .to_string(),
++                                                ),
++                                            })
++                                        } else {
++                                            None
++                                        };
+                                     let restored_res = carrier.restored_keep_set();
+                                     // G5: the first FA ordinal's restored canonical ids
+                                     // for the FirstLayer head aux binding, captured before
+@@ -6620,17 +6709,23 @@ fn run_loop(
+                                     // the next span's draft take this binding. `Ok(None)` when
+                                     // the head plane is inactive or the restore errored.
+                                     let aux_res = if head_plane {
+-                                        aux_first
+-                                            .as_deref()
+-                                            .map(|first| {
+-                                                crate::layerwise_mtp::bind_first_layer_auxiliary(
+-                                                    first,
+-                                                    begin,
+-                                                    crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS
+-                                                        as u64,
+-                                                )
+-                                            })
+-                                            .transpose()
++                                        if mtp_history
++                                            == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
++                                        {
++                                            probe_aux.transpose()
++                                        } else {
++                                            aux_first
++                                                .as_deref()
++                                                .map(|first| {
++                                                    crate::layerwise_mtp::bind_first_layer_auxiliary(
++                                                        first,
++                                                        begin,
++                                                        crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS
++                                                            as u64,
++                                                    )
++                                                })
++                                                .transpose()
++                                        }
+                                     } else {
+                                         Ok(None)
+                                     };
+@@ -6964,7 +7059,7 @@ fn run_loop(
+             if rig.model.kvmem.is_some() {
+                 let mut row = 0usize;
+                 let mut feed_err: Option<String> = None;
+-                // fix(a) (② head-plane gap): take the controller OUT so the AR-decode
++                // P4.1③ root-cause fix: take the controller OUT so the AR-decode
+                 // head aux co-archive below can borrow head/weights/hidden
+                 // disjointly alongside `&mut ctl` (mirrors the MTP verify accept
+                 // path's `self.kvmem.take()`).
+@@ -6992,7 +7087,7 @@ fn run_loop(
+                             &rig.gpu, taps, s, pos0, m, row_start,
+                             &rig.pool, &rig.model.k_arenas, &rig.model.v_arenas,
+                         )?;
+-                        // fix(a) (AR-decode head aux co-archive, ② head-plane gap):
++                        // P4.1③ root-cause fix (AR-decode head aux co-archive):
+                         // the head aux plane was co-archived ONLY in MTP prefill
+                         // (mtp_prefill) + MTP verify accept; plain AR-decode rows
+                         // fed here advanced the trunk Main plane but NOT the aux
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index b5a99b6b52d8b49b763bc25e0a2a0ef1fe87e3d0..b4ccddf1fa9210979c2a5e66ad5ad5904315caa9 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -536,6 +536,11 @@ struct HkLayerwiseRequest {
+     _private: [u8; 0],
+ }
+ 
++#[repr(C)]
++struct HkProbeSelection {
++    _private: [u8; 0],
++}
++
+ #[repr(C)]
+ struct HkSpill {
+     _private: [u8; 0],
+@@ -1589,6 +1594,57 @@ mod ffi {
+             scorer_user: *mut c_void,
+         ) -> c_int;
+ 
++        // ── layerwise MTP private-probe selection (host-only, additive) ──
++        pub fn hk_probe_metadata_bound(
++            policy: *const HkKvStore,
++            target_layers: u32,
++            out: *mut u64,
++        ) -> c_int;
++        pub fn hk_probe_create(
++            identity: *const LayerwiseIdentity,
++            policy: *const HkKvStore,
++            keys: *const HkRawStore,
++            targets: *const LayerQueryGeometry,
++            n_targets: usize,
++            revision: Option<unsafe extern "C" fn(*mut c_void) -> MemoryStamp>,
++            revision_user: *mut c_void,
++            metadata: *mut HkStorage,
++            mandatory: *const u32,
++            mandatory_count: usize,
++        ) -> *mut HkProbeSelection;
++        pub fn hk_probe_destroy(p: *mut HkProbeSelection);
++        pub fn hk_probe_abort(p: *mut HkProbeSelection);
++        pub fn hk_probe_phase(p: *const HkProbeSelection) -> u32;
++        pub fn hk_probe_scored_rows(p: *const HkProbeSelection) -> u64;
++        pub fn hk_probe_next_layer(p: *const HkProbeSelection) -> u32;
++        pub fn hk_probe_metadata_bytes(p: *const HkProbeSelection) -> u64;
++        pub fn hk_probe_append_native(
++            p: *mut HkProbeSelection,
++            id: *const LayerwiseIdentity,
++            begin: u64,
++            q: *const NativeCurrentLayerQuery,
++            scorer: Option<
++                unsafe extern "C" fn(
++                    *mut c_void,
++                    *const HkRawStore,
++                    *const NativeCurrentLayerQuery,
++                    *const HkQueryScoreFrame,
++                    *mut f64,
++                    usize,
++                ) -> c_int,
++            >,
++            scorer_user: *mut c_void,
++        ) -> c_int;
++        pub fn hk_probe_finish(p: *mut HkProbeSelection, id: *const LayerwiseIdentity) -> c_int;
++        pub fn hk_probe_selected_count(p: *const HkProbeSelection) -> usize;
++        pub fn hk_probe_selected(p: *const HkProbeSelection, i: usize) -> u32;
++        pub fn hk_probe_fixed_count(p: *const HkProbeSelection) -> usize;
++        pub fn hk_probe_fixed(p: *const HkProbeSelection, i: usize) -> u32;
++        pub fn hk_probe_score_count(p: *const HkProbeSelection) -> usize;
++        pub fn hk_probe_score(p: *const HkProbeSelection, i: usize, out: *mut f64) -> c_int;
++        pub fn hk_probe_historical_tokens(p: *const HkProbeSelection) -> u64;
++        pub fn hk_probe_charged_tokens(p: *const HkProbeSelection) -> u64;
++
+         // ── layerwise activation accounts + projected-Q history tape ──
+         pub fn hk_spill_create(directory: *const c_char, capacity_bytes: u64) -> *mut HkSpill;
+         pub fn hk_spill_destroy(s: *mut HkSpill);
+@@ -2541,7 +2597,6 @@ impl Drop for RawStore {
+     }
+ }
+ 
+-
+ /// Block repository + working-set selection for one engine sequence.
+ pub struct KvStore {
+     ptr: NonNull<HkKvStore>,
+@@ -5093,3 +5148,177 @@ pub fn plan_content_group_publication(
+         .ok_or_else(|| KvMemError(format!("unknown publication reason {reason}")))?;
+     Ok((slot, reason, retired))
+ }
++
++/// Mirrors `kvmem::LayerwiseSelectionPhase` ordinals (the private-probe phase).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u32)]
++pub enum ProbePhase {
++    Collecting = 0,
++    Complete = 1,
++    Aborted = 2,
++}
++
++impl ProbePhase {
++    pub fn from_u32(v: u32) -> Self {
++        match v {
++            0 => Self::Collecting,
++            1 => Self::Complete,
++            _ => Self::Aborted,
++        }
++    }
++}
++
++/// The pinned upstream private-probe global Mean-K reduction for the MTP head
++/// history (UpstreamGlobal policy), mirroring `kvmem::LayerwiseProbeSelection`.
++///
++/// Scoring/selection ONLY: the hipfire driver owns the private target-layer-major
++/// forward, the exact source/rollback envelope and the GPU scorer. Each
++/// [`Self::append_native`] supplies the private TARGET forward's normalized
++/// pre-RoPE Q; the core averages the target layers (one global reduction, NOT the
++/// real fresh forward) and [`Self::finish`] picks the head history. The
++/// `policy`/`keys`/`metadata` handles are borrowed and must outlive the selection;
++/// the frozen result keeps its metadata charged until both the accumulator and
++/// the result retire (Drop). Neither `Send` nor `Sync` (the serve loop serializes
++/// the C ABI). ZERO core C++ change.
++pub struct ProbeSelection {
++    ptr: NonNull<HkProbeSelection>,
++    // Ownership anchor for the C SourceRevision trampoline's user pointer; freed
++    // only after the C++ accumulator is destroyed (see Drop).
++    #[allow(dead_code)]
++    revision: Box<RevisionState>,
++}
++
++impl ProbeSelection {
++    /// Conservative metadata bound (bytes) to reserve against an independent
++    /// FINITE metadata account BEFORE [`Self::new`].
++    pub fn metadata_bound(policy: &KvStore, target_layers: u32) -> Result<u64> {
++        let mut out = 0u64;
++        checked(|| unsafe {
++            ffi::hk_probe_metadata_bound(policy.ptr.as_ptr(), target_layers, &mut out);
++        })?;
++        Ok(out)
++    }
++
++    /// Admit a private-probe selection. `targets` are the private forward's target
++    /// FA layers in token-major scoring order; `metadata` is the finite account
++    /// reserved via [`Self::metadata_bound`]; `revision` proves the frozen index
++    /// stamp at each native boundary; `mandatory` are pinned canonical ordinals.
++    pub fn new(
++        identity: &LayerwiseIdentity,
++        policy: &KvStore,
++        keys: &RawStore,
++        targets: &[LayerQueryGeometry],
++        revision: impl FnMut() -> MemoryStamp + 'static,
++        metadata: &Storage,
++        mandatory: &[u32],
++    ) -> Result<Self> {
++        let mut state = Box::new(RevisionState { f: Box::new(revision) });
++        let user = &mut *state as *mut RevisionState as *mut c_void;
++        clear_error();
++        let ptr = unsafe {
++            ffi::hk_probe_create(
++                identity,
++                policy.ptr.as_ptr(),
++                keys.ptr.as_ptr(),
++                targets.as_ptr(),
++                targets.len(),
++                Some(revision_trampoline),
++                user,
++                metadata.ptr.as_ptr(),
++                mandatory.as_ptr(),
++                mandatory.len(),
++            )
++        };
++        NonNull::new(ptr)
++            .map(|ptr| Self { ptr, revision: state })
++            .ok_or_else(err_from_last)
++    }
++
++    /// Abort the probe (idempotent); moves the phase to `Aborted`.
++    pub fn abort(&self) {
++        unsafe { ffi::hk_probe_abort(self.ptr.as_ptr()) };
++    }
++    pub fn phase(&self) -> ProbePhase {
++        ProbePhase::from_u32(unsafe { ffi::hk_probe_phase(self.ptr.as_ptr()) })
++    }
++    pub fn scored_rows(&self) -> u64 {
++        unsafe { ffi::hk_probe_scored_rows(self.ptr.as_ptr()) }
++    }
++    pub fn next_layer(&self) -> u32 {
++        unsafe { ffi::hk_probe_next_layer(self.ptr.as_ptr()) }
++    }
++    pub fn metadata_bytes(&self) -> u64 {
++        unsafe { ffi::hk_probe_metadata_bytes(self.ptr.as_ptr()) }
++    }
++
++    /// Token-major: for each Query tile `[begin,begin+rows)` append every target
++    /// layer in geometry order, letting the owner's `scorer` compute per-block
++    /// page mass against the frozen frame. Same native scorer contract as
++    /// [`LayerwiseRequest::projected_native`]: complete the native stream before
++    /// returning and write exactly `frame.starts.len()` non-negative scores.
++    pub fn append_native<F>(
++        &self,
++        id: &LayerwiseIdentity,
++        begin: u64,
++        query: &NativeCurrentLayerQuery,
++        mut scorer: F,
++    ) -> Result<()>
++    where
++        F: FnMut(&NativeCurrentLayerQuery, &QueryScoreFrame<'_>) -> Result<Vec<f64>>,
++    {
++        let p = self.ptr.as_ptr();
++        let user = &mut scorer as *mut F as *mut c_void;
++        checked(|| unsafe {
++            ffi::hk_probe_append_native(p, id, begin, query, Some(scorer_trampoline::<F>), user);
++        })
++    }
++
++    /// Requires every Query target covered; picks the head history (phase
++    /// `Complete`). The frozen result is then readable via the accessors below.
++    pub fn finish(&self, id: &LayerwiseIdentity) -> Result<()> {
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_probe_finish(p, id); })
++    }
++
++    // ── frozen result (available only after a successful finish) ──
++    pub fn selected_count(&self) -> usize {
++        unsafe { ffi::hk_probe_selected_count(self.ptr.as_ptr()) }
++    }
++    pub fn selected(&self, i: usize) -> u32 {
++        unsafe { ffi::hk_probe_selected(self.ptr.as_ptr(), i) }
++    }
++    /// The selected canonical head-history block IDs (chronological pick order).
++    pub fn selected_ids(&self) -> Vec<u32> {
++        (0..self.selected_count()).map(|i| self.selected(i)).collect()
++    }
++    pub fn fixed_count(&self) -> usize {
++        unsafe { ffi::hk_probe_fixed_count(self.ptr.as_ptr()) }
++    }
++    pub fn fixed(&self, i: usize) -> u32 {
++        unsafe { ffi::hk_probe_fixed(self.ptr.as_ptr(), i) }
++    }
++    pub fn score_count(&self) -> usize {
++        unsafe { ffi::hk_probe_score_count(self.ptr.as_ptr()) }
++    }
++    pub fn score(&self, i: usize) -> Result<f64> {
++        let mut out = 0f64;
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_probe_score(p, i, &mut out); })?;
++        Ok(out)
++    }
++    pub fn historical_tokens(&self) -> u64 {
++        unsafe { ffi::hk_probe_historical_tokens(self.ptr.as_ptr()) }
++    }
++    pub fn charged_tokens(&self) -> u64 {
++        unsafe { ffi::hk_probe_charged_tokens(self.ptr.as_ptr()) }
++    }
++}
++
++impl Drop for ProbeSelection {
++    fn drop(&mut self) {
++        // Destroy the C++ accumulator first (its SourceRevision lambda can no
++        // longer call the trampoline); the result's metadata lease retires here
++        // too; `self.revision` is freed afterwards.
++        unsafe { ffi::hk_probe_destroy(self.ptr.as_ptr()) };
++    }
++}
+diff --git a/crates/hipfire-kvmem/tests/layerwise_probe_smoke.rs b/crates/hipfire-kvmem/tests/layerwise_probe_smoke.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f0e263dc57da991a91dca9841183cbc02ec589da
+--- /dev/null
++++ b/crates/hipfire-kvmem/tests/layerwise_probe_smoke.rs
+@@ -0,0 +1,332 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Host-only smoke test for the layerwise MTP private-probe selection
++//! (UpstreamGlobal head history): no GPU, no model. Mirrors kvmem's
++//! LayerwiseProbeSelection scalar reference over the C ABI — admit a frozen
++//! two-target probe against a finite metadata account, append the private TARGET
++//! forward's pre-RoPE Q token-major (a host Mean-K stand-in scorer), then finish
++//! to the global-reduction head-history pick. Proves the C-ABI scorer plumbing,
++//! the uniform L-layer global averaging (NOT a per-layer pick), the token-major
++//! coverage contract, tiling invariance and fail-closed abort — with no GPU and
++//! no model. The statistics oracle uses head_dim 1 (n_embd_k 1); the two target
++//! layers share one frozen page denominator.
++
++use std::cell::Cell;
++use std::ffi::c_void;
++use std::rc::Rc;
++
++use hipfire_kvmem::{
++    KvMemError, KvStore, KvStoreConfig, LayerQueryGeometry, LayerwiseIdentity, MemoryStamp,
++    NativeCurrentLayerQuery, NativeQueryScalar, ProbePhase, ProbeSelection, QueryRange,
++    QueryScoreFrame, RawStore, RawStoreConfig, SessionIdentity, Storage,
++};
++
++const BLOCK: u32 = 4;
++// evaluation span [8, 12); query span [9, 11); frontier 8 == policy.total_tokens.
++const QUERY_ROWS: u32 = 2;
++
++fn session() -> SessionIdentity {
++    SessionIdentity { id: 42, incarnation: 3 }
++}
++
++fn stats_config() -> RawStoreConfig {
++    RawStoreConfig {
++        n_layer: 2,
++        n_embd_k: 1,
++        n_embd_v: 0,
++        block_tokens: BLOCK,
++        k_row_bytes: 0,
++        k_gpu_row_bytes: 0,
++        v_gpu_row_bytes: 0,
++    }
++}
++
++fn stamp() -> MemoryStamp {
++    MemoryStamp {
++        valid: 1,
++        session: session(),
++        history_revision: 5,
++        view_version: 6,
++        frontier: 8,
++        execution_history: 9,
++    }
++}
++
++fn identity() -> LayerwiseIdentity {
++    LayerwiseIdentity {
++        history: stamp(),
++        request: 77,
++        evaluation: QueryRange { begin: 8, end: 12 },
++        query: QueryRange { begin: 9, end: 11 },
++    }
++}
++
++fn geometry(layer: u32) -> LayerQueryGeometry {
++    LayerQueryGeometry { layer, query_heads: 1, kv_heads: 1, head_dim: 1, attention_scale: 1.0 }
++}
++
++fn targets() -> Vec<LayerQueryGeometry> {
++    vec![geometry(0), geometry(1)]
++}
++
++/// Sealed plain Mean-K TopK index: 2 canonical blocks of 4 tokens, budget 1 block.
++fn policy() -> KvStore {
++    let cfg = KvStoreConfig {
++        block_tokens: BLOCK,
++        select_budget: BLOCK,
++        sink_blocks: 0,
++        recent_blocks: 0,
++        ..KvStoreConfig::default()
++    };
++    let kv = KvStore::new(&cfg).expect("policy");
++    kv.register_append(2 * BLOCK).expect("append");
++    kv
++}
++
++/// block0 mean_k = -1, block1 mean_k = +1 for both statistics ordinals.
++fn keys() -> RawStore {
++    let raw = RawStore::new(stats_config(), None).expect("keys");
++    for il in 0..2u32 {
++        raw.write_layer_mean_k(0, BLOCK, il, &[-1.0; BLOCK as usize]).expect("mean k block0");
++        raw.write_layer_mean_k(BLOCK, BLOCK, il, &[1.0; BLOCK as usize]).expect("mean k block1");
++    }
++    raw
++}
++
++/// A finite metadata account large enough for the probe accumulator bound.
++fn metadata() -> Storage {
++    Storage::new_ram(1 << 20).expect("metadata account")
++}
++
++fn native_query(q: &[f32], ordinal: u32) -> NativeCurrentLayerQuery {
++    NativeCurrentLayerQuery {
++        data: q.as_ptr() as *const c_void,
++        bytes: q.len() * std::mem::size_of::<f32>(),
++        layer: ordinal,
++        rows: q.len() as u32,
++        query_heads: 1,
++        kv_heads: 1,
++        head_dim: 1,
++        attention_scale: 1.0,
++        scalar: NativeQueryScalar::Float32 as u32,
++        row_stride: 4,
++        head_stride: 4,
++        dimension_stride: 4,
++    }
++}
++
++/// Host reference stand-in for the GPU qualified Mean-K scorer: page mass = sum
++/// over the sliced Query rows of exp(q · mean_k · scale). Asserts the frozen frame
++/// shape and forces masked blocks to exactly 0.
++fn reference_scorer(
++    mean_k: Vec<f32>,
++) -> impl FnMut(&NativeCurrentLayerQuery, &QueryScoreFrame<'_>) -> Result<Vec<f64>, KvMemError> {
++    move |tile, frame| {
++        assert_eq!(frame.starts, &[0u64, 4], "frozen frame starts");
++        assert_eq!(frame.counts, &[4u32, 4], "frozen frame counts");
++        assert_eq!(frame.score_mask, &[1u8, 1], "frozen frame score mask");
++        assert_eq!(frame.accepted_through, 8, "frozen frame frontier");
++        let mut operands = Vec::with_capacity(tile.rows as usize);
++        for r in 0..tile.rows as usize {
++            let q = unsafe {
++                let p = (tile.data as *const u8).add(r * tile.row_stride) as *const f32;
++                *p
++            };
++            operands.push(q as f64);
++        }
++        let mut scores = Vec::with_capacity(frame.starts.len());
++        for i in 0..frame.starts.len() {
++            if frame.score_mask[i] == 0 {
++                scores.push(0.0);
++                continue;
++            }
++            let mut mass = 0.0f64;
++            for &q in &operands {
++                mass += (q * mean_k[i] as f64 * tile.attention_scale as f64).exp();
++            }
++            scores.push(mass);
++        }
++        Ok(scores)
++    }
++}
++
++/// Append one Query tile token-major: every target layer in geometry order. Both
++/// layers carry the same aligned Q (favor block1) so the global L-layer average
++/// still picks block1 — proving the reduction averages layers, not picks per-layer.
++fn append_tile(probe: &ProbeSelection, id: &LayerwiseIdentity, begin: u64, q: &[f32]) {
++    for ordinal in 0..2u32 {
++        let tile = native_query(q, ordinal);
++        probe
++            .append_native(id, begin, &tile, reference_scorer(vec![-1.0, 1.0]))
++            .expect("append_native");
++    }
++}
++
++fn admit(revision: MemoryStamp) -> (ProbeSelection, Storage) {
++    let meta = metadata();
++    let pol = policy();
++    let key = keys();
++    let id = identity();
++    let bound = ProbeSelection::metadata_bound(&pol, 2).expect("metadata bound");
++    assert!(bound > 0, "probe metadata bound must be positive");
++    let probe = ProbeSelection::new(&id, &pol, &key, &targets(), move || revision, &meta, &[])
++        .expect("probe create");
++    (probe, meta)
++}
++
++#[test]
++fn global_reduction_selection_and_tiling_invariance() {
++    // Both target layers favor block1 (mean_k +1). The global average picks block1
++    // for every tiling of the query span [9, 11), and the accumulated mass is
++    // tiling-invariant (the core averages L exactly once per token row).
++    let mut reference: Option<Vec<f64>> = None;
++    for chunk in [1u32, 2] {
++        let (probe, _meta) = admit(stamp());
++        assert_eq!(probe.phase(), ProbePhase::Collecting);
++        assert_eq!(probe.scored_rows(), 0);
++
++        let q = [1.0f32; QUERY_ROWS as usize];
++        let mut first = 0u32;
++        while first < QUERY_ROWS {
++            let count = chunk.min(QUERY_ROWS - first);
++            append_tile(&probe, &identity(), 9 + first as u64, &q[first as usize..(first + count) as usize]);
++            first += count;
++            if first != QUERY_ROWS {
++                // Token-major coverage incomplete: finish must be Pending.
++                assert!(probe.finish(&identity()).is_err(), "finish before full query coverage");
++                assert_eq!(probe.phase(), ProbePhase::Collecting);
++            }
++        }
++        assert_eq!(probe.scored_rows(), QUERY_ROWS as u64);
++        assert_eq!(probe.next_layer(), 0, "layer cursor wraps after each complete tile");
++
++        probe.finish(&identity()).expect("finish");
++        assert_eq!(probe.phase(), ProbePhase::Complete);
++
++        // Budget 1 block → exactly the aligned block1 (ordinal 1).
++        assert_eq!(probe.selected_count(), 1);
++        assert_eq!(probe.selected_ids(), vec![1u32]);
++        assert_eq!(probe.fixed_count(), 0);
++        assert_eq!(probe.historical_tokens(), BLOCK as u64);
++        assert_eq!(probe.charged_tokens(), BLOCK as u64);
++        assert_eq!(probe.score_count(), 2);
++        let s0 = probe.score(0).expect("score 0");
++        let s1 = probe.score(1).expect("score 1");
++        assert!(s0 >= 0.0 && s1 >= 0.0, "page mass non-negative: {s0} {s1}");
++        assert!(s1 > s0, "aligned block1 must win the global reduction: {s0} {s1}");
++        assert!(probe.score(2).is_err(), "out-of-range score index");
++
++        // Global L-layer average: 2 layers × 2 query rows × exp(±1), averaged /2.
++        let expect1 = 2.0 * (1.0f64).exp();
++        let expect0 = 2.0 * (-1.0f64).exp();
++        assert!((s1 - expect1).abs() < 1e-9, "block1 global mass {s1} != {expect1}");
++        assert!((s0 - expect0).abs() < 1e-9, "block0 global mass {s0} != {expect0}");
++
++        match &reference {
++            None => reference = Some(vec![s0, s1]),
++            Some(r) => assert!((r[0] - s0).abs() < 1e-9 && (r[1] - s1).abs() < 1e-9, "tiling invariant"),
++        }
++    }
++}
++
++#[test]
++fn metadata_bound_requires_finite_account_and_layers() {
++    let pol = policy();
++    let bound = ProbeSelection::metadata_bound(&pol, 2).expect("bound");
++    assert!(bound > 0);
++    // Zero target layers is rejected fail-closed.
++    assert!(ProbeSelection::metadata_bound(&pol, 0).is_err(), "zero target layers");
++    // The bound must fit a finite account; an undersized account rejects create.
++    let tiny = Storage::new_ram(1).expect("tiny account");
++    let key = keys();
++    let id = identity();
++    let rev = stamp();
++    assert!(
++        ProbeSelection::new(&id, &pol, &key, &targets(), move || rev, &tiny, &[]).is_err(),
++        "metadata account too small for the probe bound"
++    );
++}
++
++#[test]
++fn fail_closed_revision_identity_and_coverage() {
++    let pol = policy();
++    let key = keys();
++    let id = identity();
++
++    // A source revision that advances after admission aborts at the next boundary.
++    {
++        let meta = metadata();
++        let revision = Rc::new(Cell::new(stamp()));
++        let rev = revision.clone();
++        let probe =
++            ProbeSelection::new(&id, &pol, &key, &targets(), move || rev.get(), &meta, &[])
++                .expect("probe");
++        revision.set({
++            let mut s = stamp();
++            s.history_revision += 1;
++            s
++        });
++        let tile = native_query(&[1.0], 0);
++        assert!(
++            probe.append_native(&id, 9, &tile, reference_scorer(vec![-1.0, 1.0])).is_err(),
++            "stale source revision"
++        );
++        assert_eq!(probe.phase(), ProbePhase::Aborted);
++    }
++
++    // A foreign request id is Stale; an out-of-order layer is InvalidPlan.
++    {
++        let (probe, _meta) = admit(stamp());
++        let mut foreign = id;
++        foreign.request += 1;
++        let tile = native_query(&[1.0], 0);
++        assert!(
++            probe.append_native(&foreign, 9, &tile, reference_scorer(vec![-1.0, 1.0])).is_err(),
++            "foreign identity"
++        );
++        // Layer 1 before layer 0 breaks token-major target coverage.
++        let wrong = native_query(&[1.0], 1);
++        assert!(
++            probe.append_native(&id, 9, &wrong, reference_scorer(vec![-1.0, 1.0])).is_err(),
++            "out-of-order target layer"
++        );
++        assert_eq!(probe.phase(), ProbePhase::Collecting, "validation must not abort");
++        probe.abort();
++        assert_eq!(probe.phase(), ProbePhase::Aborted);
++    }
++
++    // A wrong geometry (head_dim mismatch) is rejected at create.
++    {
++        let meta = metadata();
++        let rev = stamp();
++        let mut bad = targets();
++        bad[1].head_dim = 2; // kv_heads*head_dim != n_embd_k
++        assert!(
++            ProbeSelection::new(&id, &pol, &key, &bad, move || rev, &meta, &[]).is_err(),
++            "geometry differs from upstream LTHD"
++        );
++    }
++}
++
++#[test]
++fn native_scorer_fail_closed() {
++    let (probe, _meta) = admit(stamp());
++    let id = identity();
++    let tile = native_query(&[1.0, 1.0], 0);
++    // A failing scorer propagates as HK_ERR (never unwinds across the C ABI). The
++    // core accumulator does NOT auto-abort — the private-probe DRIVER owns the
++    // abort/rollback envelope (mirrors ninfer native_layerwise_probe's try/catch
++    // calling selection.abort()), so the phase stays Collecting until the driver
++    // aborts. This is the contract H2's run_private_probe must honor.
++    let mut failing = |_: &NativeCurrentLayerQuery, _: &QueryScoreFrame<'_>| {
++        Err(KvMemError("scorer failed".into()))
++    };
++    assert!(probe.append_native(&id, 9, &tile, &mut failing).is_err(), "scorer failure");
++    assert_eq!(probe.phase(), ProbePhase::Collecting, "core leaves abort to the driver");
++    // The driver aborts fail-closed; a closed probe rejects further projection.
++    probe.abort();
++    assert_eq!(probe.phase(), ProbePhase::Aborted);
++    assert!(probe.append_native(&id, 9, &tile, reference_scorer(vec![-1.0, 1.0])).is_err(), "closed");
++}
+\ No newline at end of file

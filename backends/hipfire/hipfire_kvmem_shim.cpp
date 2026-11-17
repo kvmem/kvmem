@@ -14,6 +14,7 @@
 #include <kvmem/native_kv_payload.hpp>
 #include <kvmem/layerwise_memory.hpp>
 #include <kvmem/layerwise_request.hpp>
+#include <kvmem/layerwise_probe_selection.hpp>
 #include <kvmem/query_projection_tape.hpp>
 #include <kvmem/layerwise_pressure.hpp>
 #include <kvmem/layerwise_window.hpp>
@@ -2253,6 +2254,162 @@ extern "C" uint64_t hk_layerwise_request_accepted_resident(const hk_layerwise_re
     } catch (...) {
         return 0;
     }
+}
+
+// ── layerwise MTP private-probe selection (host-only, additive) ──
+// Mirrors kvmem::LayerwiseProbeSelection (UpstreamGlobal head-history global
+// Mean-K reduction). Scoring/selection only; the hipfire driver owns the private
+// forward + exact source/rollback + GPU scorer. ZERO core C++ change.
+
+struct hk_probe_selection {
+    std::unique_ptr<kvmem::LayerwiseProbeSelection> impl;
+    const hk_raw_store * keys; // borrowed; same store admitted, passed to the scorer
+    kvmem::LayerwiseProbeHistorySelection result; // populated by finish (move-only)
+    bool finished = false;
+};
+
+extern "C" int hk_probe_metadata_bound(const hk_kv_store * policy, uint32_t target_layers,
+                                       uint64_t * out) {
+    if (!policy || !policy->impl || !out) {
+        set_error("hk_probe_metadata_bound: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded([&] {
+        *out = kvmem::LayerwiseProbeSelection::metadata_bound(*policy->impl, target_layers);
+    }, "hk_probe_metadata_bound");
+}
+
+extern "C" hk_probe_selection * hk_probe_create(
+    const hk_layerwise_identity * identity, const hk_kv_store * policy, const hk_raw_store * keys,
+    const hk_layer_query_geometry * targets, size_t n_targets, hk_source_revision_fn revision,
+    void * revision_user, hk_storage * metadata, const uint32_t * mandatory,
+    size_t mandatory_count) {
+    clear_error();
+    if (!identity || !policy || !policy->impl || !keys || !keys->impl || !metadata ||
+        !metadata->impl || (!targets && n_targets) || (!mandatory && mandatory_count)) {
+        set_error("hk_probe_create: invalid arguments");
+        return nullptr;
+    }
+    try {
+        std::vector<kvmem::LayerwiseQueryGeometry> geom;
+        geom.reserve(n_targets);
+        for (size_t i = 0; i < n_targets; ++i)
+            geom.push_back({targets[i].layer, targets[i].query_heads, targets[i].kv_heads,
+                            targets[i].head_dim, targets[i].attention_scale});
+        kvmem::LayerwiseProbeSelection::SourceRevision rev;
+        if (revision) rev = [revision, revision_user]() { return stamp_from(revision(revision_user)); };
+        auto impl = std::make_unique<kvmem::LayerwiseProbeSelection>(
+            *policy->impl, *keys->impl, identity_from(identity), geom, std::move(rev),
+            *metadata->impl, copy_ids(mandatory, static_cast<uint32_t>(mandatory_count)));
+        return new hk_probe_selection{std::move(impl), keys, {}, false};
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("hk_probe_create: unknown C++ exception");
+    }
+    return nullptr;
+}
+
+extern "C" void hk_probe_destroy(hk_probe_selection * p) { delete p; }
+
+extern "C" void hk_probe_abort(hk_probe_selection * p) {
+    if (p && p->impl) p->impl->abort();
+}
+
+extern "C" uint32_t hk_probe_phase(const hk_probe_selection * p) {
+    return (p && p->impl) ? static_cast<uint32_t>(p->impl->phase())
+                          : static_cast<uint32_t>(kvmem::LayerwiseSelectionPhase::Aborted);
+}
+
+extern "C" uint64_t hk_probe_scored_rows(const hk_probe_selection * p) {
+    return (p && p->impl) ? p->impl->scored_rows() : 0;
+}
+
+extern "C" uint32_t hk_probe_next_layer(const hk_probe_selection * p) {
+    return (p && p->impl) ? p->impl->next_layer() : 0;
+}
+
+extern "C" uint64_t hk_probe_metadata_bytes(const hk_probe_selection * p) {
+    return (p && p->impl) ? p->impl->metadata_bytes() : 0;
+}
+
+extern "C" int hk_probe_append_native(hk_probe_selection * p, const hk_layerwise_identity * id,
+                                      uint64_t begin, const hk_native_current_layer_query * q,
+                                      hk_native_scorer_fn scorer, void * scorer_user) {
+    if (!p || !p->impl) {
+        set_error("hk_probe_append_native: null selection");
+        return HK_ERR;
+    }
+    if (!q || !scorer) {
+        set_error("hk_probe_append_native: null query or scorer");
+        return HK_ERR;
+    }
+    const hk_raw_store * keys = p->keys;
+    return guarded([&] {
+        // Wrap the owner's C scorer into the core NativeScorer (identical to the
+        // request's projected_native bridge). The core keys reference is the same
+        // borrowed store; the callback receives the handle so a C owner can read
+        // statistics without capturing it.
+        kvmem::LayerwiseQuerySelection::NativeScorer fn =
+            [scorer, scorer_user, keys](const kvmem::RawKvStore &,
+                                        kvmem::NativeCurrentLayerQuery tile,
+                                        const kvmem::QueryScoreFrame & frame) -> std::vector<double> {
+                const hk_native_current_layer_query ctile = native_query_to(tile);
+                const hk_query_score_frame cframe = score_frame_to(frame);
+                std::vector<double> out(frame.starts.size(), 0.0);
+                const int rc = scorer(scorer_user, keys, &ctile, &cframe, out.data(), out.size());
+                if (rc != HK_OK)
+                    throw kvmem::MemoryError(kvmem::MemoryErrorCode::InvalidPlan,
+                                             "native probe scorer reported failure");
+                return out;
+            };
+        p->impl->append_native(identity_from(id), begin, native_query_from(q), fn);
+    }, "hk_probe_append_native");
+}
+
+extern "C" int hk_probe_finish(hk_probe_selection * p, const hk_layerwise_identity * id) {
+    if (!p || !p->impl) {
+        set_error("hk_probe_finish: null selection");
+        return HK_ERR;
+    }
+    return guarded([&] {
+        p->result = p->impl->finish(identity_from(id));
+        p->finished = true;
+    }, "hk_probe_finish");
+}
+
+extern "C" size_t hk_probe_selected_count(const hk_probe_selection * p) {
+    return (p && p->finished) ? p->result.selected.size() : 0;
+}
+extern "C" uint32_t hk_probe_selected(const hk_probe_selection * p, size_t i) {
+    if (!p || !p->finished || i >= p->result.selected.size()) return 0;
+    return p->result.selected[i];
+}
+extern "C" size_t hk_probe_fixed_count(const hk_probe_selection * p) {
+    return (p && p->finished) ? p->result.fixed.size() : 0;
+}
+extern "C" uint32_t hk_probe_fixed(const hk_probe_selection * p, size_t i) {
+    if (!p || !p->finished || i >= p->result.fixed.size()) return 0;
+    return p->result.fixed[i];
+}
+extern "C" size_t hk_probe_score_count(const hk_probe_selection * p) {
+    return (p && p->finished) ? p->result.scores.size() : 0;
+}
+extern "C" int hk_probe_score(const hk_probe_selection * p, size_t i, double * out) {
+    if (!p || !p->finished || !out) {
+        set_error("hk_probe_score: invalid arguments");
+        return HK_ERR;
+    }
+    return guarded([&] {
+        if (i >= p->result.scores.size()) throw std::out_of_range("probe score index");
+        *out = p->result.scores[i];
+    }, "hk_probe_score");
+}
+extern "C" uint64_t hk_probe_historical_tokens(const hk_probe_selection * p) {
+    return (p && p->finished) ? p->result.historical_tokens : 0;
+}
+extern "C" uint64_t hk_probe_charged_tokens(const hk_probe_selection * p) {
+    return (p && p->finished) ? p->result.charged_tokens : 0;
 }
 
 // ── layerwise activation accounts + projected-Q history tape ──

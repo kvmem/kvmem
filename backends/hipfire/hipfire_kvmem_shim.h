@@ -755,6 +755,63 @@ int hk_layerwise_request_projected_native(hk_layerwise_request * r,
                                           const hk_native_current_layer_query * q,
                                           hk_native_scorer_fn scorer, void * scorer_user);
 
+// ── layerwise MTP private-probe selection (host-only, additive) ──
+// Mirrors kvmem::LayerwiseProbeSelection: the pinned upstream private-probe
+// global Mean-K reduction for the MTP head history (UpstreamGlobal policy). Each
+// append_native supplies the private TARGET forward's normalized pre-RoPE Q; the
+// core averages the target layers (one global reduction, NOT the real fresh
+// forward) and picks the head history. This owns scoring/selection ONLY — the
+// hipfire driver owns the private target-layer-major forward, the exact
+// source/rollback envelope and the GPU scorer (the same native scorer as the
+// request). ZERO core C++ change. The policy/keys/metadata handles are borrowed
+// and must outlive the selection; the returned result keeps its metadata charged
+// until both the accumulator and the result retire (hk_probe_destroy).
+
+typedef struct hk_probe_selection hk_probe_selection;
+
+// Conservative metadata bound (bytes) for the probe accumulator. Reserve this
+// against an independent FINITE metadata account before hk_probe_create. HK_ERR
+// on a null/invalid policy or zero target layers.
+int hk_probe_metadata_bound(const hk_kv_store * policy, uint32_t target_layers,
+                            uint64_t * out);
+
+// identity/geometry mirror the request. targets are the private forward's target
+// FA layers in token-major scoring order; revision proves the frozen index stamp
+// at each native boundary; metadata is the finite account reserved above.
+hk_probe_selection * hk_probe_create(const hk_layerwise_identity * identity,
+                                     const hk_kv_store * policy, const hk_raw_store * keys,
+                                     const hk_layer_query_geometry * targets, size_t n_targets,
+                                     hk_source_revision_fn revision, void * revision_user,
+                                     hk_storage * metadata,
+                                     const uint32_t * mandatory, size_t mandatory_count);
+void hk_probe_destroy(hk_probe_selection * p);
+void hk_probe_abort(hk_probe_selection * p);
+// Mirrors kvmem::LayerwiseSelectionPhase ordinals (Collecting=0/Complete=1/Aborted=2).
+uint32_t hk_probe_phase(const hk_probe_selection * p);
+uint64_t hk_probe_scored_rows(const hk_probe_selection * p);
+uint32_t hk_probe_next_layer(const hk_probe_selection * p);
+uint64_t hk_probe_metadata_bytes(const hk_probe_selection * p);
+
+// Token-major: for each Query tile [begin,begin+rows) append every target layer
+// in geometry order. The scorer is the same native GPU scorer as the request;
+// native stream completion must precede its return.
+int hk_probe_append_native(hk_probe_selection * p, const hk_layerwise_identity * id,
+                           uint64_t begin, const hk_native_current_layer_query * q,
+                           hk_native_scorer_fn scorer, void * scorer_user);
+
+// Requires every Query target covered (phase Complete); picks the head history.
+int hk_probe_finish(hk_probe_selection * p, const hk_layerwise_identity * id);
+
+// Frozen result (available only after a successful finish).
+size_t hk_probe_selected_count(const hk_probe_selection * p);
+uint32_t hk_probe_selected(const hk_probe_selection * p, size_t i);
+size_t hk_probe_fixed_count(const hk_probe_selection * p);
+uint32_t hk_probe_fixed(const hk_probe_selection * p, size_t i);
+size_t hk_probe_score_count(const hk_probe_selection * p);
+int hk_probe_score(const hk_probe_selection * p, size_t i, double * out);
+uint64_t hk_probe_historical_tokens(const hk_probe_selection * p);
+uint64_t hk_probe_charged_tokens(const hk_probe_selection * p);
+
 // ── layerwise activation accounts + projected-Q history tape (host-only, additive) ──
 // The engine-owned projected-Q history substrate that backs the layerwise
 // activation quotas, mirroring kvmem::QueryProjectionTape and the ninfer native
