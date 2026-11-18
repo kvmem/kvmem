@@ -1,0 +1,2057 @@
+diff --git a/crates/hipfire-arch-qwen35/src/spec_emit.rs b/crates/hipfire-arch-qwen35/src/spec_emit.rs
+index f44a93f75..d2855f0c0 100644
+--- a/crates/hipfire-arch-qwen35/src/spec_emit.rs
++++ b/crates/hipfire-arch-qwen35/src/spec_emit.rs
+@@ -618,6 +618,46 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
+         let in_think = currently_in_think(raw_str, self.open_think_prefix);
+         self.think_budget.window_cap(in_think)
+     }
++
++    /// Whether the stream currently sits inside an unclosed think span. The
++    /// think router's flag is authoritative: a held-back PARTIAL close marker
++    /// keeps the span open (the close has not been consumed), which matches
++    /// PolyStrata's `parser.state == "reasoning"` with a non-empty buffer.
++    fn open_think_now(&self) -> bool {
++        self.think_router.in_think()
++    }
++
++    /// Clean token boundary: neither the byte filter nor the think router is
++    /// holding back bytes (a partial EOT prefix or a partial think marker).
++    /// The recovery decision (#728) may only be taken at such a boundary.
++    fn at_clean_boundary(&self) -> bool {
++        !self.filter.has_pending() && !self.think_router.has_pending()
++    }
++
++    /// The family's think-close text, for the daemon's #1053 injection. This
++    /// is the same string `think_budget_stop` splices, so the injected close
++    /// is byte-identical to what a budget force-close would have produced.
++    fn think_close_text(&self) -> Option<&str> {
++        Some(&self.think_close)
++    }
++
++    /// Feed a daemon-injected token (the think-close splice) through the
++    /// emission pipeline as pure STATE REPAIR: bytes are decoded and routed
++    /// through the think router / content router exactly as if generated, but
++    /// no `Committed` event is posted, no grammar cursor moves, and neither
++    /// the EOT filter nor the stop matcher observes the bytes — an injected
++    /// close must never arm a terminator or stop sequence.
++    fn observe_injected(&mut self, token: u32) -> Vec<ClientEvent> {
++        let mut events = Vec::new();
++        let fed = self.stream_bytes.len();
++        self.tokenizer
++            .decode_token_bytes_into(token, &mut self.stream_bytes);
++        let text = std::str::from_utf8(&self.stream_bytes[fed..])
++            .unwrap_or("")
++            .to_string();
++        self.route_filter_text(&text, &mut events);
++        events
++    }
+ }
+ 
+ // ── Deterministic non-GPU producer tests ────────────────────────────────────
+@@ -1359,4 +1399,69 @@ mod tests {
+             assert_eq!(emit.window_cap(), None);
+         }
+     }
++
++    /// #1053 state repair: the daemon feeds "\n" + think_close through the same router the generated
++    /// stream uses. The pre-close newline is reasoning, the close marker is consumed, the trailing
++    /// newlines are stripped from the answer, and no `Committed` event (nor grammar/terminator
++    /// state) is touched by the injected ids.
++    #[test]
++    fn injected_think_close_repairs_the_span_without_client_trace() {
++        let tok = test_tokenizer();
++        let mut emit = Qwen35Emit::from_ctx_recover(SpecEmitCtx {
++            tokenizer: &tok,
++            eos: 9,
++            im_end: Some(1),
++            tools: Some(&[]),
++            enable_grammar: true,
++            stop: Vec::new(),
++            min_tokens: 0,
++            max_think: 0,
++            max_tokens: 256,
++            assistant_prefix: AssistantPrefix::OpenThink,
++            think_mode: hipfire_runtime::prompt_frame::ThinkMode::Low,
++            decoded_vocab: None,
++        });
++        // The prompt opened the span: reasoning is live and the boundary is clean.
++        assert!(emit.open_think_now());
++        assert_eq!(emit.think_close_text(), Some("</think>\n\n"));
++        let mut first = true;
++        let mut stream = Vec::new();
++        for id in tok.encode("plan") {
++            let out = if first {
++                first = false;
++                emit.begin(id)
++            } else {
++                emit.observe(id)
++            };
++            stream.extend(out.events);
++        }
++        assert!(!reasoning_text(&stream).is_empty());
++        assert!(emit.open_think_now(), "still inside the span");
++        assert!(emit.at_clean_boundary());
++
++        // The injection, byte for byte what `slots.rs` encodes.
++        let mut injected = Vec::new();
++        for id in tok.encode("\n</think>\n\n") {
++            injected.extend(emit.observe_injected(id));
++        }
++        assert!(reasoning_text(&injected).contains('\n'), "pre-close newline is reasoning");
++        assert!(!emit.open_think_now(), "the close token flipped the span state");
++        assert!(
++            injected
++                .iter()
++                .all(|ev| !matches!(ev, ClientEvent::Committed { .. })),
++            "injected tokens never post Committed"
++        );
++        assert!(
++            tokens_text(&injected).trim().is_empty(),
++            "the post-close newlines are stripped from the answer"
++        );
++
++        // The continuation pass resumes as visible content.
++        let mut visible = String::new();
++        for id in tok.encode("Hello") {
++            visible.push_str(&tokens_text(&emit.observe(id).events));
++        }
++        assert_eq!(visible, "Hello");
++    }
+ }
+diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
+index b6ebc8290..48a6e76e6 100644
+--- a/crates/hipfire-cli/src/serve/metrics.rs
++++ b/crates/hipfire-cli/src/serve/metrics.rs
+@@ -744,6 +744,51 @@ impl Metrics {
+                     s.kvmem.cold_pack_misses,
+                 );
+             }
++            counter(
++                &mut out,
++                "hipfire_think_close_injections_total",
++                "#1053: think-close injections that continued the turn in place.",
++                s.think_recovery.close_injections as u64,
++            );
++            counter(
++                &mut out,
++                "hipfire_repeat_run_stops_total",
++                "#606: same-token runs that ended the pass as `length`.",
++                s.think_recovery.repeat_run_stops as u64,
++            );
++            out.push_str(
++                "# HELP hipfire_think_loop_recoveries_total #728 reasoning-loop endings, by mode.\n\
++                 # TYPE hipfire_think_loop_recoveries_total counter\n",
++            );
++            for (mode, value) in [
++                ("recover", s.think_recovery.loop_recoveries),
++                ("stop", s.think_recovery.loop_stops),
++            ] {
++                out.push_str(&format!(
++                    "hipfire_think_loop_recoveries_total{{mode=\"{}\"}} {value}\n",
++                    escape_label(mode)
++                ));
++            }
++            out.push_str(
++                "# HELP hipfire_think_loop_skips_total Periodic #728 loop checks that declined, by reason.\n\
++                 # TYPE hipfire_think_loop_skips_total counter\n",
++            );
++            for (reason, value) in [
++                (
++                    "already_recovered",
++                    s.think_recovery.loop_skips_already_recovered,
++                ),
++                ("vision", s.think_recovery.loop_skips_vision),
++                (
++                    "budget_exhausted",
++                    s.think_recovery.loop_skips_budget_exhausted,
++                ),
++            ] {
++                out.push_str(&format!(
++                    "hipfire_think_loop_skips_total{{reason=\"{}\"}} {value}\n",
++                    escape_label(reason)
++                ));
++            }
+         }
+ 
+         // Multi-slot swap tier, from the last daemon `done` (or the CLI seed
+@@ -1237,6 +1282,43 @@ mod tests {
+         assert!(!out.contains("hipfire_kv_pages"), "{out}");
+     }
+ 
++    #[test]
++    fn think_recovery_counters_export_with_engine_stats() {
++        use hipfire_runtime::serve::{EngineStats, ThinkRecoveryStats};
++        let m = Metrics::default();
++        let meta = ServeMeta {
++            engine_stats: Some(EngineStats {
++                think_recovery: ThinkRecoveryStats {
++                    close_injections: 2,
++                    loop_recoveries: 1,
++                    loop_stops: 3,
++                    repeat_run_stops: 4,
++                    loop_skips_already_recovered: 5,
++                    loop_skips_vision: 6,
++                    loop_skips_budget_exhausted: 7,
++                },
++                ..EngineStats::default()
++            }),
++            ..ServeMeta::new("t".to_owned())
++        };
++        let out = m.render(&meta, 0, 16);
++        for sample in [
++            "hipfire_think_close_injections_total 2\n",
++            "hipfire_repeat_run_stops_total 4\n",
++            "hipfire_think_loop_recoveries_total{mode=\"recover\"} 1\n",
++            "hipfire_think_loop_recoveries_total{mode=\"stop\"} 3\n",
++            "hipfire_think_loop_skips_total{reason=\"already_recovered\"} 5\n",
++            "hipfire_think_loop_skips_total{reason=\"vision\"} 6\n",
++            "hipfire_think_loop_skips_total{reason=\"budget_exhausted\"} 7\n",
++        ] {
++            assert!(out.contains(sample), "{sample}: {out}");
++        }
++        // Standard route: no daemon snapshot, no think-recovery series.
++        let standard = m.render(&ServeMeta::new("t".to_owned()), 0, 16);
++        assert!(!standard.contains("hipfire_think_"), "{standard}");
++        assert!(!standard.contains("hipfire_repeat_run"), "{standard}");
++    }
++
+     #[test]
+     fn swap_gauges_render_only_when_published() {
+         let m = Metrics::default();
+diff --git a/crates/hipfire-daemon/src/main.rs b/crates/hipfire-daemon/src/main.rs
+index bbae9ac31..4406615f4 100644
+--- a/crates/hipfire-daemon/src/main.rs
++++ b/crates/hipfire-daemon/src/main.rs
+@@ -96,6 +96,7 @@ mod npu_route;
+ mod process_init;
+ mod request_guards;
+ mod slots;
++mod think_recovery;
+ mod vision_ladder;
+ mod weight_host_tenant;
+ use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
+diff --git a/crates/hipfire-daemon/src/slots.rs b/crates/hipfire-daemon/src/slots.rs
+index 77924b15f..f79c51cf4 100644
+--- a/crates/hipfire-daemon/src/slots.rs
++++ b/crates/hipfire-daemon/src/slots.rs
+@@ -50,11 +50,17 @@ use hipfire_runtime::prompt_frame::{
+     JinjaChatFrame, Message, Role, ThinkMode, ToolCall,
+ };
+ use hipfire_runtime::serve::{
+-    Continuation, DoneReason, Event, SlotEngineConfig, SubmitRequest, VisualData,
++    Continuation, DoneReason, Event, SlotEngineConfig, SubmitRequest, ThinkRecoveryStats,
++    VisualData,
+ };
+ use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
+ use hipfire_runtime::tokenizer::Tokenizer;
+ 
++use crate::think_recovery::{
++    close_retry_skip_reason, focused_recovery_prompt, injection_text, CloseRetryInputs, GateAction,
++    GateCtx, LoopMode, StreamGates, REPEAT_STOP_TOKENS,
++};
++
+ fn emit_qwen_ar_slot_error<W: std::io::Write>(
+     stdout: &mut W,
+     id: &str,
+@@ -264,6 +270,9 @@ pub struct SlotBackend {
+     active: AtomicUsize,
+     tool_grammar: bool,
+     pending_tools: Mutex<PendingToolBroker>,
++    /// Cumulative think-recovery counters (#1053 / #728 / #606), patched into
++    /// the `done.engine_stats` snapshot the gateway exports on `/metrics`.
++    think_recovery: Mutex<ThinkRecoveryStats>,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -739,12 +748,29 @@ impl SlotBackend {
+             active: AtomicUsize::new(0),
+             tool_grammar,
+             pending_tools: Mutex::new(PendingToolBroker::default()),
++            think_recovery: Mutex::new(ThinkRecoveryStats::default()),
+         })
+     }
+ 
+     pub fn arch_str(&self) -> &str {
+         &self.arch_str
+     }
++
++    /// Fold one think-recovery event into the cumulative `/metrics` counters.
++    fn note_think_recovery(&self, apply: impl FnOnce(&mut ThinkRecoveryStats)) {
++        let mut st = self
++            .think_recovery
++            .lock()
++            .unwrap_or_else(|error| error.into_inner());
++        apply(&mut st);
++    }
++
++    fn think_recovery_snapshot(&self) -> ThinkRecoveryStats {
++        *self
++            .think_recovery
++            .lock()
++            .unwrap_or_else(|error| error.into_inner())
++    }
+     /// The MTP mode this slot engine serves after the producer-capability gate.
+     pub fn mtp_mode_effective(&self) -> &'static str {
+         self.mtp_mode_effective
+@@ -1589,10 +1615,10 @@ impl SlotBackend {
+         }
+         // Transition queued (stdin reader announced). Bind will happen after Accepted.
+         let _ = batch_transition_to_queued(id, attempt_id, admission);
+-        let (tx, rx) = mpsc::channel::<Event>();
+         // Cancellation identity (spec §4.6 C6): a request parked in the
+         // engine's waiting room has no session id yet, so the abort path
+         // cancels it by this tag. (id, attempt_id) is unique per attempt.
++        // Every think-recovery pass reuses the same tag.
+         let request_tag = {
+             use std::hash::{Hash, Hasher};
+             let mut h = std::collections::hash_map::DefaultHasher::new();
+@@ -1600,53 +1626,63 @@ impl SlotBackend {
+             attempt_id.hash(&mut h);
+             h.finish()
+         };
+-        let req = SubmitRequest {
+-            query: request_query,
+-            prompt_tokens,
+-            convo: convo.clone(),
+-            continuation,
+-            max_tokens,
+-            temperature,
+-            top_p,
+-            top_k: top_k as i32,
+-            seed,
+-            repeat_window,
+-            repeat_penalty,
+-            presence_penalty,
+-            frequency_penalty,
+-            min_p,
+-            visual_data,
+-            json_schema,
+-            started_in_think,
+-            // Enforced thinking budget: absent/0 = uncapped; the 1-sentinel
+-            // never enters a think span so the budget cannot engage.
+-            think_budget: max_think_tokens
+-                .filter(|&n| n >= 2)
+-                .map(|n| n as usize)
+-                .unwrap_or(usize::MAX),
+-            // Canonical pending-input bytes (spec §5.3): the engine's wait
+-            // queue charges its byte cap against this, so daemon-side
+-            // waiters must carry the real prompt weight — a hardcoded 0
+-            // (floored to 1 downstream) made the byte cap unbindable.
+-            queue_bytes: canonical_prompt_bytes(msg),
+-            request_tag,
+-            reply: tx,
++        // ── Think-recovery pass loop (hipfire-think-recovery-design.md) ──
++        // #1053 (inject a think-close and continue), #728 (detect reasoning
++        // loops and stop/recover) and #606 (same-token run guard) all extend
++        // ONE request across several engine passes. A pass whose repair must
++        // be invisible to the client ends through `EngineCommand::Interrupt`;
++        // the session KV stays resident for the continuation pass.
++        // Served default is ON (design Q1); HIPFIRE_REASONING_CLOSE_RETRY=0/off
++        // disables. Unknown values keep the served default.
++        let close_retry_enabled = hipfire_config::developer_var("HIPFIRE_REASONING_CLOSE_RETRY")
++            .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
++            .unwrap_or(true);
++        // Served default is `recover` (design Q1); an explicit valid value
++        // overrides, and an invalid value falls back to `off` rather than
++        // guessing at the operator's intent.
++        let loop_mode = hipfire_config::developer_var("HIPFIRE_REASONING_LOOP_RECOVERY")
++            .map(|v| LoopMode::from_config_value(&v).unwrap_or(LoopMode::Off))
++            .unwrap_or(LoopMode::Recover);
++        let repeat_stop = hipfire_config::developer_var("HIPFIRE_REPEAT_STOP_TOKENS")
++            .ok()
++            .and_then(|v| v.trim().parse::<usize>().ok())
++            .unwrap_or(REPEAT_STOP_TOKENS);
++        // Only thinking turns are repaired. Vision and structured-output
++        // requests keep single-pass semantics: an injected token would
++        // desync the schema cursor, and the multi-slot vision path owns its
++        // own per-token pipeline.
++        let has_vision = visual_data.is_some();
++        let recovery_allowed = !has_vision && json_schema.is_none();
++        let close_retry_enabled = close_retry_enabled && recovery_allowed;
++        let loop_mode = if recovery_allowed {
++            loop_mode
++        } else {
++            LoopMode::Off
+         };
+-        if let Err(e) = self.engine.submit(req) {
+-            if let Some(session) = claimed_session {
+-                self.close_session(session);
++        let trace_think = |line: String| {
++            if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_ok() {
++                eprintln!("[think-recover] {line}");
+             }
+-            emit_qwen_ar_slot_error(
+-                stdout,
+-                id,
+-                &format!("multi_slot submit: {e}"),
+-                "internal",
+-                false,
+-                false,
+-            );
+-            let _ = stdout.flush();
+-            return Ok(());
+-        }
++        };
++        let original_prompt = prompt_tokens.clone();
++        // raw_ids: every sampled token of the request, rendered or not (a
++        // gate may drop a token from the client stream, but it is still part
++        // of the sampled history).
++        let mut gen_ids: Vec<u32> = Vec::new();
++        // Client-visible completion tokens (delivered + injected).
++        let mut tokens_total: usize = 0;
++        let mut injected_once = false;
++        // The reference's per-token gate state: sampled count, repeat run,
++        // loop schedule, reasoning text, sticky answered flag.
++        let mut gates = StreamGates::new(repeat_stop);
++        let mut repeat_stopped = false;
++        let mut loop_stopped = false;
++        let mut pass_prompt = prompt_tokens;
++        let mut pass_continuation = continuation;
++        let mut pass_max_tokens = max_tokens;
++        let mut pass_temperature = temperature;
++        let mut pass_presence = presence_penalty;
++        let mut pass_index: usize = 0;
+ 
+         // Stream loop with keyed terminal binding
+         let mut accepted_session: Option<u64> = None;
+@@ -1704,146 +1740,440 @@ impl SlotBackend {
+         // a normal stop: the client would see a clean-looking truncated
+         // answer while the session leaks resident on its slot.
+         let mut engine_died = false;
+-
+-        loop {
+-            if batch_check_abort(id, attempt_id, admission) {
+-                drop(rx);
+-                // A request parked in the engine's waiting room has no
+-                // session to close — cancel it by tag so it leaves the queue
+-                // (and its queue-byte charge) immediately instead of being
+-                // admitted against a dead receiver later (spec §4.6 C6/A11).
+-                self.engine.cancel_waiting(request_tag);
+-                if let Some(sess) = accepted_session.take() {
+-                    self.close_session(sess);
+-                } else if let Some(session) = claimed_session {
++        // The previous pass's terminal, kept so a REJECTED continuation can
++        // fall back to the stream the client actually saw.
++        let mut saved_stop: Option<(DoneReason, usize)> = None;
++        // #1053: tokens to feed the emitter once the continuation pass is
++        // ADMITTED (a rejected continuation must leave no trace for the
++        // client). Survives the pass boundary on purpose.
++        let mut pending_injection: Option<Vec<u32>> = None;
++
++        'pass: loop {
++            pass_index += 1;
++            done_reason = None;
++            rejected = None;
++            engine_died = false;
++            repeat_stopped = false;
++            loop_stopped = false;
++            let mut pass_ending = false;
++            let mut gate_trip_len: usize = 0;
++            let mut recover_requested = false;
++            let (tx, rx) = mpsc::channel::<Event>();
++            let req = SubmitRequest {
++                query: if pass_index == 1 { request_query } else { None },
++                prompt_tokens: std::mem::take(&mut pass_prompt),
++                convo: convo.clone(),
++                continuation: std::mem::replace(&mut pass_continuation, Continuation::Cold),
++                max_tokens: pass_max_tokens,
++                temperature: pass_temperature,
++                top_p,
++                top_k: top_k as i32,
++                seed,
++                repeat_window,
++                repeat_penalty,
++                presence_penalty: pass_presence,
++                frequency_penalty,
++                min_p,
++                visual_data: if pass_index == 1 {
++                    visual_data.take()
++                } else {
++                    None
++                },
++                json_schema: if pass_index == 1 {
++                    json_schema.clone()
++                } else {
++                    None
++                },
++                started_in_think,
++                // Enforced thinking budget: absent/0 = uncapped; the 1-sentinel
++                // never enters a think span so the budget cannot engage.
++                think_budget: max_think_tokens
++                    .filter(|&n| n >= 2)
++                    .map(|n| n as usize)
++                    .unwrap_or(usize::MAX),
++                // Canonical pending-input bytes (spec §5.3): the engine's wait
++                // queue charges its byte cap against this, so daemon-side
++                // waiters must carry the real prompt weight — a hardcoded 0
++                // (floored to 1 downstream) made the byte cap unbindable.
++                queue_bytes: canonical_prompt_bytes(msg),
++                request_tag,
++                reply: tx,
++            };
++            if let Err(e) = self.engine.submit(req) {
++                if let Some(session) = claimed_session {
+                     self.close_session(session);
+                 }
+-                emit_active_route_cancel(stdout, id, produced);
++                emit_qwen_ar_slot_error(
++                    stdout,
++                    id,
++                    &format!("multi_slot submit: {e}"),
++                    "internal",
++                    false,
++                    false,
++                );
++                let _ = stdout.flush();
+                 return Ok(());
+             }
+-            match rx.recv_timeout(Duration::from_millis(100)) {
+-                Ok(ev) => match ev {
+-                    Event::Accepted {
+-                        session,
+-                        reused,
+-                        prefill,
+-                    } => {
+-                        // An admit may have swept parked sessions; prune their
+-                        // broker state before this request can name one.
+-                        self.reap_closed_sessions();
+-                        if let Some(expected) =
+-                            claimed_session.filter(|expected| *expected != session)
+-                        {
+-                            self.close_session(expected);
++
++            loop {
++                if batch_check_abort(id, attempt_id, admission) {
++                    drop(rx);
++                    // A request parked in the engine's waiting room has no
++                    // session to close — cancel it by tag so it leaves the queue
++                    // (and its queue-byte charge) immediately instead of being
++                    // admitted against a dead receiver later (spec §4.6 C6/A11).
++                    self.engine.cancel_waiting(request_tag);
++                    if let Some(sess) = accepted_session.take() {
++                        self.close_session(sess);
++                    } else if let Some(session) = claimed_session {
++                        self.close_session(session);
++                    }
++                    emit_active_route_cancel(stdout, id, produced);
++                    return Ok(());
++                }
++                match rx.recv_timeout(Duration::from_millis(100)) {
++                    Ok(ev) => match ev {
++                        Event::Accepted {
++                            session,
++                            reused,
++                            prefill,
++                        } => {
++                            // An admit may have swept parked sessions; prune their
++                            // broker state before this request can name one.
++                            self.reap_closed_sessions();
++                            if pass_index == 1 {
++                                if let Some(expected) =
++                                    claimed_session.filter(|expected| *expected != session)
++                                {
++                                    // The claimed session was swept between emitting the
++                                    // calls and answering them (an idle park for another
++                                    // admit), and the engine re-admitted this exact
++                                    // conversation: either its parked history was
++                                    // restored (only the tool-result suffix prefills) or
++                                    // the prompt cold-prefilled with the results already
++                                    // in it. The claim is already consumed, so a retry
++                                    // could never re-claim — failing here would strand
++                                    // the conversation. Adopt the accepted session; the
++                                    // next pending turn registers under it.
++                                    eprintln!(
++                                        "[tool-reentry] claimed session {expected} was swept; \
++                                         adopted accepted session {session} (reused={reused} \
++                                         prefill={prefill})"
++                                    );
++                                    self.close_session(expected);
++                                }
++                            }
+                             accepted_session = Some(session);
+-                            rejected = Some((
+-                                hipfire_runtime::serve::RejectClass::Internal,
+-                                "tool-result reentry was admitted on the wrong slot session"
+-                                    .to_string(),
+-                            ));
++                            if pass_index == 1 {
++                                // The client-facing prompt accounting is the
++                                // FIRST pass's; later passes extend it
++                                // engine-side only.
++                                cached_tokens = reused;
++                                prefill_tokens = prefill;
++                            }
++                            let ticket = LaneTicket {
++                                lane: (session % 1024) as usize,
++                                generation: session,
++                                admission,
++                            };
++                            accepted_ticket = Some(ticket);
++                            let _ = batch_bind_active(id, attempt_id, admission, ticket);
++                            // #1053: the injected close renders only once the
++                            // continuation pass is ADMITTED — a rejected
++                            // continuation must leave the client stream
++                            // without it.
++                            if let Some(ids) = pending_injection.take() {
++                                for tok_id in ids {
++                                    let evs = emitter.observe_injected(tok_id);
++                                    for ev in &evs {
++                                        match ev {
++                                            ClientEvent::Reasoning(text) => {
++                                                gates.push_reasoning(text)
++                                            }
++                                            ClientEvent::Token(_) | ClientEvent::ToolCalls(_) => {
++                                                gates.mark_answered()
++                                            }
++                                            ClientEvent::Committed { .. } => {}
++                                        }
++                                    }
++                                    render_events(evs, stdout, &mut terminal_tool_calls);
++                                    tokens_total += 1;
++                                }
++                            }
++                        }
++                        Event::Token { id: tok_id } => {
++                            // Every sampled token joins the history, rendered
++                            // or not: the later continuation prompts reproduce
++                            // this exact stream.
++                            gen_ids.push(tok_id);
++                            if pass_ending {
++                                // The gate ended this pass AT the trip token;
++                                // anything the engine emits before the
++                                // interrupt lands was never part of the
++                                // sampled request: keep it out of the history
++                                // the recovery prompt reproduces and out of n.
++                                gen_ids.truncate(gate_trip_len);
++                                continue;
++                            }
++                            // #606 → #728 in the reference's order; both read
++                            // the state as of the previous token.
++                            let mut splice_ok = || {
++                                focused_recovery_prompt(
++                                    &self.tokenizer,
++                                    &original_prompt,
++                                    &gen_ids,
++                                )
++                                .is_some()
++                            };
++                            let gate = gates.note_token(
++                                tok_id,
++                                &GateCtx {
++                                    loop_mode,
++                                    open_think: emitter.open_think_now(),
++                                    clean_boundary: emitter.at_clean_boundary(),
++                                    has_images: has_vision,
++                                    max_new: max_tokens,
++                                },
++                                &mut splice_ok,
++                            );
++                            if let Some(line) = gate.trace {
++                                trace_think(line);
++                            }
++                            if let Some(reason) = gate.skip {
++                                self.note_think_recovery(|st| match reason {
++                                    "already recovered" => st.loop_skips_already_recovered += 1,
++                                    "vision" => st.loop_skips_vision += 1,
++                                    "budget exhausted" => st.loop_skips_budget_exhausted += 1,
++                                    _ => {}
++                                });
++                            }
++                            match gate.action {
++                                GateAction::Deliver => {}
++                                GateAction::RepeatStop
++                                | GateAction::LoopStop
++                                | GateAction::Recover => {
++                                    match gate.action {
++                                        GateAction::RepeatStop => {
++                                            repeat_stopped = true;
++                                            self.note_think_recovery(|st| {
++                                                st.repeat_run_stops += 1
++                                            });
++                                        }
++                                        GateAction::LoopStop => {
++                                            loop_stopped = true;
++                                            self.note_think_recovery(|st| st.loop_stops += 1);
++                                        }
++                                        _ => {
++                                            recover_requested = true;
++                                            self.note_think_recovery(|st| {
++                                                st.loop_recoveries += 1
++                                            });
++                                        }
++                                    }
++                                    pass_ending = true;
++                                    gate_trip_len = gen_ids.len();
++                                    if let Some(sess) = accepted_session {
++                                        self.engine.interrupt(sess);
++                                    }
++                                    continue;
++                                }
++                            }
++                            let outcome = if first_token {
++                                first_token = false;
++                                emitter.begin(tok_id)
++                            } else {
++                                emitter.observe(tok_id)
++                            };
++                            for ev in &outcome.events {
++                                match ev {
++                                    ClientEvent::Reasoning(text) => gates.push_reasoning(text),
++                                    ClientEvent::Token(_) | ClientEvent::ToolCalls(_) => {
++                                        gates.mark_answered()
++                                    }
++                                    ClientEvent::Committed { .. } => {}
++                                }
++                            }
++                            render_events(outcome.events, stdout, &mut terminal_tool_calls);
++                            produced += 1;
++                            tokens_total += 1;
++                        }
++                        Event::Done { reason, generated } => {
++                            done_reason = Some((reason, generated));
+                             break;
+                         }
+-                        accepted_session = Some(session);
+-                        cached_tokens = reused;
+-                        prefill_tokens = prefill;
+-                        let ticket = LaneTicket {
+-                            lane: (session % 1024) as usize,
+-                            generation: session,
+-                            admission,
+-                        };
+-                        accepted_ticket = Some(ticket);
+-                        let _ = batch_bind_active(id, attempt_id, admission, ticket);
+-                    }
+-                    Event::Token { id: tok_id } => {
+-                        let outcome = if first_token {
+-                            first_token = false;
+-                            emitter.begin(tok_id)
+-                        } else {
+-                            emitter.observe(tok_id)
+-                        };
+-                        render_events(outcome.events, stdout, &mut terminal_tool_calls);
+-                        produced += 1;
+-                    }
+-                    Event::Done { reason, generated } => {
+-                        done_reason = Some((reason, generated));
+-                        break;
+-                    }
+-                    Event::Rejected { class, reason } => {
+-                        rejected = Some((class, reason));
++                        Event::Rejected { class, reason } => {
++                            rejected = Some((class, reason));
++                            break;
++                        }
++                    },
++                    Err(RecvTimeoutError::Timeout) => continue,
++                    Err(RecvTimeoutError::Disconnected) => {
++                        engine_died = true;
+                         break;
+                     }
+-                },
+-                Err(RecvTimeoutError::Timeout) => continue,
+-                Err(RecvTimeoutError::Disconnected) => {
+-                    engine_died = true;
+-                    break;
+                 }
+             }
+-        }
+ 
+-        if engine_died {
+-            // The engine thread dropped its end without Done/Rejected. Close
+-            // the session (its resident state is untrustworthy) and fail
+-            // loudly — never a normal "stop" with partial tokens.
+-            drop(rx);
+-            if let Some(sess) = accepted_session.take() {
+-                let _ = self.engine.close(sess);
++            // ── per-pass conclusion ──
++            if engine_died {
++                if let Some(sess) = accepted_session.take() {
++                    let _ = self.engine.close(sess);
++                }
++                hipfire_engine::emit::emit_active_attempt_error(
++                    stdout,
++                    Some(id),
++                    &format!(
++                        "multi_slot engine terminated without completing request {} \
++                         (engine thread exited; {produced} tokens were produced)",
++                        attempt_id
++                    ),
++                    "internal",
++                    false,
++                    false,
++                );
++                let _ = stdout.flush();
++                return Ok(());
+             }
+-            hipfire_engine::emit::emit_active_attempt_error(
+-                stdout,
+-                Some(id),
+-                &format!(
+-                    "multi_slot engine terminated without completing request {} \
+-                     (engine thread exited; {produced} tokens were produced)",
+-                    attempt_id
+-                ),
+-                "internal",
+-                false,
+-                false,
+-            );
+-            let _ = stdout.flush();
+-            return Ok(());
+-        }
+-
+-        if let Some((class, reason)) = rejected {
+-            drop(rx);
+-            if let Some(sess) = accepted_session.take() {
+-                self.close_session(sess);
+-            } else if let Some(session) = claimed_session {
+-                self.close_session(session);
++            if let Some((class, reason)) = rejected {
++                // A continuation pass that never produced a terminal of its
++                // own falls back to the pass whose stream the client saw.
++                if let Some((prev_reason, prev_generated)) = saved_stop.take() {
++                    trace_think(format!(
++                        "continuation rejected ({reason}); keeping the previous pass terminal"
++                    ));
++                    done_reason = Some((prev_reason, prev_generated));
++                    break 'pass;
++                }
++                if let Some(sess) = accepted_session.take() {
++                    self.close_session(sess);
++                } else if let Some(session) = claimed_session {
++                    self.close_session(session);
++                }
++                let kind = match class {
++                    hipfire_runtime::serve::RejectClass::Overload => "overload",
++                    hipfire_runtime::serve::RejectClass::Validation => "validation",
++                    hipfire_runtime::serve::RejectClass::Internal => "internal",
++                    hipfire_runtime::serve::RejectClass::Cancel => "cancel",
++                };
++                hipfire_engine::emit::emit_active_attempt_error(
++                    stdout,
++                    Some(id),
++                    &format!("multi_slot rejected: {reason}"),
++                    kind,
++                    false,
++                    false,
++                );
++                let _ = stdout.flush();
++                return Ok(());
+             }
+-            let kind = match class {
+-                hipfire_runtime::serve::RejectClass::Overload => "overload",
+-                hipfire_runtime::serve::RejectClass::Validation => "validation",
+-                hipfire_runtime::serve::RejectClass::Internal => "internal",
+-                hipfire_runtime::serve::RejectClass::Cancel => "cancel",
++            let Some((reason, generated)) = done_reason else {
++                // Channel closed without any terminal event: treat like the
++                // engine died (never a normal stop).
++                if let Some(sess) = accepted_session.take() {
++                    let _ = self.engine.close(sess);
++                }
++                emit_qwen_ar_slot_error(
++                    stdout,
++                    id,
++                    "multi_slot stream ended before session acceptance",
++                    "internal",
++                    false,
++                    false,
++                );
++                let _ = stdout.flush();
++                return Ok(());
+             };
+-            hipfire_engine::emit::emit_active_attempt_error(
+-                stdout,
+-                Some(id),
+-                &format!("multi_slot rejected: {reason}"),
+-                kind,
+-                false,
+-                false,
+-            );
+-            let _ = stdout.flush();
+-            return Ok(());
+-        }
+-        if accepted_session.is_none() {
+-            if let Some(session) = claimed_session {
+-                self.close_session(session);
++            let natural_stop = matches!(reason, DoneReason::Eos);
++            if natural_stop {
++                // n counts the sampled terminator: the reference appends it
++                // to its sampled stream before breaking.
++                gates.note_eos();
+             }
+-            emit_qwen_ar_slot_error(
+-                stdout,
+-                id,
+-                "multi_slot stream ended before session acceptance",
+-                "internal",
+-                false,
+-                false,
+-            );
+-            let _ = stdout.flush();
+-            return Ok(());
++            saved_stop = Some((reason, generated));
++
++            // ── #728 recover: the loop gate ended this pass ──
++            if recover_requested {
++                gates.mark_recovered();
++                if let Some(sess) = accepted_session.take() {
++                    // The recovered prompt rewrites the head effort sentence:
++                    // no prefix of it can be reused, so hand pass one's
++                    // session back before the cold restart.
++                    self.close_session(sess);
++                }
++                match focused_recovery_prompt(&self.tokenizer, &original_prompt, &gen_ids) {
++                    Some(prompt) => {
++                        pass_prompt = prompt;
++                        pass_continuation = Continuation::Cold;
++                        pass_temperature = temperature.max(1.0);
++                        pass_presence = presence_penalty.max(1.5);
++                        pass_max_tokens = max_tokens.saturating_sub(gates.n()).max(1);
++                        trace_think(format!(
++                            "recover pass: temperature {} presence {} max_tokens {}",
++                            pass_temperature, pass_presence, pass_max_tokens
++                        ));
++                        continue 'pass;
++                    }
++                    None => {
++                        trace_think(format!(
++                            "recovery prompt unavailable after the pass (effort sentence \
++                             absent; request effort={jinja_effort:?}); ending as length"
++                        ));
++                        break 'pass;
++                    }
++                }
++            }
++            if repeat_stopped || loop_stopped {
++                break 'pass;
++            }
++
++            // ── #1053: a natural stop landed with thinking still open ──
++            if let Some(close) = emitter.think_close_text().map(str::to_string) {
++                let extra = self.tokenizer.encode(&injection_text(&close));
++                let skip = close_retry_skip_reason(&CloseRetryInputs {
++                    enabled: close_retry_enabled,
++                    // The open-think gate below is the operative filter; the
++                    // reference's separate `thinking` flag only reorders the
++                    // skip reason for requests that never opened a span.
++                    thinking: true,
++                    natural_stop,
++                    answered: gates.answered(),
++                    cancelled: false,
++                    open_think: emitter.open_think_now(),
++                    already_injected: injected_once,
++                    budget_left: max_tokens.saturating_sub(gates.n()),
++                    extra_len: extra.len(),
++                });
++                if skip.is_none() && !extra.is_empty() {
++                    if let Some(session) = accepted_session {
++                        injected_once = true;
++                        self.note_think_recovery(|st| st.close_injections += 1);
++                        gates.note_injected(extra.len());
++                        pass_max_tokens = max_tokens.saturating_sub(gates.n()).max(1);
++                        let mut full = original_prompt.clone();
++                        full.extend_from_slice(&gen_ids);
++                        full.extend_from_slice(&extra);
++                        pass_prompt = full;
++                        pass_continuation = Continuation::ToolResults {
++                            tokens: extra.clone(),
++                            session,
++                        };
++                        pending_injection = Some(extra.clone());
++                        trace_think(format!(
++                            "close-retry: injected {} close tokens at n={}; continuing in-turn",
++                            extra.len(),
++                            gates.n()
++                        ));
++                        continue 'pass;
++                    }
++                } else if let Some(reason) = skip {
++                    trace_think(format!(
++                        "close-retry skipped: {reason} (request effort={jinja_effort:?})"
++                    ));
++                }
++            }
++            break 'pass;
+         }
++
+         let summary = emitter.finish();
+         render_events(summary.events, stdout, &mut terminal_tool_calls);
+         // Multi-slot keeps failing closed on an unfinished tool call at any
+@@ -1875,7 +2205,7 @@ impl SlotBackend {
+             return Ok(());
+         }
+ 
+-        let (reason, generated) = done_reason.unwrap_or((DoneReason::Eos, produced));
++        let (reason, _generated) = done_reason.unwrap_or((DoneReason::Eos, produced));
+         if matches!(reason, DoneReason::ClientGone) {
+             if let Some(sess) = accepted_session.take() {
+                 self.close_session(sess);
+@@ -1922,7 +2252,10 @@ impl SlotBackend {
+             "id": id,
+             "attempt_id": attempt_id,
+             "finish_reason": finish_reason,
+-            "tokens": generated,
++            // Completion tokens include every delivered token across the
++            // recovery passes plus the injected think-close, like the
++            // reference's usage accounting.
++            "tokens": tokens_total,
+             "prompt_tokens": cached_tokens + prefill_tokens,
+             "cached_tokens": cached_tokens,
+             "prefill_tokens": prefill_tokens,
+@@ -1935,6 +2268,18 @@ impl SlotBackend {
+         // Live swap-tier counters for /health. The engine refreshes its stats
+         // each step, so this is the state as of (at worst) the current step.
+         pending_done["swap"] = swap_stats_json(&self.engine.stats());
++        // Think-recovery totals ride the same snapshot so the gateway's
++        // `/metrics` sees them without a second channel (Q8).
++        if let Some(engine_stats) = pending_done
++            .get_mut("engine_stats")
++            .and_then(|value| value.as_object_mut())
++        {
++            engine_stats.insert(
++                "think_recovery".to_string(),
++                serde_json::to_value(self.think_recovery_snapshot())
++                    .unwrap_or(serde_json::Value::Null),
++            );
++        }
+ 
+         // Mark ready with exact pending done, publish commit_ready, poll keyed Commit/Abort with normal timeout
+         let Some(ticket) = accepted_ticket else {
+@@ -1967,7 +2312,11 @@ impl SlotBackend {
+         match decision {
+             hipfire_engine::terminal::ClientTerminalDecision::Commit => {
+                 if let Some(session) = accepted_session {
+-                    if open_think {
++                    // A gate-ended pass (repeat run / reasoning loop) leaves
++                    // the engine stream holding at least one sampled token the
++                    // client never saw: the session no longer reproduces the
++                    // rendered history, so it is not reusable either.
++                    if open_think || repeat_stopped || loop_stopped {
+                         self.close_session(session);
+                     } else {
+                         self.pending_tools
+diff --git a/crates/hipfire-daemon/src/think_recovery.rs b/crates/hipfire-daemon/src/think_recovery.rs
+new file mode 100644
+index 000000000..77f463661
+--- /dev/null
++++ b/crates/hipfire-daemon/src/think_recovery.rs
+@@ -0,0 +1,881 @@
++//! PolyStrata's think-recovery semantics as pure logic, ported for the hipfire multi-slot serve path.
++//!
++//! Three mechanisms, each a knob in `hipfire-think-recovery-design.md` §4:
++//! - #1053 close-retry: a reply that ended on a natural stop with its thinking still open gets one injected
++//!   `\n</think>\n\n` and continues (`injection_text`, `close_retry_skip_reason`).
++//! - #728 loop recovery: reasoning that repeats whole passages is detected every 512 output tokens at a clean
++//!   boundary (`reasoning_repeat_coverage`, `LoopCheck`, `loop_skip_reason`) and either ends the reply as "length"
++//!   (mode stop) or resumes it with the low-effort sentence spliced into the first system message
++//!   (`focused_recovery_prompt`).
++//! - #606 repeat guard: one token 256 times in a row ends the reply (`RepeatRunGuard`).
++//!
++//! Reference: /mnt/ai/llm/PolyStrata/serve/server.py — `REASONING_CLOSE`/`closed_with` (:167-175),
++//! `reasoning_repeat_coverage` (:188-212), `focused_recovery_prompt` (:215-229), the #606 run guard (:4975-4979),
++//! the #728 detect gate (:4999-5011) and the recovery action (:5072-5091). No engine, tokenizer or I/O here; S2
++//! wires these decisions into `slots.rs` and the runtime's `SpecEmit` state.
++
++use std::collections::{HashMap, HashSet};
++
++/// Output tokens between two looks at the reasoning (`LOOP_CHECK_EVERY`).
++pub const LOOP_CHECK_EVERY: usize = 512;
++/// Share of the recent window inside 12-word passages seen three times that reads as a loop (`LOOP_COVERAGE`).
++pub const LOOP_COVERAGE: f64 = 0.25;
++/// How far back the passages are counted (`LOOP_HISTORY_WORDS`).
++pub const LOOP_HISTORY_WORDS: usize = 30_000;
++/// Characters at the end of the reasoning also checked for a short period (`LOOP_TAIL_CHARS`, #1753).
++pub const LOOP_TAIL_CHARS: usize = 2048;
++/// A period at most this long in that tail reads as a fully repeated window (`LOOP_TAIL_PERIOD`).
++pub const LOOP_TAIL_PERIOD: usize = 64;
++/// Passage width in words for the coverage count.
++pub const LOOP_WIDTH: usize = 12;
++/// Recent window in words for the coverage count.
++pub const LOOP_WINDOW_WORDS: usize = 2000;
++/// One token repeated this many times in a row ends the reply as "length" (`REPEAT_STOP_TOKENS`).
++pub const REPEAT_STOP_TOKENS: usize = 256;
++
++/// The template's own xhigh sentence, which the recovery pass swaps for the low one (`EFFORT_TEXT["xhigh"]`).
++pub const HIGH_EFFORT_INSTRUCTION: &str = "Reasoning effort is set to xhigh. Please think carefully through the \
++task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and \
++clarity in the final answer.";
++/// The low sentence spliced in by the recovery pass (`EFFORT_TEXT["low"]`).
++pub const LOW_EFFORT_INSTRUCTION: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, \
++moving directly to the conclusion without unnecessary elaboration.";
++
++/// The chat template's turn-end token, which closes the first (system) message in a rendered prompt.
++pub const IM_END: &str = "<|im_end|>";
++/// The chat template's turn start, which a system message's rendering begins with.
++pub const SYSTEM_PREFIX: &str = "<|im_start|>system\n";
++
++/// `closed_with`: the reference injects `REASONING_CLOSE = "\n</think>\n\n"` and, for a template whose reasoning
++/// ends some other way, the same line but ending in that model's close tag (Gemma `<channel|>`). hipfire's emitter
++/// already carries the model's close text (`HIPFIRE_THINK_CONTINUATION`, default `</think>\n\n`), so prefixing one
++/// newline reproduces both: `"\n" + "</think>\n\n"` is the reference string verbatim, `"\n" + "<channel|>"` its
++/// Gemma form.
++pub fn injection_text(think_close: &str) -> String {
++    let mut s = String::with_capacity(1 + think_close.len());
++    s.push('\n');
++    s.push_str(think_close);
++    s
++}
++
++/// The reasoning-loop knob's three states. The reference has off/True("recover")/"stop"; served defaults to
++/// recover, library and test callers default to off (design §4).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum LoopMode {
++    Off,
++    Stop,
++    Recover,
++}
++
++impl LoopMode {
++    /// Parses a configured value. Unknown strings return `None` so the caller applies its own default.
++    pub fn from_config_value(v: &str) -> Option<LoopMode> {
++        match v.trim().to_ascii_lowercase().as_str() {
++            "off" | "0" | "false" | "no" => Some(LoopMode::Off),
++            "stop" => Some(LoopMode::Stop),
++            "recover" | "1" | "true" | "on" | "yes" => Some(LoopMode::Recover),
++            _ => None,
++        }
++    }
++}
++
++/// Python's `\w` for a `str` pattern: letters, digits and underscore (plus whatever `is_alphanumeric` covers in
++/// the numeric categories Nd/Nl/No). Combining marks are not word characters in either implementation.
++fn is_word_char(ch: char) -> bool {
++    ch.is_alphanumeric() || ch == '_'
++}
++
++/// `re.findall(r"\w+|[^\w\s]", lower)`: runs of word characters, and every other non-space character alone.
++fn split_words(lower: &str) -> Vec<&str> {
++    let mut out = Vec::new();
++    let mut run_start: Option<usize> = None;
++    for (idx, ch) in lower.char_indices() {
++        if is_word_char(ch) {
++            run_start.get_or_insert(idx);
++            continue;
++        }
++        if let Some(s) = run_start.take() {
++            out.push(&lower[s..idx]);
++        }
++        if !ch.is_whitespace() {
++            out.push(&lower[idx..idx + ch.len_utf8()]);
++        }
++    }
++    if let Some(s) = run_start {
++        out.push(&lower[s..]);
++    }
++    out
++}
++
++/// `reasoning_repeat_coverage` (server.py:188-212), verbatim semantics:
++/// 1. `tail = text[-2048:].lower()`; exactly 2048 chars and some period `p` in `1..=64` with `tail[p:] == tail[:-p]`
++///    reads as 1.0 (a short cycle, e.g. one long number repeating a block).
++/// 2. Otherwise words of the lowercased text, last 30,000 of them; fewer than 2,000 words reads as 0.0.
++/// 3. Count every 12-word passage; a passage seen at least three times covers the word positions it occupies when
++///    its start lies in the last 2,000 words. Coverage = covered positions / (len(words) - start).
++pub fn reasoning_repeat_coverage(text: &str) -> f64 {
++    let orig: Vec<char> = text.chars().collect();
++    if orig.len() >= LOOP_TAIL_CHARS {
++        let tail: String = orig[orig.len() - LOOP_TAIL_CHARS..].iter().collect();
++        let tail: Vec<char> = tail.to_lowercase().chars().collect();
++        if tail.len() == LOOP_TAIL_CHARS
++            && (1..=LOOP_TAIL_PERIOD).any(|p| tail[p..] == tail[..LOOP_TAIL_CHARS - p])
++        {
++            return 1.0;
++        }
++    }
++    let lower = text.to_lowercase();
++    let words = split_words(&lower);
++    let words = if words.len() > LOOP_HISTORY_WORDS {
++        &words[words.len() - LOOP_HISTORY_WORDS..]
++    } else {
++        &words[..]
++    };
++    if words.len() < LOOP_WINDOW_WORDS {
++        return 0.0;
++    }
++    // Intern the words to ids so a 12-gram key is a plain array (the reference keys tuples; this is the same
++    // equality, without per-gram allocation).
++    let mut ids: HashMap<&str, u32> = HashMap::new();
++    let mut seq: Vec<u32> = Vec::with_capacity(words.len());
++    for w in words {
++        let next = ids.len() as u32;
++        seq.push(*ids.entry(*w).or_insert(next));
++    }
++    let mut counts: HashMap<[u32; LOOP_WIDTH], u32> = HashMap::new();
++    for i in 0..=seq.len() - LOOP_WIDTH {
++        let mut gram = [0u32; LOOP_WIDTH];
++        gram.copy_from_slice(&seq[i..i + LOOP_WIDTH]);
++        *counts.entry(gram).or_insert(0) += 1;
++    }
++    let start = seq.len() - LOOP_WINDOW_WORDS;
++    let mut covered: HashSet<usize> = HashSet::new();
++    for i in start..=seq.len() - LOOP_WIDTH {
++        let mut gram = [0u32; LOOP_WIDTH];
++        gram.copy_from_slice(&seq[i..i + LOOP_WIDTH]);
++        if counts[&gram] >= 3 {
++            covered.extend(i..i + LOOP_WIDTH);
++        }
++    }
++    covered.len() as f64 / (seq.len() - start) as f64
++}
++
++/// #606: the current run of one repeated token. `observe` returns true when this token makes the run reach the
++/// limit (the reference counts after appending the token and breaks at `run_len >= limit`).
++#[derive(Clone, Debug)]
++pub struct RepeatRunGuard {
++    limit: usize,
++    last: Option<u32>,
++    run: usize,
++}
++
++impl RepeatRunGuard {
++    pub fn new(limit: usize) -> Self {
++        Self { limit, last: None, run: 0 }
++    }
++
++    pub fn observe(&mut self, token: u32) -> bool {
++        self.run = match self.last {
++            Some(t) if t == token => self.run + 1,
++            _ => 1,
++        };
++        self.last = Some(token);
++        self.limit > 0 && self.run >= self.limit
++    }
++
++    pub fn run(&self) -> usize {
++        self.run
++    }
++
++    pub fn limit(&self) -> usize {
++        self.limit
++    }
++}
++
++/// #728's check cadence: a look is due when the request has produced `n >= next_at` output tokens (counted across
++/// passes, injections included). The reference re-arms to `n + 512` each time a look runs at a clean boundary.
++#[derive(Clone, Debug)]
++pub struct LoopCheck {
++    next_at: usize,
++}
++
++impl LoopCheck {
++    pub fn new() -> Self {
++        Self { next_at: LOOP_CHECK_EVERY }
++    }
++
++    pub fn due(&self, n: usize) -> bool {
++        n >= self.next_at
++    }
++
++    pub fn advance(&mut self, n: usize) {
++        self.next_at = n + LOOP_CHECK_EVERY;
++    }
++
++    pub fn next_at(&self) -> usize {
++        self.next_at
++    }
++}
++
++impl Default for LoopCheck {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++/// #1053's trigger, as skip reasons in trace order. `None` means inject. The reference's other guards map as:
++/// `not wrap` and `stops.hit is None` hold structurally here (no budget wrap; the multi-slot stop list is always
++/// empty); `parser.buf != parser.think_end` (a held `</think>`) cannot happen because the emitter consumes a
++/// complete close tag immediately; `not opens` is #537's forced-call opening, which has no hipfire equivalent.
++#[derive(Clone, Debug)]
++pub struct CloseRetryInputs {
++    pub enabled: bool,
++    pub thinking: bool,
++    /// DoneReason was a natural stop token (Eos), not max-tokens/client-gone/rejected.
++    pub natural_stop: bool,
++    /// Any content reached the client, sticky (reasoning alone does not count).
++    pub answered: bool,
++    pub cancelled: bool,
++    /// The emitter finished with its thinking still open.
++    pub open_think: bool,
++    pub already_injected: bool,
++    /// `max_tokens - n`: output budget left before this pass ends.
++    pub budget_left: usize,
++    /// Tokens the injection (plus following text) will add on top of the current output.
++    pub extra_len: usize,
++}
++
++pub fn close_retry_skip_reason(i: &CloseRetryInputs) -> Option<&'static str> {
++    if i.cancelled {
++        return Some("cancelled");
++    }
++    if !i.enabled {
++        return Some("disabled");
++    }
++    if !i.thinking {
++        return Some("no thinking");
++    }
++    if !i.natural_stop {
++        return Some("not a natural stop");
++    }
++    if i.already_injected {
++        return Some("already retried");
++    }
++    if i.answered {
++        return Some("already answered");
++    }
++    if !i.open_think {
++        return Some("thinking closed");
++    }
++    // The reference needs `max_new - n - len(extra) >= 1` and gives up silently otherwise.
++    if i.budget_left <= i.extra_len {
++        return Some("no headroom");
++    }
++    None
++}
++
++/// #728's decision once a look ran at a clean boundary with its coverage. `None` means act (stop or recover);
++/// otherwise the reason the look is a no-op and generation continues.
++#[derive(Clone, Debug)]
++pub struct LoopDecisionInputs {
++    pub mode: LoopMode,
++    pub coverage: f64,
++    pub already_recovered: bool,
++    pub has_images: bool,
++    /// Output tokens so far (n).
++    pub n: usize,
++    /// The request's max_tokens for this pass.
++    pub max_new: usize,
++}
++
++pub fn loop_skip_reason(i: &LoopDecisionInputs) -> Option<&'static str> {
++    if i.mode == LoopMode::Off {
++        return Some("off");
++    }
++    if i.coverage < LOOP_COVERAGE {
++        return Some("below threshold");
++    }
++    if i.mode == LoopMode::Stop {
++        return None;
++    }
++    if i.already_recovered {
++        return Some("already recovered");
++    }
++    if i.has_images {
++        return Some("vision");
++    }
++    if i.n >= i.max_new {
++        return Some("budget exhausted");
++    }
++    None
++}
++
++/// The id splice of `focused_recovery_prompt` (server.py:215-229): the prompt's ids with the xhigh effort sentence
++/// of the first system message replaced by the low one, then every token generated so far. A splice of token ids —
++/// the prompt is never decoded and encoded again, so a literal `</think>` or vision marker in it stays what it was.
++/// `None` when the sentence is not there as whole tokens in the first system message.
++///
++/// `im_end` is the turn-end id; `head_is_system` is the caller's `decode(head).starts_with("<|im_start|>system\n")`
++/// (the reference decodes once; a pure core takes the answer as a bool so it needs no tokenizer).
++pub fn splice_effort_ids(
++    ids: &[u32],
++    im_end: u32,
++    head_is_system: bool,
++    old: &[u32],
++    new: &[u32],
++    generated: &[u32],
++) -> Option<Vec<u32>> {
++    if old.is_empty() {
++        return None;
++    }
++    let end_pos = ids.iter().position(|&t| t == im_end)?;
++    if !head_is_system {
++        return None;
++    }
++    let head = &ids[..end_pos];
++    let at = head.windows(old.len()).position(|w| w == old)?;
++    let mut out = Vec::with_capacity(ids.len() + new.len() + generated.len());
++    out.extend_from_slice(&ids[..at]);
++    out.extend_from_slice(new);
++    out.extend_from_slice(&ids[at + old.len()..]);
++    out.extend_from_slice(generated);
++    Some(out)
++}
++
++/// `focused_recovery_prompt` with the runtime tokenizer: the effort sentences are encoded without special-token
++/// treatment (hipfire's `encode` only rewrites strings that spell a known special token and prepends BOS only for
++/// models that ask for one; Qwen-family carriers do not).
++pub fn focused_recovery_prompt(
++    tok: &hipfire_runtime::tokenizer::Tokenizer,
++    ids: &[u32],
++    generated: &[u32],
++) -> Option<Vec<u32>> {
++    let im_end = tok.special_token_id(IM_END)?;
++    let end_pos = ids.iter().position(|&t| t == im_end)?;
++    let head_is_system = tok.decode(&ids[..end_pos]).starts_with(SYSTEM_PREFIX);
++    let old = tok.encode(HIGH_EFFORT_INSTRUCTION);
++    let new = tok.encode(LOW_EFFORT_INSTRUCTION);
++    splice_effort_ids(ids, im_end, head_is_system, &old, &new, generated)
++}
++
++/// What the per-token gates decided for one sampled token.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum GateAction {
++    /// Hand the token to the emitter.
++    Deliver,
++    /// #606: a token run reached its limit — end the pass; the token is not rendered.
++    RepeatStop,
++    /// #728 (stop): the reasoning reads as a loop — end the pass as "length".
++    LoopStop,
++    /// #728 (recover): end the pass and restart it with the low-effort sentence.
++    Recover,
++}
++
++/// Per-token gate result plus the trace line the reference would log.
++#[derive(Debug, Clone, PartialEq)]
++pub struct GateOutcome {
++    pub action: GateAction,
++    pub trace: Option<String>,
++    /// Loop-check skip reason (`loop_skip_reason`), for `/metrics`. `None`
++    /// unless this token ran the periodic check and declined.
++    pub skip: Option<&'static str>,
++}
++
++/// Everything the #728 gate needs to know about the CURRENT pass and request.
++pub struct GateCtx {
++    pub loop_mode: LoopMode,
++    /// The emitter's think state as of the PREVIOUS token (the reference looks at its parser before
++    /// feeding the new token).
++    pub open_think: bool,
++    /// No partial bytes held in the EOT filter or think router.
++    pub clean_boundary: bool,
++    pub has_images: bool,
++    /// The request's `max_tokens`.
++    pub max_new: usize,
++}
++
++/// The request-level bookkeeping the gate order reads and writes: sampled-token count (`n`, injections
++/// included), the #606 run, the #728 schedule, the rendered reasoning text and the sticky `answered` flag.
++/// Mirrors the loop in the reference (`server.py` :4975-5011) — the state machine lives here so a synthetic
++/// event stream can drive it in a host test, while `slots.rs` only renders what it returns.
++pub struct StreamGates {
++    n: usize,
++    repeat: RepeatRunGuard,
++    loop_next: LoopCheck,
++    recovered: bool,
++    reasoning: String,
++    answered: bool,
++}
++
++impl StreamGates {
++    pub fn new(repeat_limit: usize) -> Self {
++        Self {
++            n: 0,
++            repeat: RepeatRunGuard::new(repeat_limit),
++            loop_next: LoopCheck::new(),
++            recovered: false,
++            reasoning: String::new(),
++            answered: false,
++        }
++    }
++
++    /// `n`: every sampled token of the request, rendered or not.
++    pub fn n(&self) -> usize {
++        self.n
++    }
++
++    /// Sticky: some content or tool call reached the client (reasoning does not count).
++    pub fn answered(&self) -> bool {
++        self.answered
++    }
++
++    pub fn recovered(&self) -> bool {
++        self.recovered
++    }
++
++    pub fn mark_recovered(&mut self) {
++        self.recovered = true;
++    }
++
++    /// #1053: injected tokens count toward `n` like sampled ones.
++    pub fn note_injected(&mut self, count: usize) {
++        self.n += count;
++    }
++
++    /// A natural stop sampled a terminator: it joins the sampled stream at +1 (`raw_ids`).
++    pub fn note_eos(&mut self) {
++        self.n += 1;
++    }
++
++    /// Reasoning text as streamed to the client — the loop coverage reads only this channel.
++    pub fn push_reasoning(&mut self, text: &str) {
++        self.reasoning.push_str(text);
++    }
++
++    pub fn mark_answered(&mut self) {
++        self.answered = true;
++    }
++
++    /// A token arriving after a gate already ended the pass: it still counts toward `n` and the repeat
++    /// run (the reference keeps appending before it notices its break), but no gate looks at it again.
++    pub fn note_dropped(&mut self, tok: u32) {
++        self.n += 1;
++        let _ = self.repeat.observe(tok);
++    }
++
++    /// #606 then #728, in the reference's order. `recover_splice` is only consulted when a recover
++    /// decision is reached; it reports whether the effort sentence spliced into `gen_ids` still
++    /// yields a prompt (the second splice reuses the tokens sampled past the decision point).
++    pub fn note_token(
++        &mut self,
++        tok: u32,
++        ctx: &GateCtx,
++        recover_splice: &mut dyn FnMut() -> bool,
++    ) -> GateOutcome {
++        self.n += 1;
++        if self.repeat.observe(tok) {
++            return GateOutcome {
++                action: GateAction::RepeatStop,
++                trace: Some(format!(
++                    "repeat-stop: run={} token={tok} at n={}; ending as length",
++                    self.repeat.run(),
++                    self.n
++                )),
++                skip: None,
++            };
++        }
++        if ctx.loop_mode != LoopMode::Off
++            && !self.recovered
++            && self.loop_next.due(self.n)
++            && ctx.open_think
++            && ctx.clean_boundary
++        {
++            self.loop_next.advance(self.n);
++            let coverage = reasoning_repeat_coverage(&self.reasoning);
++            let decision = loop_skip_reason(&LoopDecisionInputs {
++                mode: ctx.loop_mode,
++                coverage,
++                already_recovered: self.recovered,
++                has_images: ctx.has_images,
++                n: self.n,
++                max_new: ctx.max_new,
++            });
++            match decision {
++                None => {
++                    if ctx.loop_mode == LoopMode::Stop {
++                        return GateOutcome {
++                            action: GateAction::LoopStop,
++                            trace: Some(format!(
++                                "loop-stop: coverage {coverage:.3} at n={}; ending as length",
++                                self.n
++                            )),
++                            skip: None,
++                        };
++                    }
++                    if recover_splice() {
++                        return GateOutcome {
++                            action: GateAction::Recover,
++                            trace: Some(format!(
++                                "loop-recover: coverage {coverage:.3} at n={}; restarting with the \
++                                 low-effort sentence",
++                                self.n
++                            )),
++                            skip: None,
++                        };
++                    }
++                    // No effort sentence to splice: the reference keeps generating.
++                }
++                Some(reason) if reason != "below threshold" => {
++                    return GateOutcome {
++                        action: GateAction::Deliver,
++                        trace: Some(format!(
++                            "loop-check skip at n={}: {reason} (coverage {coverage:.3})",
++                            self.n
++                        )),
++                        skip: Some(reason),
++                    };
++                }
++                Some(_) => {}
++            }
++        }
++        GateOutcome {
++            action: GateAction::Deliver,
++            trace: None,
++            skip: None,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn words_text(n: usize, prefix: &str) -> String {
++        (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>().join(" ")
++    }
++
++    #[test]
++    fn injection_matches_reference_strings() {
++        assert_eq!(injection_text("</think>\n\n"), "\n</think>\n\n");
++        assert_eq!(injection_text("<channel|>"), "\n<channel|>");
++    }
++
++    #[test]
++    fn loop_mode_parsing() {
++        assert_eq!(LoopMode::from_config_value("off"), Some(LoopMode::Off));
++        assert_eq!(LoopMode::from_config_value("STOP"), Some(LoopMode::Stop));
++        assert_eq!(LoopMode::from_config_value("recover"), Some(LoopMode::Recover));
++        assert_eq!(LoopMode::from_config_value("true"), Some(LoopMode::Recover));
++        assert_eq!(LoopMode::from_config_value(""), None);
++        assert_eq!(LoopMode::from_config_value("sometimes"), None);
++    }
++
++    #[test]
++    fn coverage_needs_two_thousand_words() {
++        assert_eq!(reasoning_repeat_coverage(""), 0.0);
++        assert_eq!(reasoning_repeat_coverage(&words_text(1999, "w")), 0.0);
++    }
++
++    #[test]
++    fn coverage_periodic_tail_reads_full() {
++        let mut text = words_text(100, "w");
++        text.push(' ');
++        // 205 full copies of a 10-char cycle: the last 2048 chars are periodic with p=10.
++        text.push_str(&"0123456789".repeat(205));
++        assert_eq!(reasoning_repeat_coverage(&text), 1.0);
++    }
++
++    #[test]
++    fn coverage_repeated_passage_crosses_threshold() {
++        // A 200-word passage four times, then 1200 unique words: 2000 words, ~800 covered.
++        let passage = words_text(200, "p");
++        let mut text = Vec::new();
++        for _ in 0..4 {
++            text.push(passage.clone());
++        }
++        text.push(words_text(1200, "u"));
++        let cov = reasoning_repeat_coverage(&text.join(" "));
++        assert!(cov >= LOOP_COVERAGE, "coverage {cov}");
++        assert!(cov < 0.5, "coverage {cov}");
++    }
++
++    #[test]
++    fn coverage_unique_words_read_zero() {
++        assert_eq!(reasoning_repeat_coverage(&words_text(2500, "u")), 0.0);
++    }
++
++    #[test]
++    fn words_split_like_python() {
++        assert_eq!(split_words("ab, cd!_x9\n"), vec!["ab", ",", "cd", "!", "_x9"]);
++    }
++
++    #[test]
++    fn repeat_run_guard_counts_to_limit() {
++        let mut g = RepeatRunGuard::new(REPEAT_STOP_TOKENS);
++        for _ in 0..255 {
++            assert!(!g.observe(7));
++        }
++        assert_eq!(g.run(), 255);
++        assert!(g.observe(7));
++        assert_eq!(g.run(), 256);
++        assert!(!g.observe(8));
++        assert_eq!(g.run(), 1);
++    }
++
++    #[test]
++    fn repeat_run_guard_limit_zero_is_off() {
++        let mut g = RepeatRunGuard::new(0);
++        for _ in 0..1000 {
++            assert!(!g.observe(1));
++        }
++    }
++
++    #[test]
++    fn loop_check_cadence() {
++        let mut c = LoopCheck::new();
++        assert!(!c.due(LOOP_CHECK_EVERY - 1));
++        assert!(c.due(LOOP_CHECK_EVERY));
++        c.advance(LOOP_CHECK_EVERY);
++        assert_eq!(c.next_at(), LOOP_CHECK_EVERY * 2);
++        assert!(!c.due(LOOP_CHECK_EVERY + 1));
++    }
++
++    fn close_inputs() -> CloseRetryInputs {
++        CloseRetryInputs {
++            enabled: true,
++            thinking: true,
++            natural_stop: true,
++            answered: false,
++            cancelled: false,
++            open_think: true,
++            already_injected: false,
++            budget_left: 10,
++            extra_len: 3,
++        }
++    }
++
++    #[test]
++    fn close_retry_triggers_only_when_every_guard_passes() {
++        assert_eq!(close_retry_skip_reason(&close_inputs()), None);
++        // One headroom token is enough.
++        let mut i = close_inputs();
++        i.budget_left = i.extra_len + 1;
++        assert_eq!(close_retry_skip_reason(&i), None);
++        let mut i = close_inputs();
++        i.budget_left = i.extra_len;
++        assert_eq!(close_retry_skip_reason(&i), Some("no headroom"));
++    }
++
++    #[test]
++    fn close_retry_reports_first_failing_guard() {
++        let cases: [(fn(&mut CloseRetryInputs), &'static str); 8] = [
++            (|i| i.cancelled = true, "cancelled"),
++            (|i| i.enabled = false, "disabled"),
++            (|i| i.thinking = false, "no thinking"),
++            (|i| i.natural_stop = false, "not a natural stop"),
++            (|i| i.already_injected = true, "already retried"),
++            (|i| i.answered = true, "already answered"),
++            (|i| i.open_think = false, "thinking closed"),
++            (|i| i.budget_left = 0, "no headroom"),
++        ];
++        for (set, want) in cases {
++            let mut i = close_inputs();
++            set(&mut i);
++            assert_eq!(close_retry_skip_reason(&i), Some(want));
++        }
++    }
++
++    fn loop_inputs() -> LoopDecisionInputs {
++        LoopDecisionInputs {
++            mode: LoopMode::Recover,
++            coverage: 0.5,
++            already_recovered: false,
++            has_images: false,
++            n: 1000,
++            max_new: 2000,
++        }
++    }
++
++    #[test]
++    fn loop_decision_matrix() {
++        assert_eq!(loop_skip_reason(&loop_inputs()), None);
++        let mut i = loop_inputs();
++        i.mode = LoopMode::Off;
++        assert_eq!(loop_skip_reason(&i), Some("off"));
++        let mut i = loop_inputs();
++        i.coverage = 0.249;
++        assert_eq!(loop_skip_reason(&i), Some("below threshold"));
++        let mut i = loop_inputs();
++        i.mode = LoopMode::Stop;
++        i.already_recovered = true;
++        i.has_images = true;
++        assert_eq!(loop_skip_reason(&i), None);
++        let mut i = loop_inputs();
++        i.already_recovered = true;
++        assert_eq!(loop_skip_reason(&i), Some("already recovered"));
++        let mut i = loop_inputs();
++        i.has_images = true;
++        assert_eq!(loop_skip_reason(&i), Some("vision"));
++        let mut i = loop_inputs();
++        i.n = i.max_new;
++        assert_eq!(loop_skip_reason(&i), Some("budget exhausted"));
++    }
++
++    #[test]
++    fn splice_replaces_whole_sentence_tokens() {
++        let ids = [1u32, 2, 10, 11, 12, 99, 5, 6];
++        let out = splice_effort_ids(&ids, 99, true, &[10, 11, 12], &[20, 21], &[30]).unwrap();
++        assert_eq!(out, vec![1, 2, 20, 21, 99, 5, 6, 30]);
++    }
++
++    #[test]
++    fn splice_declines_without_system_head_or_whole_tokens() {
++        let ids = [1u32, 2, 10, 11, 12, 99];
++        assert!(splice_effort_ids(&ids, 98, true, &[10, 11], &[20], &[]).is_none());
++        assert!(splice_effort_ids(&ids, 99, false, &[10, 11], &[20], &[]).is_none());
++        assert!(splice_effort_ids(&ids, 99, true, &[11, 10], &[20], &[]).is_none());
++        assert!(splice_effort_ids(&ids, 99, true, &[], &[20], &[]).is_none());
++    }
++
++    #[test]
++    fn effort_sentences_match_the_reference_text() {
++        assert!(HIGH_EFFORT_INSTRUCTION.starts_with("Reasoning effort is set to xhigh. Please think carefully"));
++        assert!(HIGH_EFFORT_INSTRUCTION.ends_with("clarity in the final answer."));
++        assert!(LOW_EFFORT_INSTRUCTION.starts_with("Reasoning effort is set to low. Keep your thinking brief"));
++        assert!(LOW_EFFORT_INSTRUCTION.ends_with("without unnecessary elaboration."));
++    }
++
++    // ── StreamGates: the reference's per-token gate order on a synthetic stream ──
++
++    fn gate_ctx(mode: LoopMode) -> GateCtx {
++        GateCtx {
++            loop_mode: mode,
++            open_think: true,
++            clean_boundary: true,
++            has_images: false,
++            max_new: 100_000,
++        }
++    }
++
++    /// Exact 2048-char tail with period 8: the reference's tail check reads it as a full loop (1.0).
++    fn periodic_reasoning() -> String {
++        "abcdefgh".repeat(LOOP_TAIL_CHARS / 8)
++    }
++
++    fn feed(gates: &mut StreamGates, ctx: &GateCtx, upto_n: usize, mut splice: impl FnMut() -> bool) -> GateOutcome {
++        let mut last = GateOutcome {
++            action: GateAction::Deliver,
++            trace: None,
++            skip: None,
++        };
++        while gates.n() < upto_n {
++            last = gates.note_token((gates.n() % 7) as u32, ctx, &mut splice);
++        }
++        last
++    }
++
++    #[test]
++    fn gates_repeat_run_stops_at_256_and_counts_the_token() {
++        let ctx = gate_ctx(LoopMode::Off);
++        let mut gates = StreamGates::new(REPEAT_STOP_TOKENS);
++        for _ in 0..255 {
++            let out = gates.note_token(42, &ctx, &mut || true);
++            assert_eq!(out.action, GateAction::Deliver);
++        }
++        let out = gates.note_token(42, &ctx, &mut || true);
++        assert_eq!(out.action, GateAction::RepeatStop);
++        assert_eq!(gates.n(), 256);
++        assert!(out.trace.unwrap().contains("run=256"));
++    }
++
++    #[test]
++    fn gates_loop_stop_fires_at_512_on_repeated_reasoning() {
++        let ctx = gate_ctx(LoopMode::Stop);
++        let mut gates = StreamGates::new(REPEAT_STOP_TOKENS);
++        gates.push_reasoning(&periodic_reasoning());
++        let first = feed(&mut gates, &ctx, 511, || true);
++        assert_eq!(first.action, GateAction::Deliver);
++        let out = gates.note_token(0, &ctx, &mut || true);
++        assert_eq!(out.action, GateAction::LoopStop);
++        assert_eq!(gates.n(), 512);
++        assert!(out.trace.unwrap().contains("coverage 1.000"));
++    }
++
++    #[test]
++    fn gates_loop_check_waits_for_a_clean_think_boundary_but_keeps_the_schedule() {
++        let mut ctx = gate_ctx(LoopMode::Stop);
++        let mut gates = StreamGates::new(REPEAT_STOP_TOKENS);
++        gates.push_reasoning(&periodic_reasoning());
++        // Due at 512 but not clean: keep generating; the look stays pending.
++        ctx.clean_boundary = false;
++        let out = feed(&mut gates, &ctx, 512, || true);
++        assert_eq!(out.action, GateAction::Deliver);
++        // The first clean token afterwards takes the look immediately.
++        ctx.clean_boundary = true;
++        let out = gates.note_token(0, &ctx, &mut || true);
++        assert_eq!(out.action, GateAction::LoopStop);
++        assert_eq!(gates.n(), 513);
++    }
++
++    #[test]
++    fn gates_loop_check_requires_open_think_and_off_mode_never_looks() {
++        let mut ctx = gate_ctx(LoopMode::Stop);
++        let mut gates = StreamGates::new(REPEAT_STOP_TOKENS);
++        gates.push_reasoning(&periodic_reasoning());
++        ctx.open_think = false;
++        let out = feed(&mut gates, &ctx, 512, || true);
++        assert_eq!(out.action, GateAction::Deliver);
++        // Mode off: no look even with everything open.
++        let ctx_off = gate_ctx(LoopMode::Off);
++        let mut gates = StreamGates::new(REPEAT_STOP_TOKENS);
++        gates.push_reasoning(&periodic_reasoning());
++        let out = feed(&mut gates, &ctx_off, 512, || true);
++        assert_eq!(out.action, GateAction::Deliver);
++    }
++
++    #[test]
++    fn gates_recover_needs_a_splice_and_stops_after_one() {
++        let ctx = gate_ctx(LoopMode::Recover);
++        let mut gates = StreamGates::new(REPEAT_STOP_TOKENS);
++        gates.push_reasoning(&periodic_reasoning());
++        // No effort sentence to splice: keep generating to the next check.
++        let out = feed(&mut gates, &ctx, 512, || false);
++        assert_eq!(out.action, GateAction::Deliver);
++        let mid = feed(&mut gates, &ctx, 1024, || false);
++        assert_eq!(mid.action, GateAction::Deliver);
++        // Splice available at the next check: recover once.
++        let mut gates = StreamGates::new(REPEAT_STOP_TOKENS);
++        gates.push_reasoning(&periodic_reasoning());
++        let out = feed(&mut gates, &ctx, 511, || true);
++        assert_eq!(out.action, GateAction::Deliver);
++        let out = gates.note_token(0, &ctx, &mut || true);
++        assert_eq!(out.action, GateAction::Recover);
++        gates.mark_recovered();
++        assert!(gates.recovered());
++        // A recovered request never looks again.
++        let out = feed(&mut gates, &ctx, 1200, || true);
++        assert_eq!(out.action, GateAction::Deliver);
++    }
++
++    #[test]
++    fn gates_dropped_tokens_count_but_do_not_re_decide() {
++        let mut gates = StreamGates::new(REPEAT_STOP_TOKENS);
++        gates.note_dropped(7);
++        gates.note_dropped(7);
++        assert_eq!(gates.n(), 2);
++        // The run guard still sees them (the reference appends before its break).
++        for _ in 0..254 {
++            gates.note_dropped(7);
++        }
++        assert_eq!(gates.n(), 256);
++    }
++
++    #[test]
++    fn gates_injected_and_eos_tokens_count_toward_n() {
++        let mut gates = StreamGates::new(REPEAT_STOP_TOKENS);
++        gates.note_token(1, &gate_ctx(LoopMode::Off), &mut || true);
++        gates.note_injected(3);
++        gates.note_eos();
++        assert_eq!(gates.n(), 5);
++    }
++}
+diff --git a/crates/hipfire-runtime/src/emit_text.rs b/crates/hipfire-runtime/src/emit_text.rs
+index c0c8e8309..ce9d9bdb5 100644
+--- a/crates/hipfire-runtime/src/emit_text.rs
++++ b/crates/hipfire-runtime/src/emit_text.rs
+@@ -222,6 +222,13 @@ impl ThinkOutputRouter {
+         self.in_think
+     }
+ 
++    /// Whether any bytes are held back awaiting more input (a trailing prefix
++    /// of an opener/closer marker). False ⇒ the router sits on a clean
++    /// boundary between tokens.
++    pub fn has_pending(&self) -> bool {
++        !self.pending.is_empty()
++    }
++
+     /// Route one UTF-8-safe text chunk into out without allocating an
+     /// intermediate event vector. Existing entries in out are preserved.
+     pub fn push_into(&mut self, text: &str, out: &mut Vec<ThinkRouteEvent>) {
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index db05c5325..522871abf 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -347,6 +347,28 @@ pub fn speculative_algorithm_name(algorithm: u32) -> &'static str {
+     }
+ }
+ 
++/// Think-recovery counters (#1053 / #728 / #606) folded into the multi-slot
++/// `done.engine_stats` snapshot; the serve gateway exports them on `/metrics`.
++/// Cumulative since daemon start. A daemon built without the pass loop always
++/// reports zeros.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(default)]
++pub struct ThinkRecoveryStats {
++    /// #1053: `\n` + think-close injections that continued the turn in-place.
++    pub close_injections: usize,
++    /// #728 recover mode: passes restarted with the low-effort sentence.
++    pub loop_recoveries: usize,
++    /// #728 stop mode: reasoning loops ended as `length`.
++    pub loop_stops: usize,
++    /// #606: same-token runs that ended the pass as `length`.
++    pub repeat_run_stops: usize,
++    /// Periodic #728 checks that declined, by reason. "below threshold" is
++    /// the normal case and is not counted.
++    pub loop_skips_already_recovered: usize,
++    pub loop_skips_vision: usize,
++    pub loop_skips_budget_exhausted: usize,
++}
++
+ /// Serialized as the `engine_stats` object of every multi-slot `done` event;
+ /// the serve gateway exports it on `/metrics`.
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+@@ -389,6 +411,8 @@ pub struct EngineStats {
+     pub kvmem: KvMemStats,
+     /// Speculative-decoding contract snapshot (期4; zeroed when off).
+     pub speculative: SpeculativeStats,
++    /// Think-recovery counters, patched in by the daemon (zeroed elsewhere).
++    pub think_recovery: ThinkRecoveryStats,
+ }
+ 
+ impl EngineStats {
+@@ -626,6 +650,14 @@ pub trait SlotEngineHandle: Send + Sync {
+     fn submit(&self, req: SubmitRequest) -> Result<(), String>;
+     /// Cancel a QUEUED request by submitter tag. Idempotent; tag 0 is a no-op.
+     fn cancel_waiting(&self, request_tag: u64);
++    /// Ask the engine to end the CURRENT generation pass of `session` at the
++    /// next token boundary while keeping the session's KV resident, so a
++    /// follow-up request can continue the accepted token stream without a
++    /// cold prefill (think-recovery pass loop, both #1053 continuation and
++    /// #728 loop recovery). Fire-and-forget: the pass end is observed through
++    /// the request's `Done { reason: MaxTokens }` event. Default is a no-op
++    /// for engines without pass semantics (the embedding engines).
++    fn interrupt(&self, _session: u64) {}
+     /// Close a session synchronously, cancelling any in-flight request and
+     /// releasing its session/pool/swap state. Never silently ignored.
+     fn close(&self, session: u64) -> Result<(), String>;
+diff --git a/crates/hipfire-runtime/src/spec.rs b/crates/hipfire-runtime/src/spec.rs
+index b333af493..9705ff3f8 100644
+--- a/crates/hipfire-runtime/src/spec.rs
++++ b/crates/hipfire-runtime/src/spec.rs
+@@ -2017,6 +2017,39 @@ pub trait SpecEmit {
+     fn window_cap(&self) -> Option<usize> {
+         None
+     }
++
++    /// True while the emitter's think state is INSIDE a reasoning span
++    /// (`<think>` opened, close not yet consumed). Think-recovery uses this to
++    /// detect "EOS fell on an open think" (#1053). Default false: emitters
++    /// without think routing never open a span.
++    fn open_think_now(&self) -> bool {
++        false
++    }
++
++    /// True when no held-back bytes are pending in the emitter — byte filter,
++    /// stop matcher and think router all sit on a clean token boundary. A
++    /// recovery decision may only be taken at such a boundary (#728 clean
++    /// gate); default true for emitters that never hold anything back.
++    fn at_clean_boundary(&self) -> bool {
++        true
++    }
++
++    /// The model family's think-close text (e.g. `</think>`), when the emitter
++    /// routes thinking. The daemon splices it into the continuation injection
++    /// so the close text always matches what the live emitter would consume.
++    fn think_close_text(&self) -> Option<&str> {
++        None
++    }
++
++    /// Feed a daemon-injected token through the emitter WITHOUT generation
++    /// semantics: no grammar advance, no EOS/stop checks, no loop counters —
++    /// this is state repair of the accepted stream (the injected think-close
++    /// must render and flip the think router exactly as if the model had
++    /// sampled it), not a commitment of sampled output. Returns the client
++    /// events to render. Default: no rendering, no state change.
++    fn observe_injected(&mut self, _token: u32) -> Vec<ClientEvent> {
++        Vec::new()
++    }
+ }
+ 
+ // ─── Model-free drafting sources (arch-agnostic, pure CPU) ──────────────────
+diff --git a/docs/env-vars.md b/docs/env-vars.md
+index a56ba33d7..12be0edbe 100644
+--- a/docs/env-vars.md
++++ b/docs/env-vars.md
+@@ -3079,9 +3079,12 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_REDLINE_POOL_DEBUG` | crates/hipfire-config/src/lib.rs, crates/redline-rocr/src/runtime.rs | experimental |
+ | `HIPFIRE_REDLINE_PROBE_VMEMAP` | crates/redline-rocr/src/runtime.rs | developer |
+ | `HIPFIRE_REDLINE_QUEUE_TIMEOUT` | crates/redline-rocr/src/runtime.rs | developer |
++| `HIPFIRE_REASONING_CLOSE_RETRY` | crates/hipfire-daemon/src/slots.rs | experimental |
++| `HIPFIRE_REASONING_LOOP_RECOVERY` | crates/hipfire-daemon/src/slots.rs | experimental |
+ | `HIPFIRE_REGISTRY_URL` | crates/hipfire-cli/src/main.rs, crates/hipfire-config/src/lib.rs | stable |
+ | `HIPFIRE_RELEASES_LATEST_API` | scripts/install.sh, scripts/test_install_revision.py | harness |
+ | `HIPFIRE_REMOTE` | scripts/mi300x_bootstrap.sh | harness |
++| `HIPFIRE_REPEAT_STOP_TOKENS` | crates/hipfire-daemon/src/slots.rs | experimental |
+ | `HIPFIRE_REPLAY_BACKEND` | crates/hipfire-arch-qwen35/examples/mq4_prefill_state_oracle.rs, crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs | stable |
+ | `HIPFIRE_REPLAY_BINDINGS_VERIFY` | crates/rdna-compute/src/replay.rs | developer |
+ | `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE` | crates/hipfire-dispatch/src/pipeline/sealed_moe.rs | developer |
