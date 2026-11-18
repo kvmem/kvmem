@@ -262,6 +262,40 @@ void hk_kv_store_set_retrieval_scores(hk_kv_store * ks, const double * scores, u
 void hk_kv_store_begin_retrieval_round(hk_kv_store * ks);
 // Returns 1 when a round was committed (lrfu on), 0 otherwise.
 int hk_kv_store_commit_retrieval_round(hk_kv_store * ks);
+
+// Immutable owned copy of core LrfuState (committed scores + round/commit flag,
+// NOT the current uncommitted preview or the non-LRFU block scores). Restore
+// borrows, never consumes; clones share the core's immutable score allocation.
+// Like other handles, use serially. All entries clear this thread's error slot;
+// NULL handles are errors, including destroy. Status accessors return HK_OK/HK_ERR.
+typedef struct hk_retrieval_checkpoint hk_retrieval_checkpoint;
+hk_retrieval_checkpoint * hk_kv_store_retrieval_checkpoint(const hk_kv_store * ks);
+hk_retrieval_checkpoint * hk_retrieval_checkpoint_clone(const hk_retrieval_checkpoint * checkpoint);
+void hk_retrieval_checkpoint_destroy(hk_retrieval_checkpoint * checkpoint);
+int hk_kv_store_restore_retrieval(hk_kv_store * ks, const hk_retrieval_checkpoint * checkpoint);
+int hk_retrieval_checkpoint_meta(const hk_retrieval_checkpoint * checkpoint,
+                                  uint64_t * round, int * committed);
+// Vector output convention for the legacy helpers below: out=NULL/capacity=0
+// queries *out_count (HK_OK). A short non-NULL buffer returns HK_ERR_TRUNCATED,
+// publishes an error and the required count, and writes no elements. NULL with
+// nonzero capacity is invalid. out_count is always required. Inputs must be
+// valid, aligned arrays of the declared length; NULL is allowed only at length 0.
+int hk_retrieval_checkpoint_scores(const hk_retrieval_checkpoint * checkpoint,
+                                    double * out, size_t capacity, size_t * out_count);
+// Rejects block >= block_count(), including when LRFU history is longer.
+int hk_kv_store_selection_score(const hk_kv_store * ks, uint32_t block, double * out);
+
+// Ordinary Pressure only: caller supplies the frozen accepted RESIDENT IDs,
+// with candidate-aligned finite scores. No history scan or future-page admission.
+// Duplicate candidates and nonresident mandatory IDs are rejected. Unique
+// mandatory IDs must fit budget_blocks; duplicates are deduplicated by core.
+// Core also rejects zero budget and negative mass. Ties prefer larger IDs;
+// selected IDs are returned ascending. Query selection still uses pick_topk.
+int hk_pressure_selection(const uint32_t * candidates, size_t n_candidates,
+                           const double * scores, size_t n_scores,
+                           const uint32_t * mandatory, size_t n_mandatory,
+                           uint32_t budget_blocks, uint32_t * out, size_t capacity,
+                           size_t * out_count);
 int hk_kv_store_prefill_needs_offload(const hk_kv_store * ks, uint32_t resident_tokens,
                                       uint32_t incoming_tokens, uint32_t pool_tokens);
 uint32_t hk_kv_store_gpu_high_watermark_tokens(const hk_kv_store * ks, uint32_t pool_tokens);
@@ -579,6 +613,31 @@ typedef struct hk_query_range {
     uint64_t begin;
     uint64_t end;
 } hk_query_range;
+
+// Pure legacy query_policy.hpp helpers. No native execution or state changes.
+// Limits preserve core semantics: zero bounds Query to empty and rejects any
+// nonempty replay. Policy refusal is HK_OK with admitted=0 and the core reason;
+// HK_ERR is reserved for ABI/exception errors. reason points to a static core
+// string (never hk_last_error storage); callers may copy it, never free it.
+typedef struct hk_legacy_replay_plan {
+    uint64_t begin;
+    uint64_t end;
+    int admitted;
+    const char * reason;
+} hk_legacy_replay_plan;
+int hk_bounded_query(uint64_t begin, uint64_t count, uint64_t total, uint32_t limit,
+                      hk_query_range * out);
+int hk_query_replay_plan(hk_query_range query, uint64_t restore_begin, uint64_t end,
+                          uint32_t limit, uint32_t block, uint64_t history_pages,
+                          uint64_t device_pages, uint32_t workspace,
+                          hk_legacy_replay_plan * out);
+// Same vector-output convention as hk_retrieval_checkpoint_scores. Rejects a
+// zero block size or a prefix requiring more than UINT32_MAX pages before core
+// division/narrowing. Core filters media beyond the prefix and keeps a partial
+// tail even when recent=0; no resident-only restriction applies to Query.
+int hk_query_prefix_required(uint64_t prefix, uint32_t block, uint32_t sink,
+                              uint32_t recent, const uint32_t * media, size_t n_media,
+                              uint32_t * out, size_t capacity, size_t * out_count);
 
 typedef struct hk_layerwise_identity {
     hk_memory_stamp history;

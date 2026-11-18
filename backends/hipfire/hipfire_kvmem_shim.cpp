@@ -6,6 +6,7 @@
 #include <kvmem/host_kv_storage.hpp>
 #include <kvmem/kvmem_store.hpp>
 #include <kvmem/graph_recall.hpp>
+#include <kvmem/query_policy.hpp>
 #include <kvmem/mean_key_retrieval.hpp>
 #include <kvmem/raw_kv_store.hpp>
 #include <kvmem/prefix_checkpoint.hpp>
@@ -25,8 +26,11 @@
 #include <kvmem/speculative.hpp>
 #include <kvmem/kv_snapshot.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <unordered_set>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -87,6 +91,10 @@ struct hk_raw_store {
 
 struct hk_kv_store {
     std::unique_ptr<kvmem::KvMemStore> impl;
+};
+
+struct hk_retrieval_checkpoint {
+    kvmem::LrfuState impl;
 };
 
 // ── diagnostics ──
@@ -906,6 +914,203 @@ extern "C" int hk_kv_store_commit_retrieval_round(hk_kv_store * ks) {
     guarded([&] { committed = ks->impl->commit_retrieval_round(); },
             "hk_kv_store_commit_retrieval_round");
     return committed ? 1 : 0;
+}
+
+namespace {
+
+// Keep failures local to the calling thread, including allocation failures in
+// the core. Do not allocate a prefixed diagnostic while handling an exception.
+template <typename F>
+int legacy_guarded(F && f) noexcept {
+    clear_error();
+    try {
+        return f();
+    } catch (const std::exception & e) {
+        set_error(e.what());
+    } catch (...) {
+        set_error("legacy policy: unknown C++ exception");
+    }
+    return HK_ERR;
+}
+
+// C callers still own the validity/lifetime of the allocation. Reject null,
+// misaligned, unrepresentable or wrapping spans before pointer arithmetic.
+template <typename T>
+void legacy_span(const T * data, size_t count) {
+    if ((!data && count) ||
+        (data && reinterpret_cast<uintptr_t>(data) % alignof(T) != 0))
+        throw std::invalid_argument("legacy policy: null or misaligned buffer");
+    if (count > size_t(std::numeric_limits<ptrdiff_t>::max()) / sizeof(T) ||
+        (data && count > (std::numeric_limits<uintptr_t>::max() -
+            reinterpret_cast<uintptr_t>(data)) / sizeof(T)))
+        throw std::length_error("legacy policy: buffer length overflow");
+}
+
+template <typename T>
+std::vector<T> legacy_input(const T * data, size_t count) {
+    legacy_span(data, count);
+    if (!count) return {};
+    return std::vector<T>(data, data + count);
+}
+
+template <typename T>
+int legacy_output(const std::vector<T> & values, T * out, size_t capacity, size_t * count) {
+    legacy_span(count, 1);
+    legacy_span(out, capacity);
+    *count = values.size();
+    if (!out) return HK_OK; // only NULL/0 is a count query
+    if (capacity < values.size()) {
+        set_error("legacy policy: output capacity too small");
+        return HK_ERR_TRUNCATED;
+    }
+    if (!values.empty()) std::memcpy(out, values.data(), values.size() * sizeof(T));
+    return HK_OK;
+}
+
+} // namespace
+
+extern "C" hk_retrieval_checkpoint * hk_kv_store_retrieval_checkpoint(const hk_kv_store * ks) {
+    hk_retrieval_checkpoint * result = nullptr;
+    legacy_guarded([&] {
+        legacy_span(ks, 1);
+        if (!ks->impl) throw std::invalid_argument("retrieval_checkpoint: null store");
+        result = new hk_retrieval_checkpoint{ks->impl->retrieval_checkpoint()};
+        return HK_OK;
+    });
+    return result;
+}
+
+extern "C" hk_retrieval_checkpoint * hk_retrieval_checkpoint_clone(
+    const hk_retrieval_checkpoint * checkpoint) {
+    hk_retrieval_checkpoint * result = nullptr;
+    legacy_guarded([&] {
+        legacy_span(checkpoint, 1);
+        result = new hk_retrieval_checkpoint{checkpoint->impl};
+        return HK_OK;
+    });
+    return result;
+}
+
+extern "C" void hk_retrieval_checkpoint_destroy(hk_retrieval_checkpoint * checkpoint) {
+    legacy_guarded([&] {
+        legacy_span(checkpoint, 1);
+        delete checkpoint;
+        return HK_OK;
+    });
+}
+
+extern "C" int hk_kv_store_restore_retrieval(hk_kv_store * ks,
+                                             const hk_retrieval_checkpoint * checkpoint) {
+    return legacy_guarded([&] {
+        legacy_span(ks, 1);
+        legacy_span(checkpoint, 1);
+        if (!ks->impl) throw std::invalid_argument("restore_retrieval: null store");
+        ks->impl->restore_retrieval(checkpoint->impl);
+        return HK_OK;
+    });
+}
+
+extern "C" int hk_retrieval_checkpoint_meta(const hk_retrieval_checkpoint * checkpoint,
+                                             uint64_t * round, int * committed) {
+    return legacy_guarded([&] {
+        legacy_span(checkpoint, 1);
+        legacy_span(round, 1);
+        legacy_span(committed, 1);
+        *round = checkpoint->impl.round;
+        *committed = checkpoint->impl.committed ? 1 : 0;
+        return HK_OK;
+    });
+}
+
+extern "C" int hk_retrieval_checkpoint_scores(const hk_retrieval_checkpoint * checkpoint,
+                                               double * out, size_t capacity, size_t * out_count) {
+    return legacy_guarded([&] {
+        legacy_span(checkpoint, 1);
+        if (!checkpoint->impl.scores) throw std::invalid_argument("retrieval_checkpoint: null scores");
+        return legacy_output(*checkpoint->impl.scores, out, capacity, out_count);
+    });
+}
+
+extern "C" int hk_kv_store_selection_score(const hk_kv_store * ks, uint32_t block, double * out) {
+    return legacy_guarded([&] {
+        legacy_span(ks, 1);
+        legacy_span(out, 1);
+        if (!ks->impl || block >= ks->impl->block_count())
+            throw std::out_of_range("selection_score: null store or block out of range");
+        *out = ks->impl->selection_score(block);
+        return HK_OK;
+    });
+}
+
+extern "C" int hk_pressure_selection(const uint32_t * candidates, size_t n_candidates,
+                                      const double * scores, size_t n_scores,
+                                      const uint32_t * mandatory, size_t n_mandatory,
+                                      uint32_t budget_blocks, uint32_t * out, size_t capacity,
+                                      size_t * out_count) {
+    return legacy_guarded([&] {
+        legacy_span(out_count, 1);
+        legacy_span(out, capacity);
+        if (!budget_blocks || n_candidates != n_scores)
+            throw std::invalid_argument("pressure_selection: invalid budget or score count");
+        const auto ids = legacy_input(candidates, n_candidates);
+        const auto mass = legacy_input(scores, n_scores);
+        const auto fixed = legacy_input(mandatory, n_mandatory);
+        std::unordered_set<uint32_t> resident;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (!resident.insert(ids[i]).second)
+                throw std::invalid_argument("pressure_selection: duplicate resident candidate");
+            if (!std::isfinite(mass[i]))
+                throw std::invalid_argument("pressure_selection: nonfinite score");
+        }
+        std::unordered_set<uint32_t> required;
+        for (auto id : fixed) {
+            if (!resident.count(id))
+                throw std::invalid_argument("pressure_selection: mandatory block is not resident");
+            required.insert(id);
+        }
+        if (required.size() > budget_blocks)
+            throw std::invalid_argument("pressure_selection: mandatory content exceeds budget");
+        return legacy_output(kvmem::pressure_selection(ids, mass, fixed, budget_blocks),
+                             out, capacity, out_count);
+    });
+}
+
+extern "C" int hk_bounded_query(uint64_t begin, uint64_t count, uint64_t total,
+                                 uint32_t limit, hk_query_range * out) {
+    return legacy_guarded([&] {
+        legacy_span(out, 1);
+        const auto query = kvmem::bounded_query(begin, count, total, limit);
+        *out = {query.begin, query.end};
+        return HK_OK;
+    });
+}
+
+extern "C" int hk_query_replay_plan(hk_query_range query, uint64_t restore_begin, uint64_t end,
+                                     uint32_t limit, uint32_t block, uint64_t history_pages,
+                                     uint64_t device_pages, uint32_t workspace,
+                                     hk_legacy_replay_plan * out) {
+    return legacy_guarded([&] {
+        legacy_span(out, 1);
+        const auto plan = kvmem::query_replay_plan({query.begin, query.end}, restore_begin, end,
+            limit, block, history_pages, device_pages, workspace);
+        *out = {plan.begin, plan.end, plan.admitted ? 1 : 0, plan.reason};
+        return HK_OK;
+    });
+}
+
+extern "C" int hk_query_prefix_required(uint64_t prefix, uint32_t block, uint32_t sink,
+                                         uint32_t recent, const uint32_t * media, size_t n_media,
+                                         uint32_t * out, size_t capacity, size_t * out_count) {
+    return legacy_guarded([&] {
+        legacy_span(out_count, 1);
+        legacy_span(out, capacity);
+        if (!block) throw std::invalid_argument("query_prefix_required: zero block size");
+        if (prefix / block + (prefix % block != 0) > UINT32_MAX)
+            throw std::overflow_error("query_prefix_required: page count exceeds uint32_t");
+        const auto required = kvmem::query_prefix_required(prefix, block, sink, recent,
+                                                          legacy_input(media, n_media));
+        return legacy_output(required, out, capacity, out_count);
+    });
 }
 
 extern "C" int hk_kv_store_prefill_needs_offload(const hk_kv_store * ks,
