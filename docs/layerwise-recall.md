@@ -261,6 +261,24 @@ PRO6000 的两项全开版本另完成 16K、98K IQ3 输入的集成验证。后
 原有 #305 的实验测试保留不变，两个环境变量仍默认关闭。
 [增量构建、数值与模型验证记录](benchmarks/ninfer-prefill-architecture-integration-20261114.json)
 
+### RTX PRO 6000 上的 1,024-token 分块
+
+在 RTX PRO 6000 Blackwell Server Edition 上运行 Qwen3.8-27B NVIDIA NVFP4，使用 FP8 KV、单并发、
+36,864-token 历史预算和 4,096-token 生成预留。启动时设置 `NINFER_PREFILL_PAGE_LSE_REUSE=1`，
+保留 `--prefill-chunk 1024`，再用 `NINFER_PREFILL_FP8_WIDE_KV=1` 开启 KV 展开复用。
+每层每个分块展开一次可见的 FP8 KV，供该层的多个查询块复用。两组仅切换 wide-KV，均关闭前缀复用和最终 Query 重选。
+
+| 输入 tokens | 仅 page-LSE | page-LSE + wide-KV | Prefill 吞吐提升 |
+|---:|---:|---:|---:|
+| 16,384 | 8,606 tokens/s | 9,378 tokens/s | +9.0% |
+| 36,864 | 5,942 tokens/s | 6,874 tokens/s | +15.7% |
+| 98,304 | 3,840 tokens/s | 4,516 tokens/s | +17.6% |
+
+吞吐使用实际计算的输入 token 数除以平均服务端 prefill 时间。每档各测两次，98,304-token 的关闭组取自同配置的三次先前运行。
+36,864-token 的 Nsight 对照中，attention GPU 耗时由 3.07 秒降至 2.05 秒，后者包含 KV 展开成本。
+三个固定输入均各生成 256 tokens，两组返回文本一致。本轮未测召回准确率。
+[完整启动参数、输入标识与逐次计时](benchmarks/ninfer-prefill-pro6000-wide-kv-1k-20261118.json)
+
 ## NInfer 的 age-adjusted prefill Pressure（实验开关）
 
 设置 `NINFER_LAYERWISE_PRESSURE_SCORER=lift` 后，普通 prefill Pressure 按
