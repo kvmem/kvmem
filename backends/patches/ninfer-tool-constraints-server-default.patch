@@ -1,0 +1,210 @@
+diff --git a/docs/serving.md b/docs/serving.md
+index 472bd37..b97093f 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -429,6 +429,10 @@ Tool requests default to `tool_constraints:"auto"`. Ordinary non-strict auto req
+ tool parsing without an added generation grammar. Required/named/allowed selections, strict tools
+ and parallel-call restrictions still activate the constraints needed to enforce those requests,
+ independently of `--structured-output`.
++The server can also set that default with `--default-tool-constraints basic|auto`. The server
++default applies only when a request omits `tool_constraints` and still declares tools; plain
++requests without tools and `tool_choice:"none"` keep the native automatic path, and an explicit
++request field always wins.
+ Explicit `tool_constraints:"basic"` restricts native Qwen calls to declared/allowed tool names and complete
+ terminal call sequences. Non-strict parameter values retain best-effort normalization.
+ An empty non-strict value may share its opening and closing framing newline; it is normalized
+diff --git a/src/serve/anthropic_messages_request.cpp b/src/serve/anthropic_messages_request.cpp
+index e12f82f..9bc579f 100644
+--- a/src/serve/anthropic_messages_request.cpp
++++ b/src/serve/anthropic_messages_request.cpp
+@@ -1083,6 +1083,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
+     }
+ 
+     parse_common_prompt(body, result.generation, ParsePurpose::Messages);
++    apply_default_tool_constraints(body, limits, result.generation);
+     result.generation.layerwise_query=parse_layerwise_query_policy(body);
+     result.hide_thinking = thinking_display_omitted(body);
+     parse_generation_fields(body, result.generation);
+diff --git a/src/serve/openai_chat_request.cpp b/src/serve/openai_chat_request.cpp
+index f46efe8..7fabca4 100644
+--- a/src/serve/openai_chat_request.cpp
++++ b/src/serve/openai_chat_request.cpp
+@@ -981,6 +981,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
+     parse_tools(body, output.generation);
+     parse_tool_choice(body, output.generation);
+     parse_tool_constraints(body, output.generation);
++    apply_default_tool_constraints(body, limits, output.generation);
+     parse_parallel_tool_calls(body, output.generation);
+     parse_messages(body, limits.assistant_prefill, output.generation);
+     settle_image_details(output.generation.messages, limits, "messages", "image_url.detail");
+diff --git a/src/serve/openai_responses_request.cpp b/src/serve/openai_responses_request.cpp
+index 8135628..97ceba6 100644
+--- a/src/serve/openai_responses_request.cpp
++++ b/src/serve/openai_responses_request.cpp
+@@ -1145,6 +1145,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
+     parse_tools(body, out);
+     parse_tool_choice(body, out);
+     parse_tool_constraints(body, out.prompt.generation);
++    apply_default_tool_constraints(body, limits, out.prompt.generation);
+     out.parallel_tool_calls = optional_bool(body, "parallel_tool_calls", true);
+     // Honoured by trimming the response to one tool call rather than refused; see the chat parser.
+     out.prompt.generation.parallel_tool_calls = out.parallel_tool_calls;
+diff --git a/src/serve/request.h b/src/serve/request.h
+index eb53da0..06b828c 100644
+--- a/src/serve/request.h
++++ b/src/serve/request.h
+@@ -58,6 +58,10 @@ struct RequestLimits {
+     // An image detail other than auto, low or high is read as auto instead of failing
+     // (--lenient-image-detail).
+     bool lenient_image_detail = false;
++    // --default-tool-constraints: the constraint used when a request omits the tool_constraints
++    // field. Only requests that declare tools are upgraded; an explicit request field always
++    // wins. Nullopt keeps the native automatic default.
++    std::optional<ToolConstraintMode> default_tool_constraints;
+ };
+ 
+ enum class ContentKind {
+diff --git a/src/serve/request_validation.cpp b/src/serve/request_validation.cpp
+index 39a3c46..8720a2a 100644
+--- a/src/serve/request_validation.cpp
++++ b/src/serve/request_validation.cpp
+@@ -44,6 +44,20 @@ void parse_tool_constraints(const RequestJson& body, GenerationRequest& request)
+     else bad_request("tool_constraints must be 'basic' or 'auto'", "tool_constraints");
+ }
+ 
++void apply_default_tool_constraints(const RequestJson& body, const RequestLimits& limits,
++                                    GenerationRequest& request) {
++    // The server default upgrades only requests that declare tools and can still call them;
++    // tool_choice "none" keeps its dedicated native path, and an explicit request field parsed
++    // by parse_tool_constraints always wins.
++    if (!limits.default_tool_constraints.has_value()) { return; }
++    if (body.contains("tool_constraints") && !body.at("tool_constraints").is_null()) { return; }
++    if (!body.contains("tools") || !body.at("tools").is_array() || body.at("tools").empty()) {
++        return;
++    }
++    if (request.tool_choice.mode == ToolChoiceMode::None) { return; }
++    request.tool_choice.constraints = *limits.default_tool_constraints;
++}
++
+ std::optional<int> optional_int(const RequestJson& object, const char* key) {
+     if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
+     const RequestJson& value = object.at(key);
+diff --git a/src/serve/request_validation.h b/src/serve/request_validation.h
+index f1e6bb3..77790df 100644
+--- a/src/serve/request_validation.h
++++ b/src/serve/request_validation.h
+@@ -41,6 +41,12 @@ std::optional<std::uint32_t> parse_thinking_budget_field(const RequestJson& body
+ 
+ void parse_tool_constraints(const RequestJson& body, GenerationRequest& request);
+ 
++// --default-tool-constraints: applied when the request omits the tool_constraints field. Only
++// requests that declare tools and have not selected tool_choice "none" are upgraded; the
++// explicit request field parsed by parse_tool_constraints always wins.
++void apply_default_tool_constraints(const RequestJson& body, const RequestLimits& limits,
++                                    GenerationRequest& request);
++
+ [[nodiscard]] bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept;
+ 
+ // An optional `post_thinking` object: temperature (up to `max_temperature`), top_p, top_k, min_p,
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 0c40949..c75dbae 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -571,6 +571,10 @@ std::string serve_usage_text(const char* argv0) {
+            "  --structured-output           accept JSON, JSON Schema, regex, choice and GBNF\n"
+            "                                response formats; native tool constraints are\n"
+            "                                enabled by default\n"
++           "  --default-tool-constraints basic|auto\n"
++           "                                default for requests omitting the tool_constraints\n"
++           "                                field; upgrades only requests that declare tools,\n"
++           "                                an explicit request field always wins\n"
+            "  --unconstrained-response-format\n"
+            "                                without --structured-output, generate such a\n"
+            "                                request unconstrained instead of refusing it\n"
+@@ -1721,6 +1725,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+             options.structured_output = true;
+             continue;
+         }
++        if (arg == "--default-tool-constraints") {
++            const std::string value = require_value("--default-tool-constraints");
++            if (value == "basic") {
++                options.default_tool_constraints = ToolConstraintMode::Basic;
++            } else if (value == "auto") {
++                options.default_tool_constraints = ToolConstraintMode::Automatic;
++            } else {
++                throw std::invalid_argument("--default-tool-constraints must be 'basic' or 'auto'");
++            }
++            continue;
++        }
+         if (arg == "--unconstrained-response-format") {
+             options.unconstrained_response_format = true;
+             continue;
+diff --git a/src/serve/serve_options.h b/src/serve/serve_options.h
+index 7b6aa83..7fe239f 100644
+--- a/src/serve/serve_options.h
++++ b/src/serve/serve_options.h
+@@ -199,6 +199,10 @@ struct ServeOptions {
+     // ui_settings, which llama.cpp's WebUI applies as its defaults. Empty without the option.
+     std::string ui_settings;
+     bool structured_output = false; // accept JSON/JSON Schema constrained requests
++    // --default-tool-constraints basic|auto: the constraint for requests that omit the
++    // tool_constraints field. Only tool-carrying requests are upgraded; an explicit request
++    // field still wins. Nullopt keeps the native automatic default.
++    std::optional<ToolConstraintMode> default_tool_constraints;
+     bool concurrent_prefill = false; // admit to free lanes while other requests prefill
+     // --recover-invariant-failures: a worker logic_error fails the active requests, not the Engine.
+     bool recover_invariant_failures = false;
+@@ -236,7 +240,8 @@ struct ServeOptions {
+                          .max_context               = static_cast<int>(options.max_context),
+                          .assistant_prefill         = options.assistant_prefill,
+                          .lenient_assistant_history = options.lenient_assistant_history,
+-                         .lenient_image_detail      = options.lenient_image_detail};
++                         .lenient_image_detail      = options.lenient_image_detail,
++                         .default_tool_constraints  = options.default_tool_constraints};
+ }
+ 
+ // Pure conversion; requires no Engine or service runtime.
+diff --git a/tests/models/qwen3_5/test_tool_constraints.cpp b/tests/models/qwen3_5/test_tool_constraints.cpp
+index 81fe5b5..5060a8a 100644
+--- a/tests/models/qwen3_5/test_tool_constraints.cpp
++++ b/tests/models/qwen3_5/test_tool_constraints.cpp
+@@ -225,6 +225,39 @@ int main() try {
+     ar=parse_anthropic_messages_request(anth,limits).generation;
+     options=to_request_options(ar,server,resolve_prompt_semantics(ar,server),true);
+     require(options.tool_choice.parallel && options.tool_choice.mode==ToolChoiceMode::Required, "Anthropic named choice preserves parallel semantics");
++    // --default-tool-constraints: the server default upgrades only tool-carrying requests.
++    RequestLimits defaulted; defaulted.default_tool_constraints = ToolConstraintMode::Basic;
++    Json sd={{"model","test"},{"messages",Json::array({{{"role","user"},{"content","hi"}}})},
++             {"tools",Json::array({Json::parse(declarations[0])})},{"tool_choice","required"}};
++    require(parse_chat_completion_request(sd,limits).generation.tool_choice.constraints==
++            ToolConstraintMode::Automatic, "no server default keeps native auto");
++    require(parse_chat_completion_request(sd,defaulted).generation.tool_choice.constraints==
++            ToolConstraintMode::Basic, "server default upgrades tool-carrying chat requests");
++    sd["tool_constraints"]="auto";
++    require(parse_chat_completion_request(sd,defaulted).generation.tool_choice.constraints==
++            ToolConstraintMode::Automatic, "explicit request field beats the server default");
++    sd.erase("tool_constraints"); sd["tools"]=Json::array(); sd["tool_choice"]="auto";
++    require(parse_chat_completion_request(sd,defaulted).generation.tool_choice.constraints==
++            ToolConstraintMode::Automatic, "requests without tools are never upgraded");
++    sd["tools"]=Json::array({Json::parse(declarations[0])}); sd["tool_choice"]="none";
++    require(parse_chat_completion_request(sd,defaulted).generation.tool_choice.mode==
++            ToolChoiceMode::None &&
++            parse_chat_completion_request(sd,defaulted).generation.tool_choice.constraints==
++            ToolConstraintMode::Automatic, "tool_choice none is never upgraded");
++    Json sd_resp={{"model","test"},{"input","hi"},
++                  {"tools",Json::array({{{"type","function"},{"name","typed"},{"strict",true},
++                                         {"parameters",Json::parse(strict_def[0])["function"]["parameters"]}}})},
++                  {"tool_choice","required"}};
++    require(parse_openai_responses_create_request(sd_resp,defaulted).prompt.generation.
++            tool_choice.constraints==ToolConstraintMode::Basic,
++            "server default upgrades Responses tool requests");
++    Json sd_anth={{"model","test"},{"max_tokens",128},
++                  {"messages",Json::array({{{"role","user"},{"content","hi"}}})},
++                  {"tools",Json::array({{{"name","alpha"},{"input_schema",Json::object()}}})},
++                  {"tool_choice",{{"type","any"}}}};
++    require(parse_anthropic_messages_request(sd_anth,defaulted).generation.tool_choice.
++            constraints==ToolConstraintMode::Basic,
++            "server default upgrades Anthropic tool requests");
+ #endif
+     std::cout << "core tool constraints: PASS (grammar, strict codecs, transactional masks"
+ #ifndef NINFER_TOOL_GRAMMAR_ONLY
