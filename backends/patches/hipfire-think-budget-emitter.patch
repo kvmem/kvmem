@@ -1,0 +1,208 @@
+diff --git a/crates/hipfire-arch-qwen35/src/spec_emit.rs b/crates/hipfire-arch-qwen35/src/spec_emit.rs
+index d2855f0c0..81dd70f67 100644
+--- a/crates/hipfire-arch-qwen35/src/spec_emit.rs
++++ b/crates/hipfire-arch-qwen35/src/spec_emit.rs
+@@ -641,14 +641,19 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
+         Some(&self.think_close)
+     }
+ 
+-    /// Feed a daemon-injected token (the think-close splice) through the
+-    /// emission pipeline as pure STATE REPAIR: bytes are decoded and routed
+-    /// through the think router / content router exactly as if generated, but
+-    /// no `Committed` event is posted, no grammar cursor moves, and neither
+-    /// the EOT filter nor the stop matcher observes the bytes — an injected
+-    /// close must never arm a terminator or stop sequence.
++    /// Feed a daemon-injected token (the think-close splice, either the
++    /// #1053 repair or the multi-slot budget close) through the emission
++    /// pipeline as pure STATE REPAIR: bytes are decoded and routed through
++    /// the think router / content router exactly as if generated, but no
++    /// `Committed` event is posted, no grammar cursor moves, and neither the
++    /// EOT filter nor the stop matcher observes the bytes — an injected
++    /// close must never arm a terminator or stop sequence. Each injected
++    /// token also discharges one queued budget-close token: the splice
++    /// delivers them without an `observe` call, and a stale `closing` count
++    /// would swallow the continuation's first tokens.
+     fn observe_injected(&mut self, token: u32) -> Vec<ClientEvent> {
+         let mut events = Vec::new();
++        self.think_budget.consume_closing(1);
+         let fed = self.stream_bytes.len();
+         self.tokenizer
+             .decode_token_bytes_into(token, &mut self.stream_bytes);
+@@ -1464,4 +1469,62 @@ mod tests {
+         }
+         assert_eq!(visible, "Hello");
+     }
++
++    /// `max_think_tokens` on the emitter (the multi-slot budget close): the
++    /// trip token queues the family close text, the daemon-routed splice
++    /// discharges the queued count, and a span re-opened afterwards spends
++    /// the budget once more before it is a hard `ThinkCap` stop.
++    #[test]
++    fn think_budget_queues_the_family_close_and_stops_on_reopen() {
++        let tok = test_tokenizer();
++        let mut emit = Qwen35Emit::from_ctx_recover(SpecEmitCtx {
++            tokenizer: &tok,
++            eos: 9,
++            im_end: Some(1),
++            tools: Some(&[]),
++            enable_grammar: true,
++            stop: Vec::new(),
++            min_tokens: 0,
++            max_think: 2,
++            max_tokens: 256,
++            assistant_prefix: AssistantPrefix::OpenThink,
++            think_mode: hipfire_runtime::prompt_frame::ThinkMode::Low,
++            decoded_vocab: None,
++        });
++        // Two reasoning tokens spend the budget; the second one trips.
++        let mut forced = Vec::new();
++        for id in tok.encode("ab") {
++            let out = emit.observe(id);
++            assert!(out.stop.is_none(), "inside the span: no hard stop yet");
++            forced.extend(emit.take_forced());
++        }
++        assert_eq!(forced, tok.encode("</think>\n\n"));
++        assert!(emit.take_forced().is_empty(), "forced payload is taken once");
++        // The daemon routes those tokens as an in-turn splice.
++        for id in &forced {
++            emit.observe_injected(*id);
++        }
++        assert!(!emit.open_think_now());
++        assert!(
++            emit.take_forced().is_empty(),
++            "the splice never re-queues a close"
++        );
++        // The continuation streams as visible content...
++        let mut visible = String::new();
++        for id in tok.encode("OK") {
++            visible.push_str(&tokens_text(&emit.observe(id).events));
++        }
++        assert_eq!(visible, "OK");
++        // ...and a re-opened span spends the same budget once more; a second
++        // exhaustion is the hard stop instead of another splice.
++        let reopen = tok.encode("<think>");
++        assert_eq!(reopen.len(), 1);
++        assert!(emit.observe(reopen[0]).stop.is_none());
++        let out = emit.observe(tok.encode("x")[0]);
++        assert_eq!(out.stop, Some(StopReason::ThinkCap));
++        assert!(
++            emit.take_forced().is_empty(),
++            "a second exhaustion never splices again"
++        );
++    }
+ }
+diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
+index 48a6e76e6..5bf032571 100644
+--- a/crates/hipfire-cli/src/serve/metrics.rs
++++ b/crates/hipfire-cli/src/serve/metrics.rs
+@@ -756,6 +756,12 @@ impl Metrics {
+                 "#606: same-token runs that ended the pass as `length`.",
+                 s.think_recovery.repeat_run_stops as u64,
+             );
++            counter(
++                &mut out,
++                "hipfire_think_budget_closes_total",
++                "`max_think_tokens` budget closes spliced and continued cold.",
++                s.think_recovery.budget_closes as u64,
++            );
+             out.push_str(
+                 "# HELP hipfire_think_loop_recoveries_total #728 reasoning-loop endings, by mode.\n\
+                  # TYPE hipfire_think_loop_recoveries_total counter\n",
+@@ -1293,6 +1299,7 @@ mod tests {
+                     loop_recoveries: 1,
+                     loop_stops: 3,
+                     repeat_run_stops: 4,
++                    budget_closes: 8,
+                     loop_skips_already_recovered: 5,
+                     loop_skips_vision: 6,
+                     loop_skips_budget_exhausted: 7,
+@@ -1305,6 +1312,7 @@ mod tests {
+         for sample in [
+             "hipfire_think_close_injections_total 2\n",
+             "hipfire_repeat_run_stops_total 4\n",
++            "hipfire_think_budget_closes_total 8\n",
+             "hipfire_think_loop_recoveries_total{mode=\"recover\"} 1\n",
+             "hipfire_think_loop_recoveries_total{mode=\"stop\"} 3\n",
+             "hipfire_think_loop_skips_total{reason=\"already_recovered\"} 5\n",
+diff --git a/crates/hipfire-runtime/src/emit_text.rs b/crates/hipfire-runtime/src/emit_text.rs
+index ce9d9bdb5..47ff79729 100644
+--- a/crates/hipfire-runtime/src/emit_text.rs
++++ b/crates/hipfire-runtime/src/emit_text.rs
+@@ -119,6 +119,14 @@ impl ThinkBudget {
+         self.closing = tokens;
+     }
+ 
++    /// Tokens spliced into the stream outside [`Self::observe`] (the
++    /// multi-slot budget close routes them through `observe_injected`) still
++    /// discharge the queued close. Without this the count swallows the first
++    /// `closing` tokens of the continuation and a re-opened span trips early.
++    pub fn consume_closing(&mut self, tokens: usize) {
++        self.closing = self.closing.saturating_sub(tokens);
++    }
++
+     /// The most tokens the caller may commit next such that no
+     /// [`Self::observe`] call within the first `n - 1` of them returns
+     /// [`ThinkBudgetStep::ForceClose`] or [`ThinkBudgetStep::Exhausted`]: a
+@@ -2864,6 +2872,30 @@ mod tests {
+         assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Exhausted);
+     }
+ 
++    /// In-turn splices (the multi-slot budget close feeds the emitter the
++    /// close tokens through `observe_injected`, never `observe`) still
++    /// discharge the queued close; otherwise the count swallows the first
++    /// continuation tokens and a re-opened span trips early.
++    #[test]
++    fn consume_closing_discharges_injected_close_tokens() {
++        let mut b = ThinkBudget::new(3);
++        for _ in 0..2 {
++            assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
++        }
++        // budget_step queues the close the way the producers do.
++        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::ForceClose);
++        b.consume_closing(CLOSE_TOKENS);
++        assert_eq!(b.window_cap(false), None);
++        // The continuation outside the span is uncapped...
++        assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
++        // ...and a re-opened span spends a fresh budget instead of tripping
++        // on its first token.
++        for _ in 0..2 {
++            assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
++        }
++        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Exhausted);
++    }
++
+     #[test]
+     fn window_cap_after_force_close_covers_closing_then_reopened_span() {
+         const MAX: usize = 4;
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index 522871abf..d9d7749cd 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -362,6 +362,9 @@ pub struct ThinkRecoveryStats {
+     pub loop_stops: usize,
+     /// #606: same-token runs that ended the pass as `length`.
+     pub repeat_run_stops: usize,
++    /// `max_think_tokens` on a non-schema turn: budget closes spliced and
++    /// continued cold.
++    pub budget_closes: usize,
+     /// Periodic #728 checks that declined, by reason. "below threshold" is
+     /// the normal case and is not counted.
+     pub loop_skips_already_recovered: usize,
+diff --git a/docs/SERVE.md b/docs/SERVE.md
+index af03eac7f..32beb7958 100644
+--- a/docs/SERVE.md
++++ b/docs/SERVE.md
+@@ -852,6 +852,13 @@ and JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss.
+ Vision+prefix reuse stays off. Non-empty stop sequences, logprobs, and the images+tools combination stay refused on slots; tools alone are supported.
+ This is not a registry admission.
+ 
++`max_think_tokens` is enforced on the multi-slot route too: structured-output
++turns keep the engine's grammar-mask cap, every other thinking turn arms the
++daemon's `ThinkBudget`, and a budget exhaustion splices the family think-close
++(the same text `HIPFIRE_THINK_CONTINUATION` names) and continues the turn as a
++cold pass, exactly like the `#1053` close retry. A span re-opened after the
++splice ends the turn as `length` instead of splicing twice.
++
+ ### Capability advertisement
+ 
+ `/health` carries a `capabilities` object built once at startup from the
