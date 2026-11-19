@@ -1,0 +1,150 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index c64a8efc5..9c1731a72 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -558,6 +558,41 @@ pub fn resolve_plan(
+     })
+ }
+ 
++/// Effective Legacy history budget for the admission site. The config layer
++/// defaults `budget_tokens` to 32768 and `gen_reserve_tokens` to 1024 without
++/// knowing the logical context, so a default budget meeting C=32768 would
++/// fail `B + R <= C` on every stock 32k deployment. An *implicit* budget (no
++/// explicit env/CLI/snapshot input, `Source::Default`) is therefore clamped to
++/// `C - R` floored to whole blocks; an explicitly requested budget is never
++/// reduced — `resolve_legacy_plan` still rejects it, mirroring the
++/// "not reduced automatically" contract for explicit physical pools.
++pub fn effective_legacy_budget(
++    budget_tokens: usize,
++    implicit: bool,
++    cap_tokens: usize,
++    reserve_tokens: usize,
++) -> usize {
++    if !implicit {
++        return budget_tokens;
++    }
++    let ceiling = cap_tokens
++        .saturating_sub(reserve_tokens)
++        .saturating_div(KV_BLOCK_TOKENS)
++        .saturating_mul(KV_BLOCK_TOKENS);
++    budget_tokens.min(ceiling)
++}
++
++/// Whether `budget_tokens` is the built-in default (no env/CLI/snapshot
++/// input). Only an implicit budget is ever clamped to the logical context;
++/// one lookup shared by the admission site and the controller restatement so
++/// the two cannot drift.
++pub fn implicit_legacy_budget(config: &hipfire_config::kvmem::ResolvedConfig) -> bool {
++    config
++        .report
++        .get("budget_tokens")
++        .is_none_or(|report| report.source == hipfire_config::kvmem::Source::Default)
++}
++
+ /// Admit the public Legacy contract after token normalization. Unlike the
+ /// historical env-only pool planner, the physical pool never silently reduces
+ /// the requested history budget. NInfer's device window is B + R: a pressure
+@@ -5246,6 +5281,22 @@ mod tests {
+         assert!(resolve_legacy_plan(0, 32768, 256, 8192, 1024, None).is_err());
+     }
+ 
++    #[test]
++    fn implicit_legacy_budget_clamps_to_context_and_explicit_stays_loud() {
++        // Stock 32k deployment with no explicit budget: the default 32768
++        // would fail B + R <= C; the implicit clamp makes it admissible.
++        let implicit = effective_legacy_budget(32768, true, 32768, 1024);
++        assert_eq!(implicit, 31744);
++        assert!(resolve_legacy_plan(1, 32768, 256, implicit, 1024, None).is_ok());
++        // An explicit budget is never reduced: the operator asked for it.
++        assert_eq!(effective_legacy_budget(32768, false, 32768, 1024), 32768);
++        assert!(resolve_legacy_plan(1, 32768, 256, 32768, 1024, None).is_err());
++        // Clamping floors to whole blocks and leaves sub-minimum contexts loud.
++        assert_eq!(effective_legacy_budget(32768, true, 9216, 1025), 8064);
++        assert_eq!(effective_legacy_budget(2048, true, 32768, 1024), 2048);
++        assert_eq!(effective_legacy_budget(32768, true, 512, 1024), 0);
++    }
++
+     /// Small Q8 geometry: 2 fa layers, 2 KV heads, head_dim 64 →
+     /// `per_pos_bytes = 2 * (64/32) * 34 = 136`.
+     fn geom() -> KvMemGeometry {
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index fb66f3633..974ac1864 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -2319,9 +2319,27 @@ impl Rig {
+                         }
+                         Ok(pages)
+                     }).transpose()?;
++                // A default budget (no explicit env/CLI/snapshot input) is
++                // clamped to C - R: the config layer cannot see the logical
++                // context, and a stock 32k deployment would otherwise fail
++                // B + R <= C at admission. Explicit budgets stay loud.
++                let budget_tokens = crate::kvmem_ctl::effective_legacy_budget(
++                    config.budget_tokens as usize,
++                    crate::kvmem_ctl::implicit_legacy_budget(config),
++                    cfg.cap_tokens,
++                    config.gen_reserve_tokens as usize,
++                );
++                if budget_tokens != config.budget_tokens as usize {
++                    eprintln!(
++                        "  [hipfire] KVMem Legacy history budget default {} clamped to {} \
++                         (context {} - reserve {})",
++                        config.budget_tokens, budget_tokens, cfg.cap_tokens,
++                        config.gen_reserve_tokens
++                    );
++                }
+                 crate::kvmem_ctl::resolve_legacy_plan(
+                     cfg.n_slots, cfg.cap_tokens, prefill_chunk.max(spec_rows),
+-                    config.budget_tokens as usize, config.gen_reserve_tokens as usize,
++                    budget_tokens, config.gen_reserve_tokens as usize,
+                     explicit_pages,
+                 )?
+             } else {
+@@ -3142,11 +3160,37 @@ impl Rig {
+         #[cfg(feature = "kvmem")]
+         let kvmem = match kvmem_plan {
+             Some(plan) => {
++                // Restate an implicit default budget at the clamped value the
++                // plan was admitted with: `new_with_config` cross-checks its
++                // Legacy config against `plan.budget_blocks`, and the
++                // `[kvmem-config]` record below must state the effective
++                // value, not the config layer's context-blind default.
++                let legacy_config = cfg.kvmem.as_ref().map(|config| {
++                    let budget_tokens = crate::kvmem_ctl::effective_legacy_budget(
++                        config.budget_tokens as usize,
++                        crate::kvmem_ctl::implicit_legacy_budget(config),
++                        cfg.cap_tokens,
++                        config.gen_reserve_tokens as usize,
++                    );
++                    let mut config = config.clone();
++                    if budget_tokens != config.budget_tokens as usize {
++                        config.budget_tokens = budget_tokens as u32;
++                        if let Some(report) = config.report.get_mut("budget_tokens") {
++                            report.effective = serde_json::json!(budget_tokens);
++                        }
++                        config.notes.push(format!(
++                            "budget_tokens clamped to {budget_tokens} at admission \
++                             (context {} - reserve {})",
++                            cfg.cap_tokens, config.gen_reserve_tokens
++                        ));
++                    }
++                    config
++                });
+                 // Consolidated effective-policy record: the operator-facing
+                 // parameters are only meaningful if the engine states the
+                 // values it actually built the pool and policy with (E01
+                 // evidence: requested vs applied, no silent clamping).
+-                if let Some(config) = cfg.kvmem.as_ref() {
++                if let Some(config) = legacy_config.as_ref() {
+                     eprintln!(
+                         "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
+                          sink_tokens={} recent_tokens={} sessions={} host_bytes={} \
+@@ -3200,7 +3244,7 @@ impl Rig {
+                     // Legacy carries it unread (byte-neutral).
+                     mtp_head: mtp_head.is_some() && mtp_k > 0,
+                 },
+-                cfg.kvmem.as_ref(),
++                legacy_config.as_ref(),
+                 )?)
+             }
+             None => None,
