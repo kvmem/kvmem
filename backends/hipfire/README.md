@@ -72,8 +72,8 @@ only the CLI leaves a stale engine:
 HIPFIRE_ROCM_PATH=/opt/rocm cargo build -p hipfire-cli -p hipfire-daemon --features kvmem --release
 ```
 
-The patch series applies to hipfire `89e32856d25d6f6e6645319f2ec2c641c46be525`
-(v0.4.6, fork `smashdog/hipfire`); see `upstream.json` for hashes and the
+The patch series applies to hipfire `d435a753d8787c12feacdc78b93e6abea9d3af58`
+(v0.4.7, fork `smashdog/hipfire`); see `upstream.json` for hashes and the
 verified tree. That release still predates the escha-dense merge, so the
 `kvmem` patch also carries the escha-dense baseline (escha trellis
 projections, quantize/dispatch support) it builds on, plus the Bonsai
@@ -81,7 +81,21 @@ TQ2G128/BQ1G128 flat-lowbit slots admission. On the v0.4.5 -> v0.4.6 rebase
 the Escha shared-weight DType tags were renumbered 65/66 -> 68/69 (upstream
 took 65..67 for MQ4G256V2P/MQ4G128V2P/HC8E4M3Row); the HFQ wire qt=42/43 is
 unchanged, and the fp16-x scratch marker invalidation the old patch added is
-now enforced by upstream's `fp16_x_scratch_writable`.
+now enforced by upstream's `fp16_x_scratch_writable`. v0.4.7 does not move
+that boundary (its highest tag is still HC8E4M3Row = 67), so 68/69 stand; the
+0.4.6 -> 0.4.7 rebase needed the dispatch test targets adapted to the
+post-escha-MoE `MoeDtypes` shape, the TUI golden snapshots refreshed for the
+`thinking.*` keys the patch series adds, and a green run of the official
+`scripts/no-gpu-ci.sh` gate. That last part keeps the curated
+`qwen3.8:27b-escha*` registry tiers: their HF repo publishes only the three
+trunk files, so the tiers are exempt from the family's shared-vision,
+MTP-head and effort-default contracts (`scripts/test_registry_gen_vision.py`
+and `crates/hipfire-registry` tests) until the repo carries those sidecars;
+`scripts/registry_gen.py` maps their `.escha-xt/.escha-pro` files to the
+`escha` codec so they stay generatable. The same gate pass pins
+`scripts/test-fmt-sweep-rebase.sh` to `LC_ALL=C` (its assertions match git's
+English conflict text) and routes the loop-recovery trace read through
+`hipfire_config::developer_var_os`.
 
 The third `rdna3-opt` patch is a gfx1100 (RDNA3) operator pass on top of that
 integration, verified byte-exact (`89e32856d` + the first three patches reproduce
