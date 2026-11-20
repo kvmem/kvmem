@@ -176,12 +176,18 @@ PRO 6000 的频繁整理诊断中，平均刷新占用时间约从 75 ms 降至 
 
 `--kvmem-layerwise-unique-query-anchor` 为文本查询增加可选的精确匹配。对于 32–64 个 token 的查询，当已接受历史中只有一个最长连续匹配、且至少匹配 32 个 token，选择器从原预算中保留实际相交的至多两个 64-token 页。重复、过短、图像或预算不足的情况沿用原打分。其余候选页继续根据当前层的 Mean-K 分数选择。
 
-## NInfer 的 FP8 prefill 页分数复用
+## NInfer 的 prefill 页分数复用
 
-单序列、FP8 E4M3 Row256 KV、24 个 Q 头 / 4 个 KV 头 / head dimension 256 的 eager prefill，
-可在启动服务前设置 `NINFER_PREFILL_PAGE_LSE_REUSE=1`，复用 attention 已计算的页 log-sum-exp，
-省去独立的页分数 QK 扫描。再设 `NINFER_PREFILL_FP8_WIDE_KV=1`，可将每层可见 KV 展开一次并跨查询块共享。
-两个开关默认关闭；不适用的形状和调用沿用普通 attention 与独立反馈计算。
+单序列 eager prefill 默认复用 attention kernel 已计算的 64-token 页 log-sum-exp，省去独立的页分数 QK 扫描。
+可设 `NINFER_PREFILL_PAGE_LSE_REUSE=0` 关闭复用。支持的 D256 prompt 路径覆盖 `bf16`、`int8`、
+`rk8v4`、`rk4v4`、`rk4v4-e8`、`rk2v4-e8`、`nvfp4`、`k8v4`，以及 24 个 Q 头 / 4 个 KV 头的 `fp8`。
+未接出页分数的 kernel 路径（例如 Volta 专用 prompt kernel）继续使用独立反馈计算。
+GPU 工作区按生效的 prefill chunk、采样步长和 resident KV 页容量规划，每次调用只使用实际采样的行。
+每 32 token 采样一次时，完整的 4096-token 块一次捕获 128 行，归一化和回读仍按 64 行分批。
+更大的 prefill chunk 沿用同一计算规则，空间受实际采样行数和引擎可用工作区约束。
+
+`NINFER_PREFILL_FP8_WIDE_KV=1` 可另行开启 FP8 wide-KV，将每层可见 KV 展开一次并跨查询块共享。
+wide-KV 默认关闭。下表记录原有 FP8 路径的架构适用范围。
 
 Blackwell 的 page-LSE 支持沿用 [PR #305](https://github.com/kvmem/kvmem/pull/305)；本次增量扩展 Turing 的内核形状选择，
 并按共享内存需求放开 wide-KV，不重复叠加 Blackwell 的收益。架构判定如下：
@@ -258,7 +264,7 @@ PR #305 的作者另在 Linux / CUDA 13.1、`NINFER_SM120_NATIVE=OFF` 的兼容�
 
 增量合入后的原生树 `dc3be91cb6e42` 再次通过五种架构编译、45 组用例 / 90 项 FP64 参考检查；
 PRO6000 的两项全开版本另完成 16K、98K IQ3 输入的集成验证。后两次仅为功能验证，不作为增量性能的统计结论。
-原有 #305 的实验测试保留不变，两个环境变量仍默认关闭。
+上述实验运行时，两个环境变量均默认关闭。
 [增量构建、数值与模型验证记录](benchmarks/ninfer-prefill-architecture-integration-20261114.json)
 
 ## NInfer 的 age-adjusted prefill Pressure（实验开关）

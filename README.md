@@ -2,13 +2,16 @@
 
 # KVMem
 
-AMD RDNA4 backend: [Radiance on Windows and Linux](docs/radiance-integration.md), with build and deployment commands, default settings, and [full benchmark comparisons](docs/radiance/PERFORMANCE-COMPARISON.md).
-
-Radiance 1.17: [observer replay, transfer and execution-overlap measurements](docs/radiance-execution-overhead-20261107.md), including opt-in controls and qualification limits.
-
 **Long-context conversations and AI agents on limited GPU memory.**
 
-KVMem keeps complete native KV history in system RAM, with optional SSD tiering. The GPU holds the history needed for the current request and space for generation. It supports **NInfer, llama.cpp, PolyStrata and Radiance** through a local Web UI and OpenAI-compatible APIs. See the [Radiance integration guide](docs/radiance-integration.md) for its AMD qualification and supported combinations.
+## News
+
+- **2026-11-14 · AMD Radeon RX 9060 XT / 9070 / 9070 XT · Windows**\
+  The Radiance pre-release includes a 256K context preset for 16 GB GPUs, with DFlash2 and text and image input. A same-day package update added monitoring for GPU utilization, VRAM, temperature, and power. Choose `gfx1200` for the **RX 9060 XT** or `gfx1201` for the **RX 9070 / 9070 XT**. [v0.19.rad1 downloads and notes](https://github.com/kvmem/kvmem/releases/tag/v0.19.rad1)
+- **2026-10-31 · NVIDIA GeForce RTX 20 / 30 / 40 / 50 and Tesla V100 · Windows**\
+  The stable dual-backend release gives NInfer and PolyStrata a shared console and chat interface and adds automatic VRAM budget estimation. NInfer supports layer splitting for multi-GPU DFlash2. Choose the package for your GPU. PolyStrata support on the V100 is experimental. [v0.19.1 downloads and notes](https://github.com/kvmem/kvmem/releases/tag/v0.19.1)
+
+[All releases](https://github.com/kvmem/kvmem/releases) · [Quick start](#quick-start)
 
 ## Supported models by backend
 
@@ -40,6 +43,8 @@ Choose a [release package](https://github.com/kvmem/kvmem/releases) matching you
 
 ## What KVMem does
 
+KVMem keeps complete native KV history in system RAM, with optional SSD tiering. The GPU holds the history needed for the current request and space for generation. It supports **NInfer, llama.cpp, PolyStrata and Radiance** through a local Web UI and OpenAI-compatible APIs. See the [Radiance integration guide](docs/radiance-integration.md) for its AMD qualification and supported combinations.
+
 - **Long context:** Retrieve relevant KV history to manage long conversations and tool histories within a fixed GPU budget.
 - **Extra-long / xhigh reasoning:** Reuse GPU generation space to sustain long reasoning and answers on limited VRAM, including the `xhigh` reasoning setting.
 - **State reuse:** Reuse prefixes and checkpoints across conversations and tool continuations according to each backend's rules.
@@ -63,7 +68,7 @@ KVMem makes room as generation proceeds, so **Gen reserve is reusable workspace,
 
 Choose a package for your operating system, GPU and backend on the release page. Each release contains its downloads, checksums, driver requirements, model support and qualification notes. Supply model weights separately. Releases marked **Pre-release** are for testing.
 
-<!-- Maintenance: Keep README version-independent. Routine releases update Releases, package notes and relevant docs; do not add version numbers, asset download URLs, package sizes or checksums here. Keep both languages in sync. -->
+<!-- Maintenance: Keep both News sections in sync. Use Beijing time for release dates and link to the release pages. Keep package URLs, sizes, and checksums on Releases. -->
 
 <a id="quick-start"></a>
 
@@ -107,6 +112,7 @@ Engines use pinned submodules and integration patches. GitHub-generated source Z
 | Startup, settings and support | [Runtime guide](docs/multi-backend.md) · [Backend differences](docs/multi-backend-differences.md) |
 | KV retrieval and memory | [Graph recall](docs/graph-recall.md) · [RAM / SSD tiering](docs/active-kv-tiering.md) |
 | Design and backend integration | [Architecture](docs/architecture.md) · [Memory backend contract](docs/memory-backend-contract.md) |
+| Radiance on AMD | [Windows and Linux integration guide](docs/radiance-integration.md) · [Benchmark comparisons](docs/radiance/PERFORMANCE-COMPARISON.md) · [Radiance 1.17 execution and transfer measurements](docs/radiance-execution-overhead-20261107.md) |
 | Builds and releases | [Development workflow](docs/multi-backend-repository.md) · [Backend versions and licenses](backends/versions.json) |
 | Tests and performance | [Validation records](docs/multi-backend-validation.md) · [Performance report](docs/recommended-config-performance.md) · [Benchmark data](docs/benchmarks/) |
 
