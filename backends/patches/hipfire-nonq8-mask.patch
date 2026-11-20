@@ -630,7 +630,7 @@ index 57c1a3de5d7c14ed6d532a8adba8900f59796346..77b5be617dde30dfed0aff13f59dc8ea
  }
 \ No newline at end of file
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
-index 5db03a3da13ef3acae2c7a5d67e186f2fe031238..18a549b76d08ac60e3b6ce11da01322f37a78620 100644
+index 51bf64e03a30611eae21dcf7abaa9b28c4e34c2f..ac4a2dab706b21e18266142de2c9757010cfcb03 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
 @@ -1222,12 +1222,24 @@ impl Rig {
@@ -664,7 +664,7 @@ index 5db03a3da13ef3acae2c7a5d67e186f2fe031238..18a549b76d08ac60e3b6ce11da01322f
              }
              if cfg.is_vl && vl_sequential {
                  return Err(
-@@ -2082,6 +2094,7 @@ impl Rig {
+@@ -2084,6 +2096,7 @@ impl Rig {
                      n_heads: config.n_heads,
                      n_kv_heads: config.n_kv_heads,
                      head_dim: config.head_dim,
@@ -672,6 +672,53 @@ index 5db03a3da13ef3acae2c7a5d67e186f2fe031238..18a549b76d08ac60e3b6ce11da01322f
                      per_pos_bytes,
                      per_pos_v_bytes,
                      max_rows: max_batch,
+diff --git a/crates/rdna-compute/src/verify_twins.rs b/crates/rdna-compute/src/verify_twins.rs
+index 394493c1356285b94239f00dcfb2ad0478eeccdd..9b871f56d554b0739f4946e02662f774aa91a05c 100644
+--- a/crates/rdna-compute/src/verify_twins.rs
++++ b/crates/rdna-compute/src/verify_twins.rs
+@@ -98,6 +98,10 @@ const ATTN_FP8_LOAD_EDITS: &[(&str, &str)] = &[
+     ),
+     (
+         "        for (int t = 0; t < eff_seq_len; t++) {
++            // KVMem residency (P4.4): spilled page weight is zero; skip the read.
++            if (!kv_page_present(desc, t)) {
++                continue;
++            }
+             const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+             const float vs = (float)*((const _Float16*)(vrow + scale_off));
+             val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
+@@ -107,17 +111,30 @@ const ATTN_FP8_LOAD_EDITS: &[(&str, &str)] = &[
+         for (; t + 8 <= eff_seq_len; t += 8) {
+             float vsu[8];
+             unsigned char vbu[8];
++            bool vpr[8];
+             #pragma unroll
+             for (int u = 0; u < 8; u++) {
++                // KVMem residency (P4.4): spilled page weight is zero; skip the read.
++                vpr[u] = kv_page_present(desc, t + u);
++                if (!vpr[u]) {
++                    vsu[u] = 0.0f;
++                    vbu[u] = 0;
++                    continue;
++                }
+                 const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t + u, per_pos_bytes);
+                 vsu[u] = (float)*((const _Float16*)(vrow + scale_off));
+                 vbu[u] = vrow[k_head_off + d];
+             }
+             #pragma unroll
+             for (int u = 0; u < 8; u++)
+-                val += scores[t + u] * (vsu[u] * hipfire_fp8_e4m3_to_f32_batched(vbu[u]));
++                if (vpr[u])
++                    val += scores[t + u] * (vsu[u] * hipfire_fp8_e4m3_to_f32_batched(vbu[u]));
+         }
+         for (; t < eff_seq_len; t++) {
++            // KVMem residency (P4.4): spilled page weight is zero; skip the read.
++            if (!kv_page_present(desc, t)) {
++                continue;
++            }
+             const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+             const float vs = (float)*((const _Float16*)(vrow + scale_off));
+             val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
 diff --git a/kernels/src/attention_flash_asym2_tile_batched.hip b/kernels/src/attention_flash_asym2_tile_batched.hip
 index b5c2e31788dea753fa2a4b79f65a9a915bd5fb3f..d4c9fa8a5254fa291d2b874323ecf39d3c325ea0 100644
 --- a/kernels/src/attention_flash_asym2_tile_batched.hip
