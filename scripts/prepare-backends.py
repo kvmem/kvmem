@@ -46,7 +46,9 @@ def source_tree(directory):
         return git(directory, 'write-tree', env=env).stdout.strip()
 
 
-def patch_series(name, entry, base=ROOT):
+def patch_series(name, entry, base=None):
+    # ROOT is looked up at call time so source-bundle tests can point it at a fixture tree.
+    base = ROOT if base is None else base
     patches = entry.get('patches')
     if not isinstance(patches, list) or not patches:
         raise RuntimeError(f'{name}: expected a nonempty ordered patches list')
@@ -74,7 +76,8 @@ def patch_series(name, entry, base=ROOT):
     return patches
 
 
-def verify_patch_series(directory, entry, patches, base=ROOT):
+def verify_patch_series(directory, entry, patches, base=None):
+    base = ROOT if base is None else base
     # Preflight the entire series in an isolated index before changing any source.
     with temporary_index() as env:
         git(directory, 'read-tree', entry['base_commit'], env=env)
@@ -114,7 +117,8 @@ def prepare(name, entry, check_only):
     finish_prepare(name, directory, entry, patches, check_only)
 
 
-def finish_prepare(name, directory, entry, patches, check_only, base=ROOT):
+def finish_prepare(name, directory, entry, patches, check_only, base=None):
+    base = ROOT if base is None else base
     head = git(directory, 'rev-parse', 'HEAD').stdout.strip()
     if head != entry['base_commit']:
         raise RuntimeError(f'{name}: expected {entry["base_commit"]}, got {head}')
