@@ -1,0 +1,1523 @@
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index 8bd67bf0bd8416bf9e060f4dfe288c26505530f1..71ec23408704e5ae1137ddf2c5620e531d1a3d52 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -32,7 +32,8 @@ use hipfire_kvmem::{
+     KvRegions, KvStore, LayerMemorySnapshot, LayerPlan, LayerQueryGeometry, LayerRequestSpec,
+     LayerwiseIdentity, LayerwisePhase, LayerwiseRequest, LayerwiseWork, MemoryBudget,
+     MemoryCapabilities, MemoryCatalog, MemoryDescriptor, MemorySnapshot, MemoryStamp,
+-    NativeCurrentLayerQuery, NativePayload, PayloadLayout, PrefillAcceptance, PrefillMass,
++    NativeCurrentLayerQuery, NativePayload, OutputAcceptance, OutputMass, OutputPressure,
++    PayloadLayout, PrefillAcceptance, PrefillMass,
+     PrefillPressure, QueryPlaneBytes, QueryProjectionLayout,
+     QueryProjectionPlane, QueryProjectionTape, QueryRange, QueryScoreFrame, RawStore, Reservation,
+     SessionIdentity, SpillFile, Storage,
+@@ -371,23 +372,33 @@ fn encode_layer_block_table(
+ /// shifted V view ([`LayerwiseArena::v_cache_view`]), supplied by the caller at
+ /// attention time and shared across layers. `GpuTensor` has no `Drop`; release
+ /// exactly once via [`Self::free_gpu`].
++///
++/// `width` is the number of active evaluation rows per step (P4.1①): `1` for the
++/// AR decode path (byte-for-byte the original single-row staging), `n` for an
++/// MTP verify span. The sequence is still ONE (every row maps to slot 0); only
++/// the per-row causal-bound `positions` and the `row_slot` map widen.
+ pub struct LayerwiseDescStaging {
+     descs: Vec<GpuTensor>,
+     block_tables: Vec<GpuTensor>,
+-    /// Per-layer compacted causal bound: one i32 `[seq_len - 1]`. The ported
+-    /// paged kernels treat `positions[]` (NOT `desc.seq_len`) as authoritative
+-    /// for the causal bound, and Layerwise attends the COMPACTED selected
+-    /// working set — so this is the compacted visible extent, distinct from the
+-    /// real decode position used for RoPE (D4a parity proof: `positions=[SEQ-1]`
+-    /// with `SEQ` the compacted extent). Stable address, re-uploaded in place.
++    /// Per-layer compacted causal bounds: `width` i32 `[seq_len - width + i]`
++    /// (row `i` of the active span). The ported paged kernels treat `positions[]`
++    /// (NOT `desc.seq_len`) as authoritative for the causal bound, and Layerwise
++    /// attends the COMPACTED selected working set — so this is the compacted
++    /// visible extent, distinct from the real decode position used for RoPE (D4a
++    /// parity proof: `positions=[SEQ-1]` with `SEQ` the compacted extent). For
++    /// `width == 1` this is the single i32 `[seq_len - 1]`, byte-identical to the
++    /// AR staging. Stable address, re-uploaded in place.
+     positions: Vec<GpuTensor>,
+-    /// Single-sequence row→slot map: one i32 `[0]`, stable address. The paged
+-    /// writer/attention take `row_slot` to resolve each active row's descriptor;
+-    /// the layerwise flow has one sequence, so every row maps to slot 0 (mirrors
+-    /// the legacy `SlotDescStaging::row_slot_dev`). Uploaded once at construction.
++    /// Single-sequence row→slot map: `width` i32 all `[0]`, stable address. The
++    /// paged writer/attention take `row_slot` to resolve each active row's
++    /// descriptor; the layerwise flow has one sequence, so every row maps to
++    /// slot 0 (mirrors the legacy `SlotDescStaging::row_slot_dev`). For
++    /// `width == 1` this is the single i32 `[0]`. Uploaded once at construction.
+     row_slot: GpuTensor,
+     n_layers: usize,
+     max_pages: usize,
++    /// Active evaluation rows per step (1 = AR, n = MTP verify span).
++    width: usize,
+ }
+ 
+ impl LayerwiseDescStaging {
+@@ -396,12 +407,28 @@ impl LayerwiseDescStaging {
+     /// field count. Fails closed on bad geometry or an allocation error — never
+     /// partially constructs (everything allocated so far is freed on failure).
+     pub fn new(gpu: &mut Gpu, n_layers: usize, max_pages: usize) -> Result<Self, String> {
++        Self::new_with_width(gpu, n_layers, max_pages, 1)
++    }
++
++    /// Width-param constructor (P4.1①): `width` active evaluation rows per step.
++    /// `width == 1` reproduces the AR single-row staging byte-for-byte (one i32
++    /// `[0]` row_slot, one i32 `[seq_len-1]` positions/layer); `width == n` widens
++    /// both to `n` i32 for an MTP verify span. Fails closed on `width == 0`.
++    pub fn new_with_width(
++        gpu: &mut Gpu,
++        n_layers: usize,
++        max_pages: usize,
++        width: usize,
++    ) -> Result<Self, String> {
+         if n_layers == 0 {
+             return Err("layerwise desc staging: n_layers == 0".to_string());
+         }
+         if max_pages == 0 {
+             return Err("layerwise desc staging: max_pages == 0".to_string());
+         }
++        if width == 0 {
++            return Err("layerwise desc staging: width == 0".to_string());
++        }
+         let desc_bytes = std::mem::size_of::<KvSlotDesc>();
+         let mut descs: Vec<GpuTensor> = Vec::with_capacity(n_layers);
+         let mut block_tables: Vec<GpuTensor> = Vec::with_capacity(n_layers);
+@@ -423,7 +450,7 @@ impl LayerwiseDescStaging {
+                 }
+             };
+             descs.push(desc);
+-            let pos = match gpu.alloc_tensor(&[4], DType::Raw) {
++            let pos = match gpu.alloc_tensor(&[width * 4], DType::Raw) {
+                 Ok(t) => t,
+                 Err(e) => {
+                     Self::free_partial(gpu, &mut descs, &mut block_tables, &mut positions);
+@@ -432,19 +459,20 @@ impl LayerwiseDescStaging {
+             };
+             positions.push(pos);
+         }
+-        // Single-sequence row→slot map ([0]), allocated after the per-layer
+-        // buffers so a loop failure frees only the Vecs (free_partial). A failure
+-        // here frees everything allocated so far — never partially constructs.
+-        let row_slot = match gpu.alloc_tensor(&[4], DType::Raw) {
++        // Single-sequence row→slot map (width × [0]), allocated after the
++        // per-layer buffers so a loop failure frees only the Vecs (free_partial).
++        // A failure here frees everything allocated so far — never partially
++        // constructs. width == 1 uploads the single i32 [0] (AR byte-identical).
++        let row_slot = match gpu.alloc_tensor(&[width * 4], DType::Raw) {
+             Ok(t) => t,
+             Err(e) => {
+                 Self::free_partial(gpu, &mut descs, &mut block_tables, &mut positions);
+                 return Err(format!("layerwise desc staging: row_slot alloc: {e:?}"));
+             }
+         };
+-        let zero = 0i32;
++        let zeros = vec![0i32; width];
+         if let Err(e) = gpu.hip.memcpy_htod(&row_slot.buf, unsafe {
+-            std::slice::from_raw_parts(&zero as *const i32 as *const u8, 4)
++            std::slice::from_raw_parts(zeros.as_ptr() as *const u8, width * 4)
+         }) {
+             let _ = gpu.free_tensor(row_slot);
+             Self::free_partial(gpu, &mut descs, &mut block_tables, &mut positions);
+@@ -457,6 +485,7 @@ impl LayerwiseDescStaging {
+             row_slot,
+             n_layers,
+             max_pages,
++            width,
+         })
+     }
+ 
+@@ -522,12 +551,16 @@ impl LayerwiseDescStaging {
+                 )
+             })
+             .map_err(|e| format!("layerwise desc staging: desc H2D layer {layer}: {e:?}"))?;
+-        // Compacted causal bound for the ported kernels (positions[] is
+-        // authoritative). seq_len == 0 → -1 (empty working set → empty partials).
+-        let pos = seq_len - 1;
++        // Compacted causal bounds for the ported kernels (positions[] is
++        // authoritative): row i of the active width-span binds seq_len-width+i.
++        // width == 1 → the single i32 [seq_len-1] (AR byte-identical); seq_len==0
++        // → -1 (empty working set → empty partials).
++        let bounds: Vec<i32> = (0..self.width)
++            .map(|i| seq_len - self.width as i32 + i as i32)
++            .collect();
+         gpu.hip
+             .memcpy_htod(&self.positions[layer].buf, unsafe {
+-                std::slice::from_raw_parts(&pos as *const i32 as *const u8, 4)
++                std::slice::from_raw_parts(bounds.as_ptr() as *const u8, self.width * 4)
+             })
+             .map_err(|e| format!("layerwise desc staging: positions H2D layer {layer}: {e:?}"))?;
+         Ok(())
+@@ -553,9 +586,10 @@ impl LayerwiseDescStaging {
+         })
+     }
+ 
+-    /// Layer `layer`'s compacted causal-bound tensor (one i32 `[seq_len - 1]`,
+-    /// stable address). Hand to the paged kernel as `positions` — it is the
+-    /// COMPACTED visible extent, not the real decode position (which drives RoPE).
++    /// Layer `layer`'s compacted causal-bound tensor (`width` i32
++    /// `[seq_len - width + i]`, stable address). Hand to the paged kernel as
++    /// `positions` — it is the COMPACTED visible extent, not the real decode
++    /// position (which drives RoPE). `width == 1` → the single i32 `[seq_len-1]`.
+     pub fn positions(&self, layer: usize) -> Result<&GpuTensor, String> {
+         self.positions.get(layer).ok_or_else(|| {
+             format!(
+@@ -573,8 +607,12 @@ impl LayerwiseDescStaging {
+     pub fn max_pages(&self) -> usize {
+         self.max_pages
+     }
+-    /// The single-sequence row→slot map (one i32 `[0]`, stable address). Hand to
+-    /// the paged writer/attention as `row_slot`.
++    /// Active evaluation rows per step (1 = AR decode, n = MTP verify span).
++    pub fn width(&self) -> usize {
++        self.width
++    }
++    /// The single-sequence row→slot map (`width` i32 all `[0]`, stable address).
++    /// Hand to the paged writer/attention as `row_slot`.
+     pub fn row_slot(&self) -> &GpuTensor {
+         &self.row_slot
+     }
+@@ -726,7 +764,10 @@ pub struct MassCapture {
+     /// The compact local begin of the sampled decode row
+     /// (`selected_pages * block_tokens + partial_tokens`).
+     local_begin: u64,
+-    /// The single decode evaluation row count (admission guarantees 1).
++    /// The physical evaluation row count (width): 1 for AR decode, n for an MTP
++    /// verify span (P4.1①). The output-pressure accept publishes the scheduler-
++    /// confirmed accepted PREFIX of these rows (partial acceptance); the prefill
++    /// accept requires the whole span (all-or-nothing).
+     eval_rows: u64,
+     /// The admitted sample schedule; empty ⇒ no capture/accept this step.
+     mass_rows: Vec<u32>,
+@@ -1516,6 +1557,74 @@ impl<'a> LayerwiseQuery<'a> {
+             .map_err(|e| format!("layerwise pressure accept: {e}"))
+     }
+ 
++    /// Accept the whole-model captured mass into a persistent OUTPUT-scope
++    /// pressure owner with PARTIAL (prefix) acceptance (P4.1①, design §A.6).
++    /// This is the MTP-verify sibling of [`Self::accept_pressure`]: the prefill
++    /// owner requires `accepted == count` (all-or-nothing, core
++    /// layerwise_pressure.cpp:79), so a verify span that rejects a draft suffix
++    /// MUST publish through [`OutputPressure`] instead. `begin` is the native
++    /// consumed-row frontier the owner was `prepare`d at; `accepted` is the
++    /// scheduler-confirmed prefix of the `eval_rows`-wide verifier batch. The
++    /// published `history.frontier == begin + accepted` (core
++    /// layerwise_pressure.cpp:340), `rows` is the captured sample schedule
++    /// (rejected rows ignored), and each FA layer contributes an [`OutputMass`]
++    /// (logical-start `history` + captured `masses`, no renormalization). Returns
++    /// the newly-accepted sampled-row bitmask (`Ok(0)` no-op when no pressure
++    /// owner backs the step or the `rows()` schedule is empty). The caller must
++    /// have `prepare`d the owner for this `request`/`begin` first; call AFTER the
++    /// forward (every layer's mass captured), BEFORE the carrier is freed.
++    pub fn accept_output_pressure(
++        &mut self,
++        pressure: &mut OutputPressure,
++        request: u64,
++        begin: u64,
++        accepted: u32,
++    ) -> Result<u64, String> {
++        let m = match self.mass.as_ref() {
++            Some(m) => m,
++            None => return Ok(0),
++        };
++        if m.mass_rows.is_empty() {
++            return Ok(0);
++        }
++        if accepted as u64 > m.eval_rows {
++            return Err(format!(
++                "layerwise output accept: accepted prefix {accepted} > eval_rows {}",
++                m.eval_rows
++            ));
++        }
++        let fa_layers = self.driver.fa_layers();
++        let mut layers = Vec::with_capacity(fa_layers.len());
++        for ordinal in 0..fa_layers.len() {
++            let pages = m.pages[ordinal]
++                .as_ref()
++                .ok_or_else(|| format!("layerwise output accept: layer {ordinal} not restored"))?;
++            let masses = m.masses[ordinal]
++                .as_ref()
++                .ok_or_else(|| format!("layerwise output accept: layer {ordinal} mass not captured"))?;
++            layers.push(OutputMass {
++                model_layer: fa_layers[ordinal],
++                history: pages.history.clone(),
++                masses: masses.clone(),
++            });
++        }
++        // Native consumed-row frontier: the prepare begin advanced by the
++        // accepted prefix (never the predicted-token +1). The core validates
++        // history.frontier == begin_ + accepted atomically before publishing.
++        let mut stamp = self.driver.canonical()[0].memory.stamp;
++        stamp.frontier = begin + accepted as u64;
++        let acceptance = OutputAcceptance {
++            history: stamp,
++            request,
++            accepted,
++            rows: m.mass_rows.clone(),
++            layers,
++        };
++        pressure
++            .accept(&acceptance)
++            .map_err(|e| format!("layerwise output accept: {e}"))
++    }
++
+     /// The per-ordinal restored canonical page ids (the keep-set contribution of
+     /// this step). Pressure mode ⇒ the pressure selection (`choice.selected`);
+     /// Query mode ⇒ the scorer's restored view blocks. The engine orchestration
+@@ -1714,8 +1823,47 @@ pub fn bootstrap_layerwise(
+     budget_blocks: u32,
+     record_bytes: u64,
+     resident: &[Vec<u64>],
++) -> Result<LayerwiseBootstrap, String> {
++    bootstrap_layerwise_rows(
++        fed, session_id, incarnation, seq, fa_layers, n_heads, n_kv_heads, head_dim,
++        budget_blocks, record_bytes, resident, 1, None,
++    )
++}
++
++/// Width-param bootstrap variant (P4.1①): `width` evaluation rows at the logical
++/// frontier (`evaluation = [frontier, frontier + width]`), and an optional absolute
++/// `query` intersection span (`None` ⇒ the whole evaluation span, the AR default).
++/// `width == 1, query == None` reproduces [`bootstrap_layerwise`] byte-for-byte.
++/// For an MTP verify span the caller passes the draft+bonus width and the true
++/// Query intersection; the core validates `query ⊆ evaluation` and ties
++/// `evaluation.begin == history.frontier`. Fails closed on `width == 0` or a
++/// `query` outside the evaluation span. The canonical history, specs, suffix page
++/// and `native_history_tokens` are width-independent (the verify span rides the
++/// single physical suffix stripe, `width ≤ block_tokens`).
++pub fn bootstrap_layerwise_rows(
++    fed: u32,
++    session_id: u64,
++    incarnation: u64,
++    seq: u64,
++    fa_layers: &[u32],
++    n_heads: u32,
++    n_kv_heads: u32,
++    head_dim: u32,
++    budget_blocks: u32,
++    record_bytes: u64,
++    resident: &[Vec<u64>],
++    width: u64,
++    query: Option<QueryRange>,
+ ) -> Result<LayerwiseBootstrap, String> {
+     let bt = LAYERWISE_BLOCK_TOKENS;
++    if width == 0 {
++        return Err("layerwise bootstrap: width == 0".to_string());
++    }
++    if width > bt as u64 {
++        return Err(format!(
++            "layerwise bootstrap: width {width} exceeds the suffix page ({bt} tokens)"
++        ));
++    }
+     if fa_layers.is_empty() {
+         return Err("layerwise bootstrap: empty fa_layers".to_string());
+     }
+@@ -1808,16 +1956,30 @@ pub fn bootstrap_layerwise(
+     // (layerwise_selection.cpp:88,90), and the layerwise selection index holds
+     // ONLY sealed full pages (`prepare_selection` requires total_tokens % block
+     // == 0 and every block full). So the frontier is the full-page boundary
+-    // `full_pages * 128` — NOT `fed` — and the single decode row is evaluated at
+-    // logical position `frontier`. The partial tail (`fed % 128` already-fed
+-    // tokens) is NOT part of the logical canonical frame: it lives only in the
+-    // statistics store and is restored as the physical suffix stripe (§3.9g),
+-    // extending the compacted causal bound by `partial_tokens + rows`.
++    // `full_pages * 128` — NOT `fed` — and the `width` evaluation rows are
++    // evaluated at logical positions `[frontier, frontier + width)` (width == 1
++    // is the single AR decode row at `frontier`). The partial tail (`fed % 128`
++    // already-fed tokens) is NOT part of the logical canonical frame: it lives
++    // only in the statistics store and is restored as the physical suffix stripe
++    // (§3.9g), extending the compacted causal bound by `partial_tokens + rows`.
++    let evaluation = QueryRange { begin: frontier, end: frontier + width };
++    let query_span = match query {
++        Some(q) => {
++            if q.begin < frontier || q.end > evaluation.end || q.begin > q.end {
++                return Err(format!(
++                    "layerwise bootstrap: query [{}, {}) outside evaluation [{}, {})",
++                    q.begin, q.end, evaluation.begin, evaluation.end
++                ));
++            }
++            q
++        }
++        None => evaluation,
++    };
+     let identity = LayerwiseIdentity {
+         history: base_stamp,
+         request: session_id + 1,
+-        evaluation: QueryRange { begin: frontier, end: frontier + 1 },
+-        query: QueryRange { begin: frontier, end: frontier + 1 },
++        evaluation,
++        query: query_span,
+     };
+     Ok(LayerwiseBootstrap {
+         canonical,
+@@ -3060,6 +3222,80 @@ mod tests {
+         assert_eq!(empty, vec![Vec::<u64>::new(), Vec::<u64>::new()]);
+     }
+ 
++    /// P4.1① multi-row seam (pure host, no GPU): `bootstrap_layerwise_rows`
++    /// evaluates `width` rows at the logical frontier with an optional absolute
++    /// query intersection, while the canonical history / specs / suffix /
++    /// native_history_tokens stay WIDTH-INDEPENDENT. `width == 1, query == None`
++    /// reproduces the AR `bootstrap_layerwise` identity byte-for-byte; the
++    /// fail-closed guards mirror the core's `query ⊆ evaluation` contract.
++    #[test]
++    fn bootstrap_rows_multi_row_span_and_width_one_identity() {
++        let fa = [3u32, 7, 11];
++        let resident = vec![vec![0u64, 1], vec![1, 2], vec![2, 3]];
++        let fed = 512u32; // 4 sealed pages → frontier 512, no partial tail
++        let bt = BT as u64;
++        let frontier = (fed / BT) as u64 * bt;
++        let rows = |width: u64, query: Option<QueryRange>| {
++            bootstrap_layerwise_rows(
++                fed, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, width, query,
++            )
++        };
++
++        // width=1/None == the AR delegator, identity field-for-field (Copy+Eq).
++        let ar = bootstrap_layerwise(
++            fed, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident,
++        )
++        .unwrap();
++        let one = rows(1, None).unwrap();
++        assert_eq!(one.identity, ar.identity, "width=1 must reproduce AR identity");
++        assert_eq!(one.identity.evaluation, QueryRange { begin: frontier, end: frontier + 1 });
++        assert_eq!(one.identity.query, one.identity.evaluation);
++        assert_eq!(one.suffix_page, ar.suffix_page);
++        assert_eq!(one.partial_tokens, ar.partial_tokens);
++        assert_eq!(one.native_history_tokens, ar.native_history_tokens);
++
++        // width=4 MTP verify span: evaluation rides [frontier, frontier+4).
++        let four = rows(4, None).unwrap();
++        assert_eq!(four.identity.evaluation, QueryRange { begin: frontier, end: frontier + 4 });
++        assert_eq!(four.identity.query, four.identity.evaluation);
++        // Canonical history / specs / suffix are WIDTH-INDEPENDENT (byte-neutral):
++        // only the evaluation/query span widens, never the restored history.
++        assert_eq!(four.suffix_page, one.suffix_page);
++        assert_eq!(four.partial_tokens, one.partial_tokens);
++        assert_eq!(four.native_history_tokens, one.native_history_tokens);
++        assert_eq!(four.canonical.len(), one.canonical.len());
++        for (a, b) in four.canonical.iter().zip(one.canonical.iter()) {
++            assert_eq!(a.model_layer, b.model_layer);
++            assert_eq!(a.memory.resident, b.memory.resident);
++            assert_eq!(a.memory.stamp.frontier, b.memory.stamp.frontier);
++        }
++        for (a, b) in four.specs.iter().zip(one.specs.iter()) {
++            assert_eq!(a.budget.selected_tokens, b.budget.selected_tokens);
++            assert_eq!(a.budget.device_tokens, b.budget.device_tokens);
++            assert_eq!(a.budget.host_payload_bytes, b.budget.host_payload_bytes);
++        }
++
++        // Custom absolute query intersection ⊆ evaluation (the true Query rows).
++        let sub = rows(4, Some(QueryRange { begin: frontier, end: frontier + 2 })).unwrap();
++        assert_eq!(sub.identity.evaluation, QueryRange { begin: frontier, end: frontier + 4 });
++        assert_eq!(sub.identity.query, QueryRange { begin: frontier, end: frontier + 2 });
++
++        // Fail-closed guards (core query ⊆ evaluation + width ≤ suffix page).
++        assert!(rows(0, None).is_err()); // width == 0
++        assert!(rows(bt + 1, None).is_err()); // width > suffix page
++        assert!(rows(4, Some(QueryRange { begin: frontier - 1, end: frontier + 2 })).is_err()); // begin < frontier
++        assert!(rows(4, Some(QueryRange { begin: frontier, end: frontier + 5 })).is_err()); // end > evaluation.end
++        assert!(rows(4, Some(QueryRange { begin: frontier + 2, end: frontier + 1 })).is_err()); // begin > end
++        assert!(bootstrap_layerwise_rows(
++            fed, 0, 0, 5, &[], Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None
++        )
++        .is_err()); // empty fa_layers
++        assert!(bootstrap_layerwise_rows(
++            64, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None
++        )
++        .is_err()); // fed < 128: no sealed history page
++    }
++
+     /// The bridge gathers Mean-K in enabled order, maps the native Q descriptor,
+     /// scores on-device, and scatters back with masked blocks = 0. Verified
+     /// against a DIRECT launcher call on the independently-gathered enabled
+@@ -4446,6 +4682,59 @@ mod tests {
+         arena.free(&mut gpu).expect("free arena");
+     }
+ 
++    /// P4.1① width-param staging geometry (GPU): `new_with_width(n)` widens the
++    /// per-layer compacted causal bounds to `n` i32 `[seq_len-n+i]` and the
++    /// row→slot map to `n` i32 `[0]`; `width == 1` is byte-identical to the AR
++    /// `new` staging. Fails closed on `width == 0`. (D4a proved the kernel reads
++    /// these bytes byte-exact; this isolates the width geometry primitive.)
++    #[test]
++    #[ignore]
++    fn layerwise_desc_staging_width_geometry() {
++        let mut gpu = Gpu::init().expect("gpu");
++        const NL: usize = 2;
++        const MAXP: usize = 4;
++        const W: usize = 4;
++        fn read_i32(gpu: &mut Gpu, t: &GpuTensor, n: usize) -> Vec<i32> {
++            let mut v = vec![0i32; n];
++            let bytes = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 4) };
++            gpu.hip.memcpy_dtoh_at(bytes, &t.buf, 0).expect("i32 d2h");
++            v
++        }
++        let staging =
++            LayerwiseDescStaging::new_with_width(&mut gpu, NL, MAXP, W).expect("staging");
++        assert_eq!(staging.width(), W);
++        assert_eq!(staging.n_layers(), NL);
++        // row→slot map: W i32 all [0] (single sequence), uploaded at construction.
++        assert_eq!(read_i32(&mut gpu, staging.row_slot(), W), vec![0i32; W]);
++        // seq_len = mapped pages × 128 (no suffix): 3 and 2 pages respectively.
++        let compact = [vec![2u32, 0, 3], vec![1u32, 3]];
++        let seq = [3 * 128i32, 2 * 128i32];
++        for layer in 0..NL {
++            staging
++                .update_layer(&mut gpu, layer, &compact[layer], None, seq[layer])
++                .expect("update");
++            // positions = [seq-W .. seq-1] (W compacted causal bounds).
++            let want: Vec<i32> = (0..W as i32).map(|i| seq[layer] - W as i32 + i).collect();
++            assert_eq!(
++                read_i32(&mut gpu, staging.positions(layer).expect("pos"), W),
++                want,
++                "positions layer {layer}"
++            );
++        }
++        staging.free_gpu(&mut gpu);
++
++        // width == 1 reproduces the AR staging byte-for-byte.
++        let ar = LayerwiseDescStaging::new(&mut gpu, NL, MAXP).expect("ar staging");
++        assert_eq!(ar.width(), 1);
++        assert_eq!(read_i32(&mut gpu, ar.row_slot(), 1), vec![0i32]);
++        ar.update_layer(&mut gpu, 0, &[0], None, 128).expect("ar update");
++        assert_eq!(read_i32(&mut gpu, ar.positions(0).expect("pos"), 1), vec![127]);
++        ar.free_gpu(&mut gpu);
++
++        // fail-closed: width == 0 rejects before any allocation.
++        assert!(LayerwiseDescStaging::new_with_width(&mut gpu, NL, MAXP, 0).is_err(), "width 0");
++    }
++
+     /// Shared GPU fixture for the Layerwise path-parity proofs (D4b-3). Path C
+     /// (the attend seam) and Path A (the whole non-escha paged forward) both
+     /// compare against the UNCHANGED legacy paged GQA decode over the identical
+@@ -6400,4 +6689,193 @@ mod tests {
+ 
+         gpu.free_tensor(q_dev).expect("free q");
+     }
++
++    /// P4.1① OutputPressure owner + multi-row PARTIAL acceptance (GPU). The MTP
++    /// verify sibling of `carrier_pressure_mass_accept_select_byte_exact`: a
++    /// width-4 evaluation span (`bootstrap_layerwise_rows`) captures a 4-row mass
++    /// matrix, and `accept_output_pressure` publishes the scheduler-confirmed
++    /// accepted PREFIX (accepted=1 of 4) into a persistent `OutputPressure` owner.
++    /// The core validates `history.frontier == begin + accepted` and only the
++    /// accepted row's mass conservation — exactly the partial-verify contract
++    /// (`PrefillPressure.accept` is all-or-nothing and cannot express this). The
++    /// carrier staging stays width-1 here (the attention causal-bound width is
++    /// proven separately by `layerwise_desc_staging_width_geometry`); mass capture
++    /// and output acceptance are width-independent. NOT wired to live serve in ①
++    /// — ② drives this from the real MTP verify span.
++    #[test]
++    #[ignore]
++    fn carrier_output_pressure_multi_row_partial_accept() {
++        use hipfire_kvmem::{
++            OutputOptions, OutputPressure, OutputScope, OutputScopeRow, OutputScopeState,
++            PrefillOptions,
++        };
++        use path_fixture::*;
++        use rdna_compute::kvmem_page_mass::PageMassScalar;
++
++        let mut gpu = Gpu::init().expect("gpu");
++        if gpu.arch != "gfx1100" {
++            // The ported scorer + mass kernel admit gfx1100 only.
++            return;
++        }
++
++        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
++        let full_pages = 3u32;
++        let budget_blocks = 1u32; // one-page resident budget
++        let frontier = full_pages as u64 * BT as u64; // 384
++        let width = 4u64;
++
++        // host store: 3 sealed canonical pages (mean-K sign trick selects one).
++        let policy = KvStore::new(&KvStoreConfig {
++            block_tokens: BT as u32,
++            select_budget: BT as u32,
++            sink_blocks: 0,
++            recent_blocks: 0,
++            ..Default::default()
++        })
++        .expect("policy");
++        policy.register_append(full_pages * BT as u32).expect("append");
++        let keys_storage = Storage::new_ram(16 << 20).expect("keys storage");
++        let keys = RawStore::new(q8.raw_config().clone(), Some(&keys_storage)).expect("keys");
++        keys.ensure_blocks(full_pages + 1).expect("ensure blocks");
++        for b in 0..full_pages {
++            for il in 0..NL {
++                keys.write_layer_k_gpu(b * BT as u32, BT as u32, il as u32, &pack(b, il as u32, false))
++                    .expect("feed K");
++                keys.write_layer_v_gpu(b * BT as u32, BT as u32, il as u32, &pack(b, il as u32, true))
++                    .expect("feed V");
++            }
++        }
++        for il in 0..NL {
++            for b in 0..full_pages {
++                let sign = if b == (2 - il as u32) { 1.0f32 } else { -1.0f32 };
++                let tile = vec![sign; BT * KVDIM];
++                keys.write_layer_mean_k(b * BT as u32, BT as u32, il as u32, &tile).expect("mean-k");
++            }
++        }
++
++        // Persistent OutputPressure owner: NonThinking semantic scope, interval=1
++        // (sample every body row), ninfer defaults otherwise.
++        let prefill_opts = PrefillOptions {
++            block_tokens: BT as u32,
++            select_tokens: budget_blocks as u64 * BT as u64,
++            reserve_tokens: BT as u64,
++            interval: 1024,
++            stride: 32,
++            half_life: 8192.0,
++        };
++        let mut pressure = OutputPressure::new_external(
++            SessionIdentity { id: 1, incarnation: 1 },
++            &[0, 1],
++            &prefill_opts,
++            &OutputOptions {
++                scope: OutputScope::NonThinking as u32,
++                interval: 1,
++                decay: 0.5,
++                commit_max_bytes: 16_777_216,
++            },
++        )
++        .expect("output pressure owner");
++
++        // width-4 verify span bootstrap (engine session 0/0 → core 1/1 == owner).
++        let bootstrap = bootstrap_layerwise_rows(
++            frontier as u32, 0, 0, 0, &[0, 1], NH as u32, KVH as u32, HD as u32,
++            budget_blocks, record_bytes, &[], width, None,
++        )
++        .expect("bootstrap rows");
++        assert_eq!(
++            bootstrap.identity.evaluation,
++            QueryRange { begin: frontier, end: frontier + width }
++        );
++        assert_eq!(bootstrap.native_history_tokens, BT as u64, "one selected page");
++        let local_begin = bootstrap.native_history_tokens; // 128
++
++        // Open the output window at the accepted frontier, then prepare 4 body
++        // rows: NonThinking + interval=1 samples all four (mask = 0b1111).
++        pressure
++            .begin_scope(&bootstrap.identity.history, 1, OutputScopeState::new(false, false))
++            .expect("begin_scope");
++        let scope_rows = vec![OutputScopeRow::new(false, false, true); width as usize];
++        let mask = pressure.prepare_scope(1, frontier, &scope_rows).expect("prepare_scope");
++        assert_eq!(mask, 0b1111, "all four verify rows sampled");
++        let mass_rows: Vec<u32> = (0..width as u32).collect();
++
++        // 4-row all-+1 Q tile (scorer pre-RoPE + mass post-RoPE).
++        let q_dev = upload_f32(&mut gpu, &vec![1.0f32; width as usize * QDIM]);
++        let native_q = NativeCurrentLayerQuery {
++            data: q_dev.buf.as_ptr() as *const std::ffi::c_void,
++            bytes: width as usize * QDIM * 4,
++            layer: 0,
++            rows: width as u32,
++            query_heads: NH as u32,
++            kv_heads: KVH as u32,
++            head_dim: HD as u32,
++            attention_scale: 0.0,
++            scalar: 0,
++            row_stride: QDIM * 4,
++            head_stride: HD * 4,
++            dimension_stride: 4,
++        };
++        let mass_q = PageMassQuery {
++            data: q_dev.buf.as_ptr() as *const std::ffi::c_void,
++            rows: width as u32,
++            query_heads: NH as u32,
++            kv_heads: KVH as u32,
++            head_dim: HD as u32,
++            attention_scale: 0.0,
++            scalar: PageMassScalar::F32,
++        };
++        let mass = MassCapture::new(NL, frontier, local_begin, width, mass_rows);
++        let n_slots = 1 + 2; // selected_pages(1) + suffix + headroom
++        let archive_bytes = (full_pages as u64 + 2) * record_bytes;
++        let mut carrier = LayerwiseQuery::build_with_pressure(
++            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
++            layerwise_capabilities(CTX as u32), bootstrap, n_slots, archive_bytes,
++            None, Some(mass),
++        )
++        .expect("build carrier");
++        let suffix_phys = carrier.suffix_slot.expect("suffix slot");
++
++        for ordinal in 0..NL {
++            let layer_q = NativeCurrentLayerQuery { layer: ordinal as u32, ..native_q };
++            carrier.restore_layer(&mut gpu, ordinal, &layer_q).expect("restore");
++            let pages = carrier.driver.arena().pool_ref().canonical_pages(ordinal).unwrap();
++            assert_eq!(pages.len(), 1, "layer {ordinal}: budget selects one page");
++            assert_eq!(pages[0], 2 - ordinal as u32, "layer {ordinal} mean-K selection");
++            // Write 4 suffix tokens (one per verify row) so every captured row
++            // sees a valid suffix K/V; row 0 is the proven single-row case.
++            let k_off = carrier.driver.arena().layout().layer_k_offset(suffix_phys as usize, ordinal).unwrap();
++            let v_off = carrier.driver.arena().layout().layer_v_offset(suffix_phys as usize, ordinal).unwrap();
++            gpu.hip.memcpy_htod_offset(&carrier.driver.arena().arena().buf, k_off, &pack(full_pages, ordinal as u32, false)[..width as usize * SEG]).expect("suffix K write");
++            gpu.hip.memcpy_htod_offset(&carrier.driver.arena().arena().buf, v_off, &pack(full_pages, ordinal as u32, true)[..width as usize * SEG]).expect("suffix V write");
++            carrier.capture_mass_layer(&mut gpu, ordinal, &mass_q).expect("capture mass");
++            carrier.attend_complete_layer(ordinal).expect("attend complete");
++        }
++
++        // Guard: an accepted prefix beyond the eval span fails closed (the
++        // carrier check, before any core state change).
++        assert!(
++            carrier.accept_output_pressure(&mut pressure, 1, frontier, width as u32 + 1).is_err(),
++            "accepted > eval_rows"
++        );
++
++        // PARTIAL acceptance: 1 of 4 verify rows confirmed. The core validates
++        // history.frontier == begin + accepted (384 + 1) and only row 0's mass
++        // conservation; rows 1-3 are captured but rejected (not yet accepted).
++        let newly = carrier
++            .accept_output_pressure(&mut pressure, 1, frontier, 1)
++            .expect("partial accept");
++        assert_eq!(newly, 0b1, "only the accepted prefix row is newly published");
++        let snap = pressure.snapshot().expect("snapshot").read().expect("read snap");
++        assert_eq!(snap.accepted_end, frontier + 1, "native consumed-row frontier (never predicted +1)");
++        assert_eq!(snap.layers.len(), NL);
++        for l in &snap.layers {
++            assert_eq!(l.samples, 1, "one accepted output row");
++            assert!(!l.pending.is_empty(), "accepted pending mass");
++            let sum: f64 = l.pending.iter().map(|(_, m)| m).sum();
++            assert!((sum - 1.0).abs() <= 0.005, "accepted row mass conserved: {sum}");
++        }
++        carrier.free(&mut gpu).expect("free carrier");
++        gpu.free_tensor(q_dev).expect("free q");
++    }
+ }
+\ No newline at end of file
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_layout.rs b/crates/hipfire-arch-qwen35/src/layerwise_layout.rs
+index a651509772510c04903bcbe62ad3877851e795d4..57c1a3de5d7c14ed6d532a8adba8900f59796346 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_layout.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_layout.rs
+@@ -25,6 +25,13 @@ use saddle_core::kv::{KvMode, SlotKvTierPlan};
+ /// Backend-owned manifest identity for the hipfire Q8 packed-page record.
+ pub const Q8_PACKED_FORMAT: &str = "hipfire-q8-packed-v1";
+ 
++/// Backend-owned manifest identity for the hipfire Q8 Main+aux MTP composite
++/// record (P4.1①). The hipfire analog of ninfer's `kvmem-main-mtp-pages-v4`: ONE
++/// composite host record co-archives the trunk (Main plane, `n_fa` layers) AND
++/// the MTP head (auxiliary plane, ONE layer) so accepted-only write-through seals
++/// both planes in a single record. The head shares the trunk's Q8 KV geometry.
++pub const Q8_MAIN_MTP_FORMAT: &str = "hipfire-q8-main-mtp-v1";
++
+ /// Tokens per composite page — the engine page size (`KV_BLOCK_TOKENS` /
+ /// `PAGE_TOKENS`). Kept as a literal here so the adapter has no legacy import.
+ pub const LAYERWISE_BLOCK_TOKENS: u32 = 128;
+@@ -118,7 +125,16 @@ impl LayerwiseQ8Layout {
+     /// Build the core generic `PayloadLayout` manifest (layer-major {Key, Value}
+     /// per fa layer). One record == one canonical page == one composite slot.
+     pub fn payload_layout(&self) -> Result<PayloadLayout, String> {
+-        PayloadLayout::from_raw(&self.raw_cfg, Q8_PACKED_FORMAT, &self.fa_layers)
++        self.payload_layout_with_format(Q8_PACKED_FORMAT)
++    }
++
++    /// Build the core generic `PayloadLayout` manifest under an explicit backend
++    /// format tag (P4.1①: the Main+aux MTP composite uses [`Q8_MAIN_MTP_FORMAT`]).
++    /// The plane geometry is identical regardless of tag — the tag is the core's
++    /// opaque provenance/admission key, so a composite record's Main and aux
++    /// planes map straight onto slot stripes with no repacking.
++    pub fn payload_layout_with_format(&self, format: &str) -> Result<PayloadLayout, String> {
++        PayloadLayout::from_raw(&self.raw_cfg, format, &self.fa_layers)
+             .map_err(|e| format!("layerwise Q8 layout: {e}"))
+     }
+ 
+@@ -137,6 +153,105 @@ impl LayerwiseQ8Layout {
+     }
+ }
+ 
++/// Main+aux composite Q8 layout (P4.1①): the trunk Main plane plus the MTP head's
++/// single auxiliary plane, manifested as ONE core record over `n_fa_layers + 1`
++/// layers (the head is the LAST ordinal). Clean sibling to [`LayerwiseQ8Layout`]
++/// — NOT wired into live serve in sub-patch ①; it reuses the trunk adapter's
++/// stride authority ([`SlotKvTierPlan::resolve`]) so the composite byte layout is
++/// provably identical to the core record (slot_bytes == record_bytes, plane
++/// offsets aligned). The head ALGORITHM is unchanged (full-history attention);
++/// only its KV RESIDENCY is re-architected (bounded pool + aux-plane co-archive,
++/// sub-patch ②). The Main plane is byte-identical to the standalone trunk record
++/// for the same ordinals, so a trunk-only restore is unaffected by the aux plane.
++#[derive(Debug, Clone)]
++pub struct LayerwiseMtpQ8Layout {
++    /// Trunk Main plane (`n_fa` layers, ordinals `0..n_fa`).
++    main: LayerwiseQ8Layout,
++    /// Composite Main+aux (`n_fa + 1` layers; head ordinal == `n_fa`).
++    composite: LayerwiseQ8Layout,
++    /// The head's auxiliary-plane layer ordinal (== `n_fa_layers`).
++    head_layer: u32,
++    n_fa_layers: usize,
++}
++
++impl LayerwiseMtpQ8Layout {
++    /// Resolve from model geometry. `n_fa_layers` is the trunk FA-layer count
++    /// (>= 1); the head adds ONE auxiliary plane at ordinal `n_fa_layers`. K/V
++    /// strides come from the engine's Q8 tier plan (shared by trunk and head).
++    /// Fails closed on bad geometry — never silently defaults.
++    pub fn resolve(
++        n_fa_layers: usize,
++        n_kv_heads: usize,
++        head_dim: usize,
++    ) -> Result<Self, String> {
++        if n_fa_layers == 0 {
++            return Err("layerwise MTP Q8 layout: n_fa_layers == 0".to_string());
++        }
++        let main_ordinals: Vec<u32> = (0..n_fa_layers as u32).collect();
++        let main = LayerwiseQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim, &main_ordinals)
++            .map_err(|e| format!("layerwise MTP Q8 layout (main): {e}"))?;
++        let head_layer = n_fa_layers as u32;
++        let mut composite_ordinals = main_ordinals;
++        composite_ordinals.push(head_layer);
++        let composite = LayerwiseQ8Layout::resolve(
++            n_fa_layers + 1,
++            n_kv_heads,
++            head_dim,
++            &composite_ordinals,
++        )
++        .map_err(|e| format!("layerwise MTP Q8 layout (composite): {e}"))?;
++        Ok(Self { main, composite, head_layer, n_fa_layers })
++    }
++
++    /// The trunk Main-plane adapter (ordinals `0..n_fa`, standalone Q8 format).
++    pub fn main(&self) -> &LayerwiseQ8Layout {
++        &self.main
++    }
++    /// The head's auxiliary-plane layer ordinal (== `n_fa_layers`).
++    pub fn head_layer(&self) -> u32 {
++        self.head_layer
++    }
++    /// The trunk FA-layer count (Main plane layers).
++    pub fn n_fa_layers(&self) -> usize {
++        self.n_fa_layers
++    }
++    /// The composite core store layer count (`n_fa_layers + 1`, Main + aux).
++    pub fn n_layer_total(&self) -> usize {
++        self.n_fa_layers + 1
++    }
++    /// Per-position K row bytes (shared trunk/head Q8 geometry).
++    pub fn k_stride(&self) -> usize {
++        self.composite.k_stride()
++    }
++    /// Per-position V row bytes (shared trunk/head Q8 geometry).
++    pub fn v_stride(&self) -> usize {
++        self.composite.v_stride()
++    }
++
++    /// The composite Main+aux core manifest under [`Q8_MAIN_MTP_FORMAT`]:
++    /// layer-major {Key, Value} for every trunk FA layer THEN the head's aux
++    /// plane. One record == one canonical page == one composite slot.
++    pub fn payload_layout(&self) -> Result<PayloadLayout, String> {
++        self.composite.payload_layout_with_format(Q8_MAIN_MTP_FORMAT)
++    }
++
++    /// The crate-agnostic packed arena geometry for `n_slots` composite slots
++    /// (`n_fa + 1` layers). Its `slot_bytes()` equals [`Self::payload_layout`]'s
++    /// `record_bytes()`; the head's aux plane is the LAST layer stripe per slot.
++    pub fn packed_arena_layout(&self, n_slots: usize) -> Result<PackedArenaLayout, String> {
++        self.composite.packed_arena_layout(n_slots)
++    }
++
++    /// Byte offset of the head's auxiliary K plane inside composite slot `slot`.
++    pub fn aux_k_offset(&self, arena: &PackedArenaLayout, slot: usize) -> Result<usize, String> {
++        arena.layer_k_offset(slot, self.n_fa_layers)
++    }
++    /// Byte offset of the head's auxiliary V plane inside composite slot `slot`.
++    pub fn aux_v_offset(&self, arena: &PackedArenaLayout, slot: usize) -> Result<usize, String> {
++        arena.layer_v_offset(slot, self.n_fa_layers)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -221,4 +336,96 @@ mod tests {
+             assert_eq!(arena.v_plane_bytes() as u64, v.bytes);
+         }
+     }
++
++    // ── P4.1① Main+aux MTP composite ──────────────────────────────────────
++    /// MTP composite fixture: 2 trunk FA layers + 1 head aux layer, Q8 geometry.
++    fn mtp_resolved() -> LayerwiseMtpQ8Layout {
++        LayerwiseMtpQ8Layout::resolve(2, 4, 256).unwrap()
++    }
++
++    #[test]
++    fn mtp_resolve_geometry_and_head_ordinal() {
++        let m = mtp_resolved();
++        assert_eq!(m.n_fa_layers(), 2);
++        assert_eq!(m.n_layer_total(), 3);
++        assert_eq!(m.head_layer(), 2);
++        assert_eq!(m.k_stride(), 1088);
++        assert_eq!(m.v_stride(), 1088);
++        // Main plane is the standalone trunk record (byte-identical ordinals).
++        assert_eq!(m.main().fa_layers(), &[0, 1]);
++        assert_eq!(m.main().k_stride(), 1088);
++    }
++
++    #[test]
++    fn mtp_composite_manifest_is_main_then_aux() {
++        let m = mtp_resolved();
++        let manifest = m.payload_layout().unwrap();
++        assert_eq!(manifest.block_tokens(), 128);
++        assert_eq!(manifest.plane_count(), 6); // (2 trunk + 1 head) × {K, V}
++        let plane_bytes = (1088 * 128) as u64;
++        assert_eq!(manifest.record_bytes(), 6 * plane_bytes);
++        // Layer-major {K,V}: trunk layers 0,1 then head aux layer 2.
++        let mut offset = 0u64;
++        for layer in 0..3u32 {
++            for kind in [PayloadPlaneKind::Key, PayloadPlaneKind::Value] {
++                let p = manifest.plane(layer * 2 + kind as u32).unwrap();
++                assert_eq!(p.layer, layer);
++                assert_eq!(p.kind, kind as u32);
++                assert_eq!(p.offset, offset);
++                assert_eq!(p.bytes, plane_bytes);
++                assert_eq!(p.token_stride, 1088);
++                offset += plane_bytes;
++            }
++        }
++        assert_eq!(offset, manifest.record_bytes());
++        // The head aux plane is the LAST layer (ordinal 2 == n_fa).
++        let aux_k = manifest.plane(m.head_layer() * 2).unwrap();
++        assert_eq!(aux_k.layer, 2);
++        assert_eq!(aux_k.offset, 4 * plane_bytes);
++    }
++
++    #[test]
++    fn mtp_composite_arena_matches_core_record() {
++        let m = mtp_resolved();
++        let manifest = m.payload_layout().unwrap();
++        let arena = m.packed_arena_layout(8).unwrap();
++        assert_eq!(arena.slot_bytes() as u64, manifest.record_bytes());
++        assert_eq!(arena.n_layers(), 3);
++        assert_eq!(arena.arena_bytes(), 8 * arena.slot_bytes());
++        // Head aux plane offsets == the manifest's last-layer plane offsets.
++        for slot in 0..8usize {
++            let aux_k = manifest.plane(m.head_layer() * 2).unwrap();
++            let aux_v = manifest.plane(m.head_layer() * 2 + 1).unwrap();
++            let base = (slot * arena.slot_bytes()) as u64;
++            assert_eq!(m.aux_k_offset(&arena, slot).unwrap() as u64, base + aux_k.offset);
++            assert_eq!(m.aux_v_offset(&arena, slot).unwrap() as u64, base + aux_v.offset);
++        }
++    }
++
++    #[test]
++    fn mtp_main_plane_byte_identical_to_trunk_record() {
++        let m = mtp_resolved();
++        let composite = m.payload_layout().unwrap();
++        let trunk = m.main().payload_layout().unwrap();
++        // The first n_fa layers' planes are identical in both manifests.
++        for layer in 0..m.n_fa_layers() as u32 {
++            for kind in [PayloadPlaneKind::Key, PayloadPlaneKind::Value] {
++                let c = composite.plane(layer * 2 + kind as u32).unwrap();
++                let t = trunk.plane(layer * 2 + kind as u32).unwrap();
++                assert_eq!(c.offset, t.offset);
++                assert_eq!(c.bytes, t.bytes);
++                assert_eq!(c.token_stride, t.token_stride);
++            }
++        }
++        // Composite record == trunk record + one aux layer {K,V}.
++        let plane_bytes = (1088 * 128) as u64;
++        assert_eq!(composite.record_bytes(), trunk.record_bytes() + 2 * plane_bytes);
++    }
++
++    #[test]
++    fn mtp_rejects_bad_geometry() {
++        assert!(LayerwiseMtpQ8Layout::resolve(0, 4, 256).is_err()); // no trunk
++        assert!(LayerwiseMtpQ8Layout::resolve(2, 4, 100).is_err()); // head_dim % 32
++        assert!(LayerwiseMtpQ8Layout::resolve(2, 0, 256).is_err()); // zero KV heads
++    }
+ }
+\ No newline at end of file
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_mtp.rs b/crates/hipfire-arch-qwen35/src/layerwise_mtp.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa235454ff103c4bde13625277a6da63b8b389f3
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/layerwise_mtp.rs
+@@ -0,0 +1,426 @@
++//! Layerwise MTP history policy + auxiliary-selection binding primitives
++//! (Phase 4.1 ① mtp-foundation).
++//!
++//! Pure-host, additive foundation for the independent MTP head's draft-owned
++//! K/V history selection. Mirrors the core `kvmem/layerwise_mtp.hpp` policy
++//! enum/parse/validate and ninfer's `bind_auxiliary_selection` guard
++//! (ninfer-layerwise-recall.patch NL:10189-10204) + FirstLayer source rule
++//! (NL:9985-9990). NOT wired into live serve in ①: the bound IDs are produced
++//! and validated here; ② feeds them into the head's `LayerWorkingSetPlan`
++//! (`plan_layer`) and ③ adds the UpstreamGlobal private probe. The default
++//! Legacy serve never constructs any of this, so it stays byte-neutral.
++//!
++//! Two user-approved history alternatives (core layerwise_mtp.hpp:10-19): both
++//! leave the target's fresh-Q selection unchanged and restore the head's OWN
++//! canonical K/V for the selected original token IDs.
++//!   * FirstLayer (ninfer default) — NO private probe; the head history is bound
++//!     from the FIRST target FA layer's restored view (cheap reuse of the real
++//!     forward's first-layer restore).
++//!   * UpstreamGlobal — a SEPARATE private target probe pass before the real
++//!     Query (core `LayerwiseProbeSelection` global Mean-K reduction). The probe
++//!     subsystem lands in ③; ① only carries the policy + the fail-closed guard
++//!     that rejects supplied target IDs.
++
++use crate::kvmem_ctl::RecallStrategy;
++
++/// MTP head history policy. Ordinals mirror the core `kvmem::LayerwiseMtpHistory`
++/// (layerwise_mtp.hpp:15-19) exactly so a future shim entry can pass the raw u8
++/// without translation.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u8)]
++pub enum LayerwiseMtpHistory {
++    Unspecified = 0,
++    UpstreamGlobal = 1,
++    FirstLayer = 2,
++}
++
++impl LayerwiseMtpHistory {
++    /// Core `layerwise_mtp_history_name` (layerwise_mtp.hpp:21-28).
++    pub fn name(self) -> &'static str {
++        match self {
++            Self::Unspecified => "unspecified",
++            Self::UpstreamGlobal => "upstream-global",
++            Self::FirstLayer => "first-layer",
++        }
++    }
++
++    /// Core `parse_layerwise_mtp_history` (layerwise_mtp.hpp:30-35). The CLI
++    /// wrapper trims before calling; the literal spellings are exact.
++    pub fn parse(text: &str) -> Result<Self, String> {
++        match text {
++            "upstream-global" => Ok(Self::UpstreamGlobal),
++            "first-layer" => Ok(Self::FirstLayer),
++            _ => Err("layerwise MTP history must be upstream-global or first-layer".to_string()),
++        }
++    }
++
++    /// Core `validate_layerwise_mtp_history` (layerwise_mtp.hpp:37-43): a
++    /// resolved policy requires Layerwise recall AND native MTP; Layerwise+MTP
++    /// with an unresolved policy is an error (the backend must declare a default).
++    pub fn validate(self, strategy: RecallStrategy, mtp_enabled: bool) -> Result<(), String> {
++        if self != Self::Unspecified && (!strategy.is_layerwise() || !mtp_enabled) {
++            return Err(
++                "--kvmem-layerwise-mtp-history requires layerwise recall and native MTP".to_string(),
++            );
++        }
++        if strategy.is_layerwise() && mtp_enabled && self == Self::Unspecified {
++            return Err("layerwise MTP policy was not resolved; select --kvmem-layerwise-mtp-history upstream-global|first-layer or use a backend-declared default".to_string());
++        }
++        Ok(())
++    }
++
++    /// ninfer FirstLayer auto-default (NL:201/13468/14019): Layerwise+MTP with an
++    /// omitted policy resolves to FirstLayer, then validates. Any other state is
++    /// returned unchanged for `validate` to accept/reject. Pure so the resolution
++    /// contract is testable without the process-start config snapshot.
++    pub fn resolve_default(
++        self,
++        strategy: RecallStrategy,
++        mtp_enabled: bool,
++    ) -> Result<Self, String> {
++        let resolved = if strategy.is_layerwise() && mtp_enabled && self == Self::Unspecified {
++            Self::FirstLayer
++        } else {
++            self
++        };
++        resolved.validate(strategy, mtp_enabled)?;
++        Ok(resolved)
++    }
++
++    /// UpstreamGlobal needs its own private target probe (③); FirstLayer reuses
++    /// the real forward's first-layer restore and never probes.
++    pub fn requires_private_probe(self) -> bool {
++        matches!(self, Self::UpstreamGlobal)
++    }
++}
++
++/// Pure-host mirror of ninfer `KvmemLayerViews::visible_tokens(pages, frontier)`
++/// (NL:12239-12249), with the block size parameterized (hipfire Q8 page = 128
++/// tokens vs ninfer's 64). `pages` are canonical block IDs in chronological
++/// order; each contributes `min(block_tokens, frontier - id*block_tokens)`
++/// visible tokens, so the final block is clipped to the accepted frontier. Fails
++/// closed on a non-chronological map (duplicate/decreasing ID) or a block that
++/// starts at/beyond the frontier — exactly ninfer's "not a chronological accepted
++/// view" guard. This subsumes ninfer's separate is_sorted/adjacent_find checks in
++/// `bind_auxiliary_selection` (NL:10193-10194).
++pub fn auxiliary_visible_tokens(
++    pages: &[u32],
++    frontier: u64,
++    block_tokens: u64,
++) -> Result<u64, String> {
++    if block_tokens == 0 {
++        return Err("auxiliary visible tokens: block_tokens must be positive".to_string());
++    }
++    let mut total = 0u64;
++    let mut previous = 0u32;
++    let mut first = true;
++    for &id in pages {
++        let begin = id as u64 * block_tokens;
++        if (!first && id <= previous) || begin >= frontier {
++            return Err("native layer map is not a chronological accepted view".to_string());
++        }
++        total += (frontier - begin).min(block_tokens);
++        previous = id;
++        first = false;
++    }
++    Ok(total)
++}
++
++/// Pure-host auxiliary(head)-selection bind primitive. Mirrors the VALIDATION
++/// half of ninfer `bind_auxiliary_selection` (NL:10189-10204): the selected
++/// canonical IDs must cover exactly the one target historical extent, be
++/// chronological/unique, bind once, and require an actual head pool. The live
++/// `LayerWorkingSetPlan` construction from the head catalog (the second half of
++/// ninfer's bind) is ②'s wiring; ① produces and validates the bound IDs only.
++#[derive(Debug, Clone)]
++pub struct AuxiliarySelection {
++    history_tokens: u64,
++    block_tokens: u64,
++    has_head_pool: bool,
++    bound: Option<Vec<u32>>,
++}
++
++impl AuxiliarySelection {
++    pub fn new(history_tokens: u64, block_tokens: u64, has_head_pool: bool) -> Self {
++        Self { history_tokens, block_tokens, has_head_pool, bound: None }
++    }
++
++    /// Bind the head history to `selected` canonical block IDs covering
++    /// `[0, frontier)`. Fail-closed mirrors of ninfer's guards:
++    ///   * no head pool → "native auxiliary selection has no actual auxiliary
++    ///     pool" (NL:9963-9964)
++    ///   * already bound → bind-once (ninfer `auxiliary_plan` non-null, NL:10191)
++    ///   * extent ≠ history_tokens / non-chronological / duplicate → "native MTP
++    ///     history binding differs from the one selected target extent"
++    ///     (NL:10192-10195)
++    pub fn bind(&mut self, selected: &[u32], frontier: u64) -> Result<(), String> {
++        if !self.has_head_pool {
++            return Err("native auxiliary selection has no actual auxiliary pool".to_string());
++        }
++        if self.bound.is_some() {
++            return Err(
++                "native MTP history binding differs from the one selected target extent".to_string(),
++            );
++        }
++        let visible = auxiliary_visible_tokens(selected, frontier, self.block_tokens)?;
++        if visible != self.history_tokens {
++            return Err(
++                "native MTP history binding differs from the one selected target extent".to_string(),
++            );
++        }
++        self.bound = Some(selected.to_vec());
++        Ok(())
++    }
++
++    pub fn is_bound(&self) -> bool {
++        self.bound.is_some()
++    }
++
++    pub fn selected(&self) -> Option<&[u32]> {
++        self.bound.as_deref()
++    }
++
++    pub fn history_tokens(&self) -> u64 {
++        self.history_tokens
++    }
++}
++
++/// One target FA layer's restored view, as the aux-binding source. `model_layer`
++/// is the core model-layer ordinal; `restored_ids` are the canonical block IDs
++/// the real forward restored for that layer (chronological).
++#[derive(Debug, Clone)]
++pub struct SourceLayerView {
++    pub model_layer: u32,
++    pub restored_ids: Vec<u32>,
++}
++
++/// Policy admission for a supplied auxiliary selection (ninfer NL:9900-9902,
++/// 9925-9927). FirstLayer binds from the first target layer's restore and cannot
++/// accept a preselected history; UpstreamGlobal requires its own private probe
++/// and cannot accept supplied target IDs. An empty preselection is always
++/// admitted (the normal path: the source is derived, not supplied).
++pub fn admit_auxiliary_source(
++    policy: LayerwiseMtpHistory,
++    preselected: &[u32],
++) -> Result<(), String> {
++    if preselected.is_empty() {
++        return Ok(());
++    }
++    match policy {
++        LayerwiseMtpHistory::FirstLayer => {
++            Err("first-layer MTP cannot accept a preselected auxiliary history".to_string())
++        }
++        LayerwiseMtpHistory::UpstreamGlobal => Err(
++            "upstream-global MTP requires its own private probe, not supplied target IDs".to_string(),
++        ),
++        LayerwiseMtpHistory::Unspecified => Err(
++            "layerwise MTP policy was not resolved; cannot admit an auxiliary selection".to_string(),
++        ),
++    }
++}
++
++/// FirstLayer source rule (ninfer NL:9985-9990): the head history is bound from
++/// the FIRST target FA layer's restored block IDs. Returns that first layer's
++/// IDs; fails closed if no source layer was restored. The caller binds them via
++/// `AuxiliarySelection::bind` only when `model == source_layers.front()` and the
++/// policy is FirstLayer (the live restore-hook condition, wired in ②).
++pub fn first_layer_auxiliary_ids(source_layers: &[SourceLayerView]) -> Result<&[u32], String> {
++    source_layers
++        .first()
++        .map(|s| s.restored_ids.as_slice())
++        .ok_or_else(|| {
++            "native Query restored no target layer for first-layer MTP binding".to_string()
++        })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    // ── policy enum: core mirror ──────────────────────────────────────────
++    #[test]
++    fn policy_ordinals_and_names_mirror_core() {
++        assert_eq!(LayerwiseMtpHistory::Unspecified as u8, 0);
++        assert_eq!(LayerwiseMtpHistory::UpstreamGlobal as u8, 1);
++        assert_eq!(LayerwiseMtpHistory::FirstLayer as u8, 2);
++        assert_eq!(LayerwiseMtpHistory::Unspecified.name(), "unspecified");
++        assert_eq!(LayerwiseMtpHistory::UpstreamGlobal.name(), "upstream-global");
++        assert_eq!(LayerwiseMtpHistory::FirstLayer.name(), "first-layer");
++    }
++
++    #[test]
++    fn policy_parse_exact_spellings() {
++        assert_eq!(LayerwiseMtpHistory::parse("first-layer").unwrap(), LayerwiseMtpHistory::FirstLayer);
++        assert_eq!(LayerwiseMtpHistory::parse("upstream-global").unwrap(), LayerwiseMtpHistory::UpstreamGlobal);
++        // Core parse is exact: no case-fold, no alias, no empty.
++        assert!(LayerwiseMtpHistory::parse("FirstLayer").is_err());
++        assert!(LayerwiseMtpHistory::parse("first_layer").is_err());
++        assert!(LayerwiseMtpHistory::parse("").is_err());
++        assert!(LayerwiseMtpHistory::parse("legacy").is_err());
++    }
++
++    #[test]
++    fn policy_validate_requires_layerwise_and_mtp() {
++        use RecallStrategy::{Legacy, Layerwise};
++        // A resolved policy needs BOTH layerwise recall and native MTP.
++        assert!(LayerwiseMtpHistory::FirstLayer.validate(Legacy, true).is_err());
++        assert!(LayerwiseMtpHistory::FirstLayer.validate(Layerwise, false).is_err());
++        assert!(LayerwiseMtpHistory::FirstLayer.validate(Layerwise, true).is_ok());
++        assert!(LayerwiseMtpHistory::UpstreamGlobal.validate(Layerwise, true).is_ok());
++        // Unspecified is fine off the layerwise+MTP path...
++        assert!(LayerwiseMtpHistory::Unspecified.validate(Legacy, false).is_ok());
++        assert!(LayerwiseMtpHistory::Unspecified.validate(Legacy, true).is_ok());
++        // ...but unresolved ON layerwise+MTP is an error (must declare a default).
++        assert!(LayerwiseMtpHistory::Unspecified.validate(Layerwise, true).is_err());
++    }
++
++    #[test]
++    fn policy_resolve_default_first_layer() {
++        use RecallStrategy::{Legacy, Layerwise};
++        // ninfer auto-default: layerwise+MTP+omitted → FirstLayer.
++        assert_eq!(
++            LayerwiseMtpHistory::Unspecified.resolve_default(Layerwise, true).unwrap(),
++            LayerwiseMtpHistory::FirstLayer
++        );
++        // An explicit policy is preserved.
++        assert_eq!(
++            LayerwiseMtpHistory::UpstreamGlobal.resolve_default(Layerwise, true).unwrap(),
++            LayerwiseMtpHistory::UpstreamGlobal
++        );
++        assert_eq!(
++            LayerwiseMtpHistory::FirstLayer.resolve_default(Layerwise, true).unwrap(),
++            LayerwiseMtpHistory::FirstLayer
++        );
++        // Off the layerwise+MTP path an omitted policy stays omitted (Legacy neutral).
++        assert_eq!(
++            LayerwiseMtpHistory::Unspecified.resolve_default(Legacy, false).unwrap(),
++            LayerwiseMtpHistory::Unspecified
++        );
++        assert_eq!(
++            LayerwiseMtpHistory::Unspecified.resolve_default(Legacy, true).unwrap(),
++            LayerwiseMtpHistory::Unspecified
++        );
++        // A resolved policy off-path is still rejected by validate.
++        assert!(LayerwiseMtpHistory::FirstLayer.resolve_default(Legacy, true).is_err());
++    }
++
++    #[test]
++    fn policy_requires_private_probe() {
++        assert!(LayerwiseMtpHistory::UpstreamGlobal.requires_private_probe());
++        assert!(!LayerwiseMtpHistory::FirstLayer.requires_private_probe());
++        assert!(!LayerwiseMtpHistory::Unspecified.requires_private_probe());
++    }
++
++    // ── extent helper: ninfer visible_tokens mirror ───────────────────────
++    #[test]
++    fn visible_tokens_clips_last_block() {
++        // 300 tokens over 128-token blocks: 128 + 128 + 44.
++        assert_eq!(auxiliary_visible_tokens(&[0, 1, 2], 300, 128).unwrap(), 300);
++        // Exact full blocks.
++        assert_eq!(auxiliary_visible_tokens(&[0, 1], 256, 128).unwrap(), 256);
++        // ninfer's native 64-token block geometry also works.
++        assert_eq!(auxiliary_visible_tokens(&[0, 1, 2], 150, 64).unwrap(), 150);
++    }
++
++    #[test]
++    fn visible_tokens_empty_is_zero() {
++        assert_eq!(auxiliary_visible_tokens(&[], 300, 128).unwrap(), 0);
++    }
++
++    #[test]
++    fn visible_tokens_rejects_non_chronological() {
++        assert!(auxiliary_visible_tokens(&[1, 0], 300, 128).is_err()); // decreasing
++        assert!(auxiliary_visible_tokens(&[0, 0], 300, 128).is_err()); // duplicate
++        assert!(auxiliary_visible_tokens(&[2], 256, 128).is_err()); // begin >= frontier
++        assert!(auxiliary_visible_tokens(&[0, 1, 2], 300, 0).is_err()); // zero block
++    }
++
++    // ── bind primitive: ninfer bind_auxiliary_selection guard ─────────────
++    #[test]
++    fn bind_covers_exact_extent() {
++        let mut sel = AuxiliarySelection::new(300, 128, true);
++        assert!(!sel.is_bound());
++        assert_eq!(sel.history_tokens(), 300);
++        sel.bind(&[0, 1, 2], 300).unwrap();
++        assert!(sel.is_bound());
++        assert_eq!(sel.selected(), Some(&[0u32, 1, 2][..]));
++    }
++
++    #[test]
++    fn bind_requires_head_pool() {
++        let mut sel = AuxiliarySelection::new(300, 128, false);
++        let err = sel.bind(&[0, 1, 2], 300).unwrap_err();
++        assert!(err.contains("no actual auxiliary pool"), "{err}");
++        assert!(!sel.is_bound());
++    }
++
++    #[test]
++    fn bind_is_once() {
++        let mut sel = AuxiliarySelection::new(300, 128, true);
++        sel.bind(&[0, 1, 2], 300).unwrap();
++        assert!(sel.bind(&[0, 1, 2], 300).is_err(), "bind-once");
++    }
++
++    #[test]
++    fn bind_rejects_wrong_extent() {
++        let mut sel = AuxiliarySelection::new(300, 128, true);
++        // [0,1] covers 256 ≠ 300.
++        let err = sel.bind(&[0, 1], 300).unwrap_err();
++        assert!(err.contains("differs from the one selected target extent"), "{err}");
++        assert!(!sel.is_bound());
++    }
++
++    #[test]
++    fn bind_rejects_non_chronological() {
++        let mut sel = AuxiliarySelection::new(300, 128, true);
++        assert!(sel.bind(&[1, 0, 2], 300).is_err());
++        assert!(sel.bind(&[0, 0, 2], 300).is_err());
++    }
++
++    // ── policy admission + FirstLayer source rule ─────────────────────────
++    #[test]
++    fn admit_empty_preselection_always_ok() {
++        assert!(admit_auxiliary_source(LayerwiseMtpHistory::FirstLayer, &[]).is_ok());
++        assert!(admit_auxiliary_source(LayerwiseMtpHistory::UpstreamGlobal, &[]).is_ok());
++    }
++
++    #[test]
++    fn admit_rejects_preselected_per_policy() {
++        let err = admit_auxiliary_source(LayerwiseMtpHistory::FirstLayer, &[0, 1]).unwrap_err();
++        assert!(err.contains("first-layer MTP cannot accept a preselected"), "{err}");
++        let err = admit_auxiliary_source(LayerwiseMtpHistory::UpstreamGlobal, &[0, 1]).unwrap_err();
++        assert!(err.contains("requires its own private probe"), "{err}");
++        assert!(admit_auxiliary_source(LayerwiseMtpHistory::Unspecified, &[0]).is_err());
++    }
++
++    #[test]
++    fn first_layer_ids_come_from_front() {
++        let sources = vec![
++            SourceLayerView { model_layer: 4, restored_ids: vec![0, 1, 2] },
++            SourceLayerView { model_layer: 8, restored_ids: vec![3, 4] },
++        ];
++        assert_eq!(first_layer_auxiliary_ids(&sources).unwrap(), &[0u32, 1, 2]);
++        assert!(first_layer_auxiliary_ids(&[]).is_err());
++    }
++
++    #[test]
++    fn first_layer_bind_end_to_end() {
++        // Pure-host fixture of the ② restore-hook flow: resolve policy, admit the
++        // (empty) supplied source, derive IDs from the first restored FA layer,
++        // bind them against the target extent. No GPU, no live serve.
++        let policy = LayerwiseMtpHistory::Unspecified
++            .resolve_default(RecallStrategy::Layerwise, true)
++            .unwrap();
++        assert_eq!(policy, LayerwiseMtpHistory::FirstLayer);
++        assert!(!policy.requires_private_probe());
++        admit_auxiliary_source(policy, &[]).unwrap();
++        let sources = vec![
++            SourceLayerView { model_layer: 4, restored_ids: vec![0, 1, 2] },
++            SourceLayerView { model_layer: 8, restored_ids: vec![0, 1, 2] },
++        ];
++        let ids = first_layer_auxiliary_ids(&sources).unwrap();
++        let mut sel = AuxiliarySelection::new(300, 128, true);
++        sel.bind(ids, 300).unwrap();
++        assert_eq!(sel.selected(), Some(&[0u32, 1, 2][..]));
++    }
++}
+\ No newline at end of file
+diff --git a/crates/hipfire-arch-qwen35/src/lib.rs b/crates/hipfire-arch-qwen35/src/lib.rs
+index 4693f23fa5ef0d8c8974a413dc9c23685036f228..ff7a616c2930921d667bdc06f2fefd393719416b 100644
+--- a/crates/hipfire-arch-qwen35/src/lib.rs
++++ b/crates/hipfire-arch-qwen35/src/lib.rs
+@@ -126,6 +126,15 @@ pub mod layerwise_layout;
+ /// gated on `RecallStrategy::Layerwise` so the default Legacy serve is untouched.
+ #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+ pub mod layerwise_driver;
++/// Layerwise MTP history policy + auxiliary-selection binding primitives
++/// (Phase 4.1 ① mtp-foundation). Pure-host mirror of the core
++/// `layerwise_mtp.hpp` policy enum/parse/validate and ninfer's
++/// `bind_auxiliary_selection` guard + FirstLayer source rule. Additive sibling
++/// to `layerwise_layout`/`layerwise_driver`; NOT wired into live serve in ①
++/// (② binds the head plan, ③ adds the UpstreamGlobal private probe), so the
++/// default Legacy serve never constructs it and stays byte-neutral.
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++pub mod layerwise_mtp;
+ /// Threaded Layerwise forward handle (Phase 3.2 ②-D4b). With `kvmem` it carries
+ /// the per-query driver+staging bundle through the shared forward spine exactly
+ /// like `SpecVerifyCapture`; without it, a zero-sized placeholder so the
+diff --git a/crates/rdna-compute/src/layerwise_pool.rs b/crates/rdna-compute/src/layerwise_pool.rs
+index 9733b21e01fb088f3fc7c25c3560067b26dfd044..d6d3f984e6ce05f82d8cb479a3de23bfb01a06bf 100644
+--- a/crates/rdna-compute/src/layerwise_pool.rs
++++ b/crates/rdna-compute/src/layerwise_pool.rs
+@@ -554,6 +554,64 @@ impl LayerwisePagePool {
+     }
+ }
+ 
++// =========================================================================
++// MTP head bounded-pool geometry (P4.1①)
++// =========================================================================
++
++/// Head bounded-pool token capacity (P4.1①, the hipfire analog of ninfer's
++/// `layerwise_mtp_auxiliary_capacity`): the trunk layerwise working-set window
++/// (`main_capacity` tokens) PLUS ONE native draft-scratch block (`block_tokens`).
++///
++/// Under Layerwise the MTP head is BOUNDED to the trunk window — accepted head
++/// history beyond the window is co-archived to the composite record's aux plane
++/// and restored-before-attend (sub-patch ②), never kept full-resident. The single
++/// scratch block holds the in-flight draft span (≤ 64 rows ninfer / ≤ 15 hipfire
++/// MTP draft). The head ALGORITHM is unchanged (full-history attention preserved
++/// via restore); only its KV residency is bounded.
++///
++/// Fails closed (never panics) on a zero `main_capacity`/`block_tokens`, a
++/// `main_capacity` that is not a whole number of pages (the window must be
++/// page-aligned so the scratch is exactly one extra page), or an overflow.
++pub fn mtp_auxiliary_capacity(main_capacity: usize, block_tokens: usize) -> Result<usize, String> {
++    if main_capacity == 0 {
++        return Err("mtp auxiliary capacity: main_capacity (trunk window) must be positive".to_string());
++    }
++    if block_tokens == 0 {
++        return Err("mtp auxiliary capacity: block_tokens must be positive".to_string());
++    }
++    if main_capacity % block_tokens != 0 {
++        return Err(format!(
++            "mtp auxiliary capacity: main_capacity {main_capacity} is not page-aligned \
++             (block_tokens {block_tokens}); cannot admit one native auxiliary scratch block"
++        ));
++    }
++    main_capacity.checked_add(block_tokens).ok_or_else(|| {
++        "mtp auxiliary capacity: main_capacity + block_tokens overflows usize".to_string()
++    })
++}
++
++/// Build the MTP head's bounded composite-slot pool (P4.1①): ONE fa layer (the
++/// head aux plane), `window_tokens` of accepted history + one draft-scratch
++/// block. Reuses [`PackedArenaLayout`] + [`LayerwisePagePool`] — the head is a
++/// 1-layer composite, so it inherits the same generation handles, per-layer
++/// stripe residency and intrinsic drop-evict as the trunk pool. The slot count is
++/// `window_tokens / block_tokens + 1` (window pages + one scratch page); the head
++/// owns this pool independently of the trunk (ninfer's independent resident map +
++/// `LayerWorkingSetPlan`, quota = window). Pure host geometry — CPU-unit-testable;
++/// sub-patch ② drives it from the head restore/pressure path.
++pub fn mtp_head_pool(
++    window_tokens: usize,
++    block_tokens: usize,
++    k_stride: usize,
++    v_stride: usize,
++) -> Result<LayerwisePagePool, String> {
++    let aux_capacity = mtp_auxiliary_capacity(window_tokens, block_tokens)?;
++    // aux_capacity is page-aligned (window aligned + one block), so this is exact.
++    let n_slots = aux_capacity / block_tokens;
++    let layout = PackedArenaLayout::new(n_slots, 1, block_tokens, k_stride, v_stride)?;
++    LayerwisePagePool::new(layout)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -750,4 +808,69 @@ mod tests {
+         pool.free_slot(h).unwrap();
+         assert!(pool.free_slot(h).is_err(), "double free / stale handle");
+     }
++
++    // ── P4.1① MTP head bounded-pool geometry ──────────────────────────────
++    #[test]
++    fn mtp_auxiliary_capacity_is_window_plus_one_block() {
++        // ninfer layerwise_mtp_auxiliary_capacity: main_capacity + one block.
++        assert_eq!(mtp_auxiliary_capacity(512, 128).unwrap(), 640);
++        assert_eq!(mtp_auxiliary_capacity(128, 128).unwrap(), 256);
++        assert_eq!(mtp_auxiliary_capacity(16, 4).unwrap(), 20); // small fixture page
++    }
++
++    #[test]
++    fn mtp_auxiliary_capacity_fails_closed() {
++        assert!(mtp_auxiliary_capacity(0, 128).is_err()); // zero window
++        assert!(mtp_auxiliary_capacity(512, 0).is_err()); // zero block
++        assert!(mtp_auxiliary_capacity(500, 128).is_err()); // not page-aligned
++        assert!(mtp_auxiliary_capacity(usize::MAX, 128).is_err()); // overflow/misaligned
++        // Page-aligned but overflowing add.
++        let big = usize::MAX - (usize::MAX % 128);
++        assert!(mtp_auxiliary_capacity(big, 128).is_err());
++    }
++
++    #[test]
++    fn mtp_head_pool_geometry_window_plus_scratch() {
++        // Q8 head: 4 KV heads × head_dim 256 → 1088 B/pos; window 512 (4 pages).
++        let stride = 4 * (256 / 32) * 34;
++        let pool = mtp_head_pool(512, LAYERWISE_PAGE_TOKENS, stride, stride).unwrap();
++        // 4 window pages + 1 scratch page = 5 slots, ONE head layer.
++        assert_eq!(pool.n_slots(), 5);
++        assert_eq!(pool.n_layers(), 1);
++        assert_eq!(pool.free_count(), 5);
++        let l = pool.layout();
++        assert_eq!(l.block_tokens(), LAYERWISE_PAGE_TOKENS);
++        assert_eq!(l.k_stride(), 1088);
++        // head slot = 1 layer × 128 × (1088+1088); arena = 5 slots.
++        assert_eq!(l.slot_bytes(), 128 * 2 * 1088);
++        assert_eq!(l.arena_bytes(), 5 * 128 * 2 * 1088);
++        // Bounded: ~1.33 MiB, far below a full-resident 256k head (~544 MiB/slot).
++        assert!(l.arena_bytes() < 2 << 20, "head pool must be bounded, not full-resident");
++    }
++
++    #[test]
++    fn mtp_head_pool_drop_evict_lifecycle() {
++        let mut pool = mtp_head_pool(16, 4, 8, 6).unwrap();
++        // 16/4 + 1 = 5 slots, 1 layer.
++        assert_eq!(pool.n_slots(), 5);
++        assert_eq!(pool.n_layers(), 1);
++        let h = pool.alloc_slot().unwrap();
++        pool.bind_stripe(h, 0, 100).unwrap();
++        assert_eq!(pool.stripe_page(h.phys, 0), Some(100));
++        // Single layer: dropping it reports freeable immediately.
++        assert!(pool.drop_stripe(h, 0).unwrap());
++        pool.free_slot(h).unwrap();
++        assert_eq!(pool.free_count(), 5);
++        // Exhaustion: 5 slots, the 6th fails (bounded — no unbounded growth).
++        let mut hs = Vec::new();
++        for _ in 0..5 { hs.push(pool.alloc_slot().unwrap()); }
++        assert!(pool.alloc_slot().is_err());
++    }
++
++    #[test]
++    fn mtp_head_pool_rejects_bad_window() {
++        assert!(mtp_head_pool(0, 128, 1088, 1088).is_err());
++        assert!(mtp_head_pool(500, 128, 1088, 1088).is_err()); // misaligned
++        assert!(mtp_head_pool(512, 128, 0, 1088).is_err()); // zero stride
++    }
+ }
+\ No newline at end of file

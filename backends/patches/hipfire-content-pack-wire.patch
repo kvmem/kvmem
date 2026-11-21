@@ -1,0 +1,463 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 9d346ad2e5794c615ddcbf8009860f255a96c3a3..36f6c1679ace694a3b4181750290383f21d028ea 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -59,7 +59,10 @@ use rdna_compute::{Gpu, GpuTensor};
+ use saddle_core::kv::KvMode;
+ 
+ use crate::kvmem_taps::KvMemTaps;
+-use crate::kvmem_prefix::{layout_fingerprint, PrefixCatalog, PrefixCheckpoint, PREFIX_PAGE_TOKENS};
++use crate::kvmem_prefix::{
++    layout_fingerprint, ColdPack, ColdPackIndex, ContentPackMeta, PrefixCatalog, PrefixCheckpoint,
++    PREFIX_PAGE_TOKENS,
++};
+ use crate::layerwise_driver::{layerwise_backend, layerwise_capabilities, OutputAcceptanceSnapshot};
+ use crate::layerwise_layout::LayerwiseMtpQ8Layout;
+ use crate::layerwise_mtp::{auxiliary_removed_tokens, auxiliary_visible_tokens, AuxiliarySelection};
+@@ -915,6 +918,16 @@ pub struct KvMemCtl {
+     /// 期3 G3-SSD: separate tiered account for canonical content copies
+     /// (`HIPFIRE_KVMEM_CACHE_DIR/_BYTES`, independent of the spill account).
+     content_storage: Option<Storage>,
++    /// 期3 G3 P1.1: persistent pack directory (same cache dir) and byte cap.
++    cold_dir: Option<PathBuf>,
++    cold_bytes: u64,
++    /// Pack files discovered at startup / registered at freeze (metadata only).
++    cold_packs: ColdPackIndex,
++    /// Catalog entries displaced by a cold pack load (the engine releases
++    /// their GPU cache refs after `prefix_lookup`).
++    cold_displaced: Vec<PrefixCheckpoint>,
++    cold_pack_hits_total: u64,
++    cold_pack_misses_total: u64,
+     /// Observability counters (`KvMemCtl::stats`). Pure bookkeeping: no path
+     /// reads them back into selection/residency, so they cannot change KV
+     /// bytes; `/metrics` exports them via `EngineStats.kvmem`.
+@@ -1137,6 +1150,27 @@ impl KvMemCtl {
+             }
+             _ => None,
+         };
++
++        // 期3 G3 P1.1: pack files live beside the content account; scanning
++        // here rebuilds the cold index after a restart (metadata only).
++        let cold_bytes = env_u64("HIPFIRE_KVMEM_CACHE_BYTES")
++            .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES)
++            .max(1);
++        let cold_dir = if content_storage.is_some() {
++            env_raw("HIPFIRE_KVMEM_CACHE_DIR").map(PathBuf::from)
++        } else {
++            None
++        };
++        let cold_packs = match cold_dir.as_ref() {
++            Some(dir) => ColdPackIndex::scan(
++                dir,
++                layout_fingerprint(&raw_cfg),
++                n_record_layers as u32,
++                KV_BLOCK_TOKENS as u32,
++                1 << 20,
++            ),
++            None => ColdPackIndex::default(),
++        };
+         let storage = match env_raw("HIPFIRE_KVMEM_SPILL_DIR") {
+             Some(dir) => {
+                 let dir = PathBuf::from(dir);
+@@ -1298,6 +1332,12 @@ impl KvMemCtl {
+             content_groups,
+             content_retirements_total: 0,
+             content_storage,
++            cold_dir,
++            cold_bytes,
++            cold_packs,
++            cold_displaced: Vec::new(),
++            cold_pack_hits_total: 0,
++            cold_pack_misses_total: 0,
+             spill_pages_total: 0,
+             restore_pages_total: 0,
+             prefix_freezes_total: 0,
+@@ -1649,6 +1689,59 @@ impl KvMemCtl {
+             );
+         }
+         entry.kv_snapshot = kv_snapshot;
++        // 期3 G3 P1.1: persist the canonical prefix as a pack file. Failure
++        // never blocks the freeze (persistence is an optional tier); the byte
++        // cap prunes the oldest packs.
++        if let Some(dir) = self.cold_dir.clone() {
++            let meta = ContentPackMeta {
++                version: ContentPackMeta::VERSION,
++                layout_id,
++                frontier,
++                tokens: entry.prefix_tokens.clone(),
++                mean_tail: entry.mean_tail.clone(),
++                group: entry.group,
++                original_query: entry.original_query,
++                n_record_layers: self.n_record_layers as u32,
++            };
++            let path = dir.join(format!(
++                "p{layout_id:016x}-{frontier:08}-{fingerprint:016x}.hkpack"
++            ));
++            let written = meta
++                .encode()
++                .and_then(|bytes| {
++                    entry
++                        .canonical()
++                        .write_prefix_pack(blocks, &path, &bytes)
++                        .map_err(|e| e.to_string())
++                });
++            match written {
++                Ok(()) => {
++                    if !self.cold_packs.contains_path(&path) {
++                        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
++                        self.cold_packs.insert(ColdPack {
++                            path: path.clone(),
++                            meta,
++                            fingerprint,
++                            bytes,
++                            stamp: 0,
++                        });
++                    }
++                    let removed = self.cold_packs.prune_to(self.cold_bytes);
++                    if !removed.is_empty()
++                        && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++                            .ok()
++                            .is_some_and(|v| v == "1" || v == "on" || v == "true")
++                    {
++                        eprintln!(
++                            "[kvmem-pack] pruned {} pack(s), {} bytes retained",
++                            removed.len(),
++                            self.cold_packs.total_bytes()
++                        );
++                    }
++                }
++                Err(e) => eprintln!("[kvmem-pack] write skipped: {e}"),
++            }
++        }
+         // 期3 G3: group-aware publication retires the whole least-recently-used
+         // group before entry trimming; the plain LRU path stays the default.
+         let (inserted, displaced) = if self.content_groups > 0 && st.convo_group != 0 {
+@@ -1685,15 +1778,115 @@ impl KvMemCtl {
+     /// Look up the longest cataloged prefix fully proven by `prompt`.
+     /// Returns the checkpoint id (engine then validates + forks).
+     pub fn prefix_lookup(&mut self, prompt: &[u32]) -> Option<u64> {
+-        let hit = self
+-            .prefix_catalog
+-            .lookup(prompt, layout_fingerprint(&self.raw_cfg));
+-        if hit.is_some() {
++        let layout = layout_fingerprint(&self.raw_cfg);
++        if let Some(hit) = self.prefix_catalog.lookup(prompt, layout) {
+             self.prefix_hits_total += 1;
+-        } else {
+-            self.prefix_misses_total += 1;
++            return Some(hit);
+         }
+-        hit
++        // 期3 G3 P1.1: a cold pack hit loads the payload and publishes a
++        // normal catalog entry; the caller then reuses it through the usual
++        // proof path (restart reuse still needs the DN checkpoint, patch 35).
++        if let Some(index) = self.cold_packs.lookup(prompt, layout) {
++            let pack = self.cold_packs.packs()[index].clone();
++            match self.load_cold_pack(&pack) {
++                Ok(id) => {
++                    self.cold_pack_hits_total += 1;
++                    self.prefix_hits_total += 1;
++                    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++                        .ok()
++                        .is_some_and(|v| v == "1" || v == "on" || v == "true")
++                    {
++                        eprintln!(
++                            "[kvmem-pack] cold hit frontier={} path={}",
++                            pack.meta.frontier,
++                            pack.path.display()
++                        );
++                    }
++                    return Some(id);
++                }
++                Err(e) => {
++                    self.cold_pack_misses_total += 1;
++                    eprintln!("[kvmem-pack] cold load failed: {e}");
++                }
++            }
++        }
++        self.prefix_misses_total += 1;
++        None
++    }
++
++    /// Drain catalog entries displaced by a cold pack load so the engine can
++    /// release their GPU cache refs.
++    pub fn take_cold_displaced(&mut self) -> Vec<PrefixCheckpoint> {
++        std::mem::take(&mut self.cold_displaced)
++    }
++
++    /// Load one pack file into a fresh store (content account when enabled),
++    /// prove the metadata is unchanged, capture the KvSnapshot and publish the
++    /// entry into the hot catalog.
++    fn load_cold_pack(&mut self, pack: &ColdPack) -> Result<u64, String> {
++        let layout = layout_fingerprint(&self.raw_cfg);
++        if pack.meta.layout_id != layout
++            || pack.meta.n_record_layers as usize != self.n_record_layers
++            || pack.meta.frontier == 0
++            || pack.meta.frontier % KV_BLOCK_TOKENS as u32 != 0
++        {
++            return Err("pack geometry/layout mismatch".to_string());
++        }
++        let on_content = self.content_storage.is_some();
++        let storage = match self.content_storage.as_ref() {
++            Some(content) => content,
++            None => &self.storage,
++        };
++        let store = RawStore::new(self.raw_cfg, Some(storage))
++            .map_err(|e| format!("pack store: {e}"))?;
++        let meta_bytes = store
++            .read_prefix_pack(&pack.path)
++            .map_err(|e| format!("pack read: {e}"))?;
++        let meta = ContentPackMeta::decode(&meta_bytes)
++            .map_err(|e| format!("pack meta: {e}"))?;
++        if meta.tokens != pack.meta.tokens || meta.frontier != pack.meta.frontier {
++            return Err("pack metadata changed since scan".to_string());
++        }
++        let blocks = meta.frontier / KV_BLOCK_TOKENS as u32;
++        let kv_snapshot = if store.has_packed(blocks) {
++            let snap = store
++                .capture_snapshot(blocks, None)
++                .map_err(|e| format!("pack snapshot: {e}"))?;
++            if !snap.covers_packed(blocks, self.n_record_layers as u32) {
++                return Err("pack snapshot grid incomplete".to_string());
++            }
++            Some(snap)
++        } else {
++            None
++        };
++        let id = self.prefix_catalog.mint_id();
++        let mut entry = PrefixCheckpoint::new(
++            id,
++            meta.frontier,
++            meta.tokens.clone(),
++            meta.mean_tail.clone(),
++            0,
++            layout,
++            store,
++        );
++        entry.original_query = meta.original_query;
++        entry.group = meta.group;
++        entry.kv_snapshot = kv_snapshot;
++        entry.canonical_on_content = on_content;
++        let (inserted, displaced) = if self.content_groups > 0 && entry.group != 0 {
++            let (id, displaced, _deduped) = self
++                .prefix_catalog
++                .insert_group_aware(entry, self.content_groups)
++                .map_err(|e| format!("pack catalog: {e}"))?;
++            self.content_retirements_total += displaced.len() as u64;
++            (id, displaced)
++        } else {
++            self.prefix_catalog
++                .insert_displacing(entry)
++                .map_err(|e| format!("pack catalog: {e}"))?
++        };
++        self.cold_displaced.extend(displaced);
++        Ok(inserted.unwrap_or(id))
+     }
+ 
+     /// Look up the longest cataloged prefix fully proven by `prompt` whose
+@@ -1788,6 +1981,9 @@ impl KvMemCtl {
+                 .as_ref()
+                 .map_or(0, |s| s.charged_bytes()),
+             content_cache_disk_bytes: self.content_storage.as_ref().map_or(0, |s| s.disk_bytes()),
++            content_packs: self.cold_packs.len() as u64,
++            content_pack_bytes: self.cold_packs.total_bytes(),
++            cold_pack_hits: self.cold_pack_hits_total,
+             draft_images: self.draft_images_total,
+             draft_image_hits: self.draft_image_hits_total,
+             draft_image_misses: self.draft_image_misses_total,
+@@ -5849,5 +6045,56 @@ mod tests {
+         std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
+         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+     }
++
++    /// 期3 G3 P1.1: a frozen prefix persists as a pack; a fresh controller
++    /// (restart) scans it, a cold lookup loads it into the catalog, and reuse
++    /// forks from the loaded canonical.
++    #[test]
++    fn content_pack_survives_restart_and_cold_lookup_loads() {
++        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
++        let dir = std::env::temp_dir().join(format!("kvmem-restart-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::env::set_var("HIPFIRE_KVMEM_CACHE_DIR", dir.to_str().unwrap());
++        std::env::set_var("HIPFIRE_KVMEM_CACHE_BYTES", "268435456");
++        std::env::set_var("HIPFIRE_KVMEM_CACHE_RAM_BYTES", "4194304");
++        let toks = prefix_tokens(128, 6);
++        {
++            let mut ctl =
++                KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
++                    .expect("ctl");
++            ctl.set_request_group(0, 9).expect("group");
++            prefix_fill(&mut ctl, 0, 1, 6);
++            ctl.freeze_prefix(0, 128, &toks).expect("freeze");
++            let st = ctl.stats();
++            assert!(st.content_packs >= 1, "pack written (packs {})", st.content_packs);
++            assert!(st.content_pack_bytes > 0);
++        }
++        // Restart: a fresh controller scans the pack directory.
++        let mut ctl2 =
++            KvMemCtl::new_with_strategy(2, &plan(), &geom(), RecallStrategy::Legacy)
++                .expect("ctl2");
++        assert!(ctl2.stats().content_packs >= 1, "pack scanned at startup");
++        assert!(ctl2.prefix_catalog.is_empty(), "hot catalog starts empty");
++        let hit = ctl2.prefix_lookup(&toks).expect("cold pack hit");
++        assert!(ctl2.prefix_checkpoint(hit).is_some(), "catalog entry loaded");
++        assert!(ctl2.stats().cold_pack_hits >= 1);
++        let frontier = ctl2.fork_prefix_into(1, hit, &toks).expect("reuse fork");
++        assert_eq!(frontier, 128);
++        let width = ctl2.raw_cfg.n_embd_k as usize;
++        let mut m1 = vec![0f32; width];
++        ctl2.slots[1].raw.mean_k(0, 0, &mut m1);
++        assert!(
++            m1.iter().any(|v| *v != 0.0),
++            "reused Mean-K loaded from the pack"
++        );
++        // A foreign prompt is neither a hot nor a cold proof.
++        ctl2.reset_slot(0).expect("reset");
++        assert!(ctl2.prefix_lookup(&prefix_tokens(128, 77)).is_none());
++        std::env::remove_var("HIPFIRE_KVMEM_CACHE_RAM_BYTES");
++        std::env::remove_var("HIPFIRE_KVMEM_CACHE_BYTES");
++        std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
++        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }
+ 
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index a886fe6434b0952d62aa7bc78d71dbd6266e2fc6..433403971e5f131b97ca42de16a841dd414d4150 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -269,6 +269,17 @@ impl ColdPackIndex {
+         removed
+     }
+ 
++    /// Register one freshly written pack (LRU stamp = newest).
++    pub fn insert(&mut self, mut pack: ColdPack) {
++        self.clock += 1;
++        pack.stamp = self.clock;
++        self.packs.push(pack);
++    }
++
++    pub fn contains_path(&self, path: &std::path::Path) -> bool {
++        self.packs.iter().any(|p| p.path == path)
++    }
++
+     pub fn remove(&mut self, index: usize) -> Option<ColdPack> {
+         if index < self.packs.len() {
+             Some(self.packs.remove(index))
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 132399c9e51f6d7db99b96cefdb58e002d977fc1..ec72b1adbcdfa3f1cdb4845ee331773d46a7a246 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -9326,11 +9326,21 @@ fn admit(
+     let mut prefix_hit = false;
+     #[cfg(feature = "kvmem")]
+     if rig.kvmem_prefix_pin && req.visual_data.is_none() {
+-        let hit = rig
+-            .model
+-            .kvmem
+-            .as_mut()
+-            .and_then(|ctl| ctl.prefix_lookup(&req.prompt_tokens));
++        // 期3 G3 P1.1: a cold pack hit publishes a catalog entry and may
++        // displace others; release their GPU cache refs outside the borrow.
++        let mut cold_displaced = Vec::new();
++        let hit = rig.model.kvmem.as_mut().and_then(|ctl| {
++            let hit = ctl.prefix_lookup(&req.prompt_tokens);
++            cold_displaced = ctl.take_cold_displaced();
++            hit
++        });
++        for d in cold_displaced {
++            if let Some(pp) = rig.pool.page_pool_mut() {
++                for &phys in &d.gpu_pages {
++                    let _ = pp.release_cache_ref(phys);
++                }
++            }
++        }
+         if let Some(ckpt_id) = hit {
+             let reuse = (|| -> Result<usize, String> {
+                 let ctl = rig
+@@ -9485,9 +9495,20 @@ fn admit(
+                     return Err("kvmem reuse: DeltaNet checkpoint restore failed".to_string());
+                 }
+                 // 3. Share the pinned pages into the (empty) block table.
+-                if gpu_pages.is_empty()
+-                    || rig.pool.share_published_pages(slot, &gpu_pages).is_err()
+-                {
++                // 期3 G3 P1.1: a restart-loaded pack carries no pinned GPU
++                // pages. Layerwise restores pages from the sealed archive on
++                // demand (carrier restore), so the share is skipped; Legacy
++                // has no cold restore path and fails closed to a cold prefill.
++                if gpu_pages.is_empty() {
++                    if !ctl.strategy().is_layerwise() {
++                        let _ = ctl.reset_slot(slot.0);
++                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
++                        return Err(
++                            "kvmem reuse: no pinned pages (restart) and Legacy has no cold restore"
++                                .to_string(),
++                        );
++                    }
++                } else if rig.pool.share_published_pages(slot, &gpu_pages).is_err() {
+                     let _ = ctl.reset_slot(slot.0);
+                     let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                     return Err("kvmem reuse: GPU page share failed".to_string());
+diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
+index ad8ba556806a69eade3c434f5743bf8ce06c639d..eb03cd8edbf0c4040a28475367e550bd5b31d9ed 100644
+--- a/crates/hipfire-cli/src/serve/metrics.rs
++++ b/crates/hipfire-cli/src/serve/metrics.rs
+@@ -689,6 +689,24 @@ impl Metrics {
+                     "Content-cache disk-tier bytes.",
+                     s.kvmem.content_cache_disk_bytes as f64,
+                 );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_content_packs",
++                    "Persistent content pack files.",
++                    s.kvmem.content_packs as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_content_pack_bytes",
++                    "Persistent content pack bytes.",
++                    s.kvmem.content_pack_bytes as f64,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_cold_pack_hits_total",
++                    "Prefix lookups served by an on-disk content pack.",
++                    s.kvmem.cold_pack_hits,
++                );
+             }
+         }
+ 
+@@ -1111,6 +1129,7 @@ mod tests {
+                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
+                 "content_groups": 2, "content_retirements": 1,
+                 "content_cache_bytes": 4096, "content_cache_disk_bytes": 2048,
++                "content_packs": 3, "content_pack_bytes": 8192, "cold_pack_hits": 1,
+             },
+         });
+         let kvmeta = ServeMeta {
+@@ -1143,6 +1162,9 @@ mod tests {
+             "hipfire_kvmem_content_retirements_total 1\n",
+             "hipfire_kvmem_content_cache_bytes 4096\n",
+             "hipfire_kvmem_content_cache_disk_bytes 2048\n",
++            "hipfire_kvmem_content_packs 3\n",
++            "hipfire_kvmem_content_pack_bytes 8192\n",
++            "hipfire_kvmem_cold_pack_hits_total 1\n",
+         ] {
+             assert!(out.contains(sample), "{sample}: {out}");
+         }
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index 95784a3a0568400b0c051556422bb8423644c8b2..63bc203f76528d8ce066e7510a5f1f646d34c5ee 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -255,6 +255,10 @@ pub struct KvMemStats {
+     /// 期3 G3-SSD: content-cache account bytes (charged) and its disk tier.
+     pub content_cache_bytes: u64,
+     pub content_cache_disk_bytes: u64,
++    /// 期3 G3 P1.1: persistent pack files and their bytes; cold pack hits.
++    pub content_packs: u64,
++    pub content_pack_bytes: u64,
++    pub cold_pack_hits: u64,
+ }
+ 
+ /// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`

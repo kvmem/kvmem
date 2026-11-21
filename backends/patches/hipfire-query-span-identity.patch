@@ -1,0 +1,699 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 83791baeee05acabb19673dbdbf1383ff47bff84..7ae2897d5da8bbab33522e48e269e4cd39207cdd 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -48,7 +48,7 @@ use hipfire_kvmem::{
+     mean_key_retrieval_scores, page_softmax_scores, BlockCopies, BlockDescriptor, ExecutionView,
+     GqaAggregation, KvStore, KvStoreConfig, LayerMemorySnapshot, LayerPlan, LayerSelection,
+     MemoryBudget, MemoryCatalog, MemoryDescriptor, MemorySnapshot, MemoryStamp, OutputOptions,
+-    ImportStart, OutputPressure, OutputScope, PrefillOptions, PrefillPressure, RawStore,
++    ImportStart, OutputPressure, OutputScope, PrefillOptions, PrefillPressure, QueryRange, RawStore,
+     RawStoreConfig, SessionIdentity, Storage, WindowEnvelope, WindowPlan, WindowPolicy, WindowState,
+ };
+ use hipfire_runtime::serve::KvMemStats;
+@@ -628,6 +628,12 @@ struct SlotState {
+     /// selection and reuses its stale compact-tail binding, corrupting recall).
+     /// Cleared on reset_slot; false under Legacy (never read there).
+     lw_query_due: bool,
++    /// 期2.3: frontend-proven span of the CURRENT request's user question
++    /// (original coordinates). `None` = unproven (historical behaviour).
++    request_query: Option<(u64, u64)>,
++    /// Span of the PREVIOUS accepted request's question on this slot —
++    /// continuation identity for `layerwise_query_at_source`.
++    last_query: Option<(u64, u64)>,
+     /// Pending output-scope acceptance snapshot for the in-flight MTP verify
+     /// (P4.1②, design §A.6). The orchestration extracts it from the verify carrier
+     /// after the forward (mass captured) and stores it here BEFORE freeing the
+@@ -1117,6 +1123,8 @@ impl KvMemCtl {
+                 lw_output_pressure: None,
+                 lw_keep: Vec::new(),
+                 lw_query_due: false,
++                request_query: None,
++                last_query: None,
+                 lw_import_blocks: Cell::new(None),
+                 lw_pending_output: None,
+                 lw_head: None,
+@@ -1358,18 +1366,23 @@ impl KvMemCtl {
+         prompt_end: u64,
+         output_tokens: u64,
+         frontier: u32,
+-    ) -> Result<ImportStart, String> {
++        query: Option<(u64, u64)>,
++        previous_query: Option<(u64, u64)>,
++    ) -> Result<ImportDecision, String> {
+         // ninfer `state.visible_tokens` is the native extent at request start;
+         // hipfire's Layerwise driver materializes a compact view of at most the
+         // resident budget B, while the logical history may be longer.
+         let visible = (frontier as u64).min((self.budget_blocks as u64) * KV_BLOCK_TOKENS as u64);
+-        layerwise_import_admission(
++        layerwise_import_decision(
+             prompt_end,
+             output_tokens,
+             self.window_capacity_tokens(),
+             self.gen_reserve,
+             frontier,
+             visible,
++            query,
++            previous_query,
++            true,
+         )
+     }
+ 
+@@ -1435,6 +1448,8 @@ impl KvMemCtl {
+             lw_output_pressure: None,
+             lw_keep: Vec::new(),
+             lw_query_due: false,
++                request_query: None,
++                last_query: None,
+             lw_import_blocks: Cell::new(None),
+             lw_pending_output: None,
+             // P4.1② G3: a fresh session drops the head resident map and its
+@@ -1494,6 +1509,8 @@ impl KvMemCtl {
+         }
+         let layout_id = layout_fingerprint(&self.raw_cfg);
+         let fingerprint = hipfire_runtime::checkpoint_pool::prefix_fingerprint(prefix_tokens);
++        // 期2.3: the question that owns this checkpoint (import identity).
++        let original_query = st.request_query;
+         // Dedup BEFORE forking/sealing: an identical frontier+proof already
+         // pins the same pages; a second archive would double the cache refs.
+         if let Some(existing) = self.prefix_catalog.find_exact(frontier, fingerprint) {
+@@ -1512,7 +1529,7 @@ impl KvMemCtl {
+             .mean_checkpoint(frontier)
+             .map_err(|e| format!("kvmem freeze_prefix mean checkpoint: {e}"))?;
+         let id = self.prefix_catalog.mint_id();
+-        let entry = PrefixCheckpoint::new(
++        let mut entry = PrefixCheckpoint::new(
+             id,
+             frontier,
+             prefix_tokens.to_vec(),
+@@ -1521,6 +1538,7 @@ impl KvMemCtl {
+             layout_id,
+             canonical,
+         );
++        entry.original_query = original_query;
+         let (inserted, displaced) = self
+             .prefix_catalog
+             .insert_displacing(entry)
+@@ -1763,10 +1781,56 @@ impl KvMemCtl {
+         // with the current question (ninfer per-request Query), not refine the
+         // frozen previous-turn keep-set by Pressure (which reuses a stale
+         // compact-tail binding and corrupts cross-turn recall).
+-        st.lw_query_due = true;
++        // 期2.3 (KVMem/nInfer `layerwise_query_at_source`): skip that Query
++        // when the new question is already effective at the source — a proven
++        // span identical to the previous turn's and wholly inside the accepted
++        // prefix (`finalize_layerwise_query_source`: keep_selected). An
++        // unproven span (`None`) keeps the historical per-request Query.
++        st.lw_query_due = match st.request_query {
++            None => true,
++            Some(q) => {
++                let same = st.last_query == Some(q);
++                let inside = q.0 < q.1 && q.1 <= st.fed as u64;
++                !(same && inside)
++            }
++        };
+         Ok(st.fed)
+     }
+ 
++    /// 期2.3: install the current request's frontend-proven question span.
++    /// Called at admit for every request (cold, reuse, continuation) BEFORE
++    /// `begin_request` / the reuse import decision; the previous request's
++    /// span moves to `last_query` (continuation identity).
++    pub fn set_request_query(
++        &mut self,
++        slot: usize,
++        query: Option<(u64, u64)>,
++    ) -> Result<(), String> {
++        let st = self
++            .slots
++            .get_mut(slot)
++            .ok_or_else(|| format!("kvmem: set_request_query slot {slot} out of range"))?;
++        st.last_query = st.request_query;
++        st.request_query = query;
++        Ok(())
++    }
++
++    /// 期2.3: arm or clear the one-shot per-request scorer Query. The reuse
++    /// import uses it: a NEW question forces the Query at the first decode
++    /// step; KeepSelected (query already effective at the source) leaves it
++    /// clear.
++    pub fn set_layerwise_query_due(&mut self, slot: usize, due: bool) {
++        if let Some(st) = self.slots.get_mut(slot) {
++            st.lw_query_due = due;
++        }
++    }
++
++    /// 期2.3: the query span stored with a cataloged checkpoint (import
++    /// identity). `None` for checkpoints frozen before a proven span existed.
++    pub fn prefix_original_query(&self, id: u64) -> Option<(u64, u64)> {
++        self.prefix_catalog.get(id).and_then(|c| c.original_query)
++    }
++
+     /// Host-store length of `slot` (tokens whose statistics are recorded).
+     pub fn fed_tokens(&self, slot: usize) -> Option<u32> {
+         self.slots.get(slot).map(|s| s.fed)
+@@ -3638,6 +3702,92 @@ fn restore_page(
+ #[allow(dead_code)]
+ const _: u32 = SPILLED_PAGE;
+ 
++/// 期2.3: the fenced-import decision — the core `ImportStart` plus the
++/// frontend-query identity outcome (KVMem/nInfer
++/// `finalize_layerwise_query_source`).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct ImportDecision {
++    pub start: ImportStart,
++    /// The query the first decode step must evaluate at the source
++    /// (`None` = already effective → the source keeps its selected views).
++    pub effective_query: Option<(u64, u64)>,
++    /// KeepSelected: the checkpoint's KV/score already covers this request's
++    /// question and the budgets fit, so no per-request Query is needed.
++    pub keep_selected: bool,
++}
++
++/// Pure query identity at a checkpoint source (nInfer
++/// `layerwise_query_at_source`): a proven span equal to the source's recorded
++/// span and wholly inside the exact native prefix is already effective.
++pub fn layerwise_query_identity(
++    query: Option<(u64, u64)>,
++    previous_query: Option<(u64, u64)>,
++    frontier: u64,
++    exact_native_prefix: bool,
++) -> Option<(u64, u64)> {
++    match query {
++        Some(q) if exact_native_prefix && previous_query == Some(q) && q.1 <= frontier => None,
++        other => other,
++    }
++}
++
++/// Pure engine→core mapping for the fenced-import admission (期2.2a/2.3): the
++/// exact restored prefix feeds one `WindowPlan` over the Layerwise capacity
++/// `B + R`, with the frontend query identity deciding Pressure vs
++/// KeepSelected (`finalize_layerwise_query_source`).
++pub fn layerwise_import_decision(
++    prompt_end: u64,
++    output_tokens: u64,
++    capacity_tokens: u64,
++    gen_reserve: u64,
++    frontier: u32,
++    visible_tokens: u64,
++    query: Option<(u64, u64)>,
++    previous_query: Option<(u64, u64)>,
++    exact_native_prefix: bool,
++) -> Result<ImportDecision, String> {
++    let effective = layerwise_query_identity(
++        query,
++        previous_query,
++        frontier as u64,
++        exact_native_prefix,
++    );
++    let block = KV_BLOCK_TOKENS as u64;
++    let limit = capacity_tokens.saturating_sub(block);
++    let remaining = prompt_end.saturating_sub(frontier as u64);
++    let fits = visible_tokens <= limit
++        && remaining <= limit.saturating_sub(visible_tokens)
++        && output_tokens <= limit.saturating_sub(visible_tokens).saturating_sub(remaining);
++    // A proven span is required to claim KeepSelected: an unproven request
++    // (`None`) must not suppress the historical per-request Query.
++    let keep_selected =
++        exact_native_prefix && frontier > 0 && query.is_some() && effective.is_none() && fits;
++    let envelope = WindowEnvelope {
++        prompt_end,
++        block_tokens: KV_BLOCK_TOKENS as u32,
++        generation_tokens: gen_reserve,
++        output_tokens,
++        rolling_active_window: false,
++        prefill_window: if keep_selected {
++            WindowPolicy::KeepSelected
++        } else {
++            WindowPolicy::Pressure
++        },
++        query: effective.map(|(begin, end)| QueryRange { begin, end }),
++        replay: effective.map(|(begin, _)| QueryRange { begin, end: prompt_end }),
++        reserve_query_output: effective.is_some(),
++        probe_tokens: 0,
++        pressure_probe_tokens: 0,
++        has_query_mandatory: false,
++    };
++    let plan = WindowPlan::new(&envelope, capacity_tokens)
++        .map_err(|e| format!("kvmem import window: {e}"))?;
++    let start = plan
++        .import_plan(WindowState { history: frontier as u64, visible_tokens })
++        .map_err(|e| format!("kvmem import plan: {e}"))?;
++    Ok(ImportDecision { start, effective_query: effective, keep_selected })
++}
++
+ /// Pure engine→core mapping for the fenced-import admission: the exact restored
+ /// prefix (`frontier`, page-aligned) feeds one `WindowPlan` over the layerwise
+ /// capacity `B + R`, and the returned `ImportStart` is the core's decision.
+@@ -5380,4 +5530,93 @@ mod tests {
+         assert_eq!(capacity, 4096 + 1024);
+         assert!(DEFAULT_GEN_RESERVE > 0);
+     }
++
++    /// 期2.3 (KVMem/nInfer `layerwise_query_at_source`): a proven span equal
++    /// to the source's recorded span and wholly inside the exact prefix is
++    /// already effective; everything else stays a new Query.
++    #[test]
++    fn query_identity_matches_ninfer() {
++        let q = (1000u64, 1100u64);
++        assert_eq!(super::layerwise_query_identity(Some(q), Some(q), 2048, true), None);
++        assert_eq!(super::layerwise_query_identity(Some(q), Some(q), 1024, true), Some(q));
++        assert_eq!(
++            super::layerwise_query_identity(Some(q), Some((0, 10)), 2048, true),
++            Some(q)
++        );
++        assert_eq!(super::layerwise_query_identity(Some(q), Some(q), 2048, false), Some(q));
++        assert_eq!(super::layerwise_query_identity(None, Some(q), 2048, true), None);
++    }
++
++    /// 期2.3: KeepSelected only with a proven, already-effective query that
++    /// fits; a new query keeps Pressure and reserves the Query envelope.
++    #[test]
++    fn import_decision_keep_selected_vs_new_query() {
++        let q = (1000u64, 1100u64);
++        let keep = super::layerwise_import_decision(
++            2048,
++            64,
++            4096 + 1024,
++            1024,
++            2048,
++            2048,
++            Some(q),
++            Some(q),
++            true,
++        )
++        .expect("keep decision");
++        assert!(keep.keep_selected, "same query inside the prefix must keep");
++        assert_eq!(keep.effective_query, None);
++        assert!(!keep.start.pressure(), "keep-selected is not a pressure import");
++
++        let fresh = super::layerwise_import_decision(
++            2048,
++            64,
++            4096 + 1024,
++            1024,
++            2048,
++            2048,
++            Some((1200, 1300)),
++            Some(q),
++            true,
++        )
++        .expect("new-query decision");
++        assert!(!fresh.keep_selected);
++        assert_eq!(fresh.effective_query, Some((1200, 1300)));
++
++        let unproven = super::layerwise_import_decision(
++            2048, 64, 4096 + 1024, 1024, 2048, 2048, None, Some(q), true,
++        )
++        .expect("unproven decision");
++        assert!(!unproven.keep_selected, "an unproven span never claims keep");
++        assert_eq!(unproven.effective_query, None);
++
++        let too_long = super::layerwise_import_decision(
++            9000, 64, 4096 + 1024, 1024, 2048, 2048, Some(q), Some(q), true,
++        )
++        .expect("fit decision");
++        assert!(!too_long.keep_selected, "an oversized suffix cannot keep");
++    }
++
++    /// 期2.3: the continuation Query gate skips a repeated in-prefix question
++    /// and arms for a new one; unproven spans keep the historical Query.
++    #[test]
++    fn begin_request_query_gate() {
++        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
++        let mut ctl =
++            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
++                .expect("ctl");
++        prefix_fill(&mut ctl, 0, 1, 0);
++        let q = (0u64, 100u64);
++        ctl.set_request_query(0, Some(q)).expect("set 1");
++        ctl.set_request_query(0, Some(q)).expect("set 2");
++        ctl.begin_request(0).expect("begin");
++        assert!(!ctl.take_layerwise_query_due(0), "same in-prefix question keeps");
++        ctl.set_request_query(0, Some((120, 220))).expect("set 3");
++        ctl.begin_request(0).expect("begin 2");
++        assert!(ctl.take_layerwise_query_due(0), "a new question arms the Query");
++        ctl.set_request_query(0, None).expect("set 4");
++        ctl.begin_request(0).expect("begin 3");
++        assert!(ctl.take_layerwise_query_due(0), "unproven keeps the historical Query");
++        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
++    }
+ }
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index b877f995f493e264e65fc4cadf0e5d00b7477af7..e5b0772a7fdef268d70418df51cfeafb8964a620 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -119,6 +119,12 @@ pub struct PrefixCheckpoint {
+     /// catalog entry). Attached by the engine at freeze; released by the
+     /// engine when the entry is evicted/removed. Empty until attached.
+     pub gpu_pages: Vec<u32>,
++    /// 期2.3: span of the user question that created this checkpoint, in the
++    /// freeze request's original coordinates. Import compares it with the new
++    /// request's proven span (KVMem/nInfer `layerwise_query_at_source`):
++    /// equal and inside the frontier ⇒ the source's KV/score already covers
++    /// the question ⇒ KeepSelected. `None` = frozen without a proven span.
++    pub original_query: Option<(u64, u64)>,
+     /// Immutable canonical archive: `source.fork_prefix(frontier)`. Packed
+     /// records are sealed shared sources; mean-K is private to this archive
+     /// and re-forked private into every branch. Never fed after freeze.
+@@ -155,6 +161,7 @@ impl PrefixCheckpoint {
+             source_incarnation,
+             layout_id,
+             gpu_pages: Vec::new(),
++            original_query: None,
+             canonical,
+             draft_image: None,
+             last_used: 0,
+@@ -529,6 +536,7 @@ mod tests {
+             source_incarnation: 1,
+             layout_id: layout_fingerprint(&raw_config()),
+             gpu_pages: Vec::new(),
++            original_query: None,
+             canonical,
+             draft_image: None,
+             last_used: 0,
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 8777e1c2d23ed22e272a5e838ddf4e3217854d70..e26bbd85dd28d9d26a188f3c5712a3abd071d0a8 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -8805,6 +8805,16 @@ fn admit(
+                                     }
+                                 }
+                             }
++                            // 期2.3: move the previous turn's proven span to
++                            // `last_query` and install this turn's before
++                            // `begin_request` decides whether the first
++                            // Layerwise step must re-score (Query) or may keep
++                            // the already-effective selection.
++                            let _ = rig
++                                .model
++                                .kvmem
++                                .as_mut()
++                                .map(|ctl| ctl.set_request_query(slot.0, req.query));
+                             let fed = rig
+                                 .model
+                                 .kvmem
+@@ -9274,6 +9284,21 @@ fn admit(
+             lock_stats(stats).note_rejected();
+             return;
+         }
++        // 期2.3: the fresh session's question identity (the reuse import and
++        // any later checkpoint freeze both read it). reset_slot cleared the
++        // previous session's spans — this is the first request of a new one.
++        if let Err(e) = ctl.set_request_query(slot.0, req.query) {
++            let _ = send_event(
++                &req.reply,
++                Event::Rejected {
++                    class: RejectClass::Internal,
++                    reason: format!("kvmem query span: {e}"),
++                },
++            );
++            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
++            lock_stats(stats).note_rejected();
++            return;
++        }
+     }
+ 
+     // ── P4.3 KVMem-native prefix reuse (HIPFIRE_KVMEM_PREFIX_PIN) ─────────
+@@ -9311,14 +9336,25 @@ fn admit(
+                 // (its DeltaNet state exists at its own page-aligned frontier);
+                 // no such checkpoint closes the reuse to cold.
+                 if ctl.strategy().is_layerwise() {
++                    // 期2.3: the import decision carries the frontend query
++                    // identity — KeepSelected (already effective at the
++                    // source) suppresses the per-request Query; a NEW proven
++                    // question arms it. Unproven spans keep the historical
++                    // behaviour (no forced Query on the cold-reuse path).
++                    let mut keep_selected = false;
+                     let admission = (|| -> Result<Option<u32>, String> {
+-                        let start = ctl
++                        let prev = ctl.prefix_original_query(reuse_id);
++                        let decision = ctl
+                             .import_window(
+                                 req.prompt_tokens.len() as u64,
+                                 req.max_tokens as u64,
+                                 frontier,
++                                req.query,
++                                prev,
+                             )
+                             .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
++                        keep_selected = decision.keep_selected;
++                        let start = decision.start;
+                         if !start.pressure() {
+                             return Ok(None);
+                         }
+@@ -9334,13 +9370,18 @@ fn admit(
+                             };
+                             frontier = ctl.fork_prefix_into(slot.0, sid, &req.prompt_tokens)?;
+                             reuse_id = sid;
+-                            let retry = ctl
++                            let prev = ctl.prefix_original_query(reuse_id);
++                            let decision = ctl
+                                 .import_window(
+                                     req.prompt_tokens.len() as u64,
+                                     req.max_tokens as u64,
+                                     frontier,
++                                    req.query,
++                                    prev,
+                                 )
+                                 .map_err(|e| format!("kvmem reuse: import retry: {e}"))?;
++                            keep_selected = decision.keep_selected;
++                            let retry = decision.start;
+                             if retry.pressure() {
+                                 if retry.restore_tokens < frontier as u64 {
+                                     return Err(format!(
+@@ -9373,6 +9414,25 @@ fn admit(
+                             return Err(e);
+                         }
+                     }
++                    // 期2.3: arm the first-step Query only for a NEW proven
++                    // question. KeepSelected leaves it clear so the source's
++                    // selected views stand; an unproven span keeps the
++                    // historical (no forced Query on the cold-reuse path).
++                    if req.query.is_some() {
++                        ctl.set_layerwise_query_due(slot.0, !keep_selected);
++                    }
++                    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++                        .ok()
++                        .is_some_and(|v| v == "1" || v == "on" || v == "true")
++                    {
++                        eprintln!(
++                            "[kvmem-query] reuse slot {} query={:?} keep_selected={} -> due={}",
++                            slot.0,
++                            req.query,
++                            keep_selected,
++                            req.query.is_some() && !keep_selected
++                        );
++                    }
+                 }
+                 let gpu_pages = ctl
+                     .prefix_checkpoint(reuse_id)
+diff --git a/crates/hipfire-daemon/src/slots.rs b/crates/hipfire-daemon/src/slots.rs
+index fcc890bf0873e80f9be5102c88e79f49d7c3b33c..ff85e98890516661dcc1d02ca62b09c3af5d9c39 100644
+--- a/crates/hipfire-daemon/src/slots.rs
++++ b/crates/hipfire-daemon/src/slots.rs
+@@ -1361,6 +1361,8 @@ impl SlotBackend {
+         }
+ 
+         let mut visual_data = None;
++        // 期2.3: frontend-derived query identity (last user question span).
++        let mut request_query: Option<(u64, u64)> = None;
+         let (prompt_tokens, prefix) = if let Some(image) = slot_image {
+             // The projected message view carries the system text; fall back to
+             // the top-level `system` field for prompt-only requests.
+@@ -1421,7 +1423,18 @@ impl SlotBackend {
+             // Qwen3-family behaviour — the model opens `<think>` itself)
+             // frames `Plain`, not `ClosedThink`.
+             let framing = hipfire_engine::emit::render_assistant_prefix(&rendered);
+-            (self.tokenizer.encode(&rendered), framing)
++            let tokens = self.tokenizer.encode(&rendered);
++            // A tool-result turn carries no new Query (nInfer query_policy);
++            // only a final user message contributes query identity.
++            if messages.last().map(|m| m.role) == Some(Role::User) {
++                request_query = rendered_query_span(
++                    &self.tokenizer,
++                    &rendered,
++                    &last_user.content,
++                    &tokens,
++                );
++            }
++            (tokens, framing)
+         } else {
+             if tools.is_some()
+                 || messages
+@@ -1460,6 +1473,17 @@ impl SlotBackend {
+         // ends in. There is nothing left to reconcile: the Jinja render owns
+         // the generation suffix, and the two builders frame it themselves.
+         let started_in_think = matches!(prefix, AssistantPrefix::OpenThink);
++        if request_query.is_some()
++            && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++                .ok()
++                .is_some_and(|v| v == "1" || v == "on" || v == "true")
++        {
++            eprintln!(
++                "[kvmem-query] frontend span {:?} in {} prompt tokens",
++                request_query,
++                prompt_tokens.len()
++            );
++        }
+         let prompt_len = prompt_tokens.len();
+         // A client that omitted max_tokens gets the default clamped to the
+         // room left after the prompt, exactly like the sequential route.
+@@ -1574,6 +1598,7 @@ impl SlotBackend {
+             h.finish()
+         };
+         let req = SubmitRequest {
++            query: request_query,
+             prompt_tokens,
+             convo: convo.clone(),
+             continuation,
+@@ -2951,6 +2976,38 @@ pub fn build_convo(turns: &[(Role, String)], last_user: &str) -> Vec<u64> {
+     build_convo_with_system(None, turns, last_user, None)
+ }
+ 
++/// 期2.3 (KVMem/nInfer `layerwise_query_at_source`): provenance-checked span
++/// of the current user question inside the rendered prompt. Encoding the text
++/// before / through the content must reproduce prefixes of the full encoding;
++/// otherwise the span is unproven and the request carries `None` (fail-closed:
++/// no query identity, historical Layerwise behaviour).
++fn rendered_query_span(
++    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
++    rendered: &str,
++    content: &str,
++    prompt_tokens: &[u32],
++) -> Option<(u64, u64)> {
++    if content.is_empty() {
++        return None;
++    }
++    let begin = rendered.rfind(content)?;
++    let end = begin + content.len();
++    let before = tokenizer.encode(&rendered[..begin]);
++    let through = tokenizer.encode(&rendered[..end]);
++    if before.len() >= through.len()
++        || !prompt_tokens.starts_with(&before)
++        || !prompt_tokens.starts_with(&through)
++    {
++        return None;
++    }
++    // nInfer `bounded_query`: the Query is the recent question window, not a
++    // whole pasted document — clamp the proven span to the last
++    // `default_query_tokens` (512) tokens.
++    const QUERY_LIMIT: u64 = 512;
++    let begin = (before.len() as u64).max((through.len() as u64).saturating_sub(QUERY_LIMIT));
++    Some((begin, through.len() as u64))
++}
++
+ pub fn build_convo_with_system(
+     system: Option<&str>,
+     turns: &[(Role, String)],
+diff --git a/crates/hipfire-runtime/examples/a13_repro.rs b/crates/hipfire-runtime/examples/a13_repro.rs
+index 5a12580c96842423c3f321b2cbb9aeac91b194c6..a5469281b28a80b499eb25f6d68ed311e7221faa 100644
+--- a/crates/hipfire-runtime/examples/a13_repro.rs
++++ b/crates/hipfire-runtime/examples/a13_repro.rs
+@@ -64,6 +64,7 @@ fn main() {
+             let prompt: Vec<u32> = (0..64).map(|t| (1000 + i * 100 + t) as u32).collect();
+             engine
+                 .submit(SubmitRequest {
++                    query: None,
+                     prompt_tokens: prompt,
+                     convo: vec![0xA13_000 + i as u64],
+                     continuation: Continuation::Cold,
+diff --git a/crates/hipfire-runtime/examples/test_e4_engine_repro.rs b/crates/hipfire-runtime/examples/test_e4_engine_repro.rs
+index 1633319c611cbbab91d74b2bebaa339eb2caf2e8..348c04f839ffbdf5e35eea35593047735d05be50 100644
+--- a/crates/hipfire-runtime/examples/test_e4_engine_repro.rs
++++ b/crates/hipfire-runtime/examples/test_e4_engine_repro.rs
+@@ -84,6 +84,7 @@ fn main() {
+ 
+     let (reply_tx, reply_rx) = channel();
+     let req = SubmitRequest {
++        query: None,
+         prompt_tokens,
+         convo: Vec::new(),
+         continuation: Continuation::Cold,
+diff --git a/crates/hipfire-runtime/examples/test_serve_concurrent.rs b/crates/hipfire-runtime/examples/test_serve_concurrent.rs
+index 6f870d7fa513fee208cf5a8404af778c88fd0ef6..980d8186c9cab9178e52343b339ca1f2b9c1d222 100644
+--- a/crates/hipfire-runtime/examples/test_serve_concurrent.rs
++++ b/crates/hipfire-runtime/examples/test_serve_concurrent.rs
+@@ -99,6 +99,7 @@ fn main() {
+         let (tx, rx) = channel::<Event>();
+         engine
+             .submit(SubmitRequest {
++                query: None,
+                 prompt_tokens: toks,
+                 // Single-turn: nothing to continue, so no conversation key and
+                 // no continuation tokens.
+diff --git a/crates/hipfire-runtime/examples/test_serve_prefix_cache.rs b/crates/hipfire-runtime/examples/test_serve_prefix_cache.rs
+index d0747b2796a913d820668aec2c0d51a6f9f3f036..3d40030f4c270d35cb44c8a4ae897638c5af477e 100644
+--- a/crates/hipfire-runtime/examples/test_serve_prefix_cache.rs
++++ b/crates/hipfire-runtime/examples/test_serve_prefix_cache.rs
+@@ -182,6 +182,7 @@ fn main() {
+         let (tx, rx) = channel::<Event>();
+         engine
+             .submit(SubmitRequest {
++                query: None,
+                 prompt_tokens: prompt,
+                 convo: Vec::new(),
+                 continuation: Continuation::Cold,
+@@ -271,6 +272,7 @@ fn main() {
+         let (tx, rx) = channel::<Event>();
+         engine
+             .submit(SubmitRequest {
++                query: None,
+                 prompt_tokens: italy.clone(),
+                 convo: Vec::new(),
+                 continuation: Continuation::Cold,
+@@ -397,6 +399,7 @@ fn main() {
+             let (tx, rx) = channel::<Event>();
+             engine
+                 .submit(SubmitRequest {
++                    query: None,
+                     prompt_tokens: italy.clone(),
+                     convo,
+                     continuation,
+@@ -709,6 +712,7 @@ fn main() {
+     let (tx_long, rx_long) = channel::<Event>();
+     engine
+         .submit(SubmitRequest {
++            query: None,
+             prompt_tokens: atlantis_long,
+             convo: Vec::new(),
+             continuation: Continuation::Cold,
+@@ -829,6 +833,7 @@ fn main() {
+             let (tx, rx) = channel::<Event>();
+             engine
+                 .submit(SubmitRequest {
++                    query: None,
+                     prompt_tokens: s.prompt.clone(),
+                     convo: s.convo.clone(),
+                     continuation: Continuation::Cold,
+diff --git a/crates/hipfire-runtime/examples/test_serve_tool_reentry.rs b/crates/hipfire-runtime/examples/test_serve_tool_reentry.rs
+index b5990cc00e9e7ff7f1afbd63e7c35ef50e5b8086..9dbe8755c2286ccc45152ae608d2de50a9795c6d 100644
+--- a/crates/hipfire-runtime/examples/test_serve_tool_reentry.rs
++++ b/crates/hipfire-runtime/examples/test_serve_tool_reentry.rs
+@@ -102,6 +102,7 @@ fn main() {
+         let (tx, rx) = channel::<Event>();
+         engine
+             .submit(SubmitRequest {
++                query: None,
+                 prompt_tokens: prompt.clone(),
+                 convo,
+                 continuation,
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index aeea897a8635ad854976e974b5e03e572224210c..eab5f2224f6fde2a1d7584219025031254da8094 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -57,6 +57,14 @@ pub struct VisualData {
+ pub struct SubmitRequest {
+     /// Full cold render of the conversation. Used when nothing is reusable.
+     pub prompt_tokens: Vec<u32>,
++    /// 期2.3: frontend-proven span of the current user question inside
++    /// `prompt_tokens` (original coordinates `[begin, end)`). The frontend
++    /// derives it from the rendered prompt; `None` when it cannot prove the
++    /// span (tool continuations, VL, template transforms). Layerwise import
++    /// uses it to tell a NEW query from one whose KV/score is already
++    /// effective at the source checkpoint (KVMem/nInfer
++    /// `layerwise_query_at_source`); `None` keeps the historical behaviour.
++    pub query: Option<(u64, u64)>,
+     /// Hashes of the conversation's user turns, in order. Identity for
+     /// continuation matching — see `Session::convo`.
+     pub convo: Vec<u64>,

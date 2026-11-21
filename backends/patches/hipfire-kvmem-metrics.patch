@@ -1,0 +1,672 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 01f17a0520650c3721ba1f92b67ead946a8904c7..134eed51a14a0a0b5ddf8e0f6c512dda933027c7 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -50,6 +50,7 @@ use hipfire_kvmem::{
+     OutputPressure, OutputScope, PrefillOptions, PrefillPressure, RawStore, RawStoreConfig,
+     SessionIdentity, Storage,
+ };
++use hipfire_runtime::serve::KvMemStats;
+ use rdna_compute::layerwise_pool::{mtp_auxiliary_capacity, mtp_head_pool, LayerwisePagePool};
+ use rdna_compute::page_pool::SPILLED_PAGE;
+ use rdna_compute::slot_pool::{SlotId, SlotPool};
+@@ -877,6 +878,15 @@ pub struct KvMemCtl {
+     /// on); an empty catalog allocates nothing and no default path reads it,
+     /// so the Legacy serve stays byte-neutral.
+     prefix_catalog: PrefixCatalog,
++    /// Observability counters (`KvMemCtl::stats`). Pure bookkeeping: no path
++    /// reads them back into selection/residency, so they cannot change KV
++    /// bytes; `/metrics` exports them via `EngineStats.kvmem`.
++    spill_pages_total: u64,
++    restore_pages_total: u64,
++    prefix_freezes_total: u64,
++    prefix_hits_total: u64,
++    prefix_misses_total: u64,
++    prefix_evictions_total: u64,
+ }
+ 
+ impl KvMemCtl {
+@@ -1181,6 +1191,12 @@ impl KvMemCtl {
+             // freezes a prefix (PREFIX_PIN on). The bound is the retention
+             // count ceiling (H5 exposes the env knob).
+             prefix_catalog: PrefixCatalog::new(4),
++            spill_pages_total: 0,
++            restore_pages_total: 0,
++            prefix_freezes_total: 0,
++            prefix_hits_total: 0,
++            prefix_misses_total: 0,
++            prefix_evictions_total: 0,
+         })
+     }
+ 
+@@ -1394,14 +1410,25 @@ impl KvMemCtl {
+             .prefix_catalog
+             .insert_displacing(entry)
+             .map_err(|e| format!("kvmem freeze_prefix catalog: {e}"))?;
++        if inserted.is_some() {
++            self.prefix_freezes_total += 1;
++        }
++        self.prefix_evictions_total += displaced.len() as u64;
+         Ok((inserted.unwrap_or(id), displaced, false))
+     }
+ 
+     /// Look up the longest cataloged prefix fully proven by `prompt`.
+     /// Returns the checkpoint id (engine then validates + forks).
+     pub fn prefix_lookup(&mut self, prompt: &[u32]) -> Option<u64> {
+-        self.prefix_catalog
+-            .lookup(prompt, layout_fingerprint(&self.raw_cfg))
++        let hit = self
++            .prefix_catalog
++            .lookup(prompt, layout_fingerprint(&self.raw_cfg));
++        if hit.is_some() {
++            self.prefix_hits_total += 1;
++        } else {
++            self.prefix_misses_total += 1;
++        }
++        hit
+     }
+ 
+     /// Read a cataloged checkpoint (engine attaches GPU pages / reads the
+@@ -1424,7 +1451,46 @@ impl KvMemCtl {
+     /// Pop the LRU checkpoint (admission pressure reclaim); the engine
+     /// releases its GPU cache refs. `None` when the catalog is empty.
+     pub fn pop_lru_prefix(&mut self) -> Option<PrefixCheckpoint> {
+-        self.prefix_catalog.pop_lru()
++        let popped = self.prefix_catalog.pop_lru();
++        if popped.is_some() {
++            self.prefix_evictions_total += 1;
++        }
++        popped
++    }
++
++    /// Live observability snapshot (`/metrics` via `EngineStats.kvmem`).
++    /// Cheap integer reads from the host stores: no device work, no
++    /// allocation, and no path reads it back into selection/residency, so it
++    /// cannot change KV bytes.
++    pub fn stats(&self) -> KvMemStats {
++        let mut payload_bytes = 0u64;
++        let mut blocks = 0u64;
++        let mut tokens = 0u64;
++        for st in &self.slots {
++            payload_bytes += st.raw.payload_bytes();
++            blocks += u64::from(st.kv.block_count());
++            tokens += u64::from(st.kv.total_tokens());
++        }
++        let page_bytes = (self.k_page_bytes + self.v_page_bytes) as u64;
++        KvMemStats {
++            enabled: true,
++            layerwise: self.strategy.is_layerwise(),
++            host_charged_bytes: self.storage.charged_bytes(),
++            disk_bytes: self.storage.disk_bytes(),
++            payload_bytes,
++            blocks,
++            tokens,
++            spill_pages: self.spill_pages_total,
++            restore_pages: self.restore_pages_total,
++            spill_bytes: self.spill_pages_total.saturating_mul(page_bytes),
++            restore_bytes: self.restore_pages_total.saturating_mul(page_bytes),
++            prefix_entries: self.prefix_catalog.len() as u64,
++            prefix_pinned_pages: self.prefix_catalog.pinned_pages(),
++            prefix_freezes: self.prefix_freezes_total,
++            prefix_hits: self.prefix_hits_total,
++            prefix_misses: self.prefix_misses_total,
++            prefix_evictions: self.prefix_evictions_total,
++        }
+     }
+ 
+     /// P4.3 fed coordination: truncate slot `slot`'s host store to a
+@@ -2951,6 +3017,9 @@ impl KvMemCtl {
+             &mut t_restore,
+             &mut n_restored,
+         )?;
++        // Observability counters (pure bookkeeping; no path reads them back).
++        self.spill_pages_total += n_spilled as u64;
++        self.restore_pages_total += n_restored as u64;
+         if timed && (n_spilled > 0 || n_restored > 0 || t_select > std::time::Duration::ZERO) {
+             eprintln!(
+                 "[kvmem-time] prepare: total {:.1} ms (select {:.1} ms, spill {} pages \
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index f5a8feda26892ed1f052827bb94afd8d0939bdd0..24427cbe3039c25abd8c2e90ce285d247222234b 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -190,6 +190,16 @@ impl PrefixCatalog {
+         self.entries.len()
+     }
+ 
++    /// GPU pages pinned resident across every cataloged checkpoint (one count
++    /// per shared page-reference; a page pinned by two checkpoints counts
++    /// twice, matching the cache-ref bookkeeping the engine releases).
++    pub fn pinned_pages(&self) -> u64 {
++        self.entries
++            .iter()
++            .map(|e| e.gpu_pages.len() as u64)
++            .sum()
++    }
++
+     pub fn is_empty(&self) -> bool {
+         self.entries.is_empty()
+     }
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 5b09a1d36ebffa14f5ed266ca55b4c69132b5758..416dd3614cddff1a497f8f3c1689d003f9d48467 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -4884,6 +4884,10 @@ fn run_loop(
+                 if let Some(pp) = rig.pool.page_pool() {
+                     st.note_pool_pages(pp.free_pages(), pp.n_pages());
+                 }
++                #[cfg(feature = "kvmem")]
++                if let Some(kvmem) = rig.model.kvmem.as_ref() {
++                    st.note_kvmem(kvmem.stats());
++                }
+                 st.note_swap(&rig.swap);
+             }
+             // Expire timed-out waiters → typed queue timeout rejection. The
+diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
+index 399bcc9440f8628cbf38118e12f2eeca321abf6e..88f25e195f8f5c7d03ccb6ffcc356efecef15809 100644
+--- a/crates/hipfire-cli/src/serve/metrics.rs
++++ b/crates/hipfire-cli/src/serve/metrics.rs
+@@ -539,6 +539,115 @@ impl Metrics {
+                 "Prompt tokens reused from the multi-slot cross-session prefix cache.",
+                 s.reused_tokens as u64,
+             );
++
++            // KVMem host-offload snapshot (one aggregate over every slot's
++            // host stores). Refreshed from the live controller each engine
++            // step; a non-KVMem engine leaves `enabled` false and exports
++            // nothing, so the series never aliases the swap tier.
++            if s.kvmem.enabled {
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_enabled",
++                    "1 when the multi-slot engine runs the KVMem host-offload controller.",
++                    1.0,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_layerwise",
++                    "1 when the KVMem controller runs the Layerwise per-layer recall strategy.",
++                    flag(s.kvmem.layerwise),
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_host_bytes",
++                    "KVMem host storage charged bytes (live + sealed payload + metadata).",
++                    s.kvmem.host_charged_bytes as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_disk_bytes",
++                    "KVMem host storage spilled to the disk tier.",
++                    s.kvmem.disk_bytes as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_payload_bytes",
++                    "Packed KV payload bytes held by the per-slot KVMem host stores.",
++                    s.kvmem.payload_bytes as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_blocks",
++                    "Logical KV blocks across every slot's KVMem policy store.",
++                    s.kvmem.blocks as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_tokens",
++                    "Tokens represented across every slot's KVMem policy store.",
++                    s.kvmem.tokens as f64,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_spill_pages_total",
++                    "Full pages spilled from GPU to the KVMem host store since start.",
++                    s.kvmem.spill_pages,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_restore_pages_total",
++                    "Full pages restored from the KVMem host store to GPU since start.",
++                    s.kvmem.restore_pages,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_spill_bytes_total",
++                    "Packed KV bytes spilled from GPU to the KVMem host store since start.",
++                    s.kvmem.spill_bytes,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_restore_bytes_total",
++                    "Packed KV bytes restored from the KVMem host store to GPU since start.",
++                    s.kvmem.restore_bytes,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_prefix_entries",
++                    "Frozen prefix checkpoints in the KVMem catalog.",
++                    s.kvmem.prefix_entries as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_prefix_pinned_pages",
++                    "GPU pages pinned resident by frozen KVMem prefix checkpoints.",
++                    s.kvmem.prefix_pinned_pages as f64,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_prefix_freezes_total",
++                    "Prefix checkpoints newly frozen into the KVMem catalog.",
++                    s.kvmem.prefix_freezes,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_prefix_hits_total",
++                    "KVMem prefix lookups served from the catalog.",
++                    s.kvmem.prefix_hits,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_prefix_misses_total",
++                    "KVMem prefix lookups that found no provable checkpoint.",
++                    s.kvmem.prefix_misses,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_prefix_evictions_total",
++                    "Frozen prefix checkpoints displaced by the LRU bound or admission reclaim.",
++                    s.kvmem.prefix_evictions,
++                );
++            }
+         }
+ 
+         // Multi-slot swap tier, from the last daemon `done` (or the CLI seed
+@@ -943,6 +1052,48 @@ mod tests {
+         ] {
+             assert!(out.contains(sample), "{sample}: {out}");
+         }
++        // KVMem series stay absent when the daemon snapshot has no controller
++        // (old wire object: the field defaults to `enabled: false`).
++        assert!(!out.contains("hipfire_kvmem"), "{out}");
++        let kvwire = serde_json::json!({
++            "total_slots": 1, "active_slots": 1,
++            "kvmem": {
++                "enabled": true, "layerwise": true,
++                "host_charged_bytes": 2048, "disk_bytes": 1024,
++                "payload_bytes": 4096, "blocks": 8, "tokens": 1024,
++                "spill_pages": 3, "restore_pages": 2,
++                "spill_bytes": 6144, "restore_bytes": 4096,
++                "prefix_entries": 2, "prefix_pinned_pages": 16,
++                "prefix_freezes": 5, "prefix_hits": 4,
++                "prefix_misses": 6, "prefix_evictions": 1,
++            },
++        });
++        let kvmeta = ServeMeta {
++            engine_stats: Some(serde_json::from_value(kvwire).unwrap()),
++            ..ServeMeta::new("t".to_owned())
++        };
++        let out = m.render(&kvmeta, 0, 16);
++        for sample in [
++            "hipfire_kvmem_enabled 1\n",
++            "hipfire_kvmem_layerwise 1\n",
++            "hipfire_kvmem_host_bytes 2048\n",
++            "hipfire_kvmem_disk_bytes 1024\n",
++            "hipfire_kvmem_payload_bytes 4096\n",
++            "hipfire_kvmem_blocks 8\n",
++            "hipfire_kvmem_tokens 1024\n",
++            "hipfire_kvmem_spill_pages_total 3\n",
++            "hipfire_kvmem_restore_pages_total 2\n",
++            "hipfire_kvmem_spill_bytes_total 6144\n",
++            "hipfire_kvmem_restore_bytes_total 4096\n",
++            "hipfire_kvmem_prefix_entries 2\n",
++            "hipfire_kvmem_prefix_pinned_pages 16\n",
++            "hipfire_kvmem_prefix_freezes_total 5\n",
++            "hipfire_kvmem_prefix_hits_total 4\n",
++            "hipfire_kvmem_prefix_misses_total 6\n",
++            "hipfire_kvmem_prefix_evictions_total 1\n",
++        ] {
++            assert!(out.contains(sample), "{sample}: {out}");
++        }
+         // Standard route: no snapshot, no series (not zeros).
+         let standard = m.render(&ServeMeta::new("t".to_owned()), 0, 16);
+         for name in [
+@@ -950,6 +1101,7 @@ mod tests {
+             "hipfire_slots_",
+             "hipfire_evictions",
+             "hipfire_prefix_",
++            "hipfire_kvmem",
+         ] {
+             assert!(!standard.contains(name), "{name}: {standard}");
+         }
+diff --git a/crates/hipfire-kvmem/tests/d3_deterministic_discriminator.rs b/crates/hipfire-kvmem/tests/d3_deterministic_discriminator.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..74c666864c3088dcd7c01dabf7d6fd86d0c8526d
+--- /dev/null
++++ b/crates/hipfire-kvmem/tests/d3_deterministic_discriminator.rs
+@@ -0,0 +1,258 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 The hipfire authors
++// hipfire — see LICENSE or NOTICE in the project root.
++
++//! D3-A deterministic discriminator (host-only, no GPU, no model sampling).
++//!
++//! The earlier recall discriminators mixed selection quality with generation
++//! nondeterminism (near-tie sampling / carrier rebuilds). This harness isolates
++//! *selection*: attention mass is injected exactly, the production
++//! `LayerwisePrefillPressure` and the Legacy global `pick_topk_blocks` picker
++//! consume it, and the retained page sets are compared byte-for-byte across
++//! repeats.
++//!
++//! S1 (heterogeneous need): three layers each depend on a different page while
++//! the documented global budget holds two. The per-layer picker must keep each
++//! layer's needed page; the global picker drops one of the three.
++//! S2 (negative control): identical mass in every layer must not manufacture a
++//! divergence — the per-layer pickers agree with each other and keep the needed
++//! page.
++//!
++//! Outcome routing (parity audit §8.3): S1 pass + S3 attribution on the real
++//! engine ⇒ selection mechanism sound (fix quotas); S1 fail ⇒ mechanism defect.
++
++use hipfire_kvmem::{
++    BackendIdentity, BlockCopies, BlockDescriptor, KvStore, KvStoreConfig, LayerMemorySnapshot,
++    MemoryCapabilities, MemoryCatalog, MemoryDescriptor, MemorySnapshot, MemoryStamp, PayloadLayout,
++    PrefillAcceptance, PrefillMass, PrefillOptions, PrefillPressure, PressureChoice, RawStoreConfig,
++    SessionIdentity,
++};
++
++const BLOCK: u32 = 4;
++const PAGES: u64 = 8;
++const TOKENS: u64 = PAGES * BLOCK as u64; // 32
++const ROW_BYTES: usize = 36;
++const LAYERS: [u32; 3] = [0, 1, 2];
++
++fn session() -> SessionIdentity {
++    SessionIdentity { id: 42, incarnation: 3 }
++}
++
++fn raw_config() -> RawStoreConfig {
++    RawStoreConfig {
++        n_layer: LAYERS.len() as u32,
++        n_embd_k: 8,
++        n_embd_v: 8,
++        block_tokens: BLOCK,
++        k_row_bytes: 0,
++        k_gpu_row_bytes: ROW_BYTES as u64,
++        v_gpu_row_bytes: ROW_BYTES as u64,
++    }
++}
++
++fn descriptor() -> MemoryDescriptor {
++    let layout = PayloadLayout::from_raw(&raw_config(), "hipfire-q8-packed-v1", &LAYERS)
++        .expect("layout");
++    let cap = MemoryCapabilities {
++        page_tokens: BLOCK,
++        max_position: 1 << 20,
++        native_payload: 1,
++        sparse_view: 1,
++        original_rope_positions: 1,
++        pre_rope_statistics: 1,
++        state_checkpoint: 1,
++        asynchronous_transfer: 0,
++    };
++    let backend = BackendIdentity {
++        backend: "hipfire".into(),
++        revision: "kvmem-v046".into(),
++        model: "d3-three-layer-fixture".into(),
++        state_schema: "state-v1".into(),
++    };
++    MemoryDescriptor::new(&backend, &layout, &cap).expect("descriptor")
++}
++
++fn stamp() -> MemoryStamp {
++    MemoryStamp {
++        valid: 1,
++        session: session(),
++        history_revision: 7,
++        view_version: 1,
++        frontier: TOKENS,
++        execution_history: 3,
++    }
++}
++
++fn block(i: u64) -> BlockDescriptor {
++    BlockDescriptor {
++        session: session(),
++        id: i,
++        original_start: i * BLOCK as u64,
++        valid_tokens: BLOCK,
++        content_version: 1,
++        statistics_version: 1,
++    }
++}
++
++/// Every page resident in every layer, one shared accepted history.
++fn catalog() -> MemoryCatalog {
++    let blocks: Vec<BlockCopies> = (0..PAGES)
++        .map(|i| BlockCopies { block: block(i), host_version: 1 })
++        .collect();
++    let resident: Vec<u64> = (0..PAGES).collect();
++    let layers: Vec<LayerMemorySnapshot> = LAYERS
++        .iter()
++        .map(|&model_layer| LayerMemorySnapshot {
++            model_layer,
++            memory: MemorySnapshot {
++                stamp: stamp(),
++                blocks: blocks.clone(),
++                resident: resident.clone(),
++            },
++        })
++        .collect();
++    MemoryCatalog::new(&descriptor(), &layers).expect("catalog")
++}
++
++fn pressure() -> PrefillPressure {
++    PrefillPressure::new(
++        session(),
++        &LAYERS,
++        &PrefillOptions {
++            block_tokens: BLOCK,
++            select_tokens: 2 * BLOCK as u64, // two pages per layer
++            reserve_tokens: 0,
++            interval: 1,
++            stride: 0, // sample the last row only (deterministic)
++            half_life: 8192.0,
++        },
++    )
++    .expect("pressure")
++}
++
++/// One injected row: `needed` gets `share`, the rest split the remainder.
++fn mass_row(needed: u64, share: f64) -> Vec<f64> {
++    let mut row = vec![(1.0 - share) / (PAGES - 1) as f64; PAGES as usize];
++    row[needed as usize] = share;
++    row
++}
++
++/// Accept one whole-model prefill chunk whose sampled row is the last token.
++fn accept(pressure: &mut PrefillPressure, needed: &[u64]) -> bool {
++    let rows = pressure.rows(0, TOKENS as u32, 0, false).expect("rows");
++    assert_eq!(rows, vec![TOKENS as u32 - 1], "stride-0 samples the last row");
++    let history: Vec<u64> = (0..PAGES).map(|i| i * BLOCK as u64).collect();
++    let layers: Vec<PrefillMass> = LAYERS
++        .iter()
++        .zip(needed)
++        .map(|(&model_layer, &page)| PrefillMass {
++            model_layer,
++            starts: history.clone(),
++            history: history.clone(),
++            masses: mass_row(page, 0.4),
++        })
++        .collect();
++    pressure
++        .accept(&PrefillAcceptance {
++            history: stamp(),
++            count: TOKENS,
++            accepted: TOKENS,
++            local_begin: 0,
++            rows,
++            layers,
++        })
++        .expect("accept")
++}
++
++fn chosen(choices: &[PressureChoice], layer: u32) -> Vec<u64> {
++    choices
++        .iter()
++        .find(|c| c.model_layer == layer)
++        .expect("layer choice")
++        .selected
++        .clone()
++}
++
++/// Legacy global picker over the same canonical pages.
++fn legacy_pick(scores: &[f64]) -> Vec<u32> {
++    let store = KvStore::new(&KvStoreConfig {
++        block_tokens: BLOCK,
++        select_budget: 2 * BLOCK, // two pages, the documented global budget
++        sink_blocks: 0,
++        recent_blocks: 0,
++        ..KvStoreConfig::default()
++    })
++    .expect("legacy store");
++    store.register_append(TOKENS as u32).expect("append");
++    store.set_retrieval_scores(scores).expect("scores");
++    store.pick_topk_blocks(&[]).expect("pick")
++}
++
++#[test]
++fn s1_heterogeneous_need_separates_per_layer_from_global_selection() {
++    let mut pressure = pressure();
++    assert!(accept(&mut pressure, &[2, 5, 7]));
++    let catalog = catalog();
++    let choices = pressure.select(&catalog, &[], 2 * BLOCK as u64, 0).expect("select");
++    let read = choices.read_all().expect("read");
++
++    // The per-layer picker keeps every layer's own needed page.
++    for (layer, needed) in LAYERS.iter().zip([2u64, 5, 7]) {
++        let selected = chosen(&read, *layer);
++        assert_eq!(selected.len(), 2, "layer {layer} picks two pages: {selected:?}");
++        assert!(selected.contains(&needed), "layer {layer} lost page {needed}: {selected:?}");
++    }
++
++    // The same canonical pages under ONE global ranking: pages 2/5/7 are the
++    // top three, the budget holds two, so one needed page is dropped.
++    let mut scores = vec![0.05f64; PAGES as usize];
++    scores[2] = 0.34;
++    scores[5] = 0.33;
++    scores[7] = 0.33;
++    let picked = legacy_pick(&scores);
++    assert_eq!(picked.len(), 2, "global budget holds two pages: {picked:?}");
++    let dropped = [2u32, 5, 7].iter().any(|id| !picked.contains(id));
++    assert!(dropped, "global picker kept every needed page: {picked:?}");
++}
++
++#[test]
++fn s2_identical_mass_does_not_manufacture_divergence() {
++    let mut pressure = pressure();
++    assert!(accept(&mut pressure, &[2, 2, 2]));
++    let catalog = catalog();
++    let choices = pressure.select(&catalog, &[], 2 * BLOCK as u64, 0).expect("select");
++    let read = choices.read_all().expect("read");
++
++    let first = chosen(&read, 0);
++    assert!(first.contains(&2), "needed page retained: {first:?}");
++    for layer in [1u32, 2] {
++        assert_eq!(chosen(&read, layer), first, "identical mass must pick identically");
++    }
++
++    // Negative control: the Legacy ranking built from the same distribution
++    // keeps the same needed page; no artificial Layerwise "win".
++    let row = mass_row(2, 0.4);
++    let picked = legacy_pick(&row.into_iter().map(|v| v).collect::<Vec<_>>());
++    assert!(picked.contains(&2), "legacy keeps the shared needed page: {picked:?}");
++}
++
++#[test]
++fn selection_is_byte_stable_across_repeats() {
++    let mut pressure = pressure();
++    assert!(accept(&mut pressure, &[2, 5, 7]));
++    let catalog = catalog();
++    let a = pressure
++        .select(&catalog, &[], 2 * BLOCK as u64, 0)
++        .expect("select a")
++        .read_all()
++        .expect("read a");
++    let b = pressure
++        .select(&catalog, &[], 2 * BLOCK as u64, 0)
++        .expect("select b")
++        .read_all()
++        .expect("read b");
++    assert_eq!(a, b, "identical accepted mass must select identically");
++    for layer in LAYERS {
++        assert_eq!(chosen(&a, layer), chosen(&b, layer));
++    }
++}
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index 2059215c33615d53ccf0da4d648664d3ef4ac568..57664d4c51dce2e284b3bf365da17ba2c0c8dec1 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -203,6 +203,40 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
+         .map_err(|_| "client receiver dropped".to_string())
+ }
+ 
++/// KVMem host-offload telemetry, refreshed from the live controller once per
++/// engine step. All fields are scalars (the snapshot is `Copy`) and every
++/// counter is monotonic since engine start. `enabled == false` carries zeros
++/// and the gateway exports no KVMem series for it.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(default)]
++pub struct KvMemStats {
++    pub enabled: bool,
++    /// Layerwise recall strategy active (per-layer selection) vs Legacy.
++    pub layerwise: bool,
++    /// Host KV storage charged bytes (live + sealed payload + metadata).
++    pub host_charged_bytes: u64,
++    /// Host KV storage spilled to the disk tier.
++    pub disk_bytes: u64,
++    /// Packed KV payload bytes held by the per-slot host stores.
++    pub payload_bytes: u64,
++    /// Logical blocks / tokens across every slot's policy store.
++    pub blocks: u64,
++    pub tokens: u64,
++    /// Paged spill/restore volume since start (pages and packed bytes).
++    pub spill_pages: u64,
++    pub restore_pages: u64,
++    pub spill_bytes: u64,
++    pub restore_bytes: u64,
++    /// P4.3 frozen-prefix catalog: entries, pinned GPU pages, and the
++    /// freeze/lookup/eviction counters that explain a hit ratio.
++    pub prefix_entries: u64,
++    pub prefix_pinned_pages: u64,
++    pub prefix_freezes: u64,
++    pub prefix_hits: u64,
++    pub prefix_misses: u64,
++    pub prefix_evictions: u64,
++}
++
+ /// Serialized as the `engine_stats` object of every multi-slot `done` event;
+ /// the serve gateway exports it on `/metrics`.
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+@@ -241,6 +275,8 @@ pub struct EngineStats {
+     pub swap_disk_used: u64,
+     pub swap_host_budget: u64,
+     pub swap_disk_budget: u64,
++    /// KVMem host-offload snapshot (zeroed when the engine runs without it).
++    pub kvmem: KvMemStats,
+ }
+ 
+ impl EngineStats {
+@@ -275,6 +311,13 @@ impl EngineStats {
+         self.active_slots = self.active_slots.saturating_sub(1);
+     }
+ 
++    /// Refresh the live KVMem snapshot (cheap integer reads from the host
++    /// stores; no allocation, no device work). Engines without KVMem leave
++    /// the default zero snapshot, whose series the gateway suppresses.
++    pub fn note_kvmem(&mut self, kvmem: KvMemStats) {
++        self.kvmem = kvmem;
++    }
++
+     /// Refresh the swap-tier snapshot from the live manager. Cheap: reads
+     /// counters and three integers, no allocation.
+     pub fn note_swap(&mut self, swap: &crate::swap::SwapManager) {

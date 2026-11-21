@@ -1,0 +1,175 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 7f9df716a0d2cda5bc6b69ca69d1e12cc1580f08..30b0646b2a1d1f9c27b73900480c22c37c5d932e 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -940,6 +940,10 @@ pub struct KvMemCtl {
+     prefix_hits_total: u64,
+     prefix_misses_total: u64,
+     prefix_evictions_total: u64,
++    /// G3 follow-up: hot catalog hits (never read a pack) and reuse
++    /// conversions that restored a demoted/restart entry from the archive.
++    prefix_catalog_hits_total: u64,
++    prefix_restore_hits_total: u64,
+     /// G3 follow-up: admission-pressure residency demotions (entry retained,
+     /// pinned pages dropped; Layerwise restores them from the archive).
+     prefix_demotions_total: u64,
+@@ -1337,6 +1341,8 @@ impl KvMemCtl {
+             prefix_hits_total: 0,
+             prefix_misses_total: 0,
+             prefix_evictions_total: 0,
++            prefix_catalog_hits_total: 0,
++            prefix_restore_hits_total: 0,
+             prefix_demotions_total: 0,
+             draft_images_total: 0,
+             draft_image_hits_total: 0,
+@@ -1787,6 +1793,7 @@ impl KvMemCtl {
+     pub fn prefix_lookup(&mut self, prompt: &[u32]) -> Option<u64> {
+         let layout = layout_fingerprint(&self.raw_cfg);
+         if let Some(hit) = self.prefix_catalog.lookup(prompt, layout) {
++            self.prefix_catalog_hits_total += 1;
+             self.prefix_hits_total += 1;
+             return Some(hit);
+         }
+@@ -1904,6 +1911,7 @@ impl KvMemCtl {
+             .prefix_catalog
+             .lookup_at_most(prompt, layout_fingerprint(&self.raw_cfg), max_frontier);
+         if hit.is_some() {
++            self.prefix_catalog_hits_total += 1;
+             self.prefix_hits_total += 1;
+         } else {
+             self.prefix_misses_total += 1;
+@@ -1929,6 +1937,12 @@ impl KvMemCtl {
+         self.draft_image_misses_total += 1;
+     }
+ 
++    /// G3 follow-up: a reuse conversion proceeded without pinned pages and
++    /// restored them from the sealed archive (demoted or restart entry).
++    pub fn note_prefix_restore_hit(&mut self) {
++        self.prefix_restore_hits_total += 1;
++    }
++
+     /// Mutable access (engine attaches `gpu_pages` after sealing + cache refs).
+     pub fn prefix_checkpoint_mut(&mut self, id: u64) -> Option<&mut PrefixCheckpoint> {
+         self.prefix_catalog.get_mut(id)
+@@ -2000,6 +2014,8 @@ impl KvMemCtl {
+             prefix_misses: self.prefix_misses_total,
+             prefix_evictions: self.prefix_evictions_total,
+             prefix_demotions: self.prefix_demotions_total,
++            prefix_catalog_hits: self.prefix_catalog_hits_total,
++            prefix_restore_hits: self.prefix_restore_hits_total,
+             content_groups: self.prefix_catalog.group_count() as u64,
+             content_retirements: self.content_retirements_total,
+             content_cache_bytes: self
+@@ -2010,6 +2026,7 @@ impl KvMemCtl {
+             content_packs: self.cold_packs.len() as u64,
+             content_pack_bytes: self.cold_packs.total_bytes(),
+             cold_pack_hits: self.cold_pack_hits_total,
++            cold_pack_misses: self.cold_pack_misses_total,
+             draft_images: self.draft_images_total,
+             draft_image_hits: self.draft_image_hits_total,
+             draft_image_misses: self.draft_image_misses_total,
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index c7040fa4a8dba0751ca013866b8fdd276bdf8ce3..9879068394191669cbe67d9d9a1c6d5648e5dc1a 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -9606,6 +9606,10 @@ fn admit(
+                                 .to_string(),
+                         );
+                     }
++                    // G3 follow-up: page-less Layerwise reuse restores pages
++                    // from the sealed archive on demand; count it apart from a
++                    // hot catalog hit (demotion / restart metrics).
++                    ctl.note_prefix_restore_hit();
+                 } else if rig.pool.share_published_pages(slot, &gpu_pages).is_err() {
+                     let _ = ctl.reset_slot(slot.0);
+                     let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
+index 375e616f460d49a10a06c94e89ca480fd98084f3..b6ebc829066c05ade586f40d5f7b6967a5b4e9c8 100644
+--- a/crates/hipfire-cli/src/serve/metrics.rs
++++ b/crates/hipfire-cli/src/serve/metrics.rs
+@@ -665,6 +665,18 @@ impl Metrics {
+                     "Admission-pressure residency demotions: pinned pages dropped, catalog entry retained.",
+                     s.kvmem.prefix_demotions,
+                 );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_prefix_catalog_hits_total",
++                    "Prefix hits served from the hot catalog without reading a pack.",
++                    s.kvmem.prefix_catalog_hits,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_prefix_restore_hits_total",
++                    "Reuse conversions that restored a page-less (demoted or restart) entry from the sealed archive.",
++                    s.kvmem.prefix_restore_hits,
++                );
+                 counter(
+                     &mut out,
+                     "hipfire_kvmem_draft_images_total",
+@@ -725,6 +737,12 @@ impl Metrics {
+                     "Prefix lookups served by an on-disk content pack.",
+                     s.kvmem.cold_pack_hits,
+                 );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_cold_pack_misses_total",
++                    "Cold pack matches that were rejected or failed to load.",
++                    s.kvmem.cold_pack_misses,
++                );
+             }
+         }
+ 
+@@ -1145,10 +1163,12 @@ mod tests {
+                 "prefix_host_bytes": 3000, "prefix_host_bytes_gross": 5000,
+                 "prefix_freezes": 5, "prefix_hits": 4,
+                 "prefix_misses": 6, "prefix_evictions": 1, "prefix_demotions": 2,
++                "prefix_catalog_hits": 3, "prefix_restore_hits": 2,
+                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
+                 "content_groups": 2, "content_retirements": 1,
+                 "content_cache_bytes": 4096, "content_cache_disk_bytes": 2048,
+                 "content_packs": 3, "content_pack_bytes": 8192, "cold_pack_hits": 1,
++                "cold_pack_misses": 1,
+             },
+         });
+         let kvmeta = ServeMeta {
+@@ -1177,6 +1197,8 @@ mod tests {
+             "hipfire_kvmem_prefix_misses_total 6\n",
+             "hipfire_kvmem_prefix_evictions_total 1\n",
+             "hipfire_kvmem_prefix_demotions_total 2\n",
++            "hipfire_kvmem_prefix_catalog_hits_total 3\n",
++            "hipfire_kvmem_prefix_restore_hits_total 2\n",
+             "hipfire_kvmem_draft_images_total 2\n",
+             "hipfire_kvmem_draft_image_hits_total 1\n",
+             "hipfire_kvmem_draft_image_misses_total 1\n",
+@@ -1187,6 +1209,7 @@ mod tests {
+             "hipfire_kvmem_content_packs 3\n",
+             "hipfire_kvmem_content_pack_bytes 8192\n",
+             "hipfire_kvmem_cold_pack_hits_total 1\n",
++            "hipfire_kvmem_cold_pack_misses_total 1\n",
+         ] {
+             assert!(out.contains(sample), "{sample}: {out}");
+         }
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index 6f207c4eecae643cebc0ad4576e3041a1e56a369..cf6c2fb63e030b931d0a23800496c34852c3b971 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -251,6 +251,10 @@ pub struct KvMemStats {
+     /// Admission-pressure residency demotions: the entry stays cataloged and
+     /// only its pinned pages are dropped (Layerwise restores them later).
+     pub prefix_demotions: u64,
++    /// Hot catalog hits (no pack read) and reuse conversions that restored a
++    /// page-less (demoted/restart) entry from the sealed archive.
++    pub prefix_catalog_hits: u64,
++    pub prefix_restore_hits: u64,
+     /// 期4: DFlash2 draft conditioning images captured with prefix
+     /// checkpoints, restored on reuse, and missing/unrestorable (reseed).
+     pub draft_images: u64,
+@@ -267,6 +271,8 @@ pub struct KvMemStats {
+     pub content_packs: u64,
+     pub content_pack_bytes: u64,
+     pub cold_pack_hits: u64,
++    /// Cold pack matches that were rejected / failed to load.
++    pub cold_pack_misses: u64,
+ }
+ 
+ /// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`

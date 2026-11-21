@@ -1,0 +1,139 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 5a8b5af1d10a210d9041e7f7f3694e445aea5446..7270a75dc0244985f363b0bed8cb6e4bbf7b6dca 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -892,6 +892,9 @@ pub struct KvMemCtl {
+     /// on); an empty catalog allocates nothing and no default path reads it,
+     /// so the Legacy serve stays byte-neutral.
+     prefix_catalog: PrefixCatalog,
++    /// P3.4 retention policy `(count, bytes, interval, min_gap)` when the spread
++    /// checkpoint policy is active; `None` keeps the historical LRU-only catalog.
++    checkpoint_retention: Option<(usize, u64, u64, u64)>,
+     /// Observability counters (`KvMemCtl::stats`). Pure bookkeeping: no path
+     /// reads them back into selection/residency, so they cannot change KV
+     /// bytes; `/metrics` exports them via `EngineStats.kvmem`.
+@@ -968,6 +971,16 @@ impl KvMemCtl {
+         if gen_reserve == 0 {
+             return Err("kvmem: HIPFIRE_KVMEM_GEN_RESERVE must be positive".to_string());
+         }
++        let checkpoint_retention = match env_raw("HIPFIRE_KVMEM_CHECKPOINT_POLICY").as_deref() {
++            Some("spread") => {
++                let count = env_usize("HIPFIRE_KVMEM_CHECKPOINT_COUNT").unwrap_or(4).clamp(1, 64);
++                let mib = env_u64("HIPFIRE_KVMEM_CHECKPOINT_MIB").unwrap_or(512).max(1);
++                let interval = env_u64("HIPFIRE_KVMEM_CHECKPOINT_INTERVAL").unwrap_or(4096).max(1);
++                let min_gap = env_u64("HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP").unwrap_or(0);
++                Some((count, mib << 20, interval, min_gap))
++            }
++            _ => None,
++        };
+ 
+         // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
+         // LRFU replaces the raw retrieval score with a decaying heavy-hitter
+@@ -1207,6 +1220,7 @@ impl KvMemCtl {
+             aux_ordinal: geom.n_fa_layers as u32,
+             n_record_layers,
+             gen_reserve,
++            checkpoint_retention,
+             // P4.3: bounded frozen-prefix catalog; empty until the engine
+             // freezes a prefix (PREFIX_PIN on). The bound is the retention
+             // count ceiling (H5 exposes the env knob).
+@@ -1486,7 +1500,13 @@ impl KvMemCtl {
+         if inserted.is_some() {
+             self.prefix_freezes_total += 1;
+         }
+-        self.prefix_evictions_total += displaced.len() as u64;
++        let mut displaced = displaced;
++        if let Some((count, bytes, interval, min_gap)) = self.checkpoint_retention {
++            let pruned = self.prefix_catalog.prune_policy(count, bytes, interval, min_gap);
++            self.prefix_evictions_total += pruned.len() as u64;
++            displaced.extend(pruned);
++        }
++        self.prefix_evictions_total += 0;
+         Ok((inserted.unwrap_or(id), displaced, false))
+     }
+ 
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index fe129d9d2b8171a907b466aa79e9b97ced0b27ef..de1d282beb8b301e2b1bcb6581824651c2428a6b 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -328,6 +328,53 @@ impl PrefixCatalog {
+         self.entries.iter().find(|e| e.id == id)
+     }
+ 
++    /// P3.4: prune the catalog with the core coverage-retention policy
++    /// (count/byte caps + interval/min_gap). Returns the removed entries so the
++    /// engine can release their GPU cache refs. A policy error falls back to
++    /// keeping every entry (never silently drops a reusable prefix).
++    pub fn prune_policy(
++        &mut self,
++        count: usize,
++        bytes: u64,
++        interval: u64,
++        min_gap: u64,
++    ) -> Vec<PrefixCheckpoint> {
++        use hipfire_kvmem::{retain_checkpoint_coverage, CoverageInfo, CoveragePurpose};
++        let infos: Vec<CoverageInfo> = self
++            .entries
++            .iter()
++            .map(|e| CoverageInfo {
++                frontier: e.frontier as u64,
++                bytes: e.canonical.payload_bytes(),
++                used: e.last_used,
++                identity: e.id,
++                purpose: CoveragePurpose::Periodic as u32,
++                protections: 0,
++            })
++            .collect();
++        let keep = match retain_checkpoint_coverage(
++            &infos,
++            count as u64,
++            bytes,
++            interval,
++            min_gap,
++        ) {
++            Ok(k) => k,
++            Err(_) => return Vec::new(),
++        };
++        let mut removed = Vec::new();
++        let mut kept = Vec::with_capacity(self.entries.len());
++        for (index, entry) in std::mem::take(&mut self.entries).into_iter().enumerate() {
++            if keep.contains(&index) {
++                kept.push(entry);
++            } else {
++                removed.push(entry);
++            }
++        }
++        self.entries = kept;
++        removed
++    }
++
+     /// Exact-frontier dedup probe: an entry with the same frontier AND
+     /// fingerprint already exists (touch it). The engine uses this BEFORE
+     /// sealing GPU pages so a deduped freeze never doubles cache refs.
+@@ -546,6 +593,26 @@ mod tests {
+         assert_eq!(cat.lookup_at_most(&toks, layout ^ 1, 512), None);
+     }
+ 
++    #[test]
++    fn catalog_prune_policy_keeps_the_policy_selected_entries() {
++        let st = storage();
++        let toks = tokens(512);
++        let mut cat = PrefixCatalog::new(4);
++        for frontier in [128u32, 256, 384] {
++            let ckpt = checkpoint(&st, cat.mint_id(), frontier, &toks[..frontier as usize]);
++            cat.insert(ckpt).expect("insert");
++        }
++        assert_eq!(cat.len(), 3);
++        // Count=1 keeps the newest frontier under the core cost heuristic.
++        let removed = cat.prune_policy(1, 1 << 30, 4096, 0);
++        assert_eq!(removed.len(), 2);
++        assert_eq!(cat.len(), 1);
++        let remaining = cat.lookup(&toks[..384], layout_fingerprint(&raw_config()));
++        assert!(remaining.is_some(), "the newest (longest) prefix survives");
++        // The same selection is idempotent.
++        assert!(cat.prune_policy(1, 1 << 30, 4096, 0).is_empty());
++    }
++
+     #[test]
+     fn catalog_lru_eviction_returns_displaced() {
+         let st = storage();

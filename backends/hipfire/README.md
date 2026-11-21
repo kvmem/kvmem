@@ -1,0 +1,511 @@
+# hipfire backend
+
+hipfire is a Rust + HIP engine whose Qwen3.5 serve path keeps KV in paged Q8
+arenas (one FullAttention K/V arena per layer, 128-token pages). This backend
+lets KVMem own *residency* for those pages: a full page is either resident in
+the slot's block table or replaced by the `SPILLED_PAGE` sentinel while its
+packed Q8 bytes live in the KVMem host store. The masked attention kernels
+skip sentinel pages, so an evicted page is invisible until a selection
+restores it.
+
+## Pieces
+
+| Piece | Where |
+|---|---|
+| C ABI shim over the portable KVMem host library | `hipfire_kvmem_shim.{h,cpp}` (this directory) |
+| Rust FFI crate + shim build | hipfire `crates/hipfire-kvmem` (`build.rs`, `KVMEM_ROOT`) |
+| Paged spill primitives (sentinel, page ops, kernel masks, paged split-K verify kernel) | `../patches/hipfire-paged-spill.patch` |
+| Statistics taps, controller, serve wiring; escha-dense baseline, Bonsai TQ2/BQ1 slots admission | `../patches/hipfire-kvmem.patch` |
+| RDNA3 (gfx1100) operator pass: MQ3G256V2 q8x verify decode, real escha grouped-WMMA batched prefill (replaces the `kvmem` patch's `prefill_chunk=1` stopgap), escha-pro/xt F16 in_proj handling | `../patches/hipfire-rdna3-opt.patch` |
+| Multi-slot spec-decode admission fix: `--spec mtp`/`dflash` engage under the router's default penalized+sampled requests (exact-AR penalty prepass + greedy/point-mass sampled verify, shared `SpecRetire`) | `../patches/hipfire-spec-accept.patch` |
+| Batched spill/restore: pinned-slab stream-ordered async page copies with one sync per chunk (byte-neutral; `HIPFIRE_KVMEM_BATCH_XFER=0` restores per-page blocking) | `../patches/hipfire-batch-restore.patch` |
+| Opt-in residency-selection policy knobs: `SELECT_METHOD` (retrieval/recency), LRFU decaying heavy-hitter history (round lifecycle wired through the shim + crate FFI), GPU high/low watermark hysteresis band; defaults byte-neutral | `../patches/hipfire-policy-knobs.patch` |
+| Query-span multi-row Q scoring: `QUERY_SPAN` (1 = mean-K cosine, byte-neutral; >1 = page-softmax over a per-slot host Q ring), `query_score_frame` + `page_softmax_scores` wrapped through the shim + crate FFI; zero VRAM growth | `../patches/hipfire-query-span.patch` |
+| Host page-softmax SIMD dot reduction: crate build adds `-fopenmp-simd` so the core dot product's `#pragma omp simd` is honoured (float32 accumulation over FP16-rounded operands); per-selection latency ~3.4× lower, default byte-neutral | `../patches/hipfire-softmax-simd.patch` |
+| Layerwise recall foundation (Phase 3.2 sub-patch ①): crate-agnostic `LayerwisePagePool` composite-slot pool + `PackedArenaLayout` packed-page geometry (rdna-compute), Q8 packed-page adapter bridging the engine stride authority to the core generic `PayloadLayout` manifest (hipfire-arch-qwen35), and the core layerwise-API C ABI shim entries + crate FFI (payload builder / catalog `plan_layer` / `NativeKvLayerRegions` / `LayerwiseQueryRequest` state machine / native scorer); additive, NOT wired into live serve, Legacy byte-neutral | `../patches/hipfire-layerwise-foundation.patch` |
+| Layerwise recall function (Phase 3.2 sub-patch ②): GPU HIP page scorer (`kvmem_page_score`, 4 wave-aware gfx1100 kernels, FP64-oracle parity) + per-layer driver (`layerwise_driver`: composite-arena stripe COW restore + drop-evict + suffix partial restore) wired into the three paged paths A/B/C via `serve_engine` scoped orchestration + `KvMemCtl` re-bootstrap/accessor/page-aligned policy + write-through feed; `HIPFIRE_KVMEM_RECALL_STRATEGY=layerwise` engine opt-in (default Legacy byte-neutral). Consumes ①'s shim + crate FFI unchanged (no new C entries, core logic zero-change) | `../patches/hipfire-layerwise-function.patch` |
+| MTP foundation (Phase 4.1 sub-patch ①): width-param multi-row driver/seam primitives (`LayerwiseDescStaging::new_with_width`, pure-host `bootstrap_layerwise_rows` n-row span, `accept_output_pressure` partial verify via the core `OutputPressure`), Main+aux composite-record Q8 layout adapter (`LayerwiseMtpQ8Layout`, head KV geometry), head bounded-pool geometry (`mtp_auxiliary_capacity` + `mtp_head_pool`, window + one scratch block), and aux-selection binding primitives (new `layerwise_mtp`: `LayerwiseMtpHistory` FirstLayer/UpstreamGlobal policy + `AuxiliarySelection` bind-once/exact-extent guards); additive host/pure, NOT wired into live serve, NO env toggle, width=1 byte-identical to AR, Legacy byte-neutral (no new C entries, core logic zero-change) | `../patches/hipfire-mtp-foundation.patch` |
+| MTP function (Phase 4.1 sub-patch ②): MTP-head (`--spec mtp`) KV write-through/restore + FirstLayer aux binding WIRED into live serve under `RecallStrategy::Layerwise` (head bounded pool window+scratch replaces full-resident `max_seq` ⇒ 2-slot×256k OOM-solved); A'-1 AR decode→`engine_carrier_rows` (OutputPressure Query-every-step + REPLACE) + continuation `sync_prefill` driver gate (ONE new shim C entry `hk_output_pressure_sync_prefill`, idempotent ⇒ Legacy byte-neutral); G7 cleanup (strip hh-trace/DIAG-53, remove dead `engine_carrier` + 4 head-coordinate primitives). C decision: seal basis = MTP capability + Legacy byte-neutral + G6 B-gate; layerwise D3 recall benefit decoupled/deferred (no recall-benefit claim) | `../patches/hipfire-mtp-function.patch` |
+| Prefix PIN (P4.3): KVMem-native cross-session prefix sharing — immutable canonical freeze at page-aligned prefill boundaries + provenance-validated fork reuse + cache-ref GPU PIN (selection skip) + block-aligned truncate coordination + DeltaNet checkpoint pairing; `HIPFIRE_KVMEM_PREFIX_PIN` opt-in (default off ⇒ Legacy byte-neutral), radix stays disabled, Legacy AND Layerwise covered. New shim C entries `hk_raw_store_fork_prefix`/`fork_mean_prefix`/`export_packed`/`import_packed` + `hk_packed_snapshot` + `hk_prefix_anchor`/`hk_prefix_restore_limit` | `../patches/hipfire-prefix-pin.patch` |
+| Non-q8 KV (P4.4): multi-format KVMem admission (ninfer-aligned) — per-tier layerwise layout adapter (`packed_format_tag`/`composite_format_tag` format identities, `kv_mode` threaded through `KvMemGeometry`/`KvMemCtl`/`layerwise_backend`) + `kv_page_present` residency masks on the 8 non-Q8 flash batched tiles (+ asym3/fwht3 hd512 variants) + the bf16/fp8 `kv_batched` shared-TU variants; admission gate relaxed to all nine KV tiers (exhaustive match, future variants compile-fail-closed). Spill byte-opaque + mean-K F32 pre-RoPE ⇒ host path tier-generic. Q8 byte-neutral; Legacy non-q8 all 8 formats + Layerwise f16/asym3 verified vs native parity. No shim change | `../patches/hipfire-nonq8-mask.patch` |
+| AR head-aux co-archive (fix(a), P4.1② head-plane gap correctness): the AR-decode statistics feed co-archives the head aux K/V for accepted decode rows (norm trunk PRE-final-norm residual → head post-norm staging → `mtp_takeover_fill_head_kv` → `head_write_through_archive` at GLOBAL pos → `accept_head_append`), mirroring the MTP verify accept path. Fixes the head aux frontier lagging the trunk Main plane → composite suffix-block export "partial frontier" (masked as "layer 0 mass not captured") → continuation HTTP 500 under Layerwise+MTP. Prefill rows skipped (already co-archived); Legacy byte-neutral. Extracted from deferred P4.1③ as an independent correctness seal (no benefit gate; precedent A'-1). No shim change | `../patches/hipfire-ar-head-aux-coarchive.patch` |
+| KVMem observability (`kvmem-metrics`): live host-offload telemetry on the multi-slot route — `EngineStats.kvmem` (`KvMemStats`: host/disk/payload bytes, blocks/tokens, spill/restore pages+bytes, prefix entries/pinned pages/freeze/hit/miss/eviction counters) refreshed from `KvMemCtl::stats()` once per engine step, exported by `/metrics` as 18 `hipfire_kvmem_*` series only when the controller exists. Counters are write-only bookkeeping (no selection/residency input), so the N-gate stays byte-neutral (`sha==29e8a27d`, VERIFY0); the added `d3_deterministic_discriminator` host test pins the Layerwise-vs-global selection difference under injected mass | `../patches/hipfire-kvmem-metrics.patch` |
+| Layerwise window/import policy (`layerwise-window-import`): additive shim + crate FFI for the literal 72a81cc request plan (`WindowPlan`: action/admit/selection_budget/prefill_checkpoint/generation_checkpoint/prefill_boundary/query_evaluation) and `plan_layerwise_import` (terminal-reserve / prefill-probe / query-replay overflow tests + exact budget/restore/selection tokens), with an 8-case host smoke test. No engine call sites yet; the engine wiring design (capacity mapping, partial-tail freeze, import trigger) is pending in parity-audit §11 | `../patches/hipfire-layerwise-window-import.patch` |
+| Fenced import admission (`import-admission`, P2.2a): `HIPFIRE_KVMEM_GEN_RESERVE` (default 1024) + layerwise window capacity B+R (ninfer `device_tokens`) + cold-admit reuse runs `plan_layerwise_import` on the restored exact prefix; a pressure import arms a one-shot Layerwise selection budget (driver consumes it on the first carrier selection) and a narrowing import fails closed to the cold rebuild until 2.2b captures narrowed DeltaNet checkpoints. Layerwise+prefix-pin only; default byte-neutral | `../patches/hipfire-import-admission.patch` |
+| Import coverage fallback (`import-coverage-fallback`, P2.2b1): the imported native extent is the compact view `min(frontier, B)` (ninfer `state.visible_tokens`), not the logical frontier — a frontier longer than `B+R` no longer trips the window validation; when a pressure import would narrow the logical prefix, the cold admit falls back to the longest coverage checkpoint at or below the narrowed extent (`PrefixCatalog::lookup_at_most`, full token proof). Any refused admission after the fork hands the slot back cold (KV+DeltaNet reset) instead of leaving a half-forked store. Live tight-budget LW reuse probe (B=2048): 2 prefix hits, recall ABC, zero mismatch/500/poison | `../patches/hipfire-import-coverage-fallback.patch` |
+| Endpoint coverage checkpoints (`endpoint-coverage`, P2.2b2): opt-in `HIPFIRE_KVMEM_PREFIX_COVERAGE` captures recurrent checkpoints at page-aligned decode frontiers (`_INTERVAL`, default 1024); at the committed terminal the engine freezes the canonical prefix INCLUDING generated rows at the latest covered/aligned frontier (residual pages must stay resident). Shared freeze/pin helper (`kvmem_catalog_and_pin`) now backs both the prefill-boundary and endpoint paths. Live probe: prompt 1157 + 256 generated → coverage at 1280/1408, endpoint freeze at 1408, zero mismatch/500/poison; default off ⇒ byte-neutral | `../patches/hipfire-endpoint-coverage.patch` |
+| Checkpoint policy foundation (`checkpoint-policy`, 期3.1): additive shim/crate exposure of the core `CheckpointCapturePlan` (semantic root/tail cuts + periodic due cursor) and `retain_checkpoint_coverage` (count/byte caps, min-gap spacing, protected Root/Anchor/Input roles, newest-endpoint bypass). Host smoke 6/6; no engine call sites yet — the engine still uses its per-chunk freeze + LRU catalog until 期3.2 wires the policy | `../patches/hipfire-checkpoint-policy.patch` |
+| Checkpoint policy wiring (`checkpoint-policy-wiring`, 期3.2): `HIPFIRE_KVMEM_CHECKPOINT_POLICY=spread` (+`_INTERVAL` default 4096, `_MIN_GAP`) gates prefill freezes through the core capture plan (per-request stride from the reuse base); legacy default freezes every boundary unchanged. Live probe (TARGET 10000): freezes 16→2 (one per session at 4096), B/C reuse hits=2, recall OK, 0 mismatch/500/poison | `../patches/hipfire-checkpoint-policy-wiring.patch` |
+| Keep-set trace (`keep-trace`, D3 S3): opt-in `HIPFIRE_KVMEM_TRACE_KEEP` logs each Layerwise selection's per-FA-layer canonical page ids (`[kvmem-keep] ... L0:.. L15:..`). Log-only, default off (byte-neutral). Used to attribute the D3 recall question: per-layer quotas fill exactly (24/24 at BUDGET=3072), layers diverge, needle anchor pages (33/58/84/110/136) survive in the keeps; the rerun is legacy 5/6 = layerwise 5/6 with the same missing needle ⇒ position effect, no reproducible deficit | `../patches/hipfire-keep-trace.patch` |
+| Content-cache foundation (`content-cache`, 期3.3): shim/crate exposure of the core cache-owner resolution (conversation > agreeing prompt keys > legacy session) and the pure content-cache policy (candidate ranking, snapshot coverage, directory publication/dedup/LRU, group-aware retention with whole-group retirement). Host smoke 6/6; no engine call sites yet — wiring into the prefix catalog is 期3.4 | `../patches/hipfire-content-cache.patch` |
+| Content-cache retention (`content-retention`, 期3.4): under `HIPFIRE_KVMEM_CHECKPOINT_POLICY=spread` the prefix catalog is pruned with the core coverage-retention policy (`_COUNT` default 4, `_MIB` default 512, `_INTERVAL`, `_MIN_GAP`); removed entries hand their GPU cache refs back. Legacy keeps the historical LRU-4 catalog. Unit test: count=1 keeps the newest prefix and is idempotent; live probe (COUNT=1, interval 4096) keeps B/C reuse hits=2 with 0 mismatch/500/poison | `../patches/hipfire-content-retention.patch` |
+| Legacy-native contract (`legacy-contract`): process-start `ResolvedConfig.kvmem` is the single Legacy policy source (resolved once, no ambient reparse) threaded through `SlotEngineConfig` into every carrier; request-time admission rejects `B + R > C`; new `legacy_query` (bounded Query capture), `legacy_catalog` (inactive-history directory) and `legacy_draft` (MTP/DFlash recovery-frontier images) modules + scheduler prefill caps + taps/page-pool/slot-pool host layer + bounded `query_max_tokens` span; `configured` reports `kvmem_contract_version` and old daemons are refused. Layerwise floor follows the fixed `(sink+recent)` blocks. N-gate AR+MTP PASS (sha==29e8a27d, VERIFY0), 10-SKU B-gate PASS | `../patches/hipfire-legacy-contract.patch` |
+| Serving tool-recover fallback (`tool-recover`, PolyStrata fallback A): a malformed or unclosed tool span degrades to ordinary assistant text instead of a terminal `malformed_protocol`/`truncated_tool_call` failure — `ToolOutputRouter::with_recover` through `Qwen35Emit::from_ctx_recover` (multi-slot) and both AR EP serve producers; strict constructors byte-identical; `[tool-router]` traces under `HIPFIRE_SLOT_TRACE` | `../patches/hipfire-tool-recover.patch` |
+| Codex Responses API (`codex-responses`): `/v1/responses` with namespace + hosted tool definitions, streamed `output_item`/function-call deltas, reasoning-summary events for the Codex thinking pane, verbatim `reasoning.effort` forwarding and `incomplete`/`max_output_tokens` length mapping | `../patches/hipfire-codex-responses.patch` |
+| Bonsai prompt-render fixes (`bonsai-render`): `preserve_thinking => true` keeps the empty `<think>\n\n</think>\n\n` block in historical assistant turns (render stays a token prefix of what the model saw, required for native KV/history reuse), and GGUF-converted artifacts fall back to `gguf_meta["tokenizer.chat_template"]` when `tokenizer_config` is absent | `../patches/hipfire-bonsai-render.patch` |
+| Think recovery (`think-recovery`, PolyStrata #1053/#728/#606): an unclosed think at a natural stop gets `"\n" + think-close` injected in-turn (once, headroom >= 1, no client-visible event beyond the stream); a reasoning loop (512-token cadence, 12-gram coverage >= 0.25 over the last 2000 words) ends the pass as `length` (stop) or rewrites the xhigh effort sentence to low and restarts cold with temp >= 1.0 / presence >= 1.5 (recover, once); same-token runs >= 256 end as `length`. Re-GEN passes keep the session KV via `EngineCommand::Interrupt`. Knobs `HIPFIRE_REASONING_CLOSE_RETRY` (default on), `HIPFIRE_REASONING_LOOP_RECOVERY` (off&#124;stop&#124;recover, default recover), `HIPFIRE_REPEAT_STOP_TOKENS` (default 256, 0=off); `[think-recover]` traces + `/metrics` counters. N-gate byte-neutral PASS, continuation REPS=5 PASS, evidence arm PASS | `../patches/hipfire-think-recovery.patch` |
+| Legacy budget default clamp (`legacy-budget-clamp`): an implicit `HIPFIRE_KVMEM_BUDGET_TOKENS` default is clamped at admission to `(C - gen_reserve)` rounded down to 128 (saturating) instead of failing `B + R > C`; an explicit budget is never reduced. The controller receives the clamped config so the pool-geometry check stays consistent | `../patches/hipfire-legacy-budget-clamp.patch` |
+| Think budget in the emitter (`think-budget-emitter`): `ThinkBudget::consume_closing` + `SpecEmit` queue the close span at the budget boundary for every non-schema multi-slot request (previously schema-only), `EngineStats.think_recovery.budget_closes` and `/metrics hipfire_think_budget_closes_total` count them | `../patches/hipfire-think-budget-emitter.patch` |
+| Think knobs + answer room (`think-knobs-answer-room`): `thinking.close_retry` / `loop_recovery` / `repeat_stop_tokens` / `answer_room` are generation-scope config keys (per-model override, request field wins, env fallback); answer room reserves `clamp(max_new/4, 512, max_new/2)` for the answer and closes thinking with the WRAP_UP sentence; loop primitives moved to `hipfire_runtime::reasoning_loop` for the sequential path | `../patches/hipfire-think-knobs-answer-room.patch` |
+| Sequential loop recovery (`sequential-loop-recovery`): PolyStrata #728 for standard serving (multi-slot off) — 512-token cadence coverage check on the raw id stream, stop -> length or recover with the low-effort sentence splice + raw-id carry across passes (gen_start suppressed, budget carried, temp >= 1.0 / presence >= 1.5); `[think-recover]` traces | `../patches/hipfire-sequential-loop-recovery.patch` |
+
+The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
+`KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
+No kvmem symbol reaches a HIP kernel; device transfers stay in hipfire.
+
+## Building
+
+`scripts/prepare-backends.py --backend hipfire` clones the pinned base commit
+into `../hipfire` beside this checkout (override with `--hipfire-dir`) and
+applies the verified patch series below; `--backend all` includes it when a
+ROCm toolchain is detected (`HIPFIRE_ROCM_PATH`, `/opt/rocm` or `hipcc`).
+`cargo build` refreshes `Cargo.lock` in the checkout, so `--check` verifies
+the pre-build prepared tree; setup resets the checkout to the pinned base and
+re-prepares it on every build.
+
+Point `KVMEM_ROOT` at this checkout (default is the sibling `../kvmem` of the
+hipfire workspace) and build the CLI **and the daemon** with the `kvmem`
+feature — the multi-slot serve engine lives in the `daemon` binary, so building
+only the CLI leaves a stale engine:
+
+```sh
+HIPFIRE_ROCM_PATH=/opt/rocm cargo build -p hipfire-cli -p hipfire-daemon --features kvmem --release
+```
+
+The patch series applies to hipfire `d435a753d8787c12feacdc78b93e6abea9d3af58`
+(v0.4.7, fork `smashdog/hipfire`); see `upstream.json` for hashes and the
+verified tree. That release still predates the escha-dense merge, so the
+`kvmem` patch also carries the escha-dense baseline (escha trellis
+projections, quantize/dispatch support) it builds on, plus the Bonsai
+TQ2G128/BQ1G128 flat-lowbit slots admission. On the v0.4.5 -> v0.4.6 rebase
+the Escha shared-weight DType tags were renumbered 65/66 -> 68/69 (upstream
+took 65..67 for MQ4G256V2P/MQ4G128V2P/HC8E4M3Row); the HFQ wire qt=42/43 is
+unchanged, and the fp16-x scratch marker invalidation the old patch added is
+now enforced by upstream's `fp16_x_scratch_writable`. v0.4.7 does not move
+that boundary (its highest tag is still HC8E4M3Row = 67), so 68/69 stand; the
+0.4.6 -> 0.4.7 rebase needed the dispatch test targets adapted to the
+post-escha-MoE `MoeDtypes` shape, the TUI golden snapshots refreshed for the
+`thinking.*` keys the patch series adds, and a green run of the official
+`scripts/no-gpu-ci.sh` gate. That last part keeps the curated
+`qwen3.8:27b-escha*` registry tiers: their HF repo publishes only the three
+trunk files, so the tiers are exempt from the family's shared-vision,
+MTP-head and effort-default contracts (`scripts/test_registry_gen_vision.py`
+and `crates/hipfire-registry` tests) until the repo carries those sidecars;
+`scripts/registry_gen.py` maps their `.escha-xt/.escha-pro` files to the
+`escha` codec so they stay generatable. The same gate pass pins
+`scripts/test-fmt-sweep-rebase.sh` to `LC_ALL=C` (its assertions match git's
+English conflict text) and routes the loop-recovery trace read through
+`hipfire_config::developer_var_os`.
+
+The third `rdna3-opt` patch is a gfx1100 (RDNA3) operator pass on top of that
+integration, verified byte-exact (`89e32856d` + the first three patches reproduce
+its `after_tree`). It removes the `kvmem` patch's escha prefill
+stopgap — that patch forced `prefill_chunk=1` so every prefill row ran through
+the lowered paged decode path — and replaces it with a real grouped-WMMA
+batched-prefill trellis arm in `forward_slots` (one weight read per
+(layer,batch) instead of per slot). Escha prefill is ~10.6-10.9x faster and its
+greedy needle argmax matches the per-token reference token-for-token;
+`HIPFIRE_PREFILL_CHUNK_OVERRIDE=1` still forces the serial reference for the A/B.
+The arm also handles the escha-pro/xt checkpoints that store DeltaNet
+`in_proj_a/b` as F16/F32 instead of MQ6G256V2 (`slots_plain_gemm_key` gains
+F16->GemmF16WmmaMb8 / F32->GemmF32Batched; need_rot/anchor are derived from the
+actual in_proj dtypes). For decode it adds a 3-bit MQ3G256V2 arm to the gfx1100
+q8x verify kernels (bit-exact vs the reference GEMV), lifting MQ3 MTP decode
+36.8 -> 45.9 tok/s (+24.7%); q8x verify only activates at batch>=2 (MTP spec
+decode), so SPEC=off is unaffected.
+
+The fourth `spec-accept` patch fixes multi-slot speculative-decode admission so
+`--spec mtp`/`dflash` actually engage under the router's default sampling,
+verified byte-exact (`89e32856d` + all four patches reproduce `upstream.json`'s
+`patched_tree`). The cold-admit gates previously required
+`!request_penalized && !request_sampled`, so the engine default
+`repeat_penalty=1.05` plus a router-injected `presence_penalty` and `temp>0`
+silently forced every slot back to plain AR (DFlash throughput == AR). The patch
+drops those gates and runs an exact-AR penalty prepass
+(`spec_apply_verify_penalties`) before greedy argmax OR point-mass sampled
+acceptance (`mtp_sampled_accept`, `point_mass=true` — DFlash2 proposals are
+deterministic q=δ(c)); MTP and DFlash share `SpecRetire`. A/B at SLOTS=2 on
+gfx1100: DFlash greedy-neutral prose 40→54.8 tok/s and code 40→93.7, MTP sampled
+prose 40→57.1. Sampled+penalty DFlash can still net-lose on prose (the greedy
+selector's proposals mismatch the penalized nucleus), so MTP is the better
+default for a sampled config; the multi-slot DFlash VRAM ceiling (per-slot
+persistent rings, KVMem skips idle-session reclaim) is unchanged — use SLOTS=2 on
+a 20 GiB card.
+
+The fifth `batch-restore` patch batches the KVMem spill/restore transfers,
+verified byte-exact (`89e32856d` + all five patches reproduce `upstream.json`'s
+`patched_tree`). The controller previously copied each spilled/restored page with
+a blocking per-page, per-layer `hipMemcpy`; the patch gathers a chunk of pages
+into one reusable pinned slab (`PinnedTransferBuffer`, 64 MiB cap, allocated once
+so a larger chunk never re-page-locks mid-prefill) and moves it with
+stream-ordered async offset copies, draining the whole chunk at a single sync
+point before the host reads it (spill) or before `forward_step` reads it
+(restore). The copies ride the steady-copy stream when one is installed, else the
+legacy null stream — the same stream prefill compute uses, so ordering holds
+either way; this matters because the capture stream is only installed inside
+decode-graph capture, *after* `prepare_step`, so a stream-required batch would
+fall back to per-page exactly during the TTFT-critical prefill/restore. Spill
+still drains every read before any `stage_out_page` frees a physical page, and
+the whole batch completes inside Pass 1 before Pass 2 reuses a freed page.
+`HIPFIRE_KVMEM_BATCH_XFER=0` restores the exact per-page blocking path. Byte
+neutrality was gated on gfx1100 (N-gate): `HIPFIRE_KVMEM_VERIFY=1` reported 0
+readback mismatch over a 5k–17.5k-token over-budget needle sweep, greedy decode
+was bitwise-identical (sha256) on vs off, and recall was identical. The transfer
+component of `prepare` is ~11% faster batched (spill 31 pages 75.2 vs 86.5 ms,
+restore 30 pages 45.5 vs 49.7 ms); wall TTFT is parity at these host-RAM-spill
+scales because prefill compute dominates (prepare is ~1% of an 11.5 s prefill),
+and the transfer win grows with the restored page count.
+
+The sixth `policy-knobs` patch wires the opt-in residency-selection policy knobs,
+verified byte-exact (`89e32856d` + all six patches reproduce `upstream.json`'s
+`patched_tree`). Every knob defaults to the historical behavior, so the patch is
+byte-neutral unless a knob is set. `SELECT_METHOD` chooses the executor-level
+signal that feeds the shared `pick_topk` ranking: `retrieval` (the default) scores
+the resident set against the tapped mean-K query, `recency` feeds no learned
+signal (the core keeps sink + recent and fills the rest by its deterministic id
+tie-break); `h2o` is rejected at construction until the attention-heat tap lands.
+`LRFU` adds a decaying heavy-hitter history on top of retrieval: each round
+reinforces the top `LRFU_TOP` fraction of blocks and decays the rest by
+`LRFU_LAMBDA`. The core requires an explicit round lifecycle
+(`begin_retrieval_round` → `set_retrieval_scores` preview → `pick_topk_blocks` →
+`commit_retrieval_round`); the patch adds the two round entries to the C ABI shim
+(`hipfire_kvmem_shim.{h,cpp}`, a kvmem-repo change) and the crate FFI
+(`crates/hipfire-kvmem/src/lib.rs`), and the controller opens a round before
+previewing scores and commits it after the pick. Both entries are no-ops when
+`LRFU` is off, so the default Retrieval path is unchanged. The GPU
+high/low watermark ratios derive a hysteresis band from the core watermark
+functions (`keep ≤ trigger ≤ budget_blocks`): the trigger replaces the single
+budget spill threshold and the keep target narrows the core selection budget via
+`set_runtime_select_budget`, so the band can only make residency more
+conservative, never overshoot the physical pool. Setting either watermark enables
+the band (the unset ratio defaults to 0.95/0.85). The knobs are exposed through
+three layers — engine env, router parameter spec, wrapper docs — not the embedded
+`/ui` chat surface.
+
+Byte neutrality was gated on gfx1100 (N-gate): with no policy env the greedy
+decode sha256 still equals the batch-restore baseline `29e8a27d…` (cross-build
+bit-identity), setting the non-watermark defaults explicitly (`expdefault`)
+reproduces it exactly, recall is identical over a 5k–17.5k-token over-budget
+needle sweep, and `HIPFIRE_KVMEM_VERIFY=1` reports 0 readback mismatch. Each
+non-default value passed its own B-gate (0 mismatch, recall and decode parity
+reported vs default): `lrfu` keeps recall `True/True/False` (== default) with the
+round lifecycle active (223 spills / 63 restores, no "probe outside a round"
+error across four sequential rounds); `watermark` (`Some((28,22))` band) keeps
+recall `True/True/False` with more conservative residency (237 spills / 47
+restores); `recency` trades the 16k middle needle by design (`True/False/False`,
+160 spills / 0 restores — the needle is never selected back) while staying
+byte-exact. All knobs leave the under-budget greedy decode bitwise-identical.
+Sustained decode parity (256-token generation) confirms no throughput regression:
+over-budget with the policy active 14.1–14.3 tok/s vs default 14.2, and
+under-budget kernel-neutral 40.18–40.27 tok/s sustained vs default 40.2 — every
+knob within 10% on both regimes. Two-slot concurrency (`SLOTS=2`, two simultaneous
+over-budget requests with distinct needles, both slots running) keeps each slot's
+LRFU round isolated: both requests recall their own passphrase with 0 round
+errors and 0 readback mismatch.
+
+The seventh `query-span` patch adds multi-row Q scoring for retrieval selection,
+verified byte-exact (`89e32856d` + all seven patches reproduce `upstream.json`'s
+`patched_tree`). `HIPFIRE_KVMEM_QUERY_SPAN` (default `1`, range `[1,512]`) chooses
+how many recent Q rows feed the resident-set ranking. At `1` the controller keeps
+the historical path: each layer contributes its single tapped last Q row
+(post-RMSNorm, pre-RoPE) scored by `mean_key_retrieval_scores` (mean-K cosine),
+so the default is byte-identical. At `>1` a per-slot host Q ring
+(`[n_fa_layers × span × q_width]`, layer-major) accumulates the recent Q rows —
+fed each step from the *existing* `q_tap` via `read_q_slot`, so there is zero VRAM
+growth (the ring lives in host RAM) — and selection scores resident pages by
+`page_softmax_scores` (FP16-rounded operands, per-row softmax mass, scale
+`1/√head_dim`, Mean GQA aggregation) over the span. The ring is reset on slot
+reset and at each request boundary so a new turn never inherits the previous Q
+span. The C ABI entry `hk_page_softmax_scores` wraps `query_score_frame` +
+`page_softmax_scores` in the kvmem-repo shim (`hipfire_kvmem_shim.{h,cpp}`, a
+separate kvmem commit); the crate FFI (`crates/hipfire-kvmem/src/lib.rs`) and the
+controller ring + branch (`crates/hipfire-arch-qwen35/src/kvmem_ctl.rs`) are the
+hipfire patch. The two scoring functions are mathematically distinct (cosine vs
+softmax); `span=1` keeps the old path entirely, so there is no bit-identity
+concern between them. The knob only affects the scored `SELECT_METHOD=retrieval`
+branch and is exposed through the same three layers — engine env, router
+parameter spec, wrapper docs — not the embedded `/ui`.
+
+Byte neutrality was gated on gfx1100 (N-gate): with no `QUERY_SPAN` env (and with
+`QUERY_SPAN=1` explicit) the greedy decode sha256 still equals the policy-knobs
+baseline `29e8a27d…` (cross-build bit-identity), recall is identical
+(`True/True/False` over the 8k/16k/28k over-budget needle sweep), and
+`HIPFIRE_KVMEM_VERIFY=1` reports 0 readback mismatch (225 spill checksums). The
+under-budget greedy decode is bitwise-identical across *every* span (selection
+never fires without spill), confirming the kernel path is untouched. Each
+`span>1` passed its own B-gate: `span16/64/256` keep recall `True/True/False`
+(== default) with 0 mismatch and decode parity within 10% on all three targets.
+Sustained decode (256-token generation) confirms no throughput regression:
+over-budget with the span active 13.9 tok/s vs default 14.3, and under-budget
+kernel-neutral 39.85–39.93 tok/s sustained vs default 40.44 — the ring D2H read +
+page-softmax overhead is negligible. A `TRACE=1` activity probe proves `span>1`
+genuinely computes multi-row page-softmax rather than silently falling back:
+`span=1` emits zero query-span lines, while `span=64` emits `rows>1` selections
+whose `score_sum` equals the row count exactly (11.0000 / 12.0000 for 11 / 12
+rows) — the fingerprint of per-row softmax normalization (each Q row contributes
+total probability mass 1.0), distinct from mean-K cosine. Two-slot concurrency
+(`SLOTS=2`, two simultaneous over-budget requests with distinct needles) keeps
+each slot's Q ring isolated: both requests recall their own passphrase with 0
+readback mismatch and no page-softmax/controller error. A ten-SKU recall sweep
+under `QUERY_SPAN=64` (escha / escha-pro / escha-xt, Bonsai tq2 / bq1, mq3 /
+mq3-pro / mq3-xt, mq4-xt / mq4-xts) confirms the ring geometry adapts per model
+(each SKU's `n_fa_layers × q_width`): all ten recall their over-budget needle
+(10/10) with 0 readback mismatch and no controller or admission error.
+
+A note on discrimination: a two-needle compound probe (vault at 25%, backup at
+75%, one compound question) shows identical recall across `span1/64/256`. This is
+a homogeneous-filler limitation, not an inactive span: when the filler is uniform
+both mean-K and page-softmax rank the needle block highest, so selection
+coincides. The `TRACE=1` score-sum fingerprint above is the definitive activity
+evidence; recall discrimination between the two scoring functions requires
+heterogeneous filler and is left to the long-needle sweep rather than gated here.
+
+The eighth `softmax-simd` patch optimizes the host page-softmax dot reduction that
+`query-span` introduced. Profiling an over-budget selection on gfx1100 (28k-token
+prompt, `span=64`) isolated the per-page dot product — a serial `double` reduction
+over `head_dim=256` that `-O2` cannot auto-vectorize without reassociation — as
+~96% of the cost (means 6.1 ms / dot 153 ms / ~167 ms per selection). The core
+change (`kvmem/src/host/graph_recall.cpp`, a separate kvmem commit) accumulates the
+dot in `float32` under a `#pragma omp simd reduction`; both operands are
+FP16-rounded, so each product is exact in float32 and the float reduction is a
+principled refinement aligned with the device float math, not a precision loss.
+The hipfire patch adds `-fopenmp-simd` to the crate build
+(`crates/hipfire-kvmem/build.rs`) so the pragma is honoured — SIMD-only, no OpenMP
+runtime linked, and no other pragma in the host library is activated.
+Per-selection latency falls ~167→49 ms (3.4×; the pure dot ~7×, the residual now
+co-dominated by the softmax `exp` loop).
+
+The edit is confined to `page_softmax_scores`, which runs only for `span>1` over
+budget, so the default `span=1` mean-K path is untouched: the N-gate greedy decode
+sha256 still equals the policy-knobs baseline `29e8a27d…`, recall is identical
+(`True/True/False` over the 8k/16k/28k sweep), and VERIFY reports 0 mismatch (225
+spill checksums). Each `span>1` keeps its B-gate — VERIFY 0, decode parity within
+10% on all three targets, and recall `True/True/False` preserved (the float
+perturbation flips no needle selection in the sweep); the under-budget greedy
+decode is bitwise-identical across every span. Selection is interval-gated (~2
+actual selections per 256-token decode), so the amortized throughput impact is
+~1–2% (14.0→14.2 tok/s). A HIP GPU page-softmax kernel is therefore **deferred**:
+the residual ~49 ms per selection does not justify the port + wiring for an opt-in
+mode whose steady-state throughput cost is already negligible.
+
+The ninth `layerwise-foundation` patch lays the additive groundwork for per-layer
+(`RecallStrategy::Layerwise`) KV recall — Phase 3.2 sub-patch ① of three. It is
+purely additive, NOT wired into the live serve allocation, and adds no env toggle,
+so Legacy remains the only path and is byte-neutral. Three pieces land:
+(1) `crates/rdna-compute/src/layerwise_pool.rs` — a crate-agnostic pure-host
+`PackedArenaLayout` (one composite slot = 128 tokens × all fa layers × {K,V},
+layer-major, Q8 scales inline) plus `LayerwisePagePool`: per-layer independent
+stripe selection into shared composite slots, generation handles, per-layer
+compact views with a core-validated equal `visible_tokens` extent, page residency,
+and an intrinsic drop-evict refcount (a slot frees only when every layer stripe
+drops). (2) `crates/hipfire-arch-qwen35/src/layerwise_layout.rs` — the Q8
+packed-page adapter that walks the engine's OWN stride authority
+(`SlotKvTierPlan::resolve`) into the core generic `PayloadLayout` manifest
+(layer-major {Key,Value} per fa layer) and bridges to `PackedArenaLayout` so a
+composite slot's byte layout is provably identical to the core record
+(`slot_bytes == record_bytes`, per-layer plane offsets aligned) — the coherence
+guarantee that lets a sealed archive layer region map onto a slot stripe with no
+repacking in sub-patch ②. (3) the core layerwise-API C ABI shim entries
+(`hipfire_kvmem_shim.{h,cpp}`, a separate kvmem commit) exposing the EXISTING core
+`PayloadLayout` builder / `LayerwiseMemoryCatalog::plan_layer` /
+`NativeKvLayerRegions` / `LayerwiseQueryRequest` state machine / native scorer,
+plus the crate FFI and three smoke tests. The core library is strategy-agnostic
+and unchanged (core logic zero-change); the legacy `MemoryBackend`
+whole-working-set coordinator is NOT consumed by layerwise (direct-drive, design
+§3.5).
+
+The shim smoke (14 crate tests: catalog 3 + payload 4 + request 6 + base shim 1)
+and the new host tests (pool 12 + adapter 4) pass. The N-gate on the rebuilt engine
+reproduces the sealed chain byte-for-byte: greedy decode sha256 == `29e8a27d…`,
+VERIFY 0 mismatch (65 restore readback lines, 225 spill checksums, 0 block-table
+dups), and recall identical to the policy-knobs/query-span baseline
+(`True/True/False` over 8k/16k/28k — the 28k miss is the pre-existing mean-K
+retrieval limit under the 45-page budget, the recall-benefit target for ②③, not a
+regression). A pre-existing `qwen35/weights.rs` `dense_fixture` (missing the
+`biases`/`escha` fields the escha chain added) is repaired test-only (`None/None`,
+matching production) so the crate's `--lib` test target compiles; release N-gate
+builds never compiled `cfg(test)`, so the breakage had stayed latent.
+
+The tenth `layerwise-function` patch makes per-layer (`RecallStrategy::Layerwise`)
+KV recall functional — Phase 3.2 sub-patch ② of three, opt-in via
+`HIPFIRE_KVMEM_RECALL_STRATEGY=layerwise` (default `legacy` stays byte-neutral). It
+consumes sub-patch ①'s EXISTING core layerwise-API shim + crate FFI unchanged (no
+new C ABI entries, no `hipfire-kvmem/src/lib.rs` change); the core library is
+strategy-agnostic and unchanged (core logic zero-change, `hybrid.rs` untouched).
+Four pieces land:
+(1) `crates/rdna-compute/src/kvmem_page_score.rs` + `kernels/src/kvmem_page_score.hip`
+— the GPU HIP page scorer (4 wave-aware gfx1100 kernels, wave32/64 shuffle
+reduction) scoring resident pages against the current layer's tapped Q, ported from
+the host reference and verified against an FP64 oracle (`2e-6 + 3e-5·expected`).
+(2) `crates/hipfire-arch-qwen35/src/layerwise_driver.rs` — the per-layer Rust driver
+wrapping the core `LayerwiseQueryRequest` state machine: composite-arena stripe COW
+restore (whole-page copy preserving the other layers + restricted-plane write +
+`writer_references==1`/`validate_sources`/eager-stream/Drain guards), intrinsic
+drop-evict (a composite slot frees only when every layer stripe drops), and suffix
+partial restore (mid-page `fed%128` causal bound). A single pinned slab sized
+`n_slots × extent` gives each cold page a disjoint host slice with one end-fence, so
+batched async H2D restore is tear-free (the slab-reuse race fix).
+(3) `serve_engine.rs` scoped orchestration + `kvmem_ctl.rs` re-bootstrap — the engine
+synthesizes a canonical bootstrap (all pages resident, `suffix_page=fed/128`,
+`partial=fed%128`), takes the driver into `forward_step(Some)` across the three paged
+paths (A `paged_decode_reference_layers`, B `run_layers_slots` dense/MoE shared seam,
+C `forward_scratch_layers_paged`), then frees + advances the layerwise seq + restores.
+Three core-contract fixes (read directly from the C++ core): 0→1-based identity
+normalization at the bootstrap synthesis boundary (`memory_contract.cpp:157` /
+`layerwise_selection.cpp:85` require non-zero identity; engine counters/SessionTable
+untouched, bijective monotone, Legacy byte-neutral), `evaluation.begin = frontier =
+full_pages*128` (`layerwise_selection.cpp:88`), and a page-aligned policy
+(`register_append(full_pages*128)`, `total_tokens%128==0`, each block `n_tokens==128`).
+(4) write-through feed (`feed_rows` writes the packed K/V archive) + the
+`LayerwiseFwd<'a,'b>` double-lifetime alias threaded through `opts`/`graphed_opts` and
+every call site (the `vmm.rs`/`vmm/exact.rs`/`ep_batch.rs` +1..3-line edits initialise
+the new field to `None`, keeping Legacy byte-neutral).
+
+Verification is layered and GPU-exact on gfx1100: D1 FP64-oracle scorer parity; D4a
+composite-arena↔paged attention addressing byte-exact (production shape, non-trivial
+slot map, incl. spill mask); D4b-3 Path A/B/C per-layer restore interleave byte-exact
+vs Legacy (`layerwise_driver` 12/12); D4b-4 Path-D real `forward_step` orchestration
+byte-exact (`partial∈{0,40}`, fed-prefix==pack proves mid-page restore). The N-gate on
+the rebuilt engine reproduces the sealed chain: greedy decode sha256 == `29e8a27d…`,
+VERIFY 0 mismatch, recall identical to baseline. A real-serve smoke under
+`RECALL_STRATEGY=layerwise` (KVMEM=1, VERIFY=1) passes (short+long needle recall True,
+0 mismatch/dups/poison, clean VRAM teardown). The recall-benefit gate — the hard seal
+condition — is met: a compound two-needle discriminator (vault@25% / backup@75%, one
+compound question, over the 45-page budget) shows Layerwise recalling the backup
+passphrase exactly where Legacy confabulates, reproduced byte-identically across two
+runs, with Layerwise ≥ Legacy on every metric (no regression). The B-gate seals the
+new baseline: a 10-SKU recall sweep (7 qwen/bonsai SKUs patched==stock on
+short/long/multi-turn + 3 escha SKUs batched-WMMA==per-token needle) and stock-v0.4.6
+sustained decode parity within 10% on all three targets (mq4-xts +3.74% slower,
+tq2 −4.07% faster, bq1 −9.26% faster).
+
+Sub-patch ③ adds the pressure attention-mass tap + quota accounts
+(`HIPFIRE_KVMEM_LAYERWISE_*_MIB`) + wrapper/router env exposure + fail-closed guards
+and seals the final recall-benefit gate. Each sub-patch is Legacy byte-neutral and
+independently re-verified; rollback granularity = sub-patch.
+
+The twelfth `mtp-foundation` patch lays the additive groundwork for MTP-head
+(`--spec mtp`) KV recall under `RecallStrategy::Layerwise` — Phase 4.1 sub-patch ①
+of three, following ninfer's integration pattern (ninfer KV-management faithful,
+the hipfire head algorithm unchanged). It is purely host/pure logic, NOT wired
+into live serve, and adds NO env toggle, so Legacy is byte-neutral and the opt-in
+Layerwise path is unchanged at width=1. Four pieces land:
+(1) `layerwise_driver` width-param multi-row primitives —
+`LayerwiseDescStaging::new_with_width` (width-sized positions/row_slot, fail-closed
+`width==0`; `new()` delegates to width=1, byte-identical to AR), the PURE-HOST
+`bootstrap_layerwise_rows` n-row span bootstrap (`evaluation=[frontier,frontier+width)`,
+query bounds validated), and `accept_output_pressure` (partial MTP verify through
+the core `OutputPressure.accept`, `accepted=prefix` — NOT the all-or-nothing
+`PrefillPressure`, since the core requires `history.frontier==begin_+accepted`).
+(2) `layerwise_layout` `LayerwiseMtpQ8Layout` — the Main+aux composite-record Q8
+adapter: the main plane is byte-identical to the trunk record, the aux (head) plane
+is appended, and the head ordinal resolves against the 1-layer head KvCache geometry.
+(3) `rdna-compute` `layerwise_pool` head bounded-pool geometry —
+`mtp_auxiliary_capacity` (`main_capacity` + one block, fail-closed on
+zero/misaligned/overflow, mirroring ninfer) and `mtp_head_pool` (a 1-layer composite
+pool of window pages + one scratch block).
+(4) the NEW `layerwise_mtp` module — `LayerwiseMtpHistory`
+(Unspecified/UpstreamGlobal/FirstLayer, mirroring the core `layerwise_mtp.hpp`),
+`auxiliary_visible_tokens` (ninfer `visible_tokens` mirror), `AuxiliarySelection`
+(bind-once / exact-extent / requires-actual-pool guards), and `admit_auxiliary_source`
++ `first_layer_auxiliary_ids` (the FirstLayer source rule). The UpstreamGlobal
+private probe is sub-patch ③; ① only scaffolds its policy + admission.
+
+Verification: 23 new host tests (F1 n-row span + width-one identity, F2 ×5
+main-plane byte-identity, F3 ×5 head-pool geometry, F4 ×17 policy/aux-bind) + 2 new
+GPU fixtures (staging-width geometry, multi-row partial-acceptance carrier) + the
+16-fixture layerwise GPU regression, all pass; zero new warnings; the 11 new symbols
+have zero production call sites (not wired). The N-gate on the rebuilt engine
+reproduces the sealed chain byte-for-byte: greedy decode sha256 == `29e8a27d…`,
+VERIFY 0 mismatch (restore_readback=65, nonzero_mismatch=0, spill_checksums=225,
+nonempty_dups=0), recall(8k/16k/28k)=[True,True,False] identical to baseline. No
+kvmem core/shim change (the multi-row core transaction + `OutputPressure` FFI already
+exist upstream). Sub-patches ② (trunk+head offload/restore + FirstLayer + admission)
+and ③ (UpstreamGlobal probe + dual-policy exposure + guards) follow; each is Legacy
+byte-neutral and independently re-verified, rollback granularity = sub-patch.
+
+The thirteenth `mtp-function` patch wires the MTP-head (`--spec mtp`) KV recall
+FUNCTION into live serve under `RecallStrategy::Layerwise` — Phase 4.1 sub-patch ②
+of three, riding ①'s aux-plane infrastructure. Unlike ① (additive, not wired), ②
+is wired and adds ONE shim C ABI entry. Three pieces land:
+(1) G1–G5 + f2 MTP head write-through/restore/FirstLayer binding — `kvmem_ctl`
+head primitives (`plan_head_plane`/`restore_head_plane`/`accept_head_restore`/
+`seal_head_plane`), `layerwise_driver` `head_restore_guard` + carrier wiring,
+`mtp_head` forward, `serve_engine` AR+MTP carrier activation. The head bounded pool
+(window + one scratch block, `mtp_head_pool`) replaces the full-resident `max_seq`
+head allocation, solving the 2-slot×256k OOM (the MTP capability benefit).
+(2) A'-1 AR correctness — AR serve decode → `engine_carrier_rows` (OutputPressure,
+Query-every-step + REPLACE keep-set), and the continuation `sync_prefill` driver
+gate (`mtp.is_some() || prefill.is_none()`). The new shim entry
+`hk_output_pressure_sync_prefill` repositions the persistent output window's
+accepted feedback to the validated consumed frontier after an unsampled
+continuation prefill; idempotent (no-op when `accepted_end >= position`) so the
+Legacy/AR/within-turn paths stay byte-neutral.
+(3) G7 cleanup — strip `[hh-trace]`/`[DIAG-53]` `HIPFIRE_DIAG_NO_ACTIVATION`; remove
+dead `engine_carrier` (PrefillPressure AR, zero serve callers) + 4 dead
+head-coordinate primitives (`head_cache_positions`/`head_rope_positions`/
+`boundary_rope_delta`/`boundary_cache_coordinate`).
+
+C decision (2026-11-15): the 13th seal basis is MTP CAPABILITY benefit (2-slot×256k
+OOM-solved + acceptance parity) + Legacy byte-neutral + G6 B-gate; the layerwise D3
+recall BENEFIT gate is DECOUPLED/deferred (the compound probe is unreliable — both
+arms flip on near-tie GPU nondeterminism — and needs a deterministic discriminator)
+so NO recall-benefit claim is made. A'-1 is a correctness fix (Layerwise must not be
+worse than Legacy; continuation must not crash), not a feature-value claim.
+
+Verification: N-gate AR (`--spec off`) + MTP (`--spec mtp`) greedy sha256 ==
+`29e8a27d…`, VERIFY 0 mismatch; 62 unit tests pass, zero new warnings (arch-qwen35
+76==76, total 444==444). MTP capability: smoke recall=True, acceptance-parity A/B
+recall PASS, 2-slot×256k OOM_GATE_PASS (cold needle prompt=62629 tok recall=True,
+oom/poison/mismatch/http500=0). G6 B-gate: 7-SKU recall sweep 7/7 PASS (content
+byte-identical to stock v0.4.6, KVMEM=0 compute parity), escha×3 needle PASS, 3-SKU
+stock-v0.4.6 sustained decode parity ≤10% (mq4-xts +3.74%, tq2 −4.48%, bq1 −6.62%).
+One new shim C entry (`hk_output_pressure_sync_prefill`); rollback granularity =
+sub-patch. Sub-patch ③ (UpstreamGlobal private probe + dual-policy exposure) follows.
+
+## Enabling
+
+`HIPFIRE_KVMEM=1` on `hipfire serve`. Requires the paged Q8 KV pool (the only
+KV quantisation supported by this first version) and the batched VL path. The
+prefix cache is disabled while KVMem is active: KVMem owns page residency, so
+sessions always cold-start and every block's statistics are fed from its own
+forward.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `HIPFIRE_KVMEM` | off | enable the controller |
+| `HIPFIRE_KVMEM_BUDGET_TOKENS` | min(cap, pages/slot − headroom) | resident tokens per slot before pages spill |
+| `HIPFIRE_SLOTS_PAGED_PAGES` | 64 × n_slots | total physical pages (overrides pool sizing) |
+| `HIPFIRE_KVMEM_SINK_BLOCKS` | 1 | oldest blocks pinned for every selection |
+| `HIPFIRE_KVMEM_RECENT_BLOCKS` | 1 | newest blocks pinned for every selection |
+| `HIPFIRE_KVMEM_SELECT_INTERVAL` | 4 | pages between re-selections (in full pages) |
+| `HIPFIRE_KVMEM_HOST_BYTES` | 16 GiB | RAM tier capacity |
+| `HIPFIRE_KVMEM_SPILL_DIR` | — | set to enable the disk tier |
+| `HIPFIRE_KVMEM_SPILL_BYTES` | 64 GiB | disk tier capacity |
+| `HIPFIRE_KVMEM_TRACE` | off | per-step residency diagnostics (`HIPFIRE_KVMEM_TRACE_PAGES=1` adds picked/restored page ids) |
+| `HIPFIRE_KVMEM_TIME` | off | per-step forward/tap timings + controller call breakdowns |
+| `HIPFIRE_KVMEM_VERIFY` | off | checksum every spilled/restored page and read the device block table back against the host table; 0 mismatch proves the spill/restore round is byte-exact |
+| `HIPFIRE_KVMEM_BATCH_XFER` | on | batch spill/restore through a pinned slab with stream-ordered async copies + one sync per chunk (byte-neutral); `0`/`off`/`false` restores the per-page blocking path |
+| `HIPFIRE_KVMEM_SELECT_METHOD` | `retrieval` | executor selection signal feeding the shared `pick_topk` ranking: `retrieval`/`0` scores the resident set against the tapped mean-K query; `recency`/`2` feeds no learned signal (sink + recent + the core's id tie-break). `h2o`/`1` is rejected until the attention-heat tap lands |
+| `HIPFIRE_KVMEM_LRFU` | off | decaying heavy-hitter retrieval history: each round reinforces the top-scoring blocks and decays the rest by `lambda`. Requires `SELECT_METHOD=retrieval`; off by default so the Retrieval path is byte-neutral |
+| `HIPFIRE_KVMEM_LRFU_LAMBDA` | 0.5 | LRFU decay weight on the prior committed score, in `[0,1]` (0 = no memory, 1 = no decay) |
+| `HIPFIRE_KVMEM_LRFU_TOP` | 0.9 | LRFU hit fraction gating positive reinforcement, in `(0,1]`; scores below the `(1−top)` quantile are clamped to ≤0 so an unselected block is never rewarded |
+| `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` | — (0.95) | spill-trigger ratio of the resident budget. Setting **either** watermark enables the hysteresis band; the unset one defaults to 0.95/0.85. Must satisfy `0 < low ≤ high ≤ 1` |
+| `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | — (0.85) | keep-target ratio of the resident budget; narrows the core selection budget so residency stays below the trigger. The band can only make residency more conservative, never overshoot the physical pool |
+| `HIPFIRE_KVMEM_QUERY_SPAN` | 1 | retrieval query span in `[1,512]`. `1` scores the single tapped last Q row by mean-K cosine (byte-identical to the historical path); `>1` accumulates a per-slot host Q ring of recent post-RMSNorm/pre-RoPE Q rows and scores resident pages by `page_softmax_scores` (FP16-rounded operands, per-row softmax mass, scale `1/√head_dim`). Zero VRAM growth (the ring lives in host RAM); only affects `SELECT_METHOD=retrieval` |
+| `HIPFIRE_KVMEM_RECALL_STRATEGY` | `legacy` | recall execution model: `legacy`/`0` keeps the historical whole-working-set path (byte-identical); `layerwise`/`1` enables the per-layer composite-slot subsystem (write-through sealed archive + per-layer current-Q GPU scoring + pressure mass/exposure keep-set refinement, the ninfer integration pattern). Under `layerwise` the global policy knobs are **fail-closed**: `SELECT_METHOD≠retrieval`, `LRFU=1`, either watermark, or `QUERY_SPAN>1` is an explicit construction error naming the strategy (no silent override/fallback); the four core selection knobs (`select_policy`/`retrieval_method`/`n_subblocks`/`semantic_expansion`) are pinned to the plain Mean-K TopK defaults the core guard requires. Unknown spellings are rejected loudly |
+| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB` | 64 | layerwise projected-Q history tape (`QueryProjectionTape`) RAM account, MiB integer; a tape peak beyond it spills to the disk tier. Only `layerwise` creates accounts against the quotas — `legacy` never reads them |
+| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB` | 32 | layerwise tape disk-tier envelope (`SpillFile`, reuses `HIPFIRE_KVMEM_SPILL_DIR`), MiB; `0` disables the disk tier so an over-RAM tape admission fails closed |
+| `HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB` | 8 | layerwise pinned Q D2H readback transfer budget (`PinnedHostBuffer`, the append/read_rows staging), MiB |
+| `HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB` | 1024 | layerwise source/feedback version-counter + frozen-index envelope (the `metadata_bytes`-derived account), MiB |
+| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB` | 96 | layerwise tape descriptor/chunk-table finite-admission account (`HostKvStorage` + reservation), MiB |
+| `HIPFIRE_KVMEM_PREFIX_PIN` | off | P4.3 KVMem-native cross-session prefix sharing: page-aligned prefill boundaries freeze an immutable canonical archive (host `fork_prefix` + DeltaNet checkpoint); the shared sealed GPU pages stay PIN-resident (cache refs; residency selection skips them). A new session whose prompt matches a frozen prefix (full token provenance + geometry + incarnation) reuses it, skipping the prefix prefill. The radix stays off; Legacy AND Layerwise covered (Layerwise reuse keeps MTP — the draft carrier restores head history from the shared aux archive); generated rows are never shared; vision participates behind the G7 media identity gate (same image digest + un-split image spans only; cold packs need `RECALL_STRATEGY=layerwise` write-through). Off = byte-neutral |
+| `HIPFIRE_KVMEM_PREFIX_PIN_BYTES` | 536870912 | DeltaNet checkpoint-pool ceiling for `PREFIX_PIN` (snapshots only, no radix pages), bytes; only read when `PREFIX_PIN` is on |
+
+With `cap ≤ budget` nothing ever spills, the tap kernels only copy, and the
+forward is bit-identical to an unpatched hipfire. Spill/restore moves arena
+bytes verbatim, so a spilled-and-returned page is bit-exact too. Multirow
+spec-verify steps (MTP, 4..=8 rows past 4096 tokens) run the reference
+split-K WMMA verifier through a block-table twin: a bench-verified bitwise
+copy of the descriptor-less route (`diff floats 0`), with absent pages
+masked out and skipped wholesale instead of sweeping the logical context.

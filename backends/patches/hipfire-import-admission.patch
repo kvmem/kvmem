@@ -1,0 +1,276 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 134eed51a14a0a0b5ddf8e0f6c512dda933027c7..8640656a96d34493f4952e110f9b2ee1545a1c29 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -41,14 +41,15 @@
+ //! H2D byte copies on spill and restore. Those copies move the arena's bytes
+ //! verbatim, so a spill/restore round is bit-exact.
+ 
++use std::cell::Cell;
+ use std::path::PathBuf;
+ 
+ use hipfire_kvmem::{
+     mean_key_retrieval_scores, page_softmax_scores, BlockCopies, BlockDescriptor, ExecutionView,
+     GqaAggregation, KvStore, KvStoreConfig, LayerMemorySnapshot, LayerPlan, LayerSelection,
+     MemoryBudget, MemoryCatalog, MemoryDescriptor, MemorySnapshot, MemoryStamp, OutputOptions,
+-    OutputPressure, OutputScope, PrefillOptions, PrefillPressure, RawStore, RawStoreConfig,
+-    SessionIdentity, Storage,
++    ImportStart, OutputPressure, OutputScope, PrefillOptions, PrefillPressure, RawStore,
++    RawStoreConfig, SessionIdentity, Storage, WindowEnvelope, WindowPlan, WindowPolicy, WindowState,
+ };
+ use hipfire_runtime::serve::KvMemStats;
+ use rdna_compute::layerwise_pool::{mtp_auxiliary_capacity, mtp_head_pool, LayerwisePagePool};
+@@ -86,6 +87,12 @@ const DEFAULT_HOST_BYTES: u64 = 16 << 30;
+ /// Disk-tier capacity when `HIPFIRE_KVMEM_SPILL_DIR` is set.
+ const DEFAULT_SPILL_BYTES: u64 = 64 << 30;
+ 
++/// Generation reserve R added on top of the resident budget B to form the
++/// layerwise window capacity (ninfer `device_tokens = selected + reserve`,
++/// CLI default_reserve). Import admission measures the prompt tail + output
++/// against B + R.
++const DEFAULT_GEN_RESERVE: u64 = 1024;
++
+ /// Upper bound on the reusable pinned transfer slab used by the batched
+ /// spill/restore path (`HIPFIRE_KVMEM_BATCH_XFER`, default on). Pages are
+ /// gathered into the slab in chunks of at most this many bytes, each chunk
+@@ -609,6 +616,10 @@ struct SlotState {
+     /// each FA layer keep its own mass-ranked pages). Empty before the first
+     /// selection / under Legacy; an absent ordinal entry reads as `[]`.
+     lw_keep: Vec<Vec<u64>>,
++    /// P2.2a: one-shot Layerwise selection budget (blocks) from the import
++    /// admission (ninfer `selection_budget`). `Cell` so the driver's shared
++    /// `&KvMemCtl` can take it; every fresh-session reset clears it.
++    lw_import_blocks: Cell<Option<u32>>,
+     /// [P4.1② fix] per-request scorer-Query gate (ninfer per-request Query
+     /// semantics). Set by `begin_request` when a continuation reuses the prefix;
+     /// consumed (take) by the orchestration at the request's first Layerwise
+@@ -794,6 +805,9 @@ pub struct KvMemCtl {
+     raw_cfg: RawStoreConfig,
+     kv_cfg: KvStoreConfig,
+     budget_blocks: usize,
++    /// P2.2a generation reserve R (ninfer `reserve_tokens`): layerwise window
++    /// capacity is `budget_blocks*128 + gen_reserve`. `HIPFIRE_KVMEM_GEN_RESERVE`.
++    gen_reserve: u64,
+     interval: usize,
+     trace: bool,
+     n_fa_layers: usize,
+@@ -950,6 +964,10 @@ impl KvMemCtl {
+             ));
+         }
+         let budget_tokens = (plan.budget_blocks * KV_BLOCK_TOKENS) as u32;
++        let gen_reserve = env_u64("HIPFIRE_KVMEM_GEN_RESERVE").unwrap_or(DEFAULT_GEN_RESERVE);
++        if gen_reserve == 0 {
++            return Err("kvmem: HIPFIRE_KVMEM_GEN_RESERVE must be positive".to_string());
++        }
+ 
+         // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
+         // LRFU replaces the raw retrieval score with a decaying heavy-hitter
+@@ -1081,6 +1099,7 @@ impl KvMemCtl {
+                 lw_output_pressure: None,
+                 lw_keep: Vec::new(),
+                 lw_query_due: false,
++                lw_import_blocks: Cell::new(None),
+                 lw_pending_output: None,
+                 lw_head: None,
+                 lw_aux_selection: None,
+@@ -1187,6 +1206,7 @@ impl KvMemCtl {
+             head_plane,
+             aux_ordinal: geom.n_fa_layers as u32,
+             n_record_layers,
++            gen_reserve,
+             // P4.3: bounded frozen-prefix catalog; empty until the engine
+             // freezes a prefix (PREFIX_PIN on). The bound is the retention
+             // count ceiling (H5 exposes the env knob).
+@@ -1259,6 +1279,53 @@ impl KvMemCtl {
+         self.budget_blocks
+     }
+ 
++    /// P2.2a: generation reserve R (ninfer `reserve_tokens`).
++    pub fn gen_reserve(&self) -> u64 {
++        self.gen_reserve
++    }
++
++    /// Layerwise window capacity: resident budget B + generation reserve R
++    /// (ninfer `device_tokens = selected_tokens + reserve_tokens`).
++    pub fn window_capacity_tokens(&self) -> u64 {
++        (self.budget_blocks as u64) * KV_BLOCK_TOKENS as u64 + self.gen_reserve
++    }
++
++    /// Arm the one-shot Layerwise selection budget from the import admission
++    /// (ninfer `selection_budget`). The next Layerwise carrier selection takes
++    /// it; later selections return to the configured residential budget.
++    pub fn set_layerwise_import_blocks(&self, slot: usize, blocks: u32) -> Result<(), String> {
++        let st = self
++            .slots
++            .get(slot)
++            .ok_or_else(|| format!("kvmem: import budget slot {slot} out of range"))?;
++        st.lw_import_blocks.set(Some(blocks.max(1)));
++        Ok(())
++    }
++
++    /// Consume the one-shot import selection budget (first Layerwise selection
++    /// after a fenced import). `None` for every ordinary selection.
++    pub fn take_layerwise_import_blocks(&self, slot: usize) -> Option<u32> {
++        self.slots.get(slot).and_then(|st| st.lw_import_blocks.take())
++    }
++
++    /// P2.2a fenced-import admission (ninfer `prepare_import_start`): build the
++    /// pure window/import policy from the restored exact prefix. Pure host
++    /// arithmetic; it touches no catalog, device or selection state.
++    pub fn import_window(
++        &self,
++        prompt_end: u64,
++        output_tokens: u64,
++        frontier: u32,
++    ) -> Result<ImportStart, String> {
++        layerwise_import_admission(
++            prompt_end,
++            output_tokens,
++            self.window_capacity_tokens(),
++            self.gen_reserve,
++            frontier,
++        )
++    }
++
+     /// Drop the slot's host state. Called when a fresh session takes the slot
+     /// and lazily when a closed slot is swept at step start.
+     pub fn reset_slot(&mut self, slot: usize) -> Result<(), String> {
+@@ -1321,6 +1388,7 @@ impl KvMemCtl {
+             lw_output_pressure: None,
+             lw_keep: Vec::new(),
+             lw_query_due: false,
++            lw_import_blocks: Cell::new(None),
+             lw_pending_output: None,
+             // P4.1② G3: a fresh session drops the head resident map and its
+             // per-Query binding, mirroring the trunk pressure owners. The next
+@@ -3468,6 +3536,36 @@ fn restore_page(
+ #[allow(dead_code)]
+ const _: u32 = SPILLED_PAGE;
+ 
++/// Pure engine→core mapping for the fenced-import admission: the exact restored
++/// prefix (`frontier`, page-aligned) feeds one `WindowPlan` over the layerwise
++/// capacity `B + R`, and the returned `ImportStart` is the core's decision.
++pub fn layerwise_import_admission(
++    prompt_end: u64,
++    output_tokens: u64,
++    capacity_tokens: u64,
++    gen_reserve: u64,
++    frontier: u32,
++) -> Result<ImportStart, String> {
++    let envelope = WindowEnvelope {
++        prompt_end,
++        block_tokens: KV_BLOCK_TOKENS as u32,
++        generation_tokens: gen_reserve,
++        output_tokens,
++        rolling_active_window: false,
++        prefill_window: WindowPolicy::Pressure,
++        query: None,
++        replay: None,
++        reserve_query_output: false,
++        probe_tokens: 0,
++        pressure_probe_tokens: 0,
++        has_query_mandatory: false,
++    };
++    let plan = WindowPlan::new(&envelope, capacity_tokens)
++        .map_err(|e| format!("kvmem import window: {e}"))?;
++    plan.import_plan(WindowState { history: frontier as u64, visible_tokens: frontier as u64 })
++        .map_err(|e| format!("kvmem import plan: {e}"))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -5147,4 +5245,35 @@ mod tests {
+         assert!(lw.truncate_slot(0, bt).is_err(), "Layerwise refuses");
+         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+     }
++    #[test]
++    fn import_admission_maps_ninfer_window_semantics() {
++        // Non-pressure: the exact prefix starts inside the window.
++        let ok = layerwise_import_admission(1024, 64, 4096 + 1024, 1024, 1024).expect("import");
++        assert!(!ok.pressure());
++        assert_eq!(ok.budget_tokens, 4096);
++        assert_eq!(ok.restore_tokens, 1024);
++        assert_eq!(ok.selection_budget, 0, "exact import keeps ordinary selection");
++
++        // Prefill-probe overflow: visible extent exceeds the prefill boundary.
++        let probe = layerwise_import_admission(4096, 64, 1024 + 1024, 1024, 2048).expect("import");
++        assert!(probe.prefill_probe_overflow, "{probe:?}");
++        assert!(probe.pressure());
++        assert_eq!(probe.budget_tokens, 1024);
++        assert_eq!(probe.restore_tokens, 1024, "narrows the imported extent");
++
++        // Terminal reserve overflow also narrows the exact prefix.
++        let term = layerwise_import_admission(2048, 512, 1024 + 1024, 1024, 2048).expect("import");
++        assert!(term.terminal_reserve_overflow, "{term:?}");
++        assert_eq!(term.budget_tokens, 1024);
++        assert_eq!(term.restore_tokens, 1024);
++        assert!(term.restore_tokens < 2048, "this is the narrowing case");
++    }
++
++    #[test]
++    fn gen_reserve_is_positive_and_adds_to_the_window() {
++        // The constructor rejects zero; capacity is B + R by construction.
++        let capacity = 32 * KV_BLOCK_TOKENS as u64 + DEFAULT_GEN_RESERVE;
++        assert_eq!(capacity, 4096 + 1024);
++        assert!(DEFAULT_GEN_RESERVE > 0);
++    }
+ }
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index 1936f9102b4757dfc9a411ae69f35126104992d1..d57e306d98761e1074b68814838125ab30dd19e7 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -2359,7 +2359,12 @@ pub fn engine_carrier_rows<'a>(
+     let n_slots = selected_pages + 2;
+     let full_pages = (fed / LAYERWISE_BLOCK_TOKENS) as u64;
+     let archive_bytes = (full_pages + 2) * record_bytes;
+-    let budget_blocks = ctl.budget_blocks() as u32;
++    // P2.2a fenced-import admission: the first Layerwise selection after a
++    // restored checkpoint may carry a narrowed one-shot budget (ninfer
++    // `selection_budget`). Ordinary steps read the configured resident budget.
++    let budget_blocks = ctl
++        .take_layerwise_import_blocks(slot)
++        .unwrap_or_else(|| ctl.budget_blocks() as u32);
+ 
+     // ── Output window (ninfer native Output cadence) ─────────────────────────
+     // The window frontier is the native consumed frontier `fed`, not the
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 416dd3614cddff1a497f8f3c1689d003f9d48467..51b72b7f4785e7589be1771fae94ea6d87f4352d 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -8751,6 +8751,35 @@ fn admit(
+                 // 1. Host fork: validates the FULL provenance (geometry +
+                 // fingerprint + token proof) before any mutation.
+                 let frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
++                // 1b. P2.2a fenced-import admission (ninfer `prepare_import_start`):
++                // the restored exact prefix is measured against the layerwise
++                // window capacity B+R. A pressure import arms a one-shot
++                // selection budget for the first Layerwise step. Narrowing the
++                // prefix would need a DeltaNet checkpoint at the narrowed
++                // frontier, which P4.3 does not capture — fail closed to cold.
++                if ctl.strategy().is_layerwise() {
++                    let start = ctl
++                        .import_window(
++                            req.prompt_tokens.len() as u64,
++                            req.max_tokens as u64,
++                            frontier,
++                        )
++                        .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
++                    if start.pressure() {
++                        if start.restore_tokens < frontier as u64 {
++                            return Err(format!(
++                                "kvmem reuse: import pressure narrows {} -> {} tokens                                  without a narrowed DeltaNet checkpoint",
++                                frontier, start.restore_tokens
++                            ));
++                        }
++                        ctl.set_layerwise_import_blocks(
++                            slot.0,
++                            (start.selection_budget / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
++                                as u32,
++                        )
++                        .map_err(|e| format!("kvmem reuse: import budget: {e}"))?;
++                    }
++                }
+                 let gpu_pages = ctl
+                     .prefix_checkpoint(ckpt_id)
+                     .map(|c| c.gpu_pages.clone())

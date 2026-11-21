@@ -1,0 +1,290 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index f2a22509bde5100f74d753be775b514ac3624611..07316f197fd3bc696909a19725262a6dd703c9c1 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -142,6 +142,25 @@ fn env_u64(name: &str) -> Option<u64> {
+     env_raw(name).and_then(|v| v.parse::<u64>().ok())
+ }
+ 
++fn env_f64(name: &str) -> Option<f64> {
++    env_raw(name).and_then(|v| v.parse::<f64>().ok())
++}
++
++/// `HIPFIRE_KVMEM_SELECT_METHOD`: `retrieval` (default) | `h2o` | `recency`, or
++/// the core `KvMemMethod` ordinals 0/1/2. Retrieval feeds the mean-K query
++/// scores (the historical behaviour); Recency feeds no learned signal so
++/// `pick_topk_blocks` keeps sink + recent and fills the rest by recency. H2O
++/// needs the per-block attention-heat tap (the `hipfire-h2o-heat` patch) and is
++/// rejected loudly until that lands, rather than silently degenerating.
++fn parse_select_method(v: &str) -> Option<u32> {
++    match v.trim().to_ascii_lowercase().as_str() {
++        "retrieval" | "0" => Some(0),
++        "h2o" | "1" => Some(1),
++        "recency" | "2" => Some(2),
++        _ => None,
++    }
++}
++
+ /// True when `HIPFIRE_KVMEM` names an enabling value. Callers must also check
+ /// that the crate was built with the `kvmem` feature — the engine refuses the
+ /// knob loudly when it was not.
+@@ -309,6 +328,16 @@ pub struct KvMemCtl {
+     /// Resolved `HIPFIRE_KVMEM_BATCH_XFER` (default on). When false, or when no
+     /// steady-copy stream is active, spill/restore use the per-page path.
+     batch_xfer: bool,
++    /// Resolved `HIPFIRE_KVMEM_SELECT_METHOD` ordinal (0 Retrieval, 2 Recency).
++    /// H2O (1) is rejected at construction until the attention-heat tap lands.
++    select_method: u32,
++    /// `HIPFIRE_KVMEM_GPU_HIGH/LOW_WATERMARK` hysteresis band, in pages, when
++    /// either env is set: `(spill_trigger, keep_target)`. The core watermark
++    /// ratios are applied to the per-slot resident budget pool, so
++    /// `keep_target <= spill_trigger <= budget_blocks` — the band can only make
++    /// residency more conservative than the default, never overshoot the pool.
++    /// `None` (default) keeps the historical single-threshold budget behaviour.
++    watermark: Option<(usize, usize)>,
+ }
+ 
+ impl KvMemCtl {
+@@ -342,6 +371,57 @@ impl KvMemCtl {
+             ));
+         }
+         let budget_tokens = (plan.budget_blocks * KV_BLOCK_TOKENS) as u32;
++
++        // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
++        // LRFU replaces the raw retrieval score with a decaying heavy-hitter
++        // history in the core's `selection_score`; lambda/top tune that decay.
++        let lrfu = env_flag("HIPFIRE_KVMEM_LRFU");
++        let lrfu_lambda = env_f64("HIPFIRE_KVMEM_LRFU_LAMBDA").unwrap_or(0.5);
++        let lrfu_top = env_f64("HIPFIRE_KVMEM_LRFU_TOP").unwrap_or(0.9);
++        let select_method = match env_raw("HIPFIRE_KVMEM_SELECT_METHOD") {
++            Some(v) => parse_select_method(&v).ok_or_else(|| {
++                format!("kvmem: HIPFIRE_KVMEM_SELECT_METHOD={v} invalid (retrieval|h2o|recency)")
++            })?,
++            None => 0,
++        };
++        if select_method == 1 {
++            return Err(
++                "kvmem: SELECT_METHOD=h2o needs the per-block attention-heat tap \
++                 (hipfire-h2o-heat patch); use retrieval or recency for now"
++                    .to_string(),
++            );
++        }
++        // The core KvMemStore constructor enforces this; fail here with a clear
++        // message instead of an opaque C++ exception at store creation.
++        if lrfu && select_method != 0 {
++            return Err("kvmem: LRFU requires SELECT_METHOD=retrieval (core constraint)".to_string());
++        }
++        if lrfu {
++            if !(0.0..=1.0).contains(&lrfu_lambda) {
++                return Err(format!("kvmem: LRFU_LAMBDA={lrfu_lambda} out of range [0,1]"));
++            }
++            if !(lrfu_top > 0.0 && lrfu_top <= 1.0) {
++                return Err(format!("kvmem: LRFU_TOP={lrfu_top} out of range (0,1]"));
++            }
++        }
++        // Watermark ratios are stored on the config; the page thresholds are
++        // derived from the CORE watermark functions after the stores exist.
++        let wm_high_env = env_f64("HIPFIRE_KVMEM_GPU_HIGH_WATERMARK");
++        let wm_low_env = env_f64("HIPFIRE_KVMEM_GPU_LOW_WATERMARK");
++        let watermark_enabled = wm_high_env.is_some() || wm_low_env.is_some();
++        let wm_high = wm_high_env.unwrap_or(0.95);
++        let wm_low = wm_low_env.unwrap_or(0.85);
++        if watermark_enabled
++            && (!(wm_high > 0.0 && wm_high <= 1.0)
++                || !(wm_low > 0.0 && wm_low <= 1.0)
++                || wm_low > wm_high)
++        {
++            return Err(format!(
++                "kvmem: GPU_HIGH/LOW_WATERMARK must satisfy 0 < low <= high <= 1 \
++                 (got high={wm_high}, low={wm_low})"
++            ));
++        }
++
+         let kv_cfg = KvStoreConfig {
+             block_tokens: KV_BLOCK_TOKENS as u32,
+             select_budget: budget_tokens,
+@@ -349,6 +429,12 @@ impl KvMemCtl {
+             gen_budget: budget_tokens,
+             sink_blocks: sink as u32,
+             recent_blocks: recent as u32,
++            select_method,
++            lrfu: lrfu as u32,
++            lrfu_lambda,
++            lrfu_top_fraction: lrfu_top,
++            gpu_high_watermark: wm_high,
++            gpu_low_watermark: wm_low,
+             ..KvStoreConfig::default()
+         };
+ 
+@@ -382,6 +468,45 @@ impl KvMemCtl {
+             });
+         }
+ 
++        // Derive the watermark hysteresis band from the CORE watermark functions
++        // applied to the per-slot resident budget pool (budget_blocks pages):
++        // keep_target <= spill_trigger <= budget_blocks, so the band can only
++        // make residency more conservative than the default, never overshoot the
++        // physical pool. The keep target narrows the core selection budget via
++        // set_runtime_select_budget (re-applied on reset_slot).
++        let watermark = if watermark_enabled {
++            let high_tok = slots[0].kv.gpu_high_watermark_tokens(budget_tokens);
++            let low_tok = slots[0].kv.gpu_low_watermark_tokens(budget_tokens);
++            let trigger = (high_tok as usize / KV_BLOCK_TOKENS).clamp(1, plan.budget_blocks);
++            let keep = (low_tok as usize / KV_BLOCK_TOKENS).clamp(1, trigger);
++            if keep < sink + recent {
++                return Err(format!(
++                    "kvmem: watermark keep target ({keep} blocks) is below sink+recent \
++                     ({}); raise GPU_LOW_WATERMARK or lower SINK/RECENT_BLOCKS",
++                    sink + recent
++                ));
++            }
++            for st in &slots {
++                st.kv
++                    .set_runtime_select_budget((keep * KV_BLOCK_TOKENS) as u32)
++                    .map_err(|e| format!("kvmem watermark select budget: {e}"))?;
++            }
++            Some((trigger, keep))
++        } else {
++            None
++        };
++
++        if (time_flag() || env_flag("HIPFIRE_KVMEM_TRACE"))
++            && (lrfu || select_method != 0 || watermark_enabled)
++        {
++            eprintln!(
++                "[kvmem] policy: select_method={select_method} lrfu={lrfu} \
++                 lambda={lrfu_lambda} top={lrfu_top} watermark={watermark:?} \
++                 budget_blocks={}",
++                plan.budget_blocks
++            );
++        }
++
+         Ok(Self {
+             slots,
+             storage,
+@@ -405,6 +530,8 @@ impl KvMemCtl {
+             counts: vec![1u32; geom.n_fa_layers],
+             xfer_slab: None,
+             batch_xfer: batch_xfer_flag(),
++            select_method,
++            watermark,
+         })
+     }
+ 
+@@ -422,6 +549,12 @@ impl KvMemCtl {
+         let raw = RawStore::new(self.raw_cfg, Some(&self.storage))
+             .map_err(|e| format!("kvmem raw store: {e}"))?;
+         let kv = KvStore::new(&self.kv_cfg).map_err(|e| format!("kvmem store: {e}"))?;
++        // A fresh store starts at the configured select_budget; re-apply the
++        // watermark keep target so a reset slot keeps the same hysteresis band.
++        if let Some((_, keep)) = self.watermark {
++            kv.set_runtime_select_budget((keep * KV_BLOCK_TOKENS) as u32)
++                .map_err(|e| format!("kvmem watermark select budget: {e}"))?;
++        }
+         self.slots[slot] = SlotState {
+             raw,
+             kv,
+@@ -613,7 +746,12 @@ impl KvMemCtl {
+                 Some(bt) => (bt.num_pages(), bt.live_tokens()),
+                 None => continue,
+             };
+-            if pages <= self.budget_blocks {
++            // Watermark hysteresis: when GPU_HIGH/LOW_WATERMARK is set, spill is
++            // triggered at the high-watermark page count (>= the keep target the
++            // core selection budget was narrowed to), instead of the single
++            // budget threshold. Unset => the historical budget_blocks trigger.
++            let spill_trigger = self.watermark.map(|(t, _)| t).unwrap_or(self.budget_blocks);
++            if pages <= spill_trigger {
+                 continue;
+             }
+             let full_pages = live / KV_BLOCK_TOKENS;
+@@ -651,15 +789,45 @@ impl KvMemCtl {
+                     .pick_prefill_pressure_blocks(&[])
+                     .map_err(|e| format!("kvmem prefill selection: {e}"))?
+             } else {
+-                let scores = self.refresh_scores(gpu, taps, s, pages)?;
++                // SELECT_METHOD gates which signal feeds the shared pick_topk
++                // ranking (the core's executor-level policy). Retrieval (0, the
++                // default) scores the resident set against the tapped mean-K
++                // query. Recency (2) feeds no learned signal: zeroing the scores
++                // makes pick_topk keep sink + recent and fill the rest by recency
++                // (the core's deterministic id tie-break), and skips the Q-tap
++                // read + mean-K scoring entirely. H2O (1) is rejected at
++                // construction until the attention-heat tap lands.
++                //
++                // LRFU round lifecycle: begin before previewing scores, commit
++                // after the pick so the selector ranks the decayed candidate and
++                // the round's reinforcement is then sealed. Both are no-ops when
++                // lrfu is off, so the default Retrieval path stays byte-neutral.
+                 self.slots[s]
+                     .kv
+-                    .set_retrieval_scores(&scores)
+-                    .map_err(|e| format!("kvmem set scores: {e}"))?;
+-                self.slots[s]
++                    .begin_retrieval_round()
++                    .map_err(|e| format!("kvmem begin round: {e}"))?;
++                if self.select_method == 2 {
++                    let zeros = vec![0.0f64; pages];
++                    self.slots[s]
++                        .kv
++                        .set_retrieval_scores(&zeros)
++                        .map_err(|e| format!("kvmem set scores: {e}"))?;
++                } else {
++                    let scores = self.refresh_scores(gpu, taps, s, pages)?;
++                    self.slots[s]
++                        .kv
++                        .set_retrieval_scores(&scores)
++                        .map_err(|e| format!("kvmem set scores: {e}"))?;
++                }
++                let picked = self.slots[s]
+                     .kv
+                     .pick_topk_blocks(&[])
+-                    .map_err(|e| format!("kvmem decode selection: {e}"))?
++                    .map_err(|e| format!("kvmem decode selection: {e}"))?;
++                self.slots[s]
++                    .kv
++                    .commit_retrieval_round()
++                    .map_err(|e| format!("kvmem commit round: {e}"))?;
++                picked
+             };
+             if timed {
+                 t_select += t_pick.elapsed();
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index b421a28e24d60d21799adad745d7c192ddbf9cc1..f428c53433757c6d681b86ef7ca8456dc597522f 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -246,6 +246,8 @@ mod ffi {
+             capacity: u32,
+         ) -> u32;
+         pub fn hk_kv_store_set_retrieval_scores(ks: *mut HkKvStore, scores: *const f64, n: u32);
++        pub fn hk_kv_store_begin_retrieval_round(ks: *mut HkKvStore);
++        pub fn hk_kv_store_commit_retrieval_round(ks: *mut HkKvStore) -> c_int;
+         pub fn hk_kv_store_prefill_needs_offload(
+             ks: *const HkKvStore,
+             resident_tokens: u32,
+@@ -573,6 +575,25 @@ impl KvStore {
+         })
+     }
+ 
++    /// Open an LRFU retrieval round. No-op (and error-free) when lrfu is off, so
++    /// the default Retrieval path is unaffected. Must precede set_retrieval_scores
++    /// when lrfu is on; pair with commit_retrieval_round after pick_topk_blocks.
++    pub fn begin_retrieval_round(&self) -> Result<()> {
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe { ffi::hk_kv_store_begin_retrieval_round(p) })
++    }
++
++    /// Close the round and reward the picked blocks. Returns Ok(false) when lrfu
++    /// is off (nothing committed); Ok(true) when a round was committed.
++    pub fn commit_retrieval_round(&self) -> Result<bool> {
++        let p = self.ptr.as_ptr();
++        let mut committed = false;
++        checked(|| unsafe {
++            committed = ffi::hk_kv_store_commit_retrieval_round(p) != 0;
++        })?;
++        Ok(committed)
++    }
++
+     pub fn prefill_needs_offload(
+         &self,
+         resident_tokens: u32,

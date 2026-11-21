@@ -1,0 +1,1587 @@
+diff --git a/crates/rdna-compute/examples/bench_mq3_prefill_shapes.rs b/crates/rdna-compute/examples/bench_mq3_prefill_shapes.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..68db7ae63c3f1379be84236c30d6b452611aa201
+--- /dev/null
++++ b/crates/rdna-compute/examples/bench_mq3_prefill_shapes.rs
+@@ -0,0 +1,469 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++
++//! MQ3G256V2 prefill GEMM throughput at production shapes (gfx1100).
++//!
++//! Phase 0 evidence for the weight-prefill lane:
++//!   base (batch-tile 1) vs generic mqv2 batch-tile weight-reuse arms
++//!   (gate BT6/BT12, residual BT4/6/8, qkvza/qkv BT4/BT12).
++//!
++//! Shapes are the Qwen3.8-27B prefill launches observed in
++//! `logs/phase0-trace-mq3xt-b12k` (per launch, N = 1024-row chunk):
++//!   gate_up  : gate 17408 + up 17408 rows, K=5120
++//!   residual : down 5120 x K=17408; o_proj 5120 x K=6144
++//!   qkvza    : (qkv 14336, z 2048, beta 48, alpha 48), K=5120   [split: total
++//!              M=16480 from trace; per-matrix split is a close hypothesis]
++//!   qkv      : (q 12288, k 1024, v 1024), K=5120                [total M=14336]
++//!
++//! Each arm prints µs, TFLOPS and effective weight-read GiB/s, plus a raw-bit
++//! comparison against the base output (full-shape parity signal; the tiny-shape
++//! raw-bit screen is `test_mqv2_bt_gfx11` with HIPFIRE_MQV2_BT_SCREEN_BITS3=1).
++//!
++//! Exit 0 on success; 1 if any parity arm differs or a launch fails.
++
++use rdna_compute::kv_slots::half_from_f32;
++use rdna_compute::{DType, Gpu, GpuTensor};
++use std::time::Instant;
++
++const GROUP: usize = 256;
++const HALF: usize = 128;
++const BITS: u8 = 3;
++
++fn f16_to_f32(bits: u16) -> f32 {
++    let sign = ((bits & 0x8000) as u32) << 16;
++    let mut exp = ((bits >> 10) & 0x1f) as u32;
++    let mut mant = (bits & 0x03ff) as u32;
++    let out = if exp == 0 {
++        if mant == 0 {
++            sign
++        } else {
++            exp = 127 - 15 + 1;
++            while mant & 0x0400 == 0 {
++                mant <<= 1;
++                exp -= 1;
++            }
++            sign | (exp << 23) | ((mant & 0x03ff) << 13)
++        }
++    } else if exp == 0x1f {
++        sign | 0x7f80_0000 | (mant << 13)
++    } else {
++        sign | ((exp + 127 - 15) << 23) | (mant << 13)
++    };
++    f32::from_bits(out)
++}
++
++fn prng(i: usize, salt: u32) -> f32 {
++    let x = (i as u32)
++        .wrapping_mul(0x9E37_79B9)
++        .wrapping_add(salt.wrapping_mul(0x85EB_CA6B));
++    let x = x ^ (x >> 15);
++    let x = x.wrapping_mul(0x2545_F491);
++    let x = x ^ (x >> 13);
++    (x >> 8) as f32 / (1u32 << 24) as f32
++}
++
++fn build_weights(m: usize, k: usize, seed: u32) -> Vec<f32> {
++    let mut w = vec![0.0f32; m * k];
++    for r in 0..m {
++        for g in 0..(k / GROUP) {
++            let base = r * k + g * GROUP;
++            let salt = (r * 7919 + g * 104_729) as u32 ^ seed;
++            for i in 0..HALF {
++                w[base + i] = prng(i, salt) * 2.0 - 1.0;
++            }
++            for i in HALF..GROUP {
++                w[base + i] = 96.0 + prng(i, salt ^ 0xA5A5_A5A5) * 64.0;
++            }
++        }
++    }
++    w
++}
++
++/// Synthetic MQ3G256V2 packer (104 B groups: dual fp16 header + 96 B 3-bit).
++/// Identical packing to `test_mqv2_bt_gfx11::pack_mqv2(bits=3, …)`.
++fn pack_mq3(w: &[f32], m: usize, k: usize) -> Vec<u8> {
++    assert_eq!(k % GROUP, 0);
++    assert_eq!(w.len(), m * k);
++    let gb = 8 + 32 * BITS as usize; // 104
++    let mq = 7.0f32;
++    let gpr = k / GROUP;
++    let mut blob = vec![0u8; m * gpr * gb];
++    for r in 0..m {
++        for g in 0..gpr {
++            let src = r * k + g * GROUP;
++            let dst = (r * gpr + g) * gb;
++            let mut codes = [0u8; GROUP];
++            for h in 0..2 {
++                let off = h * HALF;
++                let slice = &w[src + off..src + off + HALF];
++                let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
++                let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
++                let step = if hi > lo { (hi - lo) / mq } else { 0.0 };
++                let s_bits = if hi == lo { 0u16 } else { half_from_f32(step) };
++                let z_bits = half_from_f32(lo);
++                blob[dst + h * 4..dst + h * 4 + 2].copy_from_slice(&s_bits.to_le_bytes());
++                blob[dst + h * 4 + 2..dst + h * 4 + 4].copy_from_slice(&z_bits.to_le_bytes());
++                let s_rt = f16_to_f32(s_bits);
++                let z_rt = f16_to_f32(z_bits);
++                if s_rt == 0.0 {
++                    continue;
++                }
++                let inv = 1.0 / s_rt;
++                for i in 0..HALF {
++                    let q = ((slice[i] - z_rt) * inv + 0.5).floor().clamp(0.0, mq);
++                    codes[off + i] = q as u8;
++                }
++            }
++            for chunk in 0..32 {
++                let ci = chunk * 8;
++                let qq = [
++                    codes[ci] & 7,
++                    codes[ci + 1] & 7,
++                    codes[ci + 2] & 7,
++                    codes[ci + 3] & 7,
++                    codes[ci + 4] & 7,
++                    codes[ci + 5] & 7,
++                    codes[ci + 6] & 7,
++                    codes[ci + 7] & 7,
++                ];
++                let b0 = qq[0] | (qq[1] << 3) | ((qq[2] & 3) << 6);
++                let b1 = ((qq[2] >> 2) & 1) | (qq[3] << 1) | (qq[4] << 4) | ((qq[5] & 1) << 7);
++                let b2 = ((qq[5] >> 1) & 3) | (qq[6] << 2) | (qq[7] << 5);
++                let bo = dst + 8 + chunk * 3;
++                blob[bo] = b0;
++                blob[bo + 1] = b1;
++                blob[bo + 2] = b2;
++            }
++        }
++    }
++    blob
++}
++
++fn htod_f32(gpu: &Gpu, t: &GpuTensor, host: &[f32]) {
++    gpu.hip
++        .memcpy_htod(&t.buf, unsafe {
++            std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
++        })
++        .expect("htod f32");
++}
++
++fn upload_blob(gpu: &Gpu, blob: &[u8]) -> GpuTensor {
++    gpu.upload_raw(blob, &[blob.len()]).expect("upload_raw")
++}
++
++struct Shape {
++    label: &'static str,
++    /// Weight rows per matrix (sums to the total M of the production launch).
++    ms: Vec<usize>,
++    k: usize,
++    n: usize,
++}
++
++struct ResultRow {
++    arm: String,
++    us: f64,
++    tflops: f64,
++    wgibs: f64,
++    bit_mism: usize,
++    max_abs: f32,
++}
++
++fn time_launch(
++    gpu: &mut Gpu,
++    warmup: usize,
++    runs: usize,
++    mut f: impl FnMut(&mut Gpu) -> Result<(), String>,
++) -> Result<f64, String> {
++    for _ in 0..warmup {
++        f(gpu)?;
++    }
++    gpu.hip.device_synchronize().map_err(|e| format!("{e:?}"))?;
++    let t0 = Instant::now();
++    for _ in 0..runs {
++        f(gpu)?;
++    }
++    gpu.hip.device_synchronize().map_err(|e| format!("{e:?}"))?;
++    Ok(t0.elapsed().as_secs_f64() * 1e6 / runs as f64)
++}
++
++fn compare(a: &[f32], b: &[f32]) -> (usize, f32) {
++    let mut mism = 0usize;
++    let mut max_abs = 0.0f32;
++    for (x, y) in a.iter().zip(b.iter()) {
++        if x.to_bits() != y.to_bits() {
++            mism += 1;
++            max_abs = max_abs.max((x - y).abs());
++        }
++    }
++    (mism, max_abs)
++}
++
++fn print_row(r: &ResultRow) {
++    println!(
++        "    {:<10} {:9.1} µs  {:6.1} TFLOPS  {:7.1} GiB/s-w  bitmism={} maxabs={:.3e}",
++        r.arm, r.us, r.tflops, r.wgibs, r.bit_mism, r.max_abs
++    );
++}
++
++fn main() {
++    let mut gpu = match Gpu::init() {
++        Ok(g) => g,
++        Err(e) => {
++            eprintln!("SKIP: no GPU ({e})");
++            return;
++        }
++    };
++    let arch = gpu.arch.clone();
++    if arch != "gfx1100" {
++        eprintln!("SKIP: arch {arch} is not exact gfx1100 (Phase 0 target)");
++        return;
++    }
++    eprintln!("arch {arch} — MQ3G256V2 prefill shapes: base vs BT arms");
++
++    let shapes = vec![
++        Shape { label: "gate_up_n1024", ms: vec![17408, 17408], k: 5120, n: 1024 },
++        Shape { label: "gate_up_n96", ms: vec![17408, 17408], k: 5120, n: 96 },
++        Shape { label: "gate_up_n80", ms: vec![17408, 17408], k: 5120, n: 80 },
++        Shape { label: "gate_up_n64", ms: vec![17408, 17408], k: 5120, n: 64 },
++        Shape { label: "resid_down_n1024", ms: vec![5120], k: 17408, n: 1024 },
++        Shape { label: "resid_down_n80", ms: vec![5120], k: 17408, n: 80 },
++        Shape { label: "resid_down_n64", ms: vec![5120], k: 17408, n: 64 },
++        Shape { label: "resid_o_n1024", ms: vec![5120], k: 6144, n: 1024 },
++        Shape { label: "qkvza_n1024", ms: vec![14336, 2048, 48, 48], k: 5120, n: 1024 },
++        Shape { label: "qkv_n1024", ms: vec![12288, 1024, 1024], k: 5120, n: 1024 },
++        // Boundary-row tails: region routing + partial tiles vs base.
++        Shape { label: "qkvza_tails", ms: vec![40, 28, 36, 16], k: 512, n: 128 },
++        Shape { label: "qkv_tails", ms: vec![40, 32, 48], k: 512, n: 128 },
++    ];
++
++    let mut failures = 0usize;
++    for sh in &shapes {
++        println!(
++            "\n== {}  M={}x?  K={}  N={} ==",
++            sh.label,
++            sh.ms.iter().sum::<usize>(),
++            sh.k,
++            sh.n
++        );
++        let gb = 8 + 32 * BITS as usize;
++        let blobs: Vec<Vec<u8>> = sh
++            .ms
++            .iter()
++            .enumerate()
++            .map(|(i, &m)| {
++                let w = build_weights(m, sh.k, 0x1000_u32 * (i as u32 + 1) + sh.k as u32);
++                pack_mq3(&w, m, sh.k)
++            })
++            .collect();
++        let w_bytes: f64 = sh
++            .ms
++            .iter()
++            .map(|&m| (m * (sh.k / GROUP) * gb) as f64)
++            .sum();
++        let tflops = |m: usize, us: f64| 2.0 * m as f64 * sh.n as f64 * sh.k as f64 / (us * 1e6);
++        let wgibs = |us: f64| w_bytes / (us * 1e-6) / 1_073_741_824.0;
++
++        // Host X and per-matrix device tensors.
++        let x_host: Vec<f32> = (0..sh.n * sh.k)
++            .map(|i| prng(i, 0xC0FF_EE00 ^ (sh.n as u32)))
++            .collect();
++        let d_x = gpu.alloc_tensor(&[sh.n * sh.k], DType::F32).expect("x");
++        htod_f32(&gpu, &d_x, &x_host);
++        let d_w: Vec<GpuTensor> = blobs.iter().map(|b| upload_blob(&gpu, b)).collect();
++        let total_m: usize = sh.ms.iter().sum();
++        let d_y: Vec<GpuTensor> = sh
++            .ms
++            .iter()
++            .map(|&m| {
++                let t = gpu.alloc_tensor(&[sh.n * m], DType::F32).expect("y");
++                htod_f32(&gpu, &t, &vec![0.0f32; sh.n * m]);
++                t
++            })
++            .collect();
++        gpu.hip.device_synchronize().unwrap();
++
++        // Base arm reference output.
++        let ok = match sh.ms.len() {
++            2 => gpu.gemm_gate_up_mq3g256v2_wmma_gfx11(
++                &d_w[0], &d_w[1], &d_x, &d_y[0], &d_y[1], sh.ms[0], sh.ms[1], sh.k, sh.n,
++            ),
++            1 => gpu.gemm_mq3g256v2_residual_wmma_gfx11(
++                &d_w[0], &d_x, &d_y[0], sh.ms[0], sh.k, sh.n,
++            ),
++            4 => gpu.gemm_qkvza_mq3g256v2_wmma_gfx11(
++                &d_w[0], &d_w[1], &d_w[2], &d_w[3], &d_x, &d_y[0], &d_y[1], &d_y[2],
++                &d_y[3], sh.ms[0], sh.ms[1], sh.ms[2], sh.ms[3], sh.k, sh.n,
++            ),
++            3 => gpu.gemm_qkv_mq3g256v2_wmma_gfx11(
++                &d_w[0], &d_w[1], &d_w[2], &d_x, &d_y[0], &d_y[1], &d_y[2], sh.ms[0],
++                sh.ms[1], sh.ms[2], sh.k, sh.n,
++            ),
++            _ => unreachable!(),
++        };
++        if let Err(e) = ok {
++            eprintln!("  base launch FAIL: {e:?}");
++            failures += 1;
++            continue;
++        }
++        gpu.hip.device_synchronize().unwrap();
++        let y_base: Vec<Vec<f32>> = d_y
++            .iter()
++            .map(|t| gpu.download_f32(t).expect("dl base"))
++            .collect();
++
++        let mut rows: Vec<ResultRow> = Vec::new();
++        let us = time_launch(&mut gpu, 2, 10, |g| match sh.ms.len() {
++            2 => g
++                .gemm_gate_up_mq3g256v2_wmma_gfx11(
++                    &d_w[0], &d_w[1], &d_x, &d_y[0], &d_y[1], sh.ms[0], sh.ms[1], sh.k, sh.n,
++                )
++                .map_err(|e| format!("{e:?}")),
++            1 => g
++                .gemm_mq3g256v2_residual_wmma_gfx11(
++                    &d_w[0], &d_x, &d_y[0], sh.ms[0], sh.k, sh.n,
++                )
++                .map_err(|e| format!("{e:?}")),
++            4 => g
++                .gemm_qkvza_mq3g256v2_wmma_gfx11(
++                    &d_w[0], &d_w[1], &d_w[2], &d_w[3], &d_x, &d_y[0], &d_y[1], &d_y[2],
++                    &d_y[3], sh.ms[0], sh.ms[1], sh.ms[2], sh.ms[3], sh.k, sh.n,
++                )
++                .map_err(|e| format!("{e:?}")),
++            3 => g
++                .gemm_qkv_mq3g256v2_wmma_gfx11(
++                    &d_w[0], &d_w[1], &d_w[2], &d_x, &d_y[0], &d_y[1], &d_y[2], sh.ms[0],
++                    sh.ms[1], sh.ms[2], sh.k, sh.n,
++                )
++                .map_err(|e| format!("{e:?}")),
++            _ => unreachable!(),
++        })
++        .expect("base timing");
++        rows.push(ResultRow {
++            arm: "base".into(),
++            us,
++            tflops: tflops(total_m, us),
++            wgibs: wgibs(us),
++            bit_mism: 0,
++            max_abs: 0.0,
++        });
++
++        // BT candidate arms (mq3 gfx11 generic module, production-weight-reuse kernels).
++        let bt_arms: Vec<usize> = match sh.ms.len() {
++            2 => vec![6, 12],
++            1 => vec![4, 6, 8],
++            _ => vec![4, 12],
++        };
++        // MW-LDS arms (weights staged in LDS across waves; all four families).
++        let mw_arms: Vec<usize> = match sh.ms.len() {
++            1 | 2 | 3 | 4 => vec![4, 8],
++            _ => vec![],
++        };
++        let mut arms: Vec<(String, Box<dyn Fn(&mut Gpu) -> Result<(), String> + '_>)> = Vec::new();
++        let dw: &Vec<GpuTensor> = &d_w;
++        let dx: &GpuTensor = &d_x;
++        let dy: &Vec<GpuTensor> = &d_y;
++        let sh_ref: &Shape = sh;
++        for &bt in &bt_arms {
++            arms.push((
++                format!("bt{bt}"),
++                Box::new(move |g: &mut Gpu| -> Result<(), String> {
++                    match sh_ref.ms.len() {
++                        2 => g.gemm_gate_up_mqv2_wmma_gfx11_bt(
++                            BITS, bt, &dw[0], &dw[1], dx, &dy[0], &dy[1], sh_ref.ms[0],
++                            sh_ref.ms[1], sh_ref.k, sh_ref.n,
++                        ),
++                        1 => g.gemm_mqv2_residual_wmma_gfx11_bt(
++                            BITS, bt, &dw[0], dx, &dy[0], sh_ref.ms[0], sh_ref.k, sh_ref.n,
++                        ),
++                        4 => g.gemm_qkvza_mqv2_wmma_gfx11_bt(
++                            BITS, bt, &dw[0], &dw[1], &dw[2], &dw[3], dx, &dy[0],
++                            &dy[1], &dy[2], &dy[3], sh_ref.ms[0], sh_ref.ms[1], sh_ref.ms[2], sh_ref.ms[3],
++                            sh_ref.k, sh_ref.n,
++                        ),
++                        3 => g.gemm_qkv_mqv2_wmma_gfx11_bt(
++                            BITS, bt, &dw[0], &dw[1], &dw[2], dx, &dy[0], &dy[1],
++                            &dy[2], sh_ref.ms[0], sh_ref.ms[1], sh_ref.ms[2], sh_ref.k, sh_ref.n,
++                        ),
++                        _ => unreachable!(),
++                    }
++                    .map_err(|e| format!("{e:?}"))
++                }),
++            ));
++        }
++        for &nw in &mw_arms {
++            arms.push((
++                format!("mw{nw}"),
++                Box::new(move |g: &mut Gpu| -> Result<(), String> {
++                    match sh_ref.ms.len() {
++                        2 => g.gemm_gate_up_mqv2_wmma_gfx11_mw_lds(
++                            BITS, nw, &dw[0], &dw[1], dx, &dy[0], &dy[1], sh_ref.ms[0],
++                            sh_ref.ms[1], sh_ref.k, sh_ref.n,
++                        ),
++                        1 => g.gemm_mqv2_residual_wmma_gfx11_mw_lds(
++                            BITS, nw, &dw[0], dx, &dy[0], sh_ref.ms[0], sh_ref.k, sh_ref.n,
++                        ),
++                        4 => g.gemm_qkvza_mqv2_wmma_gfx11_mw_lds(
++                            BITS, nw, &dw[0], &dw[1], &dw[2], &dw[3], dx, &dy[0], &dy[1],
++                            &dy[2], &dy[3], sh_ref.ms[0], sh_ref.ms[1], sh_ref.ms[2],
++                            sh_ref.ms[3], sh_ref.k, sh_ref.n,
++                        ),
++                        3 => g.gemm_qkv_mqv2_wmma_gfx11_mw_lds(
++                            BITS, nw, &dw[0], &dw[1], &dw[2], dx, &dy[0], &dy[1], &dy[2],
++                            sh_ref.ms[0], sh_ref.ms[1], sh_ref.ms[2], sh_ref.k, sh_ref.n,
++                        ),
++                        _ => unreachable!(),
++                    }
++                    .map_err(|e| format!("{e:?}"))
++                }),
++            ));
++        }
++        for (label, run) in arms.iter() {
++            // Reset Y before the arm so a failed silent launch is visible.
++            for (i, t) in d_y.iter().enumerate() {
++                htod_f32(&gpu, t, &vec![0.0f32; sh.n * sh.ms[i]]);
++            }
++            if let Err(e) = run(&mut gpu) {
++                eprintln!("    {label} launch FAIL: {e}");
++                failures += 1;
++                continue;
++            }
++            gpu.hip.device_synchronize().unwrap();
++            let y_bt: Vec<Vec<f32>> = d_y
++                .iter()
++                .map(|t| gpu.download_f32(t).expect("dl arm"))
++                .collect();
++            let (mut mism, mut max_abs) = (0usize, 0.0f32);
++            for (a, b) in y_base.iter().zip(y_bt.iter()) {
++                let (m, d) = compare(a, b);
++                mism += m;
++                max_abs = max_abs.max(d);
++            }
++            let us = time_launch(&mut gpu, 2, 10, |g| run(g)).expect("arm timing");
++            rows.push(ResultRow {
++                arm: label.clone(),
++                us,
++                tflops: tflops(total_m, us),
++                wgibs: wgibs(us),
++                bit_mism: mism,
++                max_abs,
++            });
++        }
++
++        let base_us = rows[0].us;
++        for r in &rows {
++            print_row(r);
++            if r.arm != "base" && r.bit_mism != 0 {
++                failures += 1;
++            }
++        }
++        for r in rows.iter().skip(1) {
++            println!("    {} speedup vs base: {:.2}x", r.arm, base_us / r.us);
++        }
++    }
++
++    if failures > 0 {
++        eprintln!("\nFAIL: {failures} arm(s) failed or differed from base");
++        std::process::exit(1);
++    }
++    eprintln!("\nPASS: all arms launched; base/branch outputs bit-identical");
++}
+diff --git a/crates/rdna-compute/examples/test_mqv2_mw_gfx11.rs b/crates/rdna-compute/examples/test_mqv2_mw_gfx11.rs
+index 7fe66b464b9d83a0b4bd42e65b90d9a327cca3a0..fae3399ac2b587baf0c4f7d042ee5ccfb995526e 100644
+--- a/crates/rdna-compute/examples/test_mqv2_mw_gfx11.rs
++++ b/crates/rdna-compute/examples/test_mqv2_mw_gfx11.rs
+@@ -18,10 +18,13 @@
+ //! accidental `+=`).
+ //!
+ //! Arch policy:
+-//!   - exact gfx1151: bits ∈ {3,4,5,6} → 4 bits × 4 ops = 16 arms
+-//!   - exact gfx1100: bits ∈ {4,5,6}   → 3 bits × 4 ops = 12 arms (MQ3 skipped)
++//!   - exact gfx1151: bits ∈ {3,4,5,6} → 16 arms + MQ3 qkvza/qkv ×2 → 20
++//!   - exact gfx1100: bits ∈ {4,5,6}   → 12 arms (MQ3 skipped);
++//!     `HIPFIRE_MQV2_MW_SCREEN_BITS3=1` adds the MQ3 gate/residual arms here
++//!     plus the MQ3-only qkvza (4 regions) and qkv (3 regions) MW families
++//!     → 20 arms.
+ //!   - other arch / no GPU: SKIP exit 0
+-//! Cross-arch total is 28 operation arms; each run covers its arch subset.
++//! Cross-arch total is 32 operation arms; each run covers its arch subset.
+ //! Exit 0 PASS / 1 FAIL.
+ 
+ use rdna_compute::kv_slots::half_from_f32;
+@@ -43,6 +46,17 @@ const RESID_M: usize = 56;
+ const GATE_NS: [(usize, usize); 2] = [(384, 4), (512, 8)];
+ const RESID_NS: [(usize, usize); 2] = [(416, 4), (464, 8)];
+ 
++// MQ3-only qkvza/qkv region boundaries (each lies inside a 16-row tile).
++const QKVZA_QKV_M: usize = 40;
++const QKVZA_Z_M: usize = 28;
++const QKVZA_BETA_M: usize = 36;
++const QKVZA_ALPHA_M: usize = 16;
++const QKV_Q_M: usize = 40;
++const QKV_K_M: usize = 32;
++const QKV_V_M: usize = 48;
++const QKVZA_NS: [(usize, usize); 2] = [(128, 4), (256, 8)];
++const QKV_NS: [(usize, usize); 2] = [(128, 4), (256, 8)];
++
+ const NAN_GATE_BITS: u32 = 0x7fc0_0001;
+ const NAN_UP_BITS: u32 = 0x7fc0_0002;
+ const SALT_GATE: u32 = 0x1111_2222;
+@@ -459,6 +473,230 @@ fn run_residual(gpu: &mut Gpu, bits: u8, n: usize, waves: usize, x_host: &[f32])
+     ok
+ }
+ 
++fn launch_base_qkvza(
++    gpu: &mut Gpu,
++    a_qkv: &GpuTensor,
++    a_z: &GpuTensor,
++    a_beta: &GpuTensor,
++    a_alpha: &GpuTensor,
++    x: &GpuTensor,
++    y_qkv: &GpuTensor,
++    y_z: &GpuTensor,
++    y_beta: &GpuTensor,
++    y_alpha: &GpuTensor,
++    n: usize,
++) -> Result<(), String> {
++    gpu.gemm_qkvza_mq3g256v2_wmma_gfx11(
++        a_qkv,
++        a_z,
++        a_beta,
++        a_alpha,
++        x,
++        y_qkv,
++        y_z,
++        y_beta,
++        y_alpha,
++        QKVZA_QKV_M,
++        QKVZA_Z_M,
++        QKVZA_BETA_M,
++        QKVZA_ALPHA_M,
++        K,
++        n,
++    )
++    .map_err(|e| format!("{e:?}"))
++}
++
++fn run_qkvza(gpu: &mut Gpu, n: usize, waves: usize, x_host: &[f32]) -> bool {
++    let bits = 3u8;
++    let w_qkv = build_disjoint_halves_seeded(QKVZA_QKV_M, K, 0x1111_2222 ^ (bits as u32) << 16);
++    let w_z = build_disjoint_halves_seeded(QKVZA_Z_M, K, 0x3333_4444 ^ (bits as u32) << 16);
++    let w_beta = build_disjoint_halves_seeded(QKVZA_BETA_M, K, 0x5555_6666 ^ (bits as u32) << 16);
++    let w_alpha = build_disjoint_halves_seeded(QKVZA_ALPHA_M, K, 0x7777_8888 ^ (bits as u32) << 16);
++    let b_qkv = pack_mqv2(bits, &w_qkv, QKVZA_QKV_M, K);
++    let b_z = pack_mqv2(bits, &w_z, QKVZA_Z_M, K);
++    let b_beta = pack_mqv2(bits, &w_beta, QKVZA_BETA_M, K);
++    let b_alpha = pack_mqv2(bits, &w_alpha, QKVZA_ALPHA_M, K);
++    let d_qkv = upload_blob(gpu, &b_qkv);
++    let d_z = upload_blob(gpu, &b_z);
++    let d_beta = upload_blob(gpu, &b_beta);
++    let d_alpha = upload_blob(gpu, &b_alpha);
++    let d_x = gpu.alloc_tensor(&[n * K], DType::F32).expect("x");
++    htod_f32(gpu, &d_x, x_host);
++
++    let sen = [0x7fc0_0011u32, 0x7fc0_0012, 0x7fc0_0013, 0x7fc0_0014];
++    let lens = [
++        n * QKVZA_QKV_M,
++        n * QKVZA_Z_M,
++        n * QKVZA_BETA_M,
++        n * QKVZA_ALPHA_M,
++    ];
++    let d_y_ref: [GpuTensor; 4] = std::array::from_fn(|i| {
++        let t = gpu.alloc_tensor(&[lens[i]], DType::F32).expect("y ref");
++        fill_f32_quiet_nan(gpu, &t, sen[i]);
++        t
++    });
++    gpu.hip.device_synchronize().unwrap();
++    if let Err(e) = with_base_path(gpu, |gpu| {
++        launch_base_qkvza(
++            gpu, &d_qkv, &d_z, &d_beta, &d_alpha, &d_x, &d_y_ref[0], &d_y_ref[1], &d_y_ref[2],
++            &d_y_ref[3], n,
++        )
++    }) {
++        eprintln!("  [qkvza N={n} MW{waves}] base launch FAIL: {e}");
++        return false;
++    }
++    gpu.hip.device_synchronize().unwrap();
++    let y_ref: [Vec<f32>; 4] =
++        std::array::from_fn(|i| gpu.download_f32(&d_y_ref[i]).expect("dl ref"));
++
++    let d_y_mw: [GpuTensor; 4] = std::array::from_fn(|i| {
++        let t = gpu.alloc_tensor(&[lens[i]], DType::F32).expect("y mw");
++        fill_f32_quiet_nan(gpu, &t, sen[i]);
++        t
++    });
++    gpu.hip.device_synchronize().unwrap();
++    if let Err(e) = gpu.gemm_qkvza_mqv2_wmma_gfx11_mw_lds(
++        3,
++        waves,
++        &d_qkv,
++        &d_z,
++        &d_beta,
++        &d_alpha,
++        &d_x,
++        &d_y_mw[0],
++        &d_y_mw[1],
++        &d_y_mw[2],
++        &d_y_mw[3],
++        QKVZA_QKV_M,
++        QKVZA_Z_M,
++        QKVZA_BETA_M,
++        QKVZA_ALPHA_M,
++        K,
++        n,
++    ) {
++        eprintln!("  [qkvza N={n} MW{waves}] MW launch FAIL: {e:?}");
++        return false;
++    }
++    gpu.hip.device_synchronize().unwrap();
++    let y_mw: [Vec<f32>; 4] =
++        std::array::from_fn(|i| gpu.download_f32(&d_y_mw[i]).expect("dl mw"));
++
++    let labels = ["qkvza.qkv", "qkvza.z", "qkvza.beta", "qkvza.alpha"];
++    let mut ok = true;
++    for i in 0..4 {
++        let left = y_mw[i]
++            .iter()
++            .filter(|x| x.to_bits() == sen[i])
++            .count();
++        if left != 0 {
++            eprintln!("  [{} N={n} MW{waves}] {left} sentinel(s) remain", labels[i]);
++            ok = false;
++        }
++        if !check_raw_bits(labels[i], bits, n, waves, &y_mw[i], &y_ref[i]) {
++            ok = false;
++        }
++    }
++    ok
++}
++
++fn launch_base_qkv(
++    gpu: &mut Gpu,
++    a_q: &GpuTensor,
++    a_k: &GpuTensor,
++    a_v: &GpuTensor,
++    x: &GpuTensor,
++    y_q: &GpuTensor,
++    y_k: &GpuTensor,
++    y_v: &GpuTensor,
++    n: usize,
++) -> Result<(), String> {
++    gpu.gemm_qkv_mq3g256v2_wmma_gfx11(
++        a_q, a_k, a_v, x, y_q, y_k, y_v, QKV_Q_M, QKV_K_M, QKV_V_M, K, n,
++    )
++    .map_err(|e| format!("{e:?}"))
++}
++
++fn run_qkv(gpu: &mut Gpu, n: usize, waves: usize, x_host: &[f32]) -> bool {
++    let bits = 3u8;
++    let w_q = build_disjoint_halves_seeded(QKV_Q_M, K, 0xA111_2222 ^ (bits as u32) << 8);
++    let w_k = build_disjoint_halves_seeded(QKV_K_M, K, 0xA333_4444 ^ (bits as u32) << 8);
++    let w_v = build_disjoint_halves_seeded(QKV_V_M, K, 0xA555_6666 ^ (bits as u32) << 8);
++    let b_q = pack_mqv2(bits, &w_q, QKV_Q_M, K);
++    let b_k = pack_mqv2(bits, &w_k, QKV_K_M, K);
++    let b_v = pack_mqv2(bits, &w_v, QKV_V_M, K);
++    let d_q = upload_blob(gpu, &b_q);
++    let d_k = upload_blob(gpu, &b_k);
++    let d_v = upload_blob(gpu, &b_v);
++    let d_x = gpu.alloc_tensor(&[n * K], DType::F32).expect("x");
++    htod_f32(gpu, &d_x, x_host);
++
++    let sen = [0x7fc0_0021u32, 0x7fc0_0022, 0x7fc0_0023];
++    let lens = [n * QKV_Q_M, n * QKV_K_M, n * QKV_V_M];
++    let d_y_ref: [GpuTensor; 3] = std::array::from_fn(|i| {
++        let t = gpu.alloc_tensor(&[lens[i]], DType::F32).expect("y ref");
++        fill_f32_quiet_nan(gpu, &t, sen[i]);
++        t
++    });
++    gpu.hip.device_synchronize().unwrap();
++    if let Err(e) = with_base_path(gpu, |gpu| {
++        launch_base_qkv(
++            gpu, &d_q, &d_k, &d_v, &d_x, &d_y_ref[0], &d_y_ref[1], &d_y_ref[2], n,
++        )
++    }) {
++        eprintln!("  [qkv N={n} MW{waves}] base launch FAIL: {e}");
++        return false;
++    }
++    gpu.hip.device_synchronize().unwrap();
++    let y_ref: [Vec<f32>; 3] =
++        std::array::from_fn(|i| gpu.download_f32(&d_y_ref[i]).expect("dl ref"));
++
++    let d_y_mw: [GpuTensor; 3] = std::array::from_fn(|i| {
++        let t = gpu.alloc_tensor(&[lens[i]], DType::F32).expect("y mw");
++        fill_f32_quiet_nan(gpu, &t, sen[i]);
++        t
++    });
++    gpu.hip.device_synchronize().unwrap();
++    if let Err(e) = gpu.gemm_qkv_mqv2_wmma_gfx11_mw_lds(
++        3,
++        waves,
++        &d_q,
++        &d_k,
++        &d_v,
++        &d_x,
++        &d_y_mw[0],
++        &d_y_mw[1],
++        &d_y_mw[2],
++        QKV_Q_M,
++        QKV_K_M,
++        QKV_V_M,
++        K,
++        n,
++    ) {
++        eprintln!("  [qkv N={n} MW{waves}] MW launch FAIL: {e:?}");
++        return false;
++    }
++    gpu.hip.device_synchronize().unwrap();
++    let y_mw: [Vec<f32>; 3] =
++        std::array::from_fn(|i| gpu.download_f32(&d_y_mw[i]).expect("dl mw"));
++
++    let labels = ["qkv.q", "qkv.k", "qkv.v"];
++    let mut ok = true;
++    for i in 0..3 {
++        let left = y_mw[i]
++            .iter()
++            .filter(|x| x.to_bits() == sen[i])
++            .count();
++        if left != 0 {
++            eprintln!("  [{} N={n} MW{waves}] {left} sentinel(s) remain", labels[i]);
++            ok = false;
++        }
++        if !check_raw_bits(labels[i], bits, n, waves, &y_mw[i], &y_ref[i]) {
++            ok = false;
++        }
++    }
++    ok
++}
++
+ fn main() {
+     let mut gpu = match Gpu::init() {
+         Ok(g) => g,
+@@ -476,19 +714,23 @@ fn main() {
+         return;
+     }
+ 
+-    // gfx1100 forbids MQ3 runtime execution; gfx1151 covers MQ3.
+-    let bits: &[u8] = if is_gfx1151 {
++    // gfx1100 covers MQ3 MW via the opt-in screen (the production lane is the
++    // 53rd weight-prefill patch; this harness is its raw-bit regression).
++    let screen_bits3_gfx1100 =
++        is_gfx1100 && std::env::var("HIPFIRE_MQV2_MW_SCREEN_BITS3").as_deref() == Ok("1");
++    let bits: &[u8] = if is_gfx1151 || screen_bits3_gfx1100 {
+         &[3, 4, 5, 6]
+     } else {
+         &[4, 5, 6]
+     };
+-    let expected_arms = bits.len() * 4; // 2 gate N + 2 residual N
++    let qkv_families = is_gfx1151 || screen_bits3_gfx1100;
++    let expected_arms = bits.len() * 4 + if qkv_families { 4 } else { 0 };
+ 
+     eprintln!(
+         "arch {arch} confirmed — MQ V2 gfx11 MW_LDS raw-bit parity (bits={bits:?}, expected_arms={expected_arms})"
+     );
+     eprintln!(
+-        "shapes: gate_up=({GATE_M},{UP_M}) residual={RESID_M} K={K} gate_N={{384/MW4,512/MW8}} resid_N={{416/MW4,464/MW8}}"
++        "shapes: gate_up=({GATE_M},{UP_M}) residual={RESID_M} qkvza=({QKVZA_QKV_M},{QKVZA_Z_M},{QKVZA_BETA_M},{QKVZA_ALPHA_M}) qkv=({QKV_Q_M},{QKV_K_M},{QKV_V_M}) K={K} gate_N={{384/MW4,512/MW8}} resid_N={{416/MW4,464/MW8}} proj_N={{128/MW4,256/MW8}}"
+     );
+     assert!(
+         GATE_M > 32 && GATE_M < 48,
+@@ -497,6 +739,11 @@ fn main() {
+     assert_eq!(GATE_M + UP_M, 93);
+     assert_eq!((GATE_M + UP_M) % 16, 13);
+     assert_eq!(RESID_M % 16, 8);
++    assert_eq!(
++        (QKVZA_QKV_M + QKVZA_Z_M + QKVZA_BETA_M + QKVZA_ALPHA_M) % 16,
++        8
++    );
++    assert_eq!((QKV_Q_M + QKV_K_M + QKV_V_M) % 16, 8);
+ 
+     if gpu.active_capture.is_some() {
+         eprintln!("SKIP: active_capture is Some");
+@@ -551,6 +798,47 @@ fn main() {
+             );
+             all_ok &= ok;
+         }
++
++        if b == 3 && qkv_families {
++            for &(n, waves) in &QKVZA_NS {
++                eprintln!("--- qkvza N={n} MW{waves} ---");
++                let x_host: Vec<f32> = (0..n * K)
++                    .map(|i| {
++                        prng(
++                            i,
++                            0xD00D_EE00 ^ ((b as u32) << 20) ^ (n as u32) ^ ((waves as u32) << 8),
++                        ) * 2.0
++                            - 1.0
++                    })
++                    .collect();
++                let ok = run_qkvza(&mut gpu, n, waves, &x_host);
++                arms += 1;
++                eprintln!(
++                    "  ARM bits={b} qkvza N={n} MW{waves}: {}",
++                    if ok { "PASS" } else { "FAIL" }
++                );
++                all_ok &= ok;
++            }
++            for &(n, waves) in &QKV_NS {
++                eprintln!("--- qkv N={n} MW{waves} ---");
++                let x_host: Vec<f32> = (0..n * K)
++                    .map(|i| {
++                        prng(
++                            i,
++                            0xBEEF_6600 ^ ((b as u32) << 20) ^ (n as u32) ^ ((waves as u32) << 8),
++                        ) * 2.0
++                            - 1.0
++                    })
++                    .collect();
++                let ok = run_qkv(&mut gpu, n, waves, &x_host);
++                arms += 1;
++                eprintln!(
++                    "  ARM bits={b} qkv N={n} MW{waves}: {}",
++                    if ok { "PASS" } else { "FAIL" }
++                );
++                all_ok &= ok;
++            }
++        }
+     }
+ 
+     assert_eq!(
+@@ -559,7 +847,7 @@ fn main() {
+     );
+     if all_ok {
+         eprintln!(
+-            "\nPASS: all {arms} arms on {arch} (bits{bits:?} × ops{{gate_up×2, residual×2}}) raw f32::to_bits equal; finite/nondegenerate; residual Y+= preserved; gate/up overwrite"
++            "\nPASS: all {arms} arms on {arch} (bits{bits:?} × ops{{gate_up×2, residual×2, qkvza×2, qkv×2}}) raw f32::to_bits equal; finite/nondegenerate; residual Y+= preserved; gate/up/qkvza/qkv overwrite"
+         );
+     } else {
+         eprintln!("\nFAIL: one or more of {arms} raw-bit parity arms failed on {arch}");
+diff --git a/crates/rdna-compute/src/feature_flags.rs b/crates/rdna-compute/src/feature_flags.rs
+index eb8b314bfefc2b826d91600602546683c25f3a02..5b9f82be058aecf0b73b0335877d25de2c9f71b6 100644
+--- a/crates/rdna-compute/src/feature_flags.rs
++++ b/crates/rdna-compute/src/feature_flags.rs
+@@ -1082,6 +1082,14 @@ pub struct FeatureFlags {
+     /// picks MW8. Parsed on unless the value is exactly `0` (kill switch);
+     /// acted on for exact gfx1100 only (`mq6_resid_port_gfx1100_enabled`).
+     pub mq6_resid_port_gfx1100: bool,
++    /// `HIPFIRE_MQV2_MQ3_MW`: exact gfx1100 MQ3G256V2 prefill weight reuse.
++    /// Admits the generic MW-LDS weight-staging kernels for bits 3
++    /// (gate/up + residual, plus the qkvza/qkv instantiations) and the BT
++    /// batch-tile arms for qkvza/qkv. Parsed on unless the value is exactly
++    /// `0` (kill switch: restores the base WMMA kernels byte-identically).
++    /// MW/BT outputs are bit-identical to base (parity screens + full-shape
++    /// bench); acted on for exact gfx1100 only (`mqv2_mq3_mw_enabled`).
++    pub mqv2_mq3_mw: bool,
+     /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE`: the q8 grouped prefill attention
+     /// (`indexed_attention_attention_q8_batched_hg4`) runs its bit-identical
+     /// low-LDS twin `..._hg4_lite`. Parsed on unless the value is exactly `0`
+@@ -1817,6 +1825,7 @@ impl FeatureFlags {
+                 .ok()
+                 .as_deref()
+                 != Some("0"),
++            mqv2_mq3_mw: value("HIPFIRE_MQV2_MQ3_MW").ok().as_deref() != Some("0"),
+             qwen4_qsa_hg4_q8_lite: value("HIPFIRE_QWEN4_QSA_HG4_Q8_LITE").ok().as_deref()
+                 != Some("0"),
+             qwen4_hc_mix_fill80_gfx1100: value("HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100")
+@@ -1969,6 +1978,13 @@ impl FeatureFlags {
+         self.mq6_resid_port_gfx1100 && self.arch == "gfx1100"
+     }
+ 
++    /// Exact gfx1100 MQ3G256V2 prefill weight reuse (`HIPFIRE_MQV2_MQ3_MW`):
++    /// default on; `=0` is the kill switch restoring the base WMMA kernels
++    /// (byte-identical outputs either way).
++    pub fn mqv2_mq3_mw_enabled(&self) -> bool {
++        self.mqv2_mq3_mw && self.arch == "gfx1100"
++    }
++
+     /// q8 grouped prefill attention low-LDS twin
+     /// (`indexed_attention_attention_q8_batched_hg4_lite`): default on, exact
+     /// gfx1100 only (the only architecture its win was measured on);
+@@ -2748,6 +2764,7 @@ impl FeatureFlags {
+             qwen4_qsa_extent_sync: false,
+             qwen4_qsa_code_check: false,
+             mq6_resid_port_gfx1100: false,
++            mqv2_mq3_mw: false,
+             qwen4_qsa_hg4_q8_lite: false,
+             qwen4_hc_mix_fill80_gfx1100: false,
+         }
+@@ -3220,6 +3237,32 @@ mod tests {
+         assert!(!FeatureFlags::for_test("gfx1100").mq6_resid_port_gfx1100_enabled());
+     }
+ 
++    /// MQ3 prefill weight reuse is default on for exact gfx1100 only; exactly
++    /// `0` is the kill switch and every other value keeps it on.
++    #[test]
++    fn mqv2_mq3_mw_defaults_on_exact_gfx1100_and_zero_opts_out() {
++        for arch in [
++            "gfx906", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1201",
++        ] {
++            let flags = |raw: Option<&str>| {
++                FeatureFlags::from_lookup(arch, |name| match raw {
++                    Some(v) if name == "HIPFIRE_MQV2_MQ3_MW" => Ok(v.into()),
++                    _ => Err(()),
++                })
++            };
++            let exact = arch == "gfx1100";
++            assert!(flags(None).mqv2_mq3_mw, "{arch}: unset");
++            assert_eq!(flags(None).mqv2_mq3_mw_enabled(), exact, "{arch}");
++            assert!(!flags(Some("0")).mqv2_mq3_mw, "{arch}: 0");
++            assert!(!flags(Some("0")).mqv2_mq3_mw_enabled(), "{arch}: 0");
++            for raw in ["1", "", "true", "on", " 0", "0 ", "00"] {
++                assert!(flags(Some(raw)).mqv2_mq3_mw, "{arch}: {raw:?}");
++                assert_eq!(flags(Some(raw)).mqv2_mq3_mw_enabled(), exact, "{arch}: {raw:?}");
++            }
++        }
++        assert!(!FeatureFlags::for_test("gfx1100").mqv2_mq3_mw_enabled());
++    }
++
+     /// The q8 hg4 lite twin is default on for exact gfx1100 only; exactly `0`
+     /// is the kill switch and every other value keeps it on.
+     #[test]
+diff --git a/crates/rdna-compute/src/gemm.rs b/crates/rdna-compute/src/gemm.rs
+index 4f96970b0fea2650223cfe02a5f6f87bf791fe83..d2ae68c65d24758346b0a30bd56bdcd08644911c 100644
+--- a/crates/rdna-compute/src/gemm.rs
++++ b/crates/rdna-compute/src/gemm.rs
+@@ -1705,8 +1705,10 @@ fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
+         "gfx1151" => matches!(bits, 2 | 3 | 5 | 6),
+         // MQ6 residual BT8 (the X-LDS kernel) on the other RDNA3.5 APUs.
+         "gfx1150" | "gfx1152" => bits == 6,
+-        // Exact gfx1100 MQ3 remains quarantined; MQ5/MQ6 are production.
+-        "gfx1100" => matches!(bits, 5 | 6),
++        // Exact gfx1100: MQ3 BT arms are admitted for qkvza/qkv only (the
++        // policy rows below); MW-LDS takes gate/residual. Measured on
++        // phase0-weight-mq3 (bit-identical, BT12 qkvza 1.11x / qkv 1.13x).
++        "gfx1100" => matches!(bits, 3 | 5 | 6),
+         _ => false,
+     }
+ }
+@@ -1717,20 +1719,31 @@ fn mqv2_mw_waves(
+     projection: MqV2PrefillProjection,
+     batch_size: usize,
+ ) -> Option<usize> {
+-    use MqV2PrefillProjection::{GateUp, Residual};
++    use MqV2PrefillProjection::{GateUp, Qkv, Qkvza, Residual};
+ 
+     // Same-row MW was neutral/negative on gfx1151. Keep its generic kernels
+     // available to direct parity harnesses, but production remains BT there.
+-    if arch != "gfx1100" || !matches!(bits, 5 | 6) {
++    if arch != "gfx1100" {
+         return None;
+     }
+-    match (projection, batch_size) {
+-        (GateUp, 384..) => {
+-            let tiles64 = batch_size.div_ceil(64);
+-            Some(if tiles64 % 2 == 0 { 8 } else { 4 })
+-        }
+-        (Residual, 464..) => Some(8),
+-        (Residual, 416..=463) => Some(4),
++    match bits {
++        // MQ3 (phase0-weight-mq3, 2026-11-17): MW8 at N>=96 measured
++        // gate_up 1.57x, residual down 2.03x / o 1.62x (n=96 gate 1.68x),
++        // all bit-identical to base. Gate/residual + qkvza/qkv families.
++        3 => match (projection, batch_size) {
++            (GateUp | Qkvza | Qkv | Residual, 96..) => Some(8),
++            _ => None,
++        },
++        // MQ5/MQ6 measured production rows (unchanged).
++        5 | 6 => match (projection, batch_size) {
++            (GateUp, 384..) => {
++                let tiles64 = batch_size.div_ceil(64);
++                Some(if tiles64 % 2 == 0 { 8 } else { 4 })
++            }
++            (Residual, 464..) => Some(8),
++            (Residual, 416..=463) => Some(4),
++            _ => None,
++        },
+         _ => None,
+     }
+ }
+@@ -2122,7 +2135,9 @@ fn mqv2_prefill_batch_tile(
+         ("gfx1151", 2 | 3 | 5 | 6, GateUp, 96..) => Some(12),
+ 
+         // MQ5V2/MQ6V2 gfx1100 candidate policy. Callers admit these rows only
+-        // under HIPFIRE_MQV2_GFX11_SCREEN; MQ3 stays quarantined.
++        // under HIPFIRE_MQV2_GFX11_SCREEN; MQ3 stays base here because its
++        // gfx1100 reuse rows are MW-LDS (mqv2_mw_waves), except qkvza/qkv
++        // which take BT12 below.
+         ("gfx1100", 5 | 6, Qkvza | Qkv, 192..) => Some(12),
+         ("gfx1100", 5 | 6, Qkvza | Qkv, 96..) => Some(4),
+         ("gfx1100", 5 | 6, GateUp, 96..=383) => Some(6),
+@@ -2130,6 +2145,11 @@ fn mqv2_prefill_batch_tile(
+         ("gfx1100", 5 | 6, Residual, 224..=287) => Some(6),
+         ("gfx1100", 5 | 6, Residual, 96..=223) => Some(4),
+ 
++        // MQ3V2 gfx1100 (phase0-weight-mq3, bit-identical): qkvza/qkv BT12
++        // while gate/residual take MW8; only reached when the MW rows do not
++        // apply (or HIPFIRE_MQV2_MQ3_MW=0 keeps everything on base).
++        ("gfx1100", 3, Qkvza | Qkv, 96..) => Some(12),
++
+         // MQ{2,5,6}V2 gfx1201 — QKV BT8 only for N>=96. MQ3 stays base
+         // (neutral/noisy). Other projections remain historical base.
+         ("gfx1201", 2 | 5 | 6, Qkv, 96..) => Some(8),
+@@ -43243,10 +43263,25 @@ impl Gpu {
+         k: usize,
+         batch_size: usize,
+     ) -> HipResult<bool> {
+-        if self.replay.is_recording()
+-            || self.graphs.capture_mode
+-            || !mqv2_gfx11_bt_admitted(self.arch.as_str(), bits)
+-        {
++        if self.replay.is_recording() || self.graphs.capture_mode {
++            return Ok(false);
++        }
++        if bits == 3 && self.arch.as_str() == "gfx1100" && !self.flags.mqv2_mq3_mw {
++            return Ok(false);
++        }
++        if let Some(waves) = mqv2_mw_waves(
++            self.arch.as_str(),
++            bits,
++            MqV2PrefillProjection::Qkvza,
++            batch_size,
++        ) {
++            self.gemm_qkvza_mqv2_wmma_gfx11_mw_lds(
++                bits, waves, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m,
++                z_m, beta_m, alpha_m, k, batch_size,
++            )?;
++            return Ok(true);
++        }
++        if !mqv2_gfx11_bt_admitted(self.arch.as_str(), bits) {
+             return Ok(false);
+         }
+         let Some(batch_tile) = mqv2_prefill_batch_tile(
+@@ -43281,10 +43316,24 @@ impl Gpu {
+         k: usize,
+         batch_size: usize,
+     ) -> HipResult<bool> {
+-        if self.replay.is_recording()
+-            || self.graphs.capture_mode
+-            || !mqv2_gfx11_bt_admitted(self.arch.as_str(), bits)
+-        {
++        if self.replay.is_recording() || self.graphs.capture_mode {
++            return Ok(false);
++        }
++        if bits == 3 && self.arch.as_str() == "gfx1100" && !self.flags.mqv2_mq3_mw {
++            return Ok(false);
++        }
++        if let Some(waves) = mqv2_mw_waves(
++            self.arch.as_str(),
++            bits,
++            MqV2PrefillProjection::Qkv,
++            batch_size,
++        ) {
++            self.gemm_qkv_mqv2_wmma_gfx11_mw_lds(
++                bits, waves, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
++            )?;
++            return Ok(true);
++        }
++        if !mqv2_gfx11_bt_admitted(self.arch.as_str(), bits) {
+             return Ok(false);
+         }
+         let Some(batch_tile) = mqv2_prefill_batch_tile(
+@@ -43318,6 +43367,9 @@ impl Gpu {
+         if self.replay.is_recording() || self.graphs.capture_mode {
+             return Ok(false);
+         }
++        if bits == 3 && self.arch.as_str() == "gfx1100" && !self.flags.mqv2_mq3_mw {
++            return Ok(false);
++        }
+         if let Some(waves) = mqv2_mw_waves(
+             self.arch.as_str(),
+             bits,
+@@ -43359,6 +43411,9 @@ impl Gpu {
+         if self.replay.is_recording() || self.graphs.capture_mode {
+             return Ok(false);
+         }
++        if bits == 3 && self.arch.as_str() == "gfx1100" && !self.flags.mqv2_mq3_mw {
++            return Ok(false);
++        }
+         if let Some(route) = mq6_resid_gfx1100_route(
+             self.arch.as_str(),
+             bits,
+@@ -44139,6 +44194,252 @@ impl Gpu {
+         result
+     }
+ 
++    /// MQ3V2 gfx11 multi-wave same-row LDS qkvza (four overwrite regions).
++    /// Exact gfx1100 lane (phase0-weight-mq3); bit-identical to the base
++    /// `gemm_qkvza_mq3g256v2_wmma`.
++    #[allow(clippy::too_many_arguments)]
++    pub fn gemm_qkvza_mqv2_wmma_gfx11_mw_lds(
++        &mut self,
++        bits: u8,
++        waves: usize,
++        a_qkv: &GpuTensor,
++        a_z: &GpuTensor,
++        a_beta: &GpuTensor,
++        a_alpha: &GpuTensor,
++        x: &GpuTensor,
++        y_qkv: &GpuTensor,
++        y_z: &GpuTensor,
++        y_beta: &GpuTensor,
++        y_alpha: &GpuTensor,
++        qkv_m: usize,
++        z_m: usize,
++        beta_m: usize,
++        alpha_m: usize,
++        k: usize,
++        batch_size: usize,
++    ) -> HipResult<()> {
++        let func_name: &'static str = match (bits, waves) {
++            (3, 4) => "gemm_qkvza_mq3g256v2_wmma_gfx11_mw4_lds",
++            (3, 8) => "gemm_qkvza_mq3g256v2_wmma_gfx11_mw8_lds",
++            _ => {
++                return Err(hip_bridge::HipError::new(
++                    1,
++                    "gemm_qkvza_mqv2_wmma_gfx11_mw_lds: unsupported bits/waves",
++                ));
++            }
++        };
++        let group_bytes = crate::dispatch::MQ3G256V2_GROUP_BYTES;
++        let total_m = qkv_m + z_m + beta_m + alpha_m;
++        if total_m == 0 || batch_size == 0 || k == 0 {
++            return Ok(());
++        }
++        if k % 256 != 0 {
++            return Err(hip_bridge::HipError::new(
++                1,
++                "gemm_qkvza_mqv2_wmma_gfx11_mw_lds: K must be a multiple of 256",
++            ));
++        }
++        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
++            return Err(hip_bridge::HipError::new(
++                1,
++                "gemm_qkvza_mqv2_wmma_gfx11_mw_lds: exact gfx1100/gfx1151 required",
++            ));
++        }
++        self.bind_thread()?;
++        let module = if self.arch == "gfx1151" {
++            "gemm_mqv2_wmma_gfx1151_mw_lds"
++        } else {
++            "gemm_mqv2_wmma_gfx1100_mw_lds"
++        };
++        self.ensure_kernel(module, kernels::GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC, func_name)?;
++        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
++        let mut aq = a_qkv.buf.as_ptr();
++        let mut az = a_z.buf.as_ptr();
++        let mut ab = a_beta.buf.as_ptr();
++        let mut aa = a_alpha.buf.as_ptr();
++        let mut xp = x_f16_ptr;
++        let mut yq = y_qkv.buf.as_ptr();
++        let mut yz = y_z.buf.as_ptr();
++        let mut yb = y_beta.buf.as_ptr();
++        let mut ya = y_alpha.buf.as_ptr();
++        let mut q_m = qkv_m as i32;
++        let mut z_m_i = z_m as i32;
++        let mut b_m = beta_m as i32;
++        let mut a_m = alpha_m as i32;
++        let mut k_val = k as i32;
++        let mut n_val = batch_size as i32;
++        let mut params: Vec<*mut c_void> = vec![
++            &mut aq as *mut _ as *mut c_void,
++            &mut az as *mut _ as *mut c_void,
++            &mut ab as *mut _ as *mut c_void,
++            &mut aa as *mut _ as *mut c_void,
++            &mut xp as *mut _ as *mut c_void,
++            &mut yq as *mut _ as *mut c_void,
++            &mut yz as *mut _ as *mut c_void,
++            &mut yb as *mut _ as *mut c_void,
++            &mut ya as *mut _ as *mut c_void,
++            &mut q_m as *mut _ as *mut c_void,
++            &mut z_m_i as *mut _ as *mut c_void,
++            &mut b_m as *mut _ as *mut c_void,
++            &mut a_m as *mut _ as *mut c_void,
++            &mut k_val as *mut _ as *mut c_void,
++            &mut n_val as *mut _ as *mut c_void,
++        ];
++        let row_tiles = total_m.div_ceil(16);
++        let n_tile = 16 * waves;
++        let batch_tiles = batch_size.div_ceil(n_tile);
++        let weight_bytes = total_m * (k / 256) * group_bytes;
++        let bytes = weight_bytes + batch_size * k * 2 + batch_size * total_m * 4 * 2;
++        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
++        let result = self.launch_maybe_blob(
++            func_name,
++            [row_tiles as u32, batch_tiles as u32, 1],
++            [(32 * waves) as u32, 1, 1],
++            0,
++            &mut params,
++            || {
++                let mut b = hip_bridge::KernargBlob::new();
++                b.push_ptr(aq);
++                b.push_ptr(az);
++                b.push_ptr(ab);
++                b.push_ptr(aa);
++                b.push_ptr(xp);
++                b.push_ptr(yq);
++                b.push_ptr(yz);
++                b.push_ptr(yb);
++                b.push_ptr(ya);
++                b.push_i32(q_m);
++                b.push_i32(z_m_i);
++                b.push_i32(b_m);
++                b.push_i32(a_m);
++                b.push_i32(k_val);
++                b.push_i32(n_val);
++                b
++            },
++        );
++        if let Some(t) = timer {
++            t.finish(&self.hip);
++        }
++        result
++    }
++
++    /// MQ3V2 gfx11 multi-wave same-row LDS qkv (three overwrite regions).
++    /// Exact gfx1100 lane (phase0-weight-mq3); bit-identical to the base
++    /// `gemm_qkv_mq3g256v2_wmma`.
++    #[allow(clippy::too_many_arguments)]
++    pub fn gemm_qkv_mqv2_wmma_gfx11_mw_lds(
++        &mut self,
++        bits: u8,
++        waves: usize,
++        a_q: &GpuTensor,
++        a_k: &GpuTensor,
++        a_v: &GpuTensor,
++        x: &GpuTensor,
++        y_q: &GpuTensor,
++        y_k: &GpuTensor,
++        y_v: &GpuTensor,
++        q_m: usize,
++        k_m: usize,
++        v_m: usize,
++        k: usize,
++        batch_size: usize,
++    ) -> HipResult<()> {
++        let func_name: &'static str = match (bits, waves) {
++            (3, 4) => "gemm_qkv_mq3g256v2_wmma_gfx11_mw4_lds",
++            (3, 8) => "gemm_qkv_mq3g256v2_wmma_gfx11_mw8_lds",
++            _ => {
++                return Err(hip_bridge::HipError::new(
++                    1,
++                    "gemm_qkv_mqv2_wmma_gfx11_mw_lds: unsupported bits/waves",
++                ));
++            }
++        };
++        let group_bytes = crate::dispatch::MQ3G256V2_GROUP_BYTES;
++        let total_m = q_m + k_m + v_m;
++        if total_m == 0 || batch_size == 0 || k == 0 {
++            return Ok(());
++        }
++        if k % 256 != 0 {
++            return Err(hip_bridge::HipError::new(
++                1,
++                "gemm_qkv_mqv2_wmma_gfx11_mw_lds: K must be a multiple of 256",
++            ));
++        }
++        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
++            return Err(hip_bridge::HipError::new(
++                1,
++                "gemm_qkv_mqv2_wmma_gfx11_mw_lds: exact gfx1100/gfx1151 required",
++            ));
++        }
++        self.bind_thread()?;
++        let module = if self.arch == "gfx1151" {
++            "gemm_mqv2_wmma_gfx1151_mw_lds"
++        } else {
++            "gemm_mqv2_wmma_gfx1100_mw_lds"
++        };
++        self.ensure_kernel(module, kernels::GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC, func_name)?;
++        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
++        let mut aq = a_q.buf.as_ptr();
++        let mut ak = a_k.buf.as_ptr();
++        let mut av = a_v.buf.as_ptr();
++        let mut xp = x_f16_ptr;
++        let mut yq = y_q.buf.as_ptr();
++        let mut yk = y_k.buf.as_ptr();
++        let mut yv = y_v.buf.as_ptr();
++        let mut q_m_i = q_m as i32;
++        let mut k_m_i = k_m as i32;
++        let mut v_m_i = v_m as i32;
++        let mut k_val = k as i32;
++        let mut n_val = batch_size as i32;
++        let mut params: Vec<*mut c_void> = vec![
++            &mut aq as *mut _ as *mut c_void,
++            &mut ak as *mut _ as *mut c_void,
++            &mut av as *mut _ as *mut c_void,
++            &mut xp as *mut _ as *mut c_void,
++            &mut yq as *mut _ as *mut c_void,
++            &mut yk as *mut _ as *mut c_void,
++            &mut yv as *mut _ as *mut c_void,
++            &mut q_m_i as *mut _ as *mut c_void,
++            &mut k_m_i as *mut _ as *mut c_void,
++            &mut v_m_i as *mut _ as *mut c_void,
++            &mut k_val as *mut _ as *mut c_void,
++            &mut n_val as *mut _ as *mut c_void,
++        ];
++        let row_tiles = total_m.div_ceil(16);
++        let n_tile = 16 * waves;
++        let batch_tiles = batch_size.div_ceil(n_tile);
++        let weight_bytes = total_m * (k / 256) * group_bytes;
++        let bytes = weight_bytes + batch_size * k * 2 + batch_size * total_m * 4 * 2;
++        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
++        let result = self.launch_maybe_blob(
++            func_name,
++            [row_tiles as u32, batch_tiles as u32, 1],
++            [(32 * waves) as u32, 1, 1],
++            0,
++            &mut params,
++            || {
++                let mut b = hip_bridge::KernargBlob::new();
++                b.push_ptr(aq);
++                b.push_ptr(ak);
++                b.push_ptr(av);
++                b.push_ptr(xp);
++                b.push_ptr(yq);
++                b.push_ptr(yk);
++                b.push_ptr(yv);
++                b.push_i32(q_m_i);
++                b.push_i32(k_m_i);
++                b.push_i32(v_m_i);
++                b.push_i32(k_val);
++                b.push_i32(n_val);
++                b
++            },
++        );
++        if let Some(t) = timer {
++            t.finish(&self.hip);
++        }
++        result
++    }
++
+     /// MQ{3,4,5,6}V2 gfx1100/gfx1151 multi-wave same-row LDS residual.
+     pub fn gemm_mqv2_residual_wmma_gfx11_mw_lds(
+         &mut self,
+diff --git a/kernels/src/gemm_mqv2_wmma_gfx11_mw_lds.hip b/kernels/src/gemm_mqv2_wmma_gfx11_mw_lds.hip
+index 5aca255ccdd729c64adc8cb821c75dea96fce1ac..d4bfbc23354409c57cbaeb97bdc76b95a56d3b70 100644
+--- a/kernels/src/gemm_mqv2_wmma_gfx11_mw_lds.hip
++++ b/kernels/src/gemm_mqv2_wmma_gfx11_mw_lds.hip
+@@ -246,6 +246,234 @@ __device__ __forceinline__ half16_t decode_tile(const unsigned char* __restrict_
+         }                                                                                      \
+     }
+ 
++// ---------------------------------------------------------------------------
++// QKVZA overwrite MW — four projection regions (QKV / Z / beta / alpha)
++// Grid: [ceil((qkv_m+z_m+beta_m+alpha_m)/16), ceil(N/(16*NW))]. Block: [32*NW].
++// Instantiated for BITS=3 (exact gfx1100 MQ3 lane) only.
++// ---------------------------------------------------------------------------
++#define GEN_QKVZA_MW_LDS(BITS, NW)                                                             \
++    extern "C" __launch_bounds__(32 * (NW), 1) __global__ void                                 \
++        gemm_qkvza_mq##BITS##g256v2_wmma_gfx11_mw##NW##_lds(                                   \
++            const char* __restrict__ A_qkv,                                                    \
++            const char* __restrict__ A_z,                                                      \
++            const char* __restrict__ A_beta,                                                   \
++            const char* __restrict__ A_alpha,                                                  \
++            const _Float16* __restrict__ X,                                                    \
++            float* __restrict__ Y_qkv,                                                         \
++            float* __restrict__ Y_z,                                                           \
++            float* __restrict__ Y_beta,                                                        \
++            float* __restrict__ Y_alpha,                                                       \
++            int qkv_m,                                                                         \
++            int z_m,                                                                           \
++            int beta_m,                                                                        \
++            int alpha_m,                                                                       \
++            int K,                                                                             \
++            int N) {                                                                           \
++        constexpr int GROUP_BYTES = 8 + 32 * (BITS);                                           \
++        const int tid = threadIdx.x;                                                           \
++        const int lane = tid & 31;                                                             \
++        const int wave_id = tid >> 5;                                                          \
++        const int ml = lane & 15;                                                              \
++        const int total_m = qkv_m + z_m + beta_m + alpha_m;                                    \
++        const int row_start = blockIdx.x * 16;                                                 \
++        const int n_block_start = blockIdx.y * (16 * (NW));                                    \
++        const int out_col = n_block_start + wave_id * 16 + ml;                                 \
++        const int safe_batch = (out_col < N) ? out_col : 0;                                    \
++        const int groups_per_row = K / 256;                                                    \
++                                                                                               \
++        /* Tile-major [kt][row][ki]: 16*16*16 half = 8192 B / 4096 fp16. */                    \
++        __shared__ __align__(32) _Float16 w_lds[16][16][16];                                   \
++                                                                                               \
++        float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};                       \
++                                                                                               \
++        for (int g = 0; g < groups_per_row; g++) {                                             \
++            /* 128 logical staging jobs: 16 rows × 8 segments. */                              \
++            for (int job = tid; job < 128; job += 32 * (NW)) {                                 \
++                const int row = job / 8;                                                       \
++                const int segment = job % 8;                                                   \
++                const int safe_row =                                                           \
++                    (row_start + row < total_m) ? (row_start + row) : (total_m - 1);            \
++                const char* A;                                                                 \
++                int local_row;                                                                 \
++                if (safe_row < qkv_m) {                                                        \
++                    A = A_qkv;                                                                 \
++                    local_row = safe_row;                                                      \
++                } else if (safe_row < qkv_m + z_m) {                                           \
++                    A = A_z;                                                                   \
++                    local_row = safe_row - qkv_m;                                              \
++                } else if (safe_row < qkv_m + z_m + beta_m) {                                  \
++                    A = A_beta;                                                                \
++                    local_row = safe_row - (qkv_m + z_m);                                      \
++                } else {                                                                       \
++                    A = A_alpha;                                                               \
++                    local_row = safe_row - (qkv_m + z_m + beta_m);                             \
++                }                                                                              \
++                const char* gp = A + (long long)local_row * groups_per_row * GROUP_BYTES +      \
++                                 (long long)g * GROUP_BYTES;                                   \
++                /* One relevant dual-half V2 header for this segment's K half. */              \
++                const unsigned int h =                                                         \
++                    *(const unsigned int*)(gp + ((segment < 4) ? 0 : 4));                      \
++                const _Float16 sc_h =                                                          \
++                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));    \
++                const _Float16 zp_h =                                                          \
++                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h >> 16)));        \
++                const unsigned char* payload = (const unsigned char*)(gp + 8);                 \
++                const int kt0 = 2 * segment;                                                   \
++                const int kt1 = kt0 + 1;                                                       \
++                half16_t frag = decode_tile<BITS>(payload, kt0, sc_h, zp_h);                   \
++                *(half16_t*)(&w_lds[kt0][row][0]) = frag;                                      \
++                frag = decode_tile<BITS>(payload, kt1, sc_h, zp_h);                            \
++                *(half16_t*)(&w_lds[kt1][row][0]) = frag;                                      \
++            }                                                                                  \
++            /* All threads reach both barriers every group — no early returns. */              \
++            __syncthreads();                                                                   \
++                                                                                               \
++            /* K2 ascending: kt pairs 0,1; 2,3; ... 14,15. One float8 acc / wave. */           \
++            const _Float16* xg = X + (long long)safe_batch * K + (long long)g * 256;           \
++            _Pragma("unroll")                                                                  \
++            for (int kt = 0; kt < 16; kt += 2) {                                               \
++                half16_t a_reg = *(const half16_t*)(&w_lds[kt][ml][0]);                        \
++                half16_t b_reg = *(const half16_t*)(xg + kt * 16);                             \
++                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);           \
++                a_reg = *(const half16_t*)(&w_lds[kt + 1][ml][0]);                             \
++                b_reg = *(const half16_t*)(xg + (kt + 1) * 16);                                \
++                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);           \
++            }                                                                                  \
++                                                                                               \
++            __syncthreads();                                                                   \
++        }                                                                                      \
++                                                                                               \
++        /* RDNA3 wave32 WMMA: acc[j] = C[2*j + (lane>>4)][lane & 15]. Overwrite (=). */        \
++        if (out_col < N) {                                                                     \
++            _Pragma("unroll")                                                                  \
++            for (int j = 0; j < 8; j++) {                                                      \
++                const int out_row = row_start + 2 * j + (lane >> 4);                            \
++                if (out_row < total_m) {                                                       \
++                    if (out_row < qkv_m) {                                                     \
++                        Y_qkv[(long long)out_col * qkv_m + out_row] = acc[j];                  \
++                    } else if (out_row < qkv_m + z_m) {                                        \
++                        Y_z[(long long)out_col * z_m + (out_row - qkv_m)] = acc[j];            \
++                    } else if (out_row < qkv_m + z_m + beta_m) {                               \
++                        Y_beta[(long long)out_col * beta_m + (out_row - (qkv_m + z_m))] =      \
++                            acc[j];                                                            \
++                    } else {                                                                   \
++                        Y_alpha[(long long)out_col * alpha_m +                                 \
++                                (out_row - (qkv_m + z_m + beta_m))] = acc[j];                  \
++                    }                                                                          \
++                }                                                                              \
++            }                                                                                  \
++        }                                                                                      \
++    }
++
++// ---------------------------------------------------------------------------
++// QKV overwrite MW — three projection regions (Q / K / V)
++// Grid: [ceil((q_m+k_m+v_m)/16), ceil(N/(16*NW))]. Block: [32*NW].
++// Instantiated for BITS=3 (exact gfx1100 MQ3 lane) only.
++// ---------------------------------------------------------------------------
++#define GEN_QKV_MW_LDS(BITS, NW)                                                               \
++    extern "C" __launch_bounds__(32 * (NW), 1) __global__ void                                 \
++        gemm_qkv_mq##BITS##g256v2_wmma_gfx11_mw##NW##_lds(                                     \
++            const char* __restrict__ A_q,                                                      \
++            const char* __restrict__ A_k,                                                      \
++            const char* __restrict__ A_v,                                                      \
++            const _Float16* __restrict__ X,                                                    \
++            float* __restrict__ Y_q,                                                           \
++            float* __restrict__ Y_k,                                                           \
++            float* __restrict__ Y_v,                                                           \
++            int q_m,                                                                           \
++            int k_m,                                                                           \
++            int v_m,                                                                           \
++            int K,                                                                             \
++            int N) {                                                                           \
++        constexpr int GROUP_BYTES = 8 + 32 * (BITS);                                           \
++        const int tid = threadIdx.x;                                                           \
++        const int lane = tid & 31;                                                             \
++        const int wave_id = tid >> 5;                                                          \
++        const int ml = lane & 15;                                                              \
++        const int total_m = q_m + k_m + v_m;                                                   \
++        const int row_start = blockIdx.x * 16;                                                 \
++        const int n_block_start = blockIdx.y * (16 * (NW));                                    \
++        const int out_col = n_block_start + wave_id * 16 + ml;                                 \
++        const int safe_batch = (out_col < N) ? out_col : 0;                                    \
++        const int groups_per_row = K / 256;                                                    \
++                                                                                               \
++        /* Tile-major [kt][row][ki]: 16*16*16 half = 8192 B / 4096 fp16. */                    \
++        __shared__ __align__(32) _Float16 w_lds[16][16][16];                                   \
++                                                                                               \
++        float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};                       \
++                                                                                               \
++        for (int g = 0; g < groups_per_row; g++) {                                             \
++            /* 128 logical staging jobs: 16 rows × 8 segments. */                              \
++            for (int job = tid; job < 128; job += 32 * (NW)) {                                 \
++                const int row = job / 8;                                                       \
++                const int segment = job % 8;                                                   \
++                const int safe_row =                                                           \
++                    (row_start + row < total_m) ? (row_start + row) : (total_m - 1);            \
++                const char* A;                                                                 \
++                int local_row;                                                                 \
++                if (safe_row < q_m) {                                                          \
++                    A = A_q;                                                                   \
++                    local_row = safe_row;                                                      \
++                } else if (safe_row < q_m + k_m) {                                             \
++                    A = A_k;                                                                   \
++                    local_row = safe_row - q_m;                                                \
++                } else {                                                                       \
++                    A = A_v;                                                                   \
++                    local_row = safe_row - (q_m + k_m);                                        \
++                }                                                                              \
++                const char* gp = A + (long long)local_row * groups_per_row * GROUP_BYTES +      \
++                                 (long long)g * GROUP_BYTES;                                   \
++                /* One relevant dual-half V2 header for this segment's K half. */              \
++                const unsigned int h =                                                         \
++                    *(const unsigned int*)(gp + ((segment < 4) ? 0 : 4));                      \
++                const _Float16 sc_h =                                                          \
++                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));    \
++                const _Float16 zp_h =                                                          \
++                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h >> 16)));        \
++                const unsigned char* payload = (const unsigned char*)(gp + 8);                 \
++                const int kt0 = 2 * segment;                                                   \
++                const int kt1 = kt0 + 1;                                                       \
++                half16_t frag = decode_tile<BITS>(payload, kt0, sc_h, zp_h);                   \
++                *(half16_t*)(&w_lds[kt0][row][0]) = frag;                                      \
++                frag = decode_tile<BITS>(payload, kt1, sc_h, zp_h);                            \
++                *(half16_t*)(&w_lds[kt1][row][0]) = frag;                                      \
++            }                                                                                  \
++            /* All threads reach both barriers every group — no early returns. */              \
++            __syncthreads();                                                                   \
++                                                                                               \
++            /* K2 ascending: kt pairs 0,1; 2,3; ... 14,15. One float8 acc / wave. */           \
++            const _Float16* xg = X + (long long)safe_batch * K + (long long)g * 256;           \
++            _Pragma("unroll")                                                                  \
++            for (int kt = 0; kt < 16; kt += 2) {                                               \
++                half16_t a_reg = *(const half16_t*)(&w_lds[kt][ml][0]);                        \
++                half16_t b_reg = *(const half16_t*)(xg + kt * 16);                             \
++                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);           \
++                a_reg = *(const half16_t*)(&w_lds[kt + 1][ml][0]);                             \
++                b_reg = *(const half16_t*)(xg + (kt + 1) * 16);                                \
++                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);           \
++            }                                                                                  \
++                                                                                               \
++            __syncthreads();                                                                   \
++        }                                                                                      \
++                                                                                               \
++        /* RDNA3 wave32 WMMA: acc[j] = C[2*j + (lane>>4)][lane & 15]. Overwrite (=). */        \
++        if (out_col < N) {                                                                     \
++            _Pragma("unroll")                                                                  \
++            for (int j = 0; j < 8; j++) {                                                      \
++                const int out_row = row_start + 2 * j + (lane >> 4);                            \
++                if (out_row < total_m) {                                                       \
++                    if (out_row < q_m) {                                                       \
++                        Y_q[(long long)out_col * q_m + out_row] = acc[j];                      \
++                    } else if (out_row < q_m + k_m) {                                          \
++                        Y_k[(long long)out_col * k_m + (out_row - q_m)] = acc[j];              \
++                    } else {                                                                   \
++                        Y_v[(long long)out_col * v_m + (out_row - (q_m + k_m))] = acc[j];      \
++                    }                                                                          \
++                }                                                                              \
++            }                                                                                  \
++        }                                                                                      \
++    }
++
+ // Instantiations: BITS ∈ {3,4,5,6} × NW ∈ {4,8} — 16 extern-C symbols.
+ GEN_GATE_UP_MW_LDS(3, 4)
+ GEN_GATE_UP_MW_LDS(3, 8)
+@@ -265,4 +493,10 @@ GEN_RESID_MW_LDS(5, 8)
+ GEN_RESID_MW_LDS(6, 4)
+ GEN_RESID_MW_LDS(6, 8)
+ 
++// MQ3-only projection families (exact gfx1100 weight-reuse lane).
++GEN_QKVZA_MW_LDS(3, 4)
++GEN_QKVZA_MW_LDS(3, 8)
++GEN_QKV_MW_LDS(3, 4)
++GEN_QKV_MW_LDS(3, 8)
++
+ #endif // __gfx1100__ || __gfx1151__

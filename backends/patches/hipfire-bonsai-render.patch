@@ -1,0 +1,160 @@
+diff --git a/crates/hipfire-runtime/src/hfq.rs b/crates/hipfire-runtime/src/hfq.rs
+index eac579665fd4263b9afa8a52b5ee1c79748abd25..01db84f703c393632ae67ecfa4f79dd92a9c8954 100644
+--- a/crates/hipfire-runtime/src/hfq.rs
++++ b/crates/hipfire-runtime/src/hfq.rs
+@@ -1499,9 +1499,13 @@ impl HfqFile {
+     /// for base models). The runtime renders this when present so prompt
+     /// framing matches the model's training-time expectation; absent or
+     /// failing renders fall back to the hand-rolled `prompt_frame` path.
++    ///
++    /// GGUF-converted artifacts carry no `tokenizer_config`; their converter
++    /// copies the GGUF KV metadata verbatim, so the same template lives at
++    /// `gguf_meta["tokenizer.chat_template"]` and is used as the fallback.
+     pub fn chat_template(&self) -> Option<String> {
+         let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+-        let ct = meta.get("tokenizer_config")?.get("chat_template")?;
++        let ct = Self::chat_template_value(&meta)?;
+         // Plain-string form: return it directly.
+         if let Some(s) = ct.as_str() {
+             return Some(s.to_string());
+@@ -1511,13 +1515,21 @@ impl HfqFile {
+         self.chat_template_named("default")
+     }
+ 
++    /// Template JSON for this artifact: HF-native metadata first, then the
++    /// GGUF KV spelling for converter output without a `tokenizer_config`.
++    fn chat_template_value(meta: &serde_json::Value) -> Option<&serde_json::Value> {
++        meta.get("tokenizer_config")
++            .and_then(|tc| tc.get("chat_template"))
++            .or_else(|| meta.get("gguf_meta")?.get("tokenizer.chat_template"))
++    }
++
+     /// Select a named chat template. Cohere-style models ship `chat_template`
+     /// as a LIST of {name, template}; older models ship a plain string. Returns
+     /// the requested name, else the "default" entry, else the first; for a plain
+     /// string, returns it directly.
+     pub fn chat_template_named(&self, name: &str) -> Option<String> {
+         let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+-        let ct = meta.get("tokenizer_config")?.get("chat_template")?;
++        let ct = Self::chat_template_value(&meta)?;
+         if let Some(s) = ct.as_str() {
+             return Some(s.to_string());
+         }
+@@ -5596,3 +5608,52 @@ mod mq3v2_symmetric_tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod chat_template_fallback_tests {
++    use super::*;
++
++    #[test]
++    fn tokenizer_config_template_wins_over_gguf_meta() {
++        let meta = serde_json::json!({
++            "tokenizer_config": {"chat_template": "hf-native"},
++            "gguf_meta": {"tokenizer.chat_template": "gguf-copy"},
++        });
++        assert_eq!(
++            HfqFile::chat_template_value(&meta).and_then(|v| v.as_str()),
++            Some("hf-native")
++        );
++    }
++
++    #[test]
++    fn gguf_meta_template_used_without_tokenizer_config() {
++        let meta = serde_json::json!({
++            "gguf_meta": {"tokenizer.chat_template": "gguf-copy"},
++        });
++        assert_eq!(
++            HfqFile::chat_template_value(&meta).and_then(|v| v.as_str()),
++            Some("gguf-copy")
++        );
++    }
++
++    #[test]
++    fn gguf_meta_template_used_when_tokenizer_config_lacks_key() {
++        let meta = serde_json::json!({
++            "tokenizer_config": {"tokenizer_class": "Qwen2Tokenizer"},
++            "gguf_meta": {"tokenizer.chat_template": "gguf-copy"},
++        });
++        assert_eq!(
++            HfqFile::chat_template_value(&meta).and_then(|v| v.as_str()),
++            Some("gguf-copy")
++        );
++    }
++
++    #[test]
++    fn no_template_anywhere_is_none() {
++        let meta = serde_json::json!({
++            "tokenizer_config": {"tokenizer_class": "Qwen2Tokenizer"},
++            "gguf_meta": {"tokenizer.ggml.model": "gpt2"},
++        });
++        assert!(HfqFile::chat_template_value(&meta).is_none());
++    }
++}
+diff --git a/crates/hipfire-runtime/src/prompt_frame.rs b/crates/hipfire-runtime/src/prompt_frame.rs
+index ee1322912518ab7b5d9def89979c5cd88e4f9815..23a97a0afec16ccef32704c422a551c31613c082 100644
+--- a/crates/hipfire-runtime/src/prompt_frame.rs
++++ b/crates/hipfire-runtime/src/prompt_frame.rs
+@@ -1498,6 +1498,16 @@ impl<'a> JinjaChatFrame<'a> {
+             messages => messages_val,
+             add_generation_prompt => true,
+             enable_thinking => self.enable_thinking,
++            // The generation prompt opens the assistant turn with an empty
++            // `<think>\n\n</think>\n\n` block when thinking is off. Templates
++            // that take `preserve_thinking is defined and is true` (Bonsai's
++            // upstream qwen35 template) otherwise drop that block from
++            // historical assistant turns, so the next turn's render is not a
++            // byte/token prefix of what the model actually saw — which makes
++            // native KV/history reuse impossible (KVMem requires the complete
++            // accepted prefix). Templates that treat `undefined` as true
++            // (Qwen's) render identically with this set.
++            preserve_thinking => true,
+             bos_token => bos_token,
+             eos_token => eos_token,
+             reasoning_strength => reasoning_strength_val,
+@@ -4929,6 +4939,43 @@ SYS:{{ build_system_message(system_message) }}:END
+         assert_eq!(t.decode(&rendered).matches("<tool_call>").count(), 1);
+     }
+ 
++    /// Bonsai/qwen35 upstream shape: the generation prompt opens the assistant
++    /// turn with an empty `</think>` block when thinking is off, and historical
++    /// assistant turns keep that block only under `preserve_thinking is true`.
++    /// The renderer must therefore supply `preserve_thinking => true`; without
++    /// it the next turn's render is not a token prefix of what the model saw
++    /// and KVMem cannot prove the accepted prefix for a native restore.
++    #[test]
++    fn history_render_preserves_non_thinking_turn_prefix() {
++        const TPL: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\\n{% if m.role == 'assistant' %}{% if preserve_thinking is defined and preserve_thinking is true %}<think>\\n\\n</think>\\n\\n{% endif %}{% endif %}{{ m.content }}<|im_end|>\\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\\n{% if enable_thinking is defined and enable_thinking is false %}<think>\\n\\n</think>\\n\\n{% else %}<think>\\n{% endif %}{% endif %}";
++        let t = make_tokenizer();
++        let frame = JinjaChatFrame {
++            tokenizer: &t,
++            template: TPL,
++            system: None,
++            user: "",
++            enable_thinking: false,
++            bos_token: Some(""),
++            reasoning_strength: None,
++            reasoning_effort: None,
++        };
++        let first = vec![qmsg(Role::User, "hello", None)];
++        let turn1 = frame.render_messages(&first, None, None).unwrap();
++        assert!(
++            turn1.ends_with("<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n"),
++            "thinking-off generation prompt closes an empty think block: {turn1:?}"
++        );
++        let mut consumed = t.encode(&turn1);
++        consumed.extend(t.encode("OK"));
++        let history = vec![
++            qmsg(Role::User, "hello", None),
++            qmsg(Role::Assistant, "OK", None),
++            qmsg(Role::User, "next", None),
++        ];
++        let turn2 = t.encode(&frame.render_messages(&history, None, None).unwrap());
++        assert_strict_extension(&turn2, &consumed, "preserve_thinking history");
++    }
++
+     #[test]
+     fn qwen_whole_body_lookup_miss_equals_plain_render() {
+         let t = make_tokenizer();

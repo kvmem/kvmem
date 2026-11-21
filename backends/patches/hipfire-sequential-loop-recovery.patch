@@ -1,0 +1,902 @@
+diff --git a/crates/hipfire-daemon/src/main.rs b/crates/hipfire-daemon/src/main.rs
+index 4af9f441da2a91633157505611c55c6d6816b2cf..49897ee3a1601d7018699db4f8788686304806d8 100644
+--- a/crates/hipfire-daemon/src/main.rs
++++ b/crates/hipfire-daemon/src/main.rs
+@@ -4388,53 +4388,120 @@ fn main() {
+                     };
+                     let request_seed =
+                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
+-                    hipfire_generate::batch::arm_promotion(
+-                        vmm_route && batch_scheduler.is_some(),
+-                        &msg,
+-                        m,
+-                        continuous_batch_size,
+-                        serve_continuous_batch,
+-                        pflash_active,
+-                        max_tokens,
+-                        max_think_tokens,
+-                        client_seed,
+-                        assistant_prefix,
+-                    );
+-                    generate(
+-                        m,
+-                        &mut gpu,
+-                        pflash_drafter_gpu.as_mut(),
+-                        &mut stdout,
+-                        id,
+-                        prompt,
+-                        system,
+-                        user_explicit_sampling,
+-                        temp,
+-                        top_p,
+-                        top_k,
+-                        min_p,
+-                        cactus_delta,
+-                        max_tokens,
+-                        repeat_penalty,
+-                        repeat_window,
+-                        presence_penalty,
+-                        frequency_penalty,
+-                        budget_alert_at_tok,
+-                        &budget_alert_text,
+-                        max_think_tokens,
+-                        assistant_prefix,
+-                        pflash_state.as_mut(),
+-                        pf_cfg_owned.as_ref(),
+-                        tools_json.as_deref(),
+-                        messages_history.as_deref(),
+-                        think_mode,
+-                        &stop_seqs, // hunt3 M-F
+-                        min_tokens,
+-                        reasoning_effort_jinja.as_deref(),
+-                        enable_thinking_jinja,
+-                        logprobs_top_k,
+-                        request_seed,
+-                    );
++                    // ── Sequential #728: one low-effort restart on a loop ──
++                    // `generate` returns before staging any terminal when its
++                    // reasoning-loop detector fires; the restart swaps the
++                    // xhigh effort sentence for the low one, raises the
++                    // sampling floors (temp >= 1.0, presence >= 1.5), keeps
++                    // the same request id and spends only the remaining
++                    // budget. Reference parity: one recovery per request.
++                    let mut seq_prompt: std::borrow::Cow<'_, str> =
++                        std::borrow::Cow::Borrowed(prompt);
++                    let mut seq_effort: Option<String> = reasoning_effort_jinja.clone();
++                    let mut seq_temp = temp;
++                    let mut seq_presence = presence_penalty;
++                    let mut seq_budget = max_tokens;
++                    let mut seq_seed = request_seed;
++                    let mut seq_base = 0usize;
++                    let mut seq_mode = developer_var("HIPFIRE_REASONING_LOOP_RECOVERY")
++                        .ok()
++                        .and_then(|v| {
++                            hipfire_runtime::reasoning_loop::LoopMode::from_config_value(&v)
++                        })
++                        .unwrap_or(hipfire_runtime::reasoning_loop::LoopMode::Recover);
++                    // Pass-2+ continuation state: the recovered pass re-renders
++                    // the prompt under the low-effort sentence (the render is
++                    // what carries the splice) and replays every generated id
++                    // after it, so the model continues its own thoughts.
++                    let mut seq_carry: Vec<u32> = Vec::new();
++                    let mut seq_pass = 0usize;
++                    loop {
++                        seq_pass += 1;
++                        let mut recovery =
++                            hipfire_generate::ar::SequentialRecovery::new(seq_mode, seq_base);
++                        recovery.suppress_route_start = seq_pass > 1;
++                        recovery.suffix = seq_carry.clone();
++                        hipfire_generate::batch::arm_promotion(
++                            vmm_route && batch_scheduler.is_some(),
++                            &msg,
++                            m,
++                            continuous_batch_size,
++                            serve_continuous_batch,
++                            pflash_active,
++                            max_tokens,
++                            max_think_tokens,
++                            client_seed,
++                            assistant_prefix,
++                        );
++                        generate(
++                            m,
++                            &mut gpu,
++                            pflash_drafter_gpu.as_mut(),
++                            &mut stdout,
++                            id,
++                            seq_prompt.as_ref(),
++                            system,
++                            user_explicit_sampling,
++                            seq_temp,
++                            top_p,
++                            top_k,
++                            min_p,
++                            cactus_delta,
++                            seq_budget,
++                            repeat_penalty,
++                            repeat_window,
++                            seq_presence,
++                            frequency_penalty,
++                            budget_alert_at_tok,
++                            &budget_alert_text,
++                            max_think_tokens,
++                            assistant_prefix,
++                            pflash_state.as_mut(),
++                            pf_cfg_owned.as_ref(),
++                            tools_json.as_deref(),
++                            messages_history.as_deref(),
++                            think_mode,
++                            &stop_seqs, // hunt3 M-F
++                            min_tokens,
++                            seq_effort.as_deref(),
++                            enable_thinking_jinja,
++                            logprobs_top_k,
++                            seq_seed,
++                            Some(&mut recovery),
++                        );
++                        if !recovery.requested {
++                            if let Some((at, cov)) = recovery.trip {
++                                if recovery.stopped {
++                                    eprintln!(
++                                        "[think-recover] sequential loop: coverage={cov:.3} at n={at}; ending as length"
++                                    );
++                                } else if let Some(why) = recovery.unavailable {
++                                    eprintln!(
++                                        "[think-recover] sequential loop: coverage={cov:.3} at n={at}; recovery unavailable ({why}); continuing"
++                                    );
++                                }
++                            }
++                            break;
++                        }
++                        eprintln!(
++                            "[think-recover] sequential loop: coverage={:.3} at n={}; restarting with the low-effort sentence",
++                            recovery.coverage,
++                            seq_base + recovery.generated
++                        );
++                        seq_base += recovery.generated;
++                        seq_carry.extend_from_slice(&recovery.emitted);
++                        seq_budget = max_tokens.saturating_sub(seq_base).max(1);
++                        seq_prompt = std::borrow::Cow::Owned(seq_prompt.replacen(
++                            think_recovery::HIGH_EFFORT_INSTRUCTION,
++                            think_recovery::LOW_EFFORT_INSTRUCTION,
++                            1,
++                        ));
++                        seq_effort = Some("low".to_string());
++                        seq_temp = seq_temp.max(1.0);
++                        seq_presence = seq_presence.max(1.5);
++                        seq_seed = seq_seed.wrapping_add(1);
++                        seq_mode = hipfire_runtime::reasoning_loop::LoopMode::Off;
++                    }
+                     if let Some(drive_res) = hipfire_generate::batch::drive_promoted(
+                         batch_scheduler.as_mut(),
+                         &mut gpu,
+diff --git a/crates/hipfire-generate/src/ar.rs b/crates/hipfire-generate/src/ar.rs
+index 2394f1e5cfcd2d4b8055ef6d6ce9ef22c7677437..62bd3eb33f68e4e606b4ccb96695628ee89c9654 100644
+--- a/crates/hipfire-generate/src/ar.rs
++++ b/crates/hipfire-generate/src/ar.rs
+@@ -34,6 +34,7 @@ use hipfire_runtime::emit_text::{ThinkRouteEvent, ToolRouteEvent};
+ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+ use hipfire_runtime::llama;
+ use hipfire_runtime::prompt_frame::ThinkMode;
++use hipfire_runtime::reasoning_loop::{reasoning_repeat_coverage, LoopCheck, LoopMode};
+ use hipfire_runtime::sampler::{self, SamplerConfig};
+ use hipfire_runtime::stop_sequence::{MinTokens, StopMatcher};
+ use std::any::Any;
+@@ -64,6 +65,7 @@ pub fn qwen_ar_route_think_events(
+     stop: &mut StopMatcher,
+     channel_events: Vec<ThinkRouteEvent>,
+     visible_acc: &mut String,
++    reasoning_acc: &mut String,
+ ) -> Result<(), ToolRouteError> {
+     for channel_event in channel_events {
+         if stop.matched() {
+@@ -71,6 +73,7 @@ pub fn qwen_ar_route_think_events(
+         }
+         match channel_event {
+             ThinkRouteEvent::Reasoning(reasoning) => {
++                reasoning_acc.push_str(&reasoning);
+                 emit_reasoning_token(stdout, id, &reasoning);
+             }
+             ThinkRouteEvent::Content(content) => {
+@@ -117,10 +120,11 @@ pub fn qwen_ar_route_filter_text(
+     stop: &mut StopMatcher,
+     text: &str,
+     visible_acc: &mut String,
++    reasoning_acc: &mut String,
+ ) -> Result<(), ToolRouteError> {
+     let mut channel_events = Vec::new();
+     think_router.push_into(text, &mut channel_events);
+-    qwen_ar_route_think_events(stdout, id, router, stop, channel_events, visible_acc)
++    qwen_ar_route_think_events(stdout, id, router, stop, channel_events, visible_acc, reasoning_acc)
+ }
+ 
+ /// Outcome of finishing the Qwen AR semantic router for one turn.
+@@ -188,6 +192,63 @@ impl QwenArTerminalCause {
+     }
+ }
+ 
++/// Sequential-path #728 control: in-memory only, one per request. The daemon
++/// fills `mode` (env/request knob) and `base` (tokens already produced by an
++/// earlier pass of the same request); the decode loop reports `requested` when
++/// a defined reasoning loop ended the pass for a recovery restart.
++#[derive(Debug, Clone)]
++pub struct SequentialRecovery {
++    pub mode: LoopMode,
++    /// Output tokens produced by previous passes of this request (done counts add them).
++    pub base: usize,
++    /// Set by the decode loop: this pass ended early for a low-effort restart.
++    pub requested: bool,
++    /// Output tokens produced by this pass when `requested` was set.
++    pub generated: usize,
++    /// Coverage reading that tripped the detector.
++    pub coverage: f64,
++    /// Continuation passes must not re-emit `gen_start`: the gateway latches
++    /// the stream contract on the first one and treats a second as a protocol
++    /// error. Pass 1 leaves this false; the daemon sets it for pass 2+.
++    pub suppress_route_start: bool,
++    /// Raw generated ids of this pass (`m.conversation_tokens` past prefill).
++    /// Pass 1 fills it so the daemon can carry the thoughts across a restart.
++    pub emitted: Vec<u32>,
++    /// Continuation suffix for THIS pass: raw ids appended directly after the
++    /// rendered assistant prefix, so the recovered pass continues the same
++    /// thoughts under the spliced low-effort sentence instead of starting cold.
++    pub suffix: Vec<u32>,
++    /// The detector tripped and `Stop` ended this pass as "length".
++    pub stopped: bool,
++    /// The detector tripped but `Recover` declined; the pass kept generating.
++    pub unavailable: Option<&'static str>,
++    /// `(output tokens, coverage)` of the last tripped look.
++    pub trip: Option<(usize, f64)>,
++}
++
++impl SequentialRecovery {
++    pub fn new(mode: LoopMode, base: usize) -> Self {
++        Self {
++            mode,
++            base,
++            requested: false,
++            generated: 0,
++            coverage: 0.0,
++            suppress_route_start: false,
++            emitted: Vec::new(),
++            suffix: Vec::new(),
++            stopped: false,
++            unavailable: None,
++            trip: None,
++        }
++    }
++}
++
++/// The template's xhigh sentence, whose presence is this path's proof that the
++/// request rendered the xhigh effort instruction (the reference splices the low
++/// sentence in only then).
++pub const SEQUENTIAL_XHIGH_EFFORT: &str = "xhigh";
++
+ /// What the AR decode loop does after a committed token under an explicit
+ /// `max_think_tokens` budget.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -341,6 +402,7 @@ pub fn qwen_ar_observe_and_route(
+     stop: &mut StopMatcher,
+     new_bytes: &[u8],
+     visible_acc: &mut String,
++    reasoning_acc: &mut String,
+ ) -> Result<bool, ToolRouteError> {
+     let action = if router.masks_builtin_terminators() {
+         filter.observe_suppressing_stops(new_bytes)
+@@ -355,7 +417,7 @@ pub fn qwen_ar_observe_and_route(
+     };
+     let text = std::str::from_utf8(&text_bytes).unwrap_or("");
+     if !text.is_empty() {
+-        qwen_ar_route_filter_text(stdout, id, think_router, router, stop, text, visible_acc)?;
++        qwen_ar_route_filter_text(stdout, id, think_router, router, stop, text, visible_acc, reasoning_acc)?;
+     }
+     Ok(filter_stop)
+ }
+@@ -372,18 +434,19 @@ pub fn qwen_ar_drain_pending_into_router(
+     router: &mut ToolOutputRouter,
+     stop: &mut StopMatcher,
+     visible_acc: &mut String,
++    reasoning_acc: &mut String,
+ ) -> Result<(), ToolRouteError> {
+     let pending = filter.flush_pending();
+     if !pending.is_empty() {
+         let text = std::str::from_utf8(&pending).unwrap_or("");
+         if !text.is_empty() {
+-            qwen_ar_route_filter_text(stdout, id, think_router, router, stop, text, visible_acc)?;
++            qwen_ar_route_filter_text(stdout, id, think_router, router, stop, text, visible_acc, reasoning_acc)?;
+         }
+     }
+ 
+     let mut channel_events = Vec::new();
+     think_router.finish_into(&mut channel_events);
+-    qwen_ar_route_think_events(stdout, id, router, stop, channel_events, visible_acc)?;
++    qwen_ar_route_think_events(stdout, id, router, stop, channel_events, visible_acc, reasoning_acc)?;
+     let held = stop.finish();
+     qwen_ar_route_answer_content(stdout, id, router, &held, visible_acc)
+ }
+@@ -498,6 +561,10 @@ pub struct QwenArSemanticProducer {
+     pub think_router: ThinkOutputRouter,
+     pub router: ToolOutputRouter,
+     pub visible_acc: String,
++    /// Reasoning-channel text emitted so far (the #728 detector's input; the
++    /// reference reads its parser's reasoning stream). Only appended while the
++    /// think router is inside a span.
++    pub reasoning_acc: String,
+     /// Tokens that completed raw-commit before classify for this producer.
+     pub raw_committed: Vec<u32>,
+     /// Stream positions recorded at each raw commit (testable ordering).
+@@ -547,6 +614,7 @@ impl QwenArSemanticProducer {
+                 ToolOutputRouter::disabled()
+             },
+             visible_acc: String::new(),
++            reasoning_acc: String::new(),
+             raw_committed: Vec::new(),
+             raw_commit_positions: Vec::new(),
+             stopped_by_filter: false,
+@@ -621,6 +689,7 @@ impl QwenArSemanticProducer {
+                     &mut self.stop,
+                     new_bytes.as_ref(),
+                     &mut self.visible_acc,
++                    &mut self.reasoning_acc,
+                 )?;
+                 if filter_stop {
+                     self.stopped_by_filter = true;
+@@ -706,6 +775,7 @@ impl QwenArSemanticProducer {
+             &mut self.router,
+             &mut self.stop,
+             &mut self.visible_acc,
++            &mut self.reasoning_acc,
+         )?;
+         let open_think = self.think_router.in_think();
+         let cause = QwenArTerminalCause::resolve(
+@@ -2660,12 +2730,26 @@ pub fn generate(
+     // attempt-key + counter entropy) so two requests with the same prompt
+     // no longer replay the identical draw sequence at temp>0.
+     request_seed: u32,
++    // Sequential #728 hook: `Some` lets a defined reasoning loop end this pass
++    // for a low-effort restart (the daemon re-invokes `generate` with the same
++    // id); `None` keeps every byte identical to the pre-recovery engine.
++    mut recovery: Option<&mut SequentialRecovery>,
+ ) {
+     // Whole-request PLE serving guard (Qwen4 with PLE rows; `None` otherwise):
+     // every route below (Qwen4 AR, native MTP, the spec-capacity fallthrough)
+     // prefills and decodes under it, and it drops on every return, error and
+     // unwind, so a caller outside the daemon is covered too.
+     let _ple_serving = m.ple_serving_guard();
++    // ── Sequential #728 recovery state ─────────────────────────────────
++    // The daemon re-invokes this entry point for a low-effort restart; `base`
++    // carries the tokens an earlier pass already produced (done counts add
++    // them). `None` keeps the decoder exactly as before this feature.
++    let recovery_mode = recovery.as_ref().map(|r| r.mode).unwrap_or(LoopMode::Off);
++    let recovery_base = recovery.as_ref().map(|r| r.base).unwrap_or(0);
++    let mut loop_check = LoopCheck::new();
++    let mut loop_stopped = false;
++    let mut recovery_requested = false;
++    let mut recovery_coverage = 0.0f64;
+     // ── Producer-route authority (Task 6) ──────────────────────────────
+     // Resolve the selected generation route BEFORE sampler RNG reset and
+     // every stateful branch. Non-empty tools are denied for unsafe routes
+@@ -4147,6 +4231,12 @@ pub fn generate(
+         assistant_prefix,
+         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+     );
++    // #728 strict mirror: recovery replaces the xhigh effort sentence inside
++    // the FIRST system message and must give up when that sentence is absent
++    // from what the model actually reads. Only the rendered prompt tells the
++    // truth here (the raw `prompt` is the user turn alone); templates that
++    // ignore effort render without it.
++    let mut effort_sentence_in_render = false;
+     let new_tokens = if try_jinja {
+         let template = m.chat_template.as_ref().unwrap();
+         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+@@ -4211,6 +4301,9 @@ pub fn generate(
+                 // Its rendered tail, not the template-less ChatFrame prefix,
+                 // determines the initial response channel.
+                 started_in_think = render_tail_opens_think(&rendered);
++                effort_sentence_in_render = rendered.contains(
++                    hipfire_runtime::reasoning_loop::HIGH_EFFORT_INSTRUCTION,
++                );
+                 tokenizer.encode(&rendered)
+             }
+             Err(e) => {
+@@ -4248,6 +4341,18 @@ pub fn generate(
+         .build_with_user_tokens(&q_tokens)
+     };
+ 
++    // #728 continuation (sequential mirror): the reference re-runs the pass
++    // over the ORIGINAL prompt ids with the low-effort sentence spliced into
++    // the first system message, then appends every generated id so the model
++    // continues its own thoughts rather than restarting cold. The render
++    // supplies the spliced head; `suffix` restores the generated ids.
++    let mut new_tokens = new_tokens;
++    if let Some(r) = recovery.as_ref() {
++        if !r.suffix.is_empty() {
++            new_tokens.extend_from_slice(&r.suffix);
++        }
++    }
++
+     // ── Prompt cache (LCP-based) — Qwen3.5/3.6 only ──────────────────────
+     //
+     // This is the Qwen3.5/3.6 AR body's own live-extension cache (DeltaNet
+@@ -4894,7 +4999,13 @@ pub fn generate(
+         _ => None,
+     };
+     let prefill_tokens = new_tokens.len();
+-    emit_generation_start(selected_route, stdout, id, started_in_think);
++    match recovery.as_ref() {
++        // A continuation pass: the gateway already latched the stream contract
++        // on pass 1's gen_start. Keep the active route so terminal wrappers
++        // still resolve, but emit no second start edge.
++        Some(r) if r.suppress_route_start => set_generation_route(selected_route),
++        _ => emit_generation_start(selected_route, stdout, id, started_in_think),
++    }
+     let t0 = Instant::now();
+ 
+     // The Qwen3.5 multi-turn branch: prefill only the NEW turn tokens,
+@@ -5528,6 +5639,8 @@ pub fn generate(
+         let loop_guard =
+             hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
+ 
++        // Raw output ids of THIS pass, for a possible continuation pass.
++        let conv_start = m.conversation_tokens.len();
+         // `while` instead of `for 0..max_tokens` so budget-alert injection
+         // (which increments `generated` beyond the iteration count) can't
+         // push generated past max_tokens: each loop start rechecks the cap.
+@@ -5734,6 +5847,72 @@ pub fn generate(
+                     return;
+                 }
+             }
++            // ── #728: reasoning-loop look (sequential mirror) ──────────
++            // Every 512 output tokens, at a clean reasoning boundary (no held
++            // think-marker prefix, no partial UTF-8 in the EOS filter), read
++            // the reasoning channel for passages seen three times. `stop` ends
++            // the pass as "length"; `recover` ends it for a low-effort restart
++            // only when the request carried the xhigh effort sentence — an
++            // unavailable recovery keeps generating, exactly like the
++            // reference's `focused_recovery_prompt() is None` path.
++            if recovery_mode != LoopMode::Off && loop_check.due(generated + recovery_base) {
++                if hipfire_config::developer_var_os("HIPFIRE_THINK_RECOVER_TRACE").is_some() {
++                    eprintln!(
++                        "[think-recover] check n={} in_think={} think_pending={} eos_pending={} effort={:?} words={} cov={:.3} sentence={}",
++                        generated + recovery_base,
++                        semantic.think_router.in_think(),
++                        semantic.think_router.has_pending(),
++                        semantic.filter.has_pending(),
++                        reasoning_effort,
++                        semantic.reasoning_acc.split_whitespace().count(),
++                        reasoning_repeat_coverage(&semantic.reasoning_acc),
++                        effort_sentence_in_render,
++                    );
++                }
++            }
++            if recovery_mode != LoopMode::Off
++                && semantic.think_router.in_think()
++                && loop_check.due(generated + recovery_base)
++                && !semantic.think_router.has_pending()
++                && !semantic.filter.has_pending()
++            {
++                loop_check.advance(generated + recovery_base);
++                let coverage = reasoning_repeat_coverage(&semantic.reasoning_acc);
++                if coverage >= hipfire_runtime::reasoning_loop::LOOP_COVERAGE {
++                    let declined = if reasoning_effort != Some(SEQUENTIAL_XHIGH_EFFORT) {
++                        Some("effort is not xhigh")
++                    } else if !effort_sentence_in_render {
++                        Some("effort sentence absent from the render")
++                    } else if generated >= max_tokens {
++                        Some("budget exhausted")
++                    } else {
++                        None
++                    };
++                    match recovery_mode {
++                        LoopMode::Stop => {
++                            loop_stopped = true;
++                            if let Some(slot) = recovery.as_mut() {
++                                slot.stopped = true;
++                                slot.trip = Some((generated + recovery_base, coverage));
++                            }
++                            break;
++                        }
++                        LoopMode::Recover if declined.is_none() => {
++                            recovery_requested = true;
++                            recovery_coverage = coverage;
++                            break;
++                        }
++                        _ => {
++                            if let Some(slot) = recovery.as_mut() {
++                                slot.unavailable = Some(
++                                    declined.unwrap_or("recovery unavailable"),
++                                );
++                                slot.trip = Some((generated + recovery_base, coverage));
++                            }
++                        }
++                    }
++                }
++            }
+             // Checkpoint during decode too, so a long generated turn (e.g. a
+             // big code emission) can be resumed mid-region if the NEXT turn's
+             // render diverges within it — without replaying the whole
+@@ -6323,6 +6502,20 @@ pub fn generate(
+             }
+         }
+ 
++        // ── #728 recovery: end this pass without any terminal ────────
++        // The client keeps the reasoning it already received; no done,
++        // commit_ready or tool release is staged. The daemon re-invokes
++        // `generate` with the same id, the low-effort sentence and the
++        // remaining budget, and only that pass reaches the terminal staging.
++        if recovery_requested {
++            if let Some(slot) = recovery {
++                slot.requested = true;
++                slot.generated = generated;
++                slot.coverage = recovery_coverage;
++                slot.emitted = m.conversation_tokens[conv_start..].to_vec();
++            }
++            return;
++        }
+         // ── semantic finish: tool_calls + cache + done ─────────────
+         //
+         // QwenArSemanticProducer is the sole wire authority for this AR path.
+@@ -6334,13 +6527,20 @@ pub fn generate(
+         // Open think → reasoning-only stop (no calls) via finish().
+         // finish() shares the same drain + classify path as unit tests.
+         let hit_length_cap = generated >= max_tokens;
+-        let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
++        let (mut finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
+             Ok(pair) => pair,
+             Err(err) => {
+                 emit_error_with_id(stdout, id, &err.to_string());
+                 return;
+             }
+         };
++        if loop_stopped {
++            // #728 stop mode: the reference leaves `finish` at "length" (the
++            // pass was force-ended, not completed), so the client maps it to
++            // an incomplete / max_output_tokens answer.
++            finish.finish_reason = "length";
++            finish.wire_tool_calls.clear();
++        }
+         //
+         // Timing + pending done are fixed before handshake so commit_ready
+         // carries the exact eventual done payload. Abort rolls back + emits
+@@ -6369,7 +6569,9 @@ pub fn generate(
+         let mut pending_done = qwen_ar_done_value(
+             id,
+             finish.finish_reason,
+-            generated,
++            // Completion count spans every pass of the request (the reference's
++            // `n` accumulates across the restart); timing stays per pass.
++            generated + recovery_base,
+             tok_s,
+             prefill_tokens,
+             prefill_s * 1000.0,
+diff --git a/crates/hipfire-generate/tests/dense_rollback_gpu.rs b/crates/hipfire-generate/tests/dense_rollback_gpu.rs
+index f26cd2208ac6efbf7a7a6bd849195e90309c28f2..28feb3eddbaf5ec227a6d99478d22708f87aafc5 100644
+--- a/crates/hipfire-generate/tests/dense_rollback_gpu.rs
++++ b/crates/hipfire-generate/tests/dense_rollback_gpu.rs
+@@ -300,6 +300,7 @@ fn run_generate_with(
+             false,
+             None,
+             12345,
++            None,
+         );
+     }
+     let bytes = finish_stdout_capture(saved, &path);
+diff --git a/crates/hipfire-tui/tests/snapshots/scope_s5_80x24.txt b/crates/hipfire-tui/tests/snapshots/scope_s5_80x24.txt
+index 5ce9eb8e2b4b1fdb72c7f9f6924b8a2cfa75bd09..7a78a283607f66fac81e442527f4985b87d1f5ec 100644
+--- a/crates/hipfire-tui/tests/snapshots/scope_s5_80x24.txt
++++ b/crates/hipfire-tui/tests/snapshots/scope_s5_80x24.txt
+@@ -13,7 +13,7 @@
+  │  Thinking                 on                      default                  │
+  │> Thinking effort          ● high                  this model               │
+  │  Thinking cap             med                     default                  │
+- └─────────────────────────────────────────────────────────── rows 1–6 of 8 ↓ ┘
++ └────────────────────────────────────────────────────────── rows 1–6 of 12 ↓ ┘
+  ┌ Thinking effort ───────────────────────────────────────────────────────────┐
+  │How hard the model is told to think, in its own vocabulary.                 │
+  │qwen3.8:27b: high (this model). All other models: low (you, config.toml).   │
+diff --git a/crates/hipfire-tui/tests/snapshots/settings_l1_160x48.txt b/crates/hipfire-tui/tests/snapshots/settings_l1_160x48.txt
+index e8627020fb460a3e975472311dabf1071a1dbab5..6f525ab1322bd92bc913db8aa1a774f80f2f96b1 100644
+--- a/crates/hipfire-tui/tests/snapshots/settings_l1_160x48.txt
++++ b/crates/hipfire-tui/tests/snapshots/settings_l1_160x48.txt
+@@ -8,7 +8,7 @@
+  └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────┐┌ Quality ─────────────────────────────────────────────────────────────────────────────────┐┌ Prompt processing ─────────────────────┐
+  │Groups                ││  Setting                       Using now               From                Applies       ││How the model reads your prompt before  │
+- │> Quality            8││> Prompt processing             Fast (4-bit math)       default · gfx1151   restart       ││it starts to answer.                    │
++ │> Quality           12││> Prompt processing             Fast (4-bit math)       default · gfx1151   restart       ││it starts to answer.                    │
+  │  Speed              5││  Flash-Next experts            — not used by 27B       Flash-Next only     restart       ││                                        │
+  │  Memory & context  32││  Flash-Next word table         — not used by 27B       Flash-Next only     restart       ││Options on this GPU                     │
+  │  Speculation       35││  Thinking                      on                      default             new chat      ││  ● Fast (4-bit math)  built-in default │
+@@ -16,12 +16,12 @@
+  │  Advanced         225││  Thinking cap                  med                     default             next message  ││      43% closer · 1.6× slower          │
+  │                      ││  reasoning.max_tokens          not set                 default             next message  ││                                        │
+  │Filters               ││  reasoning.max_total_tokens    0                       default             next message  ││Why "Fast (4-bit math)"                 │
+- │  Changed only (c) off││  — also affects quality —                                                                ││  1. built-in default · gfx1151         │
+- │  Hide unused (h)  off││  KV cache precision            q8 (auto)               default             see Memory    ││     Fast (4-bit math)  ← used          │
+- │                      ││                                                                                          ││     no registry, profile, preset,      │
+- │                      ││                                                                                          ││     user, model or environment value   │
+- │                      ││                                                                                          ││     is set                             │
+- │                      ││                                                                                          ││                                        │
++ │  Changed only (c) off││  thinking.answer_room          on                      default             next message  ││  1. built-in default · gfx1151         │
++ │  Hide unused (h)  off││  thinking.close_retry          on                      default             next message  ││     Fast (4-bit math)  ← used          │
++ │                      ││  thinking.loop_recovery        recover                 default             next message  ││     no registry, profile, preset,      │
++ │                      ││  thinking.repeat_stop_tokens   256                     default             next message  ││     user, model or environment value   │
++ │                      ││  — also affects quality —                                                                ││     is set                             │
++ │                      ││  KV cache precision            q8 (auto)               default             see Memory    ││                                        │
+  │                      ││                                                                                          ││Measured · gfx1151                      │
+  │                      ││                                                                                          ││  KLD vs full model (lower = closer)    │
+  │                      ││                                                                                          ││    WT2  Fast 0.0695   Accurate 0.0394  │
+diff --git a/crates/hipfire-tui/tests/snapshots/settings_s1_80x24.txt b/crates/hipfire-tui/tests/snapshots/settings_s1_80x24.txt
+index 65f43d5d966412a3535088526c975cc095382336..cc4ffe20491e0edf82d0c324444d521376632c26 100644
+--- a/crates/hipfire-tui/tests/snapshots/settings_s1_80x24.txt
++++ b/crates/hipfire-tui/tests/snapshots/settings_s1_80x24.txt
+@@ -13,7 +13,7 @@
+  │  Thinking                      on                      default             │
+  │  Thinking effort               ● low                   you                 │
+  │  Thinking cap                  med                     default             │
+- └─────────────────────────────────────────────────────────── rows 1–6 of 8 ↓ ┘
++ └────────────────────────────────────────────────────────── rows 1–6 of 12 ↓ ┘
+  ┌ Prompt processing ─────────────────────────────────────────────────────────┐
+  │How the model reads your prompt before it starts to answer.                 │
+  │Accurate: 43% closer to the full model, prompts 1.6× slower.                │
+diff --git a/docs/env-vars.md b/docs/env-vars.md
+index b3eed4bea8be8870d7388f0099afb5702d9ffdd2..c89a3fecd0fc46513ee1734e97507dcb84280303 100644
+--- a/docs/env-vars.md
++++ b/docs/env-vars.md
+@@ -1100,7 +1100,7 @@ KVMem keeps a small per-slot paged KV pool and spills the rest to a host store;
+ 
+ | Variable | Default | Meaning |
+ |---|---|---|
+-| `HIPFIRE_KVMEM_BUDGET_TOKENS` | pool/slot minus headroom | Per-slot GPU residency budget in tokens (blocks = tokens/128, at least 2). Everything past it lives in the host store. |
++| `HIPFIRE_KVMEM_BUDGET_TOKENS` | pool/slot minus headroom | Per-slot GPU residency budget in tokens (blocks = tokens/128, at least 2). Everything past it lives in the host store. A budget left at its built-in default is clamped at admission to logical context minus gen-reserve; an explicitly requested budget is never reduced (B + R > C stays a named error). |
+ | `HIPFIRE_KVMEM_SINK_BLOCKS` / `HIPFIRE_KVMEM_RECENT_BLOCKS` | `1` / `1` | Always-resident sink/recent blocks kept by selection. |
+ | `HIPFIRE_KVMEM_SELECT_INTERVAL` | `4` (clamp 1..256) | Blocks written between selection rounds. |
+ | `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` / `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | unset (single threshold) | Residency hysteresis band as fractions of the budget; setting either enables it. |
+@@ -1261,7 +1261,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ 
+ **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
+ **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
+-**Count:** 2095
++**Count:** 2158
+ 
+ | Variable | Example source path(s) | Lifecycle |
+ |---|---|---|
+@@ -1789,9 +1789,17 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_EP_UNIT_TAIL_PREFILL` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail_rank.rs | developer |
+ | `HIPFIRE_EP_UNIT_TAIL_RETIRE_IDS` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
+ | `HIPFIRE_EP_UNIT_TAIL_STAGE_GAP` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs, crates/hipfire-arch-qwen4/src/gpu_forward/slab_stage.rs | developer |
++| `HIPFIRE_ESCHA_DENSE` | crates/hipfire-quantize/src/pipeline_escha.rs | developer |
++| `HIPFIRE_ESCHA_EXPERT_STORE` | crates/hipfire-arch-qwen35/src/qwen35/escha.rs, crates/hipfire-arch-qwen35/src/qwen35/load.rs | developer |
++| `HIPFIRE_ESCHA_FOLD` | crates/hipfire-quantize/src/pipeline_escha.rs | developer |
++| `HIPFIRE_ESCHA_FOLD_DROP_BIAS` | crates/hipfire-quantize/src/pipeline_escha.rs | developer |
++| `HIPFIRE_ESCHA_GROUPED_TILE` | crates/rdna-compute/src/gemv.rs | developer |
++| `HIPFIRE_ESCHA_INDEXED` | crates/hipfire-arch-qwen35/src/qwen35/escha.rs, crates/hipfire-arch-qwen35/src/qwen35/load.rs | developer |
++| `HIPFIRE_ESCHA_ROUTE_TRACE` | crates/hipfire-dispatch/src/pipeline/route_trace.rs | developer |
+ | `HIPFIRE_EVENT_LOG` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
+ | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
+ | `HIPFIRE_EXPERIMENTAL_MODE` | crates/hipfire-config/src/lib.rs | developer |
++| `HIPFIRE_F16_LM_HEAD` | crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
+ | `HIPFIRE_F1LITE` | crates/hipfire-dispatch/src/pipeline/batched.rs, crates/rdna-compute/src/gemm.rs | developer |
+ | `HIPFIRE_F1_REAL_MODEL` | crates/hipfire-runtime/tests/mq4_planar_real.rs | harness |
+ | `HIPFIRE_FA2_A4_EPILOGUE` | crates/rdna-compute/src/kernels.rs | developer |
+@@ -1856,7 +1864,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_FORCE_ANSWER_SECS` | scripts/test-qwen35-think-cap.sh | harness |
+ | `HIPFIRE_FORCE_REBUILD` | crates/hipfire-cli/src/main.rs | developer |
+ | `HIPFIRE_FORCE_UNFUSED` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
+-| `HIPFIRE_FORWARD_LOWERED` | crates/hipfire-arch-qwen2/src/qwen2.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
++| `HIPFIRE_FORWARD_LOWERED` | crates/hipfire-arch-qwen2/src/qwen2.rs, crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
+ | `HIPFIRE_FORWARD_ORACLE` | crates/hipfire-dispatch/src/pipeline/superop.rs | developer |
+ | `HIPFIRE_FP16` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | stable |
+ | `HIPFIRE_FP16_LAYER_MAX` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
+@@ -1915,7 +1923,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_GATED_DELTA_VECTOR_PM` | crates/rdna-compute/src/gated_delta_vector_pm.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
+ | `HIPFIRE_GATED_NORM_FP8_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
+ | `HIPFIRE_GATED_NORM_FP8_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
+-| `HIPFIRE_GATED_NORM_MQ_ROTATE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
++| `HIPFIRE_GATED_NORM_MQ_ROTATE` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
+ | `HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
+ | `HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
+ | `HIPFIRE_GATED_NORM_WAVE_GROUP` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
+@@ -1934,7 +1942,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_GDN_CHUNK_PM` | crates/rdna-compute/src/gated_delta_chunk_pm.rs, crates/rdna-compute/src/kernels.rs | developer |
+ | `HIPFIRE_GDN_CHUNK_PREP_PM` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/pipeline/batched_deltanet.rs | developer |
+ | `HIPFIRE_GDN_CHUNK_SIZE` | crates/rdna-compute/src/norm.rs | developer |
+-| `HIPFIRE_GDN_COMPACT2` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
++| `HIPFIRE_GDN_COMPACT2` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
+ | `HIPFIRE_GDN_COMPACT2_SHAPE` | crates/rdna-compute/src/norm.rs, crates/rdna-compute/src/rows_batched.rs | developer |
+ | `HIPFIRE_GDN_COMPACT3` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
+ | `HIPFIRE_GDN_DPP_REDUCE` | crates/rdna-compute/src/dflash_gdn_replay.rs, crates/rdna-compute/src/kernels.rs | developer |
+@@ -2004,7 +2012,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_GFX1100_PM_BUNDLE` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
+ | `HIPFIRE_GFX1100_PM_GEMM` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
+ | `HIPFIRE_GFX1100_Q8X_VERIFY` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv_q8x.rs | developer |
+-| `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
++| `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-arch-qwen35/src/lib.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
+ | `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN` | crates/hipfire-dispatch/src/pipeline/batched_attention.rs, crates/rdna-compute/src/attention_wmma_verify.rs | developer |
+ | `HIPFIRE_GFX1101_GFX1100_CAMPAIGN` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/src/norm.rs | developer |
+ | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP` | crates/rdna-compute/src/attention.rs | developer |
+@@ -2246,48 +2254,51 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_KLD_NGL` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/eval_gguf.rs | harness |
+ | `HIPFIRE_KLD_TEACHER` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
+ | `HIPFIRE_KV` | crates/saddle-lab/examples/oracle_xcheck.rs | harness |
+-| `HIPFIRE_KVMEM_BATCH_XFER` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_BUDGET_TOKENS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_CACHE_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_CACHE_DIR` | crates/hipfire-arch-qwen35/src/kvmem_prefix.rs, crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_CHECKPOINT_COUNT` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_CHECKPOINT_INTERVAL` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+-| `HIPFIRE_KVMEM_CHECKPOINT_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+-| `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+-| `HIPFIRE_KVMEM_CONTENT_GROUPS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_GEN_RESERVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
++| `HIPFIRE_KVMEM` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/lib.rs | developer |
++| `HIPFIRE_KVMEM_BATCH_XFER` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_BUDGET_TOKENS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_CACHE_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_CACHE_DIR` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/kvmem_prefix.rs | developer |
++| `HIPFIRE_KVMEM_CHECKPOINT_COUNT` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_CHECKPOINT_INTERVAL` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_KVMEM_CHECKPOINT_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_KVMEM_CONTENT_GROUPS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_GEN_RESERVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+ | `HIPFIRE_KVMEM_GPU_HIGH` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+-| `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_GQA_DECODE` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
+-| `HIPFIRE_KVMEM_HOST_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+-| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+-| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+-| `HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+-| `HIPFIRE_KVMEM_LRFU` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_LRFU_LAMBDA` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_LRFU_TOP` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_PREFIX_COVERAGE` | crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+-| `HIPFIRE_KVMEM_PREFIX_COVERAGE_INTERVAL` | crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+-| `HIPFIRE_KVMEM_PREFIX_PIN` | crates/hipfire-arch-qwen35/src/kvmem_prefix.rs, crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_PREFIX_PIN_BYTES` | crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+-| `HIPFIRE_KVMEM_QUERY_SPAN` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_RECALL_STRATEGY` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_RECENT_BLOCKS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+-| `HIPFIRE_KVMEM_SELECT_INTERVAL` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_SELECT_METHOD` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_SINK_BLOCKS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+-| `HIPFIRE_KVMEM_SPILL_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+-| `HIPFIRE_KVMEM_SPILL_DIR` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
++| `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_GQA_DECODE` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_KVMEM_HOST_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
++| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
++| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
++| `HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
++| `HIPFIRE_KVMEM_LRFU` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_LRFU_LAMBDA` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_LRFU_TOP` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_PREFIX_COVERAGE` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_KVMEM_PREFIX_COVERAGE_INTERVAL` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_KVMEM_PREFIX_PIN` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/kvmem_prefix.rs | developer |
++| `HIPFIRE_KVMEM_PREFIX_PIN_BYTES` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_KVMEM_QUERY_SPAN` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_RECALL_STRATEGY` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_RECENT_BLOCKS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
++| `HIPFIRE_KVMEM_SELECT_INTERVAL` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_SELECT_METHOD` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_SESSIONS` | crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_SINK_BLOCKS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
++| `HIPFIRE_KVMEM_SPILL_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_SPILL_DIR` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
+ | `HIPFIRE_KVMEM_TAP_COPY` | crates/hipfire-arch-qwen35/src/kvmem_taps.rs | developer |
+-| `HIPFIRE_KVMEM_TIME` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+-| `HIPFIRE_KVMEM_TRACE` | crates/hipfire-daemon/src/slots.rs, crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
++| `HIPFIRE_KVMEM_TIME` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/kvmem_taps.rs | developer |
++| `HIPFIRE_KVMEM_TRACE` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+ | `HIPFIRE_KVMEM_TRACE_KEEP` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+ | `HIPFIRE_KVMEM_TRACE_PAGES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+-| `HIPFIRE_KVMEM_VERIFY` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
++| `HIPFIRE_KVMEM_VERIFY` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+ | `HIPFIRE_KV_ADAPTIVE` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-config/src/lib.rs | stable |
+ | `HIPFIRE_KV_BACKEND` | crates/hipfire-loader/src/admission.rs, scripts/guard_gfx1201_baseline.py | developer |
+ | `HIPFIRE_KV_BF16` | crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-dispatch/src/families/kv_tier.rs | developer |
+@@ -2341,6 +2352,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_LOCAL` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-cli/src/main.rs | stable |
+ | `HIPFIRE_LOCK_DIR` | crates/hipfire-cli/src/doctor/probe.rs, crates/hipfire-cli/src/main.rs | developer |
+ | `HIPFIRE_LOG` | crates/hipfire-daemon/src/process_init.rs | developer |
++| `HIPFIRE_LOGIT_PROBE` | crates/saddle-lab/examples/infer.rs | harness |
+ | `HIPFIRE_LOG_FORMAT` | crates/hipfire-daemon/src/process_init.rs, scripts/check-env-docs.py | developer |
+ | `HIPFIRE_LOWBIT_WMMA_WAVES` | crates/rdna-compute/src/gemm.rs | developer |
+ | `HIPFIRE_M7_TEST_CASE` | crates/peacemaker-isa/src/pm_check.rs, scripts/check-env-docs.py | developer |
+@@ -2453,7 +2465,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_MOE_PROJECTION_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
+ | `HIPFIRE_MOE_ROTATE_I4_PM` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/moe_rotate_i4_pm_oracle.rs | developer |
+ | `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
+-| `HIPFIRE_MOE_ROUTER_SHARED_FUSE` | crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
++| `HIPFIRE_MOE_ROUTER_SHARED_FUSE` | crates/hipfire-arch-qwen35/src/lib.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
+ | `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
+ | `HIPFIRE_MOE_ROUTE_DUMP` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
+ | `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
+@@ -2508,12 +2520,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_MQ6_RESID_PM_GFX1100` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
+ | `HIPFIRE_MQ6_RESID_PORT_GFX1100` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
+ | `HIPFIRE_MQ6_ROWS_SPLIT` | crates/rdna-compute/examples/mq6_rows_split_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+-| `HIPFIRE_MQV2_BT_SCREEN_BITS3` | crates/rdna-compute/examples/test_mqv2_bt_gfx11.rs | harness |
++| `HIPFIRE_MQV2_BT_SCREEN_BITS3` | crates/rdna-compute/examples/bench_mq3_prefill_shapes.rs, crates/rdna-compute/examples/test_mqv2_bt_gfx11.rs | harness |
+ | `HIPFIRE_MQV2_GFX11_SCREEN` | crates/rdna-compute/src/gemm.rs | developer |
+ | `HIPFIRE_MQV2_GFX11_WMMA` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-runtime/src/llama.rs | developer |
++| `HIPFIRE_MQV2_MQ3_MW` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
++| `HIPFIRE_MQV2_MW_SCREEN_BITS3` | crates/rdna-compute/examples/test_mqv2_mw_gfx11.rs | harness |
+ | `HIPFIRE_MQ_F16_PROJECTION_OFF` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/mq_f16_producers.rs | developer |
+ | `HIPFIRE_MQ_F16_RESIDUAL_OFF` | crates/rdna-compute/src/feature_flags.rs | developer |
+ | `HIPFIRE_MQ_PROLOGUE_FUSE_OFF` | crates/rdna-compute/src/feature_flags.rs | developer |
++| `HIPFIRE_MTP_ACCEPT_STATS` | crates/hipfire-runtime/src/spec.rs | developer |
+ | `HIPFIRE_MTP_AR_FLOOR` | crates/hipfire-arch-qwen4/src/mesh_lane_protocol.rs, crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
+ | `HIPFIRE_MTP_BYTE_IDENTITY_HEAD` | crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs, crates/hipfire-arch-qwen35/tests/mtp_step_oracle.rs | harness |
+ | `HIPFIRE_MTP_BYTE_IDENTITY_MODEL` | crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs, crates/hipfire-arch-qwen35/tests/mtp_step_oracle.rs | harness |
+@@ -2645,6 +2660,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_PP_RESET_MODEL` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
+ | `HIPFIRE_PREFILL_BATCHED` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs | stable |
+ | `HIPFIRE_PREFILL_CHUNK` | crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
++| `HIPFIRE_PREFILL_CHUNK_OVERRIDE` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+ | `HIPFIRE_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/examples/prefill_ragged_oracle.rs | stable |
+ | `HIPFIRE_PREFILL_IU4_C8_PM` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
+ | `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
+@@ -3072,6 +3088,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_RDNA3_SIGMOID_M2048` | crates/rdna-compute/src/kernels.rs | developer |
+ | `HIPFIRE_RDNA3_SIGMOID_ROWS4` | crates/rdna-compute/src/kernels.rs | developer |
+ | `HIPFIRE_REAP_PLAN` | crates/hipfire-arch-deepseek4/src/deepseek4.rs, crates/hipfire-arch-lfm2moe/src/config.rs | developer |
++| `HIPFIRE_REASONING_CLOSE_RETRY` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | developer |
++| `HIPFIRE_REASONING_LOOP_RECOVERY` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/main.rs | developer |
+ | `HIPFIRE_REDLINE_DISPATCH_PROFILE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/pm4_ledger.rs | experimental |
+ | `HIPFIRE_REDLINE_GAP_TIMING` | crates/rdna-compute/src/gap_timing.rs | developer |
+ | `HIPFIRE_REDLINE_IB_POOL` | crates/rdna-compute/src/replay.rs | developer |
+@@ -3081,12 +3099,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_REDLINE_POOL_DEBUG` | crates/hipfire-config/src/lib.rs, crates/redline-rocr/src/runtime.rs | experimental |
+ | `HIPFIRE_REDLINE_PROBE_VMEMAP` | crates/redline-rocr/src/runtime.rs | developer |
+ | `HIPFIRE_REDLINE_QUEUE_TIMEOUT` | crates/redline-rocr/src/runtime.rs | developer |
+-| `HIPFIRE_REASONING_CLOSE_RETRY` | crates/hipfire-daemon/src/slots.rs | experimental |
+-| `HIPFIRE_REASONING_LOOP_RECOVERY` | crates/hipfire-daemon/src/slots.rs | experimental |
+ | `HIPFIRE_REGISTRY_URL` | crates/hipfire-cli/src/main.rs, crates/hipfire-config/src/lib.rs | stable |
+ | `HIPFIRE_RELEASES_LATEST_API` | scripts/install.sh, scripts/test_install_revision.py | harness |
+ | `HIPFIRE_REMOTE` | scripts/mi300x_bootstrap.sh | harness |
+-| `HIPFIRE_REPEAT_STOP_TOKENS` | crates/hipfire-daemon/src/slots.rs | experimental |
++| `HIPFIRE_REPEAT_STOP_TOKENS` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | developer |
+ | `HIPFIRE_REPLAY_BACKEND` | crates/hipfire-arch-qwen35/examples/mq4_prefill_state_oracle.rs, crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs | stable |
+ | `HIPFIRE_REPLAY_BINDINGS_VERIFY` | crates/rdna-compute/src/replay.rs | developer |
+ | `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE` | crates/hipfire-dispatch/src/pipeline/sealed_moe.rs | developer |
+@@ -3257,8 +3273,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_SLOTS_ATTN_CROSSOVER` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+ | `HIPFIRE_SLOTS_DECODE_GRAPH` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+ | `HIPFIRE_SLOTS_PAGED` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+-| `HIPFIRE_SLOTS_PAGED_PAGES` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+-| `HIPFIRE_SLOT_TRACE` | crates/rdna-compute/src/feature_flags.rs, scripts/serve_concurrency_gate.sh | developer |
++| `HIPFIRE_SLOTS_PAGED_PAGES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_SLOT_TRACE` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-arch-qwen35/src/spec_emit.rs | developer |
+ | `HIPFIRE_SLOWLINK_HW_MODEL` | crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs | harness |
+ | `HIPFIRE_SLOWLINK_HW_ROWS` | crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs | harness |
+ | `HIPFIRE_SLOW_TOKEN_LOG` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs | harness |
+@@ -3270,7 +3286,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_SPECULATION` | crates/hipfire-config/src/lib.rs, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | stable |
+ | `HIPFIRE_SPEC_LOOKUP_TAIL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-config/src/lib.rs | developer |
+ | `HIPFIRE_SPEC_PHASES` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
+-| `HIPFIRE_SPEC_RETIRE` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-generate/src/qwen.rs | developer |
++| `HIPFIRE_SPEC_RETIRE` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs | developer |
+ | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-config/src/lib.rs | developer |
+ | `HIPFIRE_SPE_OUT_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
+ | `HIPFIRE_SPILL_DIR` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/pipeline.rs | stable |
+@@ -3293,7 +3309,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_TEST_REQUIRE_ROCM` | crates/peacemaker-cdna/src/oracle.rs, crates/peacemaker-cdna/tests/enc_sop.rs | developer |
+ | `HIPFIRE_TEST_TARGET` | crates/hipfire-arch-qwen35/examples/dflash_draft_emit_oracle.rs, crates/hipfire-arch-qwen35/tests/dflash_lookup_state_oracle.rs | harness |
+ | `HIPFIRE_TEXT_OUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
++| `HIPFIRE_THINKING_ANSWER_ROOM` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | developer |
+ | `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs | developer |
++| `HIPFIRE_THINK_RECOVER_TRACE` | crates/hipfire-generate/src/ar.rs | developer |
+ | `HIPFIRE_TIER_RATIO` | crates/hipfire-quantize/src/cli.rs | developer |
+ | `HIPFIRE_TOKBENCH_ONLY` | crates/hipfire-runtime/tests/hf_tokenizer_encode_bench.rs | harness |
+ | `HIPFIRE_TOKBENCH_REPS` | crates/hipfire-runtime/tests/hf_tokenizer_encode_bench.rs | harness |
