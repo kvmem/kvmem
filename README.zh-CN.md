@@ -101,6 +101,8 @@ python scripts/prepare-backends.py --check
 
 引擎使用固定版本的子模块和集成补丁，GitHub 自动生成的 Source ZIP 不含完整子模块。构建要求与命令见 [源码准备与构建](docs/multi-backend-repository.md)；AMD 用户另见 [ROCm 指南](docs/rocm.md)。源码主线与已发布运行包的功能可能不同。
 
+NInfer worker 也可以构建成容器镜像：`scripts/docker/build.sh` 先准备引擎再执行 `docker build`，说明见 [Docker 镜像](docs/docker-image.md)。
+
 <a id="defaults"></a>
 <a id="performance"></a>
 <a id="documentation"></a>
@@ -113,7 +115,7 @@ python scripts/prepare-backends.py --check
 | KV 召回与内存管理 | [图召回](docs/graph-recall.md) · [RAM / SSD 分层](docs/active-kv-tiering.md) |
 | 设计与后端接入 | [架构](docs/architecture.md) · [内存后端契约](docs/memory-backend-contract.md) |
 | AMD Radiance | [Windows 与 Linux 接入指南](docs/radiance-integration.md) · [性能对比](docs/radiance/PERFORMANCE-COMPARISON.md) · [Radiance 1.17 执行与传输测量](docs/radiance-execution-overhead-20261107.md) |
-| 构建与发布 | [开发工作流](docs/multi-backend-repository.md) · [后端版本与许可证](backends/versions.json) |
+| 构建与发布 | [开发工作流](docs/multi-backend-repository.md) · [后端版本与许可证](backends/versions.json) · [Docker 镜像](docs/docker-image.md) |
 | 测试与性能 | [验证记录](docs/multi-backend-validation.md) · [性能报告](docs/recommended-config-performance.md) · [测试数据](docs/benchmarks/) |
 
 测试报告保留各自的版本、硬件与参数条件，不代表所有运行包或设备的表现。更多专题见 [docs/](docs/)。
