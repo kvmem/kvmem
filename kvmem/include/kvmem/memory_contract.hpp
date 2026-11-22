@@ -38,7 +38,7 @@ struct SessionIdentity {
 };
 // PackedKeyValue preserves a backend-native page (including its scales) as an
 // opaque byte record. Append new kinds to preserve existing serialized values.
-enum class PayloadPlaneKind { Key, Value, KeyScale, ValueScale, PackedKeyValue };
+enum class PayloadPlaneKind { Key, Value, KeyScale, ValueScale, PackedKeyValue, RawKey };
 struct PayloadPlane {
     uint32_t layer = 0; // model layer identity, not a dense attention-layer index
     PayloadPlaneKind kind = PayloadPlaneKind::Key;

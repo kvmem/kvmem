@@ -20,6 +20,14 @@ Legacy 的评分器、聚合、graph alpha、LRFU 和 Query/replay 上限保存�
 可选只代表程序声明了分层能力，模型、KV 格式或草稿组合仍需检查配置。
 旧配置中的不可用策略（包括旧版 NInfer）保持原值并阻止启动；可切回 Legacy，已填写的参数仍会保留。
 
+## 紧凑 RoPE
+
+在 NInfer 的命令行增加 `--kvmem-re-rope`，可让每层 attention 使用连续的缓存槽作为文本 RoPE 位置。适用于单 GPU、FP8 KV、原生 64 维无缩放 RoPE 的 Qwen 文本模型，支持普通解码和 MTP。省略该选项时使用原文位置。
+
+开启后，KV 页多保存一份归一化后的 BF16 K。文档压力压缩和最终 Query 回填后，GPU 根据该层的新页顺序重新旋转 K，并按原有的 FP8 格式编码。V 使用原生搬运路径。新 Q 和 K 都从紧凑尾部继续。Mean-K 仍使用旋转前的投影，压力评分使用本轮前向产生的 attention，因此重新运行时各层选页可能变化。
+
+额外 BF16 平面计入 GPU 缓存和主机归档，FP8 布局下每个 KV head、每个 token 增加 512 字节。包含紧凑 RoPE 页的检查点使用对应的页布局。
+
 ## 实验性混合 Query 评分
 
 NInfer dense Qwen 27B 可设置 `NINFER_LAYERWISE_HYBRID_QUERY=1`：最终 Query 在模型层 **3、7、11、15**（从 0 编号）按各层已接受的 prefill attention `mass / exposure` 排序；沿用 Pressure 的衰减、曝光归一化和同分时偏向较新页的规则。候选仅限该层此时驻留的历史页，已淘汰的冷页不能借用残留统计重新进入。必选 sink／recent／显式保留页仍计入相同历史预算；统计缺失、必选页已不驻留或候选不足时明确报错。

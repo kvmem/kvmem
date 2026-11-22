@@ -1,0 +1,1065 @@
+diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
+index e4865cc..d3717fe 100644
+--- a/apps/cli/options.cpp
++++ b/apps/cli/options.cpp
+@@ -178,6 +178,7 @@ std::string usage_text(const char* argv0) {
+            "  --kvmem-layerwise-staging-mib N          bounded transfer staging (default 16)\n"
+            "  --kvmem-layerwise-score-tokens N   Mean-K statistics per 64-token page: 32 or 64 (default 64)\n"
+            "  --kvmem-layerwise-half-reduce MODE   32-token half-page scores: sum (default) or max\n"
++           "  --kvmem-re-rope                    Rotate layerwise FP8 keys at compact positions\n"
+            "  --kvmem-layerwise-unique-query-anchor    keep a long unique exact match within the history budget\n"
+            "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
+            "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+@@ -778,6 +779,7 @@ Options parse_options(int argc, char** argv) {
+     options.kvmem.layerwise_unique_query_anchor = retention.query_anchor;
+     options.kvmem.layerwise_score_tokens = retention.score_tokens;
+     options.kvmem.layerwise_half_max = retention.half_max;
++    options.kvmem.layerwise_compact_rope = retention.compact_rope;
+     (void)options.kvmem.mean_key_block_tokens();
+     if (memory.enabled) {
+         const auto window=options.kvmem.device_tokens();
+diff --git a/docs/serving.md b/docs/serving.md
+index 472bd37..20fb904 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -3029,6 +3029,14 @@ The C++ Engine equivalent is `PreparedPrompt::set_layerwise_request_policy`
+ with `KvmemRequestPolicy` from `ninfer/layerwise_request.h`; it keeps the
+ prepared prompt's original tokens and tokenizer provenance.
+ 
++On single-device Qwen3.5-core text serving with FP8 KV, `--kvmem-re-rope`
++uses the dense cache slots as RoPE positions. The native page includes the
++normalized BF16 key. Pressure and Query restores rotate it at the new slot
++and encode the result in the FP8 execution cache. This also applies to the MTP
++cache and continuation. This option requires unscaled 64-dimensional Qwen
++RoPE with theta 1e7. The added BF16 key plane counts against both KV budgets in
++bytes. The default uses the original text positions.
++
+ ### KVMem statistics extension
+ 
+ For experimental single-GPU Qwen prefill, `NINFER_PREFILL_PAGE_LSE_REUSE=1`
+diff --git a/include/ninfer/engine_options.h b/include/ninfer/engine_options.h
+index 6ae3a47..01738f1 100644
+--- a/include/ninfer/engine_options.h
++++ b/include/ninfer/engine_options.h
+@@ -473,6 +473,7 @@ struct KvmemOptions {
+     bool layerwise_unique_query_anchor = false;
+     std::uint32_t layerwise_score_tokens = 64;
+     bool layerwise_half_max = false;
++    bool layerwise_compact_rope = false;
+     [[nodiscard]] std::uint32_t mean_key_block_tokens() const {
+         if (layerwise_half_max && (recall_strategy != kvmem::RecallStrategy::Layerwise || layerwise_score_tokens != 32))
+             throw std::invalid_argument("half-page max requires layerwise recall and 32-token Mean-K");
+diff --git a/src/models/qwen3_5/execution/attention.cpp b/src/models/qwen3_5/execution/attention.cpp
+index 81748d4..7a52928 100644
+--- a/src/models/qwen3_5/execution/attention.cpp
++++ b/src/models/qwen3_5/execution/attention.cpp
+@@ -174,18 +174,21 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
+                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
+                        Tensor& normalized_key, const ops::RopeYarn& yarn, cudaStream_t stream,
+                        const MemoryStatisticsShard* statistics, std::int32_t layer,
+-                       const CurrentLayerQueryBoundary* boundary, CurrentLayerQueryIdentity identity) {
++                       const CurrentLayerQueryBoundary* boundary, CurrentLayerQueryIdentity identity,
++                       const ops::RawKeyWrite& raw_key) {
+     require_rope_axes(positions, rope);
+     if (boundary != nullptr) { require_current_layer_query_eager(*boundary, stream); }
+     // The fused Op rotates unscaled positions at the unscaled frequencies, so YaRN or position
+     // interpolation keeps the three separate calls.
+-    if (boundary == nullptr && statistics == nullptr && !yarn.active() && fused_text_qk_norm_rope(positions, rope, attention, rms_norm_eps, query.ne[2])) {
++    if (boundary == nullptr && statistics == nullptr && !raw_key && !yarn.active() &&
++        fused_text_qk_norm_rope(positions, rope, attention, rms_norm_eps, query.ne[2])) {
+         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
+                           normalized_key, stream);
+         return;
+     }
+     text_qk_norm(attention, rms_norm_eps, q_norm_weight, k_norm_weight, query, key,
+                  normalized_query, normalized_key, stream, statistics, layer);
++    if (raw_key) ops::write_raw_keys(raw_key, normalized_key, stream);
+     if (boundary != nullptr && boundary->projected != nullptr) {
+         boundary->projected(boundary->owner,
+             CurrentLayerQueryFrame{identity, normalized_query, normalized_key, positions, stream});
+diff --git a/src/models/qwen3_5/execution/attention.h b/src/models/qwen3_5/execution/attention.h
+index 42b1e5f..7ebd7c3 100644
+--- a/src/models/qwen3_5/execution/attention.h
++++ b/src/models/qwen3_5/execution/attention.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "ops/kv_cache/re_rope.h"
++
+ #include "models/qwen3_5/execution/parameters.h"
+ #include "models/qwen3_5/execution/rotation.h"
+ #include "ninfer/ops/rope.h"
+@@ -134,6 +136,7 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
+                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
+                        Tensor& normalized_key, const ops::RopeYarn& yarn, cudaStream_t stream,
+                        const MemoryStatisticsShard* statistics, std::int32_t layer,
+-                       const CurrentLayerQueryBoundary* boundary, CurrentLayerQueryIdentity identity);
++                       const CurrentLayerQueryBoundary* boundary, CurrentLayerQueryIdentity identity,
++                       const ops::RawKeyWrite& raw_key = {});
+ 
+ } // namespace ninfer::models::qwen3_5::execution
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index f1c3bee..c7c7cf3 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -351,6 +351,22 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
+     }
+ }
+ 
++ops::RawKeyWrite TextContext::raw_key_destination(std::uint32_t layer, const Tensor& positions,
++                                                  bool auxiliary) const {
++    const auto& cache = auxiliary ? mtp_kv_ : kv_;
++    if (!active_sequence_batch_) {
++        const auto* raw = cache.raw_key_pages(layer);
++        if (!raw) return {};
++        return {raw, positions, cache.layer_view(layer).block_table, nullptr, nullptr, positions.ne[0]};
++    }
++    const auto* batch = auxiliary ? batch_mtp_kv_ : batch_text_kv_;
++    const auto* raw = batch ? batch->raw_key_pages(layer) : nullptr;
++    if (!raw) return {};
++    return {raw, positions, batch->batch_layer_view(layer).block_tables,
++            auxiliary ? active_backend_kv_table_rows_ : active_kv_table_rows_,
++            active_valid_columns_, active_sequence_width_};
++}
++
+ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
+                                    const Tensor& rope_positions,
+                                    ops::CausalAttentionExecutionEnvelope envelope,
+@@ -387,10 +403,12 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
+     Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
+                                              dimension(config_.attention->num_key_value_heads), T});
+ 
+-    Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
++    const auto raw_key = raw_key_destination(0, positions, true);
++    const Tensor rope_for_op = raw_key ? positions.view({T}) :
++        active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
+     text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
+                       config_.rms_norm_eps, mtp_->query_norm, mtp_->key_norm, q, k, qn, kn,
+-                      rope_yarn_, s);
++                      rope_yarn_, s, nullptr, 0, nullptr, {}, raw_key);
+ 
+     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
+                                        dimension(config_.attention->num_attention_heads), T});
+@@ -1057,7 +1075,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
+             work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
+                                       dimension(config_.attention->num_key_value_heads), T});
+         ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
+-        text_rope(rope_positions, *config_.rope_parameters, rope_yarn_, kn, s);
++        const auto raw_key = raw_key_destination(0, positions, true);
++        if (raw_key) ops::write_raw_keys(raw_key, kn, s);
++        text_rope(raw_key ? positions : rope_positions, *config_.rope_parameters, rope_yarn_, kn, s);
+         ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+ 
+         if (final_chunk) {
+@@ -1102,7 +1122,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
+                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
+             }
+         }
+-        text_rope(last_rope_position, *config_.rope_parameters, rope_yarn_, qn, s);
++        text_rope(mtp_kv_.raw_key_pages(0) ? last_position : last_rope_position,
++                  *config_.rope_parameters, rope_yarn_, qn, s);
+ 
+         Tensor a = work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
+                                              dimension(config_.attention->num_attention_heads), 1});
+@@ -1616,7 +1637,10 @@ void TextContext::consume_query_attention(PreparedLayerQuery& prepared, const Te
+     prepared.state_ = PreparedLayerQuery::State::Consuming;
+     try {
+         auto scope = work_.scope();
+-        text_rope(storage.rope_positions, *config_.rope_parameters, rope_yarn_,
++        const auto raw_key = raw_key_destination(prepared.identity_.attention_layer, storage.cache_positions);
++        if (raw_key) ops::write_raw_keys(raw_key, storage.key, ctx_.stream);
++        text_rope(raw_key ? storage.cache_positions : storage.rope_positions,
++                   *config_.rope_parameters, rope_yarn_,
+                    storage.query, storage.key, ctx_.stream);
+         MemoryStatisticsShard local;
+         std::int32_t statistics_layer;
+@@ -1952,14 +1976,16 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
+     const Tensor& rope_positions =
+         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
+-    Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
++    const auto raw_key = raw_key_destination(fidx, cache_positions);
++    const Tensor rope_for_op = raw_key ? cache_positions.view({T}) :
++        active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
+     MemoryStatisticsShard local_statistics;
+     std::int32_t statistics_layer;
+     const auto* statistics = memory_statistics_for_layer(fidx, local_statistics, statistics_layer);
+     text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config.attention,
+                       config_.rms_norm_eps, p.query_norm, p.key_norm, q, k, qn, kn, rope_yarn_,
+                       s, statistics, statistics_layer, current_layer_query_boundary_,
+-                      {model_layer, static_cast<std::uint32_t>(fidx), ctx_.active_rank()});
++                      {model_layer, static_cast<std::uint32_t>(fidx), ctx_.active_rank()}, raw_key);
+     capture_post_rope_query(qn, fidx, statistics);
+     Tensor a = results.attention.view({dimension(config.attention->head_dim),
+                                        dimension(config.attention->num_attention_heads), T});
+diff --git a/src/models/qwen3_5/execution/text.h b/src/models/qwen3_5/execution/text.h
+index 83b277f..455a9c1 100644
+--- a/src/models/qwen3_5/execution/text.h
++++ b/src/models/qwen3_5/execution/text.h
+@@ -12,7 +12,7 @@
+ #include "ninfer/ops/rope.h"
+ #include "ninfer/ops/sampling.h"
+ #include "ninfer/ops/softmax_attention.h"
+-namespace ninfer::ops { struct PromptPageLse; }
++namespace ninfer::ops { struct PromptPageLse; struct RawKeyWrite; }
+ #include "ninfer/ops/sparse_moe.h"
+ #include "models/qwen3_5/state/decoder_state.h"
+ #include "models/qwen3_5/frontend/prepared_prompt.h"
+@@ -432,6 +432,9 @@ private:
+                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
+ 
++    [[nodiscard]] ops::RawKeyWrite raw_key_destination(
++        std::uint32_t layer, const Tensor& positions, bool auxiliary = false) const;
++
+     // `ah`, where given, takes the attention's input; a divided attention normalizes on each rank.
+     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
+                           Tensor& x, Tensor* ah);
+diff --git a/src/models/qwen3_5/program/planning/request_plan.cpp b/src/models/qwen3_5/program/planning/request_plan.cpp
+index c9a57a4..646d00c 100644
+--- a/src/models/qwen3_5/program/planning/request_plan.cpp
++++ b/src/models/qwen3_5/program/planning/request_plan.cpp
+@@ -406,6 +406,9 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
+     if (prompt.has_media() && !vision_enabled) {
+         throw std::invalid_argument("Vision is disabled for this Engine");
+     }
++    if (kvmem_options.layerwise_compact_rope && (prompt.has_media() || prompt.rope_delta != 0)) {
++        throw std::invalid_argument("--kvmem-re-rope supports only text with a single position coordinate");
++    }
+     validate_sampling(options.sampling);
+ 
+     auto base                             = std::make_unique<RequestBasePlanImpl>();
+diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
+index c333e67..cc0d8dd 100644
+--- a/src/models/qwen3_5/program/planning/startup.cpp
++++ b/src/models/qwen3_5/program/planning/startup.cpp
+@@ -234,6 +234,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
+                               .text_kv_position_ranks    = kv_position_ranks,
+                               .mtp_kv_head_shares        = std::move(mtp_kv_head_shares),
+                               .invariant_attention       = plan.invariant_attention,
++                              .retain_raw_keys            = plan.kvmem.layerwise_compact_rope,
+                           };
+     out.decoder = plan.features.mtp() && plan.kvmem.recall_strategy == kvmem::RecallStrategy::Layerwise
+         ? qwen3_5::plan_decoder_state_with_auxiliary_capacity(builder_pointers, decoder_spec,
+@@ -1385,6 +1386,16 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
+         parameters.model.config().text.full_attention_layers == 0) {
+         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
+     }
++    if (options.kvmem.layerwise_compact_rope) {
++        const auto& text = parameters.model.config().text;
++        if (device.size() != 1 || !text.rope_parameters ||
++            text.rope_parameters->rotary_dim != 64 ||
++            text.rope_parameters->rope_theta != 1.0e7F ||
++            runtime::resolve_rope_scaling(options, text.max_position_embeddings,
++                                          runtime::kQwen35RopeScaling).yarn.active()) {
++            throw std::invalid_argument("--kvmem-re-rope requires the unscaled Qwen rotary geometry (64D, theta 1e7)");
++        }
++    }
+     if (parameters.model.options() != models::load_options(options)) {
+         throw std::invalid_argument(
+             "loaded components do not match the requested execution options");
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index 6c92424..148613a 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -544,6 +544,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+     }
+     if (kvmem_window_tokens) {
+         if (kvmem_options.recall_strategy==kvmem::RecallStrategy::Layerwise) {
++            if (kvmem_options.layerwise_compact_rope) {
++                std::fprintf(stderr, "KVMEM_ROPE mode=compact raw_key=bf16 working_key=fp8\n");
++            }
+             const auto target = kvmem_options.checkpoint_target;
+             if (!target || target > kMaxLayerwiseCheckpointTarget)
+                 throw std::invalid_argument("layerwise checkpoint target must be in 1..256");
+diff --git a/src/models/qwen3_5/program/storage/kv_store.h b/src/models/qwen3_5/program/storage/kv_store.h
+index 9a2ed9b..507130d 100644
+--- a/src/models/qwen3_5/program/storage/kv_store.h
++++ b/src/models/qwen3_5/program/storage/kv_store.h
+@@ -1874,6 +1874,10 @@ public:
+         return *address.row;
+     }
+ 
++    [[nodiscard]] Tensor device_page_table(KVAddressSpaceHandle handle) const {
++        return tables_->row(execution_row(handle).handle());
++    }
++
+     [[nodiscard]] DeviceKVPageHandle physical_page(KVAddressSpaceHandle handle,
+                                                    std::uint32_t logical_page) const {
+         const Address& address = require(handle);
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index 4bc6a8f..98c66a9 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -21,6 +21,7 @@
+ #include "ninfer/ops/argmax.h"
+ #include "ninfer/ops/readout_logprobs.h"
+ #include "ninfer/ops/scalar.h"
++#include "ops/kv_cache/re_rope.h"
+ 
+ #include <atomic>
+ #include <chrono>
+@@ -195,14 +196,16 @@ kvmem::MemoryDescriptor native_window_descriptor(ProgramImpl& program,const Host
+         break;
+     default: throw std::logic_error("Unsupported KVMem native KV storage");
+     }
+-    d.layout = {layout_name, 2, page_tokens, page_bytes, 256, {}};
++    const auto& cache = program.decoder->text_kv;
++    const std::string format = cache.retains_raw_keys() ? std::string(layout_name) + ".raw-key" : layout_name;
++    d.layout = {format, 2, page_tokens, page_bytes, 256, {}};
+     const auto& config = program.parameters.model.config().text;
+-    const std::uint32_t planes = program.kv_storage == KvCacheStorage::BFloat16 ? 2 : 4;
++    const std::uint32_t planes = (program.kv_storage == KvCacheStorage::BFloat16 ? 2 : 4) +
++        cache.retains_raw_keys();
+     const kvmem::PayloadPlaneKind kinds[] = {kvmem::PayloadPlaneKind::Key,
+         kvmem::PayloadPlaneKind::Value, kvmem::PayloadPlaneKind::KeyScale,
+-        kvmem::PayloadPlaneKind::ValueScale};
++        kvmem::PayloadPlaneKind::ValueScale, kvmem::PayloadPlaneKind::RawKey};
+     std::size_t ordinal = 0;
+-    const auto& cache = program.decoder->text_kv;
+     if (cache.position_ranks() > 1)
+         throw std::logic_error("KVMem native pages require heads attention");
+     const auto shares = cache.head_shares();
+@@ -245,7 +248,7 @@ kvmem::MemoryDescriptor native_window_descriptor(ProgramImpl& program,const Host
+             throw std::logic_error("KVMem auxiliary KV plane groups mismatch");
+         }
+         const auto auxiliary_planes = mtp_layout->planes.size() / groups;
+-        if (auxiliary_planes != 2 && auxiliary_planes != 4) {
++        if (auxiliary_planes != 2 && auxiliary_planes != (mtp->retains_raw_keys() ? 5U : 4U)) {
+             throw std::logic_error("KVMem auxiliary KV has an unsupported storage geometry");
+         }
+         std::size_t mtp_ordinal = 0;
+@@ -1375,6 +1378,11 @@ struct NativeLayerwiseProgramQuery::Impl {
+         if (selected!=pending_maps.auxiliary_pages.end() && *selected==id) {
+             const auto slot=static_cast<std::uint32_t>(selected-pending_maps.auxiliary_pages.begin());
+             pool.copy_page(scratch.front(),p.backend_kv_addresses->physical_page(*sequence.kv->backend,slot),p.compute_streams);
++            if (const auto* raw = context.mtp_kv.raw_key_pages(0)) {
++                const auto cache = context.mtp_kv.layer_view(0);
++                ops::materialize_compact_keys(*raw, cache.k_pages, cache.k_scale_pages,
++                    cache.block_table, slot * kPagedKVPageSize, kPagedKVPageSize, p.device.stream);
++            }
+             p.device.synchronize();
+         }
+         auxiliary_boundary_ready=true;
+diff --git a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp
+index 87388b5..e4ae0f9 100644
+--- a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp
++++ b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp
+@@ -1,5 +1,6 @@
+ #include "models/qwen3_5/program/storage/layerwise_kv_transfer.h"
+ #include "models/qwen3_5/program/storage/layerwise_refresh_profile.h"
++#include "ops/kv_cache/re_rope.h"
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
+@@ -10,6 +11,32 @@ LayerRestoreTrace*& active_layer_restore_trace() noexcept {
+     static thread_local LayerRestoreTrace* active=nullptr;return active;
+ }
+ namespace {
++std::optional<NativeCompactKeyPlanes> compact_planes(
++    const kvmem::NativeKvLayerRegions& regions, std::span<const std::size_t> planes) {
++    NativeCompactKeyPlanes result{SIZE_MAX, SIZE_MAX, SIZE_MAX};
++    const auto items = regions.regions();
++    for (std::size_t i = 0; i < items.size(); ++i) {
++        switch (items[i].plane.kind) {
++        case kvmem::PayloadPlaneKind::Key: result.key = planes[i]; break;
++        case kvmem::PayloadPlaneKind::KeyScale: result.scale = planes[i]; break;
++        case kvmem::PayloadPlaneKind::RawKey: result.raw = planes[i]; break;
++        default: break;
++        }
++    }
++    if (result.raw == SIZE_MAX) return std::nullopt;
++    if (items.size() != 5 || result.key == SIZE_MAX || result.scale == SIZE_MAX)
++        throw std::logic_error("pre-RoPE plane requires a native FP8 key and scale plane");
++    return result;
++}
++
++void materialize_compact_stripe(const NativeCompactKeyPlanes& planes, DeviceKVPagePool& pool,
++                                KVAddressSpaceStore& addresses, KVAddressSpaceHandle address,
++                                std::uint32_t tokens, cudaStream_t stream) {
++    if (!tokens) return;
++    ops::materialize_compact_keys(pool.plane(planes.raw), pool.plane(planes.key),
++        pool.plane(planes.scale), addresses.device_page_table(address), 0, tokens, stream);
++}
++
+ bool same_history(const kvmem::MemoryStamp& a,const kvmem::MemoryStamp& b) {
+     auto left=a,right=b;left.view_version=right.view_version=0;return left==right;
+ }
+@@ -100,6 +127,7 @@ kvmem::ExecutionView restore_native_layer_stripe(
+     // the host record pitch differ. The pool's existing restricted-plane copy
+     // accesses exactly these regions, preserving native codes/scales verbatim.
+     host.page_stride=static_cast<std::size_t>(regions.packed_bytes());
++    const auto compact = compact_planes(regions, planes);
+     KVLayerStripeWrite::require_unpublished_destination(addresses,address,pool,
+         static_cast<std::uint32_t>(selected.size()));
+     for (std::size_t rank=0;rank<device.size();++rank) {
+@@ -140,9 +168,11 @@ kvmem::ExecutionView restore_native_layer_stripe(
+         }
+         if(trace) {trace->pack_ms+=LayerRestoreTrace::elapsed(phase);phase=LayerRestoreTrace::Clock::now();}
+         uploads.submitted=true;
+-        for (auto plane:planes)
++        for (auto plane:planes) {
++            if (compact && !verify && (plane == compact->key || plane == compact->scale)) continue;
+             pool.copy_from_host_records({records.data(),count},{},{destinations.data(),count},
+                 host,plane,plane+1,streams);
++        }
+         uploads.record(slot);
+         if(trace) {trace->submit_ms+=LayerRestoreTrace::elapsed(phase);phase=LayerRestoreTrace::Clock::now();}
+         if (verify) uploads.wait(slot);
+@@ -174,6 +204,12 @@ kvmem::ExecutionView restore_native_layer_stripe(
+     }
+     const auto final_wait=trace?LayerRestoreTrace::Clock::now():LayerRestoreTrace::Clock::time_point{};
+     uploads.finish();if (trace) trace->wait_ms+=LayerRestoreTrace::elapsed(final_wait);
++    if (compact) {
++        DeviceBinding binding(device.rank(0).device);
++        materialize_compact_stripe(*compact, pool, addresses, address,
++                                   checked.next.visible_tokens, streams[0]);
++        CUDA_CHECK(cudaStreamSynchronize(streams[0]));
++    }
+     return checked.next;
+ }
+ NativeResidentStripe plan_native_resident_stripe(const kvmem::MemoryDescriptor& descriptor,
+@@ -212,6 +248,8 @@ NativeResidentStripe plan_native_resident_stripe(const kvmem::MemoryDescriptor&
+             throw std::logic_error("resident stripe does not match its physical pool");
+         result.planes.push_back(index);
+     }
++    result.compact_keys = compact_planes(regions, result.planes);
++    result.visible_tokens = static_cast<std::uint32_t>(checked.next.visible_tokens);
+     return result;
+ }
+ 
+@@ -253,5 +291,9 @@ void submit_native_resident_stripe(const NativeResidentStripe& recipe,DeviceKVPa
+         }
+         first+=count;
+     }
++    if (recipe.compact_keys) {
++        materialize_compact_stripe(*recipe.compact_keys, pool, addresses, address,
++                                   recipe.visible_tokens, streams[0]);
++    }
+ }
+ } // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.h b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.h
+index c51516f..5a10a97 100644
+--- a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.h
++++ b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.h
+@@ -39,9 +39,14 @@ kvmem::ExecutionView restore_native_layer_stripe(
+ // is at least that destination. Ascending copies therefore cannot destroy a
+ // later unread source. COW changes physical handles, never these logical slots.
+ struct LayerRestoreTrace;
++struct NativeCompactKeyPlanes {
++    std::size_t raw, key, scale;
++};
+ struct NativeResidentStripe {
+     std::vector<std::uint32_t> source_slots;
+     std::vector<std::size_t> planes;
++    std::optional<NativeCompactKeyPlanes> compact_keys;
++    std::uint32_t visible_tokens = 0;
+ };
+ NativeResidentStripe plan_native_resident_stripe(const kvmem::MemoryDescriptor&,
+     const kvmem::MemorySnapshot&,const kvmem::LayerWorkingSetPlan&,const DeviceKVPagePool&);
+diff --git a/src/models/qwen3_5/state/decoder_state.cpp b/src/models/qwen3_5/state/decoder_state.cpp
+index 07ad5c5..5879c2e 100644
+--- a/src/models/qwen3_5/state/decoder_state.cpp
++++ b/src/models/qwen3_5/state/decoder_state.cpp
+@@ -22,7 +22,8 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
+                               std::uint32_t position_ranks, std::uint32_t layers,
+                               std::uint32_t capacity, std::int32_t kv_heads, std::int32_t head_dim,
+                               KvCacheStorage storage, std::int32_t table_rows,
+-                              std::uint32_t physical_page_groups, bool invariant_attention) {
++                              std::uint32_t physical_page_groups, bool invariant_attention,
++                              bool retain_raw_keys = false) {
+     if (layers == 0 ||
+         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
+         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
+@@ -53,6 +54,10 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
+         }
+     }
+     const bool positions = position_ranks > 1;
++    if (retain_raw_keys &&
++        (builders.size() != 1 || storage != KvCacheStorage::Fp8E4M3Row256)) {
++        throw std::invalid_argument("pre-RoPE key planes require a single-device FP8 pool");
++    }
+     if (positions && (!head_shares.empty() || !layer_rank.empty() ||
+                       position_ranks > static_cast<std::uint32_t>(builders.size()) ||
+                       position_ranks > physical_page_groups)) {
+@@ -73,7 +78,7 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
+                   : (head_shares.empty() ? std::span<const std::int32_t>(one_share) : head_shares);
+     KVPageGeometry geometry;
+     std::vector<std::size_t> plane_rank;
+-    const std::size_t planes_per_share = scaled ? 4ULL : 2ULL;
++    const std::size_t planes_per_share = (scaled ? 4ULL : 2ULL) + retain_raw_keys;
+     const std::size_t planes_per_layer = planes_per_share * shares.size();
+     geometry.planes.reserve(static_cast<std::size_t>(layers) * planes_per_layer);
+     plane_rank.reserve(static_cast<std::size_t>(layers) * planes_per_layer);
+@@ -82,6 +87,7 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
+         {profile.value_code_dtype, profile.value_leading_extent},
+         {profile.key_scale_dtype, profile.scale_leading_extent},
+         {profile.value_scale_dtype, profile.value_scale_leading_extent},
++        {DType::BF16, head_dim},
+     };
+     for (std::uint32_t layer = 0; layer < layers; ++layer) {
+         if (positions) {
+@@ -131,6 +137,7 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
+         .position_ranks   = positions ? position_ranks : 0U,
+         .attention_segment_keys =
+             invariant_attention ? ops::causal_attention_invariant_segment_keys(capacity) : 0U,
++        .retain_raw_keys = retain_raw_keys,
+     };
+     for (const std::size_t rank : table_ranks) {
+         if (rank >= builders.size() || builders[rank] == nullptr) {
+@@ -171,12 +178,12 @@ DecoderStateLayout plan_decoder_state_with_auxiliary_capacity(
+                                 spec.text_kv_position_ranks, spec.full_attention_layers,
+                                 spec.capacity, spec.kv_heads, spec.attention_head_dim,
+                                 spec.kv_storage, spec.kv_table_rows,
+-                                spec.text_physical_page_groups, spec.invariant_attention);
++                                spec.text_physical_page_groups, spec.invariant_attention, spec.retain_raw_keys);
+     if (spec.enable_mtp) {
+         layout.mtp_kv = plan_cache(spec.mtp_kv_head_shares.empty() ? builders.first(1) : builders,
+                                    {}, spec.mtp_kv_head_shares, 0, spec.mtp_layers, auxiliary_capacity,
+                                    spec.kv_heads, spec.attention_head_dim, spec.kv_storage,
+-                                   spec.kv_table_rows, spec.mtp_physical_page_groups, false);
++                                   spec.kv_table_rows, spec.mtp_physical_page_groups, false, spec.retain_raw_keys);
+     }
+     return layout;
+ }
+@@ -219,7 +226,7 @@ PagedKVCache::PagedKVCache(std::span<const DeviceSpan> backings, const PagedKVCa
+       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
+       head_dim_(layout.head_dim), storage_(layout.storage), head_shares_(layout.head_shares),
+       position_ranks_(layout.position_ranks),
+-      attention_segment_keys_(layout.attention_segment_keys) {}
++      attention_segment_keys_(layout.attention_segment_keys), retain_raw_keys_(layout.retain_raw_keys) {}
+ 
+ PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, KVExecutionRowHandle row) noexcept
+     : cache_(&cache), row_(row) {}
+@@ -233,6 +240,14 @@ PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer, std::size_t r
+     return cache_->layer_view(layer, &row_, rank);
+ }
+ 
++const Tensor* PagedKVCacheView::raw_key_pages(std::uint32_t layer) const {
++    return cache_ ? cache_->raw_key_pages(layer) : nullptr;
++}
++
++const Tensor* PagedKVCache::raw_key_pages(std::uint32_t layer) const {
++    return retain_raw_keys_ ? &pages_.plane(plane_index(layer, 0, 4)) : nullptr;
++}
++
+ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) const {
+     if (!row.belongs_to(execution_tables_)) {
+         throw std::invalid_argument("Paged KV execution row belongs to another cache");
+@@ -247,7 +262,7 @@ std::size_t PagedKVCache::plane_index(std::uint32_t layer, std::size_t rank,
+         position_ranks_ > 1 ? position_ranks_ : (head_shares_.empty() ? 1 : head_shares_.size());
+     if (rank >= shares) { throw std::out_of_range("Paged KV rank holds no heads of the layer"); }
+     const bool scaled        = ops::d256_kv_cache_profile(storage_).quant_group != 0;
+-    const std::size_t kinds  = scaled ? 4ULL : 2ULL;
++    const std::size_t kinds  = (scaled ? 4ULL : 2ULL) + retain_raw_keys_;
+     const std::size_t first  = static_cast<std::size_t>(layer) * shares * kinds;
+     return position_ranks_ > 1 ? first + kind * shares + rank : first + rank * kinds + kind;
+ }
+diff --git a/src/models/qwen3_5/state/decoder_state.h b/src/models/qwen3_5/state/decoder_state.h
+index 0ae5112..4429ae4 100644
+--- a/src/models/qwen3_5/state/decoder_state.h
++++ b/src/models/qwen3_5/state/decoder_state.h
+@@ -42,6 +42,7 @@ struct DecoderStateSpec {
+     // calls split their keys into fixed segments for the capacity
+     // (ops::causal_attention_invariant_segment_keys).
+     bool invariant_attention = false;
++    bool retain_raw_keys = false;
+ };
+ 
+ struct PagedKVCacheLayout {
+@@ -59,6 +60,7 @@ struct PagedKVCacheLayout {
+     std::uint32_t position_ranks = 0;
+     // Invariant attention reductions: the keys of one split, 0 for the tuned splits.
+     std::uint32_t attention_segment_keys = 0;
++    bool retain_raw_keys = false;
+ 
+     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
+ };
+@@ -74,6 +76,7 @@ public:
+     [[nodiscard]] std::uint32_t max_context() const noexcept;
+     // `rank`: a tensor-parallel rank's heads of the layer; 0 otherwise.
+     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, std::size_t rank = 0) const;
++    [[nodiscard]] const Tensor* raw_key_pages(std::uint32_t layer) const;
+ 
+ private:
+     friend class PagedKVCache;
+@@ -99,6 +102,8 @@ public:
+     [[nodiscard]] std::uint32_t max_context() const noexcept { return max_context_; }
+ 
+     [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
++    [[nodiscard]] bool retains_raw_keys() const noexcept { return retain_raw_keys_; }
++    [[nodiscard]] const Tensor* raw_key_pages(std::uint32_t layer) const;
+ 
+     [[nodiscard]] DeviceKVPagePool& page_pool() noexcept { return pages_; }
+ 
+@@ -138,7 +143,7 @@ private:
+     friend class PagedKVCacheView;
+     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, const KVExecutionRowHandle* row,
+                                               std::size_t rank) const;
+-    // A rank's plane of a layer: `kind` 0 K, 1 V, 2 K scales, 3 V scales.
++    // A rank's plane of a layer: K, V, optional scales, then optional pre-RoPE K.
+     [[nodiscard]] std::size_t plane_index(std::uint32_t layer, std::size_t rank,
+                                           std::size_t kind) const;
+ 
+@@ -152,6 +157,7 @@ private:
+     std::vector<std::int32_t> head_shares_;
+     std::uint32_t position_ranks_         = 0;
+     std::uint32_t attention_segment_keys_ = 0;
++    bool retain_raw_keys_ = false;
+ };
+ 
+ struct DecoderStateLayout {
+diff --git a/src/ops/kv_cache/re_rope.cu b/src/ops/kv_cache/re_rope.cu
+new file mode 100644
+index 0000000..14edf80
+--- /dev/null
++++ b/src/ops/kv_cache/re_rope.cu
+@@ -0,0 +1,126 @@
++#include "ops/kv_cache/re_rope.h"
++
++#include "core/device.h"
++#include "ops/common/warp.cuh"
++#include "ops/kernel/rope.cuh"
++#include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
++#include "ops/kv_cache/hadamard_d256.cuh"
++
++#include <stdexcept>
++
++namespace ninfer::ops {
++namespace {
++
++constexpr int kTokensPerBlock = 4;
++
++__global__ void write_raw(const __nv_bfloat16* key, __nv_bfloat16* raw, const int* positions,
++                          const int* tables, int table_stride, const int* rows,
++                          const int* valid, int width, int tokens, int heads) {
++    const int token = blockIdx.x * kTokensPerBlock + threadIdx.y;
++    if (token >= tokens) return;
++    const int sequence = token / width;
++    if (valid && token % width >= valid[sequence]) return;
++    const int* table = tables + (rows ? static_cast<std::int64_t>(rows[sequence]) * table_stride : 0);
++    const int pos = positions[token];
++    const int page = paged_kv_physical_page(table, pos);
++    const int head = blockIdx.y;
++    const int lane = threadIdx.x;
++#pragma unroll
++    for (int group = 0; group < 8; ++group) {
++        const int dim = lane + 32 * group;
++        raw[kv_cache_fp8_code_index(page, head, dim, pos & kPagedKVPageMask, heads)] =
++            key[kv_cache_fp8_src_index(head, dim, token, heads)];
++    }
++}
++
++__global__ void rebuild_keys(const __nv_bfloat16* raw, std::uint8_t* keys, __half* scales,
++                             const int* table, int begin, int count, int heads) {
++    const int token = blockIdx.x * kTokensPerBlock + threadIdx.y;
++    if (token >= count) return;
++    const int pos = begin + token;
++    const int page = paged_kv_physical_page(table, pos);
++    const int offset = pos & kPagedKVPageMask;
++    const int head = blockIdx.y;
++    const int lane = threadIdx.x;
++    float values[8];
++#pragma unroll
++    for (int group = 0; group < 8; ++group) {
++        values[group] = __bfloat162float(
++            raw[kv_cache_fp8_code_index(page, head, lane + 32 * group, offset, heads)]);
++    }
++    float sine, cosine;
++    sincosf(static_cast<float>(pos) * kTextRopeInvFrequency[lane], &sine, &cosine);
++    const float first = values[0], second = values[1];
++    values[0] = __bfloat162float(__float2bfloat16_rn(first * cosine - second * sine));
++    values[1] = __bfloat162float(__float2bfloat16_rn(first * sine + second * cosine));
++    normalized_hadamard_d256_inplace(values, lane);
++    float maximum = 0.0F;
++    for (float v : values) maximum = fmaxf(maximum, fabsf(v));
++    const auto quant = kv_cache_fp8_quant_params(warp_max(maximum, 0xffffffffU));
++#pragma unroll
++    for (int group = 0; group < 8; ++group) {
++        keys[kv_cache_fp8_code_index(page, head, lane + 32 * group, offset, heads)] =
++            kv_cache_fp8_quant_code(values[group], quant.inverse_scale);
++    }
++    if (!lane) scales[kv_cache_fp8_scale_index(page, head, offset, heads)] = quant.scale;
++}
++
++bool is_page_plane(const Tensor& plane, int leading, int heads, int pages) {
++    return plane.data && plane.is_contiguous() && plane.ne[0] == leading &&
++        plane.ne[1] == kPagedKVPageSize && plane.ne[2] == heads && plane.ne[3] == pages;
++}
++
++bool is_i32_input(const Tensor& tensor, std::int64_t size) {
++    return tensor.data && tensor.dtype == DType::I32 && tensor.is_contiguous() &&
++        tensor.numel() == size;
++}
++
++} // namespace
++
++void write_raw_keys(const RawKeyWrite& output, const Tensor& normalized_key, cudaStream_t stream) {
++    if (!output) return;
++    const auto& raw = *output.pages;
++    const int heads = raw.ne[2], tokens = normalized_key.ne[2];
++    const int width = output.columns_per_sequence;
++    const auto& table = output.page_tables;
++    if (raw.dtype != DType::BF16 || !is_page_plane(raw, 256, heads, raw.ne[3]) ||
++        normalized_key.dtype != DType::BF16 || !normalized_key.is_contiguous() ||
++        normalized_key.ne[0] != 256 || normalized_key.ne[1] != heads ||
++        width <= 0 || tokens <= 0 || tokens % width ||
++        !is_i32_input(output.positions, tokens) ||
++        !table.data || table.dtype != DType::I32 || !table.is_contiguous() ||
++        (output.table_rows && !is_i32_input(*output.table_rows, tokens / width)) ||
++        (output.valid_columns && (!output.table_rows ||
++            !is_i32_input(*output.valid_columns, tokens / width))) ||
++        (!output.table_rows && width != tokens)) {
++        throw std::invalid_argument("invalid pre-RoPE key write geometry");
++    }
++    write_raw<<<dim3((tokens + kTokensPerBlock - 1) / kTokensPerBlock, heads),
++                dim3(32, kTokensPerBlock), 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(normalized_key.data),
++        static_cast<__nv_bfloat16*>(raw.data),
++        static_cast<const int*>(output.positions.data), static_cast<const int*>(table.data), table.ne[0],
++        output.table_rows ? static_cast<const int*>(output.table_rows->data) : nullptr,
++        output.valid_columns ? static_cast<const int*>(output.valid_columns->data) : nullptr,
++        width, tokens, heads);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void materialize_compact_keys(const Tensor& raw, const Tensor& key, const Tensor& scale,
++                              const Tensor& table, int begin, int count, cudaStream_t stream) {
++    const int heads = raw.ne[2], pages = raw.ne[3];
++    if (begin < 0 || count <= 0 || (std::int64_t(begin) + count - 1) / kPagedKVPageSize >= table.ne[0] ||
++        raw.dtype != DType::BF16 || !is_page_plane(raw, 256, heads, pages) ||
++        key.dtype != DType::FP8_E4M3FN || !is_page_plane(key, 256, heads, pages) ||
++        scale.dtype != DType::FP16 || !is_page_plane(scale, 1, heads, pages) ||
++        table.dtype != DType::I32 || !table.is_contiguous() || !table.data) {
++        throw std::invalid_argument("invalid compact FP8 key materialization");
++    }
++    rebuild_keys<<<dim3((count + kTokensPerBlock - 1) / kTokensPerBlock, heads),
++                   dim3(32, kTokensPerBlock), 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(raw.data), static_cast<std::uint8_t*>(key.data),
++        static_cast<__half*>(scale.data), static_cast<const int*>(table.data), begin, count, heads);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/kv_cache/re_rope.h b/src/ops/kv_cache/re_rope.h
+new file mode 100644
+index 0000000..6bb00ca
+--- /dev/null
++++ b/src/ops/kv_cache/re_rope.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include "core/tensor.h"
++
++#include <cuda_runtime_api.h>
++
++namespace ninfer::ops {
++
++// A write uses the attention call's positions and page table, including its valid
++// column mask. The raw plane therefore follows the same ownership as native K/V.
++struct RawKeyWrite {
++    const Tensor* pages = nullptr;
++    Tensor positions;
++    Tensor page_tables;
++    const Tensor* table_rows = nullptr;
++    const Tensor* valid_columns = nullptr;
++    int columns_per_sequence = 0;
++
++    explicit operator bool() const noexcept { return pages != nullptr; }
++};
++
++void write_raw_keys(const RawKeyWrite&, const Tensor& normalized_key, cudaStream_t);
++
++// Rebuild represented FP8 K and its scales from the normalized BF16 plane.
++// The rows' position indices are their dense logical slots in the page table.
++void materialize_compact_keys(const Tensor& raw_pages, const Tensor& key_pages,
++                              const Tensor& scale_pages, const Tensor& page_table,
++                              int begin, int count, cudaStream_t);
++
++} // namespace ninfer::ops
+diff --git a/src/ops/kv_cache/sources.cmake b/src/ops/kv_cache/sources.cmake
+index 97659ab..1339c90 100644
+--- a/src/ops/kv_cache/sources.cmake
++++ b/src/ops/kv_cache/sources.cmake
+@@ -3,4 +3,5 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/append/launch.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/append/nvfp4_launch.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/append/k8v4_launch.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/re_rope.cu"
+ )
+diff --git a/src/product/kvmem_cli_options.h b/src/product/kvmem_cli_options.h
+index c4348ea..99a3929 100644
+--- a/src/product/kvmem_cli_options.h
++++ b/src/product/kvmem_cli_options.h
+@@ -15,6 +15,7 @@ struct NativeRetentionOptions {
+     bool query_anchor = false;
+     std::uint32_t score_tokens = 64;
+     bool half_max = false;
++    bool compact_rope = false;
+ 
+     template<class Need>
+     bool parse(const std::string& arg, const Need& need, kvmem::CliOptions& memory) {
+@@ -24,6 +25,8 @@ struct NativeRetentionOptions {
+             target = memory.integer(arg, need(arg.c_str()), 1);
+             if (target > kMaxLayerwiseCheckpointTarget)
+                 throw std::invalid_argument("checkpoint target exceeds 256");
++        } else if (arg == "--kvmem-re-rope") {
++            compact_rope = true;
+         } else if (arg == "--kvmem-layerwise-half-reduce") {
+             const std::string value(need(arg.c_str()));
+             if (value != "sum" && value != "max")
+diff --git a/src/runtime/engine/engine.cpp b/src/runtime/engine/engine.cpp
+index 36d0a2b..47926ce 100644
+--- a/src/runtime/engine/engine.cpp
++++ b/src/runtime/engine/engine.cpp
+@@ -88,6 +88,9 @@ EngineOptions with_family_steering(EngineOptions options) {
+ // partial-sum exchange is the Qwen3.5 Program's and Flash-Next's; the other families divide only
+ // their routed experts and sum them their own way.
+ EngineOptions with_family_attention(EngineOptions options) {
++    if (options.kvmem.layerwise_compact_rope && own_family_artifact(options.artifact_path)) {
++        throw std::invalid_argument("--kvmem-re-rope applies to Qwen3.5-core text artifacts");
++    }
+     if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
+         own_family_artifact(options.artifact_path)) {
+         throw std::invalid_argument(
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index fa1d88f..e5e73dd 100644
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -323,6 +323,15 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
+ } // namespace
+ 
+ EngineOptions normalize_engine_options(EngineOptions options) {
++    if (options.kvmem.layerwise_compact_rope &&
++        (options.kvmem.recall_strategy != kvmem::RecallStrategy::Layerwise ||
++         options.kv_cache != KvCacheStorage::Fp8E4M3Row256 ||
++         options.tensor_parallel || options.devices.size() > 1 ||
++         (options.speculative.backend != SpeculativeBackend::None &&
++          options.speculative.backend != SpeculativeBackend::Mtp))) {
++        throw std::invalid_argument(
++            "--kvmem-re-rope requires single-device layerwise FP8 generation with ordinary decode or MTP");
++    }
+     if (options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise &&
+         options.speculative.backend==SpeculativeBackend::Mtp &&
+         options.kvmem.layerwise_mtp_history==kvmem::LayerwiseMtpHistory::Unspecified)
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 0c40949..52d49db 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -128,6 +128,7 @@ std::string serve_usage_text(const char* argv0) {
+            "  --kvmem-layerwise-activation-disk-mib N bounded Query activation SSD (default 0)\n"
+            "  --kvmem-layerwise-staging-mib N bounded Query/KV transfer staging (default 16)\n"
+            "  --kvmem-layerwise-score-tokens N   Mean-K statistics per 64-token page: 32 or 64 (default 64)\n"
++           "  --kvmem-re-rope                    Rotate layerwise FP8 keys at compact positions\n"
+            "  --kvmem-layerwise-half-reduce MODE   32-token half-page scores: sum (default) or max\n"
+            "  --kvmem-layerwise-unique-query-anchor    keep a long unique exact match within the history budget\n"
+            "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
+@@ -1834,6 +1835,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+     options.kvmem.layerwise_unique_query_anchor = retention.query_anchor;
+     options.kvmem.layerwise_score_tokens = retention.score_tokens;
+     options.kvmem.layerwise_half_max = retention.half_max;
++    options.kvmem.layerwise_compact_rope = retention.compact_rope;
+     (void)options.kvmem.mean_key_block_tokens();
+     kvmem::validate_layerwise_mtp_history(memory.recall_strategy,
+         options.speculative.backend==SpeculativeBackend::Mtp,memory.layerwise_mtp_history);
+diff --git a/tests/ops/test_kv_cache_append.cpp b/tests/ops/test_kv_cache_append.cpp
+index 1da37d4..df2d781 100644
+--- a/tests/ops/test_kv_cache_append.cpp
++++ b/tests/ops/test_kv_cache_append.cpp
+@@ -1,4 +1,6 @@
+ #include "ninfer/ops/kv_cache_append.h"
++#include "ninfer/ops/rope.h"
++#include "ops/kv_cache/re_rope.h"
+ #include "ops/kv_cache_e8_root_host.h"
+ #include "ops/kv_cache_lloyd4_oracle.h"
+ #include "ops/op_tester.h"
+@@ -2047,6 +2049,146 @@ public:
+     }
+ };
+ 
++int compact_key_case(int heads, int begin, int count) {
++    const int first_page = begin / kPage;
++    const int logical_pages = (begin + count + kPage - 1) / kPage;
++    constexpr int physical_pages = 8;
++    constexpr auto code_sentinel = std::uint8_t{0x55};
++    constexpr auto scale_sentinel = std::uint16_t{0x4321};
++    std::vector<int> table(logical_pages, -1);
++    constexpr int physical_order[]{4, 0, 7};
++    for (int i = first_page; i < logical_pages; ++i) table[i] = physical_order[i - first_page];
++    std::vector<int> positions(count);
++    fill_iota_i32(positions, begin);
++    std::vector<float> source(std::size_t(count) * heads * kFullHeadDim);
++    fill_uniform(source, 4421 + begin + heads, -1.5F, 1.5F);
++    round_to_bf16(source);
++    auto dk = to_device_bf16(source);
++    auto dp = to_device(positions);
++    auto dt = to_device(table);
++
++    const auto rows = kPage * heads * physical_pages;
++    auto raw = to_device(std::vector<std::uint16_t>(rows * kFullHeadDim, 0));
++    auto codes = to_device(std::vector<std::uint8_t>(rows * kFullHeadDim, code_sentinel));
++    auto scales = to_device(std::vector<std::uint16_t>(rows, scale_sentinel));
++    Tensor key(dk.p, DType::BF16, {kFullHeadDim, heads, count});
++    const Tensor pos(dp.p, DType::I32, {count});
++    const Tensor page_table(dt.p, DType::I32, {logical_pages});
++    const Tensor raw_plane(raw.p, DType::BF16, {kFullHeadDim, kPage, heads, physical_pages});
++    const Tensor code_plane(codes.p, DType::FP8_E4M3FN, {kFullHeadDim, kPage, heads, physical_pages});
++    const Tensor scale_plane(scales.p, DType::FP16, {1, kPage, heads, physical_pages});
++    ops::write_raw_keys({&raw_plane, pos, page_table, nullptr, nullptr, count}, key, nullptr);
++    ops::materialize_compact_keys(raw_plane, code_plane, scale_plane, page_table, begin, count, nullptr);
++
++    // Independent coordinate, BF16 rounding, Hadamard and row FP8 encoding oracle.
++    auto expected_codes = std::vector<std::uint8_t>(rows * kFullHeadDim, code_sentinel);
++    auto expected_scales = std::vector<std::uint16_t>(rows, scale_sentinel);
++    auto expected_raw = std::vector<std::uint16_t>(rows * kFullHeadDim, 0);
++    for (int i = 0; i < count; ++i) {
++        const int slot = begin + i;
++        const int physical = table.at(slot / kPage);
++        for (int head = 0; head < heads; ++head) {
++            std::array<float, kFullHeadDim> values;
++            for (int dim = 0; dim < kFullHeadDim; ++dim) {
++                values[dim] = source[full_input_index(dim, head, i, heads)];
++                expected_raw[full_cache_index(kFullHeadDim, dim, head, slot, physical, heads)] =
++                    f32_to_bf16(values[dim]);
++            }
++            for (int dim = 0; dim < 32; ++dim) {
++                const double angle = slot * std::pow(1.0e7, -double(dim) / 32);
++                const double a = values[dim], b = values[dim + 32];
++                values[dim] = bf16_to_f32(f32_to_bf16(float(a * std::cos(angle) - b * std::sin(angle))));
++                values[dim + 32] = bf16_to_f32(f32_to_bf16(float(a * std::sin(angle) + b * std::cos(angle))));
++            }
++            normalized_hadamard_d256_host(values);
++            encode_full_fp8_row(values, expected_codes, head, slot, physical, heads, expected_scales);
++        }
++    }
++    // A second check locks the restoration to the live FP32-frequency math
++    // and the native represented FP8 byte stream, including rounding ties.
++    const auto actual_codes = from_device<std::uint8_t>(codes, expected_codes.size());
++    const auto actual_scales = from_device<std::uint16_t>(scales, expected_scales.size());
++    auto direct_k = to_device(std::vector<std::uint8_t>(expected_codes.size(), code_sentinel));
++    auto direct_s = to_device(std::vector<std::uint16_t>(expected_scales.size(), scale_sentinel));
++    auto direct_v = to_device(std::vector<std::uint8_t>(expected_codes.size(), code_sentinel));
++    auto direct_vs = to_device(std::vector<std::uint16_t>(expected_scales.size(), scale_sentinel));
++    auto values = to_device_bf16(source);
++    ops::rope(pos, 64, 1.0e7F, {}, key, nullptr);
++    ops::kv_cache_append(key, Tensor(values.p, DType::BF16, {kFullHeadDim, heads, count}), pos,
++        {Tensor(direct_k.p, DType::FP8_E4M3FN, {kFullHeadDim, kPage, heads, physical_pages}),
++         Tensor(direct_v.p, DType::FP8_E4M3FN, {kFullHeadDim, kPage, heads, physical_pages}),
++         Tensor(direct_s.p, DType::FP16, {1, kPage, heads, physical_pages}),
++         Tensor(direct_vs.p, DType::FP16, {1, kPage, heads, physical_pages}),
++         page_table, kFullHeadDim, heads, KvCacheStorage::Fp8E4M3Row256}, nullptr);
++    const auto label = "compact FP8 heads=" + std::to_string(heads) + " begin=" +
++        std::to_string(begin) + " count=" + std::to_string(count);
++    int failures = verify_exact((label + " raw").c_str(), from_device<std::uint16_t>(raw, expected_raw.size()), expected_raw) +
++        verify_exact((label + " native keys").c_str(), actual_codes, from_device<std::uint8_t>(direct_k, actual_codes.size())) +
++        verify_exact((label + " native scales").c_str(), actual_scales, from_device<std::uint16_t>(direct_s, actual_scales.size()));
++    // The independent FP64 result can land on the other side of a BF16 tie.
++    // Compare decoded values within the E4M3 spacing and the small rotary
++    // rounding allowance. Near zero a code-index difference is not meaningful.
++    for (std::size_t row = 0; row < expected_scales.size(); ++row) {
++        const bool touched = expected_scales[row] != scale_sentinel;
++        const int scale_distance = std::abs(int(expected_scales[row]) - int(actual_scales[row]));
++        if (scale_distance > (touched ? 2 : 0)) ++failures;
++        const float cpu_scale = f16_bits_to_f32(expected_scales[row]);
++        const float gpu_scale = f16_bits_to_f32(actual_scales[row]);
++        for (int dim = 0; dim < kFullHeadDim; ++dim) {
++            const auto idx = row * kFullHeadDim + dim;
++            const auto ref = expected_codes[idx], act = actual_codes[idx];
++            if (!touched) {
++                if (act != ref) ++failures;
++                continue;
++            }
++            const float want = (ref & 0x80 ? -cpu_scale : cpu_scale) * decode_e4m3fn_positive(ref & 0x7f);
++            const float got = (act & 0x80 ? -gpu_scale : gpu_scale) * decode_e4m3fn_positive(act & 0x7f);
++            const float tolerance = 0.125F * std::max(std::abs(want), std::abs(got)) +
++                0.003F * 448.0F * cpu_scale;
++            if (!(std::abs(want - got) <= tolerance)) ++failures;
++        }
++    }
++    if (failures) std::cerr << label << ": " << failures << " validation errors\n";
++    return failures;
++}
++
++int compact_key_batched_capture(bool masked) {
++    constexpr int heads = 2, sequences = 3;
++    constexpr int pages_per_row = 2, physical_pages = pages_per_row * sequences;
++    const int width = masked ? 4 : 1;
++    const int tokens = sequences * width;
++    const std::vector<int> table{0, 3, 2, 5, 4, 1};
++    const std::vector<int> table_rows{2, 0, 1};
++    const std::vector<int> valid{3, 0, 4};
++    std::vector<int> positions(tokens);
++    for (int i = 0; i < tokens; ++i) positions[i] = 62 + i % width;
++    auto bits = patterned_bits(tokens * heads * kFullHeadDim, 9183U);
++    std::vector<std::uint16_t> expected(kPage * heads * physical_pages * kFullHeadDim);
++    auto dk = to_device(bits), dt = to_device(table), dp = to_device(positions);
++    auto dr = to_device(table_rows), dv = to_device(valid), raw = to_device(expected);
++    const Tensor raw_plane(raw.p, DType::BF16, {kFullHeadDim, kPage, heads, physical_pages});
++    const Tensor key(dk.p, DType::BF16, {kFullHeadDim, heads, tokens});
++    const Tensor pos(dp.p, DType::I32, {width, sequences});
++    const Tensor page_table(dt.p, DType::I32, {pages_per_row, sequences});
++    const Tensor rows(dr.p, DType::I32, {sequences});
++    const Tensor counts(dv.p, DType::I32, {sequences});
++    ops::write_raw_keys({&raw_plane, pos, page_table, &rows, masked ? &counts : nullptr, width}, key, nullptr);
++    for (int i = 0; i < tokens; ++i) {
++        const int lane = i / width;
++        if (masked && i % width >= valid[lane]) continue;
++        const int slot = positions[i];
++        const int physical = table[table_rows[lane] * pages_per_row + slot / kPage];
++        for (int head = 0; head < heads; ++head) {
++            for (int dim = 0; dim < kFullHeadDim; ++dim) {
++                expected[full_cache_index(kFullHeadDim, dim, head, slot, physical, heads)] =
++                    bits[full_input_index(dim, head, i, heads)];
++            }
++        }
++    }
++    return verify_exact(masked ? "compact FP8 masked rows" : "compact FP8 ordinary rows",
++                        from_device<std::uint16_t>(raw, expected.size()), expected);
++}
++
+ int cyclic_variable_prefix_tests() {
+     int failures = 0;
+     CyclicPrefixFixture dflash2(2048);
+@@ -2085,12 +2227,22 @@ int main(int argc, char** argv) {
+ 
+     const bool nvfp4_only = argc == 2 && std::string_view(argv[1]) == "--nvfp4-only";
+     const bool k8v4_only  = argc == 2 && std::string_view(argv[1]) == "--k8v4-only";
+-    if (argc != 1 && !nvfp4_only && !k8v4_only) {
+-        std::cerr << "usage: ninfer_kv_cache_append_test [--nvfp4-only|--k8v4-only]\n";
++    const bool compact_only = argc == 2 && std::string_view(argv[1]) == "--compact-rope-only";
++    if (argc != 1 && !nvfp4_only && !k8v4_only && !compact_only) {
++        std::cerr << "usage: ninfer_kv_cache_append_test [--nvfp4-only|--k8v4-only|--compact-rope-only]\n";
+         return 2;
+     }
+ 
+     int failures = 0;
++    if (argc == 1 || compact_only) {
++        failures += compact_key_case(4, 0, 1);
++        failures += compact_key_case(2, 63, 11);
++        failures += compact_key_case(4, 128, 65);
++        failures += compact_key_case(4, 16364, 65);
++        failures += compact_key_batched_capture(false);
++        failures += compact_key_batched_capture(true);
++    }
++    if (compact_only) return failures == 0 ? 0 : 1;
+     if (nvfp4_only || k8v4_only) {
+         const KvCacheStorage storage =
+             nvfp4_only ? KvCacheStorage::Nvfp4Group16 : KvCacheStorage::Fp8KeyNvfp4Value;
+diff --git a/tests/ops/tests.cmake b/tests/ops/tests.cmake
+index 5542d07..3bf7c16 100644
+--- a/tests/ops/tests.cmake
++++ b/tests/ops/tests.cmake
+@@ -171,9 +171,13 @@ add_test(NAME ninfer_kv_cache_append_nvfp4_test
+ add_test(NAME ninfer_kv_cache_append_k8v4_test
+   COMMAND ninfer_tests ninfer_kv_cache_append_test --k8v4-only)
+ 
++add_test(NAME ninfer_kv_cache_compact_rope_test
++  COMMAND ninfer_tests ninfer_kv_cache_append_test --compact-rope-only)
++
+ set_tests_properties(
+   ninfer_kv_cache_append_nvfp4_test
+   ninfer_kv_cache_append_k8v4_test
++  ninfer_kv_cache_compact_rope_test
+   PROPERTIES SKIP_RETURN_CODE 77)
+ 
+ ninfer_add_op_test(ninfer_prepare_masked_block_test
