@@ -24,9 +24,9 @@ Legacy 的评分器、聚合、graph alpha、LRFU 和 Query/replay 上限保存�
 
 在 NInfer 的命令行增加 `--kvmem-re-rope`，可让文本注意力使用连续的缓存槽作为 RoPE 位置。支持 `legacy` 和 `layerwise` 两种召回策略，以及 `bf16`、`int8`、`fp8`、`rk8v4`、`rk4v4`、`rk4v4-e8`、`rk2v4-e8`、`nvfp4` 和 `k8v4`。各格式沿用其原生注意力的硬件要求。适用于单 GPU、原生 64 维无缩放 RoPE 的 Qwen 文本模型，支持普通解码和 MTP。
 
-开启后，KV 页多保存一份归一化后的 BF16 K。文档压力压缩和最终 Query 回填时，GPU 按各层的新页顺序重新旋转 K，并用所选 KV 格式的编码器写入 K 和对应的尺度。V 和 V 的尺度按原字节搬运。新 Q 和 K 都从紧凑尾部继续。Mean-K 使用旋转前的投影，压力评分使用本轮前向产生的 attention。
+默认使用原生 KV 编码。每层每个 token 增加一个由所有 KV head 共用的 4 字节位置。页留在原位时可直接复用，移动时按位置差旋转 K。同一块连续调整达到上限后，下次移动从归档中的首次编码和原位置重建。冷页同样走归档。V 和 V 的尺度按原字节搬运。新 Q/K 使用紧凑坐标。
 
-额外 BF16 平面计入 GPU 缓存和主机归档，每个 KV head、每个 token 增加 512 字节。启用此模式的检查点和磁盘缓存使用对应的布局。
+`--kvmem-re-rope-reuse-limit N` 可覆盖按 K 编码设置的默认上限。BF16、INT8 与 RK8V4 为 32，FP8 与 K8V4 为 8，NVFP4 与 RK4V4 为 2，RK4V4-E8 为 1，RK2V4-E8 为 0。0 表示每次移动均从归档重建。低位量化即使只调整一次也会有额外舍入。需要从完整归一化 K 重建时可用 `--kvmem-re-rope-source bf16`，此时每个 token、每个 KV head 增加 512 字节。两种模式和不同上限有独立的缓存标识。
 
 ## 实验性混合 Query 评分
 

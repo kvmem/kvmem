@@ -71,7 +71,7 @@ void PayloadLayout::validate() const {
         switch (p.kind) {
         case PayloadPlaneKind::Key: case PayloadPlaneKind::Value:
         case PayloadPlaneKind::KeyScale: case PayloadPlaneKind::ValueScale:
-        case PayloadPlaneKind::RawKey: break;
+        case PayloadPlaneKind::RawKey: case PayloadPlaneKind::KeyPosition: break;
         case PayloadPlaneKind::PackedKeyValue:
             if (p.token_stride)
                 fail(MemoryErrorCode::InvalidPlan, "packed KV pages require opaque token addressing");
