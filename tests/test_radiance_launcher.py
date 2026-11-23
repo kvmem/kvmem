@@ -33,20 +33,6 @@ class RadiancePlanTest(unittest.TestCase):
         parameters.update(settings)
         return build_plan(dict(schema_version=1,parameters=parameters))
 
-    def test_rdna3_profile_selects_qualified_kernel_and_rolling_path(self):
-        from launcher.config import RDNA3_IQR_DEFAULTS
-        parameters={**RDNA3_IQR_DEFAULTS,'Model':str(self.model),'Worker':str(self.worker),
-                    'RadianceHome':str(self.home),'Gpu':'GPU-65471d75ce486b4f'}
-        for profile in ('qwen35-iqr-gfx1101','qwen35-iqr-rdna3'):
-            plan=build_radiance_plan(parameters,self.root,'windows',False,{'build_profile':profile})
-            args=plan['argv']
-            self.assertEqual(args[args.index('--kernels')+1],'libr3diqr,libr3d')
-            self.assertIn('--kvmem-rolling-generation',args)
-            self.assertEqual((plan['effective_parameters']['Budget'],plan['effective_parameters']['KvType']),(1024,'bf16'))
-        normal=build_radiance_plan(parameters,self.root,'windows',False,{})['argv']
-        self.assertNotIn('--kernels',normal)
-        self.assertNotIn('--kvmem-rolling-generation',normal)
-
     def test_prefill_default_and_explicit_override(self):
         for settings, expected in (({}, 256), ({'Prefill': 512}, 512)):
             with self.subTest(settings=settings):

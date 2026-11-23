@@ -59,23 +59,6 @@ class PlatformLaunchTest(unittest.TestCase):
                     self.assertEqual(selected,[] if profile is None else ['-DR4D_PROFILE='+profile])
                     self.assertEqual(execute.call_args_list[1].args[0][-2:],['--target','radiance-kvmem-server'])
 
-    def test_linux_build_selects_rdna3_iqr_closure(self):
-        revision=json.loads((Path(build_linux.__file__).parents[1]/'upstream.json').read_text())['revision']
-        with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory); sdk=root/'sdk'
-            for relative in ('bin/hipcc','llvm/bin/clang++','lib/libamdhip64.so','lib/libhsa-runtime64.so'):
-                path=sdk/relative;path.parent.mkdir(parents=True,exist_ok=True);path.touch()
-            for arch, expected in [('gfx1100','ON'),('gfx1101','ON'),('gfx1200','OFF')]:
-                argv=['build_linux.py','--source',str(root/'native'),'--build',str(root/'build'),
-                      '--rocm',str(sdk),'--arch',arch,'--configure-only']
-                with self.subTest(arch=arch), patch.object(build_linux,'os') as host, \
-                        patch.object(sys,'argv',argv), \
-                        patch.object(build_linux,'source_revision',return_value=revision), \
-                        patch.object(build_linux.subprocess,'run') as execute:
-                    host.name='posix';host.environ.copy.return_value={}
-                    build_linux.main()
-                    self.assertIn('-DR3D_QUALIFY_QWEN_IQR='+expected,execute.call_args.args[0])
-
     def test_command_capacity_is_shared(self):
         config = serve.profile()
         cmd = serve.command_for(self.args(), config)
@@ -112,43 +95,9 @@ class PlatformLaunchTest(unittest.TestCase):
             self.assertEqual(resolved['arguments'][-1],'off')
             self.assertEqual(resolved['arguments'][args.index('--num-speculative-tokens')+1],'0')
 
-    def test_7800m_profile_disables_embedded_dflash_and_preserves_small_budget(self):
-        with tempfile.TemporaryDirectory() as directory:
-            a=self.args(Path(directory))
-            container(a.model,['dflash.fc.weight'],[
-                ('draft.architectures','DFlash2Model'),('draft.dflash_config.block_size',8)],
-                quant='w8a8_fwht128')
-            config=serve.profile('rx7800m-iq2r')
-            resolved,plugin=serve.model_profile(a,config)
-            self.assertEqual(plugin,'qwen35_w8a8')
-            args=resolved['arguments']
-            self.assertEqual(args[-2:],['--kvmem-drafter','off'])
-            self.assertEqual(args[args.index('--kvmem-budget')+1],'1024')
-            self.assertEqual(args[args.index('--max-num-batched-tokens')+1],'256')
-            self.assertEqual(args[args.index('--kv-cache-dtype')+1],'bf16')
-            self.assertEqual(config['kernel_plugins'],['libr3diqr','libr3d'])
-            a.drafter='dflash2'
-            speculative,_=serve.model_profile(a,config)
-            draft_args=speculative['arguments']
-            self.assertEqual(draft_args[-2:],['--kvmem-drafter','dflash2'])
-            for option,value in [('--num-speculative-tokens','7'),('--kvmem-budget','3072'),
-                                 ('--kvmem-recent-tokens','2176'),('--kv-cache-dtype','bf16')]:
-                self.assertEqual(draft_args[draft_args.index(option)+1],value)
-            self.assertEqual(config['arguments'][config['arguments'].index('--kvmem-budget')+1],'1024')
-            a.speculative_tokens=3
-            with self.assertRaisesRegex(ValueError,'trained block requires 7'):
-                serve.model_profile(a,config)
-            a.speculative_tokens=None
-            container(a.model,['mtp.0.weight'],[('qwen35.nextn_predict_layers',1)],quant='w8a8_fwht128')
-            a.drafter='mtp'
-            a.speculative_tokens=3
-            with self.assertRaisesRegex(ValueError,'no compatible kernel path for this drafter'):
-                serve.model_profile(a,config)
-            a.speculative_tokens=None
-            a.drafter='off'
-            container(a.model,[],[],quant='fp8_e4m3')
-            with self.assertRaisesRegex(ValueError,'no compatible model plugin'):
-                serve.model_profile(a,config)
+    def test_removed_windows_profile_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'unsupported Radiance profile'):
+            serve.profile('rx7800m-iq2r')
 
     def test_vocab_weighted_mtp_uses_u2_in_windows_and_linux_children(self):
         with tempfile.TemporaryDirectory() as directory:

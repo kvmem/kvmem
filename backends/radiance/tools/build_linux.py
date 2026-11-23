@@ -58,9 +58,8 @@ def main():
     arch = sorted(set(arch))
     if not arch or any(not re.fullmatch(r"gfx[0-9a-f]+", x) for x in arch):
         p.error(f"invalid/missing AMD architectures: {arch}")
-    rdna3_iqr = any(re.fullmatch(r"gfx110[0-3]", x) for x in arch)
-    if not rdna3_iqr and not any(x.startswith("gfx12") for x in arch):
-        p.error("this build supports RDNA3 gfx1100-1103 or RDNA4 gfx12 targets")
+    if any(x not in ("gfx1200", "gfx1201") for x in arch):
+        p.error("this KVMem build supports RDNA4 gfx1200 and gfx1201")
     a.build.mkdir(parents=True, exist_ok=True)
     command = ["cmake", "-S", str(a.source), "-B", str(a.build), "-G", "Ninja",
                "-DCMAKE_BUILD_TYPE=Release", "-DRAD_WITH_HIP=ON", "-DRAD_CORE_GENERIC_GPU_TARGETS=OFF", f"-DRAD_WITH_FFMPEG={a.ffmpeg}",
@@ -69,7 +68,6 @@ def main():
                f"-DRAD_GPU_TARGETS={';'.join(arch)}", f"-DCMAKE_HIP_ARCHITECTURES={';'.join(arch)}",
                f"-DRAD_HIP_RUNTIME={hip}", f"-DRAD_HSA_RUNTIME={hsa}",
                f"-DRAD_KVMEM_SOURCE_DIR={Path(__file__).resolve().parents[3]}"]
-    command.append(f"-DR3D_QUALIFY_QWEN_IQR={'ON' if rdna3_iqr else 'OFF'}")
     if a.kernel_profile is not None:command.append(f'-DR4D_PROFILE={a.kernel_profile}')
     if a.ffmpeg_static:command.append('-DPKG_CONFIG_ARGN=--static')
     if a.json_include:

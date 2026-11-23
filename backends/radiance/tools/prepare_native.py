@@ -19,6 +19,7 @@ def main():
     subprocess.run(['git', 'init', str(dest)], check=True)
     def git(*args):
         subprocess.run(['git', '-C', str(dest), *args], check=True)
+    git('config', 'core.autocrlf', 'false')
     git('remote', 'add', 'origin', meta['repository'])
     git('fetch', '--depth=1', 'origin', meta['revision'])
     git('checkout', '--detach', 'FETCH_HEAD')
