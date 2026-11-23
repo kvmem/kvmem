@@ -101,6 +101,8 @@ python scripts/prepare-backends.py --check
 
 Engines use pinned submodules and integration patches. GitHub-generated source ZIPs omit submodule contents. See [source preparation and builds](docs/multi-backend-repository.md) for requirements and commands, and the [ROCm guide](docs/rocm.md) for AMD. Mainline source and published packages may have different capabilities.
 
+The NInfer worker also builds as a container image: `scripts/docker/build.sh` prepares the engine and runs `docker build`. See [Docker image](docs/docker-image.md).
+
 <a id="defaults"></a>
 <a id="performance"></a>
 <a id="documentation"></a>
@@ -113,7 +115,7 @@ Engines use pinned submodules and integration patches. GitHub-generated source Z
 | KV retrieval and memory | [Graph recall](docs/graph-recall.md) · [RAM / SSD tiering](docs/active-kv-tiering.md) |
 | Design and backend integration | [Architecture](docs/architecture.md) · [Memory backend contract](docs/memory-backend-contract.md) |
 | Radiance on AMD | [Windows and Linux integration guide](docs/radiance-integration.md) · [Benchmark comparisons](docs/radiance/PERFORMANCE-COMPARISON.md) · [Radiance 1.17 execution and transfer measurements](docs/radiance-execution-overhead-20261107.md) |
-| Builds and releases | [Development workflow](docs/multi-backend-repository.md) · [Backend versions and licenses](backends/versions.json) |
+| Builds and releases | [Development workflow](docs/multi-backend-repository.md) · [Backend versions and licenses](backends/versions.json) · [Docker image](docs/docker-image.md) |
 | Tests and performance | [Validation records](docs/multi-backend-validation.md) · [Performance report](docs/recommended-config-performance.md) · [Benchmark data](docs/benchmarks/) |
 
 Reports retain their original versions, hardware and settings; their results do not apply to every package or device. Browse [docs/](docs/) for more topics.
