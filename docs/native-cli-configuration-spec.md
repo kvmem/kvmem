@@ -522,6 +522,7 @@ KVMem 新公共配置的默认策略由一份版本化定义提供，模板可�
 | `--thinking-budget-message` | 非空文本；达到预算时使用，必要时附加标准思考结束标记 |
 | `--default-reasoning-effort` | none/minimal/low/medium/high/xhigh/max；模型还可进一步约束 |
 | `--structured-output` | 开启 JSON/JSON Schema 响应约束；工具默认采用 `tool_constraints:auto`，显式 basic 或强制/strict 等工具约束独立于这个开关；none 默认不计算工具语法、不发布结构化调用；词表里恰好有一个文本为 `<tool_call>` 的 token 时，采样只禁掉这一个 token，其它拼法仍可能输出工具标签文本 |
+| `--default-tool-constraints` | basic/auto；请求省略 `tool_constraints` 字段时的服务端默认。只升级带 tools 声明的请求；`tool_choice:none` 与不带工具的请求保持 auto 原生路径；请求显式字段始终优先；不设置即完全保持现状 |
 | `--unconstrained-response-format` | 未开结构化输出时允许无约束生成对应格式请求；与 structured-output 互斥 |
 | `--assistant-prefill` | 继续末尾 assistant 内容；要求关闭思考 |
 | `--lenient-assistant-history` | 兼容 function_call 后的 assistant text/reasoning 历史布局 |

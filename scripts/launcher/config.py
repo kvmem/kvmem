@@ -117,14 +117,6 @@ RADIANCE_LAUNCH_DEFAULTS = dict(Backend='radiance', Context=65536, Budget=4096, 
     ThinkingMode='default', ThinkingBudget=0, VramReserveMiB=1024,
     VisionTokens=1024, VisionResidency='resident', EmbeddingPlacement='vram', CpuThreads=2, VisionCacheMiB=256,
     WeightPlacement='all_vram', WeightHostMiB=0)
-RDNA3_IQR_DEFAULTS = dict(Backend='radiance', Context=8192, Budget=1024, Reserve=512,
-    HostMiB=2048, SinkTokens=128, RecentTokens=256, Concurrency=1, RetainedSessions=1,
-    QueryScorer='page-softmax', ScoreAggregation='mean', GraphAlpha=.2, Lrfu=False,
-    QueryMaxTokens=256, QueryReplayMaxTokens=512, KvType='bf16', StateCacheType='f32', Prefill=256,
-    SpeculativeMode='none', DraftTokens=0, DraftPolicy='fixed', Vision=False, MaxTokens=0,
-    ThinkingMode='default', ThinkingBudget=0, VramReserveMiB=256, EmbeddingPlacement='vram',
-    CpuThreads=2, VisionResidency='resident', VisionTokens=256, VisionCacheMiB=0,
-    NgramDrafts=0, NgramMinMatch=12, WeightPlacement='all_vram', WeightHostMiB=0)
 ENGINE_DEFAULTS['radiance'] = {'Backend': 'radiance', 'Context': 262144, 'Budget': 36864, 'Reserve': 4096, 'HostMiB': 12288, 'SinkTokens': 12288, 'RecentTokens': 1024, 'Concurrency': 1, 'RetainedSessions': 1, 'QueryScorer': 'page-softmax', 'ScoreAggregation': 'mean', 'GraphAlpha': 0.2, 'Lrfu': False, 'QueryMaxTokens': 512, 'QueryReplayMaxTokens': 2048, 'KvType': 'fp8', 'StateCacheType': 'f32', 'Prefill': 256, 'SpeculativeMode': 'dflash2', 'DraftTokens': 7, 'DraftPolicy': 'fixed', 'Vision': True, 'MaxTokens': 0, 'ThinkingMode': 'default', 'ThinkingBudget': 0, 'VramReserveMiB': 256, 'EmbeddingPlacement': 'ram', 'CpuThreads': 8, 'VisionResidency': 'cpu', 'VisionTokens': 256, 'VisionCacheMiB': 64, 'ReasoningEffort': 'xhigh', 'PreserveThinking': True, 'NgramDrafts': 0, 'NgramMinMatch': 12}
 
 STRINGS = {'StateCacheType', 'EmbeddingPlacement', 'WeightPlacement', 'RadianceHome', 'RocmPath', 'Tokenizer','PolystrataSource','Python','VisionWorker','Mmproj','Lora','QueryScorer','Backend', 'Model', 'Worker', 'Gpu', 'ListenHost', 'KvType', 'KvTypeK', 'KvTypeV', 'DiskPath',

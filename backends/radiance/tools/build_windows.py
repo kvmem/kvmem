@@ -12,8 +12,7 @@ def main():
     p.add_argument('--source', type=Path, required=True)
     p.add_argument('--build', type=Path, required=True)
     p.add_argument('--rocm', type=Path, required=True)
-    p.add_argument('--gpu-target', choices=('rdna3', 'gfx1100', 'gfx1101', 'gfx1102', 'gfx1103', 'gfx1200', 'gfx1201'), default='gfx1200',
-                   help='rdna3 embeds gfx1100/1101/1102/1103 code objects; individual targets make smaller builds')
+    p.add_argument('--gpu-target', choices=('gfx1200', 'gfx1201'), default='gfx1200')
     p.add_argument('--json-include', type=Path, help='Pinned include directory containing nlohmann/json.hpp')
     p.add_argument('--jobs', type=int, default=8)
     p.add_argument('--ffmpeg', choices=['AUTO','ON','OFF'], default='AUTO')
@@ -39,7 +38,7 @@ def main():
         if not file.is_file():
             p.error(f'missing SDK component: {file}')
     sdk_path = sdk.as_posix()  # CMake cache/script strings must not contain \P escapes.
-    targets = 'gfx1100;gfx1101;gfx1102;gfx1103' if a.gpu_target == 'rdna3' else a.gpu_target
+    targets = a.gpu_target
     command = ['cmake', '-S', source.as_posix(), '-B', build.as_posix(), '-G', 'Ninja',
                '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_C_COMPILER={compiler_dir.as_posix()}/clang.exe',
                f'-DCMAKE_CXX_COMPILER={compiler_dir.as_posix()}/clang++.exe',
@@ -58,8 +57,6 @@ def main():
         if not (pc/'libavcodec.pc').is_file():p.error('missing FFmpeg pkg-config files')
         env['PKG_CONFIG_PATH']=str(pc)
     if a.ffmpeg_static:command.append('-DPKG_CONFIG_ARGN=--static')
-    if a.gpu_target=='rdna3' or a.gpu_target.startswith('gfx110'):
-        command.append('-DR3D_QUALIFY_QWEN_IQR=ON')
     if a.json_include:
         if not (a.json_include/'nlohmann/json.hpp').is_file():p.error('missing pinned nlohmann JSON header')
         command.append(f'-DKVMEM_RADIANCE_JSON_INCLUDE_DIR={a.json_include.resolve().as_posix()}')
