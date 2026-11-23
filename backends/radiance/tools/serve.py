@@ -19,7 +19,9 @@ WSL_RUNTIME_SHA256 = '2b2a082ede46324a5e3771b4b14f2850fdb9bd38348abfbeedee83966b
 
 
 def profile(name='rdna4'):
-    filename='windows-rx7800m-iq2r-profile.json' if name=='rx7800m-iq2r' else 'windows-profile.json'
+    if name != 'rdna4':
+        raise ValueError(f'unsupported Radiance profile: {name}')
+    filename = 'windows-profile.json'
     return json.loads((Path(__file__).resolve().parents[1] / filename).read_text(encoding='utf-8'))
 
 
@@ -197,7 +199,7 @@ def main(argv=None):
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--wsl-runtime-dir', type=Path)
     p.add_argument('--port', type=int, default=18380)
-    p.add_argument('--profile', choices=('rdna4','rx7800m-iq2r'), default='rdna4')
+    p.add_argument('--profile', choices=('rdna4',), default='rdna4')
     p.add_argument('--drafter', choices=('auto','off','mtp','dflash','dflash2'), default='auto',
                    help='Embedded drafter, selected from container metadata by default')
     p.add_argument('--speculative-tokens', type=int,
@@ -209,8 +211,6 @@ def main(argv=None):
         if not 1 <= a.port <= 65535:
             raise ValueError('port must be in 1..65535')
         wsl = host == 'linux' and Path('/dev/dxg').exists()
-        if a.profile=='rx7800m-iq2r' and host!='windows':
-            raise ValueError('the RX7800M IQR plugin currently requires native Windows')
         config,architecture_plugin = model_profile(a,profile(a.profile))
         validate_inputs(a, host, wsl,architecture_plugin,kernel_plugins=config.get('kernel_plugins'))
         env = child_environment(a, host, wsl, config)

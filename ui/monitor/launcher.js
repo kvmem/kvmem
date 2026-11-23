@@ -120,22 +120,6 @@
         ...(backend==='llamacpp'?{KvTypeK:'q8_0',KvTypeV:'q8_0'}:{}),...(explicitLayerwiseRecipeResources[backend]||{})}
     })),
   ].map(p=>({...p,note:p.note||['256K 上下文 · 46K 驻留 · 2K 生成预留','256K context · 46K resident · 2K reserve']}));
-  function configureRadianceTemplates() {
-    const profile=info?.backend_capabilities?.radiance?.build_profile;
-    if(!['qwen35-iqr-gfx1101','qwen35-iqr-rdna3'].includes(profile))return;
-    const base={Backend:'radiance',Context:8192,Budget:1024,Reserve:512,HostMiB:2048,SinkTokens:128,RecentTokens:256,
-      Concurrency:1,RetainedSessions:1,QueryScorer:'page-softmax',ScoreAggregation:'mean',GraphAlpha:.2,Lrfu:false,
-      QueryMaxTokens:256,QueryReplayMaxTokens:512,KvType:'bf16',StateCacheType:'f32',Prefill:256,
-      SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',Vision:false,MaxTokens:0,ThinkingMode:'default',ThinkingBudget:0,
-      VramReserveMiB:256,EmbeddingPlacement:'vram',CpuThreads:2,VisionResidency:'resident',VisionTokens:256,VisionCacheMiB:0,
-      NgramDrafts:0,NgramMinMatch:12,WeightPlacement:'all_vram',WeightHostMiB:0};
-    const at=presets.findIndex(p=>p.id==='radiance');
-    presets.splice(at,1,
-      {id:'radiance-rdna3',title:['RDNA3 · 文本测试','RDNA3 · Text preview'],note:['BF16 KV · 1K 预算 · 不启用草稿','BF16 KV · 1K budget · no drafts'],parameters:base},
-      {id:'radiance-rdna3-dflash2',title:['RDNA3 · DFlash2 测试','RDNA3 · DFlash2 preview'],note:['需包含 DFlash2 的兼容模型 · 3K 预算','Requires a compatible DFlash2 model · 3K budget'],parameters:{...base,Budget:3072,RecentTokens:2176,SpeculativeMode:'dflash2',DraftTokens:7}},
-      {id:'radiance-rdna3-offload',title:['RDNA3 · 主存卸载','RDNA3 · RAM offload'],note:['显存不足时使用 · 模型权重 RAM 预算 8 GiB','For limited VRAM · 8 GiB RAM for model weights'],parameters:{...base,Context:2048,Budget:512,Reserve:384,HostMiB:512,Prefill:128,RecentTokens:128,QueryMaxTokens:128,QueryReplayMaxTokens:256,EmbeddingPlacement:'ram',WeightPlacement:'layer_offload',WeightHostMiB:8192}},
-      {id:'radiance-rdna3-offload-dflash2',title:['RDNA3 · 主存卸载 + DFlash2','RDNA3 · RAM offload + DFlash2'],note:['需兼容的 DFlash2 模型 · 8 GiB 权重 RAM 预算','Requires compatible DFlash2 model · 8 GiB weight RAM'],parameters:{...base,Context:4096,Budget:3072,RecentTokens:2176,HostMiB:512,Prefill:128,EmbeddingPlacement:'ram',WeightPlacement:'layer_offload',WeightHostMiB:8192,SpeculativeMode:'dflash2',DraftTokens:7}});
-  }
   const enginePreset=backend=>structuredClone(presets.find(p=>p.parameters.Backend===backend).parameters);
   const BACKENDS_KEY='kvmem-launch-backends-v1';
   const defaults={Backend:'ninfer',Model:'',Worker:'',Gpu:'',Context:262144,Budget:32768,HostMiB:16384,Reserve:1024,Prefill:128,MaxTokens:1024,Port:18200,ListenHost:'127.0.0.1',SinkTokens:12288,RecentTokens:1024};
@@ -1573,7 +1557,7 @@
   async function poll(){if(info&&!busy){try{updateStatus(await api('status'),true);}catch(e){message(e.message,true);}}setTimeout(poll,document.hidden?5000:2000);}
   // The shared i18n bindings translate navigation, including its mobile label.
   window.addEventListener('kvmem-language-change',()=>{if(info){try{restoreDraft(captureDraft());}catch(e){message(e.message,true);}}});
-  async function init(){try{info=await api('info');configureRadianceTemplates();let saved;try{saved=JSON.parse(localStorage.getItem(DRAFT_KEY)||'null');}catch{saveError=true;}try{const drafts=JSON.parse(localStorage.getItem(BACKENDS_KEY)||'{}');for(const [key,value] of Object.entries(drafts))if(usableDraft(value)&&value.parameters.Backend===key)perBackend[key]=value;}catch{saveError=true;}if(usableDraft(saved))restoreDraft(saved);else render(info.draft.parameters);updateStatus(info.status,true);if(location.pathname!=='/chat/'&&!location.hash&&!['starting','ready'].includes(info.status.state))document.querySelector('[data-page=config]').click();poll();}catch(e){root.replaceChildren(make('section',{class:'s-card'},tr('启动配置需要独立的本地控制台。请运行 scripts/local-console.py，然后打开它显示的地址；推理服务停止后，这个控制台仍然可用。','Launch settings require the independent local console. Run scripts/local-console.py and open its printed URL; the console remains available when inference stops.')));}}
+  async function init(){try{info=await api('info');let saved;try{saved=JSON.parse(localStorage.getItem(DRAFT_KEY)||'null');}catch{saveError=true;}try{const drafts=JSON.parse(localStorage.getItem(BACKENDS_KEY)||'{}');for(const [key,value] of Object.entries(drafts))if(usableDraft(value)&&value.parameters.Backend===key)perBackend[key]=value;}catch{saveError=true;}if(usableDraft(saved))restoreDraft(saved);else render(info.draft.parameters);updateStatus(info.status,true);if(location.pathname!=='/chat/'&&!location.hash&&!['starting','ready'].includes(info.status.state))document.querySelector('[data-page=config]').click();poll();}catch(e){root.replaceChildren(make('section',{class:'s-card'},tr('启动配置需要独立的本地控制台。请运行 scripts/local-console.py，然后打开它显示的地址；推理服务停止后，这个控制台仍然可用。','Launch settings require the independent local console. Run scripts/local-console.py and open its printed URL; the console remains available when inference stops.')));}}
   init();
   document.documentElement.dataset.launcherReady = "true";
 })();

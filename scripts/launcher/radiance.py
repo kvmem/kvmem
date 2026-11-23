@@ -120,8 +120,6 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     argv+=['--tp',str(len(gpu_ids)),'--tp-wire','exact','--no-prefix-cache','--host-pool-mib',str(p['WeightHostMiB']),'--prefix-cache-mib','0',
            '--placement',p['WeightPlacement'],'--embedding-placement',p['EmbeddingPlacement'],
            '--draft-window',p['DraftPolicy'],'--kvmem','--kvmem-block-tokens','128']
-    if capability.get('build_profile') in ('qwen35-iqr-gfx1101','qwen35-iqr-rdna3'):
-        argv+=['--kernels','libr3diqr,libr3d','--kvmem-rolling-generation']
     pair('--kvmem-drafter','off' if mode=='none' else mode)
     if p['CacheMinTokens']:pair('--kvmem-cache-min-tokens',p['CacheMinTokens'])
     if p.get('Vision'):
