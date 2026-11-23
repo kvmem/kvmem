@@ -11,13 +11,14 @@ this image is the inference process only.
   build script refuses to start without it, because the ccache cache mount needs BuildKit.
 - The [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
   on the host, so that `docker run --gpus all` works.
-- An NVIDIA driver new enough for the CUDA toolkit in the image (CUDA 13.5 needs driver
-  580.xx or newer). The image does not ship `libcuda.so.1`; the toolkit injects the host
-  driver at start.
-- At build time: `git`, `python3` and roughly 30 GB of free disk for the build context, the
-  devel base image and the image cache. Compilation dominates the build time: about 25-30
-  minutes on 24 cores. The context carries no Git metadata, so the commit is passed in as a
-  build argument and baked into `ninfer-serve --version` and the image labels.
+- An NVIDIA host driver compatible with the CUDA runtime in the image. The author
+  exercised the 13.5.0 image with driver 620.73.04. NVIDIA's [minor version
+  compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/latest/minor-version-compatibility.html)
+  has feature limits. The NVIDIA Container Toolkit supplies the host driver libraries.
+- At build time: `git`, `python3` and roughly 30 GB of free disk for the devel base and
+  build cache. The Dockerfile-specific context includes prepared NInfer, the KVMem core
+  and the README. The build script records the KVMem commit in the worker's version and
+  image labels.
 
 ## Build
 
@@ -55,7 +56,7 @@ the 0.7 GB cache. `docker buildx prune` drops that cache.
 | `UBUNTU` | `ubuntu26.04` | Ubuntu suffix of that tag |
 | `CUBLAS_PACKAGE` | `libcublas-13-5` | cuBLAS package of the runtime image; follows the CUDA minor release |
 | `CUDA_ARCH` | detected by `build.sh`, required otherwise | `70`, `75`, `80`, `86`, `89` or `120a`, or a `;`-separated list; one image runs only on the tiers it carries |
-| `JOBS` | all cores | parallel compilation jobs |
+| `JOBS` | 8 | parallel compilation jobs (lower this on memory-limited builders) |
 
 ```sh
 CUDA_ARCH=86 TAG=kvmem/ninfer:86 scripts/docker/build.sh
@@ -64,8 +65,9 @@ docker build --build-arg CUDA_ARCH=120a --build-arg JOBS=12 -t kvmem/ninfer:loca
 
 Without `CUDA_ARCH`, `build.sh` reads `compute_cap` from the host GPUs and derives the tiers
 (7.0, 7.5, 8.0, 8.6, 8.9, 12.0 map to `70`, `75`, `80`, `86`, `89`, `120a`), so the image
-matches the machine that builds it. A host with mixed cards yields a list, which compiles one
-binary that pipelines cards of those tiers. Compile time and image size grow with every tier.
+targets the machine that builds it. A mixed host yields a list of targets. The
+author exercised only a single `120a` build. Other targets and mixed lists need
+validation. V100 (`70`) requires CUDA 12.x and cannot share a CUDA build with `120a`.
 
 `120a` alone builds upstream's native SM120 routes (the qualified 0.19 configuration); any
 other target, and every list, takes the `mma.sync` compatibility path.
@@ -82,10 +84,12 @@ docker run --rm --gpus all \
 
 The default command serves `/models/model.ninfer` on `0.0.0.0:18200` with `--kvmem`; the
 model mount is the only host path required. The API is then at
-`http://127.0.0.1:18200/v1`.
+`http://127.0.0.1:18200/v1`. For a different host port, change only the host side
+of `-p`. If you change the internal `--port`, set
+`-e KVMEM_HEALTH_PORT=<internal-port>` to match it.
 
-A full 16 GB recipe (200K context, 36K history budget, INT8 KV, adaptive MTP4 + ngram31,
-CPU vision), as the console generates it:
+A reference recipe for a 16 GB card follows. Its 200K context and CPU vision
+settings come from the host console and have not been validated in the container:
 
 ```sh
 docker run --rm --gpus all --name kvmem-ninfer \
@@ -148,8 +152,8 @@ image was built from.
 
 ## Differences from a native build
 
-- The console UI (`START-HERE-*.sh`, `scripts/local-console.py`) is not included; run it on
-  the host against this container's port, or use the API directly.
+- Connect an API client to the published port. The existing host console and its
+  native worker launch flow are separate from this image.
 - Host-side tools (`scripts/*.py`, tests, benchmarks) stay on the host.
 - The image contains only the compiled worker, so changing sources means rebuilding the
   image; the Docker build cache reuses unaffected compilation units.
@@ -172,9 +176,11 @@ functionality, and the Deep Learning Container License (section 1.c) permits dis
 derived container on those terms. The image therefore keeps both NVIDIA license files and adds
 no development-toolchain files: no `nvcc`, headers, static CUDA libraries or samples.
 
-The FFmpeg source archives are the exact pinned releases the binary was built from (the build
-verifies their SHA-256), which satisfies the LGPL source-availability requirement for static
-linking.
+The image is a recipe for local builds. The FFmpeg source archives are the pinned
+releases used by the build. Before distributing a prebuilt image, verify the project
+and bundled licenses and provide an applicable way to relink the statically linked
+FFmpeg libraries under [LGPL 2.1 section 6](https://spdx.org/licenses/LGPL-2.1-only.html).
+See the [FFmpeg compliance guidance](https://ffmpeg.org/legal.html).
 
 ## Troubleshooting
 

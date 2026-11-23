@@ -53,22 +53,30 @@ if [ -z "$CUDA_ARCH" ]; then
     printf '==> GPU tiers on this host: %s\n' "$CUDA_ARCH"
 fi
 
-arch_elements="$(printf '%s' "$CUDA_ARCH" | tr ';' ' ')"
-for element in $arch_elements; do
-    case "$element" in
-        70|75|80|86|89|120a) ;;
-        *) printf 'CUDA_ARCH must be 70, 75, 80, 86, 89 or 120a (or a ";"-separated list); got %s\n' "$element" >&2; exit 2 ;;
-    esac
-done
+arch_list='^(70|75|80|86|89|120a)(;(70|75|80|86|89|120a))*$'
+if ! [[ "$CUDA_ARCH" =~ $arch_list ]]; then
+    printf 'CUDA_ARCH must be 70, 75, 80, 86, 89 or 120a (or a semicolon-separated list); got %s\n' "$CUDA_ARCH" >&2
+    exit 2
+fi
+if [[ -n "$JOBS" ]] && ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'JOBS must be a positive integer\n' >&2
+    exit 2
+fi
+if ! [[ "$CUDA_VERSION" =~ ^([1-9][0-9]*)\.([0-9]|[1-9][0-9]*)\.[0-9]+$ ]]; then
+    printf 'CUDA_VERSION must be a CUDA image release such as 13.5.0\n' >&2
+    exit 2
+fi
+cuda_major="${BASH_REMATCH[1]}"
+cuda_minor="${BASH_REMATCH[2]}"
+IFS=';' read -r -a arch_elements <<< "$CUDA_ARCH"
 
 # The engine's own configure step rejects these combinations; fail before uploading the context.
-cuda_major="${CUDA_VERSION%%.*}"
-for element in $arch_elements; do
+for element in "${arch_elements[@]}"; do
     if [ "$element" = 70 ] && [ "$cuda_major" -ge 13 ]; then
         printf 'sm_70 (Tesla V100) needs CUDA 12.x; %s cannot compile it\n' "$CUDA_VERSION" >&2
         exit 2
     fi
-    if [ "$element" = 120a ] && [ "$cuda_major" -lt 13 ]; then
+    if [ "$element" = 120a ] && (( cuda_major < 13 || (cuda_major == 13 && cuda_minor < 1) )); then
         printf 'sm_120a needs CUDA 13.1 or newer, not %s\n' "$CUDA_VERSION" >&2
         exit 2
     fi
@@ -92,20 +100,18 @@ command -v python3 >/dev/null || { printf 'python3 is required\n' >&2; exit 2; }
 # cuBLAS ships as a separate package in the CUDA runtime image; the package name follows the
 # CUDA minor release (libcublas-13-5 for 13.5).
 if [[ -z "$CUBLAS_PACKAGE" ]]; then
-    major="${CUDA_VERSION%%.*}"
-    rest="${CUDA_VERSION#*.}"
-    minor="${rest%%.*}"
-    CUBLAS_PACKAGE="libcublas-${major}-${minor}"
+    CUBLAS_PACKAGE="libcublas-${cuda_major}-${cuda_minor}"
 fi
 
 # The context carries no .git, so record the exact source state in the image.
-revision="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+revision="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     revision="${revision}-dirty"
 fi
 
 printf '==> preparing backends/ninfer\n'
 python3 scripts/prepare-backends.py --backend ninfer
+python3 scripts/prepare-backends.py --backend ninfer --check
 
 build_args=(
     --build-arg "CUDA_VERSION=$CUDA_VERSION"
