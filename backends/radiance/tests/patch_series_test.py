@@ -13,11 +13,10 @@ from patch_series import patch_specs, verified_patches
 class PatchSeriesTest(unittest.TestCase):
     def test_repository_series_is_complete(self):
         meta, specs, paths = verified_patches()
-        self.assertEqual(len(paths), 5)
+        self.assertEqual(len(paths), 2)
         self.assertEqual([s.get('id') for s in specs[1:]],
-                         ['rdna3', 'rdna3-iqr', 'offload-budget', 'iq4r-mtp-u2'])
+                         ['offload-budget'])
         self.assertNotIn('diff --git a/libr3diqr/', paths[0].read_text(encoding='utf8'))
-        self.assertIn('diff --git a/libr3diqr/', paths[2].read_text(encoding='utf8'))
         for spec in specs[1:]:
             self.assertTrue(spec['retire_when'])
 

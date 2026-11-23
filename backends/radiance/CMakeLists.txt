@@ -5,12 +5,6 @@ endif()
 
 # Only the adapter sees engine types. The portable kvmem library remains C++17
 # and can still be built without Radiance, HIP, or any GPU.
-if(EXISTS "${RADIANCE_SOURCE_DIR}/libr3diqr/r3di_args.h")
-    add_executable(radiance_rdna3_tensor_contract_test tests/rdna3_tensor_contract_test.cpp)
-    target_include_directories(radiance_rdna3_tensor_contract_test PRIVATE
-        ${RADIANCE_SOURCE_DIR}/libr3diqr ${RADIANCE_SOURCE_DIR}/abi)
-    add_test(NAME radiance_rdna3_tensor_contract_test COMMAND radiance_rdna3_tensor_contract_test)
-endif()
 add_library(kvmem_radiance_pages STATIC adapter/native_pages.cpp adapter/execution_pages.cpp)
 target_compile_features(kvmem_radiance_pages PUBLIC cxx_std_20)
 target_include_directories(kvmem_radiance_pages PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/adapter)
@@ -168,14 +162,7 @@ if(TARGET rad_core)
     string(JSON radiance_capabilities GET "${launcher_capabilities}" backends radiance)
     string(JSON radiance_mtp_max_draft_tokens GET "${radiance_capabilities}" speculative modes mtp max_draft_tokens)
     set(_radiance_capability_profile "${R4D_PROFILE}")
-    if(WIN32 AND RAD_GPU_TARGETS STREQUAL "gfx1101")
-        set(_radiance_capability_profile "qwen35-iqr-gfx1101")
-        set(radiance_mtp_max_draft_tokens 7)
-    elseif(WIN32 AND R3D_QUALIFY_QWEN_IQR AND RAD_GPU_TARGETS MATCHES "^gfx110[0-3](;gfx110[0-3])*$")
-        set(_radiance_capability_profile "qwen35-iqr-rdna3")
-        set(radiance_mtp_max_draft_tokens 7)
-    endif()
-    if(_radiance_capability_profile MATCHES "^(qwen35-dense-tp1|qwen35-iqr-gfx1101|qwen35-iqr-rdna3)$")
+    if(_radiance_capability_profile STREQUAL "qwen35-dense-tp1")
         # The selected kernel closure serves one rank. Keep the common manifest
         # usable by general builds and constrain this binary's advertised limits.
         find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
