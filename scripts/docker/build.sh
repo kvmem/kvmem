@@ -36,6 +36,15 @@ if [ "$CUDA_ARCH" = 120a ] && [ "$cuda_major" -lt 13 ]; then
 fi
 
 command -v docker >/dev/null || { printf 'docker is required\n' >&2; exit 2; }
+# The build uses a BuildKit cache mount for ccache, so the classic builder is not enough.
+if ! docker buildx version >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+BuildKit is required: the image build keeps its ccache in a BuildKit cache mount.
+  Arch/CachyOS: sudo pacman -S --needed docker-buildx
+  Debian/Ubuntu: sudo apt-get install -y docker-buildx-plugin
+EOF
+    exit 2
+fi
 command -v python3 >/dev/null || { printf 'python3 is required\n' >&2; exit 2; }
 
 # cuBLAS ships as a separate package in the CUDA runtime image; the package name follows the

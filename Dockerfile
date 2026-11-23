@@ -35,11 +35,19 @@ ENV DEBIAN_FRONTEND=noninteractive
 # engine itself needs zlib and libcurl headers. No vcpkg on Linux.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates cmake curl libcurl4-openssl-dev meson nasm ninja-build \
+      ca-certificates ccache cmake curl libcurl4-openssl-dev meson nasm ninja-build \
       pkg-config python3 python3-pip python3-venv zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
+
+# Object cache for repeated builds. It lives in a BuildKit cache mount (not in the image), so
+# invalidating the Docker layer cache -- a context change, a Dockerfile edit above this RUN --
+# recompiles from ccache instead of from scratch. The first build is cold.
+ENV CCACHE_DIR=/root/.ccache \
+    CCACHE_MAXSIZE=10G \
+    CCACHE_COMPRESS=true \
+    CCACHE_COMPRESSLEVEL=6
 
 # The build context has no Git metadata, so the commit is passed in and baked into the binary's
 # build id (`ninfer-serve --version`) and the image labels.
@@ -55,7 +63,8 @@ ARG JOBS=""
 # sm_120a compiles upstream's native routes, as the qualified 0.19 build does; every other
 # architecture takes the mma.sync compatibility path. A parallel CUDA translation unit needs
 # roughly 2 GiB, so the default job count follows the container's memory, not only its cores.
-RUN set -eux; \
+RUN --mount=type=cache,target=/root/.ccache,sharing=shared \
+    set -eux; \
     bash backends/ninfer/scripts/fetch-media-sources.sh; \
     native=OFF; [ "${CUDA_ARCH}" = 120a ] && native=ON; \
     if [ -z "${JOBS}" ]; then \
@@ -67,6 +76,9 @@ RUN set -eux; \
     fi; \
     cmake -S backends/ninfer -B build-ninfer -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
       -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
       -DNINFER_SM120_NATIVE="${native}" \
@@ -75,7 +87,8 @@ RUN set -eux; \
       -DBUILD_TESTING=OFF \
       -DNINFER_KVMEM_SOURCE_DIR=/src/kvmem; \
     cmake --build build-ninfer --target ninfer-serve --parallel "${jobs}"; \
-    cmake --build build-ninfer --target ninfer --parallel "${jobs}"
+    cmake --build build-ninfer --target ninfer --parallel "${jobs}"; \
+    ccache --show-stats
 
 # -------------------------------------------------------------- runtime ----
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
@@ -102,6 +115,10 @@ COPY --from=build /src/build-ninfer/apps/ninfer-serve /usr/local/bin/ninfer-serv
 COPY --from=build /src/build-ninfer/apps/ninfer /usr/local/bin/ninfer
 COPY --from=build /src/backends/ninfer/LICENSE /usr/share/doc/kvmem/ninfer-LICENSE
 COPY --from=build /src/README.md /usr/share/doc/kvmem/README.md
+# FFmpeg is linked statically and carries LGPL-2.1-or-later; dav1d is BSD-2-Clause. The image
+# ships the exact pinned archives, so their licence texts and corresponding source travel with
+# the binary.
+COPY --from=build /src/backends/ninfer/third_party/media-sources/*.tar.xz /usr/share/doc/kvmem/sources/
 
 ARG KV_SRC_COMMIT
 LABEL org.opencontainers.image.title="KVMem NInfer worker" \

@@ -7,7 +7,8 @@ this image is the inference process only.
 
 ## Requirements
 
-- Docker with BuildKit (Docker 24 or newer).
+- Docker with BuildKit (Docker 24 or newer). Arch/CachyOS ships it as `docker-buildx`; the
+  build script refuses to start without it, because the ccache cache mount needs BuildKit.
 - The [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
   on the host, so that `docker run --gpus all` works.
 - An NVIDIA driver new enough for the CUDA toolkit in the image (CUDA 13.5 needs driver
@@ -37,6 +38,12 @@ docker build -t kvmem/ninfer:local .
 The tree the build sees must be prepared: the submodule contents and the patches cannot be
 reconstructed from a plain source archive. The build stage fetches the pinned FFmpeg and
 dav1d release archives itself.
+
+Compilation runs through ccache with a BuildKit cache mount at `/root/.ccache`. The first
+build is cold; a later build whose Docker layer cache was invalidated (a context or Dockerfile
+change) recompiles from the object cache instead: measured here, the compilation step took
+1007 s cold and 26 s when the layer was invalidated, with about 60% of all calls served from
+the 0.7 GB cache. `docker buildx prune` drops that cache.
 
 ### Build arguments
 
@@ -140,7 +147,32 @@ image was built from.
 - The image contains only the compiled worker, so changing sources means rebuilding the
   image; the Docker build cache reuses unaffected compilation units.
 
+## Licenses
+
+| component | license | where it ships |
+|---|---|---|
+| NInfer engine | Apache-2.0 | `/usr/share/doc/kvmem/ninfer-LICENSE` |
+| FFmpeg 9.0.2 (static) | LGPL-2.1-or-later, built without `--enable-gpl` | `/usr/share/doc/kvmem/sources/ffmpeg-9.0.2.tar.xz` (holds `COPYING.LGPLv2.1`) |
+| dav1d 1.5.4 (static) | BSD-2-Clause | `/usr/share/doc/kvmem/sources/dav1d-1.5.4.tar.xz` (holds `COPYING`) |
+| CUDA runtime (cuBLAS, cuBLASLt, cudart, NVRTC, ...) | NVIDIA CUDA Toolkit EULA | `/usr/local/cuda/EULA.txt`, `/usr/share/doc/*-13-5/copyright` |
+| NVIDIA base image contents | NVIDIA Deep Learning Container License | `/NGC-DL-CONTAINER-LICENSE` |
+
+The CUDA libraries are not vendored by this repository: the runtime stage starts from NVIDIA's
+published runtime image and adds the `libcublas-13-5` package from NVIDIA's repository. The
+CUDA Toolkit EULA's Attachment A lists `libcublas.so`, `libcublasLt.so`, `libcudart.so` and
+`libnvrtc.so` as redistributable when incorporated in an application with material additional
+functionality, and the Deep Learning Container License (section 1.c) permits distributing a
+derived container on those terms. The image therefore keeps both NVIDIA license files and adds
+no development-toolchain files: no `nvcc`, headers, static CUDA libraries or samples.
+
+The FFmpeg source archives are the exact pinned releases the binary was built from (the build
+verifies their SHA-256), which satisfies the LGPL source-availability requirement for static
+linking.
+
 ## Troubleshooting
+
+- `the --mount option requires BuildKit` — install the buildx plugin (see Requirements);
+  `docker buildx version` must work.
 
 - `libcuda.so.1: cannot open shared object file` — the container started without
   `--gpus all`, or the NVIDIA Container Toolkit is not configured. Verify with
