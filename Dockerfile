@@ -113,7 +113,7 @@ RUN apt-get update \
 
 # The CUDA base image already ships an unprivileged "ubuntu" account (uid 1000); reuse it
 # instead of adding a second uid-1000 user. The mounted artifact must be readable by it.
-RUN mkdir -p /models && chown ubuntu:ubuntu /models
+RUN install -d -o ubuntu -g ubuntu /models /srv/kvmem
 
 COPY --from=build /src/build-ninfer/apps/ninfer-serve /usr/local/bin/ninfer-serve
 COPY --from=build /src/build-ninfer/apps/ninfer /usr/local/bin/ninfer
@@ -132,7 +132,7 @@ LABEL org.opencontainers.image.title="KVMem NInfer worker" \
       org.opencontainers.image.licenses="See /usr/share/doc/kvmem"
 
 USER ubuntu
-WORKDIR /home/ubuntu
+WORKDIR /srv/kvmem
 EXPOSE 18200
 
 # Override KVMEM_HEALTH_PORT together with --port when using a custom internal port.
