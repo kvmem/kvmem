@@ -28,6 +28,25 @@ Legacy 的评分器、聚合、graph alpha、LRFU 和 Query/replay 上限保存�
 
 `--kvmem-re-rope-reuse-limit N` 可覆盖按 K 编码设置的默认上限。BF16、INT8 与 RK8V4 为 32，FP8 与 K8V4 为 8，NVFP4 与 RK4V4 为 2，RK4V4-E8 为 1，RK2V4-E8 为 0。0 表示每次移动均从归档重建。低位量化即使只调整一次也会有额外舍入。需要从完整归一化 K 重建时可用 `--kvmem-re-rope-source bf16`，此时每个 token、每个 KV head 增加 512 字节。两种模式和不同上限有独立的缓存标识。
 
+### RTX 4090 上的 RULER 和 LongMemEval-S 结果
+
+以下 NInfer 实验使用 Qwen3.8-27B NVFP4、FP8 KV、64-token 物理页和原生紧凑 RoPE，页内位置调整上限为 8。每个请求在单张 RTX 4090 上运行。文档预填充使用半衰期为 32,768 token 的 lift，最终 Query 的第 3、7、11、15 层共享全局 Mean-K 选页，其余 12 个注意力层分别选页。各 NInfer 组都开启了 re-RoPE，组间对照衡量页内评分方式。
+
+| RULER 官方分数 | 题数 | NInfer 整页 64 | NInfer 32+32 max | 历史 vLLM 逐层 Mean-K |
+|---|---:|---:|---:|---:|
+| 全部 | 130 | 86.67 | 90.51 | 93.50 |
+| 大海捞针（NIAH） | 80 | 89.38 | 93.13 | 97.19 |
+| 其余题型 | 50 | 82.33 | 86.33 | 87.60 |
+
+RULER 每类取原始编号 0–9 的 10 题。三组的输入 token、问题区间、参考答案和采样参数逐题一致，按官方规则只评最终回答，再对题型取平均。32+32 max 相对整页评分有 13 题提高、5 题降低、112 题同分，整体提升 3.85 分。三组的选页预算均为 36,864 token。NInfer 的生成预留为 4,096，历史 vLLM 的生成 KV 预算为 16,384，vLLM 可独立选择 32-token 块。
+
+| LongMemEval-S 答对数 | NInfer 32+32 sum | NInfer 32+32 max | 历史 vLLM combined |
+|---|---:|---:|---:|
+| 完整 500 题 | 未跑满 | 441/500（88.20%） | 454/500（90.80%） |
+| sum 停测时已完成的 337 道同题 | 299/337（88.72%） | 298/337（88.43%） | 299/337（88.72%） |
+
+LongMemEval-S 三组均使用 16,384 token 选页预算和 8,192 token 生成预算，采用官方提示词和 DeepSeek Flash 判分。337 道同题中，max 相对 sum 多答对 11 题、少答对 12 题，其余 314 题同分。完整 500 题中，NInfer max 和 vLLM 分别单独答对 15 题和 28 题。
+
 ## 实验性混合 Query 评分
 
 NInfer dense Qwen 27B 可设置 `NINFER_LAYERWISE_HYBRID_QUERY=1`：最终 Query 在模型层 **3、7、11、15**（从 0 编号）按各层已接受的 prefill attention `mass / exposure` 排序；沿用 Pressure 的衰减、曝光归一化和同分时偏向较新页的规则。候选仅限该层此时驻留的历史页，已淘汰的冷页不能借用残留统计重新进入。必选 sink／recent／显式保留页仍计入相同历史预算；统计缺失、必选页已不驻留或候选不足时明确报错。
