@@ -14,26 +14,68 @@ cd "$ROOT"
 
 CUDA_VERSION="${CUDA_VERSION:-13.5.0}"
 UBUNTU="${UBUNTU:-ubuntu26.04}"
-CUDA_ARCH="${CUDA_ARCH:-120a}"
+CUDA_ARCH="${CUDA_ARCH:-}"   # empty: derive from the GPUs of this host
 JOBS="${JOBS:-}"
 CUBLAS_PACKAGE="${CUBLAS_PACKAGE:-}"
-TAG="${TAG:-kvmem/ninfer:$(tr -d '[:space:]' < VERSION)-${CUDA_ARCH}}"
 
-case "$CUDA_ARCH" in
-    70|75|80|86|89|120a) ;;
-    *) printf 'CUDA_ARCH must be one of 70, 75, 80, 86, 89 or 120a; got %s\n' "$CUDA_ARCH" >&2; exit 2 ;;
-esac
+# The Dockerfile has no default target: an image built here should run on the cards this host
+# has, so the tiers come from the driver unless CUDA_ARCH pins them.
+arch_tier() {
+    case "$1" in
+        7.0) echo 70 ;;
+        7.5) echo 75 ;;
+        8.0) echo 80 ;;
+        8.6) echo 86 ;;
+        8.9) echo 89 ;;
+        12.0) echo 120a ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ -z "$CUDA_ARCH" ]; then
+    caps=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        caps="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null || true)"
+    fi
+    if [ -z "$caps" ]; then
+        printf 'No GPU detected; pass CUDA_ARCH=70|75|80|86|89|120a, or several as "86;89".\n' >&2
+        exit 2
+    fi
+    tiers=""
+    for cap in $caps; do
+        tier="$(arch_tier "$cap")" || {
+            printf 'Unsupported compute capability %s (supported: 7.0, 7.5, 8.0, 8.6, 8.9, 12.0)\n' "$cap" >&2
+            exit 2
+        }
+        case ";$tiers;" in *";$tier;"*) ;; *) tiers="${tiers:+$tiers;}$tier" ;; esac
+    done
+    CUDA_ARCH="$tiers"
+    printf '==> GPU tiers on this host: %s\n' "$CUDA_ARCH"
+fi
+
+arch_elements="$(printf '%s' "$CUDA_ARCH" | tr ';' ' ')"
+for element in $arch_elements; do
+    case "$element" in
+        70|75|80|86|89|120a) ;;
+        *) printf 'CUDA_ARCH must be 70, 75, 80, 86, 89 or 120a (or a ";"-separated list); got %s\n' "$element" >&2; exit 2 ;;
+    esac
+done
 
 # The engine's own configure step rejects these combinations; fail before uploading the context.
 cuda_major="${CUDA_VERSION%%.*}"
-if [ "$CUDA_ARCH" = 70 ] && [ "$cuda_major" -ge 13 ]; then
-    printf 'sm_70 (Tesla V100) needs CUDA 12.x; %s cannot compile it\n' "$CUDA_VERSION" >&2
-    exit 2
-fi
-if [ "$CUDA_ARCH" = 120a ] && [ "$cuda_major" -lt 13 ]; then
-    printf 'sm_120a needs CUDA 13.1 or newer, not %s\n' "$CUDA_VERSION" >&2
-    exit 2
-fi
+for element in $arch_elements; do
+    if [ "$element" = 70 ] && [ "$cuda_major" -ge 13 ]; then
+        printf 'sm_70 (Tesla V100) needs CUDA 12.x; %s cannot compile it\n' "$CUDA_VERSION" >&2
+        exit 2
+    fi
+    if [ "$element" = 120a ] && [ "$cuda_major" -lt 13 ]; then
+        printf 'sm_120a needs CUDA 13.1 or newer, not %s\n' "$CUDA_VERSION" >&2
+        exit 2
+    fi
+done
+
+TAG_ARCH="$(printf '%s' "$CUDA_ARCH" | tr ';' '-')"
+TAG="${TAG:-kvmem/ninfer:$(tr -d '[:space:]' < VERSION)-${TAG_ARCH}}"
 
 command -v docker >/dev/null || { printf 'docker is required\n' >&2; exit 2; }
 # The build uses a BuildKit cache mount for ccache, so the classic builder is not enough.

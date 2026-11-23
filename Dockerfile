@@ -57,7 +57,10 @@ ENV NINFER_BUILD_ID=${KV_SRC_COMMIT}
 # Sources must be prepared on the host (submodule + integration patches); see the header.
 COPY . .
 
-ARG CUDA_ARCH=120a
+# No default: the target follows the cards the caller builds for (scripts/docker/build.sh
+# derives it from the host GPU). `docker build` users pass it explicitly, optionally as a
+# ";"-separated list, e.g. 86;89.
+ARG CUDA_ARCH
 ARG JOBS=""
 
 # sm_120a compiles upstream's native routes, as the qualified 0.19 build does; every other
@@ -66,6 +69,14 @@ ARG JOBS=""
 RUN --mount=type=cache,target=/root/.ccache,sharing=shared \
     set -eux; \
     bash backends/ninfer/scripts/fetch-media-sources.sh; \
+    if [ -z "${CUDA_ARCH:-}" ]; then \
+      echo "CUDA_ARCH is required: 70, 75, 80, 86, 89 or 120a, or a \";\"-separated list" >&2; \
+      exit 2; \
+    fi; \
+    for arch in $(printf '%s' "${CUDA_ARCH}" | tr ';' ' '); do \
+      case "${arch}" in 70|75|80|86|89|120a) ;; \
+        *) echo "unsupported CUDA_ARCH element: ${arch}" >&2; exit 2 ;; esac; \
+    done; \
     native=OFF; [ "${CUDA_ARCH}" = 120a ] && native=ON; \
     if [ -z "${JOBS}" ]; then \
       jobs=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 2097152 )); \

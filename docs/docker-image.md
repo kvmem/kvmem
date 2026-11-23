@@ -27,12 +27,14 @@ scripts/docker/build.sh
 ```
 
 The script applies the engine integration patches (`scripts/prepare-backends.py --backend
-ninfer`, idempotent), records the source commit and then runs `docker build`. To drive the
-build yourself:
+ninfer`, idempotent), detects the CUDA target, records the source commit and then runs
+`docker build`. To drive the build yourself, name the target: the Dockerfile has no default
+architecture, so a plain `docker build` fails with a message instead of producing an image that
+only runs on one card family.
 
 ```sh
 python3 scripts/prepare-backends.py --backend ninfer
-docker build -t kvmem/ninfer:local .
+docker build --build-arg CUDA_ARCH=120a -t kvmem/ninfer:local .
 ```
 
 The tree the build sees must be prepared: the submodule contents and the patches cannot be
@@ -52,7 +54,7 @@ the 0.7 GB cache. `docker buildx prune` drops that cache.
 | `CUDA_VERSION` | `13.5.0` | CUDA/Ubuntu tag of the NVIDIA base images |
 | `UBUNTU` | `ubuntu26.04` | Ubuntu suffix of that tag |
 | `CUBLAS_PACKAGE` | `libcublas-13-5` | cuBLAS package of the runtime image; follows the CUDA minor release |
-| `CUDA_ARCH` | `120a` | `70`, `75`, `80`, `86`, `89` or `120a`; one image runs only on its own architecture tier |
+| `CUDA_ARCH` | detected by `build.sh`, required otherwise | `70`, `75`, `80`, `86`, `89` or `120a`, or a `;`-separated list; one image runs only on the tiers it carries |
 | `JOBS` | all cores | parallel compilation jobs |
 
 ```sh
@@ -60,8 +62,13 @@ CUDA_ARCH=86 TAG=kvmem/ninfer:86 scripts/docker/build.sh
 docker build --build-arg CUDA_ARCH=120a --build-arg JOBS=12 -t kvmem/ninfer:local .
 ```
 
-`120a` builds upstream's native SM120 routes (the qualified 0.19 configuration); the other
-architectures take the `mma.sync` compatibility path.
+Without `CUDA_ARCH`, `build.sh` reads `compute_cap` from the host GPUs and derives the tiers
+(7.0, 7.5, 8.0, 8.6, 8.9, 12.0 map to `70`, `75`, `80`, `86`, `89`, `120a`), so the image
+matches the machine that builds it. A host with mixed cards yields a list, which compiles one
+binary that pipelines cards of those tiers. Compile time and image size grow with every tier.
+
+`120a` alone builds upstream's native SM120 routes (the qualified 0.19 configuration); any
+other target, and every list, takes the `mma.sync` compatibility path.
 
 ## Run
 
@@ -171,6 +178,8 @@ linking.
 
 ## Troubleshooting
 
+- `CUDA_ARCH is required` — `docker build` was run without the target that `build.sh` detects;
+  pass `--build-arg CUDA_ARCH=120a` (or the tiers of the cards you target).
 - `the --mount option requires BuildKit` — install the buildx plugin (see Requirements);
   `docker buildx version` must work.
 
