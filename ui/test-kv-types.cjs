@@ -5,7 +5,7 @@ const path=require('node:path');
 module.exports=async({browser,base,info})=>{
  const context=await browser.newContext({viewport:{width:1366,height:900}});
  const page=await context.newPage(),errors=[],previews=[],mutations=[];
- const parameters={...info.draft.parameters,Backend:'llamacpp',Model:'C:/models/kv-test.gguf',Worker:'C:/workers/llama.exe',Gpu:'GPU-kv-fixture',KvType:'q5_0'};
+ const parameters={...info.draft.parameters,QueryMaxTokens:512,QueryReplayMaxTokens:2048,Backend:'llamacpp',Model:'C:/models/kv-test.gguf',Worker:'C:/workers/llama.exe',Gpu:'GPU-kv-fixture',KvType:'q5_0'};
  const fixture={...info,gpus:[{uuid:parameters.Gpu,name:'NVIDIA GeForce KV test GPU'}],status:{state:'stopped'},draft:{schema_version:1,parameters}};
  page.on('pageerror',error=>errors.push(error.message));
  page.on('request',request=>{if(request.method()==='POST')mutations.push(new URL(request.url()).pathname);});
@@ -57,7 +57,7 @@ module.exports=async({browser,base,info})=>{
   await saved();await page.reload();await field('KvTypeK').waitFor();
   const beforeRestart=previews.length;await page.locator('[data-action=preview]').click();
   assert.ok((await page.locator('[data-dialog=check]').textContent()).includes('重新启动控制台'));assert.equal(previews.length,beforeRestart);
-  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/inspect-model'].includes(url)),
+  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/inspect-model','/api/launcher/worker-capabilities'].includes(url)),
    'KV edits may preview/inspect but never start, stop or save a service');assert.deepEqual(errors,[]);
   console.log('PASS: independent K/V selection, mixed-bit payload, native pair limits, drafts/templates/reload, legacy migration, backend isolation and restart guidance (no inference)');
  }finally{await context.close();}

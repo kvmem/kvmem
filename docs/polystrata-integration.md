@@ -1,14 +1,30 @@
 # PolyStrata integration
 
-The opt-in `polystrata` backend pins upstream `v0.1.45-poly.7` at
-`fabae0d6445e524a1dc68b2c2fa99b53880f98e6`. It supports qwen35moe GGUF models
+The opt-in `polystrata` backend pins upstream `v0.1.45-poly.9` at
+`83a7a33272413bf87b8d2742dc557c165e2cb2d2`. It supports qwen35moe GGUF models
 with F16/Q8_0 KV and Gemma 4 26B-A4B with F16/int8/int8k KV on one CUDA GPU.
 This revision also carries the opt-in HIP
 integration, marked experimental and disabled by default. Its compile/link CI
 is a merge gate; AMD inference qualification is required before promoting it
 to validated hardware support, rather than blocking the validated CUDA update.
 The source submodule stays at the upstream commit; `backends/versions.json`
-identifies all sixteen ordered patches and their resulting trees.
+identifies all twenty-five ordered patches and their resulting trees.
+
+The poly.9 integration sizes each Qwen35 batched attention launch from that
+sequence's compact position, including its decode window. Sequence-buffer lookup
+uses the allocated KV capacity rather than the logical context length, preventing
+overlapping address ranges from selecting another buffer when KVMem bounds KV.
+
+The KVMem Python launcher preserves the pre-poly.9 mapped-expert default by
+passing `--ram-experts-mib -1` when no explicit value is supplied. This does not
+lock all expert pages in RAM; the operating system still manages the file
+mapping. An explicit MiB limit enables the native RAM expert pool; `-2` selects
+poly.9's automatic budget. The automatic pool showed variable decode performance
+on the RTX 5050 qualification host, so the launcher does not enable it implicitly.
+Native CPU thread selection is unchanged by the launcher.
+See the [poly.9 qualification record](benchmarks/polystrata-poly9-qualification-20261111.json)
+for the fixes, controlled RTX 5050 comparisons, retained failed investigations,
+native acceptance coverage and untested hardware paths.
 
 ## Gemma 4 26B-A4B
 
@@ -118,12 +134,12 @@ separate state/replay validation before claiming a speed or quality benefit.
 The web chat's send and regenerate paths share the same explicit request
 overrides, client-owned reasoning, native timing and incomplete-stream detection.
 The poly.5 qualification below is historical; the current pin is in
-`backends/versions.json`. The current pin excludes commits after the poly.7
-release. The poly.7 update adds `--ram-experts-mib` expert staging/spill, an
-optional streaming CPU store (`STRATA_POLY_STREAM_STAGE`) and a RAM expert
-pool; the rebase keeps the KVMem memory validation beside the new
-streaming-stage setup instead of replacing it. It also retains upstream's
-`gemma4-kvmem` layer, rebased onto poly.7, so Gemma 4 26B-A4B support is not
+`backends/versions.json`. The current pin is the poly.9 release. The poly.9
+update carries upstream's multi-row step with optional block-token guesses,
+the elastic workspace layer and configurable 32/64-token KVMem blocks; the
+rebase keeps KVMem's per-sequence capture, Query/replay and expert staging
+beside the new batch and elastic paths. It also retains upstream's
+`gemma4-kvmem` layer, rebased onto poly.9, so Gemma 4 26B-A4B support is not
 dropped by the version bump.
 The poly.5 layer had rebased the integration, added HIP KVMem integration,
 linked Kolibri sources into model test targets, and preserved the `(0, 0)`
@@ -397,6 +413,13 @@ Documentation-only changes may skip it. Its result is included in the existing
 PolyStrata build cannot be reported as a successful native check.
 
 ## Known limits
+
+- `truncate_middle: true` is rejected when KVMem is enabled, even for short or image
+  prompts. Middle truncation breaks the original history and Query boundaries.
+  Remove the setting or set it to `false`; requests exceeding the logical context
+  must be shortened. Startup, model switching and config edits validate this
+  combination, and request preparation also rejects a stale enabled setting.
+  PolyStrata without KVMem retains its native middle-truncation option.
 
 A prior two-stage, 7131-token code-document probe answered both questions correctly
 at B2048 and with original full context. B1024 answered the first correctly but

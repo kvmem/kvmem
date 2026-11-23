@@ -28,8 +28,8 @@ class ProfileCapabilitiesTest(unittest.TestCase):
         for mode in ('mtp','dflash2'):
             self.assertEqual(result['speculative']['modes'][mode]['max_devices'],1)
         self.assertEqual(result['supported_combinations']['text']['tensor_parallel'],[1])
-        self.assertEqual(result['qualification']['tensor_parallel'],[1])
-        self.assertNotIn('tp2_mtp_depths',result['qualification'])
+        self.assertEqual(result['qualification']['status'],'not-requalified-on-v2')
+        self.assertEqual(result['historical_qualification'],self.manifest['backends']['radiance']['historical_qualification'])
         self.assertEqual(result['build_profile'],'qwen35-dense-tp1')
         self.assertEqual(result['speculative']['modes']['mtp']['max_draft_tokens'],7)
         self.assertEqual(self.manifest,original)
@@ -41,6 +41,5 @@ class ProfileCapabilitiesTest(unittest.TestCase):
 
     def test_unknown_profile_is_rejected(self):
         with self.assertRaises(ValueError):for_profile(self.manifest,'unsupported-profile')
-
 
 if __name__=='__main__':unittest.main()

@@ -18,6 +18,7 @@ def main():
     p.add_argument("--ffmpeg", choices=["AUTO","ON","OFF"], default="AUTO")
     p.add_argument("--ffmpeg-prefix", type=Path, help="Pinned FFmpeg install containing lib/pkgconfig")
     p.add_argument("--ffmpeg-static", action="store_true")
+    p.add_argument('--json-include', type=Path, help='Pinned include directory containing nlohmann/json.hpp')
     p.add_argument("--kernel-profile", choices=("all","qwen35-dense-tp1"),
                    help="Override the cached kernel profile; omitted retains an existing selection")
     p.add_argument("--configure-only", action="store_true")
@@ -57,8 +58,8 @@ def main():
     arch = sorted(set(arch))
     if not arch or any(not re.fullmatch(r"gfx[0-9a-f]+", x) for x in arch):
         p.error(f"invalid/missing AMD architectures: {arch}")
-    if not any(x.startswith("gfx12") for x in arch):
-        p.error("pinned libr4d has RDNA4 kernels only; a new ISA needs a kernel plugin")
+    if any(x not in ("gfx1200", "gfx1201") for x in arch):
+        p.error("this KVMem build supports RDNA4 gfx1200 and gfx1201")
     a.build.mkdir(parents=True, exist_ok=True)
     command = ["cmake", "-S", str(a.source), "-B", str(a.build), "-G", "Ninja",
                "-DCMAKE_BUILD_TYPE=Release", "-DRAD_WITH_HIP=ON", "-DRAD_CORE_GENERIC_GPU_TARGETS=OFF", f"-DRAD_WITH_FFMPEG={a.ffmpeg}",
@@ -69,6 +70,9 @@ def main():
                f"-DRAD_KVMEM_SOURCE_DIR={Path(__file__).resolve().parents[3]}"]
     if a.kernel_profile is not None:command.append(f'-DR4D_PROFILE={a.kernel_profile}')
     if a.ffmpeg_static:command.append('-DPKG_CONFIG_ARGN=--static')
+    if a.json_include:
+        if not (a.json_include/'nlohmann/json.hpp').is_file():p.error('missing pinned nlohmann JSON header')
+        command.append(f'-DKVMEM_RADIANCE_JSON_INCLUDE_DIR={a.json_include.resolve()}')
     inputs = {"revision": head, "source": str(a.source), "sdk": str(a.rocm),
               "architectures": arch, "configure": command, "targets": a.target or []}
     (a.build / "kvmem-build-inputs.json").write_text(json.dumps(inputs, indent=2))

@@ -1,0 +1,326 @@
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
+index 3f8ae4ea23d3c4d2107ff91a18225666c6b81381..d216ffc9398470a2c9749cac3b045c210802fc8c 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
+@@ -126,7 +126,8 @@ std::size_t prompt_fp8_wide_workspace(int width, std::uint32_t max_visible) {
+     const char* setting = std::getenv("NINFER_PREFILL_FP8_WIDE_KV");
+     const char* feedback = std::getenv("NINFER_PREFILL_PAGE_LSE_REUSE");
+     if (!feedback || std::strcmp(feedback,"1") || !setting || std::strcmp(setting,"1") || width < 128 || max_visible > 65536 ||
+-        current_device_tier() != DeviceTier::Ampere) return 0;
++        current_device_volta() ||
++        shape_max_shared_bytes_per_block(turing_shapes_here()) < kCausalPromptSmemBytes) return 0;
+     const std::size_t stride = (std::size_t(max_visible)+63)/64*64;
+     return stride * 4 * 256 * 2 * sizeof(__half);
+ }
+@@ -134,11 +135,9 @@ std::size_t prompt_fp8_wide_workspace(int width, std::uint32_t max_visible) {
+ bool try_prompt_fp8_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
+     const Tensor& positions, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+     std::uint32_t max_visible, WorkspaceArena& workspace, Tensor& out, cudaStream_t stream, PromptPageLse& capture) {
+-    // Ampere/Ada and the default Blackwell build use this same BF16-QK,
+-    // FP16-PV FP8-cache kernel. Capture its page LSE without a second QK pass.
+-    // The optional widened-KV route keeps its separate architecture admission.
+-    const auto tier = current_device_tier();
+-    if (tier != DeviceTier::Ampere && tier != DeviceTier::Blackwell) return false;
++    // Volta owns a separate prompt implementation. Every other supported tier
++    // uses this FP8 kernel, with Turing's smaller shared-memory shape selected below.
++    if (current_device_volta()) return false;
+     const auto& scratch = capture.scratch;
+     const int n=capture.count;
+     if (n<=0 || n>PromptPageLse::max_samples || scratch.dtype!=DType::FP32 ||
+@@ -149,7 +148,6 @@ bool try_prompt_fp8_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
+     for (int i=0;i<n;++i)
+         if (capture.rows[i]<0 || capture.rows[i]>=q.ne[2] || (i && capture.rows[i]<=capture.rows[i-1]))
+             return false;
+-    using Shape=CausalPromptFp8Shape<false>;
+     using Metadata=PagedKVBatchMetadata<false>;
+     const Metadata meta{.tables=static_cast<const int*>(cache.block_tables.data),
+         .valid_columns=nullptr, .table_rows=static_cast<const int*>(table_rows.data),
+@@ -180,14 +178,18 @@ bool try_prompt_fp8_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
+         CUDA_CHECK(cudaGetLastError());
+         return true;
+     }
+-    const auto kernel=causal_attention_prompt_fp8_kernel<CausalD256H24Kv4,Metadata,false,PromptPageLseTile>;
+-    raise_dynamic_shared_memory(kernel,Shape::SmemBytes);
+-    const dim3 grid(unsigned(div_up(int(q.ne[2]),Shape::Br)),unsigned(q.ne[1]),1);
+-    kernel<<<grid,kCausalPromptFp8Threads,Shape::SmemBytes,stream>>>(
+-        static_cast<const __nv_bfloat16*>(q.data),static_cast<const std::uint8_t*>(cache.k_pages.data),
+-        static_cast<const std::uint8_t*>(cache.v_pages.data),static_cast<const __half*>(cache.k_scale_pages.data),
+-        static_cast<const __half*>(cache.v_scale_pages.data),meta,static_cast<const int*>(positions.data),scale,
+-        static_cast<__nv_bfloat16*>(out.data),int(q.ne[2]),tile);
++    with_shape_set([&]<bool TuringShapes>() {
++        using Shape = CausalPromptFp8Shape<TuringShapes>;
++        const auto kernel = causal_attention_prompt_fp8_kernel<
++            CausalD256H24Kv4, Metadata, TuringShapes, PromptPageLseTile>;
++        raise_dynamic_shared_memory(kernel, Shape::SmemBytes);
++        const dim3 grid(unsigned(div_up(int(q.ne[2]), Shape::Br)), unsigned(q.ne[1]), 1);
++        kernel<<<grid, kCausalPromptFp8Threads, Shape::SmemBytes, stream>>>(
++            static_cast<const __nv_bfloat16*>(q.data), static_cast<const std::uint8_t*>(cache.k_pages.data),
++            static_cast<const std::uint8_t*>(cache.v_pages.data), static_cast<const __half*>(cache.k_scale_pages.data),
++            static_cast<const __half*>(cache.v_scale_pages.data), meta, static_cast<const int*>(positions.data), scale,
++            static_cast<__nv_bfloat16*>(out.data), int(q.ne[2]), tile);
++    });
+     CUDA_CHECK(cudaGetLastError());
+     return true;
+ }
+diff --git a/tests/ops/softmax_attention/page_lse.cpp b/tests/ops/softmax_attention/page_lse.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fb3ccbe3ef0170eddf09f992e2b6389bc3fcbd0
+--- /dev/null
++++ b/tests/ops/softmax_attention/page_lse.cpp
+@@ -0,0 +1,243 @@
++#include "ninfer/ops/attention_page_mass.h"
++#include "ninfer/ops/prompt_page_lse.h"
++#include "ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h"
++#include "ops/op_tester.h"
++#include <numeric>
++#include <cstdlib>
++#include <iomanip>
++#include <array>
++#include <thread>
++#include <atomic>
++#include <string_view>
++using namespace ninfer;
++using namespace ninfer::test;
++
++static double half_value(std::uint16_t bits) {
++    const int exponent=(bits>>10)&31, fraction=bits&1023;
++    const double value=exponent ? std::ldexp(1.+fraction/1024.,exponent-15) : std::ldexp(double(fraction),-24);
++    return bits&32768 ? -value:value;
++}
++static double e4m3_value(std::uint8_t bits) {
++    const int exponent=(bits>>3)&15, fraction=bits&7;
++    const double value=exponent ? std::ldexp(1.+fraction/8.,exponent-7) : std::ldexp(double(fraction),-9);
++    return bits&128 ? -value:value;
++}
++// The reference reads represented cache bytes and scales independently, without
++// importing a device codec, staging cast, softmax tile, or production reduction.
++static void independent_reference(const std::vector<std::uint16_t>& q,
++    const std::vector<std::uint8_t>& codes_k,const std::vector<std::uint8_t>& codes_v,
++    const std::vector<std::uint16_t>& scales_k,const std::vector<std::uint16_t>& scales_v,
++    const std::vector<int>& table,int capacity,int width,int base,int pages,
++    const std::vector<int>& samples,std::vector<double>& output,std::vector<double>& mass) {
++    constexpr int D=256,H=24,K=4;
++    const int end=base+width,S=int(samples.size());
++    std::vector<float> keys(size_t(end)*K*D),values(keys.size());
++    for(int t=0;t<end;++t)for(int h=0;h<K;++h) {
++        const size_t row=(size_t(table[capacity+t/64])*K+h)*64+t%64;
++        const double ks=half_value(scales_k[row]),vs=half_value(scales_v[row]);
++        for(int d=0;d<D;++d){
++            keys[(size_t(h)*end+t)*D+d]=float(e4m3_value(codes_k[row*D+d])*ks);
++            values[(size_t(h)*end+t)*D+d]=float(e4m3_value(codes_v[row*D+d])*vs);
++        }
++    }
++    output.assign(size_t(S)*H*D,0);mass.assign(size_t(S)*pages,0);
++    std::vector<double> head_mass(size_t(S)*H*pages);
++    std::atomic<int> next{0};std::vector<std::thread> workers;
++    for(int worker=0;worker<8;++worker)workers.emplace_back([&]{
++        std::vector<double> weights(end);
++        for(int row=next.fetch_add(1);row<S*H;row=next.fetch_add(1)) {
++            const int sample=row/H,head=row%H,kvhead=head/6,visible=base+samples[sample]+1;
++            std::array<double,D> query{};
++            for(int d=0;d<D;++d)query[d]=bf16_to_f32(q[(size_t(samples[sample])*H+head)*D+d]);
++            for(int stride=1;stride<D;stride*=2)for(int start=0;start<D;start+=2*stride)
++                for(int d=0;d<stride;++d){
++                    const double a=query[start+d],b=query[start+d+stride];
++                    query[start+d]=a+b;query[start+d+stride]=a-b;
++                }
++            for(auto& x:query)x/=16.;
++            double maximum=-INFINITY;
++            for(int t=0;t<visible;++t){
++                double dot=0;for(int d=0;d<D;++d)dot+=query[d]*keys[(size_t(kvhead)*end+t)*D+d];
++                weights[t]=dot/16.;maximum=std::max(maximum,weights[t]);
++            }
++            double denominator=0;
++            for(int t=0;t<visible;++t){weights[t]=std::exp(weights[t]-maximum);denominator+=weights[t];}
++            auto* result=output.data()+size_t(row)*D;
++            for(int t=0;t<visible;++t){
++                const double probability=weights[t]/denominator;
++                head_mass[size_t(row)*pages+t/64]+=probability;
++                for(int d=0;d<D;++d)result[d]+=probability*values[(size_t(kvhead)*end+t)*D+d];
++            }
++        }
++    });
++    for(auto& worker:workers)worker.join();
++    for(int s=0;s<S;++s)for(int h=0;h<H;++h)for(int p=0;p<pages;++p)
++        mass[size_t(s)*pages+p]+=head_mass[(size_t(s)*H+h)*pages+p]/H;
++}
++// FP8 cache attention stages Q/K through BF16 before softmax. Logit rounding
++// can concentrate its error in individual output coordinates, beyond the final
++// BF16 store error alone. Use a fixed 1.2% normwise budget plus a finite 1.2%
++// gross bound for every fixture/mode, including the unchanged baseline. The
++// FP64 oracle never reproduces those internal casts or reduction schedules.
++constexpr double kAttentionRelativeBudget=0.012;
++constexpr double kAttentionGrossAbsolute=0.004;
++constexpr double kAttentionGrossRelative=0.012;
++static double maximum_attention_error=0,maximum_mass_error=0;
++static int oracle_checks=0;
++static int numerical_failures=0;
++static void check_error(const char* label,const std::vector<double>& values,
++                        const std::vector<double>& expected,double l2_limit,double absolute,double relative) {
++    double squared=0,norm=0,maximum=0,error=0;
++    if(values.size()!=expected.size())throw std::runtime_error("Reference size differs");
++    for(size_t i=0;i<values.size();++i){
++        if(!std::isfinite(values[i])||!std::isfinite(expected[i]))throw std::runtime_error("Nonfinite result");
++        const double delta=values[i]-expected[i];squared+=delta*delta;norm+=expected[i]*expected[i];
++        maximum=std::max(maximum,std::abs(expected[i]));error=std::max(error,std::abs(delta));
++    }
++    const double l2=std::sqrt(squared/std::max(norm,1e-30));
++    if(l2>l2_limit || error>absolute+relative*maximum) {
++        ++numerical_failures;
++        std::cout<<"{\"failed_check\":\""<<label<<"\",\"relative_l2\":"<<l2
++            <<",\"max_abs\":"<<error<<",\"max_reference\":"<<maximum<<"}"<<std::endl;
++    }
++    if(std::string_view(label)=="attention"){maximum_attention_error=std::max(maximum_attention_error,l2);++oracle_checks;}
++    if(std::string_view(label)=="page_mass"){maximum_mass_error=std::max(maximum_mass_error,l2);++oracle_checks;}
++}
++static double relative_error(const std::vector<float>& values,const std::vector<float>& expected) {
++    double delta=0,norm=0;for(size_t i=0;i<values.size();++i){
++        const double diff=double(values[i])-expected[i];delta+=diff*diff;norm+=double(expected[i])*expected[i];
++    }
++    return std::sqrt(delta/std::max(norm,1e-30));
++}
++
++static void setting(int mode) {
++#ifdef _WIN32
++    _putenv_s("NINFER_PREFILL_PAGE_LSE_REUSE", mode ? "1" : "0");
++    _putenv_s("NINFER_PREFILL_FP8_WIDE_KV", mode==2 ? "1" : "0");
++#else
++    setenv("NINFER_PREFILL_PAGE_LSE_REUSE", mode ? "1" : "0", 1);
++    setenv("NINFER_PREFILL_FP8_WIDE_KV", mode==2 ? "1" : "0", 1);
++#endif
++}
++static void qualify(int width, int base, bool bench) {
++    constexpr int D=256,H=24,K=4;
++    const int end=base+width,pages=(end+63)/64+2,capacity=pages+3,S=bench ? std::min(64,width/64) : (base>60000 ? 2 : std::min(64,width));
++    const size_t nk=size_t(capacity)*K*64,nq=size_t(width)*H*D;
++    std::mt19937 rng(302+width);std::uniform_real_distribution<float> uniform(-1.6f,1.6f);
++    std::vector<std::uint16_t> q(nq),k(size_t(width)*K*D),v(k.size());
++    for(auto& x:q)x=f32_to_bf16(uniform(rng));
++    for(auto& x:k)x=f32_to_bf16(uniform(rng));
++    for(auto& x:v)x=f32_to_bf16(uniform(rng)*.7f);
++    std::vector<std::uint8_t> codes(nk*D);std::vector<std::uint16_t> scales(nk);
++    for(size_t i=0;i<nk;++i){scales[i]=std::uint16_t(0x2400+(i%19)*67);
++        for(int d=0;d<D;++d)codes[i*D+d]=std::uint8_t((rng()%127)|((rng()%2)*128));}
++    std::vector<int> table(capacity*2,-1),pos(width),samples(S),limits(S);
++    for(int i=0;i<capacity;++i)table[capacity+i]=capacity-1-i;
++    std::iota(pos.begin(),pos.end(),base);
++    for(int i=0;i<S;++i){samples[i]=(i+1)*width/S-1;limits[i]=pos[samples[i]];}
++    auto dq=to_device(q),dk=to_device(k),dv=to_device(v),dt=to_device(table);
++    auto pc=to_device(codes),pv=to_device(codes),ps=to_device(scales),vs=to_device(scales);
++    auto dp=to_device(pos),dtr=to_device(std::vector<int>{1}),dr=to_device(samples),de=to_device(limits);
++    DeviceBuffer result(nq*2+64),scratch(size_t(pages)*H*S*4+64),norms(size_t(2)*H*S*4+64),mass(size_t(pages)*S*4+64);
++    for(auto [buffer,bytes]:std::vector<std::pair<void*,size_t>>{{result.p,nq*2},{scratch.p,size_t(pages)*H*S*4},
++          {norms.p,size_t(2)*H*S*4},{mass.p,size_t(pages)*S*4}})
++        CUDA_CHECK(cudaMemset(static_cast<char*>(buffer)+bytes,0x5a,64));
++    Tensor qt(dq.p,DType::BF16,{D,H,width}),kt(dk.p,DType::BF16,{D,K,width}),vt(dv.p,DType::BF16,{D,K,width});
++    Tensor ot(result.p,DType::BF16,{D,H,width}),pt(dp.p,DType::I32,{width}),rt(dtr.p,DType::I32,{1});
++    Tensor rr(dr.p,DType::I32,{S}),ee(de.p,DType::I32,{S});
++    Tensor st(scratch.p,DType::FP32,{pages,H,S}),nt(norms.p,DType::FP32,{2,H,S}),mt(mass.p,DType::FP32,{pages,S});
++    PagedKVBatchLayerView cache;
++    cache.head_dim=D;cache.num_kv_heads=K;cache.storage=KvCacheStorage::Fp8E4M3Row256;
++    cache.k_pages=Tensor(pc.p,DType::FP8_E4M3FN,{D,64,K,capacity});cache.v_pages=Tensor(pv.p,DType::FP8_E4M3FN,{D,64,K,capacity});
++    cache.k_scale_pages=Tensor(ps.p,DType::FP16,{1,64,K,capacity});cache.v_scale_pages=Tensor(vs.p,DType::FP16,{1,64,K,capacity});
++    cache.block_tables=Tensor(dt.p,DType::I32,{capacity,2});
++    const ops::AttentionHeadGeometry geo{D,H,K};
++    const ops::CausalAttentionExecutionEnvelope env{unsigned(base+1),unsigned(end)};
++    setting(2);
++    const auto workspace_bytes=ops::causal_softmax_attention_workspace_capacity_bytes(geo,cache.storage,env,1,width,width);
++    WorkspaceArena arena(std::max<size_t>(4096,workspace_bytes));
++    std::vector<std::uint16_t> reference;std::vector<float> reference_mass;
++    std::vector<double> oracle_output,oracle_mass;
++    cudaEvent_t begin,finish;CUDA_CHECK(cudaEventCreate(&begin));CUDA_CHECK(cudaEventCreate(&finish));
++    for(int round=bench?-1:0;round<(bench?6:1);++round)for(int order=0;order<3;++order){
++        const int mode=round<0?order:(order+round)%3;setting(mode);
++        ops::PromptPageLse capture;capture.scratch=st;capture.count=S;
++        std::copy(samples.begin(),samples.end(),capture.rows);
++        int captured=0;
++        auto invoke=[&]{
++            capture.captured=false;
++            ops::causal_softmax_attention_with_page_lse(qt,kt,vt,pt,{},rt,geo,1.f/16,cache,env,arena,ot,nullptr,nullptr,nullptr,mode?&capture:nullptr);
++            captured+=capture.captured;
++            if(capture.captured)ops::attention_page_mass_from_lse(st,nt,mt,nullptr);
++            else ops::attention_page_mass(qt,rr,ee,1,cache,st,nt,mt,nullptr);
++        };
++        for(int i=0;i<(bench?5:1);++i)invoke();CUDA_CHECK(cudaDeviceSynchronize());captured=0;
++        CUDA_CHECK(cudaEventRecord(begin));const int iterations=bench?10:1;for(int i=0;i<iterations;++i)invoke();
++        CUDA_CHECK(cudaEventRecord(finish));CUDA_CHECK(cudaEventSynchronize(finish));
++        float ms=0;CUDA_CHECK(cudaEventElapsedTime(&ms,begin,finish));
++        const auto values=from_device<std::uint16_t>(result,nq);const auto masses=from_device<float>(mass,mt.numel());
++        if(reference.empty()){reference=values;reference_mass=masses;}
++        const bool equal=values==reference&&masses==reference_mass;
++        for(auto [buffer,bytes]:std::vector<std::pair<void*,size_t>>{{result.p,nq*2},{scratch.p,size_t(pages)*H*S*4},
++              {norms.p,size_t(2)*H*S*4},{mass.p,size_t(pages)*S*4}}) {
++            const auto guard=from_device<std::uint8_t>(static_cast<char*>(buffer)+bytes,64);
++            if(!std::all_of(guard.begin(),guard.end(),[](auto x){return x==0x5a;}))
++                throw std::runtime_error("Output/scratch canary overwritten");
++        }
++        for(auto x:values)if(!std::isfinite(bf16_to_f32(x)))throw std::runtime_error("nonfinite output");
++        if (!bench) {
++            if (oracle_output.empty()) {
++                const auto raw_k=from_device<std::uint8_t>(pc,codes.size());
++                const auto raw_v=from_device<std::uint8_t>(pv,codes.size());
++                const auto raw_ks=from_device<std::uint16_t>(ps,scales.size());
++                const auto raw_vs=from_device<std::uint16_t>(vs,scales.size());
++                independent_reference(q,raw_k,raw_v,raw_ks,raw_vs,table,capacity,width,base,pages,
++                                      samples,oracle_output,oracle_mass);
++            }
++            std::vector<double> selected;
++            for(int row:samples)for(int h=0;h<H;++h)for(int d=0;d<D;++d)
++                selected.push_back(bf16_to_f32(values[(size_t(row)*H+h)*D+d]));
++            check_error("attention",selected,oracle_output,kAttentionRelativeBudget,kAttentionGrossAbsolute,kAttentionGrossRelative);
++            check_error("page_mass",std::vector<double>(masses.begin(),masses.end()),oracle_mass,0.01,0.001,0.005);
++        }
++        if(mode==1 && values!=reference)throw std::runtime_error("LSE capture changed attention output");
++        const double mass_difference=relative_error(masses,reference_mass);
++        std::vector<float> actual_float(nq),baseline_float(nq);
++        for(size_t i=0;i<nq;++i){actual_float[i]=bf16_to_f32(values[i]);baseline_float[i]=bf16_to_f32(reference[i]);}
++        check_error("attention parity",std::vector<double>(actual_float.begin(),actual_float.end()),
++                    std::vector<double>(baseline_float.begin(),baseline_float.end()),kAttentionRelativeBudget,kAttentionGrossAbsolute,kAttentionGrossRelative);
++        if(mode && width>=128 && !ops::current_device_volta() && captured!=iterations)
++            throw std::runtime_error("Eligible prompt did not capture page LSE");
++        for(int i=0;i<S;++i) {
++            double total=0;for(int page=0;page<pages;++page){
++                const float value=masses[size_t(i)*pages+page];
++                if(!std::isfinite(value)||value<0)throw std::runtime_error("Invalid page mass");
++                if(page*64>limits[i] && value!=0)throw std::runtime_error("Noncausal page mass");
++                total+=value;
++            }
++            if(std::abs(total-1)>1e-5)throw std::runtime_error("Page masses do not normalize");
++        }
++        if(round>=0)std::cout<<std::setprecision(9)<<"{\"width\":"<<width<<",\"history\":"<<base
++          <<",\"samples\":"<<S<<",\"round\":"<<round<<",\"mode\":"<<mode<<",\"ms\":"<<ms/iterations
++          <<",\"captured\":"<<captured<<",\"iterations\":"<<iterations<<",\"wide_bytes\":"<<ops::detail::prompt_fp8_wide_workspace(width,end)
++          <<",\"attention_equal\":"<<(values==reference?"true":"false")<<",\"output_and_mass_equal\":"<<(equal?"true":"false")<<",\"mass_relative_difference\":"<<mass_difference<<"}"<<std::endl;
++    }
++    CUDA_CHECK(cudaEventDestroy(begin));CUDA_CHECK(cudaEventDestroy(finish));
++}
++int main(int argc,char** argv){try{
++    if(cuda_unavailable())return 77;
++    CUDA_CHECK(cudaSetDevice(0));cudaDeviceProp p{};CUDA_CHECK(cudaGetDeviceProperties(&p,0));
++    std::cout<<"{\"gpu\":\""<<p.name<<"\",\"cc_major\":"<<p.major<<",\"cc_minor\":"<<p.minor
++        <<",\"device_tier\":"<<int(ops::current_device_tier())<<"}"<<std::endl;
++    if(argc==2 && std::string_view(argv[1])=="--bench") {
++        qualify(1024,36864,true);qualify(4096,36864,true);qualify(128,65408,true);
++    } else {
++        for (auto [width,history]:std::vector<std::pair<int,int>>{{1,0},{2,63},{31,65},{32,64},
++             {33,63},{63,1},{64,0},{65,127},{127,65},{128,64},{129,63},{257,513},
++             {128,65407},{128,65408},{128,65409}}) qualify(width,history,false);
++    }
++    if(oracle_checks)std::cout<<"{\"oracle_checks\":"<<oracle_checks
++        <<",\"maximum_attention_relative_l2\":"<<maximum_attention_error
++        <<",\"maximum_mass_relative_l2\":"<<maximum_mass_error<<"}"<<std::endl;
++    return numerical_failures ? 1:0;
++}catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}}
+diff --git a/tests/ops/tests.cmake b/tests/ops/tests.cmake
+index 7f670676f5ce6dff8f32db54e6518c16dd390040..c5b1be1314aae7b715dda75674f2ee6636dc749d 100644
+--- a/tests/ops/tests.cmake
++++ b/tests/ops/tests.cmake
+@@ -422,3 +422,8 @@ ninfer_add_test(ninfer_stream_cpu_test
+   LIBRARIES ninfer_ops)
+ target_include_directories(ninfer_gguf_expert_cpu_test PRIVATE
+   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
++
++# Public attention and page-feedback qualification; also supports --bench.
++ninfer_add_op_test(ninfer_prompt_page_lse_test STANDALONE
++  SOURCES ops/softmax_attention/page_lse.cpp LIBRARIES ninfer_ops ninfer_core)
++ninfer_stage_runtime_dlls(ninfer_prompt_page_lse_test)

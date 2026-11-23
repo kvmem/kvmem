@@ -105,6 +105,10 @@ add_executable(radiance_page_transfer_test tests/page_transfer_test.cpp)
 target_link_libraries(radiance_page_transfer_test PRIVATE kvmem_radiance_transfer)
 add_test(NAME radiance_page_transfer_test COMMAND radiance_page_transfer_test)
 if(TARGET rad_core)
+    # Radiance v2 uses its own JSON DOM. KVMem's monitor retains its independent
+    # nlohmann API, supplied by the task's pinned dependency bundle.
+    find_path(KVMEM_RADIANCE_JSON_INCLUDE_DIR nlohmann/json.hpp REQUIRED)
+    include_directories(SYSTEM "${KVMEM_RADIANCE_JSON_INCLUDE_DIR}")
     if(NOT RAD_HIP_FOUND)
         message(FATAL_ERROR "The native Radiance KVMem executor requires HIP attention feedback")
     endif()
@@ -157,7 +161,8 @@ if(TARGET rad_core)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/launcher-capabilities.json" launcher_capabilities)
     string(JSON radiance_capabilities GET "${launcher_capabilities}" backends radiance)
     string(JSON radiance_mtp_max_draft_tokens GET "${radiance_capabilities}" speculative modes mtp max_draft_tokens)
-    if(R4D_PROFILE STREQUAL "qwen35-dense-tp1")
+    set(_radiance_capability_profile "${R4D_PROFILE}")
+    if(_radiance_capability_profile STREQUAL "qwen35-dense-tp1")
         # The selected kernel closure serves one rank. Keep the common manifest
         # usable by general builds and constrain this binary's advertised limits.
         find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
@@ -166,7 +171,7 @@ if(TARGET rad_core)
         execute_process(COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_capabilities.py"
             --manifest "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/launcher-capabilities.json"
-            --kernel-profile "${R4D_PROFILE}"
+            --kernel-profile "${_radiance_capability_profile}"
             OUTPUT_VARIABLE radiance_capabilities
             ERROR_VARIABLE _radiance_caps_error
             RESULT_VARIABLE _radiance_caps_status)
@@ -199,6 +204,9 @@ if(TARGET rad_core)
     target_link_libraries(radiance-kvmem-server PRIVATE kvmem_radiance_memory)
     set_target_properties(radiance-kvmem-server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin ENABLE_EXPORTS ON)
     if(WIN32)
+        # The v2 Windows core is a DLL. The worker exports no symbols, so no
+        # import library is emitted; asking Ninja for one forces endless relinks.
+        set_target_properties(radiance-kvmem-server PROPERTIES ENABLE_EXPORTS OFF)
         # Windows searches System32 before PATH. Keep the HIP runtime paired
         # with the compiler that emitted the worker's device code.
         get_filename_component(_hip_libdir "${RAD_HIP_RUNTIME}" DIRECTORY)
@@ -219,7 +227,9 @@ if(TARGET rad_core)
     target_link_libraries(kvmem-radiance-observer-probe PRIVATE kvmem_radiance_memory)
     set_target_properties(kvmem-radiance-observer-probe PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin ENABLE_EXPORTS ON)
-    if(NOT WIN32)
+    if(WIN32)
+        set_target_properties(kvmem-radiance-observer-probe PROPERTIES ENABLE_EXPORTS OFF)
+    else()
         set_target_properties(kvmem-radiance-observer-probe PROPERTIES LINK_LIBRARY_OVERRIDE_rad_core WHOLE_ARCHIVE)
     endif()
     add_executable(radiance_native_memory_gpu_test tests/native_memory_gpu_test.cpp)

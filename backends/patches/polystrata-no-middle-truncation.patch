@@ -1,0 +1,99 @@
+--- a/serve/kvmem.py
++++ b/serve/kvmem.py
+@@ -6,14 +6,22 @@
+ from jinja2.exceptions import TemplateError
+ 
+ 
+-def enabled(engine) -> bool:
++def enabled(engine=None, *, args=None) -> bool:
+     if (getattr(engine, "info", {}) or {}).get("kvmem") in (1, "1"):
+         return True
+     try:
+-        args = getattr(engine, "spawn", (None, []))[1]
++        if args is None:
++            args = getattr(engine, "spawn", (None, []))[1]
+         return int(args[args.index("--kvmem-budget") + 1]) > 0
+     except (ValueError, IndexError, TypeError, AttributeError, KeyError):
+         return False
++
++
++def check_truncate_middle(value, *, engine=None, args=None) -> None:
++    """KVMem keeps the original history and Query coordinates; token splicing is unsupported."""
++    if value and (enabled(engine) or enabled(args=args)):
++        raise ValueError("truncate_middle is not supported with KVMem; set it to false or remove it. "
++                         "Shorten the conversation if it exceeds the logical context.")
+ 
+ 
+ def cache_owner(req):
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -3852,6 +3852,9 @@
+ 
+     def apply_settings(self, settings: dict) -> None:
+         """#37: a model's own settings (model_settings()), at the start and at every switch to it."""
++        from serve import kvmem
++        kvmem.check_truncate_middle(settings.get("truncate_middle", getattr(self, "truncate_middle", False)),
++                                    engine=self.engine)
+         for key, value in settings.items():
+             if key == "aliases":
+                 self.set_aliases(value)
+@@ -4610,6 +4613,8 @@
+         Leave room for an explicitly requested answer, or one eighth of the context when no answer limit was given.
+         Image prompts are excluded by the caller because cutting encoded image embeddings would corrupt their layout.
+         """
++        from serve import kvmem
++        kvmem.check_truncate_middle(True, engine=self.engine)
+         ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+         if ctx <= 0:
+             return ids
+@@ -4641,6 +4646,7 @@
+         if max_new is None and getattr(self, "kvmem_default_max_tokens", None) is not None:
+             max_new = self.kvmem_default_max_tokens
+         from serve import kvmem
++        kvmem.check_truncate_middle(self.truncate_middle, engine=self.engine)
+         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
+         # between pictures and raise ClientGone
+         fetched = self._note_unreadable_tool_images(messages, cancel)
+@@ -6736,6 +6742,9 @@
+                 with svc.config_lock:
+                     cfg = runconfig.load(svc.config_path)
+                     new, changed = runconfig.apply(cfg, req.get("set") if isinstance(req, dict) else None)
++                    from serve import kvmem
++                    kvmem.check_truncate_middle(new.get("truncate_middle") is True, engine=svc.engine,
++                                                args=new.get("args"))
+                     if changed:
+                         bak = runconfig.save(svc.config_path, new)
+             except ValueError as e:
+@@ -7619,6 +7628,8 @@
+     --min-free-vram-mib and --before-load, which win for every model.  ValueError names a bad value; nothing is set
+     then, so a switch to a model with a bad config leaves the loaded one alone.  The keys of the server itself (host,
+     api_key, allowed_hosts, cors_origins, ...) are main()'s: they come from the config the server started with."""
++    from serve import kvmem
++    kvmem.check_truncate_middle(cfg.get("truncate_middle") is True, args=cfg.get("args"))
+     over = {k: v for k, v in (overrides or {}).items() if v is not None}
+ 
+     def flag(key):                                     # an opt-in that is true or false (absent: false)
+--- a/serve/runconfig.py
++++ b/serve/runconfig.py
+@@ -26,7 +26,7 @@
+     ("fit_max_tokens", "bool", "Shorten a max_tokens that does not fit the context instead of answering 400"),
+     ("drop_oldest", "bool", "Leave out a conversation's oldest turns when it no longer fits the context, instead of "
+                             "answering 400 (the system prompt and the last turn stay)"),
+-    ("truncate_middle", "bool", "Trim the middle of an oversized text prompt, keeping its beginning and ending"),
++    ("truncate_middle", "bool", "Trim the middle of an oversized text prompt, keeping its beginning and ending (unavailable with KVMem)"),
+     ("preserve_thinking", "bool", "Keep the thinking of earlier turns in the prompt (templates that support it: "
+                                   "Qwen3.6, Ornith, Tiel Coder)"),
+     ("anthropic_thinking", ("enum", ["model", "on_request"]),
+@@ -165,6 +165,12 @@
+         else:
+             new[key] = v
+         changed.append(key)
++    if new.get("truncate_middle") is True:
++        from serve import kvmem
++        from serve.server import split_joined_args
++        effective = dict(new)  # validate the startup interpretation without rewriting the stored args
++        split_joined_args(effective)
++        kvmem.check_truncate_middle(True, args=effective.get("args"))
+     return new, changed
+ 
+ 

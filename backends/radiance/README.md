@@ -1,8 +1,12 @@
 # Radiance Windows / Linux AMD backend
 
-For native Windows RX 9070 XT (gfx1201), start with the [console and chat quickstart](../../docs/radiance/CLIENT-QUICKSTART.md). The qualified text configuration uses Radiance 1.17.0, ordinary Qwen3.8-27B IQ3R v4, DFlash7, one GPU and one sequence, FP8 KV and F32 state. The full 256K Task 2 run and same-build comparisons are linked below.
+The Radiance 2.2.0 / ABI43 integration targets RDNA4 (`gfx1200` and `gfx1201`). The RDNA3 maintenance baseline is `maint/radiance-v2-rdna3` at `ecfcc82`. See the [historical migration record](../../docs/radiance-v2-migration-20261116.md).
 
-The Linux RX 9060 XT (gfx1200) IQ3R-S v4 qualification covers single-GPU text, bounded RAM/SSD history and DFlash7, including a 12K two-stage test. CPU PNG request/cache/placement checks pass. The original image suite scored 21/22 on low-resolution OCR; the separate higher-resolution probe passed. See the [Linux integration record](../../docs/radiance-iqr-v4-integration-20261105.md) for tested profiles and exclusions.
+The ABI43 Windows RX 9070 XT qualification used Qwen3.8-27B IQ3R v4, one GPU and one sequence, BF16 KV, F32 state, 4096-token prefill and drafting disabled. The document-first test confirmed exact prefix reuse, Query replay and SSD spill/read-back. See the [measured result](../../docs/radiance/evidence/windows-gfx1201-abi43-text.json).
+
+For the historical Radiance 1.17.0 release on Windows RX 9070 XT (gfx1201), see the [console and chat quickstart](../../docs/radiance/CLIENT-QUICKSTART.md). The qualified text configuration uses ordinary Qwen3.8-27B IQ3R v4, DFlash7, one GPU and one sequence, FP8 KV and F32 state. The full 256K Task 2 run and same-build comparisons are linked below.
+
+The historical Linux RX 9060 XT (gfx1200) IQ3R-S v4 qualification covers single-GPU text, bounded RAM/SSD history and DFlash7, including a 12K two-stage test. CPU PNG request/cache/placement checks pass. The original image suite scored 21/22 on low-resolution OCR; the separate higher-resolution probe passed. See the [Linux integration record](../../docs/radiance-iqr-v4-integration-20261105.md) for tested profiles and exclusions.
 
 Build and run with `tools/build.py --platform auto|windows|linux` and
 `tools/serve.py --platform auto|windows|linux` on the target OS.

@@ -2,9 +2,16 @@
 
 # KVMem
 
-**在有限显存中运行长上下文对话与 AI Agent。**
+**在有限显存上运行长上下文对话和本地 AI Agent。**
 
-KVMem 将完整原生 KV 历史保存在内存中，可选下沉到 SSD；GPU 只保留当前请求需要的历史和生成工作空间。项目支持 **NInfer、llama.cpp、PolyStrata** 等多种推理后端，并持续接入更多后端，提供本地 Web UI 和兼容 OpenAI 的 API。
+## News · 最新发布
+
+- **2026-11-14 · AMD Radeon RX 9060 XT / 9070 / 9070 XT · Windows**\
+  Radiance 预发布版为 16 GB 显卡提供 256K 上下文预设，支持 DFlash2 和图文输入。同日更新了 GPU 利用率、显存、温度和功耗监控。**RX 9060 XT** 选 `gfx1200`，**RX 9070 / 9070 XT** 选 `gfx1201`。[v0.19.rad1 下载与说明](https://github.com/kvmem/kvmem/releases/tag/v0.19.rad1)
+- **2026-10-31 · NVIDIA GeForce RTX 20 / 30 / 40 / 50、Tesla V100 · Windows**\
+  双后端稳定版，NInfer 与 PolyStrata 共用控制台和聊天界面，新增显存预算自动测算，NInfer 支持 DFlash2 多卡按层拆分。按显卡选择对应安装包，V100 上的 PolyStrata 为实验支持。[v0.19.1 下载与说明](https://github.com/kvmem/kvmem/releases/tag/v0.19.1)
+
+[所有 Release](https://github.com/kvmem/kvmem/releases) · [快速开始](#quick-start)
 
 ## 支持哪些模型？按后端选择
 
@@ -36,6 +43,8 @@ RTX 代表型号包括 **2060 / 2080 Ti**、**3060 / 3090**、**4060 Ti / 4090**
 
 ## KVMem 能做什么
 
+KVMem 将完整原生 KV 历史保存在内存中，可选下沉到 SSD；GPU 只保留当前请求需要的历史和生成工作空间。项目支持 **NInfer、llama.cpp、PolyStrata** 等多种推理后端，并持续接入更多后端，提供本地 Web UI 和兼容 OpenAI 的 API。
+
 - **长上下文**：按查询召回历史 KV，在固定显存预算内管理长对话和工具历史。
 - **Extra-long / xhigh 长推理**：循环复用 GPU 生成空间，在有限显存下持续生成长推理与回答，支持 `xhigh` 推理档位。
 - **状态复用**：支持多轮对话、工具续接和会话管理，按后端规则复用前缀与检查点。
@@ -59,7 +68,7 @@ KVMem 在生成过程中持续腾出空间，**Gen reserve 是可循环使用的
 
 在发布页选择匹配操作系统、GPU 和后端的运行包。安装包、校验文件、驱动要求、模型支持及实测范围统一放在对应发布说明中；模型需另行准备。标记为 **Pre-release** 的版本用于试用。
 
-<!-- 维护约定：README 保持与版本无关。普通发版只更新 Releases、随包说明与相关文档；不在首页添加版本号、下载直链、包大小或校验值。中英文同步维护。 -->
+<!-- 维护约定：中英文 News 同步更新。发布日期使用北京时间，并链接到对应发布页。下载直链、包大小和校验值放在 Releases。 -->
 
 <a id="quick-start"></a>
 
@@ -103,6 +112,7 @@ python scripts/prepare-backends.py --check
 | 启动、参数与支持范围 | [运行指南](docs/multi-backend.md) · [后端差异](docs/multi-backend-differences.md) |
 | KV 召回与内存管理 | [图召回](docs/graph-recall.md) · [RAM / SSD 分层](docs/active-kv-tiering.md) |
 | 设计与后端接入 | [架构](docs/architecture.md) · [内存后端契约](docs/memory-backend-contract.md) |
+| AMD Radiance | [Windows 与 Linux 接入指南](docs/radiance-integration.md) · [性能对比](docs/radiance/PERFORMANCE-COMPARISON.md) · [Radiance 1.17 执行与传输测量](docs/radiance-execution-overhead-20261107.md) |
 | 构建与发布 | [开发工作流](docs/multi-backend-repository.md) · [后端版本与许可证](backends/versions.json) |
 | 测试与性能 | [验证记录](docs/multi-backend-validation.md) · [性能报告](docs/recommended-config-performance.md) · [测试数据](docs/benchmarks/) |
 

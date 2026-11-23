@@ -135,7 +135,7 @@ class ConsoleTests(unittest.TestCase):
         self.controller = console.Controller(console.ROOT, self.tmp.name, 18199)
         self.capability_stub = patch.object(self.controller, 'worker_capabilities', return_value={
             'schema_version': 1, 'query_scoring_revision': 2, 'independent_graph_lrfu': True,
-            'signed_lrfu_hits': True, 'executable_sha256': 'a' * 64})
+            'signed_lrfu_hits': True, 'legacy_query_replay_revision': 1, 'executable_sha256': 'a' * 64})
         self.capability_stub.start()
         self.addCleanup(self.capability_stub.stop)
         self.config = {'schema_version': 1, 'parameters': dict(console.DEFAULTS)}
@@ -158,8 +158,8 @@ class ConsoleTests(unittest.TestCase):
             self.assertNotIn('NoLrfu', migrated)
             if no_history: self.assertNotIn('LrfuLambda', migrated)
         for invalid in ({'QueryScorer': 'bad'}, {'GraphAlpha': float('nan')}, {'GraphAlpha': 1.1},
-                        {'ScoreAggregation': 'median'}, {'QueryMaxTokens': 0},
-                        {'QueryReplayMaxTokens': 0}, {'QueryScorer': 'page-softmax', 'Lrfu': False, 'LrfuLambda': .4}):
+                        {'ScoreAggregation': 'median'}, {'QueryMaxTokens': -1},
+                        {'QueryReplayMaxTokens': -1}, {'QueryScorer': 'page-softmax', 'Lrfu': False, 'LrfuLambda': .4}):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 console.normalize({'schema_version': 1, 'parameters': dict(console.DEFAULTS, **invalid)}, self.controller.backends)
 
@@ -179,6 +179,22 @@ class ConsoleTests(unittest.TestCase):
             with patch.object(console.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(value))):
                 with self.assertRaisesRegex(ValueError, 'Worker does not support'):
                     console.Controller.worker_capabilities(self.controller, worker, 'ninfer')
+
+    def test_full_query_plan_rejects_old_worker_before_start(self):
+        model = Path(self.tmp.name) / 'query.ninfer'; model.touch()
+        worker = Path(self.tmp.name) / f'query{EXE}'; worker.touch(); worker.chmod(0o755)
+        self.config['parameters'].update(Model=str(model), Worker=str(worker),
+            Gpu='GPU-00000000-0000-0000-0000-000000000001')
+        capabilities = self.controller.worker_capabilities.return_value
+        capabilities.pop('legacy_query_replay_revision')
+        with self.assertRaisesRegex(ValueError, 'full Query/replay'):
+            self.controller.plan(self.config)
+        self.assertIsNone(self.controller.process)
+        capabilities['legacy_query_replay_revision'] = 1
+        plan = self.controller.plan(self.config)
+        for flag in ('--kvmem-query-max-tokens', '--kvmem-query-replay-max-tokens'):
+            self.assertEqual(plan['argv'][plan['argv'].index(flag) + 1], '0')
+        self.assertIsNone(self.controller.process)
 
     def test_checkpoint_recompute_plan_rejects_old_worker_before_start(self):
         config = json.loads(json.dumps(self.config))
@@ -206,6 +222,19 @@ class ConsoleTests(unittest.TestCase):
         plan = self.controller.plan(self.config)
         self.assertEqual(plan['argv'][plan['argv'].index('--tensor-attention') + 1], 'heads')
         self.assertEqual(plan['argv'][plan['argv'].index('--tensor-split') + 1], '3,1')
+        self.assertIsNone(self.controller.process)
+
+    def test_cache_minimum_rejects_old_worker_before_start(self):
+        model = Path(self.tmp.name) / 'admission.ninfer'; model.touch()
+        worker = Path(self.tmp.name) / f'admission{EXE}'; worker.touch(); worker.chmod(0o755)
+        self.config['parameters'].update(Model=str(model), Worker=str(worker),
+            Gpu='GPU-00000000-0000-0000-0000-000000000001', CacheMinTokens=4096)
+        with self.assertRaisesRegex(ValueError, 'CacheMinTokens'):
+            self.controller.plan(self.config)
+        self.assertIsNone(self.controller.process)
+        self.controller.worker_capabilities.return_value['cache_admission_revision'] = 1
+        plan = self.controller.plan(self.config)
+        self.assertEqual(plan['argv'][plan['argv'].index('--kvmem-cache-min-tokens') + 1], '4096')
         self.assertIsNone(self.controller.process)
 
     def test_actual_scoring_is_observed_independently_of_the_editing_draft(self):

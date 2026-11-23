@@ -17,13 +17,13 @@ HostKvReservation reserve_metadata(HostKvStorage& owner,uint64_t bytes) {
 }
 }
 
-uint64_t LayerwiseProbeSelection::metadata_bound(const KvMemStore& policy,uint32_t layers) {
+uint64_t LayerwiseProbeSelection::metadata_bound(const KvMemStore& policy,uint32_t layers,bool half_pages) {
     if (!layers) throw MemoryError(MemoryErrorCode::InvalidPlan,"probe selection has no target layers");
     // Owned policy copy; all frame/fixed/score/result vectors; picker candidate,
     // scorer-return and atomic accumulation scratch. The copied policy vector
     // capacities cannot exceed the source capacities. No Q payload is owned.
     const uint64_t extra=sizeof(LayerwiseProbeSelection)+4096+
-        uint64_t(policy.block_count())*128+uint64_t(layers)*(sizeof(LayerwiseQueryGeometry)+64);
+        uint64_t(policy.block_count())*(half_pages ? 192 : 128)+uint64_t(layers)*(sizeof(LayerwiseQueryGeometry)+64);
     if (policy.allocated_bytes()>UINT64_MAX-extra)
         throw MemoryError(MemoryErrorCode::BudgetExceeded,"probe metadata extent overflow");
     return policy.allocated_bytes()+extra;
@@ -32,7 +32,8 @@ uint64_t LayerwiseProbeSelection::metadata_bound(const KvMemStore& policy,uint32
 LayerwiseProbeSelection::LayerwiseProbeSelection(const KvMemStore& policy,const RawKvStore& keys,
     LayerwiseQueryIdentity identity,const std::vector<LayerwiseQueryGeometry>& geometry,
     SourceRevision revision,HostKvStorage& metadata,const std::vector<uint32_t>& mandatory)
-    :metadata_bytes_(metadata_bound(policy,uint32_t(geometry.size()))),
+    :metadata_bytes_(metadata_bound(policy,uint32_t(geometry.size()),
+          keys.config().block_tokens != policy.config().block_tokens)),
      metadata_(std::make_shared<HostKvReservation>(reserve_metadata(metadata,metadata_bytes_))),policy_(policy),keys_(keys),
      identity_(std::move(identity)),geometry_(geometry),revision_(std::move(revision)),
      next_(identity_.query.begin) {
@@ -44,7 +45,7 @@ LayerwiseProbeSelection::LayerwiseProbeSelection(const KvMemStore& policy,const 
         throw MemoryError(MemoryErrorCode::InvalidPlan,"invalid private-probe Query identity");
     const auto& cfg=policy_.config();const auto block=cfg.block_tokens;
     const auto budget=policy_.select_budget_tokens();
-    if (!block || !budget || budget%block || keys_.config().block_tokens!=block ||
+    if (!block || !budget || budget%block || !layerwise_score_geometry(block, keys_.config().block_tokens) ||
         policy_.total_tokens()%block || uint64_t(policy_.block_count())*block!=policy_.total_tokens() ||
         cfg.select_method!=KvMemMethod::Retrieval || cfg.select_policy!=KvMemSelectPolicy::TopK || cfg.lrfu ||
         cfg.retrieval_method!=KvMemRetrievalMethod::MeanK || cfg.n_subblocks!=1 ||
@@ -68,8 +69,9 @@ LayerwiseProbeSelection::LayerwiseProbeSelection(const KvMemStore& policy,const 
             g.query_heads!=first.query_heads || g.kv_heads!=first.kv_heads ||
             g.head_dim!=first.head_dim || g.attention_scale!=first.attention_scale)
             throw MemoryError(MemoryErrorCode::InvalidPlan,"private-probe target tensor geometry differs from upstream LTHD");
-        for (uint32_t id=0;id<policy_.block_count();++id)
-            if (keys_.mean_k_tokens(id,g.layer)!=block)
+        const auto mean_tokens = keys_.config().block_tokens;
+        for (uint64_t id=0;id<policy_.total_tokens()/mean_tokens;++id)
+            if (id > UINT32_MAX || keys_.mean_k_tokens(static_cast<uint32_t>(id),g.layer)!=mean_tokens)
                 throw MemoryError(MemoryErrorCode::InvalidPlan,"probe target Mean-K does not match the accepted frame");
     }
     // New layerwise paths use only explicit request pins plus exact fixed
@@ -79,7 +81,7 @@ LayerwiseProbeSelection::LayerwiseProbeSelection(const KvMemStore& policy,const 
     result_.fixed=policy_.query_fixed_blocks(mandatory);
     result_.frame=query_score_frame(policy_.total_tokens(),block,policy_.budget_blocks(),
         cfg.sink_blocks,cfg.recent_blocks,result_.fixed);
-    result_.scores.assign(result_.frame.starts.size(),0.);
+    result_.scores.assign(layerwise_score_slots(result_.frame, policy_.config().layerwise_half_max),0.);
     result_.metadata_=metadata_;
     check_source();
 }
@@ -108,7 +110,9 @@ void LayerwiseProbeSelection::check_tile(const LayerwiseQueryIdentity& identity,
 }
 void LayerwiseProbeSelection::append(const LayerwiseQueryIdentity& identity,uint64_t begin,CurrentLayerQuery tile) {
     check_tile(identity,begin,tile.rows,tile.layer,tile.query_heads,tile.kv_heads,tile.head_dim,tile.attention_scale);
-    check_source();const auto scores=layerwise_mean_key_scores(keys_,tile,result_.frame);check_source();
+    check_source();const auto scores=layerwise_tile_scores(result_.frame,policy_.config().block_tokens,keys_.config().block_tokens,
+        policy_.config().layerwise_half_max,
+        [&](const auto& frame) { return layerwise_mean_key_scores(keys_,tile,frame); });check_source();
     accumulate(tile.rows,scores);
 }
 void LayerwiseProbeSelection::append_native(const LayerwiseQueryIdentity& identity,uint64_t begin,
@@ -116,14 +120,17 @@ void LayerwiseProbeSelection::append_native(const LayerwiseQueryIdentity& identi
     check_tile(identity,begin,tile.rows,tile.layer,tile.query_heads,tile.kv_heads,tile.head_dim,tile.attention_scale);
     validate_native_layer_query(tile);
     if (!scorer)throw MemoryError(MemoryErrorCode::InvalidPlan,"private-probe native scorer is missing");
-    check_source();const auto scores=scorer(keys_,tile,result_.frame);check_source();accumulate(tile.rows,scores);
+    check_source();const auto scores=layerwise_tile_scores(result_.frame,policy_.config().block_tokens,keys_.config().block_tokens,
+        policy_.config().layerwise_half_max,
+        [&](const auto& frame) { return scorer(keys_,tile,frame); });check_source();accumulate(tile.rows,scores);
 }
 void LayerwiseProbeSelection::accumulate(uint32_t rows,const std::vector<double>& scores) {
     if (scores.size()!=result_.scores.size())
         throw MemoryError(MemoryErrorCode::InvalidPlan,"private-probe mass shape differs from frozen frame");
+    const std::size_t slots_per_page = policy_.config().layerwise_half_max ? 2 : 1;
     auto accumulated=result_.scores;
     for (size_t i=0;i<scores.size();++i) {
-        if (!std::isfinite(scores[i]) || scores[i]<0 || (!result_.frame.score_mask[i] && scores[i]!=0))
+        if (!std::isfinite(scores[i]) || scores[i]<0 || (!result_.frame.score_mask[i/slots_per_page] && scores[i]!=0))
             throw MemoryError(MemoryErrorCode::InvalidPlan,"invalid private-probe raw page mass");
         // Existing scorer already averages heads and sums tokens. Upstream's
         // remaining reduction is the uniform TARGET-layer mean, exactly once.
@@ -141,9 +148,16 @@ LayerwiseProbeHistorySelection LayerwiseProbeSelection::finish(const LayerwiseQu
         throw MemoryError(MemoryErrorCode::Pending,"all private-probe Query targets are required before selection");
     check_source();
     std::vector<uint32_t> candidates(policy_.block_count());std::iota(candidates.begin(),candidates.end(),0u);
-    auto selected=policy_.pick_scored_blocks(candidates,result_.scores,result_.fixed,policy_.budget_blocks());
+    // This optional MTP policy scores a shared history across the target
+    // layers. Keep those contributions per half until the full Query ends.
+    auto condensed = policy_.config().layerwise_half_max
+        ? layerwise_max_page_scores(result_.scores) : std::vector<double>{};
+    const auto& ranks = policy_.config().layerwise_half_max ? condensed : result_.scores;
+    auto selected=policy_.pick_scored_blocks(candidates,ranks,result_.fixed,policy_.budget_blocks());
     uint64_t historical=0;for(auto id:selected)historical+=policy_.blocks()[id].n_tokens;
-    check_source();result_.selected=std::move(selected);result_.historical_tokens=historical;
+    check_source();
+    if (policy_.config().layerwise_half_max) result_.scores=std::move(condensed);
+    result_.selected=std::move(selected);result_.historical_tokens=historical;
     result_.charged_tokens=uint64_t(result_.selected.size())*policy_.config().block_tokens;
     phase_=LayerwiseSelectionPhase::Complete;return std::move(result_);
 }

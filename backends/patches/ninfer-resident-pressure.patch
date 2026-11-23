@@ -1,0 +1,1157 @@
+diff --git a/src/core/paged_kv_cache.cpp b/src/core/paged_kv_cache.cpp
+index 33e73344..30a6a5e9 100644
+--- a/src/core/paged_kv_cache.cpp
++++ b/src/core/paged_kv_cache.cpp
+@@ -828,6 +828,38 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
+     }
+ }
+ 
++void DeviceKVPagePool::copy_page_run_planes(std::span<const DeviceKVPageHandle> source,
++    std::span<const DeviceKVPageHandle> destination, std::span<const std::size_t> selected,
++    RankStreams streams) const {
++    if (source.empty() || source.size()!=destination.size() || selected.empty())
++        throw std::invalid_argument("native plane run has inconsistent extents");
++    const auto from=physical_index(source.front()),to=physical_index(destination.front());
++    for (std::size_t i=0;i<source.size();++i)
++        if (physical_index(source[i])!=std::int64_t(from)+i ||
++            physical_index(destination[i])!=std::int64_t(to)+i)
++            throw std::logic_error("native plane run is not physically consecutive");
++    if (from!=to && std::uint64_t(std::abs(std::int64_t(from)-to))<source.size())
++        throw std::logic_error("native plane run has overlapping CUDA copy ranges");
++    for (auto index:selected)
++        if (index>=planes_.size() || spec_.geometry.planes[index].page_stride!=1 ||
++            plane_ranks_[index]>=streams.size())
++            throw std::logic_error("native plane run has unsupported geometry or rank");
++    if (from==to) return;
++    for (auto index:selected) {
++        const auto& plane=planes_[index];
++        const HoldingDeviceBinding binding(plane_devices_[index]);
++        auto* base=static_cast<unsigned char*>(plane.data);
++        if (spec_.geometry.device_plane_order==PagedKVPlaneOrder::PageMajor)
++            CUDA_CHECK(cudaMemcpyAsync(base+std::int64_t(to)*plane.nb[3],
++                base+std::int64_t(from)*plane.nb[3],source.size()*plane.nb[3],
++                cudaMemcpyDeviceToDevice,streams[plane_ranks_[index]]));
++        else
++            CUDA_CHECK(cudaMemcpy2DAsync(base+std::int64_t(to)*plane.nb[2],plane.nb[3],
++                base+std::int64_t(from)*plane.nb[2],plane.nb[3],source.size()*plane.nb[2],
++                static_cast<std::size_t>(plane.ne[3]),cudaMemcpyDeviceToDevice,streams[plane_ranks_[index]]));
++    }
++}
++
+ void DeviceKVPagePool::copy_residue_page(std::size_t first_sibling, std::int32_t source,
+                                          std::int32_t destination, RankStreams streams) const {
+     const std::int32_t stride  = spec_.geometry.planes[first_sibling].page_stride;
+diff --git a/src/core/paged_kv_cache.h b/src/core/paged_kv_cache.h
+index b62cad08..c7bd89d2 100644
+--- a/src/core/paged_kv_cache.h
++++ b/src/core/paged_kv_cache.h
+@@ -332,6 +332,12 @@ public:
+     void copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
+                    RankStreams streams = {}) const;
+ 
++    // Restricted planes, consecutive physical pages, disjoint source/destination.
++    // Validates every handle before submission; residue geometries are excluded.
++    void copy_page_run_planes(std::span<const DeviceKVPageHandle> source,
++        std::span<const DeviceKVPageHandle> destination, std::span<const std::size_t> planes,
++        RankStreams streams) const;
++
+     void copy_to_host(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
+                       RankStreams streams = {}) const;
+     void copy_from_host(HostKVAllocationConstView source,
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.cpp b/src/models/qwen3_5/program/native_layerwise_request.cpp
+index f36e07fb..1ae4ac3c 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_request.cpp
+@@ -143,6 +143,7 @@ struct NativeLayerwiseRequest::Impl {
+         std::vector<kvmem::LayerwisePrefillMass> layers;
+         std::vector<HeadTile> head_tiles;
+     };
++    std::unique_ptr<NativeLayerwisePressure> pressure;
+     std::optional<Capture> capture;
+     std::optional<kvmem::MemoryStamp> credit;
+     std::uint32_t credit_count=0;
+@@ -1013,6 +1014,7 @@ void NativeLayerwiseRequest::prepare_feedback_admission(ProgramImpl& p,NativeLay
+ NativeLayerwiseRequest::~NativeLayerwiseRequest() {abort();}
+ std::uint32_t NativeLayerwiseRequest::admit_prefill(std::uint32_t desired) {
+     auto& q=*impl_;q.owner();if (q.credit) throw std::logic_error("native tile already owns a credit");
++    if (!progress_pressure()) return 0;
+     if (q.capture) {
+         auto& c=*q.capture;
+         if ((!c.no_refresh && !c.split_prefill) || q.sequence.text_kv_valid!=std::uint64_t(c.begin)+c.accepted_chunks)
+@@ -1023,6 +1025,8 @@ std::uint32_t NativeLayerwiseRequest::admit_prefill(std::uint32_t desired) {
+     auto state=q.state();const auto action=q.window.action(state);
+     if (action==kvmem::LayerwiseWindowAction::Query) return 0;
+     if (action==kvmem::LayerwiseWindowAction::Pressure) {
++        const bool time_selection=Impl::flag("NINFER_TIME_LAYER_REFRESH");
++        const auto selection_start=time_selection?Impl::FeedbackClock::now():Impl::FeedbackClock::time_point{};
+         const auto catalog=q.p.layerwise_catalog(q.sequence);std::vector<std::uint64_t> mandatory;
+         // Literal resident-only Pressure uses no recent band. Query's separate
+         // sink/recent policy never becomes a set of Pressure hard pins.
+@@ -1030,7 +1034,18 @@ std::uint32_t NativeLayerwiseRequest::admit_prefill(std::uint32_t desired) {
+         kvmem::validate_layerwise_selection_bands({q.options.sink_blocks,q.options.recent_blocks},64,budget,true);
+         const auto choices=q.output?q.output->select(catalog,*q.prefill,mandatory,budget,q.options.sink_blocks):
+             q.prefill->select(catalog,mandatory,budget,q.options.sink_blocks);
+-        q.p.compact_layerwise_pressure(q.sequence,choices);state=q.state();
++        if (time_selection) std::fprintf(stderr,"REFRESH_SELECT lane=%u frontier=%u select_ms=%.3f\n",
++            q.sequence.lane,q.sequence.text_kv_valid,Impl::milliseconds(selection_start));
++        q.reclaim_metadata();
++        q.pressure=q.p.start_layerwise_pressure(q.sequence,choices,q.runtime_metadata);
++        if (q.pressure) {
++            if (!q.pressure->ready()) {
++                if (Impl::flag("NINFER_ASYNC_LAYER_PRESSURE",true)) return 0;
++                q.pressure->wait();
++            }
++            (void)progress_pressure();
++        } else q.p.compact_layerwise_pressure(q.sequence,choices);
++        state=q.state();
+     } else if (action==kvmem::LayerwiseWindowAction::Chunk || action==kvmem::LayerwiseWindowAction::Exhausted)
+         throw std::length_error("native layerwise request cannot admit this semantic/exhausted boundary");
+     const auto n=q.window.admit(state,desired);if (n>UINT32_MAX) throw std::length_error("native tile exceeds native coordinates");
+@@ -1149,7 +1164,7 @@ void NativeLayerwiseRequest::prepare_no_refresh_query() {
+     } catch (...) {q.capture.reset();q.end_query_workspace();throw;}
+ }
+ void NativeLayerwiseRequest::detach_prefill() {
+-    auto& q=*impl_;q.owner();if (q.capture || q.credit) throw std::logic_error("native input cannot retire pending capture/credit");
++    auto& q=*impl_;q.owner();if (q.pressure || q.capture || q.credit) throw std::logic_error("native input cannot retire pending Pressure/capture/credit");
+     if (q.admission) {q.admission->finish_input();q.admission.reset();}
+     q.input_owner=nullptr;q.input=nullptr;
+ }
+@@ -1164,6 +1179,7 @@ std::uint32_t NativeLayerwiseRequest::admit_output(std::uint32_t desired) {
+     // Inspect the literal action at every accepted block boundary. Keeping a
+     // native physical draft width does not authorize skipping H%BT==0 when a
+     // variable accepted prefix crosses that boundary.
++    if (!progress_pressure()) return 0;
+     desired=std::min(desired,64u-static_cast<std::uint32_t>(impl_->state().history%64));
+     return admit_prefill(desired);
+ }
+@@ -1412,12 +1428,25 @@ void NativeLayerwiseRequest::abort_graph_output(std::uint64_t epoch) noexcept {
+     q.graph_epoch=0;q.graph_staging={};q.failed=true;q.sequence.window.stamp.valid=false;
+ }
+ NativeLayerwiseOutputWork NativeLayerwiseRequest::output_work() const noexcept {return impl_->output_work;}
+-bool NativeLayerwiseRequest::query_due() const {return impl_->window.action(impl_->state())==kvmem::LayerwiseWindowAction::Query;}
+-bool NativeLayerwiseRequest::pending_native() const noexcept {return impl_->capture.has_value() || impl_->credit.has_value() || impl_->physical_grant.has_value();}
++bool NativeLayerwiseRequest::pressure_pending() const noexcept {return bool(impl_->pressure);}
++bool NativeLayerwiseRequest::pressure_waiting() const noexcept {
++    try {return impl_->pressure && !impl_->pressure->ready();} catch (...) {return false;}
++}
++bool NativeLayerwiseRequest::progress_pressure() {
++    auto& q=*impl_;if (!q.pressure) return true;
++    q.owner();if (!q.pressure->ready()) return false;
++    q.pressure->finish();q.pressure.reset();return true;
++}
++bool NativeLayerwiseRequest::wait_pressure() {
++    if (!impl_->pressure || impl_->pressure->ready()) return false;
++    impl_->pressure->wait();return true;
++}
++bool NativeLayerwiseRequest::query_due() const {return !impl_->pressure && impl_->window.action(impl_->state())==kvmem::LayerwiseWindowAction::Query;}
++bool NativeLayerwiseRequest::pending_native() const noexcept {return bool(impl_->pressure) || impl_->capture.has_value() || impl_->credit.has_value() || impl_->physical_grant.has_value();}
+ const kvmem::LayerwiseWindowPlan& NativeLayerwiseRequest::plan() const {return impl_->window;}
+ const NativeLayerwiseRequestOptions& NativeLayerwiseRequest::options() const {return impl_->options;}
+ void NativeLayerwiseRequest::retire() {
+-    auto& q=*impl_;if (q.capture || q.credit || q.physical_grant) throw std::logic_error("native layerwise request cannot retire pending native work");
++    auto& q=*impl_;if (q.pressure || q.capture || q.credit || q.physical_grant) throw std::logic_error("native layerwise request cannot retire pending native work");
+     if (q.trace_feedback || q.verify_feedback) {
+         const auto& c=q.counters;
+         std::fprintf(stderr,"FEEDBACK_DETAIL req=%" PRIu64 " candidate_hash=%" PRIu64 " graph_steps=%" PRIu64 " max_packed_row=%u graph_body_ms=%.3f snapshot_bytes=%" PRIu64 " pinned_peak=%" PRIu64 " control_bytes=%" PRIu64 " full=%" PRIu64 " partial=%" PRIu64 " zero=%" PRIu64 "\n",
+@@ -1433,6 +1462,9 @@ void NativeLayerwiseRequest::retire() {
+     q.retired=true;
+ }
+ void NativeLayerwiseRequest::abort() noexcept {if (impl_ && !impl_->retired) {
++    // The private copy stream must drain before any physical grant or native
++    // address can retire. A partially rewritten owner is never republished.
++    impl_->pressure.reset();
+     // Whole-cohort RAII owns the shared storage fence/release.
+     if (impl_->graph_epoch) abort_graph_output(impl_->graph_epoch);
+     // A grant can have submitted GDN work before the first attention observer
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.h b/src/models/qwen3_5/program/native_layerwise_request.h
+index cd2e3b50..c9abe1ff 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.h
++++ b/src/models/qwen3_5/program/native_layerwise_request.h
+@@ -14,6 +14,16 @@ struct DecodeGraphProfile;
+ struct NativeLayerwiseAdmission;
+ struct NativeLayerwiseCheckpointCredit;
+ enum class NativeLayerwiseCheckpointRole : std::uint8_t;
++// Private accepted-boundary refresh. No model work may consume its owner until
++// finish publishes the complete view. Destruction drains and invalidates any
++// uncommitted destination before the lane/address can be reused.
++class NativeLayerwisePressure {
++public:
++    virtual ~NativeLayerwisePressure()=default;
++    virtual bool ready() const=0;
++    virtual void wait()=0;
++    virtual void finish()=0;
++};
+ struct NativeLayerwiseOutputWork {
+     std::uint64_t physical_attention_rows=0,valid_attention_rows=0;
+     std::uint64_t accepted_consumed_tokens=0,discarded_candidate_tokens=0;
+@@ -110,6 +120,10 @@ public:
+     void complete_graph_output(std::uint64_t epoch) noexcept;
+     void abort_graph_output(std::uint64_t epoch) noexcept;
+     NativeLayerwiseOutputWork output_work() const noexcept;
++    bool pressure_pending() const noexcept;
++    bool pressure_waiting() const noexcept;
++    bool progress_pressure();
++    bool wait_pressure();
+     bool query_due() const;
+     bool pending_native() const noexcept;
+     const kvmem::LayerwiseWindowPlan& plan() const;
+diff --git a/src/models/qwen3_5/program/prefill.cpp b/src/models/qwen3_5/program/prefill.cpp
+index 1cbdcbc8..b0b3d28a 100644
+--- a/src/models/qwen3_5/program/prefill.cpp
++++ b/src/models/qwen3_5/program/prefill.cpp
+@@ -1368,6 +1368,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+     };
+     const auto started                    = Clock::now();
+     try {
++        if (auto* owner=sequence.window.layerwise_request.get();owner && !owner->progress_pressure()) {
++            staged.waiting_for_storage=true;
++            staged.elapsed_seconds+=std::chrono::duration<double>(Clock::now()-started).count();
++            return runtime::PrefillStepResult{.summary=summary,.timing=timing.finish()};
++        }
+         if (staged.batched) {
+             // A batched pass has computed the rest of the prompt (advance_prefill_batch), or a
+             // branched read's prompt part and next branches.
+@@ -1755,6 +1760,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+                     if (layerwise) {
+                         const auto desired=split_frontier?std::min(length,*split_frontier-staged.cursor):length;
+                         length=layerwise->admit_prefill(desired);
++                        if (!length && layerwise->pressure_pending()) {
++                            const auto progressed=reported_tokens();
++                            // The engine carries this partial chunk's accepted
++                            // tokens without charging a full extra service unit.
++                            staged.waiting_for_storage=true;
++                            staged.elapsed_seconds+=std::chrono::duration<double>(Clock::now()-started).count();
++                            return runtime::PrefillStepResult{.summary=summary,
++                                .processed_prompt_tokens=progressed,.timing=timing.finish()};
++                        }
+                         if (!length) throw std::logic_error("native layerwise ordinary tile has no complete Window credit: H="+
+                             std::to_string(staged.cursor)+" desired="+std::to_string(desired)+
+                             " split="+std::to_string(split_frontier.value_or(0))+" T="+std::to_string(staged.prompt_tokens)+
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index 77986145..211c977f 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -1186,6 +1186,7 @@ public:
+     friend class NativeLayerwiseProgramQuery;
+     friend class NativeLayerwiseQueryFixture;
+     friend class NativeLayerwiseRequest;
++    friend class NativeLayerwiseResidentPressure;
+     friend class NativeLayerwiseDecodePreparation;
+     friend class NativeLayerwiseOutputCohort;
+ 
+@@ -2221,6 +2222,8 @@ private:
+     kvmem::LayerwiseRequestEnvelope layerwise_envelope(const PreparedPromptData&,std::uint32_t output_tokens) const;
+     void activate_layerwise_request(SequenceState&,RequestControl&,std::uint32_t output_tokens);
+     kvmem::LayerwiseMemoryCatalog layerwise_catalog(SequenceState&);
++    std::unique_ptr<NativeLayerwisePressure> start_layerwise_pressure(SequenceState&,
++        const std::vector<kvmem::LayerwisePressureChoice>&,NativeSourceVersionCharge&);
+     void compact_layerwise_pressure(SequenceState&,const std::vector<kvmem::LayerwisePressureChoice>&);
+     std::shared_ptr<const NativeCanonicalHistoryVersion> freeze_canonical_source(SequenceState&);
+     std::shared_ptr<const NativeCanonicalHistoryVersion> freeze_canonical_source(
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index b7572009..d20c0a75 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -9,6 +9,7 @@
+ #include "models/qwen3_5/program/storage/kvmem_transfer_trace.h"
+ #include "models/qwen3_5/program/storage/checkpoint_recompute_policy.h"
+ #include "models/qwen3_5/program/storage/layerwise_kv_transfer.h"
++#include "models/qwen3_5/program/storage/layerwise_refresh_profile.h"
+ #include "models/qwen3_5/program/native_layerwise_probe.h"
+ #include "models/qwen3_5/program/native_mtp_boundary.h"
+ #include "runtime/contract/dflash_conditioning.h"
+@@ -1575,7 +1576,148 @@ void ProgramImpl::begin_layerwise_request(SequenceState& sequence,RequestControl
+         std::move(envelope),std::move(options),std::move(admitted));
+ }
+ 
++// One private stream/event per in-flight request, bounded by max_concurrency.
++// It borrows neither the shared Host staging nor model scratch across a yield.
++class NativeLayerwiseResidentPressure final : public NativeLayerwisePressure {
++public:
++    NativeLayerwiseResidentPressure(ProgramImpl& program,SequenceState& sequence,
++        NativeSourceVersionCharge metadata)
++        : p_(program),sequence_(sequence),metadata_(std::move(metadata)),
++          source_(sequence.window.stamp),epoch_(p_.lane_epochs.at(sequence.lane)),
++          address_(sequence.kv->text),producer_(p_.device),done_(p_.device) {
++        const auto* flag=std::getenv("NINFER_TIME_LAYER_REFRESH");timed_=flag && flag[0]=='1';
++        if (timed_) started_=phase_=LayerRestoreTrace::Clock::now();
++        DeviceBinding binding(p_.device.rank(0).device);
++        CUDA_CHECK(cudaStreamCreateWithFlags(&stream_,cudaStreamNonBlocking));
++    }
++    ~NativeLayerwiseResidentPressure() override {
++        if (stream_) {
++            DeviceBinding binding(p_.device.rank(0).device);
++            // Also covers partial submission/failed event recording in begin().
++            (void)cudaStreamSynchronize(stream_);(void)cudaStreamDestroy(stream_);
++        }
++        if (mutated_ && !published_) {
++            sequence_.window.stamp.valid=false;
++            sequence_.window.layerwise_rewrite_pending=false;
++        }
++        if (timed_)
++            std::fprintf(stderr,"REFRESH_RESIDENT lane=%u frontier=%llu complete=%d archive_ms=%.3f plan_ms=%.3f cow_ms=%.3f submit_ms=%.3f publish_ms=%.3f active_ms=%.3f elapsed_ms=%.3f wait_ms=%.3f batches=%llu pages=%llu bytes=%llu polls=%llu\n",
++                sequence_.lane,(unsigned long long)source_.frontier,published_,archive_ms_,plan_ms_,cow_ms_,submit_ms_,publish_ms_,
++                archive_ms_+plan_ms_+cow_ms_+submit_ms_+publish_ms_,LayerRestoreTrace::elapsed(started_),wait_ms_,
++                (unsigned long long)copies_.batches,(unsigned long long)copies_.pages,
++                (unsigned long long)copies_.bytes,(unsigned long long)polls_);
++    }
++    void begin(const std::vector<kvmem::LayerwisePressureChoice>& choices) {
++        auto& window=sequence_.window;
++        if (window.layerwise_rewrite_pending || !window.layer_views.active() ||
++            choices.size()!=window.layer_views.target.size() || p_.backend_kv_pages)
++            throw std::logic_error("resident Pressure requires an accepted complete target-only boundary");
++        p_.archive_memory_window(sequence_);archive_ms_=lap();
++        const auto catalog=p_.layerwise_catalog(sequence_);
++        WindowMemoryBackend backend(p_,sequence_,sequence_.text_kv_valid);
++        const auto descriptor=backend.descriptor();
++        std::vector<kvmem::LayerWorkingSetSelection> selections;
++        for (const auto& choice:choices) {
++            const auto& source=catalog.snapshot(choice.model_layer);
++            if (choice.candidates!=source.resident ||
++                !std::includes(source.resident.begin(),source.resident.end(),choice.selected.begin(),choice.selected.end()) ||
++                (sequence_.text_kv_valid%64 && (choice.selected.empty() || choice.selected.back()!=sequence_.text_kv_valid/64)))
++                throw std::logic_error("resident Pressure changed its resident source or partial tail");
++            selections.push_back({choice.model_layer,source.stamp,choice.selected,choice.fixed,
++                {p_.kvmem_window_tokens,0,p_.kvmem_window_tokens,p_.memory_retained_budget}});
++        }
++        const auto planned=catalog.plan(selections);
++        auto& pool=p_.text_kv_pages->physical_pool();
++        std::vector<NativeResidentStripe> recipes;
++        maps_=window.layer_views;
++        for (const auto& plan:planned.layers) {
++            recipes.push_back(plan_native_resident_stripe(descriptor,catalog.snapshot(plan.model_layer),plan,pool));
++            // These maps remain private until the event has completed.
++            maps_.restored(plan.model_layer,plan.plan.next);
++        }
++        extent_=static_cast<std::uint32_t>(maps_.validate(sequence_.text_kv_valid));
++        pages_=maps_.target.front().pages;
++        const auto held=sizeof(*this)+maps_.allocated_bytes()-(maps_.feedback?maps_.feedback->allocated_bytes():0)+
++            pages_.capacity()*sizeof(std::uint32_t);
++        if (held>metadata_.bytes()) throw std::length_error("resident Pressure exceeded its admitted metadata");
++        plan_ms_=lap();
++        KVLayerStripeWrite writer(*p_.text_kv_addresses,address_,0,
++            p_.text_kv_addresses->mapped_pages(address_),p_.device,p_.compute_streams);
++        window.layerwise_rewrite_pending=true;mutated_=true;
++        writer.copy_native_pages();writer.commit_unpublished_destination();
++        cow_ms_=lap();
++        // COW publication uploads the table on the producing stream. The copy
++        // stream must wait for that boundary, but never borrows a peer's stream.
++        producer_.record(p_.compute_streams[0]);producer_.wait(stream_);
++        for (const auto& recipe:recipes)
++            submit_native_resident_stripe(recipe,pool,*p_.text_kv_addresses,address_,RankStreams(stream_),timed_?&copies_:nullptr);
++        done_.record(stream_);submitted_=true;submit_ms_=lap();
++    }
++    bool ready() const override {
++        ++polls_;return submitted_ && done_.ready();
++    }
++    void wait() override {
++        const auto start=timed_?LayerRestoreTrace::Clock::now():LayerRestoreTrace::Clock::time_point{};
++        if (!submitted_) throw std::logic_error("resident Pressure has no completion fence");
++        done_.synchronize();if (timed_) wait_ms_+=LayerRestoreTrace::elapsed(start);
++    }
++    void finish() override {
++        if (published_ || !ready() || source_!=sequence_.window.stamp ||
++            epoch_!=p_.lane_epochs.at(sequence_.lane) || !sequence_.kv ||
++            !(address_==sequence_.kv->text) || sequence_.text_kv_valid!=source_.frontier)
++            throw std::logic_error("resident Pressure lost its exact accepted owner before publication");
++        const auto start=timed_?LayerRestoreTrace::Clock::now():LayerRestoreTrace::Clock::time_point{};
++        KVLayerStripeWrite::require_unpublished_destination(*p_.text_kv_addresses,address_,
++            p_.text_kv_pages->physical_pool(),static_cast<std::uint32_t>(pages_.size()));
++        p_.text_kv_addresses->commit_frontier(address_,extent_);
++        p_.text_kv_addresses->destructive_truncate(address_,extent_);
++        auto& window=sequence_.window;
++        window.layer_views=std::move(maps_);window.pages=std::move(pages_);
++        window.removed_tokens=sequence_.text_kv_valid-extent_;
++        ++window.stamp.view_version;++window.swaps;
++        window.layerwise_rewrite_pending=false;
++        p_.bind_sequence_kv(sequence_);published_=true;
++        if (timed_) publish_ms_=LayerRestoreTrace::elapsed(start);
++    }
++private:
++    double lap() {
++        if (!timed_) return 0;
++        const auto elapsed=LayerRestoreTrace::elapsed(phase_);phase_=LayerRestoreTrace::Clock::now();return elapsed;
++    }
++    ProgramImpl& p_;SequenceState& sequence_;
++    NativeSourceVersionCharge metadata_;
++    kvmem::MemoryStamp source_;
++    std::uint64_t epoch_;
++    KVAddressSpaceHandle address_;
++    CudaCompletionEvent producer_,done_;
++    cudaStream_t stream_=nullptr;
++    KvmemLayerViews maps_;
++    std::vector<std::uint32_t> pages_;
++    std::uint32_t extent_=0;
++    bool timed_=false,mutated_=false,submitted_=false,published_=false;
++    mutable std::uint64_t polls_=0;
++    LayerRestoreTrace copies_;
++    LayerRestoreTrace::Clock::time_point started_,phase_;
++    double archive_ms_=0,plan_ms_=0,cow_ms_=0,submit_ms_=0,publish_ms_=0,wait_ms_=0;
++};
++
++std::unique_ptr<NativeLayerwisePressure> ProgramImpl::start_layerwise_pressure(SequenceState& sequence,
++    const std::vector<kvmem::LayerwisePressureChoice>& choices,NativeSourceVersionCharge& metadata) {
++    const auto* flag=std::getenv("NINFER_RESIDENT_LAYER_PRESSURE");
++    // MTP has an independently selected auxiliary map which may require cold
++    // recall. TP residue layouts and diagnostic readback keep the proven path.
++    if ((flag && std::strcmp(flag,"0")==0) || device.size()!=1 || backend_kv_pages || kvmem_options.verify_transfers)
++        return {};
++    const auto& maps=sequence.window.layer_views;
++    const auto bytes=sizeof(NativeLayerwiseResidentPressure)+maps.allocated_bytes()-
++        (maps.feedback?maps.feedback->allocated_bytes():0)+
++        (kvmem_window_tokens/64+1)*sizeof(std::uint32_t);
++    auto work=std::make_unique<NativeLayerwiseResidentPressure>(*this,sequence,metadata.split(bytes));
++    work->begin(choices);return work;
++}
++
+ void ProgramImpl::compact_layerwise_pressure(SequenceState& sequence,const std::vector<kvmem::LayerwisePressureChoice>& choices) {
++    LayerwiseRefreshProfile profile(sequence.lane,sequence.text_kv_valid);
+     auto& window=sequence.window;
+     if (window.layerwise_rewrite_pending || !window.layer_views.active() ||
+         choices.size()!=window.layer_views.target.size() ||
+@@ -1585,6 +1727,7 @@ void ProgramImpl::compact_layerwise_pressure(SequenceState& sequence,const std::
+     // Previously mixed historical pages must already have their sealed source;
+     // archive_memory_window refuses manufacturing one from unlike layer IDs.
+     archive_memory_window(sequence);
++    profile.archive_ms=profile.lap();
+     const auto catalog=layerwise_catalog(sequence);
+     WindowMemoryBackend backend(*this,sequence,sequence.text_kv_valid);
+     NativeFrozenLayerArchive archive{backend.descriptor(),backend.snapshot(),{}};
+@@ -1630,6 +1773,7 @@ void ProgramImpl::compact_layerwise_pressure(SequenceState& sequence,const std::
+     if (!memory_kv_staging || memory_kv_staging->size()<bytes || memory_kv_staging->size()>limit) {
+         memory_kv_staging.reset();memory_kv_staging=std::make_unique<PinnedHostBuffer>(bytes);
+     }
++    profile.plan_ms=profile.lap();
+     KVLayerStripeWrite writer(*text_kv_addresses,sequence.kv->text,0,text_kv_addresses->mapped_pages(sequence.kv->text),device,compute_streams);
+     std::unique_ptr<KVLayerStripeWrite> auxiliary_writer;
+     if (auxiliary) auxiliary_writer=std::make_unique<KVLayerStripeWrite>(*backend_kv_addresses,*sequence.kv->backend,
+@@ -1638,6 +1782,7 @@ void ProgramImpl::compact_layerwise_pressure(SequenceState& sequence,const std::
+     try {
+         writer.copy_native_pages();if (auxiliary_writer) auxiliary_writer->copy_native_pages();
+         writer.commit_unpublished_destination();if (auxiliary_writer) auxiliary_writer->commit_unpublished_destination();
++        profile.cow_ms=profile.lap();
+         for (const auto& plan:planned.layers) {
+             const auto view=restore_native_layer_stripe(archive,catalog.snapshot(plan.model_layer),plan,text_kv_pages->physical_pool(),
+                 *text_kv_addresses,sequence.kv->text,device,compute_streams,*memory_kv_staging,0,kvmem_options.verify_transfers);
+@@ -1652,6 +1797,7 @@ void ProgramImpl::compact_layerwise_pressure(SequenceState& sequence,const std::
+             maps.auxiliary_view_version=view.stamp.view_version;
+             maps.auxiliary_removed_tokens=sequence.text_kv_valid-static_cast<std::uint32_t>(view.visible_tokens);
+         }
++        profile.restore_ms=profile.lap();
+         device.synchronize();const auto extent=static_cast<std::uint32_t>(maps.validate(sequence.text_kv_valid));
+         text_kv_addresses->commit_frontier(sequence.kv->text,extent);text_kv_addresses->destructive_truncate(sequence.kv->text,extent);
+         if (auxiliary) {
+@@ -1662,6 +1808,7 @@ void ProgramImpl::compact_layerwise_pressure(SequenceState& sequence,const std::
+         window.layer_views=std::move(maps);window.pages=window.layer_views.target.front().pages;
+         window.removed_tokens=sequence.text_kv_valid-extent;++window.stamp.view_version;++window.swaps;window.layerwise_rewrite_pending=false;
+         bind_sequence_kv(sequence);
++        profile.publish_ms=profile.lap();profile.complete=true;
+     } catch (...) {try {device.synchronize();} catch (...) {}window.stamp.valid=false;throw;}
+ }
+ 
+@@ -1893,6 +2040,8 @@ bool ProgramImpl::memory_pending(SequenceHandle handle) const noexcept {
+     if (!valid_sequence(handle)) return false;
+     const auto lane=ContractAccess::lane(handle).value;
+     const auto& sequence=active_sequence(lane);const auto& request=requests[lane];
++    if (sequence.window.layerwise_request && sequence.window.layerwise_request->pressure_pending())
++        return sequence.window.layerwise_request->pressure_waiting();
+     if (layerwise_query_work.occupied() && request.prefill && !request.prefill->layerwise_query &&
+         sequence.window.layerwise_request) {
+         const auto& owner=*sequence.window.layerwise_request;
+@@ -1947,7 +2096,9 @@ bool ProgramImpl::prepare_control_memory(SequenceHandle handle, std::uint32_t to
+     if (valid_sequence(handle)) {
+         auto& sequence=active_sequence(ContractAccess::lane(handle).value);
+         if (auto* owner=sequence.window.layerwise_request.get()) {
+-            if (owner->admit_output(tokens)!=tokens)
++            const auto admitted=owner->admit_output(tokens);
++            if (!admitted && owner->pressure_pending()) return false;
++            if (admitted!=tokens)
+                 throw std::logic_error("control membership exceeded its perowner accepted boundary");
+             owner->prepare_output_control(tokens);return true;
+         }
+diff --git a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp
+index 09e0e64a..87388b5d 100644
+--- a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp
++++ b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.cpp
+@@ -1,10 +1,14 @@
+ #include "models/qwen3_5/program/storage/layerwise_kv_transfer.h"
++#include "models/qwen3_5/program/storage/layerwise_refresh_profile.h"
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
+ #include <limits>
+ 
+ namespace ninfer::models::qwen3_5::detail {
++LayerRestoreTrace*& active_layer_restore_trace() noexcept {
++    static thread_local LayerRestoreTrace* active=nullptr;return active;
++}
+ namespace {
+ bool same_history(const kvmem::MemoryStamp& a,const kvmem::MemoryStamp& b) {
+     auto left=a,right=b;left.view_version=right.view_version=0;return left==right;
+@@ -15,6 +19,24 @@ bool same_view(const kvmem::ExecutionView& a,const kvmem::ExecutionView& b) {
+         if (!(a.blocks[i].block==b.blocks[i].block) || a.blocks[i].compact_start!=b.blocks[i].compact_start) return false;
+     return true;
+ }
++// A source half remains live until its own producing streams have consumed
++// it. Exceptional submission (including failure before event recording) drains
++// those streams before the caller may recycle the pinned buffer.
++struct StripeUploadFences {
++    DeviceContext& device;RankStreams streams;
++    RankFenceSet first,second;
++    std::array<bool,2> pending{};bool submitted=false;
++    StripeUploadFences(DeviceContext& d,RankStreams s):device(d),streams(s),first(d),second(d) {}
++    ~StripeUploadFences() {
++        if (submitted) for (std::size_t rank=0;rank<device.size();++rank) {
++            DeviceBinding binding(device.rank(rank).device);(void)cudaStreamSynchronize(streams[rank]);
++        }
++    }
++    RankFenceSet& fence(std::size_t slot) {return slot?second:first;}
++    void wait(std::size_t slot) {if (pending[slot]) {fence(slot).synchronize();pending[slot]=false;}}
++    void record(std::size_t slot) {fence(slot).record(streams);pending[slot]=true;}
++    void finish() {wait(0);wait(1);submitted=false;}
++};
+ struct Drain {
+     DeviceContext& device;bool armed=false;
+     ~Drain() { if (armed) try { device.synchronize(); } catch (...) {} }
+@@ -93,24 +115,38 @@ kvmem::ExecutionView restore_native_layer_stripe(
+     // native copy, with one producer fence per batch instead of per page.
+     // Both metadata and transfer memory stay bounded independently of history.
+     constexpr std::size_t max_batch=64;
+-    const auto capacity=std::min(max_batch,staging.size()/host.page_stride);
++    const auto* pipeline_flag=std::getenv("NINFER_LAYER_RESTORE_PIPELINE");
++    const bool pipeline=!verify && staging.size()/host.page_stride>=2 &&
++        (!pipeline_flag || std::strcmp(pipeline_flag,"0")!=0);
++    const std::size_t slots=pipeline?2:1;
++    const auto capacity=std::min(max_batch,staging.size()/host.page_stride/slots);
++    StripeUploadFences uploads(device,streams);
+     std::array<const std::byte*,max_batch> records{};
+     std::array<DeviceKVPageHandle,max_batch> destinations{};
+     Drain drain{device};
+-    for (std::size_t first=0;first<selected.size();) {
++    auto* trace=active_layer_restore_trace();
++    for (std::size_t first=0,batch=0;first<selected.size();++batch) {
++        const auto slot=batch%slots;
++        auto phase=trace?LayerRestoreTrace::Clock::now():LayerRestoreTrace::Clock::time_point{};
++        uploads.wait(slot);
++        if (trace) {trace->wait_ms+=LayerRestoreTrace::elapsed(phase);phase=LayerRestoreTrace::Clock::now();}
+         const auto count=std::min(capacity,selected.size()-first);
+         for (std::size_t i=0;i<count;++i) {
+-            auto* packed=static_cast<std::byte*>(staging.data())+i*host.page_stride;
++            auto* packed=static_cast<std::byte*>(staging.data())+(slot*capacity+i)*host.page_stride;
+             const auto& source=archive.records.at(static_cast<std::size_t>(selected[first+i]));
+             regions.read(source,0,packed,host.page_stride);
+             records[i]=packed;
+             destinations[i]=addresses.physical_page(address,static_cast<std::uint32_t>(first+i));
+         }
+-        drain.armed=true;
++        if(trace) {trace->pack_ms+=LayerRestoreTrace::elapsed(phase);phase=LayerRestoreTrace::Clock::now();}
++        uploads.submitted=true;
+         for (auto plane:planes)
+             pool.copy_from_host_records({records.data(),count},{},{destinations.data(),count},
+                 host,plane,plane+1,streams);
+-        drain.finish();
++        uploads.record(slot);
++        if(trace) {trace->submit_ms+=LayerRestoreTrace::elapsed(phase);phase=LayerRestoreTrace::Clock::now();}
++        if (verify) uploads.wait(slot);
++        if(trace) {trace->wait_ms+=LayerRestoreTrace::elapsed(phase);++trace->batches;trace->pages+=count;trace->bytes+=count*host.page_stride;}
+         // All uploads must finish before diagnostic readback overwrites any
+         // packed source in this same buffer, including a partial final batch.
+         if (verify) for (std::size_t i=0;i<count;++i) {
+@@ -136,6 +172,86 @@ kvmem::ExecutionView restore_native_layer_stripe(
+         }
+         first+=count;
+     }
++    const auto final_wait=trace?LayerRestoreTrace::Clock::now():LayerRestoreTrace::Clock::time_point{};
++    uploads.finish();if (trace) trace->wait_ms+=LayerRestoreTrace::elapsed(final_wait);
+     return checked.next;
+ }
++NativeResidentStripe plan_native_resident_stripe(const kvmem::MemoryDescriptor& descriptor,
++    const kvmem::MemorySnapshot& current,const kvmem::LayerWorkingSetPlan& layer,
++    const DeviceKVPagePool& pool) {
++    std::vector<std::uint64_t> selected;
++    for (const auto& item:layer.plan.next.blocks) selected.push_back(item.block.id);
++    const auto checked=kvmem::plan_working_set(descriptor,current,selected,layer.plan.mandatory,layer.plan.budget);
++    if (descriptor.layout.block_tokens!=64 || current.stamp!=layer.plan.expected ||
++        !same_view(checked.next,layer.plan.next) || !checked.spill.empty() ||
++        !std::is_sorted(current.resident.begin(),current.resident.end()) ||
++        std::adjacent_find(current.resident.begin(),current.resident.end())!=current.resident.end() ||
++        !std::includes(current.resident.begin(),current.resident.end(),selected.begin(),selected.end()))
++        throw std::logic_error("resident stripe is not an exact chronological resident subset");
++    NativeResidentStripe result;
++    for (auto id:selected) {
++        const auto slot=std::lower_bound(current.resident.begin(),current.resident.end(),id)-current.resident.begin();
++        if (slot<result.source_slots.size() || slot>UINT32_MAX)
++            throw std::logic_error("resident stripe would overwrite an unread source");
++        result.source_slots.push_back(static_cast<std::uint32_t>(slot));
++    }
++    const auto host=plan_host_kv_page_layout(pool.geometry());
++    const kvmem::NativeKvLayerRegions regions(descriptor.layout,layer.model_layer);
++    if (regions.packed_bytes()!=layer.payload.packed_bytes() || regions.regions().size()!=layer.payload.regions().size())
++        throw std::logic_error("resident stripe payload does not match its layer");
++    for (std::size_t r=0;r<regions.regions().size();++r) {
++        const auto& region=regions.regions()[r];
++        if (!(region.plane==layer.payload.regions()[r].plane) ||
++            region.packed_offset!=layer.payload.regions()[r].packed_offset)
++            throw std::logic_error("resident stripe changed a native plane");
++        const auto found=std::find_if(host.planes.begin(),host.planes.end(),[&](const auto& p){return p.offset==region.plane.offset;});
++        const auto index=std::size_t(found-host.planes.begin());
++        if (found==host.planes.end() || found->page_payload_bytes!=region.plane.bytes ||
++            pool.geometry().planes[index].page_stride!=1 || pool.plane_rank(index)!=region.plane.rank ||
++            std::find(result.planes.begin(),result.planes.end(),index)!=result.planes.end())
++            throw std::logic_error("resident stripe does not match its physical pool");
++        result.planes.push_back(index);
++    }
++    return result;
++}
++
++void submit_native_resident_stripe(const NativeResidentStripe& recipe,DeviceKVPagePool& pool,
++    KVAddressSpaceStore& addresses,KVAddressSpaceHandle address,RankStreams streams,LayerRestoreTrace* trace) {
++    KVLayerStripeWrite::require_unpublished_destination(addresses,address,pool,
++        static_cast<std::uint32_t>(recipe.source_slots.size()));
++    const auto mapped=addresses.mapped_pages(address);
++    // Validate the entire recipe before mutation. Physical uniqueness follows
++    // from the complete address's exclusive writer-reference proof above.
++    for (std::size_t i=0;i<recipe.source_slots.size();++i)
++        if (recipe.source_slots[i]<i || recipe.source_slots[i]>=mapped ||
++            (i && recipe.source_slots[i]<=recipe.source_slots[i-1]))
++            throw std::logic_error("resident stripe has an unsafe source ordering");
++    std::uint64_t stripe_bytes=0;
++    if (trace) {
++        const auto host=plan_host_kv_page_layout(pool.geometry());
++        for (auto p:recipe.planes) stripe_bytes+=host.planes[p].page_payload_bytes;
++    }
++    std::array<DeviceKVPageHandle,64> from{},to{};
++    for (std::size_t first=0;first<recipe.source_slots.size();) {
++        if (recipe.source_slots[first]==first) {++first;continue;}
++        std::size_t count=0;
++        const auto gap=recipe.source_slots[first]-first;
++        // A physical contiguous run may still overlap its source. Bound it by
++        // the logical gap, then split again on either physical discontinuity.
++        for (;count<std::min<std::size_t>({64,gap,recipe.source_slots.size()-first});++count) {
++            if (recipe.source_slots[first+count]!=recipe.source_slots[first]+count) break;
++            const auto a=addresses.physical_page(address,recipe.source_slots[first+count]);
++            const auto b=addresses.physical_page(address,static_cast<std::uint32_t>(first+count));
++            from[count]=a;to[count]=b;
++            if (count && (pool.contiguous_run_count({from.data(),count+1})!=1 ||
++                pool.contiguous_run_count({to.data(),count+1})!=1)) break;
++        }
++        pool.copy_page_run_planes({from.data(),count},{to.data(),count},recipe.planes,streams);
++        if (trace) {
++            ++trace->batches;trace->pages+=count;
++            trace->bytes+=count*stripe_bytes;
++        }
++        first+=count;
++    }
++}
+ } // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.h b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.h
+index 2873f7eb..c51516fa 100644
+--- a/src/models/qwen3_5/program/storage/layerwise_kv_transfer.h
++++ b/src/models/qwen3_5/program/storage/layerwise_kv_transfer.h
+@@ -34,4 +34,20 @@ kvmem::ExecutionView restore_native_layer_stripe(
+     KVAddressSpaceHandle, DeviceContext&, RankStreams, PinnedHostBuffer& staging,
+     std::uint64_t canonical_pool_offset=0, bool diagnostic_readback=false);
+ 
++// Build this recipe against the accepted view BEFORE revoking its coverage.
++// Only chronological resident subsets qualify; every destination's source slot
++// is at least that destination. Ascending copies therefore cannot destroy a
++// later unread source. COW changes physical handles, never these logical slots.
++struct LayerRestoreTrace;
++struct NativeResidentStripe {
++    std::vector<std::uint32_t> source_slots;
++    std::vector<std::size_t> planes;
++};
++NativeResidentStripe plan_native_resident_stripe(const kvmem::MemoryDescriptor&,
++    const kvmem::MemorySnapshot&,const kvmem::LayerWorkingSetPlan&,const DeviceKVPagePool&);
++// Does not wait or publish. Caller retains the entire private address until its
++// own completion fence, including cancellation and all error paths.
++void submit_native_resident_stripe(const NativeResidentStripe&,DeviceKVPagePool&,
++    KVAddressSpaceStore&,KVAddressSpaceHandle,RankStreams,LayerRestoreTrace* trace=nullptr);
++
+ } // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/models/qwen3_5/program/storage/layerwise_refresh_profile.h b/src/models/qwen3_5/program/storage/layerwise_refresh_profile.h
+new file mode 100644
+index 00000000..711af254
+--- /dev/null
++++ b/src/models/qwen3_5/program/storage/layerwise_refresh_profile.h
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
++namespace ninfer::models::qwen3_5::detail {
++struct LayerRestoreTrace {
++    using Clock=std::chrono::steady_clock;
++    std::uint64_t batches=0,bytes=0,pages=0;
++    double pack_ms=0,submit_ms=0,wait_ms=0;
++    static double elapsed(Clock::time_point start) {
++        return std::chrono::duration<double,std::milli>(Clock::now()-start).count();
++    }
++};
++LayerRestoreTrace*& active_layer_restore_trace() noexcept;
++
++// Optional host timing only. No CUDA timing events or extra device fences.
++class LayerwiseRefreshProfile {
++public:
++    LayerwiseRefreshProfile(std::uint32_t lane,std::uint32_t frontier)
++        : lane_(lane),frontier_(frontier),previous_(active_layer_restore_trace()) {
++        static const bool enabled=[] { const auto* v=std::getenv("NINFER_TIME_LAYER_REFRESH");return v && v[0]=='1'; }();
++        enabled_=enabled;
++        if (enabled_) {start_=phase_=LayerRestoreTrace::Clock::now();active_layer_restore_trace()=&transfer;}
++    }
++    ~LayerwiseRefreshProfile() {
++        if (!enabled_) return;
++        active_layer_restore_trace()=previous_;
++        std::fprintf(stderr,"REFRESH_PROFILE lane=%u frontier=%u complete=%d archive_ms=%.3f plan_ms=%.3f cow_ms=%.3f restore_ms=%.3f publish_ms=%.3f total_ms=%.3f batches=%llu pages=%llu bytes=%llu pack_ms=%.3f submit_ms=%.3f wait_ms=%.3f\n",
++            lane_,frontier_,complete,archive_ms,plan_ms,cow_ms,restore_ms,publish_ms,LayerRestoreTrace::elapsed(start_),
++            (unsigned long long)transfer.batches,(unsigned long long)transfer.pages,(unsigned long long)transfer.bytes,
++            transfer.pack_ms,transfer.submit_ms,transfer.wait_ms);
++    }
++    double lap() {if(!enabled_)return 0;const auto value=LayerRestoreTrace::elapsed(phase_);phase_=LayerRestoreTrace::Clock::now();return value;}
++    LayerRestoreTrace transfer;
++    double archive_ms=0,plan_ms=0,cow_ms=0,restore_ms=0,publish_ms=0;
++    bool complete=false;
++private:
++    std::uint32_t lane_,frontier_;
++    bool enabled_=false;
++    LayerRestoreTrace* previous_;
++    LayerRestoreTrace::Clock::time_point start_,phase_;
++};
++}
+diff --git a/src/models/qwen3_5/program/transactions/materialization.cpp b/src/models/qwen3_5/program/transactions/materialization.cpp
+index 7a9b65dc..41e85fff 100644
+--- a/src/models/qwen3_5/program/transactions/materialization.cpp
++++ b/src/models/qwen3_5/program/transactions/materialization.cpp
+@@ -2403,6 +2403,13 @@ bool ProgramImpl::vision_pending(SequenceHandle sequence) const noexcept {
+ }
+ 
+ bool ProgramImpl::wait_context_transfer() noexcept {
++    // Called only when no runnable peer was selected. Normal boundaries poll;
++    // idle waits fence one private stream, never the whole device.
++    for (auto& sequence:continuation_states) {
++        if (auto* owner=sequence.window.layerwise_request.get()) {
++            try {if (owner->wait_pressure()) return true;} catch (...) {return false;}
++        }
++    }
+     if (memory_io && memory_io->pending_jobs()) {
+         const auto epoch = memory_io->completion_epoch();
+         memory_io->wait_for_completion(epoch, std::chrono::milliseconds(1));
+diff --git a/src/runtime/engine/engine_core.h b/src/runtime/engine/engine_core.h
+index 06d128d2..68a1838d 100644
+--- a/src/runtime/engine/engine_core.h
++++ b/src/runtime/engine/engine_core.h
+@@ -2147,12 +2147,14 @@ private:
+         const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start, bool paced = false) {
+         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
+         if constexpr (requires { progress.waiting_for_storage; }) {
+-            // A storage continuation performed no prefill unit. Charging it
+-            // here exhausts admission's compute projection merely by waiting.
++            // A storage yield can follow accepted tokens inside a planned
++            // chunk. Account those tokens as a cut, not another whole quantum.
++            // A pure wait consumes neither compute nor admission projection.
+             if (progress.waiting_for_storage) {
+-                if (progress.complete || progress.processed_prompt_tokens || progress.pending || progress.capture)
+-                    throw std::logic_error("storage wait also published prefill work");
+-                return;
++                if (progress.complete || progress.pending || progress.capture)
++                    throw std::logic_error("storage wait also published terminal/capture work");
++                if (!progress.processed_prompt_tokens) return;
++                paced=true;
+             }
+         }
+         ++cumulative_stats_.host_work.prefill_units;
+diff --git a/tests/layerwise_pressure_wait.h b/tests/layerwise_pressure_wait.h
+new file mode 100644
+index 00000000..deba33bb
+--- /dev/null
++++ b/tests/layerwise_pressure_wait.h
+@@ -0,0 +1,23 @@
++#pragma once
++#include "models/qwen3_5/program/native_layerwise_request.h"
++
++namespace ninfer::test {
++// Direct Program fixtures have no Engine scheduler. Drive exactly the private
++// pressure continuation that the scheduler normally polls between units.
++inline std::uint32_t admit_layerwise_prefill(models::qwen3_5::detail::NativeLayerwiseRequest& owner,
++    std::uint32_t desired) {
++    for (;;) {
++        const auto admitted=owner.admit_prefill(desired);
++        if (admitted || !owner.pressure_pending()) return admitted;
++        owner.wait_pressure();owner.progress_pressure();
++    }
++}
++inline std::uint32_t admit_layerwise_output(models::qwen3_5::detail::NativeLayerwiseRequest& owner,
++    std::uint32_t desired) {
++    for (;;) {
++        const auto admitted=owner.admit_output(desired);
++        if (admitted || !owner.pressure_pending()) return admitted;
++        owner.wait_pressure();owner.progress_pressure();
++    }
++}
++}
+diff --git a/tests/models/qwen3_5/test_layerwise_dflash_checkpoint.cpp b/tests/models/qwen3_5/test_layerwise_dflash_checkpoint.cpp
+index 2b9cf937..032d4d8f 100644
+--- a/tests/models/qwen3_5/test_layerwise_dflash_checkpoint.cpp
++++ b/tests/models/qwen3_5/test_layerwise_dflash_checkpoint.cpp
+@@ -5,6 +5,7 @@
+ #include "models/qwen3_5/program/context.h"
+ #include "kvmem/snapshot.hpp"
+ #include "cuda_availability.h"
++#include "layerwise_pressure_wait.h"
+ #include <array>
+ #include <cstring>
+ #include <iostream>
+@@ -88,7 +89,7 @@ public:
+         };
+         const auto ordinary=[&](std::uint32_t begin,std::uint32_t count,bool final) {
+             auto& owner=*sequence.window.layerwise_request;auto& staged=*request.prefill;
+-            check(owner.admit_prefill(count)==count,"DFlash ordinary prefix lost complete Window credit");owner.prepare_prefill(begin,count);
++            check(ninfer::test::admit_layerwise_prefill(owner,count)==count,"DFlash ordinary prefix lost complete Window credit");owner.prepare_prefill(begin,count);
+             check(program.prepare_window(sequence,begin,begin+count,false,false),"DFlash ordinary native preparation failed");
+             program.bind_sequence_kv(sequence);auto card=context();card.text_kv_base=begin;
+             program.set_device_i32(program.io.rope_delta,sequence.window.removed_tokens);
+diff --git a/tests/models/qwen3_5/test_layerwise_kv_transfer.cpp b/tests/models/qwen3_5/test_layerwise_kv_transfer.cpp
+index 765ac259..b627d998 100644
+--- a/tests/models/qwen3_5/test_layerwise_kv_transfer.cpp
++++ b/tests/models/qwen3_5/test_layerwise_kv_transfer.cpp
+@@ -205,6 +205,135 @@ void qualify_batches(DeviceContext& device,PagedKVPlaneOrder order,
+     std::cout<<"batch native layer restore order="<<int(order)<<" staging_records="<<staging_records
+         <<" verify="<<verify<<" pages="<<selected_count<<" exact\n";
+ }
++void qualify_resident(DeviceContext& device,PagedKVPlaneOrder order,bool shared,bool partial=false) {
++    constexpr std::uint32_t n=69,keep=67;
++    const std::uint32_t frontier=n*64-(partial?27:0);
++    LayoutBuilder builder;DeviceKVPagePoolSpec spec;
++    spec.page_group_count=2*n+2;spec.geometry.page_tokens=64;spec.geometry.device_plane_order=order;
++    for (int layer=0;layer<2;++layer) {
++        spec.geometry.planes.push_back({DType::I8,8,2});spec.geometry.planes.push_back({DType::I8,8,2});
++        spec.geometry.planes.push_back({DType::FP16,1,2});spec.geometry.planes.push_back({DType::FP16,1,2});
++    }
++    const auto layout=plan_device_kv_page_pool(builder,spec);
++    const auto table_layout=plan_kv_execution_tables(builder,{n,2});
++    DeviceArena arena(builder.finish(256));const DeviceSpan backing{arena.base(),arena.capacity()};
++    DeviceKVPagePool pool(backing,layout);KVExecutionTablePool tables(backing,table_layout,pool);
++    store::LogicalKVPageStore pages(pool,2*n+2);store::KVAddressSpaceStore addresses(pages,tables,3,n);
++    const auto address=addresses.create_active(n,0,device.stream);check(bool(address),"resident address admission failed");
++    addresses.ensure_mapped_to_tokens(*address,n*64,device.stream);
++    const auto host=plan_host_kv_page_layout(pool.geometry());PinnedHostBuffer io(host.page_stride);
++    std::vector<std::vector<std::byte>> expected(n,std::vector<std::byte>(host.page_stride));
++    for (std::uint32_t r=0;r<n;++r) {
++        for (std::size_t p=0;p<host.planes.size();++p)
++            for (std::size_t d=0;d<host.planes[p].page_payload_bytes;++d)
++                expected[r][host.planes[p].offset+d]=std::byte((r*71+p*29+d*7+3)%251);
++        std::memcpy(io.data(),expected[r].data(),io.size());
++        const std::array input{static_cast<const std::byte*>(io.data())};
++        const std::array dest{addresses.physical_page(*address,r)};
++        pool.copy_from_host_records(input,{},dest,host,device.stream);device.synchronize();
++    }
++    addresses.commit_frontier(*address,frontier);
++    std::vector<DeviceKVPageHandle> originals;
++    for (std::uint32_t i=0;i<n;++i) originals.push_back(addresses.physical_page(*address,i));
++    const auto checkpoint=addresses.create_inactive();check(bool(checkpoint),"resident snapshot slot missing");
++    if (shared) {
++        auto snapshot=addresses.prepare_active_snapshot(*address,*checkpoint,frontier);
++        addresses.commit_active_snapshot(std::move(snapshot),device.stream);device.synchronize();
++    }
++    const auto working=shared?*checkpoint:*address;
++    kvmem::MemoryDescriptor descriptor;
++    descriptor.identity={"resident-stripe-fixture","native-v1","two-layers","state-v1"};
++    descriptor.layout={"native-i8-fp16-scales",1,64,host.page_stride,256,{}};
++    const std::array kinds{kvmem::PayloadPlaneKind::Key,kvmem::PayloadPlaneKind::Value,
++        kvmem::PayloadPlaneKind::KeyScale,kvmem::PayloadPlaneKind::ValueScale};
++    for (std::size_t p=0;p<host.planes.size();++p)
++        descriptor.layout.planes.push_back({p<4?3u:7u,kinds[p%4],host.planes[p].offset,
++            host.planes[p].page_payload_bytes,256,0,0,0,2});
++    descriptor.capabilities={64,8192,true,true,true,true,true,true};descriptor.validate();
++    kvmem::MemorySnapshot source;source.stamp={true,{37,2},7,4,frontier,11};
++    std::vector<std::uint64_t> left,right;
++    for (std::uint64_t i=0;i<n;++i) {
++        source.blocks.push_back({{{37,2},i,i*64,(partial && i+1==n)?37u:64u,1,1},1});source.resident.push_back(i);
++        if (partial?(i!=0 && i!=2):(i>0 && i+1<n)) left.push_back(i); // overlapping gap=1 copies
++        if (i!=3 && i!=39) right.push_back(i); // unchanged prefix, gap=1 then 2
++    }
++    const kvmem::LayerwiseMemoryCatalog catalog(descriptor,{{3,source},{7,source}});
++    const kvmem::MemoryBudget budget{keep*64,0,n*64,n*host.page_stride};
++    const auto a=catalog.plan_layer({3,source.stamp,left,{},budget});
++    const auto b=catalog.plan_layer({7,source.stamp,right,{},budget});
++    const auto ra=store::plan_native_resident_stripe(descriptor,source,a,pool);
++    const auto rb=store::plan_native_resident_stripe(descriptor,source,b,pool);
++    auto stale=source;++stale.stamp.history_revision;
++    rejects([&]{store::plan_native_resident_stripe(descriptor,stale,a,pool);},"stale resident plan was accepted");
++    auto cold=source;cold.resident.pop_back();
++    rejects([&]{store::plan_native_resident_stripe(descriptor,cold,b,pool);},"cold resident plan was accepted");
++    rejects([&]{store::submit_native_resident_stripe(ra,pool,addresses,working,device.stream);},
++        "resident copy accepted published coverage");
++    {
++        store::KVLayerStripeWrite cow(addresses,working,0,n,device,device.stream);
++        check(cow.copied_pages()==(shared?n-(partial?1:0):0),"resident COW admission changed shared ownership");
++        cow.copy_native_pages();cow.commit_unpublished_destination();
++    }
++    auto unsafe=ra;unsafe.source_slots[1]=0;
++    rejects([&]{store::submit_native_resident_stripe(unsafe,pool,addresses,working,device.stream);},
++        "resident copy accepted an unread-source overwrite");
++    cudaStream_t stream=nullptr;CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
++    CudaCompletionEvent producer(device),done(device);
++    producer.record(device.stream);producer.wait(stream);
++    store::submit_native_resident_stripe(ra,pool,addresses,working,stream);
++    store::submit_native_resident_stripe(rb,pool,addresses,working,stream);
++    done.record(stream);
++    check(addresses.committed_frontier(working)==0,"resident submission published early");
++    done.synchronize();CUDA_CHECK(cudaStreamDestroy(stream));
++    const auto compare=[&](DeviceKVPageHandle page,const std::vector<std::byte>& reference) {
++        const std::array src{page};const std::array dst{static_cast<std::byte*>(io.data())};
++        pool.copy_to_host_records(src,dst,{},host,device.stream);device.synchronize();
++        check(std::memcmp(io.data(),reference.data(),io.size())==0,"resident GPU compaction changed native bytes");
++    };
++    for (std::uint32_t i=0;i<keep;++i) {
++        auto composite=expected[left[i]];
++        for (std::size_t p=4;p<8;++p)
++            std::memcpy(composite.data()+host.planes[p].offset,
++                expected[right[i]].data()+host.planes[p].offset,host.planes[p].page_payload_bytes);
++        compare(addresses.physical_page(working,i),composite);
++    }
++    // A second Pressure starts from different per-layer logical maps in the
++    // same physical pages. Resolving IDs through a common first-layer map would
++    // pass the first compaction and corrupt this one.
++    auto current_a=source,current_b=source;
++    current_a.resident=left;current_a.stamp=a.plan.next.stamp;
++    current_b.resident=right;current_b.stamp=b.plan.next.stamp;
++    auto left2=left,right2=right;left2.erase(left2.begin()+4);left2.erase(left2.begin());
++    right2.erase(right2.begin()+6);right2.erase(right2.begin()+5);
++    const kvmem::LayerwiseMemoryCatalog next_catalog(descriptor,{{3,current_a},{7,current_b}});
++    const auto next_a=next_catalog.plan_layer({3,current_a.stamp,left2,{},budget});
++    const auto next_b=next_catalog.plan_layer({7,current_b.stamp,right2,{},budget});
++    const auto recipe_a=store::plan_native_resident_stripe(descriptor,current_a,next_a,pool);
++    const auto recipe_b=store::plan_native_resident_stripe(descriptor,current_b,next_b,pool);
++    addresses.commit_frontier(working,keep*64-(partial?27:0));
++    {
++        store::KVLayerStripeWrite cow(addresses,working,0,n,device,device.stream);
++        cow.copy_native_pages();cow.commit_unpublished_destination();
++    }
++    store::submit_native_resident_stripe(recipe_a,pool,addresses,working,device.stream);
++    store::submit_native_resident_stripe(recipe_b,pool,addresses,working,device.stream);
++    device.synchronize();
++    for (std::size_t i=0;i<left2.size();++i) {
++        auto composite=expected[left2[i]];
++        for (std::size_t p=4;p<8;++p)
++            std::memcpy(composite.data()+host.planes[p].offset,
++                expected[right2[i]].data()+host.planes[p].offset,host.planes[p].page_payload_bytes);
++        compare(addresses.physical_page(working,static_cast<std::uint32_t>(i)),composite);
++    }
++    if (shared) for (std::uint32_t i=0;i<n;++i) compare(originals[i],expected[i]);
++    // Releasing an unpublished destination after the private fence is the
++    // cancellation path; never manufacture committed coverage for cleanup.
++    check(addresses.release_after_deactivate(working),"resident cancelled address leaked");
++    check(addresses.release(shared?*address:*checkpoint) && pool.allocated_pages()==0,"resident compaction leaked COW pages");
++    std::cout<<"resident GPU stripe order="<<int(order)<<" shared="<<shared<<" partial="<<partial
++        <<" overlap, independent maps, K/V/scales exact, fenced cancellation, immutable checkpoint retained\n";
++}
++
+ }
+ int main() {
+     try {
+@@ -212,6 +341,9 @@ int main() {
+         if (ninfer::test::cuda_unavailable(status) || (status==cudaSuccess && !count)) return 77;
+         CUDA_CHECK(status);DeviceContext device(0);
+         for (auto order:{PagedKVPlaneOrder::PageMajor,PagedKVPlaneOrder::HeadMajor}) {
++            qualify_resident(device,order,false);
++            qualify_resident(device,order,true);
++            qualify_resident(device,order,false,true);
+             qualify(device,order);
+             qualify_batches(device,order,1,false);
+             qualify_batches(device,order,2,false);
+diff --git a/tests/models/qwen3_5/test_layerwise_physical_native.cpp b/tests/models/qwen3_5/test_layerwise_physical_native.cpp
+index 4d77f2f8..45950bea 100644
+--- a/tests/models/qwen3_5/test_layerwise_physical_native.cpp
++++ b/tests/models/qwen3_5/test_layerwise_physical_native.cpp
+@@ -8,6 +8,7 @@
+ #include "runtime/engine/model_instance.h"
+ #include "kvmem/snapshot.hpp"
+ #include "cuda_availability.h"
++#include "layerwise_pressure_wait.h"
+ #include <array>
+ #include <cstring>
+ #include <iostream>
+@@ -231,7 +232,7 @@ public:
+         sequence.prefix_identity.assign(request.prefill->prompt);sequence.prefix_digests.assign(request.prefill->prompt);
+         {
+             auto& owner=*sequence.window.layerwise_request;
+-            check(owner.admit_prefill(Prefix)==Prefix,"initial native PF64 lost literal credit");owner.prepare_prefill(0,Prefix);
++            check(ninfer::test::admit_layerwise_prefill(owner,Prefix)==Prefix,"initial native PF64 lost literal credit");owner.prepare_prefill(0,Prefix);
+             check(program.prepare_window(sequence,0,Prefix,false,false),"initial native PF64 prepare failed");program.bind_sequence_kv(sequence);
+             auto card=context();program.set_device_i32(program.io.rope_delta,0);
+             const auto result=execution::prefill_text_chunk(card,ids,Prefix,{},false,&owner.boundary());
+@@ -250,7 +251,7 @@ public:
+             // This lower-level setup uses the same flattened block1 producer
+             // and accepted-column commit as real decode, even though native
+             // math is invoked through the bounded text-chunk fixture helper.
+-            const auto n=owner.admit_output(std::min(program.memory_candidate_statistics->columns,Near-begin));
++            const auto n=ninfer::test::admit_layerwise_output(owner,std::min(program.memory_candidate_statistics->columns,Near-begin));
+             check(n!=0,"literal rolling Output made no progress");
+             std::vector<TokenId> consumed(ids.begin()+begin,ids.begin()+begin+n);owner.prepare_output(begin,consumed);
+             check(program.prepare_window(sequence,begin,begin+n,false,false),"accepted native output prepare failed");
+@@ -323,7 +324,7 @@ public:
+             immutable(base);
+         };
+         if (test=="pre-forward") {
+-            auto& owner=*sequence.window.layerwise_request;check(owner.admit_output(D+1)==1,"near-C grant did not cap accepted valid1");
++            auto& owner=*sequence.window.layerwise_request;check(ninfer::test::admit_layerwise_output(owner,D+1)==1,"near-C grant did not cap accepted valid1");
+             const auto grant=owner.prepare_output_physical(1,D+1);
+             check(grant.main_end==C && grant.physical_target_rows==16 &&
+                 (!mtp || grant.auxiliary_end==Near+D),"near-C actual private scratch plan is wrong");
+@@ -360,9 +361,48 @@ public:
+         check(program.text_kv_addresses->mapped_pages(*address)==C/64 &&
+             (!mtp || program.backend_kv_addresses->mapped_pages(*auxiliary)==C/64),"accepted native future scratch rows/pages survived closure");
+         auto accepted_cp=capture();verify_native(accepted_cp);immutable(base);
++        if (test=="pressure-control") {
++            const auto handle=ContractAccess::make_sequence(&program,runtime::LaneId{0},program.lane_epochs[0]);
++            while (!program.prepare_control_memory(handle,1)) {
++                check(sequence.window.layerwise_request->pressure_pending(),"control wait has no private Pressure owner");
++                sequence.window.layerwise_request->wait_pressure();
++            }
++            check(program.text_kv_addresses->committed_frontier(*address)==K,
++                "control admission did not publish the complete Pressure view");
++            immutable(accepted_cp);clear_fault();immutable(accepted_cp);
++            std::cout<<"PASS pressure-control admitted after event, unpublished native owner never executed, immutable CP retained\n";
++            return;
++        }
++        if (test=="pressure-cancel" || test=="pressure-stale") {
++            check(!mtp,"resident Pressure lifecycle fixture requires target-only DFlash2");
++            std::vector<kvmem::LayerwisePressureChoice> choices;
++            const auto catalog=program.layerwise_catalog(sequence);
++            for (const auto& layer:sequence.window.layer_views.target) {
++                kvmem::LayerwisePressureChoice choice;choice.model_layer=layer.model_layer;
++                choice.candidates=catalog.snapshot(layer.model_layer).resident;
++                choice.selected={choice.candidates.front(),choice.candidates[2],choice.candidates.back()};
++                choices.push_back(std::move(choice));
++            }
++            auto metadata=program.layerwise_feedback_account->reserve(1ull<<20);
++            auto refresh=program.start_layerwise_pressure(sequence,choices,metadata);
++            check(bool(refresh) && sequence.window.layerwise_rewrite_pending &&
++                program.text_kv_addresses->committed_frontier(*address)==0,
++                "resident Pressure published an in-flight private destination");
++            if (test=="pressure-stale") {
++                ++sequence.window.stamp.history_revision;refresh->wait();bool rejected=false;
++                try {refresh->finish();} catch (const std::logic_error&) {rejected=true;}
++                check(rejected,"stale resident Pressure completion published a changed owner");
++            }
++            refresh.reset();
++            check(!sequence.window.stamp.valid && !sequence.window.layerwise_rewrite_pending,
++                "cancelled resident Pressure retained a publishable owner");
++            immutable(accepted_cp);clear_fault();immutable(accepted_cp);
++            std::cout<<"PASS "<<test<<" private copy drained, stale owner rejected, native CP bytes unchanged, owner released\n";
++            return;
++        }
+         // Literal next aligned action restores startupK; no final-Query budget
+         // is substituted. Drain the unused credit before restoring old CP.
+-        check(sequence.window.layerwise_request->admit_output(1)==1 &&
++        check(ninfer::test::admit_layerwise_output(*sequence.window.layerwise_request,1)==1 &&
+             program.text_kv_addresses->committed_frontier(*address)==K,"next aligned literal Pressure did not restore startupK");
+         sequence.window.layerwise_request->abort();sequence.window.layerwise_request.reset();request.prefill.reset();
+         sequence.ledger=accepted_cp.checkpoint->prefix;sequence.ledger_frontier=C;
+@@ -464,7 +504,7 @@ int main(int argc,char** argv) {
+     if (argc!=4) return 77;
+     const std::string_view mode=argv[2],test=argv[3];
+     if ((mode!="first-layer"&&mode!="upstream-global"&&mode!="dflash2") ||
+-        (test!="positive"&&test!="cancel"&&test!="pre-forward"&&test!="post-forward"&&test!="retention")) return 77;
++        (test!="positive"&&test!="cancel"&&test!="pre-forward"&&test!="post-forward"&&test!="retention"&&test!="pressure-cancel"&&test!="pressure-stale"&&test!="pressure-control")) return 77;
+     try {int devices=0;const auto status=cudaGetDeviceCount(&devices);
+         if (ninfer::test::cuda_unavailable(status)||(status==cudaSuccess&&!devices)) return 77;
+         CUDA_CHECK(status);ninfer::models::qwen3_5::detail::NativeLayerwiseQueryFixture::run(argv[1],mode,test);return 0;
+diff --git a/tests/models/qwen3_5/test_layerwise_program_query.cpp b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+index 7e71c8c9..cfd3aa5b 100644
+--- a/tests/models/qwen3_5/test_layerwise_program_query.cpp
++++ b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+@@ -4,6 +4,7 @@
+ #include "models/qwen3_5/program/context.h"
+ #include "models/qwen3_5/program/native_mtp_boundary.h"
+ #include "cuda_availability.h"
++#include "layerwise_pressure_wait.h"
+ #include "kvmem/snapshot.hpp"
+ #include <cmath>
+ #include <cstring>
+@@ -161,7 +162,7 @@ public:
+             //128-token workspace and the complete Query's192-token reserve.
+             const auto count=std::min<std::uint32_t>(64,Prefix-begin);
+             auto& seed=*sequence.window.layerwise_request;
+-            check(seed.admit_prefill(count)==count,"seed admission split source tile");
++            check(ninfer::test::admit_layerwise_prefill(seed,count)==count,"seed admission split source tile");
+             seed.prepare_prefill(begin,count);
+             check(program.prepare_window(sequence,begin,begin+count,false,false),"ordinary prefix preparation did not finish");
+             program.bind_sequence_kv(sequence);context.text_kv=program.text_kv_view(sequence);
+@@ -277,7 +278,7 @@ public:
+             auto& ordinary=*sequence.window.layerwise_request;
+             const auto candidates=sequence.window.layer_views.layer(1).pages;
+             const auto old_swaps=sequence.window.swaps;
+-            const auto count=ordinary.admit_prefill(prompt_end-begin);
++            const auto count=ninfer::test::admit_layerwise_prefill(ordinary,prompt_end-begin);
+             check(count==prompt_end-begin,"ordinary tool continuation was truncated despite full exact tile credit");
+             if (begin==384) {
+                 // C384 - fullremaining64 - output80 - headroom64 =176,
+@@ -319,7 +320,7 @@ public:
+             const TokenId consumed=row==0?259:row==17?260:row==18?265:row==35?266:0;
+             sequence.ledger.push_back(consumed);sequence.prefix_identity.append_generated(1,0);
+             sequence.prefix_digests.append_generated(std::span<const TokenId>(&consumed,1),0);
+-            check(output.admit_output(1)==1,"native Output exact tile admission failed");
++            check(ninfer::test::admit_layerwise_output(output,1)==1,"native Output exact tile admission failed");
+             output.prepare_output(begin,std::span<const TokenId>(&consumed,1));
+             check(program.prepare_window(sequence,begin,begin+1,false,false),"native Output append preparation failed");
+             program.bind_sequence_kv(sequence);auto& ingress=*program.ordinary_host_ingress;
+@@ -370,6 +371,9 @@ public:
+         options.kvmem.selected_tokens=minimal_budget?64:192;options.kvmem.reserve_tokens=minimal_budget?192:256;
+         options.kvmem.recall_strategy=kvmem::RecallStrategy::Layerwise;
+         options.kvmem.layerwise_sink_tokens=minimal_budget?0:64;options.kvmem.layerwise_recent_tokens=minimal_budget?0:64;
++        // This quota-isolation fixture deliberately holds a 32 MiB source lease.
++        // Automatic model-sized metadata can be smaller than that test allocation.
++        options.kvmem.layerwise.metadata_bytes=64u<<20;
+         options.kvmem.host_bytes=16u<<20;options.kvmem.disk_bytes=16u<<20;options.kvmem.disk_path=artifact.file.directory;
+         options.context_cache.device_state_slots=1;options.context_cache.host_state_slots=0;options.context_cache.host_kv_capacity_bytes=0;
+         options.context_cache.max_private_continuations=2;options.context_cache.max_shared_prefixes=0;options.context_cache.max_long_anchors_per_continuation=0;
+@@ -426,7 +430,7 @@ public:
+         context.sampling=static_cast<const ops::SamplingConfig*>(program.sampling_config.slice(1,0,1).data);
+         for (std::uint32_t begin=0;begin<prefix;begin+=64) {
+             auto& owner=*sequence.window.layerwise_request;
+-            check(owner.admit_prefill(64)==64,"prefix bootstrap did not admit a complete block");owner.prepare_prefill(begin,64);
++            check(ninfer::test::admit_layerwise_prefill(owner,64)==64,"prefix bootstrap did not admit a complete block");owner.prepare_prefill(begin,64);
+             check(program.prepare_window(sequence,begin,begin+64,false,false),"public source native preparation failed");
+             program.bind_sequence_kv(sequence);context.text_kv=program.text_kv_view(sequence);context.text_kv_base=begin;
+             context.cache_position_shift=sequence.window.removed_tokens;program.set_device_i32(program.io.rope_delta,sequence.window.removed_tokens);
+@@ -505,6 +509,8 @@ public:
+             idle->stamp.session.id=901;
+             idle->source_versions=account;
+             idle->statistics_metadata=account->reserve(4u<<20);
++            // Reclamation selects retained checkpoints, not an empty history.
++            program.memory_checkpoint_slot(*idle,KvmemCheckpointKind::PromptTail)=checkpoint;
+             auto held=account->reserve(account->limit()-account->charged_bytes());
+             request.prefill.emplace();
+             request.prefill->memory_restore_generation=idle->stamp.session.id;
+@@ -674,7 +680,7 @@ public:
+             auto& source_owner=*sequence.window.layerwise_request;
+             for (std::uint32_t begin=0;begin<source_end;begin+=64) {
+                 const auto count=std::min(64u,source_end-begin);
+-                check(source_owner.admit_prefill(count)==count,"MTP source Prefill lost exact tile credit");
++                check(ninfer::test::admit_layerwise_prefill(source_owner,count)==count,"MTP source Prefill lost exact tile credit");
+                 source_owner.prepare_prefill(begin,count);
+                 check(program.prepare_window(sequence,begin,begin+count,false,false),"MTP native prefix preparation failed");
+                 program.bind_sequence_kv(sequence);context.text_kv=program.text_kv_view(sequence);context.mtp_kv=program.mtp_kv_view(sequence);
+@@ -836,7 +842,7 @@ public:
+                 }
+                 program.bind_sequence_kv(sequence);context.text_kv=program.text_kv_view(sequence);context.mtp_kv=program.mtp_kv_view(sequence);
+                 context.text_kv_base=source_end;context.cache_position_shift=sequence.window.removed_tokens;
+-                check(imported.admit_prefill(5)==5,"partial import failed the exact five-token ordinary prefix credit");
++                check(ninfer::test::admit_layerwise_prefill(imported,5)==5,"partial import failed the exact five-token ordinary prefix credit");
+                 imported.prepare_prefill(source_end,5);check(program.prepare_window(sequence,source_end,A,false,false),"partial import append preparation failed");
+                 program.set_device_i32(program.io.rope_delta,sequence.window.removed_tokens);
+                 const auto result=execution::prefill_text_chunk(context,staged.prompt.token_ids,5,{},false,&imported.boundary());
+@@ -1241,7 +1247,7 @@ public:
+                 "no-refresh Query used a recall runner or did not reserve its complete native suffix");
+             context.execution.prefill_chunk=64;
+             for (std::uint32_t done=0;done<80;) {
+-                const auto begin=prefix+done,count=native.admit_prefill(std::min(64u,80-done));
++                const auto begin=prefix+done,count=ninfer::test::admit_layerwise_prefill(native,std::min(64u,80-done));
+                 native.prepare_prefill(begin,count);
+                 check(program.prepare_window(sequence,begin,begin+count,false,false),"no-refresh native chunk preparation failed");
+                 program.bind_sequence_kv(sequence);context.text_kv=program.text_kv_view(sequence);context.text_kv_base=begin;

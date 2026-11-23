@@ -5,7 +5,7 @@ module.exports=async({browser,base,info})=>{
  try{
   const page=await context.newPage(),errors=[],inspections=[];
   page.on('pageerror',error=>errors.push(error.message));
-  const parameters={...info.draft.parameters,Backend:'polystrata',Model:'C:/fixture/gemma.gguf',Gpu:'GPU-gemma-fixture',SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',NgramDrafts:0,KvType:'f16'};
+  const parameters={...info.draft.parameters,QueryMaxTokens:512,QueryReplayMaxTokens:2048,Backend:'polystrata',Model:'C:/fixture/gemma.gguf',Gpu:'GPU-gemma-fixture',SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',NgramDrafts:0,KvType:'f16'};
   await page.route('**/api/launcher/info',r=>r.fulfill({json:{...info,model_inspection_version:1,gpus:[{uuid:parameters.Gpu,name:'Fixture GPU'}],status:{state:'stopped'},draft:{schema_version:1,parameters}}}));
   await page.route('**/api/launcher/status',r=>r.fulfill({json:{state:'stopped'}}));
   await page.route('**/api/launcher/inspect-model',r=>{

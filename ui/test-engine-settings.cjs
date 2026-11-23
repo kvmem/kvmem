@@ -3,7 +3,7 @@ const assert=require('node:assert/strict'),path=require('node:path'),fs=require(
 module.exports=async({browser,base,info,stage})=>{
   const context=await browser.newContext({viewport:{width:1440,height:1050}}),page=await context.newPage(),errors=[],sent=[];
   const gpu={uuid:'GPU-engine-settings-fixture',name:'Fixture GPU'};
-  const p={...info.draft.parameters,Backend:'polystrata',Model:'C:/fixture/model.gguf',Gpu:gpu.uuid,Context:8192,Budget:2048,Reserve:1024,Prefill:128,MaxTokens:128,HostMiB:256,SinkTokens:128,RecentTokens:64,Concurrency:1,RetainedSessions:1,ThinkingMode:'on',DraftTokens:2,Worker:'',Python:'',Tokenizer:'',PolystrataSource:'',WorkerArgs:['--threads','4']};
+  const p={...info.draft.parameters,QueryMaxTokens:512,QueryReplayMaxTokens:2048,Backend:'polystrata',Model:'C:/fixture/model.gguf',Gpu:gpu.uuid,Context:8192,Budget:2048,Reserve:1024,Prefill:128,MaxTokens:128,HostMiB:256,SinkTokens:128,RecentTokens:64,Concurrency:1,RetainedSessions:1,ThinkingMode:'on',DraftTokens:2,Worker:'',Python:'',Tokenizer:'',PolystrataSource:'',WorkerArgs:['--threads','4']};
   let status={state:'stopped'};
   page.on('pageerror',error=>errors.push(error.message));
   await page.route('**/api/launcher/info',r=>r.fulfill({json:{...info,gpus:[gpu],status,draft:{schema_version:1,parameters:p},workers:Object.fromEntries(['polystrata','ninfer','llamacpp'].map(b=>[b,{available:true,path:'C:/runtime/'+b+'.exe'}]))}}));
@@ -26,7 +26,7 @@ module.exports=async({browser,base,info,stage})=>{
     await f('Tokenizer').fill('C:/tokenizer');await f('Worker').fill('C:/custom/worker.exe');
     assert.equal(await page.locator('[data-engine-environment] .l-engine-status').textContent(),'已自定义');
     await shot('polystrata-runtime');
-    await page.locator('#launch-tab-3').click();await page.locator('[data-vision-assets] > summary').click();
+    await page.locator('#launch-tab-4').click();await page.locator('[data-vision-assets] > summary').click();
     await f('VisionWorker').fill('C:/vision/encoder.exe');await f('Mmproj').fill('C:/vision/mmproj.gguf');
     assert.equal(await page.locator('.l-native [data-param=VisionWorker]').count(),0);
     await page.locator('[data-engine-arguments] > summary').click();await page.locator('[data-native]').fill('["--threads","6"]');
@@ -43,7 +43,7 @@ module.exports=async({browser,base,info,stage})=>{
     }
     await f('Backend').selectOption('llamacpp');
     await f('Model').fill('C:/fixture/model.gguf');
-    await page.locator('#launch-tab-3').click();
+    await page.locator('#launch-tab-4').click();
     assert.equal(await f('LoraScale').isDisabled(),true);
     await f('Lora').fill('C:/adapters/rank two.gguf');
     await f('LoraScale').fill('-0.5');
@@ -51,7 +51,7 @@ module.exports=async({browser,base,info,stage})=>{
     assert.equal(adapted.Lora,'C:/adapters/rank two.gguf');
     assert.equal(adapted.LoraScale,-0.5);
     for(const value of [-0.5,0]){
-      await page.locator('#launch-tab-3').click();
+      await page.locator('#launch-tab-4').click();
       await f('LoraScale').fill(String(value));
       await page.locator('[data-preset="llamacpp-default"]').click();
       assert.equal(await f('Lora').inputValue(),'C:/adapters/rank two.gguf');
@@ -59,7 +59,7 @@ module.exports=async({browser,base,info,stage})=>{
       const reapplied=await preview();
       assert.equal(reapplied.LoraScale,value);
     }
-    await page.locator('#launch-tab-3').click();
+    await page.locator('#launch-tab-4').click();
     await f('Lora').fill('');
     assert.equal(await f('LoraScale').isDisabled(),true);
     const plain=await preview();

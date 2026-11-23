@@ -12,6 +12,66 @@ spec.loader.exec_module(changes)
 
 
 class DocumentationChangesTest(unittest.TestCase):
+    def test_windows_telemetry_runs_console_checks_without_engine_builds(self):
+        from unittest.mock import patch
+        paths = ['scripts/windows_amd_hardware.py','scripts/windows_gpu_hardware.py',
+                 'scripts/windows/package-polystrata.ps1','tests/test_windows_amd_hardware.py',
+                 'tests/test_windows_gpu_hardware.py','ui/memory-fixture.py']
+        self.assertTrue(changes.requires_ci(paths))
+        self.assertFalse(changes.requires_native(paths))
+        current = (Path(__file__).resolve().parents[1] / changes.WORKFLOW).read_text(encoding='utf8')
+        self.assertEqual(current.count(changes.HARDWARE_TEST_STEP),1)
+        before = current.replace(changes.HARDWARE_TEST_STEP,'',1)
+        for after, expected in ((current,False),(current+'\n# unrelated recipe change\n',True)):
+            with patch.object(changes,'git',side_effect=lambda _,ref,**kw:
+                              (before if ref.startswith('a'*40) else after).encode()):
+                self.assertEqual(changes.requires_native(paths+[changes.WORKFLOW],'a'*40,'b'*40),expected)
+
+    def test_query_launcher_contracts_run_without_engine_builds(self):
+        from unittest.mock import patch
+        paths = ['scripts/launcher/worker.py', 'scripts/windows/start-backend.ps1',
+                 'tests/test_layerwise_launcher.py', 'tests/test_layerwise_product.py',
+                 'tests/test_windows_worker_args.py', 'tests/test_launcher_export.py',
+                 '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py']
+        self.assertTrue(changes.requires_ci(paths))
+        self.assertFalse(changes.requires_native(paths))
+        self.assertFalse(changes.requires_cuda(paths, 'a' * 40, 'b' * 40))
+        current = (Path(__file__).resolve().parents[1] / changes.WORKFLOW).read_text(encoding='utf-8')
+        self.assertEqual(current.count(changes.CONSOLE_CONTRACT_TEST_STEP), 1)
+        before = current.replace(changes.CONSOLE_CONTRACT_TEST_STEP, '', 1)
+        for after, expected in ((current, False), (current + '\n# unrelated edit\n', True),
+                                (current.replace('cmake --build build', 'cmake --build other'), True)):
+            with patch.object(changes, 'git', side_effect=lambda _, ref, **kw:
+                              (before if ref.startswith('a' * 40) else after).encode()):
+                self.assertEqual(changes.requires_native(paths + [changes.WORKFLOW], 'a' * 40, 'b' * 40), expected)
+        for extra in ('kvmem/src/host/kvmem_store.cpp', 'backends/ninfer', 'CMakeLists.txt',
+                      'scripts/windows/build-backends.ps1', 'tests/unreviewed_native_test.py'):
+            self.assertTrue(changes.requires_native(paths + [extra]))
+            self.assertTrue(changes.requires_cuda(paths + [extra], 'a' * 40, 'b' * 40))
+
+    def test_chat_crlf_attributes_are_not_native_build_inputs(self):
+        from unittest.mock import patch
+        old = b'*.md text\n'
+        addition = '\n# Preserve existing lightweight chat CRLF blobs.\nui/lightweight/+page.svelte whitespace=cr-at-eol\nui/lightweight/labels.ts whitespace=cr-at-eol\n'
+        paths = ['backends/patches/radiance-win-single-stream.patch', '.gitattributes']
+        for suffix, expected in [(addition, False), (addition + '* eol=crlf\n', True)]:
+            with patch.object(changes, 'git', side_effect=lambda _, ref, **kw:
+                              old if ref.startswith('old:') else old + suffix.encode()):
+                self.assertEqual(changes.requires_native(paths, 'old', 'new'), expected)
+
+    def test_radiance_console_and_chat_do_not_build_unrelated_engines(self):
+        paths = ['scripts/console_radiance.py', 'scripts/console_state.py',
+                 'ui/lightweight/+page.svelte', 'ui/lightweight/labels.ts',
+                 'ui/monitor/launcher.js', 'tests/test_console_state.py']
+        self.assertTrue(changes.requires_ci(paths))
+        self.assertFalse(changes.requires_native(paths))
+        self.assertFalse(changes.requires_cuda(paths, 'a', 'b'))
+        paths += ['backends/patches/radiance-win-single-stream.patch', 'backends/radiance/upstream.json']
+        self.assertTrue(changes.radiance_only_change(paths))
+        self.assertFalse(changes.requires_native(paths))
+        self.assertFalse(changes.requires_cuda(paths, 'a', 'b'))
+        self.assertTrue(changes.requires_native(paths + ['src/unknown.cpp']))
+
     def test_versioned_radiance_patch_uses_only_radiance_native_checks(self):
         paths = ['backends/patches/radiance-1.17-kvmem.patch',
                  'backends/radiance/adapter/window_checkpoint.hpp',

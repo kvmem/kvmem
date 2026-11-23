@@ -1,0 +1,391 @@
+diff --git a/include/ninfer/ops/prompt_page_lse.h b/include/ninfer/ops/prompt_page_lse.h
+index fedf65868c0d4365aa30653583577af7966a6727..d9e347ac2d97333a99d56379514604ef5b3fd501 100644
+--- a/include/ninfer/ops/prompt_page_lse.h
++++ b/include/ninfer/ops/prompt_page_lse.h
+@@ -2,16 +2,25 @@
+ 
+ #include "ninfer/ops/softmax_attention.h"
+ 
++#include <cstdlib>
++#include <cstring>
++#include <span>
++
+ namespace ninfer::ops {
+-// Eager single-sequence prompt feedback. Row IDs are relative to this physical
+-// call, strictly increasing; CUDA copies them as launch parameters. scratch is
+-// caller-owned contiguous FP32 [page,head,sample] and lives through reduction.
++inline bool prefill_page_lse_reuse_enabled() {
++    const char* value = std::getenv("NINFER_PREFILL_PAGE_LSE_REUSE");
++    return !value || std::strcmp(value, "1") == 0;
++}
++
++// Eager single-sequence prompt feedback. The sorted host rows share an origin;
++// row_offset is the first row of this physical call in that coordinate system.
++// The caller keeps rows, device_rows and scratch alive through reduction.
+ // Unsupported attention routes leave captured=false and perform normal attention.
+ struct PromptPageLse {
+-    static constexpr int max_samples = 64;
+-    Tensor scratch;
+-    std::int32_t rows[max_samples]{};
+-    std::int32_t count = 0;
++    Tensor scratch;     // Contiguous FP32 [page,head,sample].
++    Tensor device_rows; // Contiguous I32 [sample].
++    std::span<const std::uint32_t> rows;
++    std::uint32_t row_offset = 0;
+     bool captured = false;
+ };
+ void causal_softmax_attention_with_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.cpp b/src/models/qwen3_5/program/native_layerwise_request.cpp
+index 4c2ad38f75b0c61bc62a8aa3246a23dfc96bcaf7..a1db53a83a49f32c2e7750b99afd3ffc1005dcc2 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_request.cpp
+@@ -494,7 +494,7 @@ struct NativeLayerwiseRequest::Impl {
+         // begin() parses the complete trusted prompt and resets this distinct
+         // request's N before its first prefill; old accepted S remains available.
+         if (output) output->begin(sequence.window.stamp,id,std::vector<std::uint32_t>(input->token_ids.begin(),input->token_ids.end()));
+-        if (flag("NINFER_PREFILL_PAGE_LSE_REUSE",true))
++        if (ops::prefill_page_lse_reuse_enabled())
+             boundary.prepare_page_lse=[](void* owner,const execution::CurrentLayerAttentionFrame& f,ops::PromptPageLse& dst) {
+                 return static_cast<Impl*>(owner)->prepare_page_lse(f,dst);
+             };
+@@ -714,10 +714,14 @@ struct NativeLayerwiseRequest::Impl {
+         if (end>c.count) return false;
+         const auto lo=std::lower_bound(c.rows.begin(),c.rows.end(),seen);
+         const auto hi=std::lower_bound(lo,c.rows.end(),end);
+-        if (lo==hi || hi-lo>ops::PromptPageLse::max_samples) return false;
+-        dst.count=static_cast<int>(hi-lo);
+-        std::transform(lo,hi,dst.rows,[seen](auto r){return std::int32_t(r-seen);});
+-        dst.scratch=p.memory_statistics->ranks.at(0).attention_scratch.slice(2,0,dst.count);
++        const auto& shard=p.memory_statistics->ranks.at(0);
++        const auto samples=hi-lo;
++        if (!samples || samples>shard.attention_scratch.ne[2]) return false;
++        const auto n=static_cast<std::int32_t>(samples);
++        dst.scratch=shard.attention_scratch.slice(2,0,n);
++        dst.device_rows=shard.attention_rows.slice(0,0,n);
++        dst.rows={lo,hi};
++        dst.row_offset=seen;
+         return true;
+     }
+     bool reported_page_reuse=false;
+@@ -773,6 +777,12 @@ struct NativeLayerwiseRequest::Impl {
+             if (c.sampled_preview && !(*c.sampled_preview & (std::uint64_t(1)<<c.rows[i]))) continue;
+             selected.push_back(static_cast<std::int32_t>(c.rows[i]-seen));positions.push_back(static_cast<std::int32_t>(c.local_begin+c.rows[i]));destinations.push_back(i);
+         }
++        const auto* reused=frame.page_lse;
++        if (reused && (reused->row_offset!=seen || reused->rows.size()!=selected.size() ||
++                       reused->scratch.data!=shard.attention_scratch.data ||
++                       !std::equal(reused->rows.begin(),reused->rows.end(),selected.begin(),
++                           [seen](auto row,auto relative){return row==seen+std::uint32_t(relative);})))
++            throw std::logic_error("prefill page capture changed its sample ownership");
+         DeviceBinding binding(p.device.rank(frame.identity.rank).device);
+         const auto staging=feedback_staging();
+         try {
+@@ -799,7 +809,9 @@ struct NativeLayerwiseRequest::Impl {
+             for (std::size_t first=0;first<selected.size();first+=64) {
+                 const auto n=static_cast<std::int32_t>(std::min<std::size_t>(64,selected.size()-first));
+                 auto rows=shard.attention_rows.slice(0,0,n),ends=shard.attention_positions.slice(0,0,n);
+-                auto scratch=shard.attention_scratch.slice(2,0,n),norms=shard.attention_norms.slice(2,0,n),mass=shard.attention_output.slice(1,0,n);
++                auto scratch=reused?reused->scratch.slice(2,static_cast<std::int32_t>(first),n):
++                    shard.attention_scratch.slice(2,0,n);
++                auto norms=shard.attention_norms.slice(2,0,n),mass=shard.attention_output.slice(1,0,n);
+                 const auto bytes=mass.bytes();if (bytes>staging.size()) throw std::length_error("native feedback readback exceeds pinned account");
+                 auto timer=trace_feedback && c.output?FeedbackClock::now():FeedbackClock::time_point{};
+                 if (trace_feedback && c.output) { ++counters.tiles;counters.bytes+=bytes; }
+@@ -847,8 +859,10 @@ struct NativeLayerwiseRequest::Impl {
+                     counters.pinned_peak=std::max<std::uint64_t>(counters.pinned_peak,bytes);
+                     counters.control_bytes+=(count+1)*sizeof(std::int32_t);
+                 }
+-                CUDA_CHECK(cudaMemcpyAsync(rows.data,selected.data()+first,std::size_t(n)*4,cudaMemcpyHostToDevice,frame.producer_stream));
+-                CUDA_CHECK(cudaMemcpyAsync(ends.data,positions.data()+first,std::size_t(n)*4,cudaMemcpyHostToDevice,frame.producer_stream));
++                if (!reused) {
++                    CUDA_CHECK(cudaMemcpyAsync(rows.data,selected.data()+first,std::size_t(n)*4,cudaMemcpyHostToDevice,frame.producer_stream));
++                    CUDA_CHECK(cudaMemcpyAsync(ends.data,positions.data()+first,std::size_t(n)*4,cudaMemcpyHostToDevice,frame.producer_stream));
++                }
+                 // Check actual native cache positions/table before interpreting
+                 // dense page columns as the externally owned logical map.
+                 std::int32_t actual_table=-1;std::vector<std::int32_t> actual_positions(count);
+@@ -860,14 +874,11 @@ struct NativeLayerwiseRequest::Impl {
+                     events.initialize();
+                     CUDA_CHECK(cudaEventRecord(events.begin,frame.producer_stream));
+                 }
+-                if (const auto* reused=frame.page_lse) {
+-                    if (first || reused->count!=static_cast<int>(selected.size()) ||
+-                        reused->scratch.data!=scratch.data || !std::equal(selected.begin(),selected.end(),reused->rows))
+-                        throw std::logic_error("prefill page capture changed its sample ownership");
++                if (reused) {
+                     ops::attention_page_mass_from_lse(scratch,norms,mass,frame.producer_stream);
+                     if (!reported_page_reuse) {
+-                        std::fprintf(stderr,"[kvmem] reused prefill QK: model_layer=%u samples=%d pages=%d\n",
+-                            frame.identity.model_layer,n,int(scratch.ne[0]));
++                        std::fprintf(stderr,"[kvmem] reused prefill QK: model_layer=%u samples=%zu pages=%d width=%u\n",
++                            frame.identity.model_layer,reused->rows.size(),int(scratch.ne[0]),physical_count);
+                         reported_page_reuse=true;
+                     }
+                 } else {
+diff --git a/src/models/qwen3_5/program/planning/memory_statistics_layout.h b/src/models/qwen3_5/program/planning/memory_statistics_layout.h
+index 27d810accb842ecbf9c58a88c877c76f5ada205e..77b240708271b09d2621deb41534037c7a1f9730 100644
+--- a/src/models/qwen3_5/program/planning/memory_statistics_layout.h
++++ b/src/models/qwen3_5/program/planning/memory_statistics_layout.h
+@@ -37,7 +37,7 @@ inline std::int32_t memory_statistics_dimension(std::uint64_t value) {
+ template<class Allocate>
+ void plan_memory_statistics_shard(MemoryStatisticsLayout& out,
+     const MemoryStatisticsPlanning& plan, std::uint64_t key_width, std::uint64_t query_width,
+-    std::uint32_t query_heads, Allocate&& allocate) {
++    std::uint32_t query_heads, Allocate&& allocate, std::uint32_t page_lse_rows = 64) {
+     if (!plan.window_tokens || !out.layers) return;
+     const auto d = memory_statistics_dimension;
+     const auto prefill = std::min(plan.prefill_chunk, plan.capacity);
+@@ -66,10 +66,10 @@ void plan_memory_statistics_shard(MemoryStatisticsLayout& out,
+         out.graph_epochs=allocate(every,DType::I64,{d(out.layers)},"layerwise graph layer epochs");
+         out.graph_ingress_epoch=allocate(every,DType::I64,{1},"layerwise graph ingress epoch");
+     }
+-    out.attention_rows = allocate(every, DType::I32, {64}, "memory attention sample rows");
++    out.attention_rows = allocate(every, DType::I32, {d(page_lse_rows)}, "memory attention sample rows");
+     out.attention_positions = allocate(every, DType::I32, {64}, "memory attention causal ends");
+     out.attention_scratch = allocate(divided, DType::FP32,
+-        {d(pages), d(query_heads), 64}, "memory attention page LSE");
++        {d(pages), d(query_heads), d(page_lse_rows)}, "memory attention page LSE");
+     out.attention_norms = allocate(divided, DType::FP32,
+         {2, d(query_heads), 64}, "memory attention row norms");
+     out.attention_output = allocate(every, DType::FP32, {d(pages), 64}, "memory attention page mass");
+diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
+index c333e67b6d3abfe9faf3c76bb3f76f318f6aaf0d..7ecea17c84f486c4190dcc6fc7cc9df8a16047fc 100644
+--- a/src/models/qwen3_5/program/planning/startup.cpp
++++ b/src/models/qwen3_5/program/planning/startup.cpp
+@@ -32,6 +32,8 @@
+ #include "ninfer/ops/sampling.h"
+ #include "ninfer/ops/sliding_window_attention.h"
+ #include "ninfer/ops/softmax_attention.h"
++#include "ninfer/ops/prompt_page_lse.h"
++#include "kvmem/layerwise_pressure.hpp"
+ #include "ninfer/ops/speculative_round.h"
+ #include "runtime/contract/rope_scaling.h"
+ #include <algorithm>
+@@ -415,6 +417,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
+                 }
+             }
+         }
++        // The single-device eager kernel writes every sampled row. Reuse the
++        // existing scratch allocation and keep normalization/readback batches at 64.
++        std::uint32_t page_lse_rows = 64;
++        if (ranks == 1 && plan.kvmem.recall_strategy == kvmem::RecallStrategy::Layerwise &&
++            ops::prefill_page_lse_reuse_enabled()) {
++            const auto width = std::min(statistics_plan.prefill_chunk, statistics_plan.capacity);
++            const auto stride = kvmem::LayerwisePrefillOptions{}.stride;
++            if (width && stride) page_lse_rows = std::max(page_lse_rows, 1 + (width - 1) / stride);
++        }
+         std::uint32_t first_layer = 0;
+         for (std::size_t rank = 0; rank < ranks; ++rank) {
+             auto& stats = out.memory_statistics[rank];
+@@ -430,7 +441,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
+                 [&](MemoryStatisticsOwner, DType dtype,
+                     std::initializer_list<std::int32_t> shape, const char* label) {
+                     return add_tensor(builders[rank], dtype, shape, label);
+-                });
++                }, page_lse_rows);
+         }
+         // Prefill sets the origin on rank 0; the stage control block carries it onward.
+         plan_memory_statistics_rank0(out.memory_statistics.front(), out.memory_query_workspace,
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_tile.cuh b/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_tile.cuh
+index 809124058d4216bbf892b2e87241b2a018af59b4..272ca9640ed84a76b6e5158d19a42ecbf624f585 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_tile.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_tile.cuh
+@@ -1,54 +1,65 @@
+ #pragma once
+ 
++#include "core/device.h"
+ #include "ninfer/ops/prompt_page_lse.h"
+ #include "ops/common/math.h"
+ #include "ops/common/warp.cuh"
+ 
+ #include <algorithm>
+-#include <climits>
++#include <functional>
+ #include <math_constants.h>
+ 
+ namespace ninfer::ops {
+ 
+ struct PromptPageLseTile {
+     float* values = nullptr;
++    const std::uint32_t* rows = nullptr;
++    std::uint32_t row_offset = 0;
+     int pages = 0;
+     int samples = 0;
+-    int rows[PromptPageLse::max_samples]{};
+ 
+     __device__ __forceinline__ int slot(int row) const {
++        if (row < 0) return -1;
++        const auto absolute_row = static_cast<std::uint32_t>(row) + row_offset;
+         int lo = 0, hi = samples;
+         while (lo < hi) {
+-            const int middle = (lo + hi) / 2;
+-            if (rows[middle] < row) lo = middle + 1; else hi = middle;
++            const int middle = lo + (hi - lo) / 2;
++            if (rows[middle] < absolute_row) lo = middle + 1; else hi = middle;
+         }
+-        return lo < samples && rows[lo] == row ? lo : -1;
++        return lo < samples && rows[lo] == absolute_row ? lo : -1;
+     }
+ };
+ 
+-static __global__ void clear_prompt_page_lse(float* values, int n) {
+-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (i < n) values[i] = -CUDART_INF_F;
++static __global__ void clear_prompt_page_lse(float* values, std::size_t n) {
++    const std::size_t stride = std::size_t(gridDim.x) * blockDim.x;
++    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride)
++        values[i] = -CUDART_INF_F;
+ }
+ 
+ inline bool prepare_prompt_page_lse_tile(const Tensor& q, PagedKVBatchLayerView cache,
+                                         std::uint32_t max_visible, const PromptPageLse& capture,
+                                         PromptPageLseTile& tile, cudaStream_t stream) {
+     const auto& scratch = capture.scratch;
+-    const int n = capture.count;
+-    if (n <= 0 || n > PromptPageLse::max_samples || scratch.dtype != DType::FP32 ||
++    const auto& rows = capture.rows;
++    const auto& device_rows = capture.device_rows;
++    if (rows.empty() || rows.size() > std::size_t(q.ne[2]) || scratch.dtype != DType::FP32 ||
+         !scratch.data || !scratch.is_contiguous() || scratch.ne[0] <= 0 ||
+         scratch.ne[0] > cache.block_tables.ne[0] || std::uint64_t(scratch.ne[0]) * 64 < max_visible ||
+-        scratch.ne[1] != q.ne[1] || scratch.ne[2] != n || scratch.ne[3] != 1 || scratch.numel() > INT_MAX)
++        scratch.ne[1] != q.ne[1] || std::size_t(scratch.ne[2]) != rows.size() || scratch.ne[3] != 1 ||
++        !device_rows.data || device_rows.dtype != DType::I32 || !device_rows.is_contiguous() ||
++        device_rows.numel() < rows.size())
+         return false;
+-    for (int i = 0; i < n; ++i)
+-        if (capture.rows[i] < 0 || capture.rows[i] >= q.ne[2] || (i && capture.rows[i] <= capture.rows[i-1]))
+-            return false;
+-    tile = {static_cast<float*>(scratch.data), int(scratch.ne[0]), n, {}};
+-    std::copy_n(capture.rows, n, tile.rows);
++    if (rows.front() < capture.row_offset ||
++        rows.back() - capture.row_offset >= std::uint32_t(q.ne[2]) ||
++        std::adjacent_find(rows.begin(), rows.end(), std::greater_equal<>()) != rows.end())
++        return false;
++    CUDA_CHECK(cudaMemcpyAsync(device_rows.data, rows.data(), rows.size_bytes(),
++                               cudaMemcpyHostToDevice, stream));
++    tile = {static_cast<float*>(scratch.data), static_cast<const std::uint32_t*>(device_rows.data),
++            capture.row_offset, scratch.ne[0], static_cast<int>(rows.size())};
+     // Pages beyond a sampled row's causal frontier have zero probability.
+-    clear_prompt_page_lse<<<(int(scratch.numel()) + 255) / 256, 256, 0, stream>>>(
+-        tile.values, int(scratch.numel()));
++    const auto blocks = std::min<std::size_t>((scratch.numel() - 1) / 256 + 1, 65535);
++    clear_prompt_page_lse<<<static_cast<unsigned>(blocks), 256, 0, stream>>>(tile.values, scratch.numel());
+     return true;
+ }
+ 
+diff --git a/tests/experimental/prompt_page_lse.cpp b/tests/experimental/prompt_page_lse.cpp
+index c17d3b27b01728afac61944f9db3b07ce5930ad2..697213ccf5b172d21398bb938c2f948a9d8aff12 100644
+--- a/tests/experimental/prompt_page_lse.cpp
++++ b/tests/experimental/prompt_page_lse.cpp
+@@ -64,8 +64,8 @@ static void qualify(int base,int width,std::vector<int> samples) {
+     ops::attention_page_mass(qt,rr,ee,1,cache,st,nt,mt,nullptr);
+     const auto old=from_device<float>(mass,mt.numel());
+     scratch.fill(0x7f); // unwritten tail must be zero probability, even with dirty scratch
+-    ops::PromptPageLse capture;
+-    capture.scratch=st;capture.count=S;std::copy(samples.begin(),samples.end(),capture.rows);
++    std::vector<std::uint32_t> capture_rows(samples.begin(),samples.end());
++    ops::PromptPageLse capture{.scratch=st,.device_rows=rr,.rows=capture_rows};
+     ops::causal_softmax_attention_with_page_lse(qt,kt,vt,pt,{},rt,geo,1.f/16,cache,env,arena,ot,nullptr,nullptr,nullptr,&capture);
+     if(!capture.captured) throw std::runtime_error("qualified route fell back");
+     ops::attention_page_mass_from_lse(st,nt,mt,nullptr);
+@@ -139,18 +139,23 @@ static void qualify(int base,int width,std::vector<int> samples) {
+     if(main_rel>0.02 || old_err>2e-5 || worst>0.002 || max_l1>0.005 || sum_err>2e-6)
+         throw std::runtime_error("outside page probability tolerance");
+     // A stale or invalid requested capture must not be mistaken for materialized stats.
+-    capture.rows[0]=-1;
++    capture_rows[0]=width;
+     ops::causal_softmax_attention_with_page_lse(qt,kt,vt,pt,{},rt,geo,1.f/16,cache,env,arena,ot,nullptr,nullptr,nullptr,&capture);
+     if(capture.captured || from_device<std::uint16_t>(result,nq)!=from_device<std::uint16_t>(other,nq))
+         throw std::runtime_error("invalid capture did not fall back to regular attention");
+ }
+ static void qualify_dense(const char* name, KvCacheStorage storage, int q_heads, int kv_heads,
+-                          int width, bool fast, bool random_q) {
++                          int width, bool fast, bool random_q, int stride = 32) {
+     constexpr int D = 256;
+     const int base = 47;
+     const int end = base + width;
+     const int pages = (end + 63) / 64 + 2;
+-    const std::vector<int> samples{0, 16, 17, 63, 64, width - 1};
++    std::vector<int> samples;
++    if (width == 4096) {
++        for (int row = stride - 1; row < width; row += stride) samples.push_back(row);
++    } else {
++        samples = {0, 16, 17, 63, 64, width - 1};
++    }
+     const int count = int(samples.size());
+     const auto profile = ops::d256_kv_cache_profile(storage);
+     const int keys = profile.key_leading_extent;
+@@ -195,19 +200,27 @@ static void qualify_dense(const char* name, KvCacheStorage storage, int q_heads,
+     WorkspaceArena arena(std::max<size_t>(4096,ops::causal_softmax_attention_workspace_capacity_bytes(
+         geometry,storage,envelope,1,width,width)));
+     ops::causal_softmax_attention(qt,kt,vt,pt,{},rt,geometry,1.f/16,cache,envelope,arena,refout,nullptr);
+-    ops::attention_page_mass(qt,rr,ee,0,cache,st,nt,mt,nullptr);
+-    const auto separate = from_device<float>(mass,mt.numel());
++    std::vector<float> separate;
++    if (random_q) {
++        ops::attention_page_mass(qt,rr,ee,0,cache,st,nt,mt,nullptr);
++        separate = from_device<float>(mass,mt.numel());
++    }
+     scratch.fill(0x7f);
+-    ops::PromptPageLse capture;
+-    capture.scratch = st;
+-    capture.count = count;
+-    std::copy(samples.begin(),samples.end(),capture.rows);
++    constexpr std::uint32_t row_offset = 173;
++    std::vector<std::uint32_t> capture_rows;
++    for (const int sample : samples) capture_rows.push_back(row_offset + sample);
++    ops::PromptPageLse capture{.scratch=st,.device_rows=rr,.rows=capture_rows,.row_offset=row_offset};
+     ops::causal_softmax_attention_with_page_lse(qt,kt,vt,pt,{},rt,geometry,1.f/16,cache,envelope,
+                                                arena,ot,nullptr,nullptr,nullptr,&capture);
+     if (!capture.captured || from_device<std::uint16_t>(result,q.size()) !=
+                               from_device<std::uint16_t>(baseline,q.size()))
+         throw std::runtime_error("dense capture unavailable or changed attention output");
+-    ops::attention_page_mass_from_lse(st,nt,mt,nullptr);
++    for (int first = 0; first < count; first += 64) {
++        const int batch = std::min(64, count - first);
++        auto sample_norms = nt.slice(2,first,batch);
++        auto sample_mass = mt.slice(1,first,batch);
++        ops::attention_page_mass_from_lse(st.slice(2,first,batch),sample_norms,sample_mass,nullptr);
++    }
+     const auto fused = from_device<float>(mass,mt.numel());
+     double worst = 0;
+     for (int i = 0; i < count; ++i) {
+@@ -223,7 +236,7 @@ static void qualify_dense(const char* name, KvCacheStorage storage, int q_heads,
+         }
+         if (std::abs(sum - 1) > 2e-6) throw std::runtime_error("dense capture mass is not normalized");
+     }
+-    std::cout << name << " h=" << q_heads << " width=" << width << " fast=" << fast
++    std::cout << name << " h=" << q_heads << " width=" << width << " samples=" << count << " fast=" << fast
+               << " random_q=" << random_q << " max_error=" << worst << std::endl;
+     if (worst > (random_q ? 0.007 : 2e-6)) throw std::runtime_error("dense page probability disagrees with reference");
+ }
+@@ -239,7 +252,8 @@ int main() {
+         qualify(1003,1024,{5,20,63,85,196,511,751,1023});
+         std::vector<int> sampled(32);for(int i=0;i<32;++i)sampled[i]=32*i+31;
+         qualify(36*1024,1024,sampled);
+-        qualify_dense("bf16",KvCacheStorage::BFloat16,24,4,4096,false,false);
++        qualify_dense("fp8",KvCacheStorage::Fp8E4M3Row256,24,4,4096,false,false);
++        qualify_dense("bf16",KvCacheStorage::BFloat16,24,4,4096,false,false,16);
+         qualify_dense("bf16",KvCacheStorage::BFloat16,8,2,257,false,true);
+         for (const auto& [name,storage] : std::array{
+                  std::pair{"int8",KvCacheStorage::Int8Group64},
+diff --git a/tests/ops/softmax_attention/page_lse.cpp b/tests/ops/softmax_attention/page_lse.cpp
+index 0fb3ccbe3ef0170eddf09f992e2b6389bc3fcbd0..5a2afe899831ca7acb3fc8b7e061b8051fd4640f 100644
+--- a/tests/ops/softmax_attention/page_lse.cpp
++++ b/tests/ops/softmax_attention/page_lse.cpp
+@@ -157,12 +157,12 @@ static void qualify(int width, int base, bool bench) {
+     const auto workspace_bytes=ops::causal_softmax_attention_workspace_capacity_bytes(geo,cache.storage,env,1,width,width);
+     WorkspaceArena arena(std::max<size_t>(4096,workspace_bytes));
+     std::vector<std::uint16_t> reference;std::vector<float> reference_mass;
++    const std::vector<std::uint32_t> capture_rows(samples.begin(),samples.end());
+     std::vector<double> oracle_output,oracle_mass;
+     cudaEvent_t begin,finish;CUDA_CHECK(cudaEventCreate(&begin));CUDA_CHECK(cudaEventCreate(&finish));
+     for(int round=bench?-1:0;round<(bench?6:1);++round)for(int order=0;order<3;++order){
+         const int mode=round<0?order:(order+round)%3;setting(mode);
+-        ops::PromptPageLse capture;capture.scratch=st;capture.count=S;
+-        std::copy(samples.begin(),samples.end(),capture.rows);
++        ops::PromptPageLse capture{.scratch=st,.device_rows=rr,.rows=capture_rows};
+         int captured=0;
+         auto invoke=[&]{
+             capture.captured=false;

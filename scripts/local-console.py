@@ -30,8 +30,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from console_chat import ChatBridge, MAX_BODY
-from console_hardware import SystemDiskSampler
-from console_radiance import enrich_props, enrich_status
+from console_hardware import SystemHardwareSampler
+from console_radiance import enrich_props, enrich_status, enrich_hardware
 from console_memory import diagnose as diagnose_memory, validate_budget_plan
 from model_health import request_parameters, unchecked
 
@@ -90,7 +90,11 @@ def private_log(path, *, truncate=False):
 
 
 def prepare_state_directory(path):
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == 'nt':
+        from console_state import prepare_windows_state_directory
+        prepare_windows_state_directory(path)
+    else:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != 'nt':
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
@@ -199,6 +203,7 @@ class Controller:
         self.worker_cache = {}
         self.observed_scoring = {}
         self.observed_service = None
+        self.radiance_template_observation = None
         self.observed_offset = 0
         self.observed_pending = ''
         self.instance = secrets.token_hex(12)
@@ -287,6 +292,10 @@ class Controller:
 
     def parse_scoring(self, lines):
         for line in lines:
+            if "a request naming no reasoning_effort" in line:
+                match = re.fullmatch(r"I chat: a request naming no reasoning_effort renders as '([a-z]+)', the template's own default \(--reasoning-effort sets another\)", line.strip())
+                if match:
+                    self.radiance_template_observation = (self.instance, match[1])
             for marker in ('KVMEM_SCORING ', 'KVMEM_LIMITS ', 'KVMEM_BLOCKS ', 'KVMEM_RECALL ', 'KVMEM_RECALL_STRATEGY ', 'KVMEM_CHECKPOINT_RETENTION ', 'INFO '):
                 if marker not in line:
                     continue
@@ -359,7 +368,8 @@ class Controller:
                 saved['parameters'] = self.prefer_packaged_worker(saved['parameters'])
                 return saved
         backend = DEFAULTS['Backend'] if DEFAULTS['Backend'] in self.backends else self.backends[0]
-        return {'schema_version': 1, 'parameters': {**DEFAULTS, **copy.deepcopy(ENGINE_DEFAULTS[backend])}}
+        selected = ENGINE_DEFAULTS[backend]
+        return {'schema_version': 1, 'parameters': {**DEFAULTS, **copy.deepcopy(selected)}}
 
     def save(self, data):
         clean = without_secrets(normalize(data, self.backends, path_root=self.backend_root))
@@ -744,6 +754,9 @@ class Controller:
                       'active_config': without_secrets(self.active) if self.active else None,
                       'api_key_configured': bool(self.active and self.active['parameters'].get('ApiKey')), 'url': None}
             result['owner'] = 'temporary' if self.active else None
+            observation = self.radiance_template_observation
+            if running and observation and observation[0] == self.instance and (self.active or {}).get('parameters', {}).get('Backend') == 'radiance':
+                result['radiance_template_effort'] = observation[1]
             if self.service_selection:
                 result.update(owner='systemd', service=service, service_error=service_error,
                               pid=service['pid'] if service else None)
@@ -755,6 +768,7 @@ class Controller:
             result['effective_scoring'] = dict(self.observed_scoring) or None
             result['worker'] = copy.deepcopy(self.active_plan.get('worker')) if self.active_plan else None
             result['token_settings'] = copy.deepcopy(self.active_plan.get('token_settings')) if self.active_plan else None
+            result['monitor_devices'] = copy.deepcopy(self.active_plan.get('monitor_devices')) if self.active_plan else None
             if AUTO_BUDGET_SUPPORTED and result['state'] == 'exited' and self.exit_code != 0 and self.active and not self.launch_was_ready:
                 if self.memory_diagnosis_instance != self.instance:
                     plan = self.active_plan or {}
@@ -1139,7 +1153,8 @@ class Controller:
                     raise ValueError(f'端口 {port} 无法使用，可能已有服务占用。请在“服务与并发”中更换端口，'
                                      '或先停止原服务。此控制台不会停止外部服务。') from error
             env = dict(os.environ); env.update(result.get('environment', {}))
-            plan_summary = {'resolved_scoring': result.get('resolved_scoring'), 'worker': result.get('worker'), 'token_settings': result.get('token_settings')}
+            plan_summary = {'resolved_scoring': result.get('resolved_scoring'), 'worker': result.get('worker'), 'token_settings': result.get('token_settings'),
+                            'monitor_devices': result.get('monitor_devices')}
             self.observed_scoring = {}; self.observed_offset = 0; self.observed_pending = ''
             self.log = self.log_path.open('wb')
             for change in (result.get('token_settings') or {}).get('adjustments', []):
@@ -1417,7 +1432,11 @@ class Handler(BaseHTTPRequestHandler):
                             snapshot=self.control.chat.get_json(state,'/api/monitor/snapshot')
                             if state.get('instance')!=self.control.status().get('instance'):
                                 raise ValueError('Service changed while reading runtime data')
-                            body=enrich_props(json.loads(body),info,snapshot)
+                            body=enrich_props(json.loads(body),info,snapshot,state.get('radiance_template_effort'),state.get('monitor_devices'))
+                        elif path == '/api/monitor/snapshot' and state.get('active_config',{}).get('parameters',{}).get('Backend') == 'radiance':
+                            if state.get('instance') != self.control.status().get('instance'):
+                                raise ValueError('Service changed while reading runtime data')
+                            body = enrich_hardware(json.loads(body), self.server.hardware.snapshot())
                         self.reply(response.status, body)
                 except urllib.error.HTTPError as error:
                     self.reply(error.code, {'error': 'Inference endpoint unavailable'})
@@ -1666,7 +1685,7 @@ def main():
             args.port = port
     control.port = server.server_port
     server.control, server.gpus = control, gpu_inventory()
-    server.hardware = SystemDiskSampler().start()
+    server.hardware = SystemHardwareSampler().start()
     url = console_url(args.host, server.server_port, args.language)
     print(f'KVMem console: {url}', flush=True)
     if args.host != '127.0.0.1':

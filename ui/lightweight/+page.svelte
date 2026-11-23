@@ -73,9 +73,11 @@
   const t = (s: string) => (language === "en" ? english[s] || s : s);
   function mtpStats(message: Row) {
     const spec = message.speculative;
-    const offered = spec?.mtp_drafted_tokens ?? (spec?.backend === "draft-mtp" ? spec.drafted_tokens : null);
-    const accepted = spec?.mtp_accepted_tokens ?? (spec?.backend === "draft-mtp" ? spec.accepted_tokens : null);
-    return Number.isFinite(offered) && Number.isFinite(accepted) ? {offered,accepted} : null;
+    const generic = spec?.backend === "radiance";
+    const totals = generic || spec?.backend === "draft-mtp";
+    const offered = spec?.mtp_drafted_tokens ?? (totals ? spec.drafted_tokens : null);
+    const accepted = spec?.mtp_accepted_tokens ?? (totals ? spec.accepted_tokens : null);
+    return Number.isFinite(offered) && Number.isFinite(accepted) ? {offered,accepted,generic} : null;
   }
   const scope = () => ctx?.backend + ":" + ctx?.model;
   const draftKey = () => "kvmem-console-draft:" + (active?.id || "new");
@@ -261,6 +263,10 @@
   const source = (key: string) =>
     t(Object.hasOwn(overrides, key) ? "本对话已修改" : "服务设置");
   function value(key: string): any {
+    if (key === "enable_thinking" && ctx?.backend === "radiance" && overrides.reasoning_effort) {
+      if (["minimal", "none"].includes(overrides.reasoning_effort)) return false;
+      return overrides.enable_thinking ?? true;
+    }
     if (Object.hasOwn(overrides, key)) return overrides[key];
     if (["temperature", "top_p", "top_k", "min_p"].includes(key)) {
       const effort =
@@ -360,7 +366,7 @@
       v = Number(raw);
       if (
         !Number.isFinite(v) ||
-        (key !== "seed" && v < 0) ||
+        (key !== "seed" && key !== "reasoning_budget_tokens" && v < 0) ||
         (["max_tokens", "reasoning_budget_tokens", "top_k", "seed"].includes(
           key,
         ) &&
@@ -383,7 +389,7 @@
             ? "xhigh"
             : ctx.effective.reasoning_effort || "xhigh"
           : "none";
-      else if (!v) delete n.reasoning_effort;
+      else if (!v || (ctx.backend === "radiance" && ["none", "minimal"].includes(n.reasoning_effort))) delete n.reasoning_effort;
       overrides = n;
     }
     void saveSettings();
@@ -1190,7 +1196,7 @@
                       >{/if}{#if m.timings?.predicted_n ?? m.usage?.completion_tokens}<span
                         >{m.timings?.predicted_n ?? m.usage?.completion_tokens} token</span
                       >{/if}
-                    {#if mtp}<span>{t("MTP 接受 / 提议")} {mtp.accepted} / {mtp.offered}</span>{/if}
+                    {#if mtp}<span>{t(mtp.generic ? "草稿接受 / 提议" : "MTP 接受 / 提议")} {mtp.accepted} / {mtp.offered}</span>{/if}
                   </div>
                   <div class="message-actions">
                     <button onclick={() => copy(m.content)} title={t("复制")}
@@ -1448,7 +1454,7 @@
               disabled={value("enable_thinking") === false}
               value={value("reasoning_effort") || ""}
               onchange={(e) => edit("reasoning_effort", e.currentTarget.value)}
-              ><option value="" disabled>{t("未报告")}</option
+              ><option value="" disabled>{t(ctx?.uses_template_effort ? "跟随模型" : "未报告")}</option
               >{#if value("reasoning_effort") === "none"}<option value="none"
                   >none</option
                 >{/if}{#each ctx.capabilities.efforts as effort}<option

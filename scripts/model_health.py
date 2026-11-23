@@ -18,7 +18,7 @@ MAX_RESOURCE = 1024 * 1024
 MAX_TENSORS = 200000
 MAX_PARTS = 128
 FIELDS = {'Backend', 'Model', 'Worker', 'Vision', 'Mmproj', 'VisionWorker',
-          'Tokenizer', 'ChatTemplateFile', 'SpeculativeMode', 'MtpDrafts', 'DraftModel', 'KvType',
+          'Tokenizer', 'ChatTemplateFile', 'SpeculativeMode', 'MtpDrafts', 'DraftTokens', 'DraftModel', 'KvType',
           'RecallStrategy'}
 
 
@@ -39,7 +39,7 @@ def request_parameters(data):
     for k, v in p.items():
         if k == 'Vision':
             valid = type(v) is bool
-        elif k == 'MtpDrafts':
+        elif k in ('MtpDrafts', 'DraftTokens'):
             valid = type(v) is int and 0 <= v <= 2147483647
         else:
             valid = isinstance(v, str) and '\0' not in v and len(v) <= 8192
@@ -437,17 +437,63 @@ class Inspection:
 
     def inspect_radiance(self, path):
         import importlib.util
-        source=Path(__file__).resolve().parents[1]/'backends/radiance/tools/inspect_rad.py'
+        source=Path(__file__).resolve().parents[1]/'backends/radiance/tools/draft_control.py'
         if not source.is_file():raise Incomplete('Radiance container inspector is not installed')
         size=self.track(path)
         spec=importlib.util.spec_from_file_location('model_health_rad_reader',source)
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-        try:info=module.inspect(path,max_directory_bytes=MAX_DIRECTORY)
+        try:info=module.inspect(path,max_directory_bytes=MAX_DIRECTORY,include_vocab=True)
         except ValueError as error:raise Invalid(str(error)) from error
         self.tick()
         self.report['model']=dict(format='rad',architecture=info['arch_id'],files=1,bytes=size,
                                   name=info['model'],quantization=info['quant'])
         self.report['features']=dict(text='present',vision='unknown',mtp='unknown',dflash2='unknown',tokenizer='unknown',template='unknown')
+        vocab=info.get('vocab') or {}
+        tokenizer=bool(vocab.get('tokens'))
+        template=bool(vocab.get('chat_template_bytes'))
+        self.report['features'].update(tokenizer='present' if tokenizer else 'absent',
+                                       template='present' if template else 'absent')
+        if tokenizer:
+            self.report['model'].update(tokenizer_kind=vocab['kind_name'],vocab_size=vocab['tokens'])
+            self.check('rad_tokenizer','pass','已包含分词器，词表头与范围检查通过',
+                       'Embedded tokenizer header and ranges checked',
+                       f"{vocab['kind_name']}; {vocab['tokens']} tokens; {vocab['merges']} merges; tokenization is checked when loading")
+        else:
+            self.check('rad_tokenizer','error','RAD 模型缺少文本分词器','RAD model has no text tokenizer')
+        if template:
+            self.report['model']['chat_template_bytes']=vocab['chat_template_bytes']
+            self.check('rad_template','pass','已包含聊天模板','Embedded chat template found',
+                       f"{vocab['chat_template_bytes']} UTF-8 bytes; SHA256 {vocab['chat_template_sha256']}; syntax is checked when loading")
+        elif not self.p.get('ChatTemplateFile'):
+            self.check('rad_template','warning','未包含聊天模板，将使用引擎默认 ChatML',
+                       'No embedded chat template; engine defaults to ChatML',
+                       'Choose the model\'s matching custom chat template if it was not trained with ChatML.','config')
+        # Use the same declaration/weight/depth rules as the launcher. In
+        # particular, retained NextN metadata does not prove MTP weights exist.
+        # Pass the bounded directory through instead of reopening the model.
+        for feature, mode, group, label in (('mtp','mtp','mtp','MTP'), ('dflash2','dflash','dflash','DFlash2')):
+            if not info['entries_by_name_prefix'].get(group):
+                self.report['features'][feature]='absent'
+                continue
+            try:
+                draft=module.resolve(path,mode,inspected=info)
+            except ValueError as error:
+                self.check('rad_'+feature,'unknown',label+' 草稿信息尚未确认',label+' drafter is unverified',str(error))
+            else:
+                self.report['features'][feature]='present'
+                self.check('rad_'+feature,'pass',label+' 草稿元数据与权重目录已确认',label+' metadata and weight directory confirmed',
+                           f"{group}.* entries: {info['entries_by_name_prefix'][group]}; default draft tokens: {draft['depth']}")
+        mode=self.p.get('SpeculativeMode') or ('mtp' if self.p.get('MtpDrafts',0) else 'none')
+        if mode in ('mtp','dflash2'):
+            try:
+                draft=module.resolve(path,'dflash' if mode=='dflash2' else mode,
+                                     self.p.get('DraftTokens',self.p.get('MtpDrafts')),inspected=info)
+            except ValueError as error:
+                self.check('rad_draft_config','error','所选草稿组件或长度与 RAD 模型不匹配',
+                           'Selected drafter or depth does not match the RAD model',str(error),'config','disable_speculative')
+            else:
+                self.check('rad_draft_config','pass','所选草稿组件与长度检查通过','Selected drafter and depth checked',
+                           f"{draft['expected_native']}; draft tokens: {draft['depth']}",'config')
         vision=bool(info['entries_by_name_prefix'].get('v') and info.get('vision_metadata'))
         self.report['features']['vision']='present' if vision else 'absent'
         if self.p.get('Vision') and not vision:
@@ -467,7 +513,8 @@ class Inspection:
             else:
                 self.inspect_gguf(path)
             if self.p.get('ChatTemplateFile'):
-                self.required_file(self.path(self.p['ChatTemplateFile']), 'template_override', '自定义聊天模板文件', 'Custom chat template file')
+                if self.required_file(self.path(self.p['ChatTemplateFile']), 'template_override', '自定义聊天模板文件', 'Custom chat template file'):
+                    self.report['features']['template']='external_ready'
             if self.p['Backend'] == 'polystrata' and self.p.get('Tokenizer'):
                 directory = self.path(self.p['Tokenizer'])
                 merge='merges.json' if (directory/'merges.json').is_file() else 'merges.txt'

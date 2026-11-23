@@ -33,10 +33,10 @@ def vision_geometry(model):
 
 
 def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
-    from .config import DEFAULTS, ENGINE_DEFAULTS
+    from .config import DEFAULTS, RADIANCE_LAUNCH_DEFAULTS
     from .recall import strategy
     from .plan import token_settings, scoring_args, scoring_settings, _existing_file, _speculative
-    p = dict(DEFAULTS, **ENGINE_DEFAULTS['radiance'])
+    p = dict(DEFAULTS, **RADIANCE_LAUNCH_DEFAULTS)
     if strategy(supplied) == 'layerwise':
         for key in ('Budget', 'Reserve', 'HostMiB'):
             p[key] = DEFAULTS[key]
@@ -60,6 +60,12 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         raise ValueError('Radiance does not implement NInfer layer splitting or CUDA fast-prefill/device profiles')
     if p['EmbeddingPlacement'] not in ('ram','vram'):
         raise ValueError('Radiance EmbeddingPlacement must be ram or vram')
+    if p['WeightPlacement'] not in ('all_vram','layer_offload'):
+        raise ValueError('Radiance WeightPlacement must be all_vram or layer_offload')
+    if not 0<=p['WeightHostMiB']<=1048576:
+        raise ValueError('WeightHostMiB must be in [0,1048576]')
+    if p['WeightPlacement']=='layer_offload' and p['WeightHostMiB']==0:
+        raise ValueError('layer_offload requires a positive WeightHostMiB')
     if p.get('Vision'):
         if p.get('VisionResidency') not in ('resident','cpu'):
             raise ValueError('Radiance VisionResidency must be resident or cpu')
@@ -89,10 +95,12 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     p['Model']=_existing_file(p['Model'],'Model')
     if Path(p['Model']).suffix.lower()!='.rad':raise ValueError('Radiance requires a .rad model')
     mode=p['SpeculativeMode']
+    mtp_head_policy='shared'
     if mode in ('mtp','dflash2'):
         explicit_depth=p['DraftTokens'] if {'DraftTokens','MtpDrafts'} & supplied.keys() else None
         selection=draft_selection(p['Model'],mode,explicit_depth)
         p['DraftTokens']=selection['depth']
+        if mode=='mtp':mtp_head_policy=selection.get('mtp_head_policy','shared')
     _speculative(p,supplied)
     if platform=='linux' and os.name!='nt' and not os.access(p['Worker'],os.X_OK):
         raise ValueError('Worker is not executable')
@@ -109,10 +117,11 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
         ('--kvmem-budget','Budget'),('--kvmem-gen-reserve','Reserve'),('--kvmem-host-mib','HostMiB'),
         ('--kvmem-sink-tokens','SinkTokens'),('--kvmem-recent-tokens','RecentTokens'),('--kvmem-sessions','RetainedSessions'),
         ('--kv-cache-dtype','KvType'),('--state-cache-dtype','StateCacheType'),('--gpu-headroom-mib','VramReserveMiB'),('--num-speculative-tokens','MtpDrafts')]:pair(flag,p[key])
-    argv+=['--tp',str(len(gpu_ids)),'--tp-wire','exact','--no-prefix-cache','--host-pool-mib','0','--prefix-cache-mib','0',
-           '--placement','all_vram','--embedding-placement',p['EmbeddingPlacement'],
+    argv+=['--tp',str(len(gpu_ids)),'--tp-wire','exact','--no-prefix-cache','--host-pool-mib',str(p['WeightHostMiB']),'--prefix-cache-mib','0',
+           '--placement',p['WeightPlacement'],'--embedding-placement',p['EmbeddingPlacement'],
            '--draft-window',p['DraftPolicy'],'--kvmem','--kvmem-block-tokens','128']
     pair('--kvmem-drafter','off' if mode=='none' else mode)
+    if p['CacheMinTokens']:pair('--kvmem-cache-min-tokens',p['CacheMinTokens'])
     if p.get('Vision'):
         patch,merge=vision_geometry(p['Model'])
         pair('--vision-residency',p['VisionResidency'])
@@ -136,26 +145,29 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     if level in ('debug','trace'):argv.append('-v' if level=='debug' else '-vv')
     elif level!='info':raise ValueError('Radiance LogLevel currently supports info, debug or trace')
     argv+=scoring_args(supplied)+p.get('WorkerArgs',[])
+    monitor_devices = []
     env={'ROCR_VISIBLE_DEVICES':p['Gpu'],'HIP_VISIBLE_DEVICES':','.join(str(i) for i in range(len(gpu_ids))),
-         'KVMEM_RAD_MTP_HEAD':'shared','OMP_NUM_THREADS':str(p['CpuThreads']),'KVMEM_RAD_VISION_CACHE_MIB':str(p['VisionCacheMiB'])}
+         'KVMEM_RAD_MTP_HEAD':mtp_head_policy,'OMP_NUM_THREADS':str(p['CpuThreads']),'KVMEM_RAD_VISION_CACHE_MIB':str(p['VisionCacheMiB'])}
     if platform == 'windows' and any(re.fullmatch(r'GPU-[0-9a-fA-F]{32}', gpu) for gpu in gpu_ids):
         from console_hardware import windows_hip_inventory
         devices = windows_hip_inventory(p.get('RocmPath'))
         ordinals = []
-        for gpu in gpu_ids:
-            matches = [d['ordinal'] for d in devices if d['uuid'].lower() == gpu.lower()]
+        for rank, gpu in enumerate(gpu_ids):
+            matches = [d for d in devices if d['uuid'].lower() == gpu.lower()]
             if len(matches) != 1:
                 raise ValueError(f'Windows HIP device {gpu} is missing or ambiguous; refresh GPU selection')
-            ordinals.append(str(matches[0]))
+            physical = matches[0]
+            ordinals.append(str(physical['ordinal']))
+            monitor_devices.append(dict(rank=rank, hip_ordinal=rank, uuid=physical['uuid'],
+                name=physical.get('name', ''), pci_bus_id=physical.get('pci_bus_id')))
         # These native HIP UUIDs belong to the Windows driver. Apply a single ordinal mask.
         del env['ROCR_VISIBLE_DEVICES']
         env['HIP_VISIBLE_DEVICES'] = ','.join(ordinals)
-    if (platform == 'windows' and mode == 'dflash2' and p['DraftTokens'] == 7 and
-            len(gpu_ids) == 1 and p['Concurrency'] == 1 and not p['Vision']):
-        container = selection['container_preflight']
-        if (container['arch_id'], container['quant']) == ('qwen35', 'w8a8_fwht128'):
-            # Match the standalone Windows profile for the same producer-stream captures.
-            env.update(KVMEM_CAPTURE_EARLY_SEAL='1', RADIANCE_HIP_SMALL_D2H='1')
+    if platform == 'windows' and len(gpu_ids) == 1 and p['Concurrency'] == 1:
+        # Producer-stream capture optimizations apply across model quantizations and drafters.
+        # Retain an explicit diagnostic opt-out for each optimization.
+        for key in ('KVMEM_CAPTURE_EARLY_SEAL', 'RADIANCE_HIP_SMALL_D2H'):
+            env[key] = '0' if os.environ.get(key) == '0' else '1'
     if p.get('RocmPath'):
         rocm=Path(p['RocmPath']).resolve()
         runtime=rocm/('bin/amdhip64_7.dll' if platform=='windows' else 'lib/libamdhip64.so')
@@ -167,5 +179,6 @@ def build_radiance_plan(supplied, root, platform, reveal_secrets, capability):
     for safe in (safe_supplied,safe_effective):safe.pop('ApiKey',None)
     return dict(schema_version=1,launch_contract_version=3,target_platform=platform,backend='radiance',
         argv=argv,cwd=str(root),environment=env,token_settings=tokens,requested_parameters=safe_supplied,
+        monitor_devices=monitor_devices,
         effective_parameters=safe_effective,api_key_configured=bool(p.get('ApiKey')),capabilities=copy.deepcopy(capability),
         resolved_scoring=scoring_settings(argv),warnings='\n'.join(f"KVMEM_CONFIG {x['parameter']}: {x['requested']} -> {x['effective']} ({x['reason']})" for x in tokens['adjustments']))

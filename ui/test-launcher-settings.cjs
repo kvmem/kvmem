@@ -28,7 +28,7 @@ module.exports = async function settingsChecks({browser,base,info}) {
     effective:{Budget:9984,Reserve:960,Prefill:896,SinkTokens:64,RecentTokens:64}}}});
  });
  const field=key=>page.locator(`[data-param=${key}]`);
- const group=index=>page.locator(`#launch-tab-${index}`).click();
+ const group=index=>page.locator(`#launch-tab-${index>=2?index+1:index}`).click();
  const disabled=async(keys,value=true)=>{for(const key of keys)assert.equal(await field(key).isDisabled(),value,key+' disabled');};
  const saved=()=>page.waitForFunction(()=>document.querySelector('[data-draft-state]').textContent.includes('已自动保存'));
  const preview=async()=>{
@@ -71,9 +71,9 @@ module.exports = async function settingsChecks({browser,base,info}) {
   assert.equal(await field('ScoreAggregation').inputValue(),'max');
   await group(1);await field('FastPrefill').check();await disabled(['StageLayers']);
   await page.locator('[data-gpu-choice]').nth(1).check();await disabled(['StageLayers'],false);
-  await field('StageLayers').fill('40,24');await page.locator('[data-gpu-choice]').nth(1).uncheck();
+  await page.getByRole('tab',{name:'多卡设置',exact:true}).click();await field('StageLayers').fill('40,24');await page.locator('[data-gpu-choice]').nth(1).uncheck();
   await disabled(['StageLayers']);assert.equal(await field('StageLayers').inputValue(),'','GPU count changes clear stale layer allocation');
-  assert.equal(await field('SpeculativeMode').inputValue(),'mtp','legacy positive draft length enables the switch');
+  await group(1);assert.equal(await field('SpeculativeMode').inputValue(),'mtp','legacy positive draft length enables the switch');
   if(process.env.SCREENSHOT_DIR)await page.screenshot({path:process.env.SCREENSHOT_DIR+'/mtp-enabled.png',fullPage:true});
   await field('SpeculativeMode').selectOption('none');await disabled(['DraftTokens','DraftPolicy','NgramDrafts','NgramMinMatch']);
   assert.equal(await field('DraftTokens').inputValue(),'4','turning MTP off retains its length');
@@ -228,7 +228,7 @@ module.exports = async function settingsChecks({browser,base,info}) {
   assert.equal(await field('BlockTokens').count(),0,'block switch is PolyStrata only');
   await field('Model').fill('C:/models/ui fixture.ninfer');
   assert.equal(Object.hasOwn(await preview(),'BlockTokens'),false);
-  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/browse-template','/api/launcher/browse-mmproj','/api/launcher/inspect-model'].includes(url)),'settings checks never start/save/stop inference');
+  assert.ok(mutations.every(url=>['/api/launcher/preview','/api/launcher/browse-template','/api/launcher/browse-mmproj','/api/launcher/inspect-model','/api/launcher/worker-capabilities'].includes(url)),'settings checks never start/save/stop inference');
   assert.deepEqual(errors,[]);
   console.log('PASS: help, resource placement, feature dependencies, draft/template retention, credentials, native settings and active preview payloads (no inference)');
  } finally { await context.close(); }

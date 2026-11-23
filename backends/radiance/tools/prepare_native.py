@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+from patch_series import verified_patches
 
 
 def main():
@@ -11,19 +12,14 @@ def main():
     p.add_argument('--destination', type=Path, required=True)
     a = p.parse_args()
     root = Path(__file__).resolve().parents[1]
-    meta = json.loads((root / 'upstream.json').read_text(encoding='utf-8'))
-    specs = [{'path': meta['native_patch'], 'sha256': meta['native_patch_sha256']},
-             *meta.get('additional_native_patches', [])]
-    patches = [(root / spec['path']).resolve() for spec in specs]
-    for spec, patch in zip(specs, patches):
-        if hashlib.sha256(patch.read_bytes()).hexdigest() != spec['sha256']:
-            p.error('native patch checksum differs from upstream.json')
+    meta, specs, patches = verified_patches(root)
     dest = a.destination.resolve()
     if dest.exists():
         p.error('destination already exists; choose a new directory to preserve local work')
     subprocess.run(['git', 'init', str(dest)], check=True)
     def git(*args):
         subprocess.run(['git', '-C', str(dest), *args], check=True)
+    git('config', 'core.autocrlf', 'false')
     git('remote', 'add', 'origin', meta['repository'])
     git('fetch', '--depth=1', 'origin', meta['revision'])
     git('checkout', '--detach', 'FETCH_HEAD')

@@ -1,6 +1,6 @@
 # Open a local Windows file picker. Inputs are data, never executable text.
 param(
-    [Parameter(Mandatory)][ValidateSet('ninfer', 'llamacpp', 'polystrata')][string]$Backend,
+    [Parameter(Mandatory)][ValidateSet('ninfer', 'llamacpp', 'polystrata', 'radiance')][string]$Backend,
     [string]$InitialDirectory = '',
     [switch]$Folder,
     [switch]$Template,
@@ -23,7 +23,7 @@ try {
         }
     } else {
     $dialog.Title = if ($Template) { 'KVMem - Select chat template' } elseif ($Projector) { 'KVMem - Select vision projector' } else { 'KVMem - Select model' }
-    $dialog.Filter = if ($Template) { 'Chat template (*.jinja;*.j2;*.txt)|*.jinja;*.j2;*.txt|All files (*.*)|*.*' } elseif ($Projector) { 'Vision projector (*.gguf)|*.gguf' } elseif ($Backend -eq 'ninfer') { 'NInfer model (*.ninfer)|*.ninfer' } else { 'GGUF model (*.gguf)|*.gguf' }
+    $dialog.Filter = if ($Template) { 'Chat template (*.jinja;*.j2;*.txt)|*.jinja;*.j2;*.txt|All files (*.*)|*.*' } elseif ($Projector) { 'Vision projector (*.gguf)|*.gguf' } elseif ($Backend -eq 'radiance') { 'Radiance model (*.rad)|*.rad' } elseif ($Backend -eq 'ninfer') { 'NInfer model (*.ninfer)|*.ninfer' } else { 'GGUF model (*.gguf)|*.gguf' }
     $dialog.CheckFileExists = $true
     $dialog.CheckPathExists = $true
     $dialog.Multiselect = $false

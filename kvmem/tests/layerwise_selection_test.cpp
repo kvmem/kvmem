@@ -1,5 +1,6 @@
 #include "kvmem/layerwise_selection.hpp"
 #include "kvmem/raw_kv_store.hpp"
+#include "kvmem/layerwise_pressure.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +33,50 @@ void populate(kvmem::RawKvStore& keys, uint32_t blocks) {
         keys.write_layer_mean_sum(id*4,4,1,sum);
     }
 }
+
+void accepted_prefill_resident_ranking() {
+    kvmem::KvMemStore policy(config(3,1)); policy.register_append(24);
+    kvmem::RawKvStore keys({2,1,0,4}); populate(keys,6);
+    kvmem::MemorySnapshot memory;
+    memory.stamp={true,{42,3},5,6,24,9};
+    for (uint32_t i=0;i<6;++i)
+        memory.blocks.push_back({{{42,3},100+10*i,uint64_t(i)*4,4,i+1,2},2});
+    memory.resident={100,110,130,140};
+    kvmem::LayerwisePrefillState state{7,{
+        {0,0.,1.},{4,8.,8.},{8,1e9,1.},{12,6.,2.},{16,6.,2.},{20,2e9,1.}},24,4,1};
+    const auto selected=kvmem::select_layerwise_prefill_history(policy,keys,1,memory,state);
+    // Independent ratio oracle: resident scores are [0,1,3,3]. Sink 0 is
+    // reserved; two stale cold scores must not resurrect the dropped pages.
+    require(selected.selected==std::vector<uint32_t>({0,3,4}),"prefill ratio/resident ranking differs");
+    require(selected.scores==std::vector<double>({0,1,0,3,3,0}),"prefill score normalization differs");
+    require(selected.historical_tokens==12 && selected.charged_tokens==12,"prefill page accounting differs");
+    require(selected.frame.score_mask==std::vector<uint8_t>({1,1,0,1,1,0}) &&
+            selected.frame.transport_mask==std::vector<uint8_t>({0,1,0,1,1,0}),"prefill candidate masks differ");
+    kvmem::KvMemStore tied(config(2,1));tied.register_append(24);
+    require(kvmem::select_layerwise_prefill_history(tied,keys,1,memory,state).selected==
+        std::vector<uint32_t>({0,4}),"prefill equal scores must keep the newer resident page");
+    require(kvmem::select_layerwise_prefill_history(policy,keys,1,memory,state,{1}).selected==
+        std::vector<uint32_t>({0,1,4}),"prefill explicit resident reservation was ignored");
+    rejects([&]{kvmem::select_layerwise_prefill_history(policy,keys,1,memory,state,{2});});
+    auto short_window=memory;short_window.resident={100,110};
+    rejects([&]{kvmem::select_layerwise_prefill_history(policy,keys,1,short_window,state);});
+    for (int failure=0;failure<5;++failure) {
+        auto bad=state;
+        if (failure==0) for (auto& v:bad.values) v.mass=0;
+        if (failure==1) bad.values[1].exposure=-1;
+        if (failure==2) bad.values[1].mass=INFINITY;
+        if (failure==3) bad.values[1].original_start=0;
+        if (failure==4) ++bad.end;
+        rejects([&]{kvmem::select_layerwise_prefill_history(policy,keys,1,memory,bad);});
+    }
+    // No Query math is used: changing valid Mean-K record granularity cannot
+    // change the accepted 4-token transport-page ranking.
+    kvmem::RawKvStore halves({2,1,0,2});
+    for (uint32_t i=0;i<12;++i) {const float mean=float(i);halves.write_layer_mean_sum(i*2,2,1,&mean);}
+    require(kvmem::select_layerwise_prefill_history(policy,halves,1,memory,state).selected==selected.selected,
+        "prefill source depended on Mean-K granularity");
+}
+
 void fixed_masks_and_current_query() {
     kvmem::KvMemStore policy(config(4,1,1)); policy.register_append(24);
     policy.set_retrieval_scores({100,80,60,40,20,0});
@@ -55,6 +100,86 @@ void fixed_masks_and_current_query() {
     const auto changed=kvmem::select_layerwise_history(policy,keys,{negative,1,1,1,1,1},{2});
     require(changed.selected==std::vector<uint32_t>({0,1,2,5}),
             "selection ignored this invocation's fresh layer Query");
+}
+void half_page_softmax_preserves_short_evidence() {
+    kvmem::KvMemStore policy(config(2,1));
+    policy.register_append(12);
+    // First physical page is a fixed sink. Page 1 has a strong and a weak
+    // half. Page 2 is uniformly moderate and wins if each page is averaged first.
+    const float values[]{100,100,8,-8,2,2};
+    kvmem::RawKvStore fine({1,1,0,2}), coarse({1,1,0,4});
+    for (uint32_t i=0;i<6;++i) {
+        const float sum=2*values[i];
+        fine.write_layer_mean_sum(2*i,2,0,&sum);
+        coarse.write_layer_mean_sum(2*i,2,0,&sum);
+    }
+    const float q[]{1};
+    const auto small=kvmem::select_layerwise_history(policy,fine,{q,0,1,1,1,1});
+    const auto large=kvmem::select_layerwise_history(policy,coarse,{q,0,1,1,1,1});
+    const double strong=std::exp(8.)+std::exp(-8.);
+    const double moderate=2*std::exp(2.);
+    require(small.scores.size()==3 && small.scores[0]==0 &&
+            std::abs(small.scores[1]-strong/(strong+moderate))<1e-5 &&
+            std::abs(small.scores[2]-moderate/(strong+moderate))<1e-5,
+            "half-page masses differ from the independent softmax");
+    require(small.selected==std::vector<uint32_t>({0,1}) &&
+            large.selected==std::vector<uint32_t>({0,2}) &&
+            small.charged_tokens==8 && small.historical_tokens==8,
+            "fine scores must restore and charge whole pages");
+    kvmem::RawKvStore incomplete({1,1,0,2});
+    for (uint32_t i=0;i<5;++i) incomplete.write_layer_mean_sum(2*i,2,0,&values[i]);
+    rejects([&]{kvmem::select_layerwise_history(policy,incomplete,{q,0,1,1,1,1});});
+}
+void strongest_half_is_taken_after_the_complete_query() {
+    // Two physical 64-token pages. Two query dimensions independently encode
+    // logits [1,-4,.75,.75] and [-4,1,.75,.75], all exactly representable
+    // through the scorer's FP16 input boundary. Query rows alternate the
+    // winning half. A premature max picks page 0; the full Query picks page 1.
+    const float left[]{1,-4,.75f,.75f}, right[]{-4,1,.75f,.75f};
+    const double z=std::exp(1.)+std::exp(-4.)+2*std::exp(.75);
+    const double expected0=(std::exp(1.)+std::exp(-4.))/z, expected1=2*std::exp(.75)/z;
+    const float q[]{1,0,0,1};
+    kvmem::RawKvStore keys({1,2,0,32});
+    for (uint32_t i=0;i<4;++i) {
+        const float sums[]{32*left[i],32*right[i]};
+        keys.write_layer_mean_sum(32*i,32,0,sums);
+    }
+    auto cfg=config(1);cfg.block_tokens=64;cfg.select_budget=64;
+    kvmem::KvMemStore sum(cfg);sum.register_append(128);
+    cfg.layerwise_half_max=true;
+    kvmem::KvMemStore max(cfg);max.register_append(128);
+    const auto baseline=kvmem::select_layerwise_history(sum,keys,{q,0,1,1,1,2,1});
+    const auto peaked=kvmem::select_layerwise_history(max,keys,{q,0,1,1,1,2,1});
+    require(baseline.selected==std::vector<uint32_t>{1} && peaked.selected==std::vector<uint32_t>{0},
+            "sum and strongest-half should rank these pages differently");
+    auto check=[&](const kvmem::LayerwiseHistorySelection& x) {
+        require(x.selected==std::vector<uint32_t>{1} && x.charged_tokens==64 && x.historical_tokens==64 &&
+            x.scores.size()==2 && std::abs(x.scores[0]-expected0)<1e-6 && std::abs(x.scores[1]-expected1)<1e-6,
+            "strongest half differs from the independent complete-query oracle");
+    };
+    check(kvmem::select_layerwise_history(max,keys,{q,0,2,1,1,2,1}));
+    const kvmem::LayerwiseQueryIdentity id{{true,{11,2},3,4,128,5},7,{128,130},{128,130}};
+    for (uint32_t chunk : {1u,2u}) {
+        kvmem::LayerwiseQuerySelection query(max,keys,id,{0,1,1,2,1},[&]{return id.history;});
+        for (uint32_t i=0;i<2;i+=chunk)
+            query.append(id,128+i,{q+2*i,0,chunk,1,1,2,1});
+        check(query.finish(id));
+    }
+    // Production append_native: its scorer emits one value per half. Deliberately
+    // alternate the peak between Query tiles, just as the host fixture does.
+    kvmem::LayerwiseQuerySelection native(max,keys,id,{0,1,1,2,1},[&]{return id.history;});
+    for (uint32_t i=0;i<2;++i) {
+        kvmem::NativeCurrentLayerQuery tile{q+2*i,2*sizeof(float),0,1,1,1,2,1,
+            kvmem::NativeQueryScalar::Float32,2*sizeof(float),2*sizeof(float),sizeof(float)};
+        native.append_native(id,128+i,tile,[&](const auto&,auto,const auto& frame){
+            require(frame.starts==std::vector<uint64_t>({0,32,64,96}),"native denominator did not cover four halves");
+            const float* values=i?right:left;
+            std::vector<double> probabilities;
+            for (int h=0;h<4;++h) probabilities.push_back(std::exp(double(values[h]))/z);
+            return probabilities;
+        });
+    }
+    check(native.finish(id));
 }
 void upstream_newer_first_ties() {
     kvmem::KvMemStore policy(config(2)); policy.register_append(24);
@@ -249,8 +374,11 @@ void tiled_bounds_geometry_and_owner() {
 
 int main() {
     try {
+        accepted_prefill_resident_ranking();
         fixed_masks_and_current_query();
         upstream_newer_first_ties();
+        half_page_softmax_preserves_short_evidence();
+        strongest_half_is_taken_after_the_complete_query();
         explicit_pins_without_legacy_media_promotion();
         fitting_and_runtime_budget();
         native_picker_equivalence();

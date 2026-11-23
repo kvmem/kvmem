@@ -15,10 +15,6 @@ def for_profile(manifest,profile):
     combinations['text']['tensor_parallel']=[1]
     for mode in capability['speculative']['modes'].values():
         if 'max_devices' in mode:mode['max_devices']=min(mode['max_devices'],1)
-    qualification=capability.get('qualification',{})
-    if 'tensor_parallel' in qualification:
-        qualification['tensor_parallel']=[count for count in qualification['tensor_parallel'] if count==1]
-    qualification.pop('tp2_mtp_depths',None)
     capability['build_profile']=profile
     return capability
 

@@ -1,0 +1,181 @@
+// CPU dispatch test: production row handling and graph-key code with inert GPU operations.
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <map>
+#include <stdexcept>
+#include <vector>
+
+struct Kvq8 { const int8_t* codes = nullptr; const uint16_t* scales = nullptr; };
+enum class KvFmt { kFp16, kQ8_0 };
+struct Memory {
+    int64_t removed = 0;
+    int64_t compact_position(int64_t p) const { return p - removed; }
+    bool capture_query() const { return false; }
+    int64_t query_last(int64_t p, int n) const { return p + n; }
+    int64_t query_first(int64_t p, int) const { return p; }
+};
+struct Row { int seq; int64_t pos; void* snap = nullptr; };
+struct Block {
+    bool gdn = false;
+    int wq = 0, wk = 0, wv = 0, wo = 0, q_norm = 0, k_norm = 0, memory_layer = 0;
+    uint16_t* keys = nullptr; uint16_t* vals = nullptr;
+    int8_t* k_codes = nullptr; int8_t* v_codes = nullptr;
+    uint16_t* k_scales = nullptr; uint16_t* v_scales = nullptr;
+};
+struct Feedback { std::array<int64_t, 7> last{}; void *config = nullptr, *rows = nullptr, *mass = nullptr; };
+struct Launch { int row, count, room; int64_t compact; bool fast; };
+std::vector<Launch> launches;
+float* query_base = nullptr;
+bool accept_fast = true;
+
+template<class... A> void lin(A...) {}
+template<class... A> void head_norm_rope(A...) {}
+template<class... A> void head_norm_rope_capture(A...) {}
+template<class... A> void kvmem_key_sums(A...) {}
+template<class... A> void kvmem_page_mass(A...) {}
+template<class... A> void store_q8_at(A...) {}
+template<class... A> void store_f16_at(A...) {}
+template<class... A> void mul_sigmoid(A...) {}
+float* fp(int) { return nullptr; }
+template<class... A> bool fdec_f16(float* q, uint16_t*, uint16_t*, int64_t pos, int n,
+                                  const long long*, int room, A...) {
+    launches.push_back({int(q-query_base), n, room, pos, true});
+    return accept_fast;
+}
+template<class... A> bool fdec_q8(float* q, Kvq8, Kvq8, int64_t pos, int n,
+                                const long long*, int room, A...) {
+    launches.push_back({int(q-query_base), n, room, pos, true});
+    return accept_fast;
+}
+void attend(float* q, uint16_t*, uint16_t*, int64_t pos, int n, float*, int, float*,
+            int, int, int, float, void*, int, int, bool, const long long*, int room, int, Kvq8, Kvq8) {
+    launches.push_back({int(q-query_base), n, room, pos, false});
+}
+
+struct Engine {
+    int capacity = 2048, bound_ = 0;
+    int64_t pos_ = 0;
+    bool memory_ready_ = false;
+    Memory memories[3]; Memory* memory_ = nullptr;
+    int cache_capacity() const { return capacity; }
+    int64_t cache_position() const { return memory_ ? memory_->compact_position(pos_) : pos_; }
+    Memory* sequence_memory(int seq) { return memory_ready_ ? &memories[seq] : nullptr; }
+    int room(int n) const;
+    int room_key(int n) const;
+};
+struct Qwen35 : Engine {
+    float buffer[256]{}; long long coordinates[16]{};
+    float *xn_=buffer, *qg_=buffer, *kraw_=buffer, *v_=buffer, *xq_=buffer, *q_=buffer,
+          *k_=buffer, *memory_kpre_=buffer, *memory_stats_all_=buffer, *att_=buffer,
+          *score_=buffer, *ao_=buffer;
+    const long long* at_=coordinates;
+    const Row* rows_of_=nullptr;
+    int head_dim_=1, n_head_=1, n_kv_=1, n_rot_=1, sections_[3]{}, chunk_=4, n_attn_=1,
+        memory_stats_stride_=1, memory_groups_=1, memory_page_stride_=1, n_layer_=1;
+    float theta_scale_=1, rms_eps_=1;
+    void* st_=nullptr;
+    bool draft_=false, fdec_=true, memory_drafting_=false;
+    int64_t fdec_from_=0;
+    struct { KvFmt kv_format=KvFmt::kFp16; struct { int block_tokens=32; } memory; } opt_;
+    std::vector<Block> blocks_{1}; std::vector<Feedback> memory_feedback_{3};
+    void* seq_buf(int, const void* p) { return const_cast<void*>(p); }
+    int head_key(int il, int n) const;
+    void attn_rows(Block& B, int n);
+    std::vector<int> graph_key(const std::vector<Row>& rows, bool with_guesses) {
+        const int R=int(rows.size()), il=0;
+        std::vector<int> key, rseq;
+        std::vector<int64_t> at;
+        std::vector<void*> rsnap;
+        for (const Row& r: rows) { rseq.push_back(r.seq); at.push_back(r.pos); rsnap.push_back(r.snap); }
+        int guess=0; const int* guesses=with_guesses ? &guess : nullptr;
+        const auto use=[&](int s) { bound_=s; memory_=sequence_memory(s); };
+        @GRAPH_KEY@
+        return key;
+    }
+};
+@ROOM_METHODS@
+@HEAD_KEY@
+@ATTN_ROWS@
+
+int expected_room(int64_t end, int capacity) {
+    // Explicit launch buckets, independent of the production loop.
+    const int buckets[]={1024,2048,4096,8192};
+    const auto it=std::lower_bound(std::begin(buckets),std::end(buckets),end);
+    if(it==std::end(buckets)) throw std::runtime_error("fixture exceeds supported buckets");
+    return std::min(*it,capacity);
+}
+int main() {
+    size_t cases=0, calls=0, cache_hits=0;
+    try {
+        for(int capacity: {2048,512,1024,1536,3072,4096})
+        for(int window: {1,2})
+        for(bool memory: {true,false}) {
+#ifndef STRATA_KVMEM
+            if(memory) continue;
+#endif
+            // KVMem still explicitly rejects batch-MTP; exercise the upstream two-row window separately.
+            if(memory && window==2) continue;
+            for(int path: {2,1,0}) for(KvFmt fmt: {KvFmt::kFp16,KvFmt::kQ8_0}) {
+                Qwen35 engine; engine.capacity=capacity; engine.memory_ready_=memory;
+                engine.opt_.kv_format=fmt; engine.fdec_=path!=0; accept_fast=path==2;
+                engine.memories[0].removed=memory?8192:0;
+                engine.memories[1].removed=memory?32768:0;
+                engine.memories[2].removed=memory?1024:0;
+                query_base=engine.q_;
+                std::map<std::vector<int>,std::vector<int>> graph_shapes;
+                // Run the confirmed long-first/short-last counterexample before the broader matrix.
+                for(int a: {1536,0,255,511,1022,1023,1024,1200,1535,2046,2047,2048,3071,3072})
+                for(int b: {256,0,255,1023,1024,2047}) for(bool reverse: {false,true}) {
+                    if(a+window>capacity || b+window>capacity) continue;
+                    std::vector<Row> rows;
+                    for(int seq: reverse?std::vector<int>{1,0}:std::vector<int>{0,1})
+                        for(int j=0;j<window;++j)
+                            rows.push_back({seq,(seq?b:a)+engine.memories[seq].removed+j,nullptr});
+                    engine.rows_of_=rows.data();
+                    // step() leaves the last sequence bound at the beginning of its token/guess group.
+                    engine.bound_=rows.back().seq; engine.memory_=engine.sequence_memory(engine.bound_);
+                    engine.pos_=rows.back().pos-(window-1);
+                    const auto key=engine.graph_key(rows,window==2);
+                    launches.clear();
+                    engine.attn_rows(engine.blocks_[0],int(rows.size()));
+                    const int per_sequence=path==1?2:1;
+                    if(launches.size()!=size_t(2*per_sequence)) throw std::runtime_error("unexpected dispatch count");
+                    std::vector<int> shape;
+                    for(const auto& call: launches) {
+                        const Row& row=rows.at(size_t(call.row));
+                        const int compact=row.seq?b:a;
+                        const int room=expected_room(compact+window,capacity);
+                        if(call.compact!=compact || call.count!=window || call.room!=room) {
+                            std::fprintf(stderr,"bad dispatch: memory=%d capacity=%d a=%d b=%d reverse=%d window=%d path=%d row=%d got=(%lld,%d,%d) expected=(%d,%d,%d)\n",
+                                int(memory),capacity,a,b,int(reverse),window,path,call.row,
+                                (long long)call.compact,call.count,call.room,compact,window,room);
+                            return 1;
+                        }
+                        if(call.room<compact+window || call.room>capacity) throw std::runtime_error("invalid KV coverage");
+                        shape.push_back(call.room);
+                        ++calls;
+                    }
+                    auto found=graph_shapes.find(key);
+                    if(found!=graph_shapes.end()) {
+                        if(found->second!=shape) throw std::runtime_error("same graph key changed launch shape");
+                        ++cache_hits;
+                    } else graph_shapes.emplace(key,shape);
+                    ++cases;
+                }
+            }
+        }
+        if(!cases || !cache_hits) throw std::runtime_error("empty test coverage");
+        std::printf("attention_rows: PASS cases=%zu dispatches=%zu graph_key_reuses=%zu kvmem_compiled=%d\n",
+                    cases,calls,cache_hits,
+#ifdef STRATA_KVMEM
+                    1
+#else
+                    0
+#endif
+        );
+        return 0;
+    } catch(const std::exception& e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 2; }
+}

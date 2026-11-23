@@ -1,0 +1,250 @@
+diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
+index 3b27809..17421af 100644
+--- a/src/poly/kvmem.cpp
++++ b/src/poly/kvmem.cpp
+@@ -38,10 +38,12 @@ void KvmemOptions::normalize(int & batch) {
+ }
+ 
+ void KvmemOptions::validate(int context, int batch, int window, bool draft) const {
++    require(cache_min_tokens <= INT32_MAX, "KVMem cache minimum exceeds 2147483647");
+     require(block_tokens == 32 || block_tokens == 64, "KVMem block tokens must be 32 or 64");
+     require(sessions >= 1 && sessions <= 16 && (sessions == 1 || (history_reuse && budget)),
+             "KVMem sessions must be 1..16; multiple histories require history reuse and a nonzero budget");
+     if (!budget) {
++        require(!cache_min_tokens, "KVMem cache minimum requires a nonzero KVMem budget");
+         require(!history_reuse, "KVMem history reuse requires a nonzero KVMem budget");
+         require(!mtp, "KVMem MTP requires a nonzero KVMem budget");
+         require(!disk_mib && disk_path.empty(), "KVMem SSD requires a nonzero KVMem budget");
+diff --git a/src/poly/kvmem.hpp b/src/poly/kvmem.hpp
+index 54ac613..16c777e 100644
+--- a/src/poly/kvmem.hpp
++++ b/src/poly/kvmem.hpp
+@@ -27,6 +27,7 @@ struct KvmemOptions {
+     uint32_t budget = 0, reserve = 1024;
+     uint32_t sink = 64, recent = 64;
+     uint32_t sessions = 1; // total retained histories, including the GPU owner
++    uint32_t cache_min_tokens = 0; // complete restorable history; zero disables filtering
+     uint64_t host_mib = 4096;
+     uint64_t disk_mib = 0;
+     std::string disk_path;
+diff --git a/src/poly/kvmem_sessions.cpp b/src/poly/kvmem_sessions.cpp
+index b6c87ac..476f6f4 100644
+--- a/src/poly/kvmem_sessions.cpp
++++ b/src/poly/kvmem_sessions.cpp
+@@ -5,6 +5,16 @@
+ #include <set>
+ 
+ namespace strata::poly {
++void KvmemSessions::complete(KvmemMemory& memory,KvmemHistory& history) {
++    // The legacy serial path saves at prompt-1. Only materialize another
++    // optional point when accepted output/input has newly crossed the gate.
++    if(!minimum_tokens_)return;
++    const auto stamp=memory.stamp();
++    if(!stamp.valid || !admit_history(std::min<uint64_t>(stamp.frontier,history.size())))return;
++    const auto prior=history.latest();
++    if(prior && prior->identity.stamp.frontier>=minimum_tokens_)return;
++    if(auto cp=checkpoint(memory,history,stamp.frontier,false))history.remember(std::move(cp));
++}
+ bool KvmemSessions::make_state_room(const KvmemMemory& memory, KvmemHistory& history, uint64_t total_tokens,
+                                    kvmem::CheckpointPurpose purpose) {
+     if (!memory.checkpoint_charge()) return true;
+@@ -24,6 +34,8 @@ bool KvmemSessions::make_state_room(const KvmemMemory& memory, KvmemHistory& his
+ }
+ std::shared_ptr<KvmemCheckpoint> KvmemSessions::checkpoint(KvmemMemory& memory, KvmemHistory& history,
+                                                           uint64_t total_tokens, bool required, kvmem::CheckpointPurpose purpose) {
++    // Intermediate input/replay points remain available if later accepted
++    // output crosses the threshold. Gate the whole completed history instead.
+     if (!memory.checkpoint_charge()) return std::make_shared<KvmemCheckpoint>(memory.checkpoint());
+     const auto exhausted = [] { return kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded,
+         "KVMem required checkpoint exceeds remaining Host state capacity"); };
+@@ -70,7 +82,7 @@ int64_t KvmemSessions::resume(Engine& engine, KvmemHistory& current, const std::
+                               const std::vector<KvmemCanonicalImage>& images) {
+     auto& memory = engine.memory();
+     last_reuse = {};
+-    configure(engine.memory_options().sessions-1);
++    configure(engine.memory_options().sessions-1,engine.memory_options().cache_min_tokens);
+     memory.admit(total_tokens);
+     auto live = current.choose(ids, query_begin, memory.stamp(),images);
+     const bool live_continuation=current.size()>0 && ids.size()>current.size() && current.observed_prefix(ids,images)==current.size();
+@@ -98,7 +110,10 @@ int64_t KvmemSessions::resume(Engine& engine, KvmemHistory& current, const std::
+     uint64_t source_group=source ? published_group(source) : 0;
+     try {
+         const auto cp = current.latest();
+-        if (cp && memory.stamp().valid && cp->identity.stamp.session == memory.stamp().session && make_archive_room(memory)) {
++        // A live fork may need a temporary source even below the retention
++        // threshold. save() independently declines its directory publication.
++        if (cp && memory.stamp().valid && cp->identity.stamp.session == memory.stamp().session &&
++            (from_live || admit_history(cp->identity.stamp.frontier)) && make_archive_room(memory)) {
+             auto leaving = std::make_unique<Entry>();
+             leaving->memory = memory.park(*cp);
+             current.truncate(int64_t(cp->identity.stamp.frontier));
+@@ -146,6 +161,9 @@ int64_t KvmemSessions::resume(Engine& engine, KvmemHistory& current, const std::
+ void KvmemSessions::metrics(const KvmemMemory& memory, const KvmemHistory* active,
+                           const std::vector<const KvmemHistory*>& others, uint64_t logical_active) const {
+     if (!std::getenv("KVMEM_POLY_SESSION_METRICS")) return;
++    std::fprintf(stderr,"KVMEM_CACHE_ADMISSION cache_min_tokens=%u cache_candidate_tokens=%llu cache_below_minimum=%llu history_retention_evictions=%llu history_capacity_evictions=%llu\n",
++        minimum_tokens_,(unsigned long long)candidate_tokens_,(unsigned long long)below_minimum_,
++        (unsigned long long)retention_evictions_,(unsigned long long)(evictions_-retention_evictions_));
+     std::fprintf(stderr, "KVMEM_SESSIONS parked=%zu parked_groups=%zu evictions=%zu restores=%zu skipped=%zu host_bytes=%llu host_limit=%llu session=%llu incarnation=%llu\n",
+         parked(), groups(), evictions(), restores(), skipped(), (unsigned long long)memory.host_bytes(),
+         (unsigned long long)memory.host_limit(), (unsigned long long)memory.stamp().session.id,
+diff --git a/src/poly/kvmem_sessions.hpp b/src/poly/kvmem_sessions.hpp
+index 4cae189..1942c92 100644
+--- a/src/poly/kvmem_sessions.hpp
++++ b/src/poly/kvmem_sessions.hpp
+@@ -28,9 +28,10 @@ public:
+         return live.at>0 && (new_user_query || continuation) && live.at>=idle.resume.at;
+     }
+     ReuseObservation last_reuse;
+-    void configure(size_t idle_slots) {
++    void configure(size_t idle_slots, uint32_t minimum_tokens = 0) {
+         if (idle_slots > 15) throw std::logic_error("KVMem supports at most 16 retained histories");
+         slots_ = idle_slots;
++        minimum_tokens_ = minimum_tokens;
+         entries_.reserve(15);
+         if(!slots_)entries_.clear();
+         else if(groups()>slots_) {
+@@ -80,6 +81,10 @@ public:
+     void save(std::shared_ptr<const Entry> entry) {
+         for(auto& slot:entries_)if(slot.value.get()==entry.get()){slot.used=++clock_;return;}
+         if(!slots_)return;
++        const auto cp=entry->history.latest();
++        const auto frontier=std::min<uint64_t>(entry->memory.identity.stamp.frontier,
++            std::min<uint64_t>(entry->history.size(),cp ? cp->identity.stamp.frontier : 0));
++        if(!admit_history(frontier))return;
+         const auto incoming_group=publication_group(*entry);
+         std::vector<kvmem::ContentCacheSlot> slots;
+         for(const auto& value:entries_)slots.push_back({true,false,value.used,value.value.get(),value.group});
+@@ -88,7 +93,7 @@ public:
+         // Remove in descending order: the selected native source may still be
+         // held by another reader, independently of its directory membership.
+         auto retired=plan.retired_slots;std::sort(retired.rbegin(),retired.rend());
+-        for(auto i:retired){entries_.erase(entries_.begin()+std::ptrdiff_t(i));++evictions_;}
++        for(auto i:retired){entries_.erase(entries_.begin()+std::ptrdiff_t(i));++evictions_;++retention_evictions_;}
+         entries_.push_back({std::move(entry),++clock_,incoming_group});
+     }
+     bool evict_one() {
+@@ -114,6 +119,13 @@ public:
+     size_t evictions() const noexcept { return evictions_; }
+     size_t restores() const noexcept { return restores_; }
+     size_t skipped() const noexcept { return skipped_; }
++    bool admit_history(uint64_t frontier) {
++        candidate_tokens_=frontier;
++        if(kvmem::admit_content_history(frontier,minimum_tokens_))return true;
++        ++below_minimum_;return false;
++    }
++    uint64_t below_minimum() const noexcept {return below_minimum_;}
++    void complete(KvmemMemory&, KvmemHistory&);
+     int64_t resume(Engine&, KvmemHistory&, const std::vector<int32_t>&, int64_t query_begin, uint64_t total_tokens, const std::string& owner = {}, bool shared = true,
+                    const std::vector<KvmemCanonicalImage>& images = {});
+     void metrics(const KvmemMemory&, const KvmemHistory* active = nullptr,
+@@ -127,6 +139,8 @@ private:
+     void admit_active(const KvmemMemory&, uint64_t total_tokens);
+     size_t slots_ = 0, evictions_ = 0, restores_ = 0, skipped_ = 0;
+     uint64_t clock_ = 0, forks_ = 0, next_group_=1;
++    uint32_t minimum_tokens_ = 0;
++    uint64_t candidate_tokens_ = 0, below_minimum_ = 0, retention_evictions_ = 0;
+     uint64_t publication_group(const Entry& incoming) {
+         const auto fresh=[&]{if(next_group_==UINT64_MAX)throw std::overflow_error("cache group identity exhausted");return next_group_++;};
+         const auto input=incoming.history.canonical_input();if(!input)return fresh();
+diff --git a/src/poly/main.cpp b/src/poly/main.cpp
+index 995ff19..36c3a1b 100644
+--- a/src/poly/main.cpp
++++ b/src/poly/main.cpp
+@@ -373,7 +373,11 @@ struct Session {
+         : engine(e), eos(std::move(eos_ids)), flags(f), kept(e, with_floor(f)),
+           most(lookup > 0 || e.drafts() ? std::min<int>(e.max_window(), strata::spec::DraftPolicy::kMaxT) : 1),
+           look(lookup > 0 && most > 1),
+-          repeats(std::max(lookup, 3), 64, (size_t) e.max_context() + 4096), policy(most) {}
++          repeats(std::max(lookup, 3), 64, (size_t) e.max_context() + 4096), policy(most) {
++#ifdef STRATA_KVMEM
++        managed_sessions.configure(e.memory_options().sessions-1,e.memory_options().cache_min_tokens);
++#endif
++    }
+ 
+     static CacheOptions with_floor(const CacheFlags& f) {
+         CacheOptions o = f.o;
+@@ -802,6 +806,7 @@ struct Session {
+         }
+         r.decode_ms = ms_since(t0);
+ #ifdef STRATA_KVMEM
++        if(history_reuse)managed_sessions.complete(engine.memory(),managed_history);
+         if (managed && std::getenv("KVMEM_POLY_DECODE_METRICS"))
+             std::fprintf(stderr, "KVMEM_DECODE produced=%lld exchanges=%llu restored_bytes=%llu ms=%.3f\n",
+                 (long long)r.produced, (unsigned long long)(engine.memory().transfers() - decode_transfers),
+@@ -1003,7 +1008,10 @@ int serve(Session& ss) {
+                     if(engine.kvmem_enabled() && engine.memory_options().history_reuse) {
+                         engine.bind(int(which[i])+1);
+                         try {
+-                            auto checkpoint=ss.managed_sessions.checkpoint(engine.memory(), sl.managed_history, sl.held.size(), false);
++                            const auto stamp=engine.memory().stamp();
++                            auto checkpoint=ss.managed_sessions.admit_history(stamp.valid ?
++                                std::min<uint64_t>(stamp.frontier,sl.managed_history.size()) : 0) ?
++                                ss.managed_sessions.checkpoint(engine.memory(), sl.managed_history, sl.held.size(), false) : nullptr;
+                             if (checkpoint) {
+                                 sl.managed_history.remember(checkpoint);
+                                 auto entry=std::make_unique<strata::poly::KvmemSessions::Entry>();
+@@ -1070,7 +1078,8 @@ int serve(Session& ss) {
+             engine.bind(0);
+             try {
+                 const auto cp=ss.managed_history.latest();
+-                if(cp && engine.memory().stamp().valid && ss.managed_sessions.make_archive_room(engine.memory())) {
++                if(cp && engine.memory().stamp().valid && ss.managed_sessions.admit_history(cp->identity.stamp.frontier) &&
++                   ss.managed_sessions.make_archive_room(engine.memory())) {
+                     auto entry=std::make_unique<strata::poly::KvmemSessions::Entry>();
+                     entry->memory=engine.memory().park(*cp);
+                     ss.managed_history.truncate(int64_t(cp->identity.stamp.frontier));
+@@ -1748,7 +1757,8 @@ int main(int argc, char** argv) {
+             char* end = nullptr;
+             errno = 0;
+             const auto number = std::strtoull(text, &end, 10);
+-            if (*text == '-' || end == text || *end || errno == ERANGE || number > limit) {
++            if (*text == '-' || end == text || *end || errno == ERANGE || number > limit ||
++                (a=="--kvmem-cache-min-tokens" && std::strspn(text,"0123456789")!=std::strlen(text))) {
+                 std::fprintf(stderr, "strata-poly: invalid integer for %s\n", a.c_str());
+                 std::exit(2);
+             }
+@@ -1821,6 +1831,7 @@ int main(int argc, char** argv) {
+         else if (a == "--kvmem-disk-path") o.memory.disk_path = val();
+         else if (a == "--kvmem-disk-mib") o.memory.disk_mib = integer(uint64_t(1)<<24);
+         else if (a == "--kvmem-sessions") o.memory.sessions = uint32_t(integer(16));
++        else if (a == "--kvmem-cache-min-tokens") o.memory.cache_min_tokens = uint32_t(integer(INT32_MAX));
+         else if (a == "--kvmem-host-mib") o.memory.host_mib = integer(uint64_t(1) << 24);
+         else if (a == "--kvmem-sink-tokens") o.memory.sink = uint32_t(integer(INT32_MAX));
+         else if (a == "--kvmem-recent-tokens") o.memory.recent = uint32_t(integer(INT32_MAX));
+diff --git a/tools/poly_kvmem_sessions_test.cpp b/tools/poly_kvmem_sessions_test.cpp
+index ada16a8..d5a9c20 100644
+--- a/tools/poly_kvmem_sessions_test.cpp
++++ b/tools/poly_kvmem_sessions_test.cpp
+@@ -83,6 +83,20 @@ int main() {
+             check(account.charged_bytes()==0,"media proof quota did not release after final reference");
+         }
+         kvmem::HostKvStorage shared(192);
++        for(uint32_t minimum:{0u,127u,128u,129u}) {
++            kvmem::HostKvStorage account(512);KvmemSessions filtered;
++            filtered.configure(1);
++            filtered.save(entry(account,1,1000));
++            const auto source=filtered.lease(0);
++            filtered.configure(1,minimum);
++            filtered.save(entry(account,2,2000));
++            if(minimum>128) {
++                check(filtered.evictions()==0 && filtered.lease(0)==source,"short publication evicted its existing source");
++                check(filtered.choose(prompt(1000),128).resume.at==128,"admission filter blocked existing prefix reads");
++                check(filtered.below_minimum()==1,"missing below-minimum decision");
++            } else check(filtered.choose(prompt(2000),128).resume.at==128,"inclusive minimum rejected a complete history");
++            check(source->history.size()==128,"publishing a branch consumed its leased source");
++        }
+         KvmemSessions cache;
+         {
+             KvmemSessions owners;
+@@ -229,7 +243,9 @@ int main() {
+             check(escaped,"optional metadata boundary swallowed a validation failure");
+         }
+         {
+-            KvmemSessions tools;tools.configure(1);
++            // The admitted 128-token history must keep its shorter 96-token
++            // internal restore point for an edited/re-templated output tail.
++            KvmemSessions tools;tools.configure(1,128);
+             auto source=entry(shared,401,41000);auto endpoint=source->history.latest();
+             source->history.truncate(96);
+             auto anchor=std::make_shared<KvmemCheckpoint>();anchor->state.assign(16,9);anchor->identity=endpoint->identity;anchor->identity.stamp.frontier=96;

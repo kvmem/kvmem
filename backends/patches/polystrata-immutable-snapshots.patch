@@ -1,11 +1,11 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a3ec2390..2e88c11b 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -2184,6 +2184,16 @@
-     target_compile_definitions(poly_gemma_kvmem_test PRIVATE STRATA_KVMEM=1)
+@@ -2192,6 +2192,16 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
      target_include_directories(poly_gemma_kvmem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
      target_link_libraries(poly_gemma_kvmem_test PRIVATE kvmem strata_poly_mmq strata_kernels ggml-cpu ggml-base
-+      ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} ${_strata_poly_driver} Threads::Threads)
+       ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} ${_strata_poly_driver} Threads::Threads)
 +    # Explicit model qualification: never runs in ctest or the default build.
 +    add_executable(poly_kvmem_snapshot_test EXCLUDE_FROM_ALL tools/poly_kvmem_snapshot_test.cpp
 +      src/poly/engine.cpp src/poly/qwen35.cpp src/poly/glm5next.cpp src/poly/gemma4.cpp
@@ -15,60 +15,12 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 +    target_compile_definitions(poly_kvmem_snapshot_test PRIVATE STRATA_KVMEM=1)
 +    target_include_directories(poly_kvmem_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
 +    target_link_libraries(poly_kvmem_snapshot_test PRIVATE kvmem strata_poly_mmq strata_kernels ggml-cpu ggml-base
-       ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} ${_strata_poly_driver} Threads::Threads)
++      ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} ${_strata_poly_driver} Threads::Threads)
    endif()
    # needs the model file, so it is run by hand: poly_expert_parity MODEL.gguf
-diff --git a/src/poly/kvmem.hpp b/src/poly/kvmem.hpp
---- a/src/poly/kvmem.hpp
-+++ b/src/poly/kvmem.hpp
-@@ -3,6 +3,7 @@
- #pragma once
- 
- #include "kvmem/host_kv_storage.hpp"
-+#include "kvmem/kv_snapshot.hpp"
- #include "kvmem/kvmem_store.hpp"
- #include "kvmem/memory_contract.hpp"
- #include "kvmem/raw_kv_store.hpp"
-@@ -58,6 +59,9 @@
-     KvmemCheckpoint(KvmemCheckpoint&&) = default;
-     KvmemCheckpoint& operator=(KvmemCheckpoint&&) = default;
-     kvmem::CheckpointIdentity identity;
-+    std::shared_ptr<kvmem::HostKvReservation> metadata_reservation;
-+    std::shared_ptr<const kvmem::KvSnapshot> kv;
-+    std::shared_ptr<const std::vector<uint64_t>> kv_versions;
-     // Gemma's large window image uses the same hard RAM quota as native KV.
-     // A shared reservation charges its vector once without duplicating bytes.
-     std::shared_ptr<kvmem::HostKvReservation> state_reservation;
-@@ -80,6 +84,7 @@
-     std::unique_ptr<kvmem::RawKvStore> statistics;
-     std::unique_ptr<kvmem::KvMemStore> selector;
-     std::vector<kvmem::HostKvRecord> archive;
-+    std::vector<std::shared_ptr<kvmem::SealedKvBlock>> origins;
-     std::vector<uint64_t> versions, host_versions;
-     kvmem::GraphSnapshot graph;
-     kvmem::AttentionFeedbackSnapshot feedback;
-@@ -109,6 +114,9 @@
-     void before(int n);
-     void admit(uint64_t tokens) const;
-     uint64_t checkpoint_charge() const;
-+    uint64_t checkpoint_ram_required() const {
-+        return checkpoint_charge()+(disk_limit()?(uint64_t(pages(capacity()))+1)*descriptor_.layout.record_bytes:0);
-+    }
-     uint64_t request_payload(uint64_t tokens) const;
-     void commit(int n, const float* keys, size_t key_layer_stride, const float* query, const float* query_rows = nullptr, size_t query_stride = 0);
-     int64_t compact_position(int64_t logical) const;
-@@ -191,8 +199,10 @@
-     std::unique_ptr<kvmem::RawKvStore> statistics_;
-     std::unique_ptr<kvmem::KvMemStore> selector_;
-     std::vector<kvmem::HostKvRecord> archive_;
-+    std::vector<std::shared_ptr<kvmem::SealedKvBlock>> origins_;
-     std::vector<uint64_t> versions_, host_versions_, resident_;
-     uint64_t visible_ = 0, transfers_ = 0, restored_bytes_ = 0;
-+    uint64_t captured_bytes_ = 0, checkpoint_view_bytes_ = 0, state_capture_bytes_ = 0;
-     uint8_t *out_ = nullptr, *in_ = nullptr;
-     struct PinnedDelete { void operator()(uint8_t*) const noexcept; };
-     std::unique_ptr<uint8_t,PinnedDelete> out_owner_,in_owner_;
+   add_executable(poly_expert_parity src/poly/expert_parity.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu)
 diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
+index 05e0b774..e34f1cd8 100644
 --- a/src/poly/kvmem.cpp
 +++ b/src/poly/kvmem.cpp
 @@ -17,6 +17,7 @@
@@ -79,7 +31,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
  void require(bool ok, const char* message) {
      if (!ok) throw kvmem::MemoryError(kvmem::MemoryErrorCode::InvalidPlan, message);
  }
-@@ -199,7 +200,7 @@
+@@ -199,7 +200,7 @@ kvmem::MemoryStamp KvmemMemory::stamp() const noexcept { return stamp_; }
  
  void KvmemMemory::reset() {
      require(!transaction_, "cannot reset a pending KVMem transaction");
@@ -88,7 +40,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
      statistics_->clear();
      selector_ = std::make_unique<kvmem::KvMemStore>(selector_->config());
      const auto incarnation = stamp_.session.incarnation + 1;
-@@ -295,7 +296,7 @@
+@@ -295,7 +296,7 @@ void KvmemMemory::before(int n) {
      require(visible_ + uint64_t(n) <= uint64_t(capacity()), "KVMem selected view leaves insufficient append space");
  }
  uint64_t KvmemMemory::checkpoint_charge() const {
@@ -97,7 +49,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
  }
  uint64_t KvmemMemory::request_payload(uint64_t tokens) const {
      // A required Query rollback image must coexist with the entire admitted
-@@ -364,6 +365,7 @@
+@@ -364,6 +365,7 @@ void KvmemMemory::save_view(uint8_t* dst) {
          dst+=bytes;
      }
      ck(cudaStreamSynchronize(cs(engine_.st_)), "KVMem spill");
@@ -105,7 +57,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
  }
  void KvmemMemory::restore_view(const uint8_t* src, uint64_t rows) {
      for (size_t p=0;p<payload_.size();++p) {
-@@ -372,6 +374,7 @@
+@@ -372,6 +374,7 @@ void KvmemMemory::restore_view(const uint8_t* src, uint64_t rows) {
          src+=bytes;
      }
      ck(cudaStreamSynchronize(cs(engine_.st_)), "KVMem restore");
@@ -113,7 +65,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
      restored_bytes_ += rows * descriptor_.layout.record_bytes / block_tokens;
  }
  void KvmemMemory::copy_to_record(uint32_t id, kvmem::HostKvRecord& record, const uint8_t* src, uint64_t rows, uint64_t first) {
-@@ -438,10 +441,13 @@
+@@ -438,10 +441,13 @@ void KvmemMemory::archive_resident() {
                  const uint64_t begin=std::max(first,range->first),end=std::min(first+rows,range->first+range->second);
                  ck(cudaMemcpyAsync(dst+(begin-first)*row,payload_[p]+begin*row,(end-begin)*row,
                      cudaMemcpyDeviceToHost,cs(engine_.st_)),"KVMem dirty archive");
@@ -127,7 +79,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
          // Native compact pages have block_tokens rows except the final partial page;
          // the slice boundary therefore never divides a record.
          for(size_t slot=size_t(first/block_tokens);slot<resident_.size() && slot*block_tokens<first+rows;++slot) {
-@@ -455,6 +461,7 @@
+@@ -455,6 +461,7 @@ void KvmemMemory::archive_resident() {
      require(next==fresh.size(),"KVMem archive omitted a dirty record");
      for(auto& item:fresh) {
          archive_[item.first] = std::move(item.second);
@@ -135,7 +87,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
          host_versions_[item.first] = versions_[item.first];
      }
  }
-@@ -546,6 +553,7 @@
+@@ -546,6 +553,7 @@ public:
          }
      }
      void finish_restore() {
@@ -143,7 +95,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
          // Publish current Host sources before any destructive device writes.
          for (auto& item : staged_) {
              owner_.archive_[item.first] = std::move(item.second);
-@@ -566,6 +574,7 @@
+@@ -566,6 +574,7 @@ public:
      }
      void publish(const kvmem::ExecutionView& view) override {
          require(phase_ == 3 && !finished_, "KVMem view published before restore completed");
@@ -151,7 +103,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
          owner_.check_fault("publish");
          require(view.stamp == plan_.next.stamp, "KVMem publish stamp differs from prepared plan");
          for (auto id : owner_.resident_) {
-@@ -673,9 +682,30 @@
+@@ -673,9 +682,30 @@ KvmemCheckpoint KvmemMemory::checkpoint() {
      archive_resident();
      KvmemCheckpoint cp;
      cp.identity = {descriptor_.identity, descriptor_.layout, stamp_};
@@ -183,7 +135,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
          cp.state_reservation=std::make_shared<kvmem::HostKvReservation>(storage_->reserve(engine_.state_bytes()));
      cp.state.resize(engine_.state_bytes());
      if (cp.state.size() == engine_.state_n_ * sizeof(float)) {
-@@ -692,6 +722,8 @@
+@@ -692,6 +722,8 @@ KvmemCheckpoint KvmemMemory::checkpoint() {
          engine_.save_state(reference.data());
          require(reference == cp.state, "KVMem contiguous checkpoint differs from native layer checkpoints");
      }
@@ -192,7 +144,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
      cp.mean_tail = statistics_->mean_checkpoint(uint32_t(stamp_.frontier));
      cp.retrieval = selector_->retrieval_checkpoint();
      cp.transfers = transfers_;
-@@ -768,7 +800,19 @@
+@@ -768,7 +800,19 @@ void KvmemMemory::truncate_catalog(const KvmemCheckpoint& cp) {
      const uint64_t frontier = cp.identity.stamp.frontier;
      const auto count = pages(frontier);
      resident_.erase(std::remove_if(resident_.begin(), resident_.end(), [count](uint64_t id) { return id >= count; }), resident_.end());
@@ -213,7 +165,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
      stamp_.frontier = frontier;
      if (count && frontier % block_tokens) {
          ++versions_.back();
-@@ -778,6 +822,10 @@
+@@ -778,6 +822,10 @@ void KvmemMemory::truncate_catalog(const KvmemCheckpoint& cp) {
      statistics_->restore_mean_checkpoint(uint32_t(frontier), cp.mean_tail);
      selector_->truncate_to(uint32_t(frontier));
      selector_->restore_retrieval(cp.retrieval);
@@ -224,7 +176,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
      graph_=cp.graph;feedback_.restore(cp.feedback);output_samples_=cp.output_samples;
      visible_ = 0;
      for (auto id : resident_) visible_ += block(uint32_t(id)).valid_tokens;
-@@ -805,9 +853,10 @@
+@@ -805,9 +853,10 @@ KvmemParked KvmemMemory::park(const KvmemCheckpoint& cp) {
      parked.statistics = std::move(statistics_);
      parked.selector = std::move(selector_);
      parked.archive = std::move(archive_);
@@ -236,7 +188,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
      statistics_ = std::move(fresh_statistics);
      selector_ = std::move(fresh_selector);
      resident_.clear();
-@@ -826,6 +875,7 @@
+@@ -826,6 +875,7 @@ KvmemParked KvmemMemory::fork(const KvmemParked& source) {
      result.statistics = source.statistics->fork_mean_prefix(uint32_t(source.identity.stamp.frontier));
      result.selector = std::make_unique<kvmem::KvMemStore>(*source.selector);
      result.selector->restore_retrieval(source.selector->retrieval_checkpoint());
@@ -244,7 +196,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
      result.versions = source.versions; result.host_versions = source.host_versions;
      result.graph = source.graph; result.feedback = source.feedback; result.output_samples = source.output_samples;
      result.archive.reserve(source.archive.size());
-@@ -845,6 +895,7 @@
+@@ -845,6 +895,7 @@ void KvmemMemory::enter(KvmemParked&& parked, const KvmemCheckpoint& cp) {
      statistics_ = std::move(parked.statistics);
      selector_ = std::move(parked.selector);
      archive_ = std::move(parked.archive);
@@ -252,7 +204,7 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
      versions_ = std::move(parked.versions);
      host_versions_ = std::move(parked.host_versions);
      stamp_ = parked.identity.stamp;
-@@ -932,6 +983,12 @@
+@@ -932,6 +983,12 @@ void KvmemMemory::trace(const char* event) const {
  void KvmemMemory::storage_metrics() const {
      if (!std::getenv("KVMEM_POLY_STORAGE_METRICS")) return;
      const auto io=io_stats();
@@ -265,10 +217,62 @@ diff --git a/src/poly/kvmem.cpp b/src/poly/kvmem.cpp
      std::fprintf(stderr,"KVMEM_STORAGE host_bytes=%llu host_limit=%llu disk_bytes=%llu disk_limit=%llu read_bytes=%llu written_bytes=%llu errors=%llu\n",
          (unsigned long long)host_bytes(),(unsigned long long)host_limit(),(unsigned long long)disk_bytes(),
          (unsigned long long)disk_limit(),(unsigned long long)io.read_bytes,(unsigned long long)io.written_bytes,(unsigned long long)io.errors);
+diff --git a/src/poly/kvmem.hpp b/src/poly/kvmem.hpp
+index 415c56dc..aa3bd706 100644
+--- a/src/poly/kvmem.hpp
++++ b/src/poly/kvmem.hpp
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include "kvmem/host_kv_storage.hpp"
++#include "kvmem/kv_snapshot.hpp"
+ #include "kvmem/kvmem_store.hpp"
+ #include "kvmem/memory_contract.hpp"
+ #include "kvmem/raw_kv_store.hpp"
+@@ -58,6 +59,9 @@ struct KvmemCheckpoint {
+     KvmemCheckpoint(KvmemCheckpoint&&) = default;
+     KvmemCheckpoint& operator=(KvmemCheckpoint&&) = default;
+     kvmem::CheckpointIdentity identity;
++    std::shared_ptr<kvmem::HostKvReservation> metadata_reservation;
++    std::shared_ptr<const kvmem::KvSnapshot> kv;
++    std::shared_ptr<const std::vector<uint64_t>> kv_versions;
+     // Gemma's large window image uses the same hard RAM quota as native KV.
+     // A shared reservation charges its vector once without duplicating bytes.
+     std::shared_ptr<kvmem::HostKvReservation> state_reservation;
+@@ -80,6 +84,7 @@ struct KvmemParked {
+     std::unique_ptr<kvmem::RawKvStore> statistics;
+     std::unique_ptr<kvmem::KvMemStore> selector;
+     std::vector<kvmem::HostKvRecord> archive;
++    std::vector<std::shared_ptr<kvmem::SealedKvBlock>> origins;
+     std::vector<uint64_t> versions, host_versions;
+     kvmem::GraphSnapshot graph;
+     kvmem::AttentionFeedbackSnapshot feedback;
+@@ -109,6 +114,9 @@ public:
+     void before(int n);
+     void admit(uint64_t tokens) const;
+     uint64_t checkpoint_charge() const;
++    uint64_t checkpoint_ram_required() const {
++        return checkpoint_charge()+(disk_limit()?(uint64_t(pages(capacity()))+1)*descriptor_.layout.record_bytes:0);
++    }
+     uint64_t request_payload(uint64_t tokens) const;
+     void commit(int n, const float* keys, size_t key_layer_stride, const float* query, const float* query_rows = nullptr, size_t query_stride = 0);
+     int64_t compact_position(int64_t logical) const;
+@@ -191,8 +199,10 @@ private:
+     std::unique_ptr<kvmem::RawKvStore> statistics_;
+     std::unique_ptr<kvmem::KvMemStore> selector_;
+     std::vector<kvmem::HostKvRecord> archive_;
++    std::vector<std::shared_ptr<kvmem::SealedKvBlock>> origins_;
+     std::vector<uint64_t> versions_, host_versions_, resident_;
+     uint64_t visible_ = 0, transfers_ = 0, restored_bytes_ = 0;
++    uint64_t captured_bytes_ = 0, checkpoint_view_bytes_ = 0, state_capture_bytes_ = 0;
+     uint8_t *out_ = nullptr, *in_ = nullptr;
+     struct PinnedDelete { void operator()(uint8_t*) const noexcept; };
+     std::unique_ptr<uint8_t,PinnedDelete> out_owner_,in_owner_;
 diff --git a/src/poly/kvmem_history.hpp b/src/poly/kvmem_history.hpp
+index 23649599..9dd25372 100644
 --- a/src/poly/kvmem_history.hpp
 +++ b/src/poly/kvmem_history.hpp
-@@ -103,8 +103,15 @@
+@@ -103,8 +103,15 @@ public:
      // Removing a mark held by an in-flight Query would free no RAM and would
      // unnecessarily discard the next request's prefix restore point.
      bool reclaim_state(uint64_t bytes, kvmem::CheckpointPurpose purpose = kvmem::CheckpointPurpose::None) {
@@ -285,7 +289,7 @@ diff --git a/src/poly/kvmem_history.hpp b/src/poly/kvmem_history.hpp
              if (purpose == kvmem::CheckpointPurpose::None) return true;
              // Use the shared retention policy: an optional Endpoint must not
              // displace the more useful assistant/image reuse anchor.
-@@ -115,12 +122,12 @@
+@@ -115,12 +122,12 @@ public:
          uint64_t available = 0;
          for (const auto& mark : marks_)
              if (eligible(mark))
@@ -300,7 +304,7 @@ diff --git a/src/poly/kvmem_history.hpp b/src/poly/kvmem_history.hpp
                  mark.data.reset();
              } else keep.remember(std::move(mark));
          }
-@@ -142,6 +149,8 @@
+@@ -142,6 +149,8 @@ public:
              const auto& old = *mark.data;
              auto cp = std::make_shared<KvmemCheckpoint>();
              cp->identity = old.identity;
@@ -310,9 +314,10 @@ diff --git a/src/poly/kvmem_history.hpp b/src/poly/kvmem_history.hpp
              cp->mean_tail = old.mean_tail; cp->retrieval = old.retrieval; cp->resident = old.resident;
              cp->transfers = old.transfers; cp->graph = old.graph; cp->feedback = old.feedback; cp->output_samples = old.output_samples;
 diff --git a/src/poly/kvmem_sessions.cpp b/src/poly/kvmem_sessions.cpp
+index f48bdf11..605befac 100644
 --- a/src/poly/kvmem_sessions.cpp
 +++ b/src/poly/kvmem_sessions.cpp
-@@ -41,7 +41,7 @@
+@@ -41,7 +41,7 @@ std::shared_ptr<KvmemCheckpoint> KvmemSessions::checkpoint(KvmemMemory& memory,
                          (unsigned long long)memory.host_bytes(),(unsigned long long)memory.checkpoint_charge(),(unsigned long long)memory.host_limit(),entries_.size());
                  while (evict_one()) {}
                  const auto free = memory.host_limit() - memory.host_bytes();
@@ -321,8 +326,33 @@ diff --git a/src/poly/kvmem_sessions.cpp b/src/poly/kvmem_sessions.cpp
              }
          }
      }
+diff --git a/tools/poly_kvmem_history_test.cpp b/tools/poly_kvmem_history_test.cpp
+index f7a85d72..815985ac 100644
+--- a/tools/poly_kvmem_history_test.cpp
++++ b/tools/poly_kvmem_history_test.cpp
+@@ -86,6 +86,19 @@ int main() {
+         bool refused = false;
+         try { history.remember(mark(stamp, 263)); } catch (const std::logic_error&) { refused = true; }
+         check(refused, "incomplete checkpoint was admitted");
++        {
++            kvmem::HostKvStorage quota(64);
++            KvmemHistory parent;
++            kvmem::MemoryStamp at{true,{900,1},1,1,32,1};
++            parent.bind(at);std::vector<int32_t> ids(32,7);parent.append(ids.data(),ids.size());
++            auto cp=mark(at,32);cp->state_reservation=std::make_shared<kvmem::HostKvReservation>(quota.reserve(16));
++            cp->state.assign(16,7);parent.remember(cp);cp.reset();
++            auto fork_stamp=at;fork_stamp.session={901,1};auto child=parent.fork(fork_stamp);
++            check(!child.reclaim_state(16),"reclamation consumed a published parent's state");
++            parent.clear();
++            check(child.reclaim_state(16),"private fork state could not be reclaimed after parent eviction");
++            check(quota.charged_bytes()==0,"private fork state reservation leaked");
++        }
+         history.clear();
+         check(history.size() == 0 && history.marks() == 0, "failed request retained history");
+         std::cout << "KVMem history planner PASS\n";
 diff --git a/tools/poly_kvmem_snapshot_test.cpp b/tools/poly_kvmem_snapshot_test.cpp
 new file mode 100644
+index 00000000..fbd6df15
 --- /dev/null
 +++ b/tools/poly_kvmem_snapshot_test.cpp
 @@ -0,0 +1,47 @@
@@ -373,26 +403,3 @@ new file mode 100644
 + e->reset();auto fresh=m.fork(parked);cp.identity.stamp.session=fresh.identity.stamp.session;m.enter(std::move(fresh),cp);check(KvmemTestAccess::kv(m)==bytes_a,"stale completion lost recovery source");
 + std::cout<<"PASS complete origins, private tail, exact old-parent native KV, cold fork, branch edit; disk_reads="<<m.io_stats().read_bytes<<"\n";}check(weak.expired(),"origin remained alive");check(account->charged_bytes()==0 && account->disk_bytes()==0,"snapshot resources leaked");std::cout<<"PASS final resource release\n";return 0;
 +}catch(const std::exception& x){std::cerr<<x.what()<<'\n';return 1;}}
-diff --git a/tools/poly_kvmem_history_test.cpp b/tools/poly_kvmem_history_test.cpp
---- a/tools/poly_kvmem_history_test.cpp
-+++ b/tools/poly_kvmem_history_test.cpp
-@@ -86,6 +86,19 @@
-         bool refused = false;
-         try { history.remember(mark(stamp, 263)); } catch (const std::logic_error&) { refused = true; }
-         check(refused, "incomplete checkpoint was admitted");
-+        {
-+            kvmem::HostKvStorage quota(64);
-+            KvmemHistory parent;
-+            kvmem::MemoryStamp at{true,{900,1},1,1,32,1};
-+            parent.bind(at);std::vector<int32_t> ids(32,7);parent.append(ids.data(),ids.size());
-+            auto cp=mark(at,32);cp->state_reservation=std::make_shared<kvmem::HostKvReservation>(quota.reserve(16));
-+            cp->state.assign(16,7);parent.remember(cp);cp.reset();
-+            auto fork_stamp=at;fork_stamp.session={901,1};auto child=parent.fork(fork_stamp);
-+            check(!child.reclaim_state(16),"reclamation consumed a published parent's state");
-+            parent.clear();
-+            check(child.reclaim_state(16),"private fork state could not be reclaimed after parent eviction");
-+            check(quota.charged_bytes()==0,"private fork state reservation leaked");
-+        }
-         history.clear();
-         check(history.size() == 0 && history.marks() == 0, "failed request retained history");
-         std::cout << "KVMem history planner PASS\n";

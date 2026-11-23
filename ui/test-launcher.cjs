@@ -64,7 +64,11 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  assert.deepEqual(info.backends,['llamacpp','ninfer','polystrata','radiance']);
  assert.deepEqual(await page.locator('[data-param=Backend] option').evaluateAll(items=>items.map(x=>x.value)),['llamacpp','ninfer','polystrata','radiance']);
  assert.equal(await page.locator('[data-view=config]').isVisible(),true);
- await page.locator('#launch-tab-5').click();
+ await page.locator('#launch-tab-6').click();
+ const cacheMinimum=page.locator('[data-param=CacheMinTokens]');
+ assert.equal(await cacheMinimum.inputValue(),'0');
+ await cacheMinimum.fill('-1');assert.equal(await cacheMinimum.evaluate(el=>el.checkValidity()),false);
+ await cacheMinimum.fill('4096');assert.equal(await cacheMinimum.evaluate(el=>el.checkValidity()),true);
  const checkpointLimit=page.locator('[data-param=CheckpointExtraRecomputeTokens]');
  assert.equal(await checkpointLimit.inputValue(),'0');
  await checkpointLimit.fill('-1');assert.equal(await checkpointLimit.evaluate(el=>el.checkValidity()),false);
@@ -72,11 +76,17 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  await page.waitForFunction(()=>document.querySelector('[data-draft-state]').textContent.includes('已自动保存'));
  await page.reload();await page.locator('[data-param=Backend]').waitFor();
  assert.equal(await page.locator('[data-param=CheckpointExtraRecomputeTokens]').inputValue(),'16');
+ assert.equal(await page.locator('[data-param=CacheMinTokens]').inputValue(),'4096');
  await page.locator('[data-param=Backend]').selectOption('llamacpp');
  assert.equal(await page.locator('[data-param=CheckpointExtraRecomputeTokens]').count(),0);
+ assert.equal(await page.locator('[data-param=CacheMinTokens]').inputValue(),'0');
+ await page.locator('#launch-tab-6').click();
+ await page.locator('[data-param=CacheMinTokens]').fill('1024');
  await page.locator('[data-param=Backend]').selectOption('ninfer');
  assert.equal(await page.locator('[data-param=CheckpointExtraRecomputeTokens]').inputValue(),'16');
- await page.locator('#launch-tab-5').click();await page.locator('[data-param=CheckpointExtraRecomputeTokens]').fill('0');
+ await page.locator('#launch-tab-6').click();await page.locator('[data-param=CheckpointExtraRecomputeTokens]').fill('0');
+ assert.equal(await page.locator('[data-param=CacheMinTokens]').inputValue(),'4096');
+ await page.locator('[data-param=CacheMinTokens]').fill('0');
  await page.locator('#launch-tab-0').click();
  console.log('PASS: NInfer checkpoint recompute limit validation, persistence and backend isolation');
  if(info.gpus.length){
@@ -95,6 +105,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
    await draftMode.selectOption('dflash2');
    assert.equal(await draftMode.evaluate(el=>el.validationMessage),'');
    await draftMode.selectOption(previousMode);
+   await page.getByRole('tab',{name:'多卡设置',exact:true}).click();
    await page.locator('[data-param=StageLayers]').fill('40,24');
    await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').click();
    assert.deepEqual(await order(),[info.gpus[1].uuid,info.gpus[0].uuid]);
@@ -104,7 +115,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
    const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem('kvmem-launch-draft-v2')).parameters);
    assert.equal(saved.Gpu,[info.gpus[1].uuid,info.gpus[0].uuid].join(','));
    assert.deepEqual(saved.StageLayers,[24,40]);
-   await page.reload();await page.locator('[data-gpu-order]').waitFor();
+   await page.reload();await page.locator('[data-gpu-order]').waitFor({state:'attached'});
    assert.deepEqual(await order(),[info.gpus[1].uuid,info.gpus[0].uuid]);
    await page.locator('[data-language-select]').selectOption('en');
    assert.deepEqual(await order(),[info.gpus[1].uuid,info.gpus[0].uuid]);
@@ -116,7 +127,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
    await page.locator('[data-gpu-choice]').first().check();
    assert.deepEqual(await order(),[info.gpus[1].uuid,info.gpus[0].uuid]);
    await page.waitForFunction(()=>document.querySelector('[data-draft-state]').textContent.includes('saved automatically'));
-   await page.locator('#launch-tab-1').click();
+   await page.getByRole('tab',{name:'Multi-GPU',exact:true}).click();
    const tp=page.locator('[data-param=TensorParallel]'),weights=page.locator('[data-param=TensorSplit]');
    assert.equal(await tp.isChecked(),false,'multiple GPUs do not silently enable TP');
    await tp.check();await weights.fill('3,1');
@@ -134,17 +145,16 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
    assert.equal(await page.locator('[data-param=TensorSplit]').inputValue(),'1,3');
    await page.locator('[data-param=Backend]').selectOption('llamacpp');
    assert.equal(await page.locator('[data-param=TensorParallel]').isDisabled(),true);
-   await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').click();
+   assert.equal(await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').isDisabled(),true);
    await page.locator('[data-param=Backend]').selectOption('ninfer');
    assert.equal(await page.locator('[data-param=TensorParallel]').isChecked(),true,'backend switch restores NInfer TP choice');
-   assert.equal(await page.locator('[data-param=TensorSplit]').inputValue(),'3,1','backend switch remaps weights to the same UUIDs');
-   await page.locator('#launch-tab-1').click();
+   assert.equal(await page.locator('[data-param=TensorSplit]').inputValue(),'1,3','backend switch preserves weights for the same UUIDs');
+   await page.getByRole('tab',{name:'Multi-GPU',exact:true}).click();
    await page.locator('[data-param=TensorSplit]').fill('3,invalid,1');
-   await page.locator('[data-param=Backend]').selectOption('llamacpp');
    await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').click();
    await page.locator('[data-param=Backend]').selectOption('ninfer');
    assert.equal(await page.locator('[data-param=TensorSplit]').inputValue(),'','invalid saved weights cannot become valid by filtering during reorder');
-   await page.locator('#launch-tab-1').click();
+   await page.getByRole('tab',{name:'Multi-GPU',exact:true}).click();
    await page.locator('[data-param=TensorSplit]').fill('1,3');
    await page.locator('[data-gpu-choice]').first().uncheck();
    assert.equal(await page.locator('[data-param=TensorSplit]').inputValue(),'');
@@ -231,7 +241,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  for(const [key,value] of Object.entries(expected))assert.equal(releaseDraft[key],value,'persisted '+key);
  await page.locator('[data-preset-undo]').click();
  assert.equal(await page.locator('[data-param=Model]').inputValue(),'C:/models/my-existing-model.ninfer');
- assert.ok(mutations.every(url=>new URL(url).pathname==='/api/launcher/inspect-model'),
+ assert.ok(mutations.every(url=>['/api/launcher/inspect-model','/api/launcher/worker-capabilities'].includes(new URL(url).pathname)),
   'select/undo may inspect the draft but must not mutate the server');
  assert.deepEqual(await page.locator('[data-preset]').evaluateAll(nodes=>nodes.map(n=>n.dataset.preset).sort()),['ninfer-layerwise','ninfer-quality','ninfer-speed']);
  await page.locator('[data-preset=ninfer-quality]').click();
@@ -423,6 +433,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  await require('./test-engine-settings.cjs')({browser,base,info});
  await require('./test-elastic-experts.cjs')({browser,base,info});
  await require('./test-query-scoring.cjs')({browser,base,info});
+ await require('./test-recall-layout.cjs')({browser,base,info,task:process.env.SCREENSHOT_DIR});
  if(process.env.TEST_MODEL&&process.env.TEST_WORKER&&process.env.TEST_GPU){
   const config={schema_version:1,parameters:{Backend:'llamacpp',Model:process.env.TEST_MODEL,Worker:'',Gpu:process.env.TEST_GPU,Context:4096,Budget:2048,Reserve:512,HostMiB:256,Prefill:128,MaxTokens:128,Port:port+1,ListenHost:'127.0.0.1',SinkTokens:512,RecentTokens:64,QueryScorer:'meanq-cosine',ScoreAggregation:'mean',GraphAlpha:.2,Lrfu:false,QueryMaxTokens:128,QueryReplayMaxTokens:512,WorkerArgs:['--n-gpu-layers','99']}};
   const preview=await api('preview',config);assert.equal(preview.code,200,JSON.stringify(preview.body));assert.ok(preview.body.argv.includes('--kvmem'));

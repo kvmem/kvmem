@@ -22,7 +22,7 @@ module.exports=async({browser,base,info})=>{
   return route.fulfill({json:{argv:['fixture-worker'],environment:{}}});
  });
  const field=key=>page.locator(`[data-param=${key}]`);
- const group=index=>page.locator(`#launch-tab-${index}`).click();
+ const group=index=>page.locator(`#launch-tab-${index>=2?index+1:index}`).click();
  const order=()=>field('Gpu').evaluate(el=>Array.from(el.selectedOptions).map(option=>option.value));
  const sharedKeys=['Context','Budget','Reserve','HostMiB','Prefill','MaxTokens','Port','ListenHost',
   'SinkTokens','RecentTokens','Concurrency','RetainedSessions','DiskPath','DiskMiB','LrfuLambda',
@@ -64,8 +64,10 @@ module.exports=async({browser,base,info})=>{
   assert.ok((await page.locator('[data-check-summary]').textContent()).includes('需要补全'));
   await closeCheck();
   // Reordering keeps counts attached to their original physical GPU when returning.
-  await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').click();
+  await page.getByRole('tab',{name:'多卡设置',exact:true}).click();
+  assert.equal(await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').isDisabled(),true);
   await field('Backend').selectOption('ninfer');
+  await page.locator('[data-ordered-gpu]').nth(1).locator('[data-gpu-move="-1"]').click();
   assert.deepEqual(await order(),[gpus[0].uuid,gpus[1].uuid]);
   assert.equal(await field('StageLayers').inputValue(),'40,24');
   assert.deepEqual(await values(),{...shared,Port:changed.Port},'resource edits belong to each engine, listener follows the last edit');
@@ -111,9 +113,9 @@ module.exports=async({browser,base,info})=>{
   await field('Backend').selectOption('llamacpp');await page.setViewportSize({width:390,height:900});
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'GPU cards fit a narrow screen');
   if(process.env.SCREENSHOT_DIR)await page.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'backend-switch-mobile.png'),fullPage:true});
-  // Preview and model inspection are read-only POSTs; start/stop and every other
+  // Preview, model inspection and capability probes are read-only POSTs; start/stop and every other
   // mutation must remain absent while switching backends.
-  assert.ok(posts.every(url=>['/api/launcher/preview','/api/launcher/inspect-model'].includes(url)),
+  assert.ok(posts.every(url=>['/api/launcher/preview','/api/launcher/inspect-model','/api/launcher/worker-capabilities'].includes(url)),
    'switches never mutate a running service');
   assert.deepEqual(errors,[]);
   console.log('PASS: identical GPU cards, shared settings, explicit capability validation, per-engine assets/raw edits, GPU/layer identity, language/reload and no inference');

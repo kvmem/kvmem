@@ -12,13 +12,17 @@ module.exports=async({browser,base,info})=>{
  await page.route('**/api/launcher/status',r=>r.fulfill({json:runtime}));
  await page.route('**/api/launcher/preview',r=>{previews.push(r.request().postDataJSON().parameters);return r.fulfill({json:{argv:['fixture-worker'],environment:{}}});});
  const field=k=>page.locator(`[data-param=${k}]`);
- const openAdvanced=async()=>{await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();};
+ const openAdvanced=async()=>{await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();await page.locator('[data-recall-advanced=scoring] > summary').click();};
  const preview=async()=>{const n=previews.length;await page.locator('[data-action=preview]').click();await page.waitForFunction(()=>document.querySelector('[data-check-summary]')?.textContent.includes('检查通过'));assert.equal(previews.length,n+1);await page.locator('[data-dialog=check] [data-dialog-close]').click();return previews.at(-1);};
  try{
   await page.goto(base+'/monitor/#config');await field('Backend').waitFor();
   assert.equal(await page.locator('[data-scoring-migration]').count(),1);
   await page.locator('[data-language-select]').selectOption('zh-CN');await openAdvanced();
   assert.equal(await field('QueryScorer').inputValue(),'meanq-cosine');assert.equal(await field('GraphAlpha').inputValue(),'0');assert.equal(await field('Lrfu').isChecked(),true);
+  assert.equal(await field('QueryMaxTokens').getAttribute('min'),'0');
+  assert.equal(await field('QueryReplayMaxTokens').getAttribute('min'),'0');
+  await field('QueryMaxTokens').fill('0');await field('QueryReplayMaxTokens').fill('0');
+  const unlimited=await preview();assert.equal(unlimited.QueryMaxTokens,0);assert.equal(unlimited.QueryReplayMaxTokens,0);
   await field('QueryScorer').selectOption('page-softmax');assert.equal(await field('Lrfu').isChecked(),true,'scorer must not toggle history');
   await field('GraphAlpha').fill('.2');await field('ScoreAggregation').selectOption('mean');await field('LrfuLambda').fill('.3');await field('LrfuTopFraction').fill('.5');
   await field('QueryMaxTokens').fill('128');await field('QueryReplayMaxTokens').fill('512');
@@ -39,6 +43,10 @@ module.exports=async({browser,base,info})=>{
   await openAdvanced();assert.equal(await field('GraphAlpha').isDisabled(),true);
   assert.equal(await field('GraphAlpha').inputValue(),'0.2','locked launch settings retain the submitted value');
   assert.equal(await page.locator('[data-runtime-key="GraphAlpha"] .s-runtime-value').textContent(),'0.7','the observed report remains distinct from launch settings');
+  runtime={state:'stopped'};await page.reload();await field('Backend').waitFor();
+  await page.locator('[data-preset=ninfer-quality]').click();
+  assert.equal(await field('QueryMaxTokens').inputValue(),'0','built-in NInfer recipe uses full Query');
+  assert.equal(await field('QueryReplayMaxTokens').inputValue(),'0','built-in NInfer recipe uses complete replay');
   if(process.env.SCREENSHOT_DIR)await page.screenshot({path:process.env.SCREENSHOT_DIR+'/query-scoring.png',fullPage:true});
   assert.deepEqual(errors,[]);
  }finally{await context.close();}

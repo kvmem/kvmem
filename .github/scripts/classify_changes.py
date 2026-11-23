@@ -19,16 +19,21 @@ NON_CUDA_PATHS = {
 CONSOLE_PATHS = {
     '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
     'tests/test_radiance_launcher.py',
+    'tests/test_layerwise_launcher.py', 'tests/test_layerwise_product.py',
+    'tests/test_windows_worker_args.py', 'scripts/windows/start-backend.ps1',
     'START-HERE-CN.sh', 'START-HERE-EN.sh', 'START-HERE-CN.bat', 'START-HERE-EN.bat',
     'scripts/local-console.py', 'scripts/launcher-cli.py', 'scripts/launcher-capabilities.json',
-    'scripts/console_chat.py', 'scripts/console_hardware.py', 'scripts/model_health.py',
+    'scripts/console_chat.py', 'scripts/console_radiance.py', 'scripts/console_state.py', 'scripts/console_hardware.py', 'scripts/model_health.py',
     'scripts/requirements-console.txt', 'scripts/speculative-capabilities.json',
     'scripts/linux/start-ui.sh', 'scripts/linux/package-console.py',
     'scripts/windows/start-ui.ps1', 'scripts/windows/package-console.ps1',
+    'scripts/windows/package-polystrata.ps1',
+    'scripts/windows_amd_hardware.py', 'scripts/windows_gpu_hardware.py',
+    'tests/test_windows_amd_hardware.py', 'tests/test_windows_gpu_hardware.py',
     'scripts/windows/package-unified.py', 'scripts/windows/native-process.ps1',
     'scripts/windows/describe-launch-json.ps1', 'scripts/install-console-dependency.py',
     'scripts/windows/start-polystrata.ps1', 'scripts/windows/select-model.ps1',
-    'ui/package.json', 'ui/package-lock.json', 'ui/README.md',
+    'ui/package.json', 'ui/package-lock.json', 'ui/README.md', 'ui/memory-fixture.py',
 }
 
 # These files audit archived results; none is an input to a native target.
@@ -43,12 +48,28 @@ EVIDENCE_TEST_STEP = (
     "        if: steps.classify.outputs.run_ci == 'true'\n"
     '        run: python3 backends/radiance/tests/cpu_image_evidence_test.py\n'
 )
+CONSOLE_CONTRACT_TEST_STEP = (
+    '      - name: Test model-free recall and worker contracts\n'
+    '        shell: bash\n'
+    '        run: |\n'
+    '          python -m unittest discover -s tests -p "test_layerwise_launcher.py"\n'
+    '          python -m unittest discover -s tests -p "test_layerwise_product.py"\n'
+    '          python -m unittest discover -s tests -p "test_windows_worker_args.py"\n'
+)
+HARDWARE_TEST_STEP = (
+    '      - name: Test hardware telemetry contracts without a GPU\n'
+    '        shell: bash\n'
+    '        run: |\n'
+    '          python -m unittest discover -s tests -p "test_console_hardware.py"\n'
+    '          python -m unittest discover -s tests -p "test_console_radiance.py"\n'
+    '          python -m unittest discover -s tests -p "test_windows_*hardware.py"\n'
+)
 
 
 def is_console_path(path):
     if '..' in PurePosixPath(path).parts or path.startswith('/'):
         return False
-    return (path in CONSOLE_PATHS or path.startswith(('scripts/launcher/', 'scripts/model_health_ninfer/', 'ui/monitor/'))
+    return (path in CONSOLE_PATHS or path.startswith(('scripts/launcher/', 'scripts/model_health_ninfer/', 'ui/monitor/', 'ui/lightweight/'))
             or bool(re.fullmatch(r'tests/test_(launcher[^/]*|local_console|console_[^/]+|one_click|model_health)\.py', path))
             or bool(re.fullmatch(r'ui/test-[^/]+\.cjs', path)))
 
@@ -60,7 +81,8 @@ def requires_native(paths, before=None, after=None, cwd=None):
     # still run Python/browser checks, without configuring or building engines.
     return not paths or any(
         not is_documentation(path) and not is_console_path(path) and path not in EVIDENCE_PATHS
-        and not (path == WORKFLOW and only_evidence_test_step_changed(before, after, cwd))
+        and not (path == WORKFLOW and only_test_step_added(before, after,
+                 (EVIDENCE_TEST_STEP, CONSOLE_CONTRACT_TEST_STEP, HARDWARE_TEST_STEP), cwd))
         for path in paths)
 
 
@@ -90,7 +112,8 @@ def radiance_only_change(paths, before=None, after=None, cwd=None):
                         'backends/radiance/upstream.json whitespace=cr-at-eol\n'
                         'ui/test-monitor.cjs whitespace=cr-at-eol\n'
                         '.github/workflows/server-compat.yml whitespace=cr-at-eol\n')
-            if new == old + addition:
+            chat_attributes = '\n# Preserve existing lightweight chat CRLF blobs.\nui/lightweight/+page.svelte whitespace=cr-at-eol\nui/lightweight/labels.ts whitespace=cr-at-eol\n'
+            if new in (old + addition, old + chat_attributes):
                 continue
         return False
     return True
@@ -169,14 +192,18 @@ def git(*args, cwd=None):
 
 
 def only_evidence_test_step_changed(before, after, cwd=None):
-    # Allow only the exact standalone Python check added by this change.
-    # Every other workflow edit retains the conservative native-build policy.
+    return only_test_step_added(before, after, (EVIDENCE_TEST_STEP,), cwd)
+
+
+def only_test_step_added(before, after, steps, cwd=None):
+    # Only an exact known model-free test addition can avoid native builds.
+    # Other recipe edits retain the conservative native-build policy.
     if not all(isinstance(ref, str) and re.fullmatch(r'[0-9a-f]{40}', ref) for ref in (before, after)):
         return False
     try:
         old, new = (git('show', ref + ':' + WORKFLOW, cwd=cwd).decode('utf-8').replace('\r\n', '\n')
                     for ref in (before, after))
-        return new.count(EVIDENCE_TEST_STEP) == 1 and new.replace(EVIDENCE_TEST_STEP, '', 1) == old
+        return any(new.count(step) == 1 and new.replace(step, '', 1) == old for step in steps)
     except (OSError, UnicodeError, subprocess.CalledProcessError):
         return False
 

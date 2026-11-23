@@ -11,7 +11,7 @@ SPECULATIVE_PROFILES = json.loads((ROOT / 'scripts/speculative-capabilities.json
 DEFAULTS = dict(Backend='ninfer', Model='', Worker='', Gpu='', Context=262144,
                 Budget=32768, Reserve=1024, HostMiB=16384, Prefill=128,
                 MaxTokens=1024, Port=18200, ListenHost='127.0.0.1',
-                SinkTokens=12288, RecentTokens=1024)
+                SinkTokens=12288, RecentTokens=1024, CacheMinTokens=0)
 # Initial UI recipes; never merge engine-specific flags into saved configurations.
 ENGINE_DEFAULTS = {'ninfer': {'Context': 262144,
             'Budget': 47104,
@@ -28,9 +28,10 @@ ENGINE_DEFAULTS = {'ninfer': {'Context': 262144,
             'ScoreAggregation': 'mean',
             'GraphAlpha': 0.2,
             'Lrfu': False,
-            'QueryMaxTokens': 512,
-            'QueryReplayMaxTokens': 2048,
+            'QueryMaxTokens': 0,
+            'QueryReplayMaxTokens': 0,
             'CheckpointExtraRecomputeTokens': 0,
+            'CacheMinTokens': 0,
             'ThinkingMode': 'default',
             'KvType': 'int8',
             'Prefill': 256,
@@ -107,21 +108,25 @@ ENGINE_DEFAULTS = {'ninfer': {'Context': 262144,
                                '128',
                                '--elastic-physical-reserve-mib',
                                '512']}}
-ENGINE_DEFAULTS['radiance'] = dict(Backend='radiance', Context=65536, Budget=4096, Reserve=1024,
+# Backward-compatible fallback for partial requests; the UI sends its full recipe.
+RADIANCE_LAUNCH_DEFAULTS = dict(Backend='radiance', Context=65536, Budget=4096, Reserve=1024,
     HostMiB=8192, SinkTokens=128, RecentTokens=512, Concurrency=1, RetainedSessions=8,
     QueryScorer='page-softmax', ScoreAggregation='mean', GraphAlpha=.2, Lrfu=False,
     QueryMaxTokens=512, QueryReplayMaxTokens=2048, KvType='fp8', StateCacheType='f32', Prefill=256,
     SpeculativeMode='none', DraftTokens=0, DraftPolicy='fixed', Vision=False, MaxTokens=0,
     ThinkingMode='default', ThinkingBudget=0, VramReserveMiB=1024,
-    VisionTokens=1024, VisionResidency='resident', EmbeddingPlacement='vram', CpuThreads=2, VisionCacheMiB=256)
-STRINGS = {'StateCacheType', 'EmbeddingPlacement', 'RadianceHome', 'RocmPath', 'Tokenizer','PolystrataSource','Python','VisionWorker','Mmproj','Lora','QueryScorer','Backend', 'Model', 'Worker', 'Gpu', 'ListenHost', 'KvType', 'KvTypeK', 'KvTypeV', 'DiskPath',
+    VisionTokens=1024, VisionResidency='resident', EmbeddingPlacement='vram', CpuThreads=2, VisionCacheMiB=256,
+    WeightPlacement='all_vram', WeightHostMiB=0)
+ENGINE_DEFAULTS['radiance'] = {'Backend': 'radiance', 'Context': 262144, 'Budget': 36864, 'Reserve': 4096, 'HostMiB': 12288, 'SinkTokens': 12288, 'RecentTokens': 1024, 'Concurrency': 1, 'RetainedSessions': 1, 'QueryScorer': 'page-softmax', 'ScoreAggregation': 'mean', 'GraphAlpha': 0.2, 'Lrfu': False, 'QueryMaxTokens': 512, 'QueryReplayMaxTokens': 2048, 'KvType': 'fp8', 'StateCacheType': 'f32', 'Prefill': 256, 'SpeculativeMode': 'dflash2', 'DraftTokens': 7, 'DraftPolicy': 'fixed', 'Vision': True, 'MaxTokens': 0, 'ThinkingMode': 'default', 'ThinkingBudget': 0, 'VramReserveMiB': 256, 'EmbeddingPlacement': 'ram', 'CpuThreads': 8, 'VisionResidency': 'cpu', 'VisionTokens': 256, 'VisionCacheMiB': 64, 'ReasoningEffort': 'xhigh', 'PreserveThinking': True, 'NgramDrafts': 0, 'NgramMinMatch': 12}
+
+STRINGS = {'StateCacheType', 'EmbeddingPlacement', 'WeightPlacement', 'RadianceHome', 'RocmPath', 'Tokenizer','PolystrataSource','Python','VisionWorker','Mmproj','Lora','QueryScorer','Backend', 'Model', 'Worker', 'Gpu', 'ListenHost', 'KvType', 'KvTypeK', 'KvTypeV', 'DiskPath',
            'VisionResidency',
            'DeviceProfile', 'ScoreAggregation', 'QueryScorer', 'ApiKey', 'ModelAlias', 'LogLevel',
            'ChatTemplateFile', 'ThinkingMode', 'ReasoningEffort', 'SpeculativeMode', 'DraftPolicy', 'DraftModel'}
-INTEGERS = {'CpuThreads', 'VisionCacheMiB', 'BlockTokens', 'VramReserveMiB', 'Context', 'Budget', 'Reserve', 'HostMiB', 'Prefill', 'MaxTokens', 'Port',
+INTEGERS = {'CpuThreads', 'VisionCacheMiB', 'WeightHostMiB', 'BlockTokens', 'VramReserveMiB', 'Context', 'Budget', 'Reserve', 'HostMiB', 'Prefill', 'MaxTokens', 'Port',
             'MtpDrafts', 'NgramDrafts', 'NgramMinMatch', 'Concurrency', 'RetainedSessions',
             'VisionTokens', 'ThinkingBudget', 'SinkTokens', 'RecentTokens', 'DiskMiB', 'DraftTokens',
-            'QueryMaxTokens', 'QueryReplayMaxTokens', 'ReplayMaxTokens', 'CheckpointExtraRecomputeTokens'}
+            'QueryMaxTokens', 'QueryReplayMaxTokens', 'ReplayMaxTokens', 'CheckpointExtraRecomputeTokens', 'CacheMinTokens'}
 BOOLEANS = {'AdaptiveMtp', 'FastPrefill', 'Vision', 'NoLrfu', 'Lrfu', 'PreserveThinking', 'TensorParallel'}
 DECIMALS = {'LrfuLambda', 'LrfuTopFraction', 'GraphAlpha'}
 STRINGS.update(('RecallStrategy', 'LayerwiseMtpHistory'))
@@ -195,10 +200,11 @@ def normalize(data, backends, *, path_root=None):
     if p.get('ScoreAggregation', 'mean') not in {'mean', 'max'}:
         raise ValueError('Unsupported ScoreAggregation')
     for key in ('QueryMaxTokens', 'QueryReplayMaxTokens'):
-        if key in p and p[key] <= 0:
-            raise ValueError(f'{key} must be positive')
-    if p['Backend'] != 'radiance' and {'CpuThreads','VisionCacheMiB'} & p.keys():
-        raise ValueError('CpuThreads and VisionCacheMiB currently configure Radiance only')
+        minimum = 0 if p['Backend'] == 'ninfer' else 1
+        if key in p and p[key] < minimum:
+            raise ValueError(f'{key} must be >= {minimum}; zero means unlimited for NInfer')
+    if p['Backend'] != 'radiance' and {'CpuThreads','VisionCacheMiB','WeightPlacement','WeightHostMiB'} & p.keys():
+        raise ValueError('CPU threads, image cache and weight placement configure Radiance only')
     if 'CheckpointExtraRecomputeTokens' in p and p['Backend'] != 'ninfer':
         raise ValueError('CheckpointExtraRecomputeTokens configures NInfer only')
     history = p.get('Lrfu', p.get('QueryScorer') == 'meanq-cosine')

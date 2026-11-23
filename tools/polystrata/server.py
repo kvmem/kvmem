@@ -99,6 +99,7 @@ def main():
     parser.add_argument("--no-lrfu", action="store_true")
     parser.add_argument("--history-reuse", action=argparse.BooleanOptionalAction, default=True, help="reuse identical managed conversation prefixes")
     parser.add_argument("--retained-sessions", type=int, default=None, help="1..16 retained histories including the GPU owner; N>1 requires reuse")
+    parser.add_argument("--cache-min-tokens", type=int, default=0, help="Minimum complete restorable history to retain; 0 disables filtering")
     parser.add_argument("--concurrency", type=int, choices=range(1, 9), default=1,
                         help="1..8 active requests in one GPU worker; each slot owns B+R KV")
     parser.add_argument("--draft-model", type=Path, help="matching Gemma 4 assistant GGUF for MTP")
@@ -141,6 +142,8 @@ def main():
             (args.thinking_mode == "on" and args.reasoning_effort == "none"):
         parser.error("thinking mode conflicts with reasoning effort")
     if args.retained_sessions is None:args.retained_sessions=max(4,args.concurrency+1)
+    if not 0 <= args.cache_min_tokens <= 2147483647:
+        parser.error("cache-min-tokens must be between 0 and 2147483647")
     if not 0 <= args.disk_mib <= (1<<20) or bool(args.disk_path) != bool(args.disk_mib):
         parser.error("SSD requires both --disk-path and positive --disk-mib")
     if not 1 <= args.retained_sessions <= 16 or (args.retained_sessions > 1 and not args.history_reuse):
@@ -229,6 +232,10 @@ def main():
         parser.error("--no-draft conflicts with --mtp-drafts")
     if not any(option == "--vram-reserve-mib" or option.startswith("--vram-reserve-mib=") for option in extra):
         extra += ["--vram-reserve-mib", str(args.vram_reserve_mib)]
+    # Preserve the mapped-expert default used before poly.9. Its automatic RAM
+    # pool can reduce decode throughput; an explicit limit (or -2 for auto) wins.
+    if not any(re.match(r"^--ram-experts-mib(?:$|=|\s)", option) for option in extra):
+        extra += ["--ram-experts-mib", "-1"]
     worker_args = ["--model", str(args.model), "--max-context", str(args.context),
                    "--prompt-batch", str(args.prefill), "--window", str(1+args.mtp_drafts), "--lookup", "0",
                    "--prompt-cache", "0", "--conversation-cache-mib", "0", "--conversation-cache-slots", "0",
@@ -280,6 +287,13 @@ def main():
         worker_args += ["--kvmem-history-reuse"]
     if args.retained_sessions != 1:
         worker_args += ["--kvmem-sessions", str(args.retained_sessions)]
+    if args.cache_min_tokens:
+        worker_args += ["--kvmem-cache-min-tokens", str(args.cache_min_tokens)]
+        if not args.dry_run:
+            from launcher.worker import require_launch_features
+            try: require_launch_features(probe_worker(args.worker, 'polystrata'),
+                                         {**recall_parameters, 'CacheMinTokens': args.cache_min_tokens})
+            except ValueError as error: parser.error(str(error))
     worker_args += extra
     indices = [0]
     if args.backend == "hip":

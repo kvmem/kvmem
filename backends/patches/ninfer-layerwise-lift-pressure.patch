@@ -1,0 +1,271 @@
+--- a/src/models/qwen3_5/program/native_feedback_workspace.h
++++ b/src/models/qwen3_5/program/native_feedback_workspace.h
+@@ -54,9 +54,12 @@
+     // their OWN source-account funding and cannot pin this reusable credit.
+     auto bytes=feedback_add(feedback_add(owner_bytes,2048),feedback_add(feedback_mul(snapshot,8),feedback_mul(matrix,6)));
+     bytes=feedback_add(bytes,feedback_add(parser,feedback_add(heads,feedback_add(maps,control))));
++    const auto lift_row_bytes=pf.scorer==kvmem::LayerwisePrefillScorer::Lift ?
++        kvmem::layerwise_lift_buckets*sizeof(std::uint32_t) : 0;
++    bytes=feedback_add(bytes,feedback_mul(rows,lift_row_bytes));
+     const auto extra_rows=query_rows-rows;
+     const auto extra_matrix=feedback_mul(feedback_mul(feedback_mul(extra_rows,visible),layers),sizeof(double));
+-    const auto extra=feedback_add(feedback_mul(extra_matrix,6),feedback_mul(extra_rows,512));
++    const auto extra=feedback_add(feedback_mul(extra_matrix,6),feedback_mul(extra_rows,512+lift_row_bytes));
+     return {bytes,snapshot,extra};
+ }
+ inline std::shared_ptr<NativeSourceVersionAccount> reserve_native_feedback_workspace(
+--- a/src/models/qwen3_5/program/native_layerwise_frontend.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_frontend.cpp
+@@ -110,7 +110,7 @@
+         throw std::logic_error("native Query admission retained history beyond its aligned source ceiling");
+     const auto& limits=kvmem_options.layerwise;kvmem::validate_layerwise_options(limits);
+     NativeLayerwiseRequestOptions options;
+-    options.prefill={64,kvmem_options.selected_tokens,kvmem_options.reserve_tokens};
++    options.prefill=native_layerwise_prefill_options(kvmem_options.selected_tokens,kvmem_options.reserve_tokens);
+     options.sink_blocks=layerwise_keep_bands.sink_blocks;options.recent_blocks=layerwise_keep_bands.recent_blocks;
+     // The finite retained metadata envelope is partitioned explicitly: source
+     // versions keep3/4, feedback/private reducers1/8, frozen request index1/8.
+--- a/src/models/qwen3_5/program/native_layerwise_request.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_request.cpp
+@@ -26,7 +26,7 @@
+ namespace {
+ bool same_options(const kvmem::LayerwisePrefillOptions& a,const kvmem::LayerwisePrefillOptions& b) {
+     return a.block_tokens==b.block_tokens && a.select_tokens==b.select_tokens &&
+-        a.reserve_tokens==b.reserve_tokens && a.interval==b.interval && a.stride==b.stride && a.half_life==b.half_life;
++        a.reserve_tokens==b.reserve_tokens && a.interval==b.interval && a.stride==b.stride && a.half_life==b.half_life && a.scorer==b.scorer;
+ }
+ bool same_options(const kvmem::LayerwiseOutputOptions& a,const kvmem::LayerwiseOutputOptions& b) {
+     return a.scope==b.scope && a.interval==b.interval && a.decay==b.decay && a.commit_max_bytes==b.commit_max_bytes;
+@@ -37,6 +37,24 @@
+ std::uint64_t checked_sum(std::uint64_t a,std::uint64_t b) {
+     if (b>UINT64_MAX-a) throw std::length_error("native layerwise feedback byte sum overflows");return a+b;
+ }
++}
++
++kvmem::LayerwisePrefillOptions native_layerwise_prefill_options(
++    std::uint64_t selected_tokens,std::uint64_t reserve_tokens) {
++    kvmem::LayerwisePrefillOptions options{64,selected_tokens,reserve_tokens};
++    if (const char* mode=std::getenv("NINFER_LAYERWISE_PRESSURE_SCORER")) {
++        if (std::strcmp(mode,"lift")==0) options.scorer=kvmem::LayerwisePrefillScorer::Lift;
++        else if (std::strcmp(mode,"attention")!=0)
++            throw std::invalid_argument("NINFER_LAYERWISE_PRESSURE_SCORER must be attention or lift");
++    }
++    if (options.scorer==kvmem::LayerwisePrefillScorer::Lift) options.half_life=32768.;
++    if (const char* value=std::getenv("NINFER_LAYERWISE_PREFILL_HALF_LIFE")) {
++        char* end=nullptr;const double half_life=std::strtod(value,&end);
++        if (end==value || *end || !std::isfinite(half_life) || half_life<=0.)
++            throw std::invalid_argument("NINFER_LAYERWISE_PREFILL_HALF_LIFE must be finite and positive");
++        options.half_life=half_life;
++    }
++    return options;
+ }
+ 
+ // Insert after NativeRequest.cpp's checked_product/checked_sum anonymous namespace.
+@@ -437,6 +455,10 @@
+         if (accepted_bytes>available/4 || prompt_bytes>available-4*accepted_bytes)
+             throw std::length_error("native request feedback/parser admission exceeds its explicit host account");
+         prefill=std::make_unique<kvmem::LayerwisePrefillPressure>(sequence.window.stamp.session,models,options.prefill);
++        if (std::getenv("KVMEM_TRACE_LAYERWISE_SELECTION"))
++            std::fprintf(stderr,"KVMEM_PREFILL_POLICY scorer=%s half_life=%.17g stride=%u block_tokens=%u\n",
++                options.prefill.scorer==kvmem::LayerwisePrefillScorer::Lift?"lift":"attention",
++                options.prefill.half_life,options.prefill.stride,options.prefill.block_tokens);
+         const auto& tokenizer=p.parameters.model.resources().tokenizer;
+         const std::array<std::string_view,5> names{"<tool_call>","</tool_call>","<think>","</think>","<|im_start|>"};
+         if (!tokenizer) throw std::logic_error("native output policy requires its actual model tokenizer");
+@@ -625,7 +647,9 @@
+             2*sizeof(kvmem::LayerwisePrefillValue)+4*sizeof(std::uint64_t));
+         if (accepted>UINT64_MAX-growth) throw std::length_error("native feedback admission sum overflows");
+         const auto reducers=checked_product(4,accepted+growth);
+-        const auto controls=checked_product(count+next.rows.size()*3,sizeof(std::int32_t));
++        const auto controls=checked_sum(checked_product(count+next.rows.size()*3,sizeof(std::int32_t)),
++            options.prefill.scorer==kvmem::LayerwisePrefillScorer::Lift ?
++                checked_product(next.rows.size(),kvmem::layerwise_lift_buckets*sizeof(std::uint32_t)) : 0);
+         const bool tensor=!target_heads.empty();
+         // The existing head accumulator owns dense GraphEdges for at most64
+         // sampled rows during a rank callback. Account its complete transient
+--- a/src/models/qwen3_5/program/native_layerwise_request.h
++++ b/src/models/qwen3_5/program/native_layerwise_request.h
+@@ -28,6 +28,9 @@
+     std::uint64_t physical_attention_rows=0,valid_attention_rows=0;
+     std::uint64_t accepted_consumed_tokens=0,discarded_candidate_tokens=0;
+ };
++// One configuration factory for Waiting admission and Active execution.
++kvmem::LayerwisePrefillOptions native_layerwise_prefill_options(
++    std::uint64_t selected_tokens,std::uint64_t reserve_tokens);
+ struct NativeLayerwiseRequestOptions {
+     kvmem::LayerwisePrefillOptions prefill;
+     kvmem::LayerwiseOutputOptions output;
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -3749,7 +3749,7 @@
+         // Graph/cohort adapter prices sizeof its actual Impl and reserves all
+         // three feedback tickets in Waiting; this is not a capacity-only probe.
+         NativeLayerwiseRequest::prepare_feedback_admission(*this,*owner,envelope,
+-            kvmem::LayerwisePrefillOptions{64,kvmem_options.selected_tokens,kvmem_options.reserve_tokens});
++            native_layerwise_prefill_options(kvmem_options.selected_tokens,kvmem_options.reserve_tokens));
+         const auto layout=plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry());
+         std::optional<HostKVPageLayout> auxiliary;
+         if (backend_kv_pages) auxiliary=plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
+--- a/src/models/qwen3_5/program/storage/layerwise_feedback.h
++++ b/src/models/qwen3_5/program/storage/layerwise_feedback.h
+@@ -27,7 +27,7 @@
+     void validate(kvmem::SessionIdentity session,std::uint32_t frontier,std::span<const std::uint32_t> models) const {
+         if (!metadata.account() || metadata.bytes()<allocated_bytes())
+             throw std::logic_error("native accepted feedback has no complete retained metadata lease");
+-        if (prefill.session!=session || prefill.layers.size()!=models.size() ||
++        if (prefill.scorer!=options.scorer || prefill.session!=session || prefill.layers.size()!=models.size() ||
+             (output && (output->session!=session || output->layers.size()!=models.size() || output->accepted_end>frontier)))
+             throw std::logic_error("native feedback snapshot belongs to another accepted owner");
+         for (std::size_t i=0;i<models.size();++i) {
+@@ -52,11 +52,14 @@
+         const auto scalar=[&](double v) {word(std::bit_cast<std::uint64_t>(v));};
+         word(bool(original_query));if (original_query) {word(original_query->begin);word(original_query->end);}
+         word(options.block_tokens);word(options.select_tokens);word(options.reserve_tokens);
+-        word(options.interval);word(options.stride);scalar(options.half_life);
++        word(options.interval);word(options.stride);scalar(options.half_life);word(std::uint64_t(options.scorer));
++        word(std::uint64_t(prefill.scorer));
+         word(prefill.session.id);word(prefill.session.incarnation);word(prefill.layers.size());
+         for (const auto& layer:prefill.layers) {
+             word(layer.model_layer);word(layer.end);word(layer.samples);word(layer.chunks);word(layer.values.size());
+-            for (const auto& value:layer.values) {word(value.original_start);scalar(value.mass);scalar(value.exposure);}
++            for (const auto& value:layer.values) {word(value.original_start);scalar(value.mass);scalar(value.exposure);scalar(value.expected);}
++            for (double value:layer.bucket_mass) scalar(value);
++            for (double value:layer.bucket_pairs) scalar(value);
+         }
+         word(bool(output));
+         if (output) {
+--- a/tests/models/qwen3_5/test_layerwise_multiowner.cpp
++++ b/tests/models/qwen3_5/test_layerwise_multiowner.cpp
+@@ -14,12 +14,13 @@
+ std::vector<std::uint8_t> identity(const NativeLayerwiseFeedbackSnapshot& s) {
+     std::vector<std::uint8_t> bytes;s.append_identity(bytes);return bytes;
+ }
+-void entitlements_and_snapshots() {
++void entitlements_and_snapshots(bool lift=false) {
+     kvmem::LayerwiseRequestEnvelope envelope;
+     envelope.prompt_end=1024;envelope.output_tokens=128;envelope.block_tokens=64;
+     envelope.generation_tokens=128;
+     kvmem::LayerwisePrefillOptions pf;
+     pf.block_tokens=64;pf.select_tokens=256;pf.reserve_tokens=128;pf.stride=1;
++    if (lift) pf.scorer=kvmem::LayerwisePrefillScorer::Lift;
+     const auto plan=plan_native_feedback_workspace(envelope,2048,8,2,64,pf,1024);
+     check(plan.workspace_bytes && plan.snapshot_bytes && plan.query_extra_bytes,"full-envelope entitlement was empty");
+     const auto control_bytes=native_output_fixed_metadata_bytes;
+@@ -34,14 +35,27 @@
+     rejected([&] {reserve_native_feedback_workspace(parent,100,99);});
+     check(parent->charged_bytes()==before,"rejected admission changed existing entitlements");
+     auto live=std::make_shared<NativeLayerwiseFeedbackSnapshot>();
+-    live->options=pf;live->prefill.session={7,3};
++    live->options=pf;live->prefill.session={7,3};live->prefill.scorer=pf.scorer;
+     live->prefill.layers={{2,{{0,7.25,9},{64,.125,3}},128,17,4},{7,{{64,1,2}},128,17,4}};
+     live->output.emplace();live->output->session={7,3};live->output->request=81;
+     live->output->accepted_end=128;live->output->active=true;live->output->parser={true,true,29};
+     live->output->layers={{2,{{0,3.25}},{{64,.75}},5,9},{7,{{64,2}},{{0,.25}},5,9}};
+     live->markers={11,12,13,14,15};live->original_query=KvmemQuerySpan{64,128};
+     live->metadata=active[0]->reserve(live->allocated_bytes());
++    if (lift) for (auto& layer:live->prefill.layers) {
++        for (auto& value:layer.values) value.expected=.125+value.mass*.25;
++        layer.bucket_mass[3]=.25;layer.bucket_pairs[3]=4;
++    }
+     const auto bytes=identity(*live);
++    const auto different=[&](double& value) {
++        const auto saved=value;value+=.5;
++        check(identity(*live)!=bytes,"feedback identity omitted a lift statistic");value=saved;
++    };
++    different(live->prefill.layers[0].values[0].expected);
++    different(live->prefill.layers[0].bucket_mass[3]);
++    different(live->prefill.layers[0].bucket_pairs[3]);
++    live->prefill.scorer=lift?kvmem::LayerwisePrefillScorer::Attention:kvmem::LayerwisePrefillScorer::Lift;
++    check(identity(*live)!=bytes,"feedback identity omitted lift mode");live->prefill.scorer=pf.scorer;
+     auto source=std::make_shared<NativeSourceVersionAccount>(4*plan.snapshot_bytes);
+     auto cp=live->funded_copy(source->reserve(plan.snapshot_bytes));
+     check(identity(*cp)==bytes && cp->metadata.account()==source,"CP funding changed accepted S/M/N/parser/Query values");
+@@ -140,6 +154,6 @@
+     rejected([] {(void)plan_native_output_control(256,255,255,2,SpeculativeBackend::Mtp);});
+ }
+ }
+-int main() {try {entitlements_and_snapshots();row_routing_and_lease();copy_packing_and_control();
++int main() {try {entitlements_and_snapshots();entitlements_and_snapshots(true);row_routing_and_lease();copy_packing_and_control();
+     std::cout<<"multiowner engineering resources/routing/copy/control CPU reference passed\n";return 0;
+ }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+--- a/tests/models/qwen3_5/test_layerwise_program_query.cpp
++++ b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+@@ -1293,7 +1293,7 @@
+             }
+         }
+     }
+-    static void run_no_refresh() {
++    static void run_no_refresh(bool lift=false) {
+         for (const std::uint32_t prefix:{0u,128u}) {
+             DeviceContext device(0);fixture::ModelFixture artifact(true);
+             ninfer::artifact::Reader reader(artifact.file.entry);
+@@ -1341,6 +1341,7 @@
+             const auto visible=program.text_kv_addresses->committed_frontier(*address);
+             check(visible==(prefix?64u:0u),"no-refresh fixture did not establish its physical resident extent");
+             NativeLayerwiseRequestOptions opts;opts.prefill={64,192,192};opts.output.scope=kvmem::LayerwiseOutputScope::NonThinking;
++            if (lift) {opts.prefill.scorer=kvmem::LayerwisePrefillScorer::Lift;opts.prefill.half_life=32768.;}
+             opts.query.transfer_staging_host_bytes=4u<<20;
+             const kvmem::LayerwiseRequestEnvelope envelope{end,64,192,0,false,kvmem::LayerwiseWindowPolicy::Pressure,
+                 kvmem::QueryRange{prefix,end}};
+@@ -1380,7 +1381,53 @@
+             for (std::size_t i=0;i<mass.size();++i) check(pf.values[i].original_start==std::uint64_t(expected_pages[i])*64 &&
+                 std::abs(pf.values[i].mass-mass[i])<3e-3 && std::abs(pf.values[i].exposure-exposure[i])<1e-12,
+                 "atomic no-refresh Prefill differs from independent global rows15/47/79 FP64 mass");
++            if (lift) {
++                // Independent FP64 attention, original logical distances and a
++                // naive matrix normalization; do not reuse the host policy.
++                std::array<double,14> bucket_mass{},bucket_pairs{};
++                std::array<std::vector<double>,3> raw;
++                const std::array<std::uint32_t,3> rows{15,47,79};
++                const auto bucket=[&](std::uint32_t row,std::uint32_t page) {
++                    const auto distance=std::max(0,static_cast<int>(prefix+row)-static_cast<int>((page+1)*64));
++                    const std::array<int,13> ends{32,64,128,256,512,1024,2048,4096,8192,16384,32768,65536,131072};
++                    return std::size_t(std::upper_bound(ends.begin(),ends.end(),distance)-ends.begin());
++                };
++                for (std::size_t row=0;row<rows.size();++row) {
++                    raw[row]=reference_mass(staged.prompt.token_ids,expected_pages,prefix+rows[row]);
++                    for (std::size_t col=0;col<expected_pages.size();++col) if (col*64<=visible+rows[row]) {
++                        const auto b=bucket(rows[row],expected_pages[col]);
++                        bucket_mass[b]+=raw[row][col];bucket_pairs[b]+=1;
++                    }
++                }
++                std::vector<double> expected(expected_pages.size());
++                for (auto row:rows) {
++                    std::vector<double> weights(expected_pages.size());double total=0;
++                    for (std::size_t col=0;col<weights.size();++col) if (col*64<=visible+row) {
++                        const auto b=bucket(row,expected_pages[col]);
++                        weights[col]=bucket_mass[b]/bucket_pairs[b];total+=weights[col];
++                    }
++                    for (std::size_t col=0;col<weights.size();++col) expected[col]+=weights[col]/total/3;
++                }
++                check(feedback.prefill.scorer==kvmem::LayerwisePrefillScorer::Lift,"native lift lost its scoring mode");
++                for (std::size_t i=0;i<expected.size();++i)
++                    check(std::abs(pf.values[i].expected-expected[i])<3e-3,"native lift expected mass differs from independent FP64 attention");
++                for (std::size_t b=0;b<14;++b)
++                    check(pf.bucket_pairs[b]==bucket_pairs[b] && std::abs(pf.bucket_mass[b]-bucket_mass[b])<1e-2,
++                        "native lift profile differs from original-coordinate FP64 attention");
++            }
+             native.retire();sequence.window.layerwise_request.reset();request.retire();
++            if (lift) {
++                program.copy_tail(sequence,program.prefill_hidden.slice(1,15,1));
++                auto checkpoint=program.capture_memory_checkpoint(sequence);
++                check(checkpoint && checkpoint->layer_views.feedback,"lift checkpoint omitted accepted policy state");
++                std::vector<std::uint8_t> before,after;
++                checkpoint->layer_views.feedback->append_identity(before);
++                sequence.window.layer_views.feedback.reset();
++                program.restore_memory_prefix(sequence,*checkpoint,true,false);
++                check(bool(sequence.window.layer_views.feedback),"lift checkpoint restore lost accepted policy state");
++                sequence.window.layer_views.feedback->append_identity(after);
++                check(before==after,"lift checkpoint restore changed expected attention or distance profile");
++            }
+             check(program.text_kv_addresses->release_after_deactivate(*address),"no-refresh fixture leaked native address");sequence.kv.reset();
+             check(program.state_store->release(*state),"no-refresh fixture leaked native StateImage");sequence.state={};
+         }
+@@ -1615,6 +1662,6 @@
+             qwen::detail::NativeLayerwiseQueryFixture::run_mtp(argv[2],mode=="cancel"?2:1);return 0;}
+         catch(const std::exception& error) {std::cerr<<"FAIL MTP Output "<<error.what()<<'\n';return 1;}
+     }
+-    try {qwen::detail::NativeLayerwiseQueryFixture::run_public_owner();qwen::detail::NativeLayerwiseQueryFixture::run_public_owner(true);qwen::detail::NativeLayerwiseQueryFixture::run_public_owner(false,32);qwen::detail::NativeLayerwiseQueryFixture::run();qwen::detail::NativeLayerwiseQueryFixture::run_branch();qwen::detail::NativeLayerwiseQueryFixture::run_no_refresh();return 0;}
++    try {qwen::detail::NativeLayerwiseQueryFixture::run_public_owner();qwen::detail::NativeLayerwiseQueryFixture::run_public_owner(true);qwen::detail::NativeLayerwiseQueryFixture::run_public_owner(false,32);qwen::detail::NativeLayerwiseQueryFixture::run();qwen::detail::NativeLayerwiseQueryFixture::run_branch();qwen::detail::NativeLayerwiseQueryFixture::run_no_refresh();qwen::detail::NativeLayerwiseQueryFixture::run_no_refresh(true);return 0;}
+     catch (const std::exception& error) {std::cerr<<"FAIL "<<error.what()<<'\n';return 1;}
+ }

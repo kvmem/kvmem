@@ -36,6 +36,10 @@ static auto proof(const std::vector<int32_t>& input, bool continuation = true) {
 }
 
 static void policy_tests() {
+    check(admit_content_history(0, 0) && admit_content_history(4095, 0), "zero disables history filtering");
+    check(!admit_content_history(4095, 4096) && admit_content_history(4096, 4096) &&
+        admit_content_history(4097, 4096), "minimum is inclusive without page alignment");
+    check(admit_content_history(100000 + 30, 4096), "long history with short append remains eligible");
     const std::vector<ContentCacheCandidate> candidates{
         {0, 100, 10, 3, true}, {1, 200, 40, 9, false},
         {2, 200, 20, 1, true}, {3, 200, 20, 5, true}, {4, 0, 0, 99, true}};

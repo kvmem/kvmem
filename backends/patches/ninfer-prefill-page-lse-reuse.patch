@@ -1,0 +1,627 @@
+diff --git a/docs/serving.md b/docs/serving.md
+index c2bd35603485860629eacc28917affaa519630ea..62bc1e5c3e62612847b5165f293f89de751e9a02 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -3031,6 +3031,18 @@ prepared prompt's original tokens and tokenizer provenance.
+ 
+ ### KVMem statistics extension
+ 
++For experimental single-GPU Qwen prefill, `NINFER_PREFILL_PAGE_LSE_REUSE=1`
++records the already-computed softmax tile weights for the existing sampled
++queries. On the D256, 24-query-head / 4-KV-head, plain FP8 cache prompt route
++used on Ada, adjacent tiles contribute to each 64-token logical page. Each head
++is normalized over the whole visible cache before averaging. Query selection,
++Mean-K granularity, KV budget and sampling cadence are unchanged. The capture
++uses the existing feedback scratch. Decode, Query replay, incompatible shapes,
++short-row routes and unsupported devices use the existing computation. Leave the
++variable unset for the reference page-statistics route. The prompt kernel rounds
++its rotated Q and decoded K to BF16: its page probabilities need not be bitwise
++equal to the reference FP32 dot-product statistics, especially near a ranking tie.
++
+ KVMem's Qwen3.5-core dense path supports explicit heads tensor parallelism:
+ `--devices 0,1 --tensor-parallel --tensor-attention heads`. Merely selecting two
+ devices retains layer-pipeline placement. Optional `--tensor-split 3,1` weights
+diff --git a/include/ninfer/ops/prompt_page_lse.h b/include/ninfer/ops/prompt_page_lse.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a787825156a0fe211ed7d521c6e3377491b2411
+--- /dev/null
++++ b/include/ninfer/ops/prompt_page_lse.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include "ninfer/ops/softmax_attention.h"
++
++namespace ninfer::ops {
++// Eager single-sequence prompt feedback. Row IDs are relative to this physical
++// call, strictly increasing; CUDA copies them as launch parameters. scratch is
++// caller-owned contiguous FP32 [page,head,sample] and lives through reduction.
++// Unsupported attention routes leave captured=false and perform normal attention.
++struct PromptPageLse {
++    static constexpr int max_samples = 64;
++    Tensor scratch;
++    std::int32_t rows[max_samples]{};
++    std::int32_t count = 0;
++    bool captured = false;
++};
++void causal_softmax_attention_with_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
++    const Tensor& positions, const Tensor& valid_columns, const Tensor& kv_table_rows,
++    AttentionHeadGeometry geometry, float scale, PagedKVBatchLayerView cache,
++    CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
++    cudaStream_t stream, const Tensor* gate, Tensor* partial, PromptPageLse* capture);
++
++// Normalize the captured natural-log page sums over all visible pages per head,
++// then average heads, exactly as in the independent attention_page_mass path.
++void attention_page_mass_from_lse(const Tensor& scratch, Tensor& norms, Tensor& output,
++    cudaStream_t stream);
++} // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/execution/attention.h b/src/models/qwen3_5/execution/attention.h
+index 95061b32c2b84ed0165ef09d0490622c75cb07df..42b1e5fc702766f4fd21ae831455fc0abcdd251c 100644
+--- a/src/models/qwen3_5/execution/attention.h
++++ b/src/models/qwen3_5/execution/attention.h
+@@ -5,6 +5,8 @@
+ #include "ninfer/ops/rope.h"
+ #include "models/qwen3_5/execution/memory_statistics.h"
+ 
++namespace ninfer::ops { struct PromptPageLse; }
++
+ namespace ninfer::models::qwen3_5::execution {
+ 
+ struct CurrentLayerQueryIdentity {
+@@ -33,6 +35,7 @@ struct CurrentLayerAttentionFrame {
+     const Tensor& cache_positions;
+     const Tensor& table_rows;
+     cudaStream_t producer_stream;
++    const ops::PromptPageLse* page_lse = nullptr;
+ };
+ 
+ // Borrowed from the owning Program for eager Query execution only. A captured
+@@ -50,6 +53,8 @@ struct CurrentLayerQueryBoundary {
+     // KV append/attention. A read-only native mass capture must drain before
+     // returning; publication still waits for whole-model accepted completion.
+     void (*attended)(void* owner, const CurrentLayerAttentionFrame&) = nullptr;
++    // Optional eager prefill scratch, owned by this request; never on graph replay.
++    bool (*prepare_page_lse)(void*, const CurrentLayerAttentionFrame&, ops::PromptPageLse&) = nullptr;
+ };
+ 
+ // Explicit target Output batch observer. This is not a projected Query hook
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index 95493ffcbb44b6dfcea0f667978eeaf45267b865..f1c3beed802df2158ea2665c1e6ef93cb908a74f 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -1,4 +1,5 @@
+ #include "models/qwen3_5/execution/layerwise_graph_capture.h"
++#include "ninfer/ops/prompt_page_lse.h"
+ #include "models/qwen3_5/program/internal.h"
+ #include "models/qwen3_5/execution/text.h"
+ #include "models/qwen3_5/execution/attention.h"
+@@ -1970,11 +1971,19 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+         capture_layerwise_graph_attention(*layerwise_graph_capture_,model_layer,
+             static_cast<std::uint32_t>(fidx),ctx_.active_rank(),qn,cache_positions,kv_table_rows,s);
+     }
++    CurrentLayerAttentionFrame frame{{model_layer,static_cast<std::uint32_t>(fidx),ctx_.active_rank()},
++                                     qn,cache_positions,kv_table_rows,s};
++    ops::PromptPageLse feedback;
++    auto* boundary=current_layer_query_boundary_;
++    const bool requested=boundary && boundary->prepare_page_lse && ph==Phase::Prefill &&
++        active_sequence_batch_==0 && active_segments_.empty() && !attention_partial_ &&
++        boundary->prepare_page_lse(boundary->owner,frame,feedback);
+     attn_consume(w, x, fidx, ph, qn, kn, v, gate, a, cache_positions, kv_table_rows,
+-                 *active_causal_attention_envelope_);
+-    if (current_layer_query_boundary_ != nullptr && current_layer_query_boundary_->attended != nullptr)
+-        current_layer_query_boundary_->attended(current_layer_query_boundary_->owner,
+-            {{model_layer,static_cast<std::uint32_t>(fidx),ctx_.active_rank()},qn,cache_positions,kv_table_rows,s});
++                 *active_causal_attention_envelope_,requested?&feedback:nullptr);
++    if (boundary && boundary->attended) {
++        if (requested && feedback.captured) frame.page_lse=&feedback;
++        boundary->attended(boundary->owner,frame);
++    }
+     if (layerwise_output_batch_observer_)
+         layerwise_output_batch_observer_->attended(layerwise_output_batch_observer_->owner,
+             {{model_layer,static_cast<std::uint32_t>(fidx),ctx_.active_rank()},qn,cache_positions,kv_table_rows,s});
+@@ -2063,7 +2072,7 @@ void TextContext::capture_post_rope_query(const Tensor& qn, int fidx, const Memo
+ void TextContext::attn_consume(const BlockParameters& w, Tensor& x, int fidx, Phase ph,
+     Tensor qn, Tensor kn, Tensor v, Tensor gate, Tensor a,
+     const Tensor& cache_positions, const Tensor& kv_table_rows,
+-    ops::CausalAttentionExecutionEnvelope input_envelope) {
++    ops::CausalAttentionExecutionEnvelope input_envelope, ops::PromptPageLse* capture) {
+     const auto& p = std::get<AttentionParameters>(w.mixer);
+     const auto s = ctx_.stream;
+     const auto T = x.ne[1];
+@@ -2150,14 +2159,14 @@ void TextContext::attn_consume(const BlockParameters& w, Tensor& x, int fidx, Ph
+         }
+     } else {
+         Tensor partial = positions ? partial_of(0, T) : Tensor{};
+-        ops::causal_softmax_attention(
++        ops::causal_softmax_attention_with_page_lse(
+             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+             {dimension(config.attention->head_dim),
+              dimension(config.attention->num_attention_heads),
+              dimension(config.attention->num_key_value_heads)},
+             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config.attention->head_dim))),
+             batch_text_kv_->batch_layer_view(fidx, kv_rank), envelope, work_, a, s,
+-            rotated_output || positions ? nullptr : &gate, positions ? &partial : nullptr);
++            rotated_output || positions ? nullptr : &gate, positions ? &partial : nullptr, capture);
+     }
+     if (positions) {
+         // The rank's query heads' gates, contiguous for the merge.
+diff --git a/src/models/qwen3_5/execution/text.h b/src/models/qwen3_5/execution/text.h
+index dcd8aa6366ffeaa894998be0a1299f663ebd1b87..83b277f44d3d857c82dcff4235907ffc1be677f7 100644
+--- a/src/models/qwen3_5/execution/text.h
++++ b/src/models/qwen3_5/execution/text.h
+@@ -12,6 +12,7 @@
+ #include "ninfer/ops/rope.h"
+ #include "ninfer/ops/sampling.h"
+ #include "ninfer/ops/softmax_attention.h"
++namespace ninfer::ops { struct PromptPageLse; }
+ #include "ninfer/ops/sparse_moe.h"
+ #include "models/qwen3_5/state/decoder_state.h"
+ #include "models/qwen3_5/frontend/prepared_prompt.h"
+@@ -360,7 +361,7 @@ private:
+     void attn_consume(const BlockParameters&, Tensor& residual, int index, Phase,
+                       Tensor query, Tensor key, Tensor value, Tensor gate, Tensor attention,
+                       const Tensor& cache_positions, const Tensor& table_rows,
+-                      ops::CausalAttentionExecutionEnvelope);
++                      ops::CausalAttentionExecutionEnvelope, ops::PromptPageLse* = nullptr);
+     const MemoryStatisticsShard* memory_statistics_for_layer(int index,
+         MemoryStatisticsShard& local, std::int32_t& statistics_layer) const;
+     void capture_post_rope_query(const Tensor&, int index, const MemoryStatisticsShard*);
+diff --git a/src/models/qwen3_5/program/native_layerwise_request.cpp b/src/models/qwen3_5/program/native_layerwise_request.cpp
+index 301bf7f97d287294aecd2fea89db9cf5622edac5..cff6f176865500bc644022c9368a51530a1cbe6b 100644
+--- a/src/models/qwen3_5/program/native_layerwise_request.cpp
++++ b/src/models/qwen3_5/program/native_layerwise_request.cpp
+@@ -10,6 +10,7 @@
+ #include "models/qwen3_5/frontend/tokenizer.h"
+ #include "models/qwen3_5/program/storage/attention_feedback_mass.h"
+ #include "ninfer/ops/attention_page_mass.h"
++#include "ninfer/ops/prompt_page_lse.h"
+ #include "kvmem/layerwise_import.hpp"
+ 
+ #include <algorithm>
+@@ -471,6 +472,10 @@ struct NativeLayerwiseRequest::Impl {
+         // begin() parses the complete trusted prompt and resets this distinct
+         // request's N before its first prefill; old accepted S remains available.
+         if (output) output->begin(sequence.window.stamp,id,std::vector<std::uint32_t>(input->token_ids.begin(),input->token_ids.end()));
++        if (flag("NINFER_PREFILL_PAGE_LSE_REUSE"))
++            boundary.prepare_page_lse=[](void* owner,const execution::CurrentLayerAttentionFrame& f,ops::PromptPageLse& dst) {
++                return static_cast<Impl*>(owner)->prepare_page_lse(f,dst);
++            };
+         boundary.owner=this;boundary.attended=[](void* owner,const execution::CurrentLayerAttentionFrame& frame) {
+             static_cast<Impl*>(owner)->attended(frame);
+         };
+@@ -674,6 +679,24 @@ struct NativeLayerwiseRequest::Impl {
+             found->history.push_back(std::uint64_t(id)*64);
+         if (found->history.size()!=found->starts.size()) throw std::logic_error("native Query feedback lost restored layer identity");
+     }
++    bool prepare_page_lse(const execution::CurrentLayerAttentionFrame& frame,ops::PromptPageLse& dst) {
++        if (!capture || capture->query || capture->output || graph_epoch || !target_heads.empty() ||
++            p.device.size()!=1 || frame.identity.rank!=0 || frame.query.ne[2]<=64) return false;
++        const auto& c=*capture;
++        const auto l=std::find_if(c.layers.begin(),c.layers.end(),[&](const auto& x){return x.model_layer==frame.identity.model_layer;});
++        if (l==c.layers.end()) return false;
++        const auto seen=c.seen.at(l-c.layers.begin());
++        const auto end=std::uint64_t(seen)+frame.query.ne[2];
++        if (end>c.count) return false;
++        const auto lo=std::lower_bound(c.rows.begin(),c.rows.end(),seen);
++        const auto hi=std::lower_bound(lo,c.rows.end(),end);
++        if (lo==hi || hi-lo>ops::PromptPageLse::max_samples) return false;
++        dst.count=static_cast<int>(hi-lo);
++        std::transform(lo,hi,dst.rows,[seen](auto r){return std::int32_t(r-seen);});
++        dst.scratch=p.memory_statistics->ranks.at(0).attention_scratch.slice(2,0,dst.count);
++        return true;
++    }
++    bool reported_page_reuse=false;
+     void attended(const execution::CurrentLayerAttentionFrame& frame) {
+         owner();const bool tensor=!target_heads.empty();
+         if (!capture || frame.identity.model_layer>=p.parameters.text.layers.size() ||
+@@ -813,7 +836,19 @@ struct NativeLayerwiseRequest::Impl {
+                     events.initialize();
+                     CUDA_CHECK(cudaEventRecord(events.begin,frame.producer_stream));
+                 }
+-                ops::attention_page_mass(frame.query,rows,ends,table,cache,scratch,norms,mass,frame.producer_stream);
++                if (const auto* reused=frame.page_lse) {
++                    if (first || reused->count!=static_cast<int>(selected.size()) ||
++                        reused->scratch.data!=scratch.data || !std::equal(selected.begin(),selected.end(),reused->rows))
++                        throw std::logic_error("prefill page capture changed its sample ownership");
++                    ops::attention_page_mass_from_lse(scratch,norms,mass,frame.producer_stream);
++                    if (!reported_page_reuse) {
++                        std::fprintf(stderr,"[kvmem] reused prefill QK: model_layer=%u samples=%d pages=%d\n",
++                            frame.identity.model_layer,n,int(scratch.ne[0]));
++                        reported_page_reuse=true;
++                    }
++                } else {
++                    ops::attention_page_mass(frame.query,rows,ends,table,cache,scratch,norms,mass,frame.producer_stream);
++                }
+                 if (sample_device) CUDA_CHECK(cudaEventRecord(events.kernel_done,frame.producer_stream));
+                 CUDA_CHECK(cudaMemcpyAsync(staging.data(),mass.data,bytes,cudaMemcpyDeviceToHost,frame.producer_stream));
+                 if (sample_device) CUDA_CHECK(cudaEventRecord(events.copy_done,frame.producer_stream));
+diff --git a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+index fa45b2d3c1e53048cdcf697bd0025a89a060e9c6..4e568e9378653945b0cb79201ed53a963df6bc57 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+@@ -2,6 +2,7 @@
+ #include "ninfer/ops/softmax_attention.h"
+ 
+ #include "ninfer/ops/sigmoid_mul.h"
++#include "ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h"
+ 
+ #include "core/layout.h"
+ #include "core/device.h"
+@@ -779,6 +780,18 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                               Tensor& out, cudaStream_t stream, const Tensor* gate,
+                               Tensor* partial) {
++    causal_softmax_attention_with_page_lse(q, k, v, positions, valid_columns, kv_table_rows,
++        geometry, scale, cache, envelope, workspace, out, stream, gate, partial, nullptr);
++}
++
++void causal_softmax_attention_with_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
++                              const Tensor& positions, const Tensor& valid_columns,
++                              const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
++                              float scale, PagedKVBatchLayerView cache,
++                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
++                              Tensor& out, cudaStream_t stream, const Tensor* gate,
++                              Tensor* partial, PromptPageLse* capture) {
++    if (capture) capture->captured = false;
+     constexpr const char* op = "causal_softmax_attention";
+     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
+                                        geometry, envelope, scale, op);
+@@ -905,6 +918,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+         if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
+         return;
+     }
++    if (capture && batch == 1 && !valid_columns.data && cache.storage == KvCacheStorage::Fp8E4M3Row256 &&
++        q.ne[1] == 24 && kv_heads == 4 && detail::try_prompt_fp8_page_lse(
++            q, k, v, positions, kv_table_rows, scale, cache, envelope.max_visible_keys, out, stream, *capture)) {
++        capture->captured = true;
++        if (gate) sigmoid_mul(*gate, out, stream);
++        return;
++    }
+     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                            cache, envelope.max_visible_keys, workspace, out,
+                                            envelope.fast_prompt_kernel, stream);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
+index 413640f6bb13e769891b394de33c7c55eb5be282..c457da7b944aafd6674eacbde986f0726e214f86 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
+@@ -6,6 +6,9 @@
+ #include "ops/kv_cache/append/launch.h"
+ #include "ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh"
+ #include "ops/kv_cache/plane_types.h"
++#include "ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h"
++#include <algorithm>
++#include <climits>
+ 
+ #include <cstdint>
+ 
+@@ -34,7 +37,7 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
+         kernel<<<grid, kCausalPromptFp8Threads, Shape::SmemBytes, stream>>>(
+             static_cast<const __nv_bfloat16*>(q.data), cache_k_ptr, cache_v_ptr, k_scale_ptr,
+             v_scale_ptr, metadata, static_cast<const std::int32_t*>(positions.data), scale,
+-            static_cast<__nv_bfloat16*>(out.data), tokens);
++            static_cast<__nv_bfloat16*>(out.data), tokens, {});
+     });
+     CUDA_CHECK(cudaGetLastError());
+ }
+@@ -84,4 +87,48 @@ void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const
+     }
+ }
+ 
++namespace {
++__global__ void clear_prompt_page_lse(float* values, int n) {
++    const int i = blockIdx.x*blockDim.x+threadIdx.x;
++    if (i<n) values[i]=-CUDART_INF_F;
++}
++}
++
++bool try_prompt_fp8_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
++    const Tensor& positions, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
++    std::uint32_t max_visible, Tensor& out, cudaStream_t stream, PromptPageLse& capture) {
++    // This implementation was qualified on the Ada wide-BF16-MMA FP8 route.
++    if (current_device_tier() != DeviceTier::Ampere) return false;
++    const auto& scratch = capture.scratch;
++    const int n=capture.count;
++    if (n<=0 || n>PromptPageLse::max_samples || scratch.dtype!=DType::FP32 ||
++        !scratch.data || !scratch.is_contiguous() || scratch.ne[0]<=0 || scratch.ne[0]>cache.block_tables.ne[0] ||
++        std::uint64_t(scratch.ne[0])*64<max_visible ||
++        scratch.ne[1]!=q.ne[1] || scratch.ne[2]!=n || scratch.ne[3]!=1 ||
++        scratch.numel()>INT_MAX) return false;
++    for (int i=0;i<n;++i)
++        if (capture.rows[i]<0 || capture.rows[i]>=q.ne[2] || (i && capture.rows[i]<=capture.rows[i-1]))
++            return false;
++    using Shape=CausalPromptFp8Shape<false>;
++    using Metadata=PagedKVBatchMetadata<false>;
++    const Metadata meta{.tables=static_cast<const int*>(cache.block_tables.data),
++        .valid_columns=nullptr, .table_rows=static_cast<const int*>(table_rows.data),
++        .table_stride=cache.block_tables.ne[0]};
++    PromptPageLseTile tile{static_cast<float*>(scratch.data),int(scratch.ne[0]),n,{}};
++    std::copy_n(capture.rows,n,tile.rows);
++    kv_cache_append_batch_launch(k,v,positions,Tensor{},table_rows,cache,stream);
++    // The CTA only traverses its visible prefix. Clear non-visible capacity,
++    // including stale values from the previous layer, to zero probability.
++    clear_prompt_page_lse<<<(int(scratch.numel())+255)/256,256,0,stream>>>(tile.values,int(scratch.numel()));
++    const auto kernel=causal_attention_prompt_fp8_kernel<CausalD256H24Kv4,Metadata,false,PromptPageLseTile>;
++    raise_dynamic_shared_memory(kernel,Shape::SmemBytes);
++    const dim3 grid(unsigned(div_up(int(q.ne[2]),Shape::Br)),unsigned(q.ne[1]),1);
++    kernel<<<grid,kCausalPromptFp8Threads,Shape::SmemBytes,stream>>>(
++        static_cast<const __nv_bfloat16*>(q.data),static_cast<const std::uint8_t*>(cache.k_pages.data),
++        static_cast<const std::uint8_t*>(cache.v_pages.data),static_cast<const __half*>(cache.k_scale_pages.data),
++        static_cast<const __half*>(cache.v_scale_pages.data),meta,static_cast<const int*>(positions.data),scale,
++        static_cast<__nv_bfloat16*>(out.data),int(q.ne[2]),tile);
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh
+index 21a1bd0c84786fb98b7fb99fc8bd9699150352bf..1aa8b17b1d379e37f4fb135af073b0ff6ec1b023 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh
+@@ -21,6 +21,7 @@
+ #include <math_constants.h>
+ 
+ #include <cstdint>
++#include <type_traits>
+ 
+ namespace ninfer::ops {
+ 
+@@ -67,13 +68,28 @@ struct CausalPromptFp8Shape {
+     static_assert(SmemBytes <= shape_max_shared_bytes_per_block(TuringShapes));
+ };
+ 
+-template <typename Geometry, typename Metadata, bool TuringShapes>
++struct NoPromptPageLse {};
++struct PromptPageLseTile {
++    float* values;
++    int pages, samples;
++    int rows[64];
++    __device__ __forceinline__ int slot(int row) const {
++        int lo=0, hi=samples;
++        while (lo<hi) {
++            const int m=(lo+hi)/2;
++            if (rows[m]<row) lo=m+1; else hi=m;
++        }
++        return lo<samples && rows[lo]==row ? lo : -1;
++    }
++};
++
++template <typename Geometry, typename Metadata, bool TuringShapes, typename Feedback = NoPromptPageLse>
+ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
+     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
+     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
+     const __half* __restrict__ cache_v_scale, Metadata metadata,
+     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
+-    std::int32_t width) {
++    std::int32_t width, const __grid_constant__ Feedback feedback) {
+     if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
+     using Shape                                 = CausalPromptFp8Shape<TuringShapes>;
+     constexpr int kCausalPromptFp8Br            = Shape::Br;
+@@ -256,6 +272,18 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
+ #pragma unroll
+         for (int i = 0; i < 4; ++i) acc[n][i] = 0.0F;
+     }
++    // One producer lane owns two Q rows. Find their sample slots once per CTA,
++    // before the history loop. Off specialization has no row lookup or stores.
++    constexpr bool Capture = !std::is_same_v<Feedback, NoPromptPageLse>;
++    int slot0 = -1, slot1 = -1;
++    float page_sum0 = 0, page_sum1 = 0;
++    if constexpr (Capture) {
++        if (warp < ProducerWarps && !(warp & 1) && lid == 0) {
++            const int row = q0 + (warp >> 1)*16 + gid;
++            slot0 = feedback.slot(row);
++            slot1 = feedback.slot(row + 8);
++        }
++    }
+     const float scale_l2 = scale * Log2E;
+     for (int kb = 0; kb < key_blocks; ++kb) {
+         const int k0 = kb * Bc;
+@@ -370,6 +398,24 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
+                 running_m_s[row1]   = nm1;
+                 alpha_s[row0]       = alpha0;
+                 alpha_s[row1]       = alpha1;
++                if constexpr (Capture) {
++                    static_assert(64 % Bc == 0);
++                    // tile_l is already masked and expressed at the current running
++                    // max. When that max changes inside a page, rescale its earlier
++                    // piece by alpha; reset at each logical 64-token boundary.
++                    const bool first = k0 % 64 == 0;
++                    const bool last = (k0 + Bc) % 64 == 0 || kb + 1 == key_blocks;
++                    auto record = [&](int slot, float& acc_page, float l, float a, float m) {
++                        if (slot < 0) return;
++                        acc_page = first ? l : __fmaf_rn(acc_page, a, l);
++                        if (last) {
++                            const size_t at = (size_t(slot)*q_heads+q_head)*feedback.pages + k0/64;
++                            feedback.values[at] = acc_page > 0 ? m*scale+logf(acc_page) : -CUDART_INF_F;
++                        }
++                    };
++                    record(slot0, page_sum0, tile_l0, alpha0, nm0);
++                    record(slot1, page_sum1, tile_l1, alpha1, nm1);
++                }
+             }
+         } else if (!kCausalPromptFp8CompactKV && warp < ProducerWarps + VWorkerWarps) {
+             const int worker_tid = tid - ProducerWarps * 32;
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h b/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f1629ffdfb40031b41f2a71b06b6979daa3245d
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_page_lse_launch.h
+@@ -0,0 +1,8 @@
++#pragma once
++#include "ninfer/ops/prompt_page_lse.h"
++
++namespace ninfer::ops::detail {
++bool try_prompt_fp8_page_lse(const Tensor& q, const Tensor& k, const Tensor& v,
++    const Tensor& positions, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
++    std::uint32_t max_visible, Tensor& out, cudaStream_t stream, PromptPageLse&);
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/token_sums/attention_page_mass.cu b/src/ops/token_sums/attention_page_mass.cu
+index 4c6f022f55cd33d0c06e7a0f0f72ac471aa23890..247d5a6b7431caa186b87a779a1278e23c842f79 100644
+--- a/src/ops/token_sums/attention_page_mass.cu
++++ b/src/ops/token_sums/attention_page_mass.cu
+@@ -1,4 +1,5 @@
+ #include "ninfer/ops/attention_page_mass.h"
++#include "ninfer/ops/prompt_page_lse.h"
+ #include "ops/kv_cache/d256_profile.h"
+ #include "ops/kv_cache/hadamard_d256.cuh"
+ #include "ops/kv_cache/int8_g64_codec.cuh"
+@@ -190,6 +191,18 @@ void attention_page_mass(const Tensor& q,const Tensor& rows,const Tensor& positi
+         tables,cache.k_pages.data,cache.k_scale_pages.data,cache.storage,heads,cache.num_kv_heads,pages,
+         cache.k_pages.ne[3],static_cast<float*>(scratch.data));
+     }
++    attention_page_mass_from_lse(scratch,norms,output,stream);
++}
++
++void attention_page_mass_from_lse(const Tensor& scratch, Tensor& norms, Tensor& output, cudaStream_t stream) {
++    const int pages=scratch.ne[0], heads=scratch.ne[1], samples=scratch.ne[2];
++    if (pages<=0 || heads<=0 || samples<=0 || samples>64 || scratch.ne[3]!=1 ||
++        norms.ne[0]!=2 || norms.ne[1]!=heads || norms.ne[2]!=samples || norms.ne[3]!=1 ||
++        output.ne[0]!=pages || output.ne[1]!=samples || output.ne[2]!=1 || output.ne[3]!=1 ||
++        !scratch.data || !norms.data || !output.data || !scratch.is_contiguous() ||
++        !norms.is_contiguous() || !output.is_contiguous() || scratch.dtype!=DType::FP32 ||
++        norms.dtype!=DType::FP32 || output.dtype!=DType::FP32)
++        throw std::invalid_argument("attention_page_mass_from_lse: invalid buffers");
+     normalize_lse<<<unsigned(samples*heads),128,0,stream>>>(static_cast<const float*>(scratch.data),pages,static_cast<float*>(norms.data));
+     average_heads<<<dim3(unsigned((pages+127)/128),unsigned(samples)),128,0,stream>>>(
+         static_cast<const float*>(scratch.data),static_cast<const float*>(norms.data),pages,heads,static_cast<float*>(output.data));
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index cc40156223ed73b27e2171dd42c6157a3d686d1f..435418d7fc09c6055538f2de9096aeca6299d69a 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -172,6 +172,9 @@ ninfer_op_oracle_options(ninfer_token_sums)
+ ninfer_add_test(ninfer_attention_page_mass STANDALONE
+   SOURCES experimental/attention_page_mass.cpp LIBRARIES ninfer_ops)
+ ninfer_op_oracle_options(ninfer_attention_page_mass)
++ninfer_add_test(ninfer_prompt_page_lse STANDALONE
++  SOURCES experimental/prompt_page_lse.cpp LIBRARIES ninfer_ops)
++ninfer_op_oracle_options(ninfer_prompt_page_lse)
+ ninfer_add_test(ninfer_p4_retrieval STANDALONE
+   SOURCES experimental/p4_retrieval.cpp LIBRARIES ninfer::engine)
+ ninfer_stage_runtime_dlls(ninfer_p4_retrieval)
+diff --git a/tests/experimental/prompt_page_lse.cpp b/tests/experimental/prompt_page_lse.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5324f72930f6344d78e229b1aadb6e6e0de98e51
+--- /dev/null
++++ b/tests/experimental/prompt_page_lse.cpp
+@@ -0,0 +1,124 @@
++// Oracle uses represented BF16 Q and the FP8 K codes/scales read back AFTER the
++// actual append. It never uses a CUDA dot product or the main attention's logits.
++#include "ninfer/ops/attention_page_mass.h"
++#include "ninfer/ops/prompt_page_lse.h"
++#include "ops/op_tester.h"
++#include <bit>
++#include <numeric>
++using namespace ninfer;
++using namespace ninfer::test;
++
++static double fp8(unsigned b) {
++    const unsigned e=(b>>3)&15, m=b&7;
++    if (e==15 && m==7) throw std::runtime_error("NaN in represented key");
++    return (b&128?-1:1)*(e?std::ldexp(1.+m/8.,int(e)-7):std::ldexp(double(m),-9));
++}
++static double half_scale(unsigned b) {
++    const unsigned e=(b>>10)&31, m=b&1023;
++    if ((b&32768)||e==31) throw std::runtime_error("invalid represented row scale");
++    return e?std::ldexp(1.+m/1024.,int(e)-15):std::ldexp(double(m),-24);
++}
++
++static void qualify(int base,int width,std::vector<int> samples) {
++    constexpr int D=256,H=24,K=4;
++    const int end=base+width, pages=(end+63)/64+2, capacity=pages+3, S=int(samples.size());
++    const size_t nk=size_t(capacity)*K*64, nq=size_t(width)*H*D;
++    std::mt19937 rng(20261113+base);
++    std::uniform_real_distribution<float> uniform(-1.6f,1.6f);
++    std::vector<std::uint16_t> q(nq), k(size_t(width)*K*D), v(k.size());
++    for (auto& x:q) x=f32_to_bf16(uniform(rng));
++    for (auto& x:k) x=f32_to_bf16(uniform(rng));
++    for (auto& x:v) x=f32_to_bf16(uniform(rng)*.7f);
++    std::vector<std::uint8_t> codes(nk*D); std::vector<std::uint16_t> scales(nk);
++    for (size_t i=0;i<nk;++i) {
++        scales[i]=std::uint16_t(0x2400+(i%19)*67);
++        for(int d=0;d<D;++d) codes[i*D+d]=std::uint8_t((rng()%127)|((rng()%2)*128));
++    }
++    // A nonzero table slot and nonmonotone physical addresses exercise logical
++    // page order. More table capacity than feedback pages exercises the bound.
++    std::vector<int> table(capacity*2,-1);
++    for(int i=0;i<capacity;++i) table[capacity+i]=capacity-1-i;
++    std::vector<int> pos(width), limits(S);
++    std::iota(pos.begin(),pos.end(),base);
++    for(int i=0;i<S;++i) limits[i]=pos.at(samples[i]);
++    auto dq=to_device(q), dk=to_device(k), dv=to_device(v), dt=to_device(table);
++    auto pc=to_device(codes), pv=to_device(codes), ps=to_device(scales), vs=to_device(scales);
++    auto dp=to_device(pos), dtr=to_device(std::vector<int>{1}), dr=to_device(samples), de=to_device(limits);
++    DeviceBuffer result(nq*2), other(nq*2), scratch(size_t(pages)*H*S*4), norms(size_t(2)*H*S*4), mass(size_t(pages)*S*4);
++    Tensor qt(dq.p,DType::BF16,{D,H,width}),kt(dk.p,DType::BF16,{D,K,width}),vt(dv.p,DType::BF16,{D,K,width});
++    Tensor ot(result.p,DType::BF16,{D,H,width}),refout(other.p,DType::BF16,{D,H,width});
++    Tensor pt(dp.p,DType::I32,{width}),rt(dtr.p,DType::I32,{1}),rr(dr.p,DType::I32,{S}),ee(de.p,DType::I32,{S});
++    Tensor st(scratch.p,DType::FP32,{pages,H,S}),nt(norms.p,DType::FP32,{2,H,S}),mt(mass.p,DType::FP32,{pages,S});
++    PagedKVBatchLayerView cache;
++    cache.head_dim=D; cache.num_kv_heads=K; cache.storage=KvCacheStorage::Fp8E4M3Row256;
++    cache.k_pages=Tensor(pc.p,DType::FP8_E4M3FN,{D,64,K,capacity}); cache.v_pages=Tensor(pv.p,DType::FP8_E4M3FN,{D,64,K,capacity});
++    cache.k_scale_pages=Tensor(ps.p,DType::FP16,{1,64,K,capacity}); cache.v_scale_pages=Tensor(vs.p,DType::FP16,{1,64,K,capacity});
++    cache.block_tables=Tensor(dt.p,DType::I32,{capacity,2});
++    const ops::AttentionHeadGeometry geo{D,H,K};
++    const ops::CausalAttentionExecutionEnvelope env{unsigned(base+1),unsigned(end)};
++    WorkspaceArena arena(std::max<size_t>(4096,ops::causal_softmax_attention_workspace_capacity_bytes(geo,cache.storage,env,1,width,width)));
++    ops::causal_softmax_attention(qt,kt,vt,pt,{},rt,geo,1.f/16,cache,env,arena,refout,nullptr);
++    ops::attention_page_mass(qt,rr,ee,1,cache,st,nt,mt,nullptr);
++    const auto old=from_device<float>(mass,mt.numel());
++    scratch.fill(0x7f); // unwritten tail must be zero probability, even with dirty scratch
++    ops::PromptPageLse capture;
++    capture.scratch=st;capture.count=S;std::copy(samples.begin(),samples.end(),capture.rows);
++    ops::causal_softmax_attention_with_page_lse(qt,kt,vt,pt,{},rt,geo,1.f/16,cache,env,arena,ot,nullptr,nullptr,nullptr,&capture);
++    if(!capture.captured) throw std::runtime_error("qualified route fell back");
++    ops::attention_page_mass_from_lse(st,nt,mt,nullptr);
++    const auto fused=from_device<float>(mass,mt.numel());
++    if(from_device<std::uint16_t>(result,nq)!=from_device<std::uint16_t>(other,nq))
++        throw std::runtime_error("capture changed main attention output bits");
++    codes=from_device<std::uint8_t>(pc,codes.size());
++    scales=from_device<std::uint16_t>(ps,scales.size());
++    std::vector<double> represented(nk*D);
++    for(size_t i=0;i<nk;++i) for(int d=0;d<D;++d) represented[i*D+d]=half_scale(scales[i])*fp8(codes[i*D+d]);
++    std::vector<double> oracle(size_t(pages)*S);
++    for(int j=0;j<S;++j) for(int h=0;h<H;++h) {
++        const auto* raw=&q[(size_t(samples[j])*H+h)*D];
++        double rotated[D]{};
++        for(int d=0;d<D;++d) for(int e=0;e<D;++e)
++            rotated[d]+=(std::popcount(unsigned(d&e))%2?-1:1)*double(bf16_to_f32(raw[e]))/16.;
++        std::vector<double> logits(limits[j]+1);
++        for(int t=0;t<=limits[j];++t) {
++            const auto idx=(size_t(table[capacity+t/64])*K+h/(H/K))*64+t%64;
++            logits[t]=std::inner_product(rotated,rotated+D,&represented[idx*D],0.)/16.;
++        }
++        const auto peak=*std::max_element(logits.begin(),logits.end());double z=0;
++        for(auto& y:logits){y=std::exp(y-peak);z+=y;}
++        for(size_t t=0;t<logits.size();++t) oracle[size_t(j)*pages+t/64]+=logits[t]/(z*H);
++    }
++    double worst=0,old_err=0,old_delta=0,max_l1=0,sum_err=0;
++    for(int j=0;j<S;++j){
++        double l1=0,sum=0;
++        for(int p=0;p<pages;++p){
++            const size_t i=size_t(j)*pages+p;const double err=std::abs(fused[i]-oracle[i]);
++            if(!std::isfinite(fused[i]) || fused[i]<0 || (p*64>limits[j] && fused[i]!=0))
++                throw std::runtime_error("invalid or unmasked page");
++            l1+=err;sum+=fused[i];worst=std::max(worst,err);
++            old_err=std::max(old_err,std::abs(old[i]-oracle[i]));
++            old_delta=std::max(old_delta,std::abs(double(old[i])-fused[i]));
++        }
++        max_l1=std::max(max_l1,l1);sum_err=std::max(sum_err,std::abs(sum-1));
++    }
++    std::cout<<"base="<<base<<" width="<<width<<" samples="<<S<<" main_bits_equal=1 max_abs="<<worst
++             <<" row_l1="<<max_l1<<" old_oracle="<<old_err<<" fused_old="<<old_delta<<" sum_err="<<sum_err<<std::endl;
++    if(old_err>2e-5 || worst>0.002 || max_l1>0.005 || sum_err>2e-6)
++        throw std::runtime_error("outside page probability tolerance");
++    // A stale or invalid requested capture must not be mistaken for materialized stats.
++    capture.rows[0]=-1;
++    ops::causal_softmax_attention_with_page_lse(qt,kt,vt,pt,{},rt,geo,1.f/16,cache,env,arena,ot,nullptr,nullptr,nullptr,&capture);
++    if(capture.captured || from_device<std::uint16_t>(result,nq)!=from_device<std::uint16_t>(other,nq))
++        throw std::runtime_error("invalid capture did not fall back to regular attention");
++}
++int main() {
++    try {
++        if(cuda_unavailable() || ops::current_device_tier()!=ops::DeviceTier::Ampere) return 77;
++        qualify(0,99,{0,31,32,62,63,64,94,98});
++        std::vector<int> many(64); for(int i=0;i<64;++i) many[i]=2*i;
++        qualify(47,137,many);
++        qualify(1003,1024,{5,20,63,85,196,511,751,1023});
++        qualify(36*1024,1024,{0,31,511,1023});
++        return 0;
++    } catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
++}

@@ -395,6 +395,12 @@ if (KVMEM_BUILD_LLAMA)
 
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if (Python3_Interpreter_FOUND)
+        add_test(NAME kvmem-gemma4-query-regression
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/gemma4-query-regression.py
+                --exe $<TARGET_FILE:llama-kvmem-server>
+                --out ${CMAKE_CURRENT_BINARY_DIR}/gemma4-query-regression)
+        set_tests_properties(kvmem-gemma4-query-regression
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
         add_test(NAME kvmem-session-restore-regression
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/session-restore-regression.py
                 --exe $<TARGET_FILE:llama-kvmem-server>
@@ -428,6 +434,15 @@ if (KVMEM_BUILD_LLAMA)
     add_test(NAME kvmem-checkpoint-tail-test COMMAND kvmem-checkpoint-tail-test)
     add_test(NAME kvmem-checkpoint-packed-prefix COMMAND kvmem-checkpoint-tail-test --packed-prefix)
     set_tests_properties(kvmem-checkpoint-tail-test PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Requires a supplied Gemma-4 model and private native memory symbols.
+    if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+        add_executable(kvmem-gemma4-prepare-test tests/gemma4-prepare-test.cpp)
+        target_include_directories(kvmem-gemma4-prepare-test PRIVATE src/adapter backends/llamacpp/src)
+        target_link_libraries(kvmem-gemma4-prepare-test PRIVATE llama kvmem)
+        add_test(NAME kvmem-gemma4-prepare-test COMMAND kvmem-gemma4-prepare-test)
+        set_tests_properties(kvmem-gemma4-prepare-test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+    endif()
 
     add_executable(kvmem-gdn-replay-test tests/gdn-replay-test.cpp)
     add_executable(kvmem-bonsai-quant-test tests/bonsai-quant-test.cpp)

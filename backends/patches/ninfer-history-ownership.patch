@@ -1,0 +1,1576 @@
+diff --git a/docs/maintainer/resource-scheduling-and-context-cache.md b/docs/maintainer/resource-scheduling-and-context-cache.md
+index 698e3964..2d46d28d 100644
+--- a/docs/maintainer/resource-scheduling-and-context-cache.md
++++ b/docs/maintainer/resource-scheduling-and-context-cache.md
+@@ -1148,13 +1148,56 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive
+ 
+ ## KVMem 内容快照目录
+ 
+-Qwen3.5 KVMem 的 legacy/spread 路径按真实内容和原生恢复证明选择快照。
++Qwen3.5 KVMem 的内容快照目录按真实内容和原生恢复证明选择快照。
+ Chat 的 key/ID 字段继续校验输入，但不选择可变 owner，不影响目录发布顺序。
+ 内部 session、generation、内容版本和执行 stamp 仍用于拒绝过期或不完整状态。
+ 
+-恢复先获得独立分支，sealed KV 和只读 StateImage 可共享物理记录；源目录
+-保持可复用。statistics、selector、feedback、Query 和回滚状态归请求私有。
+-准备失败和取消释放本次分支；新请求不按客户端 key 清除既有快照。
++恢复先获得独立分支，sealed KV 和只读 StateImage 可共享物理记录。
++statistics、selector、feedback、Query 和回滚状态归请求私有。
++源目录只在查找和取得完整恢复引用期间被借用；分支取得所需 checkpoint、前缀
++记录与状态，且完成最后一次源目录访问后，目录即可参与正常淘汰。generation
++记录来源身份，不是延续整个 prefill 的目录保护。复用本身不破坏源快照内容，
++但也不要求为了短前缀命中而保留来源的全部长尾。没有压力时目录仍可复用。
++
++目录淘汰与物理数据释放是两个事件。其他分支、准备中恢复、异步读写持有的
++record/source/lease 继续保有有效内容和资源 charge；只有最后一个使用者释放后
++才回收对应字节。共享记录按 allocation identity 去重，COW 目的地单独计费。
++取消释放本次分支和未使用额度；已经开始的 CPU I/O 持有独立输入直到完成，
++不能因为请求或目录消失而提前减账。新请求不按客户端 key 清除既有快照。
++
++Waiting 与准备阶段使用同一份必要 payload 账本。完整未来 archive 的容量 H 与
++prefill 的 archive 上界 P、必要私有执行版本按生命期报价为 max(H, P + 执行峰值)，
++不把未来输出与已结束的临时 Query 状态机械相加。Legacy partial Query 源需要一页
++私有版本；Layerwise MTP 的 Query 边界和最后 prompt 边界替换有两个完整 record 的
++重叠上界。稀疏来源即使 prompt 小于窗口仍可能需要 Query，候选单独报价；回退根
++执行恢复根报价。自动输出上限沿用原 token 容量规则，不对 -1 单独截断。
++
++每个请求的有限额度先支付真实 archive identity，再支付当前 checkpoint/在途复制；
++重复 identity 只消费一次，超过有限额度的字节仍单独收费。未占用的未来 archive
++额度可暂时承载可选快照，但 archive 增长和 COW 分配前必须重新核算并回收可选引用。
++pending append、Window transfer 和未发布的 native Query 辅助 record 保留增长报价，
++ready/publication 后改由真实记录承担；脱离已取消请求的恢复 Work 不再借用其额度。
++
++execution_checkpoint 与目录 alias 分离：Legacy 精确 Query 源保护到 accepted Begin，
++普通恢复源在最后一次 restore/MTP bridge 读取后解除执行保护；Layerwise 的实际
++Query owner 仍持有完整来源。PromptTail、InputFallback/InputReuse、coverage 和已经
++消费的 Query 快照仅用于未来复用，压力时可回收，不能因为位于 active window 就
++被当成永久必需资源。可选目录不阻塞 Waiting。已取消读操作完成并释放引用后，
++维护阶段报告容量变化，触发等待请求重新检查；不依赖另一个请求到来才恢复调度。
++
++准备阶段核算有界元数据、完整执行预留、恢复所需私有数据及临时复制峰值，
++在发布活动 window/ledger 之前回收可选保留内容并确认必要额度。容量不足沿
++materialization 的稳定 Aborted 路径报告为当前请求的资源错误，不得当成
++不变量损坏而使其他请求失败。真正的身份、原生状态或所有权不变量错误仍然
++保留原错误语义；通用 ResourceManager 的 native source/victim 保护不受影响。
++活动请求既有 storage-failure 边界只把 MemoryError::BudgetExceeded 转成标准
++Overloaded；其他存储、I/O 与逻辑异常保持原类型，不能泛化成容量错误。
++
++若只是可选恢复的复制峰值超额，且尚未提交 I/O、创建恢复 Work 或修改原生状态，
++可释放恢复分支并重新核算从零执行。该回退保留报价 frontier 用于 hidden replay，
++实际复用量为零，Layerwise 重新绑定根来源。含媒体的请求必须仍有覆盖全部原始
++Vision item 的计划和全部输入 payload；后缀规划已释放媒体时拒绝本次请求，不能
++进入该预算回退。此规则约束新增预算回退，不改变既有 I/O 异常回退路径。
+ 
+ 公共 content_cache.hpp 负责候选排序和保留计划。原生目录最多
+ min(16, retained_sessions) 个槽，retained_sessions 同时限制内部资源组数量。
+diff --git a/src/models/qwen3_5/program/native_mtp_boundary.cpp b/src/models/qwen3_5/program/native_mtp_boundary.cpp
+index 6db87064..5bbb00c1 100644
+--- a/src/models/qwen3_5/program/native_mtp_boundary.cpp
++++ b/src/models/qwen3_5/program/native_mtp_boundary.cpp
+@@ -66,6 +66,7 @@ void NativeLayerwiseMtpBoundary::rebuild(ProgramImpl& p,SequenceState& sequence,
+         throw std::length_error("native MTP boundary exceeds finite transfer staging");
+     // Detach the full native record before touching any Device byte. Target
+     // planes, scales and every other own-KV row retain their exact source bits.
++    p.enforce_memory_payload_budget(window.archive[id].size(),false,false,&sequence);
+     auto replacement=window.archive[id].fork();std::byte first;
+     replacement.read(0,&first,1);replacement.write(0,&first,1);
+     std::unique_ptr<PinnedHostBuffer> staging;
+diff --git a/src/models/qwen3_5/program/planning/pressure.cpp b/src/models/qwen3_5/program/planning/pressure.cpp
+index 287d4f03..d04cf1f1 100644
+--- a/src/models/qwen3_5/program/planning/pressure.cpp
++++ b/src/models/qwen3_5/program/planning/pressure.cpp
+@@ -1,6 +1,7 @@
+ #include "models/qwen3_5/program/program_impl.h"
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/planning/pressure_planner.h"
++#include "models/qwen3_5/program/storage/kvmem_payload_budget.h"
+ 
+ #include <algorithm>
+ #include <cstddef>
+@@ -2661,17 +2662,14 @@ bool ProgramImpl::isolated_request_feasible(const RequestBasePlan& base) const n
+ bool ProgramImpl::temporary_request_feasible(const RequestBasePlan& base) const noexcept {
+     if (!base.impl_) return false;
+     if (!kvmem_window_tokens) return true;
+-    std::uint64_t available = memory_retained_budget;
+-    if (memory_idle_transfer) {
+-        const auto pending = memory_idle_transfer->work->destination.size();
+-        if (pending > available) return false;
+-        available -= pending;
+-    }
+-    for (const auto& request : requests) {
+-        if (request.memory_payload_reservation > available) return false;
+-        available -= request.memory_payload_reservation;
++    try {
++        // Only execution owners and in-flight readers can block Waiting. Idle
++        // cache directories remain optional and are reclaimed during preparation.
++        return required_memory_payload(base.impl_->memory_payload_envelope, nullptr, false).fits(memory_retained_budget);
++    } catch (...) {
++        // This scheduling probe is noexcept and cannot mutate resource owners.
++        return false;
+     }
+-    return base.impl_->memory_payload_reservation <= available;
+ }
+ 
+ bool ProgramImpl::persistent_backfill_safe(
+diff --git a/src/models/qwen3_5/program/planning/request_plan.cpp b/src/models/qwen3_5/program/planning/request_plan.cpp
+index 8e40de34..c9a57a42 100644
+--- a/src/models/qwen3_5/program/planning/request_plan.cpp
++++ b/src/models/qwen3_5/program/planning/request_plan.cpp
+@@ -4,6 +4,7 @@
+ #include "models/qwen3_5/program/program_impl.h"
+ #include "models/qwen3_5/program/planning/rebuild_work.h"
+ #include "models/qwen3_5/program/planning/prefill_service_work.h"
++#include "models/qwen3_5/program/storage/kvmem_payload_budget.h"
+ #include "models/qwen3_5/program/context.h"
+ #include "models/qwen3_5/program/context_work.h"
+ #include <algorithm>
+@@ -537,6 +538,35 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
+                     "KVMem retained payload budget cannot reserve the requested token history");
+             }
+             base->memory_payload_reservation = pages * page_bytes;
++            // QueryReplay's private partial page exists only during prefill.
++            // Full future decode history and that temporary version must not be
++            // charged as if both lived at the maximum output frontier. Native
++            // layerwise Query boundaries are block aligned and share sealed KV.
++            std::uint64_t execution_private = 0;
++            // Native MTP owns a Query-boundary replacement until accepted
++            // publication, then rebuilds the final prompt boundary. These two
++            // complete-record versions can overlap with its exact Query source.
++            if (kvmem_options.recall_strategy == kvmem::RecallStrategy::Layerwise &&
++                speculative_backend == SpeculativeBackend::Mtp)
++                execution_private = 2 * page_bytes;
++            const auto query = memory_query_span(prompt);
++            const auto workspace = backend_kv_pages
++                ? std::max(draft_window, ngram_draft_window) + draft_window : 0;
++            if (kvmem_options.recall_strategy != kvmem::RecallStrategy::Layerwise &&
++                query.begin && query.count && query.begin % kPagedKVPageSize &&
++                std::uint64_t(base->summary.prompt_tokens) + workspace > kvmem_window_tokens) {
++                const auto replay = kvmem::streaming_query_replay_plan(
++                    {query.begin, query.begin + query.count}, query.begin, base->summary.prompt_tokens,
++                    kvmem_options.query_replay_max_tokens, kPagedKVPageSize,
++                    std::min<std::uint64_t>(kv_pages_for_tokens(query.begin), kvmem_options.selected_tokens / kPagedKVPageSize),
++                    kvmem_window_tokens / kPagedKVPageSize, workspace);
++                if (replay.admitted) execution_private = page_bytes;
++            }
++            base->memory_payload_envelope = kvmem_payload_envelope(base->memory_payload_reservation,
++                std::uint64_t(kv_pages_for_tokens(base->summary.prompt_tokens)) * page_bytes, execution_private);
++            if (base->memory_payload_envelope > memory_retained_budget)
++                throw RequestError(RequestErrorKind::ContextLengthExceeded,
++                    "KVMem payload budget cannot reserve the required prefill execution peak");
+         }
+         base->text_kv_page_entitlement = kv_pages_for_tokens(kvmem_window_tokens);
+         if (backend_kv_pages) base->backend_kv_page_entitlement = kv_pages_for_tokens(kvmem_window_tokens) +
+@@ -763,6 +793,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+     plan->root_rebuild_tail_begin     = base.root_rebuild_tail_begin;
+     plan->allow_memory_reuse = base.allow_memory_reuse;
+     plan->memory_payload_reservation = base.memory_payload_reservation;
++    plan->memory_payload_envelope = base.memory_payload_envelope;
++    plan->memory_payload_root_envelope = base.memory_payload_envelope;
+     plan->publication_order = base.publication_order;
+ 
+     if ((source != nullptr && shared_source != nullptr) ||
+@@ -909,6 +941,24 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
+             plan->memory_restore_frontier = match->frontier;
+             plan->memory_restore_generation = history.stamp.session.id;
+             plan->reuse_base = plan->memory_restore_frontier;
++            const auto* checkpoint=memory_checkpoint(history,match->kind);
++            const auto query=memory_query_span(prompt);
++            // A sparse restored view may need Query even below B+R. Price that
++            // candidate's execution peak independently; root fallback keeps
++            // its smaller, executable quote.
++            if (kvmem_options.recall_strategy!=kvmem::RecallStrategy::Layerwise && checkpoint &&
++                checkpoint->resident_pages.size()<kv_pages_for_tokens(match->frontier) &&
++                query.begin && query.count && query.begin%kPagedKVPageSize) {
++                const auto workspace=backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0;
++                const auto replay=kvmem::streaming_query_replay_plan({query.begin,query.begin+query.count},query.begin,
++                    plan->summary.prompt_tokens,kvmem_options.query_replay_max_tokens,kPagedKVPageSize,
++                    std::min<std::uint64_t>(kv_pages_for_tokens(query.begin),kvmem_options.selected_tokens/kPagedKVPageSize),
++                    kvmem_window_tokens/kPagedKVPageSize,workspace);
++                if (replay.admitted) plan->memory_payload_envelope=std::max(plan->memory_payload_envelope,
++                    kvmem_payload_envelope(plan->memory_payload_reservation,
++                        std::uint64_t(kv_pages_for_tokens(plan->summary.prompt_tokens))*(text_host_kv_page_stride+backend_host_kv_page_stride),
++                        text_host_kv_page_stride+backend_host_kv_page_stride));
++            }
+         }
+     }
+ 
+diff --git a/src/models/qwen3_5/program/prefill.cpp b/src/models/qwen3_5/program/prefill.cpp
+index 895993f0..f7a8b4fb 100644
+--- a/src/models/qwen3_5/program/prefill.cpp
++++ b/src/models/qwen3_5/program/prefill.cpp
+@@ -810,6 +810,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
+                                        request_plan.drafting && !request_plan.branches;
+         request.allow_memory_reuse = request_plan.allow_memory_reuse;
+         request.memory_payload_reservation = request_plan.memory_payload_reservation;
++        request.memory_payload_envelope = request_plan.memory_payload_envelope;
+         sequence.mtp_draft_count     = 0;
+         sequence.mtp_drafts_pending  = false;
+         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
+@@ -853,7 +854,10 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
+             sequence.window.think_open=staged.prompt.memory_think_open;
+             sequence.window.think_close=staged.prompt.memory_think_close;
+             sequence.window.attention_scope={staged.prompt.starts_in_reasoning,0};
+-            reserve_memory_history(sequence, request);
++            // Preparation admitted the complete detached restore and its peak
++            // before this function changed the native state/ledger. Publication
++            // cannot perform another capacity refusal after those mutations.
++            if(!sequence.window.statistics) ++memory_history_misses;
+         }
+         if (staged.disk_restore_frontier != 0) {
+             bool restored = false;
+@@ -1604,6 +1608,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+                     native.prepare_mtp_probe_window()) {
+                     auto accepted=capture_memory_checkpoint(sequence,NativeLayerwiseCheckpointRole::ProbeResident);
+                     memory_checkpoint_slot(sequence.window,KvmemCheckpointKind::PromptTail)=std::move(accepted);
++                    sequence.window.execution_checkpoint=memory_checkpoint_slot(sequence.window,KvmemCheckpointKind::PromptTail);
+                     bind_sequence_kv(sequence);schedule_state.text_kv=text_kv_view(sequence);
+                     schedule_state.mtp_kv=mtp_kv_view(sequence);
+                 }
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index 9a06694c..6c92424f 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -1339,7 +1339,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+         memory.disk_payload_bytes = memory_payload_storage.disk_bytes();
+         memory.disk_payload_budget_bytes = kvmem_options.disk_bytes;
+         memory.retained_payload_budget_bytes = memory_retained_budget;
+-        for (const auto& request : requests) memory.active_payload_reservation_bytes += request.memory_payload_reservation;
++        for (const auto& request : requests) memory.active_payload_reservation_bytes += request.memory_payload_envelope;
+         memory.snapshot_capture_bytes=memory_snapshot_capture_bytes;
+         memory.snapshot_view_bytes=memory_snapshot_view_bytes;
+         memory.snapshot_tail_copy_bytes=memory_snapshot_tail_copy_bytes;
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index 63482e1a..62803a64 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -74,6 +74,7 @@
+ #include <vector>
+ 
+ namespace ninfer::models::qwen3_5::detail {
++class KvmemPayloadBudget;
+ 
+ using runtime::MtpAdaptiveBatchController;
+ using runtime::MtpAdaptiveSignal;
+@@ -243,6 +244,7 @@ branch_extent(const std::vector<runtime::ReadBranch>* branches) noexcept {
+ 
+ struct RequestBasePlanImpl {
+     std::uint64_t memory_payload_reservation = 0, publication_order = 0;
++    std::uint64_t memory_payload_envelope = 0;
+     runtime::RequestPlanSummary summary;
+     detail::PhysicalDemand root_demand;
+     runtime::PrefillWork root_rebuild_work;
+@@ -321,6 +323,8 @@ struct ResourceCandidateState {
+ 
+ struct AdmissionCandidateImpl : ResourceCandidateState {
+     std::uint64_t memory_payload_reservation = 0, publication_order = 0;
++    std::uint64_t memory_payload_envelope = 0;
++    std::uint64_t memory_payload_root_envelope = 0;
+     MtpBridgeMode mtp_bridge = MtpBridgeMode::None;
+     bool prepare_mtp         = false;
+     std::optional<VisionPrefillPlan> vision;
+@@ -617,9 +621,13 @@ struct KvmemHistoryPreparation {
+         std::vector<kvmem::HostKvSource> sources;
+         std::vector<KvmemHostRecord> records;
+         std::vector<kvmem::HostKvLease> leases;
+-        // Program-owned Waiting admission. Work is only constructed/read by
+-        // kvmem_window.cpp; enclosing Preparation/Transaction/Program layouts
+-        // and the existing five-argument restore symbol do not change.
++        // Immutable engine-side quote: workers mutate records/leases only while
++        // this ticket is pending. Keep this quote until a cancelled read drains.
++        std::vector<std::pair<const void*,std::uint64_t>> payload_inputs;
++        std::uint64_t payload_growth = 0;
++        kvmem::StorageTicket accounting_ticket;
++        // Program-owned Waiting admission, transferred to the active owner only
++        // after the independently held source has been restored.
+         std::shared_ptr<NativeLayerwiseAdmission> layerwise_admission;
+         NativeSourceVersionCharge layerwise_restore_metadata;
+         std::shared_ptr<const NativeCanonicalHistoryVersion> layerwise_restore_source;
+@@ -634,6 +642,9 @@ struct KvmemHistoryPreparation {
+     KvmemCheckpointKind selected = KvmemCheckpointKind::Base;
+     std::unique_ptr<KvmemWindowState> fork;
+     bool native_ready = false;
++    // Source identity remains diagnostic provenance after this borrow ends.
++    // The independent fork then owns all bytes needed by restoration.
++    bool directory_borrowed = true;
+     // Workers own only CPU buffers/leases. Cancellation can release the engine
+     // transaction while a started read safely drains its independent sources.
+     ~KvmemHistoryPreparation();
+@@ -709,6 +720,12 @@ struct KvmemWindowState {
+     // InputReuse independently retains a deeper structural input boundary when
+     // conservative template rewrite recovery requires an earlier InputFallback.
+     kvmem::CheckpointCatalog<KvmemCheckpointRecord> checkpoints{kvmem::CheckpointLimits{7}};
++    // Required by the current Query/restore, independently of cache directory
++    // aliases. Released only after accepted Begin (or drained cancellation).
++    std::shared_ptr<KvmemPrefixCheckpoint> execution_checkpoint;
++    // Native Query owns this mutable unpublished record. Quote it without
++    // creating another HostKvRecord alias (which would force a second COW).
++    std::uint64_t execution_auxiliary_bytes = 0;
+     kvmem::CheckpointArchive<KvmemCheckpointRecord> coverage;
+     kvmem::CheckpointCapturePlan capture_plan;
+     std::uint32_t reuse_anchor = 0;
+@@ -727,6 +744,7 @@ struct KvmemWindowState {
+     // Non-null only while this accepted canonical prefix remains unchanged.
+     std::shared_ptr<const NativeCanonicalHistoryVersion> canonical_source;
+     kvmem::StorageTicket pending_window_io;
++    std::uint64_t pending_window_payload_growth = 0;
+     // Last member: abort/drain the transaction before its source archive dies.
+     std::unique_ptr<kvmem::MemorySession> pending_window;
+ };
+@@ -843,6 +861,7 @@ struct RequestControl {
+     bool publish_continuation = true;
+     bool allow_memory_reuse = false;
+     std::uint64_t memory_payload_reservation = 0;
++    std::uint64_t memory_payload_envelope = 0;
+     // The sequence's own output ceiling: the largest frontier its lease may ever cover, so
+     // on-demand growth never leases pages the request cannot reach.
+     std::uint32_t lease_ceiling = 0;
+@@ -928,6 +947,7 @@ struct RequestControl {
+         publish_continuation = true;
+         allow_memory_reuse = false;
+         memory_payload_reservation = 0;
++        memory_payload_envelope = 0;
+         lease_settled        = false;
+         lease_space_limited  = false;
+         lease_minimum_target = {};
+@@ -1189,6 +1209,8 @@ public:
+     friend class NativeLayerwiseResidentPressure;
+     friend class NativeLayerwiseDecodePreparation;
+     friend class NativeLayerwiseOutputCohort;
++    // This internal boundary owner admits its Host COW before native writes.
++    friend class NativeLayerwiseMtpBoundary;
+ 
+     const execution::Parameters& parameters;
+     DeviceContext& device;
+@@ -1210,6 +1232,7 @@ public:
+     // Declared before the queue: shutdown joins workers before freeing their
+     // engine-owned pinned source, even if its original history was evicted.
+     std::unique_ptr<KvmemIdleTransfer> memory_idle_transfer;
++    std::vector<std::weak_ptr<KvmemHistoryPreparation::Work>> memory_history_work;
+     bool memory_idle_requested = false;
+     std::unique_ptr<kvmem::StorageIoQueue> memory_io;
+     std::uint64_t memory_retained_budget = 0; // logical payload; physical H/D remain separate
+@@ -2293,6 +2316,12 @@ private:
+     void capture_memory_anchor(SequenceState& sequence, std::uint32_t chunk_tokens) noexcept;
+     void reserve_memory_history(SequenceState& sequence, RequestControl& request,
+                                 uint64_t additional = 0, bool optional = false);
++    std::uint64_t borrowed_memory_history() const noexcept;
++    KvmemPayloadBudget required_memory_payload(uint64_t additional = 0,
++        const SequenceState* owner = nullptr, bool include_optional = true) const;
++    bool reclaim_optional_memory_checkpoints();
++    void enforce_memory_payload_budget(uint64_t additional = 0, bool optional = false,
++                                       bool admission = false, const SequenceState* owner = nullptr);
+     bool restore_memory_history(SequenceState& sequence, RequestControl::Prefill& staged);
+     bool admit_retained_history(std::uint32_t frontier) noexcept;
+     void retain_memory_history(SequenceState& sequence, const RequestControl& request,
+diff --git a/src/models/qwen3_5/program/storage/kvmem_payload_budget.h b/src/models/qwen3_5/program/storage/kvmem_payload_budget.h
+new file mode 100644
+index 00000000..e07817aa
+--- /dev/null
++++ b/src/models/qwen3_5/program/storage/kvmem_payload_budget.h
+@@ -0,0 +1,55 @@
++#pragma once
++
++#include <cstdint>
++#include <algorithm>
++#include <limits>
++#include <stdexcept>
++#include <unordered_set>
++
++namespace ninfer::models::qwen3_5::detail {
++// A future archive and a temporary prefill checkpoint have different lifetimes.
++// Reserve their largest simultaneous live set, not their sum across phases.
++inline std::uint64_t kvmem_payload_envelope(std::uint64_t history,
++        std::uint64_t prefill, std::uint64_t execution_private) {
++    if (execution_private > std::numeric_limits<std::uint64_t>::max() - prefill)
++        throw std::overflow_error("KVMem payload phase overflow");
++    return std::max(history, prefill + execution_private);
++}
++// A reservation pays for its archive once. Immutable snapshots and in-flight
++// readers can share those records, but private versions retain their own charge.
++// Establish every covered identity before adding the remaining owners.
++class KvmemPayloadBudget {
++public:
++    void reserve(std::uint64_t bytes) {
++        if (bytes > std::numeric_limits<std::uint64_t>::max() - used_)
++            throw std::overflow_error("KVMem payload reservation overflow");
++        used_ += bytes;
++    }
++    void cover(const void* identity) { if (identity) identities_.insert(identity); }
++    void require(const void* identity, std::uint64_t bytes) {
++        std::uint64_t credit = 0;
++        require(identity, bytes, credit);
++    }
++    // Credit is an already-reserved, finite phase envelope. Each physical
++    // identity consumes it once; exhausted credit never hides additional bytes.
++    void require(const void* identity, std::uint64_t bytes, std::uint64_t& credit) {
++        if (!identity || identities_.find(identity)!=identities_.end()) return;
++        const auto funded = std::min(bytes, credit);
++        if (bytes - funded > std::numeric_limits<std::uint64_t>::max() - used_)
++            throw std::overflow_error("KVMem payload reservation overflow");
++        identities_.insert(identity);
++        credit -= funded;
++        used_ += bytes - funded;
++    }
++    void reserve(std::uint64_t bytes, std::uint64_t& credit) {
++        const auto funded = std::min(bytes, credit);
++        reserve(bytes - funded);
++        credit -= funded;
++    }
++    std::uint64_t used() const noexcept { return used_; }
++    bool fits(std::uint64_t limit) const noexcept { return used_ <= limit; }
++private:
++    std::uint64_t used_ = 0;
++    std::unordered_set<const void*> identities_;
++};
++} // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index 5f793f8b..d4af8c43 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -7,6 +7,7 @@
+ #include "models/qwen3_5/program/context.h"
+ #include "models/qwen3_5/program/context_work.h"
+ #include "models/qwen3_5/program/storage/kvmem_transfer_trace.h"
++#include "models/qwen3_5/program/storage/kvmem_payload_budget.h"
+ #include "models/qwen3_5/program/storage/checkpoint_recompute_policy.h"
+ #include "models/qwen3_5/program/storage/layerwise_kv_transfer.h"
+ #include "models/qwen3_5/program/storage/unique_query_anchor.h"
+@@ -48,6 +49,7 @@ std::uint32_t valid_columns(std::uint32_t logical_page, std::uint32_t frontier)
+ // public allocation identity, including records shared with the active archive.
+ template<class Visitor>
+ void visit_memory_checkpoints(const KvmemWindowState& window, Visitor&& visitor) {
++    if (window.execution_checkpoint) visitor(*window.execution_checkpoint);
+     for (const auto& entry : window.checkpoints) if (entry.data) visitor(*entry.data);
+     for (const auto& entry : window.coverage)
+         if (entry.info.identity && entry.record.data) visitor(*entry.record.data);
+@@ -146,6 +148,7 @@ void publish_memory_checkpoint_source(KvmemWindowState& window,
+         window.checkpoints.slot(kvmem::CheckpointPurpose::QueryReplay).data,
+         window.checkpoints.slot(kvmem::CheckpointPurpose::PromptTail).data,
+         std::move(checkpoint), query_source, window.query_replay_active);
++    if (query_source) window.execution_checkpoint = window.checkpoints.slot(kvmem::CheckpointPurpose::QueryReplay).data;
+ }
+ } // namespace
+ 
+@@ -346,6 +349,16 @@ public:
+         auto& seq = backend.sequence;
+         auto& p = backend.program;
+         const auto count = kv_pages_for_tokens(seq.text_kv_valid);
++        std::uint64_t growth=0;
++        for (const auto id:seq.window.pages) if (id<count) {
++            const auto& record=seq.window.archive.at(id);
++            if (!record || (seq.window.host_versions.at(id)!=valid_columns(id,seq.text_kv_valid) &&
++                (asynchronous || !record.mutable_resident()))) growth+=backend.page_bytes;
++        }
++        // Optional snapshots may borrow unused future-history capacity. Revoke
++        // those aliases before an append/COW consumes that capacity, not after
++        // allocating the new native payload.
++        p.enforce_memory_payload_budget(growth,false,false,&seq);
+         pending.resize(count);
+         // Rebuilding a native compact address space also moves retained pages.
+         // Reserve their host records up front and include them in physical H and logical history admission.
+@@ -428,6 +441,15 @@ public:
+             std::memset(before->data(), 0, bytes_state);
+             std::memset(after->data(), 0, bytes_state);
+         }
++        if (asynchronous) seq.window.pending_window_payload_growth=growth;
++    }
++
++    ~WindowMemoryTransfer() override {
++        if (asynchronous) {
++            ticket.cancel();
++            try { ticket.wait(); } catch (...) {}
++            backend.sequence.window.pending_window_payload_growth=0;
++        }
+     }
+ 
+     void start_spill() override {
+@@ -555,6 +577,7 @@ public:
+         for (auto id : spill_ids) { seq.window.host_versions[id] = valid_columns(id, seq.text_kv_valid); }
+         seq.window.payload_bytes = prepared_payload_bytes;
+         seq.window.spilled_bytes += spill_ids.size() * backend.page_bytes;
++        if (asynchronous) seq.window.pending_window_payload_growth=0;
+         host_published = true;
+     }
+ 
+@@ -972,9 +995,11 @@ struct NativeLayerwiseProgramQuery::Impl {
+                 // Admit a branch-private last record BEFORE any native work:
+                 // the row A-1 must be rebuilt for this request's token_A even
+                 // though the target's aligned prefix A remains immutable.
++                p.enforce_memory_payload_budget(window.archive.at(begin/64-1).size(),false,false,&sequence);
+                 auxiliary_boundary_record=window.archive.at(begin/64-1).fork();
+                 std::byte first;auxiliary_boundary_record.read(0,&first,1);
+                 auxiliary_boundary_record.write(0,&first,1);
++                window.execution_auxiliary_bytes=auxiliary_boundary_record.size();
+             }
+             if (p.kvmem_options.layerwise_mtp_history==kvmem::LayerwiseMtpHistory::FirstLayer &&
+                 !resources.auxiliary_selected.empty())
+@@ -1412,6 +1437,7 @@ NativeLayerwiseProgramQuery::NativeLayerwiseProgramQuery(ProgramImpl& p,Sequence
+ NativeLayerwiseProgramQuery::~NativeLayerwiseProgramQuery() {
+     if (!impl_) return;abort();
+     auto& program=impl_->program;const auto lease=impl_->work_identity;
++    impl_->sequence.window.execution_auxiliary_bytes=0;
+     // Destroy every sealed source/staging account BEFORE a waiter may acquire
+     // the same complete Query resources or startup-owned device slab.
+     impl_.reset();
+@@ -1467,6 +1493,7 @@ void NativeLayerwiseProgramQuery::accept() {
+         if (q.auxiliary_boundary_record) {
+             const auto id=begin/64-1;
+             window.archive.at(id)=std::move(q.auxiliary_boundary_record);
++            window.execution_auxiliary_bytes=0;
+             window.host_versions.at(id)=64;
+         }
+         window.canonical_source.reset();
+@@ -1492,9 +1519,10 @@ void ProgramImpl::begin_layerwise_query(SequenceState& sequence,RequestControl&
+     if (!layerwise_query_work.acquire(lease))
+         throw kvmem::MemoryError(kvmem::MemoryErrorCode::Pending,"another request owns the Program Query work slot");
+     try {
++        sequence.window.execution_checkpoint = checkpoint;
+         request.prefill->layerwise_query=std::make_unique<NativeLayerwiseProgramQuery>(*this,sequence,request,context,
+             id,std::move(checkpoint),std::move(resources));
+-    } catch (...) {layerwise_query_work.release(lease);throw;}
++    } catch (...) {sequence.window.execution_auxiliary_bytes=0;layerwise_query_work.release(lease);throw;}
+ }
+ 
+ std::uint64_t NativeLayerwiseMtpBoundary::next_source_epoch() {
+@@ -1899,6 +1927,7 @@ bool ProgramImpl::prepare_memory_append(SequenceState& sequence, std::uint32_t b
+         work->sources.push_back(record ? record.source() : kvmem::HostKvSource{});
+     }
+     if (!work) return true;
++    enforce_memory_payload_budget(work->ids.size()*stride,false,false,&sequence);
+     work->records.resize(work->ids.size());
+     auto preparation = std::make_unique<KvmemAppendPreparation>();
+     preparation->work = work;
+@@ -2322,11 +2351,7 @@ void ProgramImpl::checkpoint_memory_room(KvmemWindowState& window,size_t bytes,b
+         }
+         // The admitted restore source is an execution lease, including its
+         // archive directory entry while the caller holds a slot reference.
+-        uint64_t restoring=0;
+-        if(const auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_)) {
+-            const auto& staged=requests[transaction->destination.value].prefill;
+-            if(staged) restoring=staged->memory_restore_generation;
+-        }
++        const auto restoring=borrowed_memory_history();
+         const auto reclaim=[&](KvmemWindowState& owner) {
+             if(restoring && owner.stamp.session.id==restoring) return;
+             for(auto& entry:owner.coverage) if(entry.info.identity && !fits()) {
+@@ -2604,7 +2629,18 @@ void ProgramImpl::capture_memory_prefix(SequenceState& sequence, std::uint32_t c
+         throw std::logic_error("KVMem prefix checkpoint is not at an uncaptured evaluated boundary");
+     }
+     copy_tail(sequence, prefill_hidden.slice(1, static_cast<std::int32_t>(chunk_tokens) - 1, 1));
+-    publish_memory_checkpoint_source(window, capture_memory_checkpoint(sequence), query_checkpoint);
++    // A normal prompt tail only accelerates a later request. A real Query
++    // source (including native layerwise's admitted boundary) is execution.
++    const bool required = query_checkpoint || bool(window.layerwise_request);
++    std::shared_ptr<KvmemPrefixCheckpoint> checkpoint;
++    try { checkpoint = capture_memory_checkpoint(sequence, !required); }
++    catch (const std::exception& error) {
++        if (required) throw;
++        std::fprintf(stderr, "KVMEM_CHECKPOINT_CAPTURE purpose=prompt_tail skipped: %s\n", error.what());
++        return;
++    }
++    publish_memory_checkpoint_source(window, checkpoint, query_checkpoint);
++    if (required) window.execution_checkpoint = std::move(checkpoint);
+     if (query_checkpoint) window.query_probe_swaps = window.swaps;
+     if (kvmem_options.verify_transfers)
+         std::fprintf(stderr, "KVMEM_CHECKPOINT_CAPTURE purpose=%s frontier=%u\n",
+@@ -2721,15 +2757,17 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
+     checkpoint->state = credit?std::move(credit->image):memory_checkpoint_pool->acquire(bytes);
+     } else {
+     archive_memory_window(sequence);
++    for (uint32_t page=0;page<frontier/page_tokens;++page) window.archive.at(page).seal();
++    reserve_memory_history(sequence, requests.at(sequence.lane),
++        frontier % page_tokens ? backend.page_bytes : 0, optional);
++    // Budget reclamation above may retire optional snapshots. Do not keep an
++    // unaccounted local alias across that boundary merely to share metadata.
+     std::shared_ptr<const kvmem::KvSnapshot> previous;
+     for (const auto kind : checkpoint_kinds(window)) {
+         const auto* saved = memory_checkpoint(window,kind);
+         if (saved && saved->kv_snapshot && saved->prefix.size() <= frontier &&
+             (!previous || saved->kv_snapshot->size() > previous->size())) previous=saved->kv_snapshot;
+     }
+-    for (uint32_t page=0;page<frontier/page_tokens;++page) window.archive.at(page).seal();
+-    reserve_memory_history(sequence, requests.at(sequence.lane),
+-        frontier % page_tokens ? backend.page_bytes : 0, optional);
+     checkpoint->kv_snapshot=capture_kvmem_snapshot(window.archive,pages,frontier%page_tokens,memory_payload_storage,previous);
+     if (frontier % page_tokens) memory_snapshot_tail_copy_bytes += backend.page_bytes;
+     // Manifest allocation is transient metadata, not a second payload account.
+@@ -2892,15 +2930,20 @@ void ProgramImpl::capture_memory_anchor(SequenceState& sequence, std::uint32_t c
+     }
+ }
+ 
++std::uint64_t ProgramImpl::borrowed_memory_history() const noexcept {
++    const auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_);
++    if (!transaction) return 0;
++    if (transaction->memory_history)
++        return transaction->memory_history->directory_borrowed ? transaction->memory_history->generation : 0;
++    const auto& staged=requests[transaction->destination.value].prefill;
++    return staged ? staged->memory_restore_generation : 0;
++}
++
+ bool ProgramImpl::retained_history_pinned(std::size_t slot) const {
+     const auto& history = *memory_histories[slot];
+     const auto generation = history.stamp.session.id;
+-    const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
+     if ((memory_idle_transfer && memory_idle_transfer->history == slot) ||
+-        (transaction && transaction->memory_history && transaction->memory_history->generation == generation) ||
+-        std::any_of(requests.begin(), requests.end(), [&](const auto& req) {
+-            return req.prefill && req.prefill->memory_restore_generation == generation;
+-        })) return true;
++        borrowed_memory_history() == generation) return true;
+     bool transferring = false;
+     if (memory_coverage_transfer) visit_memory_checkpoints(history, [&](const auto& cp) {
+         transferring |= &cp == memory_coverage_transfer->checkpoint.get();
+@@ -3525,10 +3568,11 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+     size_t metadata=0;
+     for(const auto kind:checkpoint_kinds(source)) {
+         const auto* cp=memory_checkpoint(source,kind);
+-        if(cp && cp->prefix.size()<=frontier && copies.emplace(cp,nullptr).second)
++        if(cp == &checkpoint && copies.emplace(cp,nullptr).second)
+             metadata+=cp->metadata_bytes()-(cp->kv_snapshot ? cp->kv_snapshot->metadata_bytes() : 0);
+     }
+-    // Optional optimization: never evict the source to make room for its fork.
++    // The finite metadata copy is admitted while the directory is borrowed.
++    // Only the selected complete recovery point becomes an execution owner.
+     checkpoint_memory_room(const_cast<KvmemWindowState&>(source),metadata,true);
+     NativeSourceVersionCharge mutable_metadata;
+     if (source.source_versions) mutable_metadata=source.source_versions->reserve(
+@@ -3553,7 +3597,7 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+     child->statistics_frontier=frontier;
+     child->selector=std::make_unique<kvmem::KvMemStore>(*source.selector);
+     child->selector->truncate_to(frontier);
+-    child->graph=source.graph;
++    child->graph=checkpoint.graph;
+     child->feedback=source.feedback;
+     child->request_messages=source.request_messages;
+     child->query_rows.resize(source.query_rows.size());
+@@ -3576,9 +3620,10 @@ std::unique_ptr<KvmemWindowState> ProgramImpl::fork_memory_history(
+     }
+     for(const auto kind:kKvmemCheckpointKinds) {
+         auto& cp=memory_checkpoint_slot(*child,kind);
+-        if(cp) cp=cp->prefix.size()<=frontier ? copies.at(cp.get()) : nullptr;
++        if(cp) cp=cp.get()==&checkpoint ? copies.at(cp.get()) : nullptr;
+     }
+     for(auto& entry:child->coverage) if(entry.info.identity) {
++        if (entry.record.data.get()!=&checkpoint) {entry={};continue;}
+         entry.record.data=copies.at(entry.record.data.get());
+         entry.info.identity=entry.record.data.get();
+         entry.info.bytes=entry.record.checkpoint_info().bytes;
+@@ -3798,7 +3843,9 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+             const auto match=memory_restorable_history(staged.prompt,&materialization_prefix_digests_);
+             if(!match || match->frontier!=staged.memory_restore_frontier ||
+                memory_histories[match->history]->stamp.session.id!=staged.memory_restore_generation) {
+-                staged.memory_restore_generation=0; return true;
++                staged.memory_restore_generation=0;
++                transaction.plan->impl_->memory_payload_envelope=transaction.plan->impl_->memory_payload_root_envelope;
++                return true;
+             }
+             const auto& source=*memory_histories[match->history];
+             pending=std::make_unique<KvmemHistoryPreparation>();
+@@ -3807,24 +3854,8 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+             pending->selected=match->kind;
+             memory_checkpoint_slot(*memory_histories[match->history], match->kind)->last_used =
+                 next_history_access.fetch_add(1);
+-            if(match->fork) {
+-                uint64_t required=transaction.plan->impl_->memory_payload_reservation;
+-                for(const auto& active:requests) required+=active.memory_payload_reservation;
++            {
+                 const auto* checkpoint=memory_checkpoint(source,match->kind);
+-                const auto full_pages=match->frontier/page_tokens;
+-                for(size_t page=0;page<kvmem_checkpoint_payload_pages(*checkpoint);++page) {
+-                    const auto record=kvmem_checkpoint_payload_record(*checkpoint,page);
+-                    const bool selected=std::find(checkpoint->resident_pages.begin(),checkpoint->resident_pages.end(),page)!=checkpoint->resident_pages.end();
+-                    const bool shared=page<full_pages && page!=(match->frontier-1)/page_tokens &&
+-                        (!selected || record.resident_bytes());
+-                    if(!shared) required+=record.size();
+-                }
+-                std::unordered_set<const void*> cold;
+-                for(const auto kind:checkpoint_kinds(source)) if(const auto* cp=memory_checkpoint(source,kind);
+-                    cp && cp->cold_state && cold.insert(cp->cold_state.storage_identity()).second)
+-                    required+=cp->cold_state.size();
+-                if(required>memory_retained_budget)
+-                    throw std::runtime_error("fork cannot retain its source within the payload budget");
+                 for (;;) {
+                     try { pending->fork=fork_memory_history(source,*checkpoint); break; }
+                     catch (const NativeSourceQuotaExceeded& error) {
+@@ -3837,16 +3868,48 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+                     pending->fork->cache_group=0;
+                 memory_histories[match->history]->publication_order=next_history_access.fetch_add(1);
+             }
++            // No source reference or directory lookup may cross this boundary.
++            // The fork and its immutable checkpoint independently own the source.
++            pending->directory_borrowed=false;
++            if(kvmem_options.verify_transfers) std::fprintf(stderr,
++                "KVMEM_HISTORY_DETACH generation=%llu frontier=%u directory_borrowed=0\n",
++                (unsigned long long)pending->generation,staged.memory_restore_frontier);
+         }
+-        if(pending->native_ready) return true;
+-        auto* history=pending->fork.get();
+-        if(!history) {
+-            auto& source=memory_histories[pending->history];
+-            if(!source || source->stamp.session.id!=pending->generation) {
+-                pending.reset(); staged.memory_restore_generation=0; return true;
++        try {
++            enforce_memory_payload_budget(0,false,true);
++        } catch(const ContextCacheExhausted&) {
++            // A directory hit is optional. Before any read/submission, compare
++            // the root plan under the same complete-history reservation instead
++            // of rejecting a request solely for the restore's copy peak.
++            if(pending->ticket || pending->work || pending->native_ready) throw;
++            // Vision suffix planning may already have released cached-prefix
++            // media. Root replay is legal only when the admitted plan still
++            // covers every original item and retains its input payload.
++            if(staged.prompt.has_media()) {
++                const auto& vision=transaction.plan->impl_->vision;
++                const auto count=staged.prompt.vision_items.size();
++                bool complete=vision && vision->uses.size()==count &&
++                    staged.prompt.media_payloads.size()==count;
++                for(std::size_t i=0;complete && i<count;++i)
++                    complete=vision->uses[i].prepared_item_index==i &&
++                        bool(staged.prompt.media_payloads[i]);
++                if(!complete) throw;
+             }
+-            history=&*source;
++            const auto generation=pending->generation;
++            pending.reset();
++            staged.memory_restore_generation=0;
++            transaction.plan->impl_->memory_payload_envelope=transaction.plan->impl_->memory_payload_root_envelope;
++            // Preserve the quoted frontier. start_request records it as hidden
++            // replay and reports zero actual reuse when no source was restored.
++            enforce_memory_payload_budget(0,false,true);
++            if(kvmem_options.verify_transfers) std::fprintf(stderr,
++                "KVMEM_HISTORY_ROOT_FALLBACK generation=%llu frontier=%u reason=restore_payload_peak\n",
++                (unsigned long long)generation,staged.memory_restore_frontier);
++            return true;
+         }
++        if(pending->native_ready) return true;
++        auto* history=pending->fork.get();
++        if(!history) throw std::logic_error("memory restoration lost its independently owned fork");
+         if(!memory_io || !kvmem_options.disk_bytes) return true;
+         if(pending->ticket && !pending->ticket.ready()) return false;
+         if(pending->ticket) {
+@@ -3884,11 +3947,14 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+             work->state_source=checkpoint->cold_state;
+             work->state_tag=checkpoint->cold_tag;
+             work->state_payload_bytes=checkpoint->state_bytes();
++            work->payload_inputs.emplace_back(checkpoint->cold_state.storage_identity(),checkpoint->cold_state.size());
++            memory_history_work.emplace_back(work);
+             pending->ticket=memory_io->submit(checkpoint->state_bytes(),[work,storage=memory_state_staging]() mutable {
+                 work->state=storage.allocate(work->state_payload_bytes);
+                 if(work->state_tag) kvmem::read_checkpoint_image(work->state_source,work->state_tag,{{work->state.writable_data(),work->state.size()}});
+                 else work->state_source.read(0,work->state.writable_data(),work->state.size());
+             });
++            work->accounting_ticket=pending->ticket;
+             return false;
+         }
+         pending->work=std::make_shared<KvmemHistoryPreparation::Work>();
+@@ -3897,10 +3963,17 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+         for(const auto id:checkpoint.resident_pages) {
+             work->ids.push_back(static_cast<uint32_t>(id));
+             work->sources.push_back(history->archive.at(id).source());
++            const auto& record=history->archive.at(id);
++            work->payload_inputs.emplace_back(record.storage_identity(),record.size());
++            // Deferred sources may change tier before their worker obtains a
++            // lease. Every selected page can therefore require a private read
++            // destination, even if resident at submission time.
++            work->payload_growth+=record.size();
+         }
+         work->records.resize(work->ids.size()); work->leases.resize(work->ids.size());
+         const auto stride=text_host_kv_page_stride+backend_host_kv_page_stride;
+         const auto tail=(staged.memory_restore_frontier-1)/page_tokens;
++        memory_history_work.emplace_back(work);
+         pending->ticket=memory_io->submit(work->ids.size()*stride,[work,storage=memory_payload_storage,stride,tail]() mutable {
+             for(size_t i=0;i<work->ids.size();++i) {
+                 auto source=work->sources[i].lease();
+@@ -3915,25 +3988,27 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+             }
+             work->sources.clear();
+         });
++        work->accounting_ticket=pending->ticket;
+         return false;
++    } catch(const ContextCacheExhausted&) {
++        throw; // The materialization boundary aborts only this request.
+     } catch(const std::exception& error) {
+         std::fprintf(stderr,"KVMEM_HISTORY preparation failed; replaying prefix: %s\n",error.what());
+         pending.reset(); staged.memory_restore_generation=0;
++        transaction.plan->impl_->memory_payload_envelope=transaction.plan->impl_->memory_payload_root_envelope;
+         return true;
+     }
+     };
+     if (!prepare_source()) return false;
++    // Includes misses/fallbacks. No payload capacity decision is deferred until
++    // start_request has overwritten native state or published a new ledger.
++    enforce_memory_payload_budget(0,false,true);
+     if (kvmem_options.recall_strategy==kvmem::RecallStrategy::Layerwise) {
+         const KvmemPrefixCheckpoint* checkpoint=nullptr;
+         const auto& prepared=transaction.memory_history;
+         if (staged.memory_restore_generation && prepared) {
+             const auto* history=prepared->fork.get();
+-            if (!history) {
+-                const auto& source=memory_histories.at(prepared->history);
+-                if (!source || source->stamp.session.id!=prepared->generation)
+-                    throw std::logic_error("native Query checkpoint changed before final source binding");
+-                history=&*source;
+-            }
++            if (!history) throw std::logic_error("native Query lost its owned restore source");
+             checkpoint=memory_checkpoint(*history,prepared->selected);
+             if (!checkpoint || checkpoint->prefix.size()!=staged.memory_restore_frontier)
+                 throw std::logic_error("native Query binding differs from its selected actual checkpoint");
+@@ -3960,7 +4035,8 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+                 std::uint64_t work_bytes=sizeof(KvmemHistoryPreparation::Work)+64;
+                 if (work) work_bytes+=work->ids.capacity()*sizeof(std::uint32_t)+
+                     work->sources.capacity()*sizeof(kvmem::HostKvSource)+work->records.capacity()*sizeof(KvmemHostRecord)+
+-                    work->leases.capacity()*sizeof(kvmem::HostKvLease);
++                    work->leases.capacity()*sizeof(kvmem::HostKvLease)+
++                    work->payload_inputs.capacity()*sizeof(std::pair<const void*,std::uint64_t>);
+                 if (copy_bytes>UINT64_MAX-work_bytes)
+                     throw ContextCacheExhausted("native Waiting restore metadata bound overflows");
+                 NativeSourceVersionCharge admission;
+@@ -3983,8 +4059,6 @@ bool ProgramImpl::prepare_memory_materialization(MaterializationTransaction& tra
+         const KvmemWindowState* prospective=nullptr;
+         if (transaction.memory_history) {
+             prospective=transaction.memory_history->fork.get();
+-            if (!prospective && staged.memory_restore_generation)
+-                prospective=&*memory_histories.at(transaction.memory_history->history);
+         }
+         prepare_layerwise_admission(transaction,checkpoint,prospective);
+     }
+@@ -3999,19 +4073,13 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
+     const bool fork=bool(prepared->fork);
+     const auto kind=prepared->selected;
+     const auto frontier=std::optional<uint32_t>(staged.memory_restore_frontier);
+-    if(fork) {
+-        sequence.window=std::move(*prepared->fork);
+-    } else {
+-        auto& history=memory_histories[prepared->history];
+-        if(!history || history->stamp.session.id!=prepared->generation) return false;
+-        // A directory hit never consumes its source, including a continuation.
+-        // Normally preparation already owns the fork; retain this invariant on
+-        // the synchronous fallback path as well.
+-        sequence.window=std::move(*fork_memory_history(*history,*memory_checkpoint(*history,kind)));
+-    }
++    if(!fork || prepared->directory_borrowed)
++        throw std::logic_error("memory restore has no detached execution owner");
++    sequence.window=std::move(*prepared->fork);
+     auto& window = sequence.window;
+     const bool same_query = memory_user_already_evaluated(staged.prompt, *frontier);
+     auto checkpoint = memory_checkpoint_slot(window, kind);
++    window.execution_checkpoint = checkpoint;
+     window.coverage.touch(checkpoint.get());
+     // The previous Program address-space lease has been released. These IDs
+     // must never be treated as resident in the new native address space.
+@@ -4103,6 +4171,13 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
+         // will not cross it again. Keep the restored complete state for repeats
+         // and cancellation recovery; restoring does not consume its payload.
+         memory_checkpoint_slot(window, kind) = std::move(checkpoint);
++    // The ordinary restore source has served its last native/MTP read. Keep
++    // its directory alias for reuse, but do not protect its old partial tail
++    // while capturing a different Query source later in this prefill.
++    // Native layerwise's Query owner retains its selected source explicitly.
++    if (kvmem_options.recall_strategy!=kvmem::RecallStrategy::Layerwise &&
++        !(memory_query_probe(sequence,staged.prompt_tokens) && *frontier==window.query_begin))
++        window.execution_checkpoint.reset();
+     staged.base = *frontier;
+     staged.cursor = *frontier;
+     ++memory_history_hits;
+@@ -4118,64 +4193,160 @@ void ProgramImpl::reserve_memory_history(SequenceState& sequence, RequestControl
+                                          uint64_t additional, bool optional) {
+     if(!sequence.window.cache_group) sequence.window.cache_group=next_snapshot_group.fetch_add(1);
+     if (!sequence.window.statistics) ++memory_history_misses;
+-    // Read/write permission belongs to this request; a fresh request never
+-    // invalidates other independently published content snapshots.
+-    std::uint64_t reserved = additional;
+-    for (const auto& active : requests) reserved += active.memory_payload_reservation;
+-    std::unordered_set<const void*> active_payloads, active_cold;
++    (void)request;
++    enforce_memory_payload_budget(additional,optional,false,&sequence);
++}
++
++KvmemPayloadBudget ProgramImpl::required_memory_payload(uint64_t additional,
++        const SequenceState* owner, bool include_optional) const {
++    KvmemPayloadBudget required;
++    if (!owner) required.reserve(additional);
++    std::vector<std::uint64_t> credits;
++    credits.reserve(requests.size());
++    for (const auto& active : requests) {
++        required.reserve(active.memory_payload_envelope);
++        credits.push_back(active.memory_payload_envelope);
++    }
++    const auto* transaction=std::get_if<MaterializationTransaction>(&context_transaction_);
++    const auto* pending=transaction ? transaction->memory_history.get() : nullptr;
++    if (transaction) {
++        const auto installed=requests[transaction->destination.value].memory_payload_envelope;
++        const auto quoted=transaction->plan->impl_->memory_payload_envelope;
++        if (quoted>installed) required.reserve(quoted-installed);
++        credits[transaction->destination.value]=std::max(installed,quoted);
++    }
++    // Establish all primary archive credits before charging immutable private
++    // versions. Preparation owns the same full-history credit as its destination.
+     for (const auto& lane : continuation_states) if (lane.window.statistics)
+         for (const auto& record : lane.window.archive) if (record)
+-            active_payloads.insert(record.storage_identity());
+-    for (const auto& lane : continuation_states) if (lane.window.statistics)
+-        visit_memory_checkpoints(lane.window, [&](const KvmemPrefixCheckpoint& cp) {
+-            account_kvmem_checkpoint_payload(cp,[&](const void* identity, size_t bytes) {
+-                if (active_payloads.insert(identity).second) reserved += bytes;
+-            });
+-            if (cp.cold_state && active_cold.insert(cp.cold_state.storage_identity()).second)
+-                reserved += cp.cold_state.size();
+-        });
+-    if (memory_coverage_transfer)
+-        account_kvmem_checkpoint_payload(*memory_coverage_transfer->checkpoint,[&](const void* identity, size_t bytes) {
+-            if (active_payloads.insert(identity).second) reserved += bytes;
+-        });
+-    if (reserved > memory_retained_budget) {
+-        throw std::runtime_error("KVMem retained snapshot payload budget exhausted");
++            required.require(record.storage_identity(),record.size(),credits.at(lane.lane));
++    if (pending && pending->fork && pending->fork->statistics)
++        for (const auto& record:pending->fork->archive) if(record)
++            required.require(record.storage_identity(),record.size(),credits.at(transaction->destination.value));
++    const auto checkpoint_payload=[&](const KvmemPrefixCheckpoint& cp, std::uint64_t& credit) {
++        account_kvmem_checkpoint_payload(cp,[&](const void* id,size_t bytes) {required.require(id,bytes,credit);});
++        if(cp.cold_state) required.require(cp.cold_state.storage_identity(),cp.cold_state.size(),credit);
++    };
++    for (const auto& lane : continuation_states) if (lane.window.statistics) {
++        auto& credit=credits.at(lane.lane);
++        if (lane.window.execution_checkpoint) checkpoint_payload(*lane.window.execution_checkpoint,credit);
++        required.reserve(lane.window.execution_auxiliary_bytes,credit);
++        if (const auto& append=lane.window.pending_append) {
++            if (!append->ticket.ready())
++                required.reserve(append->work->ids.size()*(text_host_kv_page_stride+backend_host_kv_page_stride),credit);
++            else for (const auto& record:append->work->records) if (record)
++                required.require(record.storage_identity(),record.size(),credit);
++        }
++        required.reserve(lane.window.pending_window_payload_growth,credit);
++        if (include_optional) visit_memory_checkpoints(lane.window,[&](const auto& cp) {checkpoint_payload(cp,credit);});
++    }
++    if(pending && pending->fork && pending->fork->statistics)
++        visit_memory_checkpoints(*pending->fork,[&](const auto& cp) {checkpoint_payload(cp,credits.at(transaction->destination.value));});
++    std::uint64_t no_credit=0;
++    if(memory_coverage_transfer) checkpoint_payload(*memory_coverage_transfer->checkpoint,no_credit);
++    if(memory_idle_transfer)
++        required.require(memory_idle_transfer->work->destination.storage_identity(),memory_idle_transfer->work->destination.size());
++
++    // The engine reads only immutable quotes while workers are running. The
++    // physical storage account keeps the same bytes charged after cancellation;
++    // this weak registry keeps the admission ledger aware until the read drains.
++    const auto work_payload=[&](const KvmemHistoryPreparation::Work& work, std::uint64_t& credit) {
++        for(const auto& [id,bytes]:work.payload_inputs) required.require(id,bytes,credit);
++        if(work.accounting_ticket && !work.accounting_ticket.ready()) {
++            required.reserve(work.payload_growth,credit);
++        } else {
++            for(const auto& record:work.records) if(record)
++                required.require(record.storage_identity(),record.size(),credit);
++        }
++    };
++    for(const auto& weak:memory_history_work) {
++        const auto work=weak.lock();
++        if(work && !(work->accounting_ticket && work->accounting_ticket.ready()) &&
++           (!pending || work!=pending->work)) work_payload(*work,no_credit);
++    }
++    if(pending && pending->work) work_payload(*pending->work,credits.at(transaction->destination.value));
++    // Reserve transient restore copies before the first I/O submission/native
++    // mutation. Once submitted, Work owns either its growth quote or its ready
++    // records until publication; do not charge the same copy a second time.
++    if(pending && pending->fork && pending->fork->statistics && !pending->native_ready &&
++       !(pending->work && pending->work->accounting_ticket &&
++         pending->work->payload_growth)) {
++        const auto* cp=memory_checkpoint(*pending->fork,pending->selected);
++        if(!cp || cp->prefix.empty()) throw std::logic_error("restore budget has no selected checkpoint");
++        const auto tail=(cp->prefix.size()-1)/page_tokens;
++        for(const auto page:cp->resident_pages) {
++            const auto& record=pending->fork->archive.at(page);
++            if((memory_io && kvmem_options.disk_bytes) || page==tail || !record.resident_bytes())
++                required.reserve(record.size(),credits.at(transaction->destination.value));
++        }
++    }
++    if (owner) required.reserve(additional,credits.at(owner->lane));
++    return required;
++}
++
++bool ProgramImpl::reclaim_optional_memory_checkpoints() {
++    bool changed=false;
++    for (auto& lane:continuation_states) {
++        auto& window=lane.window;
++        if (!window.statistics) continue;
++        const auto* required=window.execution_checkpoint.get();
++        for (auto& slot:window.checkpoints) if (slot.data && slot.data.get()!=required) {
++            slot.data.reset();changed=true;
++        }
++        for (auto& entry:window.coverage) if (entry.record.data && entry.record.data.get()!=required) {
++            entry={};changed=true;
++        }
++    }
++    if (changed && kvmem_options.verify_transfers)
++        std::fprintf(stderr,"KVMEM_CHECKPOINT_EVICT reason=payload_pressure scope=optional_active\n");
++    return changed;
++}
++
++void ProgramImpl::enforce_memory_payload_budget(uint64_t additional, bool optional, bool admission,
++                                               const SequenceState* owner) {
++    if(!kvmem_window_tokens) return;
++    auto required=required_memory_payload(additional,owner);
++    const auto denied=[&]() {
++        if(optional) throw std::runtime_error("optional snapshot exceeds retained payload budget");
++        if(admission) throw ContextCacheExhausted("KVMem required execution payload exceeds the retained budget");
++        // Active KVMem steps already have a request-local storage failure/drain
++        // path. Do not send expected capacity pressure to the invariant handler.
++        throw kvmem::MemoryError(kvmem::MemoryErrorCode::BudgetExceeded,
++                                "KVMem required execution payload exceeds the retained budget");
++    };
++    if(!required.fits(memory_retained_budget)) {
++        if (!optional && reclaim_optional_memory_checkpoints()) required=required_memory_payload(additional,owner);
++        if(!required.fits(memory_retained_budget)) denied();
+     }
+-    auto available = memory_retained_budget - reserved;
+     for (;;) {
+-        std::uint64_t cached_bytes = memory_idle_transfer ? memory_idle_transfer->work->destination.size() : 0;
++        auto total=required;
+         std::vector<kvmem::ContentCacheSlot> slots;
+-        auto payloads = active_payloads;
+-        auto cold = active_cold;
+-        // Active reservations cover archive records; retained private versions
+-        // have been added above. Shared identities receive credit exactly once.
+-        const auto protected_source=request.prefill ? request.prefill->memory_restore_generation : 0;
+         for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+             const auto& history = memory_histories[index];
+-            slots.push_back({bool(history),history && (history->stamp.session.id==protected_source || retained_history_pinned(index)),
++            slots.push_back({bool(history),history && retained_history_pinned(index),
+                 history ? history->publication_order : 0,
+                 history ? static_cast<const void*>(&*history) : nullptr,history ? history->cache_group : 0});
+             if (!history) continue;
+             for(const auto& record:history->archive)
+-                if(record && payloads.insert(record.storage_identity()).second) cached_bytes+=record.size();
+-            std::vector<const KvmemPrefixCheckpoint*> seen;
+-            for (const auto kind : checkpoint_kinds(*history))
+-                if (const auto* checkpoint = memory_checkpoint(*history, kind);
+-                    checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
+-                    account_kvmem_checkpoint_payload(*checkpoint,[&](const void* identity, size_t bytes) {
+-                        if (payloads.insert(identity).second) cached_bytes += bytes;
+-                    });
+-                    if(checkpoint->cold_state && cold.insert(checkpoint->cold_state.storage_identity()).second)
+-                        cached_bytes += checkpoint->cold_state.size();
+-                    seen.push_back(checkpoint);
+-                }
++                if(record) total.require(record.storage_identity(),record.size());
++            visit_memory_checkpoints(*history,[&](const KvmemPrefixCheckpoint& cp) {
++                account_kvmem_checkpoint_payload(cp,[&](const void* id,size_t bytes) {total.require(id,bytes);});
++                if(cp.cold_state) total.require(cp.cold_state.storage_identity(),cp.cold_state.size());
++            });
+         }
+-        if (cached_bytes <= available) break;
++        if(total.fits(memory_retained_budget)) break;
+         if (optional) throw std::runtime_error("optional snapshot exceeds retained payload budget");
+         const auto victim=kvmem::select_content_eviction(slots);
+-        if (!victim) throw std::logic_error("KVMem retained Host accounting has no victim");
++        if(!victim) denied();
++        const auto generation=memory_histories[*victim]->stamp.session.id;
++        const auto physical_before=memory_payload_storage.charged_bytes();
+         memory_histories[*victim].reset();
+         ++memory_history_evictions;
++        if(kvmem_options.verify_transfers) std::fprintf(stderr,
++            "KVMEM_HISTORY_EVICT generation=%llu required_bytes=%llu total_before=%llu budget=%llu physical_before=%llu physical_after=%llu\n",
++            (unsigned long long)generation,(unsigned long long)required.used(),(unsigned long long)total.used(),
++            (unsigned long long)memory_retained_budget,(unsigned long long)physical_before,
++            (unsigned long long)memory_payload_storage.charged_bytes());
+     }
+ }
+ 
+@@ -4362,25 +4533,31 @@ void ProgramImpl::retain_memory_history(SequenceState& sequence, const RequestCo
+ }
+ 
+ bool ProgramImpl::memory_maintenance_pending() const noexcept {
+-    return memory_io && (memory_idle_requested || memory_idle_transfer || memory_coverage_transfer);
++    return memory_io && (memory_idle_requested || memory_idle_transfer || memory_coverage_transfer ||
++                         !memory_history_work.empty());
+ }
+ 
+ bool ProgramImpl::progress_memory_storage() {
+     if (!memory_maintenance_pending()) return false;
+     bool changed = false;
++    // Ready includes release of the worker's captured owners. Report this
++    // capacity change so Waiting requests blocked on cancelled reads retry.
++    for(auto it=memory_history_work.begin();it!=memory_history_work.end();) {
++        const auto work=it->lock();
++        if(!work || (work->accounting_ticket && work->accounting_ticket.ready())) {
++            it=memory_history_work.erase(it); changed=true;
++        } else ++it;
++    }
+     if(memory_coverage_transfer) {
+         progress_checkpoint_coverage(continuation_states.front().window);
+-        if(memory_coverage_transfer) return false;
++        if(memory_coverage_transfer) return changed;
+         changed = true;
+     }
+     const auto being_restored = [&](std::uint64_t generation) {
+-        const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
+-        if (!transaction) return false;
+-        const auto& prefill = requests[transaction->destination.value].prefill;
+-        return prefill && prefill->memory_restore_frontier && prefill->memory_restore_generation == generation;
++        return borrowed_memory_history()==generation;
+     };
+     if (memory_idle_transfer) {
+-        if (!memory_idle_transfer->ticket.ready()) return false;
++        if (!memory_idle_transfer->ticket.ready()) return changed;
+         auto completed = std::move(memory_idle_transfer);
+         auto& pending = *completed;
+         try {
+@@ -4420,35 +4597,20 @@ bool ProgramImpl::progress_memory_storage() {
+     const auto victim = layerwise_source_account ? oldest_retained_checkpoint(kvmem_options.checkpoint_target) :
+         std::optional<std::uint64_t>{};
+     if (layerwise_source_account && !victim) return changed;
+-    std::uint64_t used = 0;
+-    for (const auto& active : requests) used += active.memory_payload_reservation;
+-    std::unordered_set<const void*> payloads,cold;
+-    for(const auto& lane:continuation_states) if(lane.window.statistics)
+-        for(const auto& record:lane.window.archive) if(record) payloads.insert(record.storage_identity());
+-    for (const auto& lane : continuation_states) if (lane.window.statistics)
+-        visit_memory_checkpoints(lane.window, [&](const KvmemPrefixCheckpoint& cp) {
+-            account_kvmem_checkpoint_payload(cp,[&](const void* identity, size_t bytes) {
+-                if (payloads.insert(identity).second) used += bytes;
+-            });
+-            if (cp.cold_state && cold.insert(cp.cold_state.storage_identity()).second)
+-                used += cp.cold_state.size();
+-        });
++    auto payload_budget=required_memory_payload();
+     for (const auto& history : memory_histories) {
+         if (!history) continue;
+         for(const auto& record:history->archive)
+-            if(record && payloads.insert(record.storage_identity()).second) used+=record.size();
+-        std::vector<const KvmemPrefixCheckpoint*> seen;
+-        for (const auto kind : checkpoint_kinds(*history))
+-            if (const auto* checkpoint = memory_checkpoint(*history, kind);
+-                checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
+-                account_kvmem_checkpoint_payload(*checkpoint,[&](const void* identity, size_t bytes) {
+-                    if (payloads.insert(identity).second) used += bytes;
+-                });
+-                if(checkpoint->cold_state && cold.insert(checkpoint->cold_state.storage_identity()).second)
+-                    used += checkpoint->cold_state.size();
+-                seen.push_back(checkpoint);
+-            }
++            if(record) payload_budget.require(record.storage_identity(),record.size());
++        visit_memory_checkpoints(*history,[&](const auto& checkpoint) {
++            account_kvmem_checkpoint_payload(checkpoint,[&](const void* identity,size_t bytes) {
++                payload_budget.require(identity,bytes);
++            });
++            if(checkpoint.cold_state)
++                payload_budget.require(checkpoint.cold_state.storage_identity(),checkpoint.cold_state.size());
++        });
+     }
++    const auto used=payload_budget.used();
+     // One background image at a time. Its original pinned owner is retained,
+     // so there is no second full state-image allocation and no worker CUDA call.
+     for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+diff --git a/src/models/qwen3_5/program/transactions/commit.cpp b/src/models/qwen3_5/program/transactions/commit.cpp
+index c769336c..c1be2f8a 100644
+--- a/src/models/qwen3_5/program/transactions/commit.cpp
++++ b/src/models/qwen3_5/program/transactions/commit.cpp
+@@ -625,6 +625,11 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
+             RequestControl& request = requests[lanes[row]];
+             if (kvmem_window_tokens) {
+                 auto& state = active_sequence(lanes[row]);
++                // Begin has been accepted by resolve_pending_raw. Query's
++                // execution owner can now retire; directory copies remain
++                // ordinary, pressure-evictable reuse candidates (for every T).
++                state.window.execution_checkpoint.reset();
++                state.window.execution_auxiliary_bytes = 0;
+                 const auto* tail = memory_checkpoint(state.window, KvmemCheckpointKind::PromptTail);
+                 if (memory_checkpoint(state.window, KvmemCheckpointKind::Base) && tail &&
+                     !state.window.coverage.policy().extra_recompute_tokens) {
+diff --git a/src/runtime/engine/engine_core.h b/src/runtime/engine/engine_core.h
+index 68a1838d..f286c7f7 100644
+--- a/src/runtime/engine/engine_core.h
++++ b/src/runtime/engine/engine_core.h
+@@ -23,6 +23,7 @@
+ #include "runtime/engine/effective_thinking_budget.h"
+ #include "runtime/engine/worker_fault.h"
+ #include "runtime/engine/worker_recovery.h"
++#include "runtime/engine/storage_failure.h"
+ #include "text/structured_output.h"
+ #include "kvmem/memory_contract.hpp"
+ 
+@@ -2320,7 +2321,7 @@ private:
+         const auto request = slots_[lane];
+         if (!request || !request->lane || !request->sequence)
+             throw std::logic_error("storage failure has no active request owner");
+-        request->storage_failure = error;
++        request->storage_failure = request_storage_failure(error);
+     }
+ 
+     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+diff --git a/src/runtime/engine/storage_failure.h b/src/runtime/engine/storage_failure.h
+new file mode 100644
+index 00000000..213ef12d
+--- /dev/null
++++ b/src/runtime/engine/storage_failure.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "kvmem/memory_contract.hpp"
++#include "ninfer/request.h"
++#include <exception>
++
++namespace ninfer::runtime {
++// Only the already-owned storage-failure path uses this conversion. Capacity
++// is an expected request failure; corruption, I/O and invariants keep their type.
++inline std::exception_ptr request_storage_failure(std::exception_ptr error) {
++    if (!error) return error;
++    try { std::rethrow_exception(error); }
++    catch (const kvmem::MemoryError& failure) {
++        if (failure.code() == kvmem::MemoryErrorCode::BudgetExceeded)
++            return std::make_exception_ptr(RequestError(RequestErrorKind::Overloaded, failure.what()));
++    } catch (...) {}
++    return error;
++}
++} // namespace ninfer::runtime
+diff --git a/tests/README.md b/tests/README.md
+index c4e2b355..79095174 100644
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -27,6 +27,16 @@ benchmark-report, and external protocol behavior. Repository verification princi
+   consumer.
+ 
+ Tests are grouped by observable risk, not by mirroring every source file or class.
++`ninfer_kvmem_snapshot_test` is a standalone host target. It covers the native snapshot
++capture/fork helpers, including evicting a long source while short-prefix branches survive,
++actual release of unrelated suffix bytes, shared/COW isolation, directory-container reuse,
++and cancellation of SSD work while started reads retain their sources and charges.
++Real captures at 1/8/63/64/65-token frontiers also exercise phase reservations,
++bounded identity credits, exhausted credits, alias deduplication and overflow atomicity.
++An actual storage allocation refusal exercises the production BudgetExceeded-to-request
++overload conversion; other storage codes and invariant errors retain their exception identity.
++These checks prove the host ownership primitives; native state restoration and continued
++service of peer requests additionally require the real Engine regression workload.
+ The standalone `ninfer_memory_frontend --tool-output-only` checks explicit basic tool publication,
+ default auto parsing without a grammar, default none text-only publication, none with JSON,
+ continuation/truncation and unconstrained quoted-marker handling.
+diff --git a/tests/test_http_error_handler.cpp b/tests/test_http_error_handler.cpp
+index 4e3b8d73..0cf8c13e 100644
+--- a/tests/test_http_error_handler.cpp
++++ b/tests/test_http_error_handler.cpp
+@@ -23,6 +23,14 @@ int main() {
+     ServeOptions options;
+     options.max_request_bytes = 1234;
+ 
++    const ninfer::serve::ApiError exhausted = ninfer::serve::request_error_to_api_error(
++        ninfer::RequestError(ninfer::RequestErrorKind::Overloaded,
++                             "KVMem required execution payload exceeds the retained budget"));
++    failures += check(exhausted.status == 429 && exhausted.code == "server_overloaded" &&
++                          exhausted.type == "rate_limit_error" && exhausted.param.empty() &&
++                          exhausted.message == "KVMem required execution payload exceeds the retained budget",
++                      "owned execution capacity failure lost its resource classification");
++
+     const ninfer::serve::ApiError media_budget = ninfer::serve::request_error_to_api_error(
+         ninfer::RequestError(ninfer::RequestErrorKind::MediaBudgetExceeded,
+                              "vision tokens exceed processor budget"));
+diff --git a/tests/test_kvmem_snapshot.cpp b/tests/test_kvmem_snapshot.cpp
+index a7157b29..5b172df0 100644
+--- a/tests/test_kvmem_snapshot.cpp
++++ b/tests/test_kvmem_snapshot.cpp
+@@ -1,4 +1,6 @@
+ #include "models/qwen3_5/program/storage/kvmem_snapshot.h"
++#include "models/qwen3_5/program/storage/kvmem_payload_budget.h"
++#include "runtime/engine/storage_failure.h"
+ #include "kvmem/spill_io.hpp"
+ #include <array>
+ #include <iostream>
+@@ -9,7 +11,300 @@
+ using namespace kvmem;
+ using namespace ninfer::models::qwen3_5;
+ void require(bool ok) { if (!ok) throw std::runtime_error("snapshot invariant failed"); }
++struct OpenGateOnExit {
++    std::promise<void>& promise;
++    ~OpenGateOnExit() { try { promise.set_value(); } catch(const std::future_error&) {} }
++};
++
++void prepared_payload_budget_counts_real_owners() {
++    using ninfer::models::qwen3_5::detail::KvmemPayloadBudget;
++    constexpr size_t stride=16;
++    HostKvStorage storage(128);
++    std::vector<HostKvRecord> archive;
++    for(size_t i=0;i<2;++i) { archive.push_back(storage.allocate(stride));archive.back().seal(); }
++    auto checkpoint=capture_kvmem_snapshot(archive,2,true,storage);
++    auto prepared=fork_kvmem_snapshot(*checkpoint);
++    // An old-tail reader outlives eviction of the archive that created it.
++    const auto old_tail=archive[1].storage_identity();
++    auto reader=archive[1].source();
++    archive.clear();
++    require(storage.charged_bytes()==3*stride);
++    KvmemPayloadBudget before;
++    before.reserve(4*stride); // Complete request archive, including future growth.
++    for(const auto& record:prepared) before.cover(record.storage_identity());
++    checkpoint->account([&](const void* id,size_t bytes){before.require(id,bytes);});
++    before.require(old_tail,stride);before.require(old_tail,stride);
++    require(before.used()==5*stride && before.fits(5*stride) && !before.fits(5*stride-1));
++
++    // Writing a shared partial tail creates a distinct version. The sealed CP
++    // and an in-flight old-tail reader each cost one additional record, even
++    // though the source's cache directory is already gone.
++    const uint8_t replacement=51;
++    prepared.back().write(0,&replacement,1);prepared.back().seal();
++    require(storage.charged_bytes()==4*stride);
++    KvmemPayloadBudget after;
++    after.reserve(4*stride);
++    for(const auto& record:prepared) after.cover(record.storage_identity());
++    checkpoint->account([&](const void* id,size_t bytes){after.require(id,bytes);});
++    after.require(old_tail,stride);
++    require(after.used()==6*stride && !after.fits(5*stride));
++    reader={};require(storage.charged_bytes()==3*stride);
++    KvmemPayloadBudget drained;
++    drained.reserve(4*stride);
++    for(const auto& record:prepared) drained.cover(record.storage_identity());
++    checkpoint->account([&](const void* id,size_t bytes){drained.require(id,bytes);});
++    require(drained.used()==5*stride && drained.fits(5*stride));
++    checkpoint.reset();prepared.clear();require(storage.charged_bytes()==0);
++
++    KvmemPayloadBudget overflow;
++    const auto maximum=std::numeric_limits<uint64_t>::max();
++    overflow.reserve(maximum-7);
++    bool rejected=false;
++    try { overflow.reserve(8); } catch(const std::overflow_error&) { rejected=true; }
++    require(rejected && overflow.used()==maximum-7);
++    int allocation_identity=0;
++    rejected=false;
++    try { overflow.require(&allocation_identity,8); } catch(const std::overflow_error&) { rejected=true; }
++    require(rejected && overflow.used()==maximum-7);
++    // A rejected addition cannot poison de-duplication for the same identity.
++    overflow.require(&allocation_identity,7);
++    require(overflow.used()==maximum && overflow.fits(maximum));
++    overflow.require(&allocation_identity,7);
++    require(overflow.used()==maximum);
++}
++
++void phase_credit_covers_real_captures() {
++    using namespace ninfer::models::qwen3_5::detail;
++    constexpr size_t stride=16, page_tokens=64;
++    for (const size_t frontier : {size_t(1),size_t(8),size_t(63),size_t(64),size_t(65)}) {
++        HostKvStorage storage(12*stride);
++        std::vector<HostKvRecord> archive;
++        const auto pages=(frontier+page_tokens-1)/page_tokens;
++        for (size_t i=0;i<pages;++i) { archive.push_back(storage.allocate(stride));archive.back().seal(); }
++        const auto primary=storage.charged_bytes();
++        auto query=capture_kvmem_snapshot(archive,pages,frontier%page_tokens!=0,storage);
++        const auto private_bytes=storage.charged_bytes()-primary;
++        require(private_bytes==(frontier%page_tokens ? stride : 0));
++
++        // Real partial-tail capture consumes future-growth slack, not another
++        // whole-page charge above an already larger complete-history quote.
++        const auto envelope=kvmem_payload_envelope(8*stride,primary,private_bytes);
++        require(envelope==8*stride);
++        KvmemPayloadBudget budget;
++        budget.reserve(envelope);
++        uint64_t credit=envelope;
++        for (const auto& record:archive) budget.require(record.storage_identity(),record.size(),credit);
++        query->account([&](const void* id,size_t bytes){budget.require(id,bytes,credit);});
++        require(budget.used()==envelope && credit==envelope-storage.charged_bytes());
++        auto alias=query;
++        const auto after_capture=credit;
++        alias->account([&](const void* id,size_t bytes){budget.require(id,bytes,credit);});
++        require(credit==after_capture && budget.used()==envelope);
++
++        // At a short output frontier the temporary real allocation is instead
++        // the phase peak. It cannot disappear behind a smaller history quote.
++        const auto short_envelope=kvmem_payload_envelope(primary,primary,private_bytes);
++        require(short_envelope==storage.charged_bytes());
++        KvmemPayloadBudget short_budget;
++        short_budget.reserve(short_envelope);
++        uint64_t short_credit=short_envelope;
++        for (const auto& record:archive) short_budget.require(record.storage_identity(),record.size(),short_credit);
++        query->account([&](const void* id,size_t bytes){short_budget.require(id,bytes,short_credit);});
++        require(short_credit==0 && short_budget.used()==storage.charged_bytes());
++        alias.reset();query.reset();archive.clear();require(storage.charged_bytes()==0);
++    }
++
++    // Multiple optional versions can exhaust the same future-growth envelope.
++    // Distinct real tail identities above that envelope remain fully charged.
++    HostKvStorage storage(8*stride);
++    std::vector<HostKvRecord> archive;
++    archive.push_back(storage.allocate(stride));archive.back().seal();
++    KvmemPayloadBudget budget;budget.reserve(4*stride);
++    budget.cover(archive.front().storage_identity());
++    uint64_t credit=3*stride;
++    std::vector<std::shared_ptr<const KvSnapshot>> captures;
++    for (size_t count=1;count<=4;++count) {
++        captures.push_back(capture_kvmem_snapshot(archive,1,true,storage));
++        captures.back()->account([&](const void* id,size_t bytes){budget.require(id,bytes,credit);});
++        require(storage.charged_bytes()==(count+1)*stride);
++        require(budget.used()==(count<=3 ? 4 : 5)*stride);
++        require(budget.fits(4*stride)==(count<=3));
++    }
++    require(credit==0);
++    // A foreign reader is a real surviving owner after this request releases
++    // its reservations and every checkpoint directory. It gets no old credit.
++    auto work=captures.back()->blocks().front()->record();
++    const auto work_id=work.storage_identity();
++    captures.clear();archive.clear();require(storage.charged_bytes()==stride);
++    KvmemPayloadBudget cancelled;
++    cancelled.require(work_id,work.size());cancelled.require(work_id,work.size());
++    require(cancelled.used()==storage.charged_bytes());
++    work={};require(storage.charged_bytes()==0);
++
++    const auto maximum=std::numeric_limits<uint64_t>::max();
++    bool rejected=false;
++    try { (void)kvmem_payload_envelope(maximum,maximum,1); }
++    catch(const std::overflow_error&) { rejected=true; }
++    require(rejected); // max(history, ...) cannot conceal an overflowing phase.
++    KvmemPayloadBudget overflow;overflow.reserve(maximum-3);
++    uint64_t allowance=2;int identity=0;
++    rejected=false;
++    try { overflow.require(&identity,6,allowance); }
++    catch(const std::overflow_error&) { rejected=true; }
++    require(rejected && overflow.used()==maximum-3 && allowance==2);
++    overflow.require(&identity,5,allowance);
++    require(overflow.used()==maximum && allowance==0);
++    allowance=2;overflow.require(&identity,5,allowance);
++    require(allowance==2); // A duplicate cannot spend a second owner's credit.
++    rejected=false;
++    try { overflow.reserve(3,allowance); }
++    catch(const std::overflow_error&) { rejected=true; }
++    require(rejected && overflow.used()==maximum && allowance==2);
++    overflow.reserve(2,allowance);require(overflow.used()==maximum && allowance==0);
++}
++
++void only_storage_budget_becomes_request_overload() {
++    using ninfer::runtime::request_storage_failure;
++    HostKvStorage storage(16);
++    std::array<uint8_t,16> expected{};expected.fill(71);
++    auto peer=storage.allocate(expected.size(),expected.data());peer.seal();
++    std::exception_ptr exhausted;
++    try { (void)storage.allocate(1); }
++    catch(const MemoryError& error) {
++        require(error.code()==MemoryErrorCode::BudgetExceeded);
++        exhausted=std::current_exception();
++    }
++    require(bool(exhausted));
++    std::string original;
++    try { std::rethrow_exception(exhausted); }
++    catch(const MemoryError& error) { original=error.what(); }
++    bool overloaded=false;
++    try { std::rethrow_exception(request_storage_failure(exhausted)); }
++    catch(const ninfer::RequestError& error) {
++        overloaded=error.kind()==ninfer::RequestErrorKind::Overloaded && original==error.what();
++    }
++    require(overloaded && storage.charged_bytes()==16);
++    require(std::equal(expected.begin(),expected.end(),peer.data()));
++    require(!request_storage_failure({}));
++    for(const auto code : {MemoryErrorCode::InvalidPlan,MemoryErrorCode::Unsupported,
++            MemoryErrorCode::Stale,MemoryErrorCode::Pending,MemoryErrorCode::TransferFailed,
++            MemoryErrorCode::Disconnected,MemoryErrorCode::InvalidSession}) {
++        const auto error=std::make_exception_ptr(MemoryError(code,"preserve storage failure"));
++        require(request_storage_failure(error)==error);
++        try { std::rethrow_exception(request_storage_failure(error)); }
++        catch(const MemoryError& value) { require(value.code()==code); }
++    }
++    const auto invariant=std::make_exception_ptr(std::logic_error("checkpoint invariant"));
++    const auto nonstandard=std::make_exception_ptr(17);
++    const auto already_classified=std::make_exception_ptr(ninfer::RequestError(
++        ninfer::RequestErrorKind::Unavailable,"worker unavailable"));
++    require(request_storage_failure(invariant)==invariant);
++    require(request_storage_failure(nonstandard)==nonstandard);
++    require(request_storage_failure(already_classified)==already_classified);
++}
++
++// Exercise the same native capture/fork helpers used by history preparation.
++// A selected prefix must not keep the unrelated suffix alive through its parent
++// directory owner, including when the selected frontier is a partial KV page.
++void evict_long_source_after_fork() {
++    constexpr size_t stride=16, history_pages=320, page_tokens=64;
++    for (const size_t frontier : {size_t(1),size_t(8),size_t(63),size_t(64),size_t(65),size_t(4097),size_t(18000)}) {
++        HostKvStorage storage((history_pages+3)*stride);
++        const auto prefix_pages=(frontier+page_tokens-1)/page_tokens;
++        std::vector<HostKvRecord> directory_archive;
++        const auto append=[&](size_t page) {
++            std::array<uint8_t,stride> value{};
++            for(size_t i=0;i<stride;++i) value[i]=uint8_t(page*11+i);
++            directory_archive.push_back(storage.allocate(stride,value.data()));
++            directory_archive.back().seal();
++        };
++        for(size_t page=0;page<prefix_pages;++page) append(page);
++        auto selected=capture_kvmem_snapshot(directory_archive,prefix_pages,frontier%page_tokens!=0,storage);
++        const auto expected=selected->read();
++        for(size_t page=prefix_pages;page<history_pages;++page) append(page);
++        auto endpoint=capture_kvmem_snapshot(directory_archive,history_pages,false,storage);
++        auto first=fork_kvmem_snapshot(*selected), second=fork_kvmem_snapshot(*selected);
++        const auto before=storage.charged_bytes();
++        require(before>=history_pages*stride);
++
++        // Evict the parent entry, not the immutable data held by each request.
++        directory_archive.clear();endpoint.reset();
++        require(storage.charged_bytes()==prefix_pages*stride);
++        require(before-storage.charged_bytes()>=(history_pages-prefix_pages)*stride);
++        require(selected->read()==expected);
++        for(size_t page=0;page<prefix_pages;++page) {
++            std::array<uint8_t,stride> got{};
++            second[page].read(0,got.data(),stride);
++            require(std::equal(got.begin(),got.end(),expected.begin()+page*stride));
++        }
++        // Reusing the directory's containers must not redirect either branch.
++        append(999);
++        auto replacement=capture_kvmem_snapshot(directory_archive,1,false,storage);
++        require(replacement->read()!=std::vector<uint8_t>(expected.begin(),expected.begin()+stride));
++        require(selected->read()==expected);
++        directory_archive.clear();replacement.reset();
++
++        const uint8_t changed=uint8_t(expected.back()^0xff);
++        first.back().write(stride-1,&changed,1);first.back().seal();
++        require(storage.charged_bytes()==(prefix_pages+1)*stride);
++        require(selected->read()==expected);
++        first.clear(); // Cancelling one request preserves the other and its CP.
++        require(storage.charged_bytes()==prefix_pages*stride);
++        selected.reset();
++        require(storage.charged_bytes()==prefix_pages*stride);
++        second.clear();require(storage.charged_bytes()==0);
++    }
++}
++
++void evicted_source_running_read_keeps_exact_charge() {
++    constexpr size_t stride=16, history_pages=48;
++    auto disk=std::make_shared<SpillFile>(std::filesystem::temp_directory_path(),history_pages*stride);
++    HostKvStorage storage(stride,disk);
++    std::array<uint8_t,stride> expected{};expected.fill(43);
++    std::vector<HostKvRecord> directory_archive;
++    directory_archive.push_back(storage.allocate(stride,expected.data()));directory_archive.back().seal();
++    auto selected=capture_kvmem_snapshot(directory_archive,1,false,storage);
++    for(size_t i=1;i<history_pages;++i) {
++        directory_archive.push_back(storage.allocate(stride));directory_archive.back().seal();
++    }
++    auto branch=fork_kvmem_snapshot(*selected);
++    const auto read_identity=branch[0].storage_identity();
++    auto read_source=branch[0].source();
++    storage.trim(0);
++    require(storage.charged_bytes()==0 && disk->charged_bytes()==history_pages*stride);
++    std::promise<void> started,release;
++    auto gate=release.get_future().share();
++    std::array<uint8_t,stride> actual{};
++    StorageIoQueue queue(2,2*stride,1);
++    OpenGateOnExit release_on_error{release};
++    auto running=queue.submit(stride,[source=read_source,&started,gate,&actual] {
++        auto lease=source.lease();started.set_value();gate.wait();
++        lease.read(0,actual.data(),actual.size());
++    });
++    started.get_future().wait();
++    // The pending copy also owns its source, but cancellation releases it.
++    std::atomic<bool> queued_published{false};
++    auto queued=queue.submit(stride,[source=read_source,&queued_published] { queued_published=true; });
++    require(queued.cancel());
++    require(!running.cancel()); // Started work must drain; it is not freed early.
++    directory_archive.clear();selected.reset();branch.clear();read_source={};
++    require(storage.charged_bytes()==0 && disk->charged_bytes()==stride);
++    require(queue.pinned_bytes()==stride);
++    ninfer::models::qwen3_5::detail::KvmemPayloadBudget cancelled;
++    cancelled.require(read_identity,stride);
++    require(cancelled.used()==disk->charged_bytes());
++    release.set_value();running.wait();
++    try { queued.wait(); } catch(const MemoryError&) {}
++    require(actual==expected && !queued_published);
++    require(storage.charged_bytes()==0 && disk->charged_bytes()==0 && queue.pinned_bytes()==0);
++}
++
+ int main() {
++    prepared_payload_budget_counts_real_owners();
++    phase_credit_covers_real_captures();
++    only_storage_budget_becomes_request_overload();
++    evict_long_source_after_fork();
++    evicted_source_running_read_keeps_exact_charge();
+     HostKvStorage storage(4096);
+     {
+         std::array<uint8_t,16> bytes{}; bytes.fill(7);

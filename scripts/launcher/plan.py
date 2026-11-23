@@ -126,8 +126,8 @@ def scoring_args(p):
         args += ['--no-kvmem-lrfu']
     for key, flag in [('QueryMaxTokens', '--kvmem-query-max-tokens'),
                       ('QueryReplayMaxTokens', '--kvmem-query-replay-max-tokens')]:
-        if key in p:
-            args += [flag, str(p[key])]
+        if key in p or p.get('Backend', 'ninfer') == 'ninfer':
+            args += [flag, str(p.get(key, 0))]
     return recall_args(p) + args
 
 
@@ -142,6 +142,7 @@ def _speculative(p, supplied):
     backend = p['Backend']
     if backend == 'ninfer':
         p.setdefault('CheckpointExtraRecomputeTokens', 0)
+    p.setdefault('CacheMinTokens', 0)
     mode = p.get('SpeculativeMode') or ('mtp' if p['MtpDrafts'] else 'none')
     spec = SPECULATIVE_PROFILES[backend].get(mode)
     if spec is None:
@@ -364,6 +365,8 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
     if p['ThinkingMode'] == 'on':
         argv.append('--enable-thinking')
     argv.append('--kvmem')
+    if p['CacheMinTokens']:
+        pair('--kvmem-cache-min-tokens', p['CacheMinTokens'])
     if backend == 'llamacpp':
         pair('--kvmem-block-tokens', tokens['block_tokens'])
         if p['MtpDrafts']:

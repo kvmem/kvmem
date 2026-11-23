@@ -73,7 +73,7 @@ let browser;
  }
  async function preview(page){
   if(await page.locator('[data-param=RecallStrategy]').inputValue()==='layerwise')
-   await page.waitForFunction(()=>document.querySelector('[data-worker-capability-note]')?.textContent.startsWith('Worker capabilities:'));
+   await page.waitForFunction(()=>document.querySelector('[data-param=RecallStrategy]')?.dataset.capabilityState==='ready');
   let posted;
   await page.route('**/api/launcher/preview',async route=>{
    posted=route.request().postDataJSON();await route.fulfill({json:{argv:['offline-worker'],environment:{},preflight:{port_available:true},effective_settings:{}}});
@@ -106,7 +106,7 @@ let browser;
   assert.equal(p.LayerwiseActivationRamMiB,0);assert.equal(p.LayerwiseActivationDiskMiB,128);
   assert.equal(p.SinkTokens,0);assert.equal(p.RecentTokens,0);
   for(const key of ['QueryScorer','GraphAlpha','QueryMaxTokens','QueryReplayMaxTokens','Lrfu'])assert.equal(key in p,false,key);
-  await page.locator('#launch-tab-5').click();
+  await page.locator('#launch-tab-6').click();
   await page.screenshot({path:path.join(task,'layerwise-launcher-ui.png'),fullPage:true});
   await set(page,'RecallStrategy','legacy');
   const old=await preview(page);assert.equal(old.QueryScorer,'page-softmax');assert.equal(old.GraphAlpha,.2);
@@ -149,6 +149,8 @@ let browser;
   assert.match(await page.locator('[data-runtime-details]').textContent(),/Awaiting full service report/);
   await context.close();
  }
+ parameters={...baseParameters};state={state:'stopped'};
+ await require('./test-recall-layout.cjs')({browser,base,info:info(),task});
  assert.deepEqual(errors,[]);
  const result={status:'PASS',scope:'offline UI; no native/model/GPU',browser:browser.version(),checks:['strategy isolation','five finite controls','explicit OWN policy','Legacy retained values','DFlash history separation','Guess SharedTarget','Radiance256 and explicit512','running configuration lock','unconfirmed actual report']};
  fs.writeFileSync(path.join(task,'layerwise-ui-result.json'),JSON.stringify(result,null,2)+'\n');

@@ -1,0 +1,44 @@
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -757,6 +757,7 @@
+     std::vector<kvmem::LayerMemorySnapshot> source_layers;
+     std::vector<std::uint32_t> query_pins;
+     KvmemLayerViews pending_maps;
++    std::shared_ptr<const NativeLayerwiseFeedbackSnapshot> query_prefill_feedback;
+     std::unique_ptr<kvmem::RawKvStore> frozen_keys;
+     std::unique_ptr<DeviceArena> score_workspace;
+     std::unique_ptr<kvmem::PageSoftmaxCuda> owned_scorer;
+@@ -905,9 +906,31 @@
+         std::vector<kvmem::LayerwiseRequestLayer> specs;
+         const kvmem::MemoryBudget target_budget{selected_budget,rows,
+             p.kvmem_window_tokens,p.memory_retained_budget};
+-        for (auto model:model_layers)
++        const auto* hybrid_flag=std::getenv("NINFER_LAYERWISE_HYBRID_QUERY");
++        if (hybrid_flag && std::strcmp(hybrid_flag,"0") && std::strcmp(hybrid_flag,"1"))
++            throw std::invalid_argument("NINFER_LAYERWISE_HYBRID_QUERY must be 0 or 1");
++        const bool hybrid=begin && hybrid_flag && std::strcmp(hybrid_flag,"1")==0;
++        if (hybrid) {
++            query_prefill_feedback=window.layer_views.feedback;
++            if (!query_prefill_feedback)
++                throw std::logic_error("hybrid Query requires accepted layerwise prefill feedback");
++            query_prefill_feedback->validate(window.stamp.session,begin,model_layers);
++            if (query_prefill_feedback->options.block_tokens!=page_tokens)
++                throw std::logic_error("hybrid Query prefill scores must address native 64-token pages");
++        }
++        for (auto model:model_layers) {
++            const kvmem::LayerwisePrefillState* prefill=nullptr;
++            if (hybrid && (model==3 || model==7 || model==11 || model==15)) {
++                const auto& states=query_prefill_feedback->prefill.layers;
++                const auto found=std::find_if(states.begin(),states.end(),[&](const auto& state){return state.model_layer==model;});
++                if (found==states.end()) throw std::logic_error("hybrid Query lost its layer's prefill source");
++                prefill=&*found;
++                std::fprintf(stderr,"KVMEM_HYBRID_QUERY source_h=%u model_layer=%u source=prefill_attention score_end=%llu samples=%llu\n",
++                    begin,model,static_cast<unsigned long long>(prefill->end),static_cast<unsigned long long>(prefill->samples));
++            }
+             specs.push_back({model,{config.compact_layer_indices[model],config.attention->num_attention_heads,
+-                config.attention->num_key_value_heads,config.attention->head_dim,resources.attention_scale},target_budget,query_pins});
++                config.attention->num_key_value_heads,config.attention->head_dim,resources.attention_scale},target_budget,query_pins,prefill});
++        }
+         transaction=std::make_unique<kvmem::LayerwiseQueryRequest>(identity,
+             kvmem::LayerwiseMemoryCatalog(archive.descriptor,source_layers),*policy,*frozen_keys,std::move(specs),
+             history_tokens,[this]{return identity.history;});

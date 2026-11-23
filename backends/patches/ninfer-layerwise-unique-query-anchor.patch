@@ -1,0 +1,251 @@
+diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
+index 6e329d703292d0918fb8c7ac3f7c03fb8f7b44db..de393ab00059afe8491610533a1940bc9e66d3d0 100644
+--- a/apps/cli/options.cpp
++++ b/apps/cli/options.cpp
+@@ -177,6 +177,7 @@ std::string usage_text(const char* argv0) {
+            "  --kvmem-layerwise-activation-disk-mib N  Query tape SSD (default 0)\n"
+            "  --kvmem-layerwise-staging-mib N          bounded transfer staging (default 16)\n"
+            "  --kvmem-layerwise-score-tokens N   Mean-K statistics per 64-token page: 32 or 64 (default 64)\n"
++           "  --kvmem-layerwise-unique-query-anchor    keep a long unique exact match within the history budget\n"
+            "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
+            "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+            "  --kvmem-layerwise-activation-metadata-mib N tape descriptors (default 128)\n"
+@@ -772,6 +773,7 @@ Options parse_options(int argc, char** argv) {
+     product::apply_kvmem_cli_options(memory,options.kvmem);
+     options.kvmem.layerwise.metadata_bytes = retention.metadata_bytes;
+     options.kvmem.checkpoint_target = retention.target;
++    options.kvmem.layerwise_unique_query_anchor = retention.query_anchor;
+     options.kvmem.layerwise_score_tokens = retention.score_tokens;
+     if (memory.enabled) {
+         const auto window=options.kvmem.device_tokens();
+diff --git a/include/ninfer/engine_options.h b/include/ninfer/engine_options.h
+index c0c6bd0bb6c000d15396793e681090dc90217085..a26aa6c9249c90a34438d190dc6a5c9f8d60722d 100644
+--- a/include/ninfer/engine_options.h
++++ b/include/ninfer/engine_options.h
+@@ -470,6 +470,7 @@ struct KvmemOptions {
+     kvmem::RecallStrategy recall_strategy = kvmem::RecallStrategy::Legacy;
+     kvmem::LayerwiseOptions layerwise=native_layerwise_defaults();
+     std::uint32_t checkpoint_target = kDefaultLayerwiseCheckpointTarget;
++    bool layerwise_unique_query_anchor = false;
+     std::uint32_t layerwise_score_tokens = 64;
+     [[nodiscard]] std::uint32_t mean_key_block_tokens() const {
+         if (recall_strategy != kvmem::RecallStrategy::Layerwise) return 64;
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index 778feb4d4969bf1f7ad0bb25e4d58aa1b4e69b9b..3b16cd45b8557b5adff2d37a35279c376c88a530 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -9,6 +9,7 @@
+ #include "models/qwen3_5/program/storage/kvmem_transfer_trace.h"
+ #include "models/qwen3_5/program/storage/checkpoint_recompute_policy.h"
+ #include "models/qwen3_5/program/storage/layerwise_kv_transfer.h"
++#include "models/qwen3_5/program/storage/unique_query_anchor.h"
+ #include "models/qwen3_5/program/storage/layerwise_refresh_profile.h"
+ #include "models/qwen3_5/program/native_layerwise_probe.h"
+ #include "models/qwen3_5/program/native_mtp_boundary.h"
+@@ -754,6 +755,7 @@ struct NativeLayerwiseProgramQuery::Impl {
+     std::shared_ptr<KvmemPrefixCheckpoint> checkpoint;
+     NativeFrozenLayerArchive archive;
+     std::vector<kvmem::LayerMemorySnapshot> source_layers;
++    std::vector<std::uint32_t> query_pins;
+     KvmemLayerViews pending_maps;
+     std::unique_ptr<kvmem::RawKvStore> frozen_keys;
+     std::unique_ptr<DeviceArena> score_workspace;
+@@ -893,12 +895,18 @@ struct NativeLayerwiseProgramQuery::Impl {
+         // A new layerwise mode has its own literal Mean-K/TopK policy. Legacy
+         // LRFU, graph expansion, score aggregation or cached Query settings do
+         // not alter the new algorithm's source, denominator or native picker.
++        if (p.kvmem_options.layerwise_unique_query_anchor && checkpoint && !input->has_media()) {
++            const auto anchor = unique_query_anchor(checkpoint->prefix,
++                std::span(input->token_ids).subspan(query.begin,query.count), page_tokens,
++                history_tokens/page_tokens, resources.sink_blocks, resources.recent_blocks);
++            query_pins.assign(anchor.pages.begin(), anchor.pages.begin()+anchor.count);
++        }
+         std::vector<kvmem::LayerwiseRequestLayer> specs;
+         const kvmem::MemoryBudget target_budget{selected_budget,rows,
+             p.kvmem_window_tokens,p.memory_retained_budget};
+         for (auto model:model_layers)
+             specs.push_back({model,{config.compact_layer_indices[model],config.attention->num_attention_heads,
+-                config.attention->num_key_value_heads,config.attention->head_dim,resources.attention_scale},target_budget,{}});
++                config.attention->num_key_value_heads,config.attention->head_dim,resources.attention_scale},target_budget,query_pins});
+         transaction=std::make_unique<kvmem::LayerwiseQueryRequest>(identity,
+             kvmem::LayerwiseMemoryCatalog(archive.descriptor,source_layers),*policy,*frozen_keys,std::move(specs),
+             history_tokens,[this]{return identity.history;});
+@@ -906,7 +914,7 @@ struct NativeLayerwiseProgramQuery::Impl {
+         // existing constructor rather than duplicating selection semantics.
+         const kvmem::LayerwiseQuerySelection admission(*policy,*frozen_keys,identity,
+             {0,config.attention->num_attention_heads,config.attention->num_key_value_heads,
+-             config.attention->head_dim,resources.attention_scale},[this]{return identity.history;});
++             config.attention->head_dim,resources.attention_scale},[this]{return identity.history;},query_pins);
+         const auto max_blocks=std::max(1u,begin/mean_block);
+         const auto score_bytes=kvmem::PageSoftmaxCuda::workspace_bytes(max_blocks,config.attention->num_attention_heads,
+             config.attention->num_key_value_heads,config.attention->head_dim);
+@@ -1204,7 +1212,7 @@ struct NativeLayerwiseProgramQuery::Impl {
+         const auto probe_started=std::chrono::steady_clock::now();
+         const auto prior_work=probe_work;
+         probe_history.emplace(native_layerwise_probe(private_context,input->token_ids,identity,physical,
+-            *policy,*frozen_keys,targets,[this]{return identity.history;},*probe_metadata,score,prepare,restore,probe_work,{},
++            *policy,*frozen_keys,targets,[this]{return identity.history;},*probe_metadata,score,prepare,restore,probe_work,query_pins,
+             p.parameters.text.tensor_parallel()?&tensor_query:nullptr,tensor_host,
+             rope_axes==3?runner.get():nullptr,rope_axes==3?input:nullptr));
+         if (p.kvmem_options.verify_transfers) {
+diff --git a/src/models/qwen3_5/program/storage/unique_query_anchor.h b/src/models/qwen3_5/program/storage/unique_query_anchor.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec363a1308eb571d93c4c1c056b3874472b3076d
+--- /dev/null
++++ b/src/models/qwen3_5/program/storage/unique_query_anchor.h
+@@ -0,0 +1,65 @@
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <span>
++#include <stdexcept>
++
++namespace ninfer::models::qwen3_5::detail {
++
++struct UniqueQueryAnchor {
++    std::array<std::uint32_t, 2> pages{};
++    std::uint32_t count = 0;
++};
++
++// An optional exact-text companion for short queries. Work is bounded by one
++// pass over history and 64 comparisons per history token. No history-sized
++// table, tokenizer, document labels, decoded strings or model outputs are used.
++inline UniqueQueryAnchor unique_query_anchor(std::span<const std::int32_t> history,
++        std::span<const std::int32_t> query, std::uint32_t page_tokens,
++        std::uint32_t budget_pages, std::uint32_t sink_pages, std::uint32_t recent_pages) {
++    if (!page_tokens || page_tokens % 2 || sink_pages > budget_pages ||
++        recent_pages > budget_pages - sink_pages || history.size() % page_tokens ||
++        history.size() > UINT32_MAX)
++        throw std::invalid_argument("invalid native exact Query anchor geometry");
++    constexpr std::size_t limit = 64;
++    const auto threshold = page_tokens / 2;
++    const auto history_pages = static_cast<std::uint32_t>(history.size() / page_tokens);
++    if (query.size() < threshold || query.size() > limit || history_pages <= budget_pages ||
++        budget_pages == sink_pages + recent_pages)
++        return {};
++
++    // row[j] is the length of the matching suffix ending at query[j-1] and
++    // the current history token. Descending order preserves the preceding row.
++    std::array<std::uint8_t, limit+1> row{};
++    std::uint32_t best = 0, best_end = 0;
++    bool unique = false;
++    for (std::uint32_t i = 0; i < history.size(); ++i) {
++        for (std::size_t j = query.size(); j > 0; --j) {
++            const std::uint32_t length = history[i] == query[j-1] ? row[j-1] + 1 : 0;
++            row[j] = static_cast<std::uint8_t>(length);
++            if (length > best) {
++                best = length;
++                best_end = i + 1;
++                unique = true;
++            } else if (length == best && best_end != i + 1) {
++                unique = false;
++            }
++        }
++    }
++    if (!unique || best < threshold) return {};
++    const auto first = (best_end - best) / page_tokens;
++    const auto last = (best_end - 1) / page_tokens;
++    // Only pages actually touched by the matched passage are candidates.
++    // Never expand to neighboring text or displace a mandatory sink/recent page.
++    UniqueQueryAnchor anchor;
++    if (last - first + 1 > anchor.pages.size()) return {};
++    for (auto page = first; page <= last; ++page) {
++        if (page >= sink_pages && page < history_pages - recent_pages)
++            anchor.pages[anchor.count++] = page;
++    }
++    if (anchor.count > budget_pages - sink_pages - recent_pages) return {};
++    return anchor;
++}
++} // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/product/kvmem_cli_options.h b/src/product/kvmem_cli_options.h
+index e22c2d99a0648570f3f0f9fd6650d2beb1c29355..3b19bebc91853aac81d410eb6a0caf8a30f84ed3 100644
+--- a/src/product/kvmem_cli_options.h
++++ b/src/product/kvmem_cli_options.h
+@@ -12,11 +12,14 @@ namespace ninfer::product {
+ struct NativeRetentionOptions {
+     std::uint64_t metadata_bytes = 0;
+     std::uint32_t target = kDefaultLayerwiseCheckpointTarget;
++    bool query_anchor = false;
+     std::uint32_t score_tokens = 64;
+ 
+     template<class Need>
+     bool parse(const std::string& arg, const Need& need, kvmem::CliOptions& memory) {
+-        if (arg == "--kvmem-layerwise-checkpoint-target") {
++        if (arg == "--kvmem-layerwise-unique-query-anchor") {
++            query_anchor = true;
++        } else if (arg == "--kvmem-layerwise-checkpoint-target") {
+             target = memory.integer(arg, need(arg.c_str()), 1);
+             if (target > kMaxLayerwiseCheckpointTarget)
+                 throw std::invalid_argument("checkpoint target exceeds 256");
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 6462347a2f3136549ccad954d4792376014b0ebf..75d0e833ce6e3158f606833e004eadd8612bbb32 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -128,6 +128,7 @@ std::string serve_usage_text(const char* argv0) {
+            "  --kvmem-layerwise-activation-disk-mib N bounded Query activation SSD (default 0)\n"
+            "  --kvmem-layerwise-staging-mib N bounded Query/KV transfer staging (default 16)\n"
+            "  --kvmem-layerwise-score-tokens N   Mean-K statistics per 64-token page: 32 or 64 (default 64)\n"
++           "  --kvmem-layerwise-unique-query-anchor    keep a long unique exact match within the history budget\n"
+            "  --kvmem-layerwise-checkpoint-target N    retained hot checkpoints per instance (default 10, 1..256)\n"
+            "  --kvmem-layerwise-metadata-mib auto|N    model-sized budget or hard cap in MiB (default auto)\n"
+            "  --kvmem-layerwise-activation-metadata-mib N bounded tape descriptors (default 128)\n"
+@@ -1828,6 +1829,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+     product::apply_kvmem_cli_options(memory, options.kvmem);
+     options.kvmem.layerwise.metadata_bytes = retention.metadata_bytes;
+     options.kvmem.checkpoint_target = retention.target;
++    options.kvmem.layerwise_unique_query_anchor = retention.query_anchor;
+     options.kvmem.layerwise_score_tokens = retention.score_tokens;
+     kvmem::validate_layerwise_mtp_history(memory.recall_strategy,
+         options.speculative.backend==SpeculativeBackend::Mtp,memory.layerwise_mtp_history);
+diff --git a/tests/models/qwen3_5/test_layerwise_program_query.cpp b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+index 6ea503f50a449d2097584eb20a1eaa9d9f2396f7..4a2a28b7760e63323e585d6cdbd4de162749ad0f 100644
+--- a/tests/models/qwen3_5/test_layerwise_program_query.cpp
++++ b/tests/models/qwen3_5/test_layerwise_program_query.cpp
+@@ -1,3 +1,4 @@
++#include "models/qwen3_5/program/storage/unique_query_anchor.h"
+ #include "models/qwen3_5/layerwise_attention_fixture.h"
+ #include "models/qwen3_5/load.h"
+ #include "models/qwen3_5/program/program_impl.h"
+@@ -1451,7 +1452,25 @@ public:
+ };
+ } // namespace ninfer::models::qwen3_5::detail
+ 
++void check_unique_text_query_pages() {
++    using ninfer::models::qwen3_5::detail::unique_query_anchor;
++    std::vector<std::int32_t> q(41);
++    for (std::size_t i=0;i<q.size();++i) q[i]=static_cast<std::int32_t>(1000+i);
++    std::vector<std::int32_t> history(640,-1);
++    std::copy(q.begin()+2,q.end()-2,history.begin()+124);
++    auto selected=unique_query_anchor(history,q,64,5,1,0);
++    check(selected.count==2 && selected.pages[0]==1 && selected.pages[1]==2,
++        "unique cross-page text match was not retained");
++    check(!unique_query_anchor(history,q,64,2,1,0).count,
++        "exact text match exceeded remaining physical budget");
++    check(!unique_query_anchor(history,std::span(q).first(31),64,5,1,0).count,
++        "short Query unexpectedly pinned a history page");
++    std::copy(q.begin()+2,q.end()-2,history.begin()+410);
++    check(!unique_query_anchor(history,q,64,5,1,0).count,
++        "repeated history match was arbitrarily resolved");
++}
+ int main(int argc,char** argv) {
++    check_unique_text_query_pages();
+     if (ninfer::test::cuda_unavailable()) return 77;
+     if ((argc==4 || argc==5) && std::string_view(argv[1])=="--mtp-kv") {
+         try {
+diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
+index 536ce23e7d2fced79a4d1ebfa3c958d64c2ea9b5..2ae894dd582ce37d608da26ce5d056e5bf20a157 100644
+--- a/tests/test_serve_options.cpp
++++ b/tests/test_serve_options.cpp
+@@ -269,6 +269,10 @@ int run_serve_option_tests() {
+         bool bad_grid=false;
+         try {(void)parse(invalid_grid);} catch(const std::invalid_argument&) {bad_grid=true;}
+         failures+=check(bad_grid,"invalid native Mean-K geometry was accepted");
++        auto quoted=base;quoted.push_back("--kvmem-layerwise-unique-query-anchor");
++        failures+=check(make_engine_options(parse(quoted)).kvmem.layerwise_unique_query_anchor &&
++            !make_engine_options(parse(base)).kvmem.layerwise_unique_query_anchor,
++            "explicit native exact Query anchor option was lost");
+         auto missing=base;missing.insert(missing.end(),{"--spec","mtp","--draft-tokens","1"});
+         failures+=check(make_engine_options(parse(missing)).kvmem.layerwise_mtp_history==
+             ::kvmem::LayerwiseMtpHistory::FirstLayer,"layerwise MTP lost its approved first-layer default");

@@ -3,12 +3,13 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
+from patch_series import patch_specs
 
 
 def source_revision(source):
     meta = json.loads((Path(__file__).resolve().parents[1]/'upstream.json').read_text(encoding='utf-8'))
     manifest = json.loads((source/'.radiance-source-manifest.json').read_text(encoding='utf-8'))
-    expected = [meta['native_patch_sha256'], *[p['sha256'] for p in meta.get('additional_native_patches', [])]]
+    expected = [spec['sha256'] for spec in patch_specs(meta)]
     if manifest.get('patches', [manifest.get('patch_sha256')]) != expected or manifest['revision'] != meta['revision']:
         raise ValueError('native source patch chain/revision differs from the adapter pin')
     if (source/'.git').exists():

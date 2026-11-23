@@ -1,0 +1,118 @@
+diff --git a/include/ninfer/ops/linear.h b/include/ninfer/ops/linear.h
+index bfee8e2..413d7d5 100644
+--- a/include/ninfer/ops/linear.h
++++ b/include/ninfer/ops/linear.h
+@@ -217,8 +217,8 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+ 
+ // The rows and K columns that a share of a `format` matrix (a tensor-parallel rank's piece) is a
+ // whole number of, so that a runtime-shape route takes it, beyond the stored layout's own units:
+-// T2 runs 32-row tiles over 512-column K slabs, FP8 64 rows over 512 and NVFP4 128 over 256; every
+-// other format adds none.
++// T2 runs 32-row tiles over 512-column K slabs, FP8 64 rows over 512, NVFP4 128 over 256
++// and GGUF 128-row output tiles; every other format adds none.
+ struct LinearShareUnits {
+     std::uint64_t rows    = 1;
+     std::uint64_t columns = 1;
+diff --git a/src/ops/linear/linear.cpp b/src/ops/linear/linear.cpp
+index aaf13d2..dc5f376 100644
+--- a/src/ops/linear/linear.cpp
++++ b/src/ops/linear/linear.cpp
+@@ -274,6 +274,9 @@ bool linear_writes_fp32(QType format) noexcept {
+ }
+ 
+ LinearShareUnits linear_share_units(QType format) noexcept {
++    // The GGUF integer matrix route requires whole 128-row output tiles on every rank.
++    // Stored GGUF blocks constrain columns separately; row-aligned cuts preserve the bytes.
++    if (is_gguf(format)) { return {128, 1}; }
+     switch (format) {
+     case QType::T2_G128_FP16:
+         return {32, detail::kT2RuntimeShapeK};
+diff --git a/tests/ops/linear/test_share_units.cpp b/tests/ops/linear/test_share_units.cpp
+new file mode 100644
+index 0000000..f1ad0d7
+--- /dev/null
++++ b/tests/ops/linear/test_share_units.cpp
+@@ -0,0 +1,70 @@
++#include "ninfer/ops/linear.h"
++#include "core/tensor_split.h"
++
++#include <array>
++#include <cstdint>
++#include <iostream>
++#include <stdexcept>
++#include <vector>
++
++using ninfer::QType;
++
++namespace {
++void require(bool value, const char* message) {
++    if (!value) { throw std::runtime_error(message); }
++}
++
++void check_splits(QType format) {
++    const auto units = ninfer::ops::linear_share_units(format);
++    require(units.columns == 1, "GGUF column layout must keep owning its block constraints");
++    for (const std::uint64_t rows : {248320, 17408, 6144}) {
++        const auto allowed = ninfer::unit_positions(rows, units.rows);
++        for (const auto& weights : std::vector<std::vector<double>>{
++                 {0.478, 0.522}, {0.493, 0.507}, {118679, 129641}, {1, 1},
++                 {1, 1000000}, {1000000, 1}, {1, 1, 1}, {1, 2, 3, 4}}) {
++            const auto ends = ninfer::split_shares(rows, allowed, weights);
++            require(ends.size() == weights.size() + 1 && ends.front() == 0 && ends.back() == rows,
++                    "rank ranges must cover the original projection");
++            for (std::size_t rank = 0; rank < weights.size(); ++rank) {
++                require(ends[rank] < ends[rank + 1], "every rank needs a nonempty range");
++                require(ends[rank] % 128 == 0 && (ends[rank + 1] - ends[rank]) % 128 == 0,
++                        "rank output rows violate GGUF integer matrix geometry");
++            }
++        }
++        require(ninfer::split_shares(rows, allowed, std::array{1.0, 1.0}) ==
++                    std::vector<std::uint64_t>{0, rows / 2, rows},
++                "already aligned equal splits must stay identical");
++    }
++    const auto ends = ninfer::split_shares(248320, ninfer::unit_positions(248320, units.rows),
++                                         std::array{118679.0, 129641.0});
++    require(ends == std::vector<std::uint64_t>{0, 118656, 248320},
++            "the reported 129641-row share must move to its nearest legal boundary");
++}
++} // namespace
++
++int main() {
++    try {
++        // Include the GGUF formats outside the contiguous Q8_0..Q2_0 enum range explicitly.
++        constexpr QType formats[]{QType::GGUF_Q8_0, QType::GGUF_Q2_K, QType::GGUF_Q3_K,
++            QType::GGUF_Q4_K, QType::GGUF_Q5_K, QType::GGUF_Q6_K, QType::GGUF_IQ2_XXS,
++            QType::GGUF_IQ2_XS, QType::GGUF_IQ2_S, QType::GGUF_IQ3_XXS, QType::GGUF_IQ3_S,
++            QType::GGUF_IQ1_S, QType::GGUF_IQ1_M, QType::GGUF_IQ4_NL, QType::GGUF_IQ4_XS,
++            QType::GGUF_Q4_0, QType::GGUF_Q5_0, QType::GGUF_Q2_0, QType::GGUF_MXFP4};
++        for (const auto format : formats) { check_splits(format); }
++        struct Expected { QType format; std::uint64_t rows, columns; };
++        for (const auto expected : {Expected{QType::BF16, 1, 1},
++                 Expected{QType::Q4_G64_FP16, 1, 1}, Expected{QType::T2_G128_FP16, 32, 512},
++                 Expected{QType::PTQ1_G128_FP16, 64, 512}, Expected{QType::T5_G128_FP16, 128, 1024},
++                 Expected{QType::FP8_E4M3FN_ROW_BF16, 64, 512}, Expected{QType::NVFP4, 128, 256}}) {
++            const auto units = ninfer::ops::linear_share_units(expected.format);
++            require(units.rows == expected.rows && units.columns == expected.columns,
++                    "non-GGUF share constraints changed");
++        }
++        std::cout << "PASS: 19 GGUF formats, three model dimensions, eight split patterns; "
++                     "equal splits and non-GGUF constraints preserved\n";
++        return 0;
++    } catch (const std::exception& error) {
++        std::cerr << error.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/tests/ops/tests.cmake b/tests/ops/tests.cmake
+index c5b1be1..5542d07 100644
+--- a/tests/ops/tests.cmake
++++ b/tests/ops/tests.cmake
+@@ -427,3 +427,8 @@ target_include_directories(ninfer_gguf_expert_cpu_test PRIVATE
+ ninfer_add_op_test(ninfer_prompt_page_lse_test STANDALONE
+   SOURCES ops/softmax_attention/page_lse.cpp LIBRARIES ninfer_ops ninfer_core)
+ ninfer_stage_runtime_dlls(ninfer_prompt_page_lse_test)
++
++# Host-only regression for legal tensor-parallel projection boundaries.
++ninfer_add_op_test(ninfer_linear_share_units_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear/test_share_units.cpp"
++  LIBRARIES ninfer_ops ninfer_core)
