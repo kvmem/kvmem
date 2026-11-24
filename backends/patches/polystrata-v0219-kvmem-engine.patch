@@ -88,7 +88,7 @@ index a8332c5..b1f3347 100644
  /// `n = kv_heads * dim`, row-major (`codes[row * n + blk * 32 + j]`, `scales[row * (n / 32) + blk]`).
  /// A q8 read is active wherever `codes` is not null.  The value a block holds is
 diff --git a/engine/src/poly/engine.cpp b/engine/src/poly/engine.cpp
-index 92dfa1b..0d99428 100644
+index 92dfa1b..b852e00 100644
 --- a/engine/src/poly/engine.cpp
 +++ b/engine/src/poly/engine.cpp
 @@ -17,6 +17,7 @@
@@ -755,7 +755,31 @@ index 92dfa1b..0d99428 100644
          lin(output_, xn_, lg, m);
          finish_logits(lg, m);
          if (picks) {
-@@ -7012,6 +7383,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+@@ -6860,7 +7231,13 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+     // Once every layer has shown it routes on the card, the step's layers and its logits are one recording, as
+     // run()'s are: the card waited 2 to 4 microseconds from one recording to the next, four of them a layer, and
+     // after the last for the host's launch of the logits.  The same launches as the layer by layer replays.
+-    bool whole = replay && card && batch_heads() && !next_;
++#ifdef STRATA_KVMEM
++    const bool managed_step = opt_.memory.budget != 0;
++#else
++    constexpr bool managed_step = false;
++#endif
++    // The standard per-layer path binds each sequence before deriving its compact replay key.
++    bool whole = !managed_step && replay && card && batch_heads() && !next_;
+     for (int il = lo_; il < hi_ && whole; ++il) {
+         const Layer& L = layers_[(size_t) il];
+         whole = L.fixed && (!L.moe || (L.card == 1 && !batched(L, R)));
+@@ -6907,7 +7284,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+     }();
+     int mid = R / 2;
+     while (mid < R && mid > 0 && rseq[(size_t) mid] == rseq[(size_t) mid - 1]) ++mid;
+-    const bool halved = halves_on && !card && batch_heads() && !all_cached() && R >= 4 && mid > 0 && mid < R &&
++    const bool halved = !managed_step && halves_on && !card && batch_heads() && !all_cached() && R >= 4 && mid > 0 && mid < R &&
+                         !batched(layers_[(size_t) first_moe_layer()], R);
+     if (halved) {
+         const int first[3] = {0, mid, R};
+@@ -7012,6 +7389,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
              const int64_t keep = pos_;
              key.assign(1, R);
              for (int i = 0; i < R; ++i) {
@@ -765,7 +789,7 @@ index 92dfa1b..0d99428 100644
                  pos_ = at[(size_t) i];
                  key.push_back(rseq[(size_t) i]);
                  key.push_back(head_key(il, 1));
-@@ -7084,7 +7458,22 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+@@ -7084,7 +7464,22 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
      }
      for (int i = 0; i < n; ++i) {
          use(seqs[i]);
@@ -788,7 +812,7 @@ index 92dfa1b..0d99428 100644
          ahead_pos_ = -1;
      }
      use(home);
-@@ -7269,6 +7658,17 @@ void Engine::hand_on(int64_t pos, int n, float* h) {
+@@ -7269,6 +7664,17 @@ void Engine::hand_on(int64_t pos, int n, float* h) {
  
  void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
      OnCard here(device_, split_);
@@ -806,7 +830,7 @@ index 92dfa1b..0d99428 100644
      run(tokens, n);
      if (next_) {
          hand_on(pos_, n, pass_rows(n));
-@@ -7306,12 +7706,37 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
+@@ -7306,12 +7712,37 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
          } else {
              tail();
          }
@@ -846,7 +870,7 @@ index 92dfa1b..0d99428 100644
  }
  
  // A layer for n tokens, as run() hands it to the card when nothing is replayed or printed.
-@@ -7384,6 +7809,33 @@ void Engine::layer_pack(int il, const Pack& p, float* rows) {
+@@ -7384,6 +7815,33 @@ void Engine::layer_pack(int il, const Pack& p, float* rows) {
  // the layer's state is what save_state() would find there, and it is copied before the next call changes it.
  bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                    const std::function<bool(int, int)>* turn, const CoRead* co, int n_co) {
@@ -880,7 +904,7 @@ index 92dfa1b..0d99428 100644
      const int lead = bound_;
      int all = n;   // the rows of the read and its co-reads
      for (int j = 0; j < n_co; ++j) {
-@@ -7468,7 +7920,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
+@@ -7468,7 +7926,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
          cover(co[j].n);
      }
      hold(lead);
@@ -890,7 +914,7 @@ index 92dfa1b..0d99428 100644
      // On several cards, each reads through its own layers and hands the rows on, and `turn` hears of a card's
      // turns as its share of the model's layers: [lo_, to).
      const std::function<bool(int, int)>* asked = turn;
-@@ -7863,6 +8316,18 @@ void Engine::window(const int32_t* tokens, int t) {
+@@ -7863,6 +8322,18 @@ void Engine::window(const int32_t* tokens, int t) {
      if (t < 1 || t > opt_.window) throw std::logic_error("a window takes 1 to max_window() tokens");
      OnCard here(device_, split_);
      end_read();
@@ -909,7 +933,7 @@ index 92dfa1b..0d99428 100644
      // the two ways are a choice only with experts on the CPU; a call that records launches says nothing of them
      const bool timed = t > 1 && !card_routes();
      const bool recorded = std::exchange(recorded_, false);
-@@ -7881,6 +8346,9 @@ void Engine::window(const int32_t* tokens, int t) {
+@@ -7881,6 +8352,9 @@ void Engine::window(const int32_t* tokens, int t) {
      try {
          run(tokens, t);
      } catch (...) {
@@ -919,7 +943,7 @@ index 92dfa1b..0d99428 100644
          windowed_ = false;
          snap_bits_ = 0;
          recorded_ = recorded_ || recorded;
-@@ -7907,6 +8375,12 @@ void Engine::window(const int32_t* tokens, int t) {
+@@ -7907,6 +8381,12 @@ void Engine::window(const int32_t* tokens, int t) {
      if (timed && !recorded_ && !freeze_experts_) took_way(t, ms_since(t0));
      recorded_ = recorded_ || recorded;
      win_ = t;
@@ -932,7 +956,7 @@ index 92dfa1b..0d99428 100644
  }
  
  // How a window of t tokens goes through the layers: in halves, or its tokens together.  Each way is timed a few
-@@ -7937,6 +8411,10 @@ void Engine::keep(int n) {
+@@ -7937,6 +8417,10 @@ void Engine::keep(int n) {
      OnCard here(device_, split_);
      // The next card reads the window's rows again for the tokens it puts through its layers again: a right token's
      // row is the same, whatever came after it.
@@ -943,7 +967,7 @@ index 92dfa1b..0d99428 100644
      if (n < win_) {
          // The state after the last right token, when that token left it.  Else the one of the last token before
          // it that did, and the right tokens after that one go through the layers again: they come out as they
-@@ -7948,20 +8426,43 @@ void Engine::keep(int n) {
+@@ -7948,20 +8432,43 @@ void Engine::keep(int n) {
             "keep");
          if (from < n) {
              pos_ += from;
@@ -988,7 +1012,7 @@ index 92dfa1b..0d99428 100644
  }
  
  // The draft block's input for n tokens: each token's embedding and the model's output for the token before it
-@@ -8009,6 +8510,9 @@ float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, i
+@@ -8009,6 +8516,9 @@ float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, i
  // and hn_'s row i is the model's output for the token before it.  A row is all a later guess reads of a token, so
  // the rest of the block is not computed for it.  Then the call's last output is the one the next token pairs with.
  void Engine::draft_rows(const int32_t* tokens, int first, int n) {
@@ -998,7 +1022,7 @@ index 92dfa1b..0d99428 100644
      const size_t e = (size_t) n_embd_;
      if (block_layer_ && first < n) {
          draft_input(tokens + first, pos_ + first, hn_ + (size_t) first * e, n - first);
-@@ -8082,7 +8586,18 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
+@@ -8082,7 +8592,18 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
          *prob = i < block_n_ ? h_block_[i].prob : 0.f;
          return i < block_n_ ? h_block_[i].token : 0;
      }
@@ -1018,7 +1042,7 @@ index 92dfa1b..0d99428 100644
      ck(cudaStreamSynchronize(cs(st_)), "draft");
      draft_step(token, i);
      // The guess and its probability are found on the card.  On the host a vocabulary's softmax takes up to 2 ms
-@@ -8094,6 +8609,13 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
+@@ -8094,6 +8615,13 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
          ahead_tok_ = token;
      }
      *prob = h_guess_->prob;
@@ -2046,10 +2070,24 @@ index 1df14ea..5e1a3ac 100644
      // the first layer of a block starts a new stream from the attention's output; the one it had joins the mixes
      if (n == 1) {   // the convolution and the stream's update in one launch
 diff --git a/engine/src/poly/inkling2.cu b/engine/src/poly/inkling2.cu
-index 5808f15..da310f2 100644
+index 5808f15..034b236 100644
 --- a/engine/src/poly/inkling2.cu
 +++ b/engine/src/poly/inkling2.cu
-@@ -741,13 +741,14 @@ __global__ void ink_clips_kernel(InkClips c) {
+@@ -39,6 +39,13 @@ void launched(const char* what) {
+         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+ }
+ 
++#if defined(__HIPCC__)
++// HIP has __ldcs and __ldcg for halves only.  The DSpark screen's are cache hints (a copy's words read once, the
++// tiles' candidates from earlier launches), so on HIP they are plain loads.
++template <typename T> __device__ __forceinline__ T __ldcs(const T* p) { return *p; }
++template <typename T> __device__ __forceinline__ T __ldcg(const T* p) { return *p; }
++#endif
++
+ constexpr int WARP = 32;   // the lanes a shuffle spans: a warp, or half of a 64-lane wavefront
+ 
+ // The warp's sum of x, in every lane.
+@@ -741,13 +748,14 @@ __global__ void ink_clips_kernel(InkClips c) {
      while (j < 3 && b >= c.rows * c.heads[j]) b -= c.rows * c.heads[j++];
      const int row = b / c.heads[j], head = b % c.heads[j];
      float* v = c.x[j] + (size_t(row) * c.heads[j] + head) * c.dim[j];
@@ -2067,7 +2105,7 @@ index 5808f15..da310f2 100644
      if (KV8) {
          kv8_store(v, (uint8_t*) c.cache[j], cell, c.heads[j], c.dim[j], head, part);
          return;
-@@ -811,7 +812,7 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
+@@ -811,7 +819,7 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
      pdl_wait();
      __shared__ float part[128 / WARP];
      const InkQkv& a = g.a;
@@ -2076,7 +2114,7 @@ index 5808f15..da310f2 100644
      int b = blockIdx.x;
      if (b < a.n_head) {
          clip_head(a.q + size_t(b) * a.dim, a.q_scale ? a.q_scale + size_t(b) * a.dim : nullptr, a.qk_thr, a.dim,
-@@ -834,7 +835,8 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
+@@ -834,7 +842,8 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
          float* head = out + size_t(h) * a.dim;
          if (is_v) rms_head(head, a.dim, a.eps, part);
          else clip_head(head, nullptr, a.qk_thr, a.dim, 0.0f, 1.0f, p, part);
@@ -2086,7 +2124,7 @@ index 5808f15..da310f2 100644
          if (KV8) kv8_store(head, (uint8_t*) (is_v ? a.vals : a.keys), row, a.n_kv, a.dim, h, part);
          else if (i < a.dim)
              ((__half*) (is_v ? a.vals : a.keys))[size_t(row) * channels + size_t(h) * a.dim + i] = __float2half(head[i]);
-@@ -900,6 +902,12 @@ __device__ __forceinline__ void lane_halves(const __half* head, int lane, int n,
+@@ -900,6 +909,12 @@ __device__ __forceinline__ void lane_halves(const __half* head, int lane, int n,
  // kScoreKeys keys, one at a time: its lanes read the key side by side, once for all of the group's heads, and
  // their products with the queries are summed across the warp.  The bias's products are the first n_rel lanes'.
  // t0 is the launch's first token among the call's, nk_max the scores a head has room for.
@@ -2099,7 +2137,7 @@ index 5808f15..da310f2 100644
  template <bool KV8>
  __global__ void ink_score_kernel(InkAttn a, int t0, int nk_max) {
      pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
-@@ -938,7 +946,7 @@ __global__ void ink_score_kernel(InkAttn a, int t0, int nk_max) {
+@@ -938,7 +953,7 @@ __global__ void ink_score_kernel(InkAttn a, int t0, int nk_max) {
          if (j0 + u < j1) {
              if (KV8) lane_fp8(a.keys, row, a.n_kv, a.dim, g, lane, lh, k[u]);
              else lane_halves((const __half*) a.keys + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, k[u]);
@@ -2108,7 +2146,7 @@ index 5808f15..da310f2 100644
              rb[u] = lane < a.n_rel && dist < a.extent ? a.rel_bias[size_t(dist) * a.n_rel + lane] : 0.0f;
              if (++row == a.ring) row = 0;
          }
-@@ -1229,7 +1237,7 @@ __global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kerne
+@@ -1229,7 +1244,7 @@ __global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kerne
                      const long long key = k0 + 8 * n + 2 * tig + j % 2;
                      float v = -INFINITY;
                      if (tok[i] < a.rows && key <= own && (a.window <= 0 || key > own - a.window)) {

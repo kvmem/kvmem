@@ -8,8 +8,34 @@
 #include <stdexcept>
 #include <vector>
 
-struct Kvq8 { const int8_t* codes = nullptr; const uint16_t* scales = nullptr; };
-enum class KvFmt { kFp16, kQ8_0 };
+struct Kvq8 { const int8_t* codes = nullptr; const uint16_t* scales = nullptr; size_t stride = 0; };
+struct block_q4_0 {};
+struct RowCaches {
+    static constexpr int kMax = 8;
+    int8_t* codes[kMax]{};
+    uint16_t* scales[kMax]{};
+    size_t rs = 0;
+};
+struct RowHalves {
+    static constexpr int kMax = RowCaches::kMax;
+    uint16_t* rows[kMax]{};
+};
+struct AttnSeqs {
+    static constexpr int kMax = RowCaches::kMax;
+    int n = 0;
+    size_t rs = 0;
+    bool f16 = false;
+    float* q[kMax]{};
+    float* out[kMax]{};
+    const int8_t* kc[kMax]{};
+    const uint16_t* ks[kMax]{};
+    const int8_t* vc[kMax]{};
+    const uint16_t* vs[kMax]{};
+    const long long* at[kMax]{};
+    int keys[kMax]{};
+    int tokens[kMax]{};
+};
+enum class KvFmt { kFp16, kQ8_0, kQ4_0 };
 struct Memory {
     int64_t removed = 0;
     int64_t compact_position(int64_t p) const { return p - removed; }
@@ -24,6 +50,8 @@ struct Block {
     uint16_t* keys = nullptr; uint16_t* vals = nullptr;
     int8_t* k_codes = nullptr; int8_t* v_codes = nullptr;
     uint16_t* k_scales = nullptr; uint16_t* v_scales = nullptr;
+    block_q4_0* k_q4 = nullptr;
+    block_q4_0* v_q4 = nullptr;
 };
 struct Feedback { std::array<int64_t, 7> last{}; void *config = nullptr, *rows = nullptr, *mass = nullptr; };
 struct Launch { int row, count, room; int64_t compact; bool fast; };
@@ -32,6 +60,14 @@ float* query_base = nullptr;
 bool accept_fast = true;
 
 template<class... A> void lin(A...) {}
+template<class... A> void lin_pair(A...) {}
+template<class... A> void head_norm_rope_rows(A...) {}
+template<class... A> void store_q8_rows(A...) {}
+template<class... A> void store_q4_at(A...) {}
+template<class... A> void dequant_q4_to_q8(A...) {}
+// Exercise the per-sequence dispatch when the combined launch declines the rows.
+template<class... A> bool attend_seqs_plan(A...) { return false; }
+template<class... A> void attend_seqs(A...) { throw std::logic_error("unexpected combined launch"); }
 template<class... A> void head_norm_rope(A...) {}
 template<class... A> void head_norm_rope_capture(A...) {}
 template<class... A> void kvmem_key_sums(A...) {}
@@ -79,11 +115,19 @@ struct Qwen35 : Engine {
     void* st_=nullptr;
     bool draft_=false, fdec_=true, memory_drafting_=false;
     int64_t fdec_from_=0;
-    struct { KvFmt kv_format=KvFmt::kFp16; struct { int block_tokens=32; } memory; } opt_;
+    struct {
+        KvFmt kv_format=KvFmt::kFp16;
+        int max_context = 2048;
+        struct { int block_tokens=32, budget=0; } memory;
+    } opt_;
+    size_t kv_rs_ = 0;
+    int kv_ring() const { return 0; }
+    template<class... A> void store_ring(A...) { throw std::logic_error("unexpected streaming cache"); }
+    template<class... A> void attn_stream(A...) { throw std::logic_error("unexpected streaming cache"); }
     std::vector<Block> blocks_{1}; std::vector<Feedback> memory_feedback_{3};
     void* seq_buf(int, const void* p) { return const_cast<void*>(p); }
     int head_key(int il, int n) const;
-    void attn_rows(Block& B, int n);
+    void attn_rows(Block& B, int il, int n);
     std::vector<int> graph_key(const std::vector<Row>& rows, bool with_guesses) {
         const int R=int(rows.size()), il=0;
         std::vector<int> key, rseq;
@@ -120,7 +164,9 @@ int main() {
             if(memory && window==2) continue;
             for(int path: {2,1,0}) for(KvFmt fmt: {KvFmt::kFp16,KvFmt::kQ8_0}) {
                 Qwen35 engine; engine.capacity=capacity; engine.memory_ready_=memory;
-                engine.opt_.kv_format=fmt; engine.fdec_=path!=0; accept_fast=path==2;
+                engine.opt_.kv_format=fmt; engine.opt_.max_context=capacity;
+                engine.opt_.memory.budget=memory?capacity:0;
+                engine.fdec_=path!=0; accept_fast=path==2;
                 engine.memories[0].removed=memory?8192:0;
                 engine.memories[1].removed=memory?32768:0;
                 engine.memories[2].removed=memory?1024:0;
@@ -140,7 +186,7 @@ int main() {
                     engine.pos_=rows.back().pos-(window-1);
                     const auto key=engine.graph_key(rows,window==2);
                     launches.clear();
-                    engine.attn_rows(engine.blocks_[0],int(rows.size()));
+                    engine.attn_rows(engine.blocks_[0],0,int(rows.size()));
                     const int per_sequence=path==1?2:1;
                     if(launches.size()!=size_t(2*per_sequence)) throw std::runtime_error("unexpected dispatch count");
                     std::vector<int> shape;
