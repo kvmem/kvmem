@@ -88,45 +88,48 @@ async function until(fn){for(let i=0;i<100;i++){try{if(await fn())return;}catch{
  await until(async()=>await card.getAttribute('data-state')==='unavailable');
  assert.equal(await start.isEnabled(),true);
  await page.unroute('**/api/launcher/inspect-model');
- // Each PolyStrata architecture gets its own list after file inspection.
- await page.locator('[data-param=Backend]').selectOption('polystrata');
- await page.getByRole('tab',{name:/缓存与历史|Cache & history/}).click();
- await page.locator('[data-param=SpeculativeMode]').evaluate(el=>{el.value='none';el.dispatchEvent(new Event('change',{bubbles:true}));});
- const modelInput=page.locator('[data-param=Model]'),kv=page.locator('[data-param=KvType]');
- const options=()=>kv.locator('option').evaluateAll(items=>items.map(item=>item.value));
- await modelInput.fill('');
- assert.equal((await options()).includes('fp8'),false,'FP8 requires positive model and worker inspection');
- await modelInput.fill(ggufModels.qwen35moe);
- await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16','q8_0']));
- await kv.selectOption('q8_0');
- await until(async()=>await card.getAttribute('data-state')==='ready');
- assert.equal(await kv.inputValue(),'q8_0','reinspection keeps a supported format');
- await modelInput.fill(ggufModels.gemma4);
- await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16','int8','int8k']));
- await until(async()=>await card.getAttribute('data-state')==='ready');
- assert.equal(await kv.inputValue(),'f16','switching from Qwen to Gemma replaces incompatible q8_0');
- await kv.selectOption('int8k');
- await modelInput.fill(ggufModels.inkling2_loop);
- await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16']));
- await until(async()=>await card.getAttribute('data-state')==='ready');
- assert.equal(await kv.inputValue(),'f16','switching to Inkling replaces incompatible int8k');
- await modelInput.fill(ggufModels.qwen35moe);
- await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16','q8_0']));
- assert.equal(await kv.inputValue(),'f16','switching back restores Qwen options and keeps compatible f16');
- if(process.env.POLYSTRATA_FP8_TEST_WORKER){
-   const setWorker=value=>page.locator('[data-param=Worker]').evaluate((el,path)=>{
-     el.value=path;el.dispatchEvent(new Event('input',{bubbles:true}));
-   },value);
-   await setWorker(process.env.POLYSTRATA_FP8_TEST_WORKER);
-   await modelInput.fill(ggufModels.inkling2_loop);
-   await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16','fp8']));
-   await kv.selectOption('fp8');
-   await until(async()=>await card.getAttribute('data-state')==='ready');
-   assert.equal(await kv.inputValue(),'fp8');
-   await setWorker(worker);
-   await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16']));
-   await until(async()=>await card.getAttribute('data-state')==='ready');
-   assert.equal(await kv.inputValue(),'f16','switching to an older worker replaces incompatible FP8');
+ if(process.env.POLYSTRATA_FP8_TEST_WORKER)assert.ok(info.backends.includes('polystrata'));
+ if(info.backends.includes('polystrata')){
+  // Each PolyStrata architecture gets its own list after file inspection.
+  await page.locator('[data-param=Backend]').selectOption('polystrata');
+  await page.getByRole('tab',{name:/缓存与历史|Cache & history/}).click();
+  await page.locator('[data-param=SpeculativeMode]').evaluate(el=>{el.value='none';el.dispatchEvent(new Event('change',{bubbles:true}));});
+  const modelInput=page.locator('[data-param=Model]'),kv=page.locator('[data-param=KvType]');
+  const options=()=>kv.locator('option').evaluateAll(items=>items.map(item=>item.value));
+  await modelInput.fill('');
+  assert.equal((await options()).includes('fp8'),false,'FP8 requires positive model and worker inspection');
+  await modelInput.fill(ggufModels.qwen35moe);
+  await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16','q8_0']));
+  await kv.selectOption('q8_0');
+  await until(async()=>await card.getAttribute('data-state')==='ready');
+  assert.equal(await kv.inputValue(),'q8_0','reinspection keeps a supported format');
+  await modelInput.fill(ggufModels.gemma4);
+  await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16','int8','int8k']));
+  await until(async()=>await card.getAttribute('data-state')==='ready');
+  assert.equal(await kv.inputValue(),'f16','switching from Qwen to Gemma replaces incompatible q8_0');
+  await kv.selectOption('int8k');
+  await modelInput.fill(ggufModels.inkling2_loop);
+  await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16']));
+  await until(async()=>await card.getAttribute('data-state')==='ready');
+  assert.equal(await kv.inputValue(),'f16','switching to Inkling replaces incompatible int8k');
+  await modelInput.fill(ggufModels.qwen35moe);
+  await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16','q8_0']));
+  assert.equal(await kv.inputValue(),'f16','switching back restores Qwen options and keeps compatible f16');
+  if(process.env.POLYSTRATA_FP8_TEST_WORKER){
+    const setWorker=value=>page.locator('[data-param=Worker]').evaluate((el,path)=>{
+      el.value=path;el.dispatchEvent(new Event('input',{bubbles:true}));
+    },value);
+    await setWorker(process.env.POLYSTRATA_FP8_TEST_WORKER);
+    await modelInput.fill(ggufModels.inkling2_loop);
+    await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16','fp8']));
+    await kv.selectOption('fp8');
+    await until(async()=>await card.getAttribute('data-state')==='ready');
+    assert.equal(await kv.inputValue(),'fp8');
+    await setWorker(worker);
+    await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16']));
+    await until(async()=>await card.getAttribute('data-state')==='ready');
+    assert.equal(await kv.inputValue(),'f16','switching to an older worker replaces incompatible FP8');
+  }
  }
  // The real RAD inspector uses metadata and weights, and changing only depth rechecks it.
  await page.locator('[data-param=Backend]').selectOption('radiance');
