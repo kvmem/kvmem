@@ -138,11 +138,11 @@
   const make=(tag,attrs={},text)=>{const el=document.createElement(tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));if(text!==undefined)el.textContent=text;return el;};
   function healthParameters(){
     const parameters={};
-    for(const key of ['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftTokens','DraftModel','KvType','RecallStrategy']){
+    for(const key of ['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftTokens','DraftModel','KvType','RecallStrategy','Concurrency','RetainedSessions']){
       const el=root.querySelector(`[data-param=${key}]`);
       if(!el||el.disabled)continue;
       if(el.type==='checkbox')parameters[key]=el.checked;
-      else if(el.value!=='')parameters[key]=el.dataset.booleanSelect==='true'?el.value==='true':(el.type==='number'||el.dataset.valueType==='number')?Number(el.value):el.value;
+      else if(el.value!=='')parameters[key]=el.dataset.booleanSelect==='true'?el.value==='true':(el.type==='number'||el.dataset.valueType==='number')?Number(el.value)+(el.dataset.idleSessions==='true'?1:0):el.value;
     }
     return parameters;
   }

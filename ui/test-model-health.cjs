@@ -108,8 +108,20 @@ async function until(fn){for(let i=0;i<100;i++){try{if(await fn())return;}catch{
   await until(async()=>await card.getAttribute('data-state')==='ready');
   assert.equal(await kv.inputValue(),'f16','switching from Qwen to Gemma replaces incompatible q8_0');
   await kv.selectOption('int8k');
+  await page.getByRole('tab',{name:/召回策略|Recall policy/}).click();
+  const retained=page.locator('[data-param=RetainedSessions]');
+  await retained.fill('1');
   await modelInput.fill(ggufModels.inkling2_loop);
   await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16']));
+  await until(async()=>await card.getAttribute('data-state')==='blocked');
+  assert.match(await card.textContent(),/最多保留 0 个额外空闲会话|at most 0 additional idle sessions/);
+  assert.equal(await start.isDisabled(),true);
+  const unsupported=await post('start',{Backend:'polystrata',Model:ggufModels.inkling2_loop,Worker:worker,
+     KvType:'f16',SpeculativeMode:'none',Concurrency:1,RetainedSessions:2});
+  assert.equal(unsupported.status,400);
+  assert.match((await unsupported.json()).error,/at most 0 additional idle sessions/);
+  await retained.fill('0');
+  await page.getByRole('tab',{name:/缓存与历史|Cache & history/}).click();
   await until(async()=>await card.getAttribute('data-state')==='ready');
   assert.equal(await kv.inputValue(),'f16','switching to Inkling replaces incompatible int8k');
   await modelInput.fill(ggufModels.qwen35moe);
@@ -129,6 +141,19 @@ async function until(fn){for(let i=0;i<100;i++){try{if(await fn())return;}catch{
     await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16']));
     await until(async()=>await card.getAttribute('data-state')==='ready');
     assert.equal(await kv.inputValue(),'f16','switching to an older worker replaces incompatible FP8');
+  }
+  if(process.env.POLYSTRATA_RETENTION_TEST_WORKER){
+    const params={Backend:'polystrata',Model:ggufModels.inkling2_loop,Worker:process.env.POLYSTRATA_RETENTION_TEST_WORKER,
+        KvType:'fp8',SpeculativeMode:'none',Concurrency:1,RetainedSessions:16};
+    const full=await (await post('inspect-model',params)).json();
+    assert.equal(full.model.max_retained_sessions,16);
+    assert.equal(full.can_start,true);
+    const concurrent=await (await post('inspect-model',{...params,Concurrency:2})).json();
+    assert.equal(concurrent.can_start,false);
+    assert.ok(concurrent.checks.some(check=>check.code==='inkling_sessions'));
+    const excess=await (await post('inspect-model',{...params,RetainedSessions:17})).json();
+    assert.equal(excess.can_start,false);
+    assert.ok(excess.checks.some(check=>check.code==='inkling_retention_worker'));
   }
  }
  // The real RAD inspector uses metadata and weights, and changing only depth rechecks it.

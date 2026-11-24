@@ -1020,10 +1020,23 @@ class Controller:
             model = report.get('model', {})
             if model.get('architecture') == 'inkling2_loop' and 'fp8' in model.get('kv_types', []):
                 try:
-                    native_fp8 = supports_inkling_fp8(self.worker_capabilities(parameters['Worker'], 'polystrata'))
+                    worker = self.worker_capabilities(parameters['Worker'], 'polystrata')
                 except (OSError, ValueError):
-                    native_fp8 = False
-                if not native_fp8:
+                    worker = {}
+                limits = worker.get('model_max_retained_sessions')
+                maximum = limits.get('inkling2_loop') if isinstance(limits, dict) else None
+                if type(maximum) is not int or not 1 <= maximum <= 16:
+                    maximum = 1
+                model['max_retained_sessions'] = maximum
+                if parameters.get('RetainedSessions', 1) > maximum:
+                    report.update(status='blocked', can_start=False)
+                    report['checks'].append({
+                        'code': 'inkling_retention_worker', 'layer': 'worker', 'status': 'error',
+                        'zh': f'当前后端程序最多保留 {maximum - 1} 个额外空闲会话',
+                        'en': f'This worker supports at most {maximum - 1} additional idle sessions',
+                        'detail': f'RetainedSessions ≤ {maximum}',
+                    })
+                if not supports_inkling_fp8(worker):
                     model['kv_types'].remove('fp8')
                     if parameters.get('KvType') == 'fp8':
                         report.update(status='blocked', can_start=False)

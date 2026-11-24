@@ -19,7 +19,7 @@ MAX_TENSORS = 200000
 MAX_PARTS = 128
 FIELDS = {'Backend', 'Model', 'Worker', 'Vision', 'Mmproj', 'VisionWorker',
           'Tokenizer', 'ChatTemplateFile', 'SpeculativeMode', 'MtpDrafts', 'DraftTokens', 'DraftModel', 'KvType',
-          'RecallStrategy'}
+          'RecallStrategy', 'Concurrency', 'RetainedSessions'}
 
 
 class Incomplete(Exception):
@@ -39,7 +39,7 @@ def request_parameters(data):
     for k, v in p.items():
         if k == 'Vision':
             valid = type(v) is bool
-        elif k in ('MtpDrafts', 'DraftTokens'):
+        elif k in ('MtpDrafts', 'DraftTokens', 'Concurrency', 'RetainedSessions'):
             valid = type(v) is int and 0 <= v <= 2147483647
         else:
             valid = isinstance(v, str) and '\0' not in v and len(v) <= 8192
@@ -284,8 +284,16 @@ class Inspection:
                 if (self.p.get('SpeculativeMode', 'none') != 'none' or self.p.get('MtpDrafts', 0) or
                         self.p.get('DraftTokens', 0) or self.p.get('DraftModel')):
                     self.check('inkling_draft', 'error', 'Inkling 2 Mini 的 KVMem 接入只支持普通解码', 'KVMem Inkling 2 Mini supports ordinary decoding only', 'SpeculativeMode', 'config')
-                if self.p.get('Concurrency', 1) != 1 or self.p.get('RetainedSessions', 1) != 1:
-                    self.check('inkling_sessions', 'error', 'Inkling 2 Mini 只支持一个会话', 'KVMem Inkling 2 Mini supports one conversation', 'Concurrency / RetainedSessions', 'config')
+                if self.p.get('RetainedSessions', 1) < 1:
+                    self.check('inkling_sessions', 'error',
+                               'Inkling 2 Mini 必须至少保留当前会话',
+                               'Inkling 2 Mini must retain at least the current session',
+                               'RetainedSessions >= 1', 'config')
+                if self.p.get('Concurrency', 1) != 1:
+                    self.check('inkling_sessions', 'error',
+                               'Inkling 2 Mini 要求并发请求数为 1',
+                               'Inkling 2 Mini requires one simultaneous request',
+                               'Concurrency=1', 'config')
         if self.p.get('Vision') and not (self.p['Backend'] == 'polystrata' and arch == 'inkling2_loop'):
             if self.p['Backend'] == 'polystrata':
                 explicit = self.p.get('Mmproj')

@@ -28,7 +28,8 @@ qualification builds.
 ## Inkling 2 Mini
 
 Select **PolyStrata · Inkling 2 Mini** with a Mainline_Support GGUF declaring
-`inkling2_loop`. Run a single text conversation on one Windows CUDA GPU.
+`inkling2_loop`. Run one active text request at a time on one Windows CUDA GPU.
+KVMem can keep up to 15 additional idle history groups within its shared cache budget.
 FP16 is the default. FP8 requires an Ampere or newer NVIDIA GPU and Inkling
 Flash Attention. Use the model's own tokenizer and template.
 When the Inkling thinking-token budget expires, the server closes the thinking

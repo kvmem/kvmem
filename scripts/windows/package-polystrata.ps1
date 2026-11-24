@@ -112,7 +112,7 @@ Copy-Item -LiteralPath $ChatUiDir -Destination (Join-Path $out 'ui/dist') -Recur
 $manifest=@{backend='polystrata';architecture='qwen35moe';architectures=@('qwen35moe','gemma4','inkling2_loop');models_included=$false;offline_python_included=[bool]$PythonRuntime;
     source=(Get-Content -LiteralPath (Join-Path $root 'backends/versions.json') -Raw|ConvertFrom-Json).polystrata;
     capability_scope=@{gpu_count=1;kv=@('f16','q8_0','int8','int8k','fp8');max_concurrency=8;solo_mtp_drafts=@(0..3);batch_mtp=$false;
-        inkling2=@{platform='windows-cuda';kv=@('f16','fp8');max_concurrency=1;max_retained_sessions=1;vision=$false;speculative_decoding=$false}};
+        inkling2=@{platform='windows-cuda';kv=@('f16','fp8');max_concurrency=1;max_retained_sessions=16;vision=$false;speculative_decoding=$false}};
     validation='provenance/validation.json records configurations actually qualified; packaging alone is not runtime qualification'}
 $manifest|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $out 'BUILD-INFO.json') -Encoding utf8
 $hashes=foreach($file in Get-ChildItem -LiteralPath $out -Recurse -File|Sort-Object FullName) { (Get-FileHash -LiteralPath $file.FullName).Hash.ToLowerInvariant()+'  '+$file.FullName.Substring($out.Length+1).Replace('\','/') }
