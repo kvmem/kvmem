@@ -24,6 +24,13 @@ endfunction()
 function(target_link_libraries name)
   set_property(GLOBAL APPEND PROPERTY "${name}_links" "${ARGN}")
 endfunction()
+function(get_target_property variable target property)
+  if(NOT property STREQUAL "SOURCES")
+    message(FATAL_ERROR "Unsupported target property: ${property}")
+  endif()
+  get_property(value GLOBAL PROPERTY "${target}_sources")
+  set(${variable} "${value}" PARENT_SCOPE)
+endfunction()
 function(target_include_directories)
 endfunction()
 function(target_compile_definitions)
@@ -50,8 +57,8 @@ class BuildContract(unittest.TestCase):
         cmake = os.environ.get("CMAKE_COMMAND") or shutil.which("cmake")
         if not cmake:
             self.skipTest("CMake is required to evaluate target declarations")
-        source = (SOURCE/"CMakeLists.txt").read_text(encoding="utf-8")
-        begin = source.index("  if(STRATA_ENABLE_CUDA)\n    target_compile_definitions(strata_poly_mmq PUBLIC STRATA_POLY_GDN_MMA=1)")
+        source = (SOURCE/"engine/cmake/strata_poly.cmake").read_text(encoding="utf-8")
+        begin = source.index("  if(STRATA_ENABLE_CUDA AND TARGET strata_gdn_mma)\n    target_compile_definitions(strata_poly_mmq PUBLIC STRATA_POLY_GDN_MMA=1)")
         end = source.index("  # needs the model file, so it is run by hand: poly_expert_parity", begin)
         with tempfile.TemporaryDirectory(prefix="poly cmake contract ") as directory:
             root = Path(directory)
@@ -61,7 +68,7 @@ class BuildContract(unittest.TestCase):
             script += f'set(STRATA_ENABLE_CUDA {"ON" if backend == "cuda" else "OFF"})\n'
             script += f'set(STRATA_ENABLE_HIP {"ON" if backend == "hip" else "OFF"})\n'
             script += 'set(_strata_gpu_runtime_target gpu_runtime)\nset(_strata_gpu_blas_target gpu_blas)\n'
-            script += source[begin:end] + '''
+            script += source[begin:end].replace("STRATA_ENABLE_CUDA AND TARGET strata_gdn_mma", "STRATA_ENABLE_CUDA") + '''
 foreach(t strata-poly kvmem kvmem_recall_hip poly_gdn_mma_state_test poly_elastic_test poly_kvmem_mtp_test)
   foreach(p sources links)
     get_property(v GLOBAL PROPERTY "${t}_${p}")

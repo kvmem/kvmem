@@ -33,7 +33,9 @@ $model=Setting 'Model' ''
 $tree=Setting 'PolystrataSource' (Join-Path $Root 'backends/polystrata')
 if(!$tree) { $tree=Join-Path $Root 'backends/polystrata' }
 $tokenizer=Setting 'Tokenizer' ''
-foreach($entry in @(@('Worker',$worker),@('Model',$model),@('frontend',(Join-Path $tree 'serve/server.py')))) {
+$frontend=Join-Path $tree 'terminal/serve/server.py'
+if(!(Test-Path -LiteralPath $frontend -PathType Leaf)) { $frontend=Join-Path $tree 'serve/server.py' }
+foreach($entry in @(@('Worker',$worker),@('Model',$model),@('frontend',$frontend))) {
     if(!$entry[1] -or !(Test-Path -LiteralPath $entry[1] -PathType Leaf)) { throw "Missing PolyStrata $($entry[0]): $($entry[1])" }
 }
 $python=Setting 'Python' (Join-Path $Root 'runtime/python/python.exe')
@@ -63,7 +65,7 @@ foreach($key in $map.Keys) {
     elseif($defaults.ContainsKey($name)) { $arguments+=@(('--'+$key.ToLowerInvariant()),[string]$defaults[$name]) }
 }
 $kv=Setting 'KvType' 'f16'
-if($kv -notin @('f16','q8_0','int8','int8k')) { throw 'PolyStrata KV: Qwen supports f16/q8_0; Gemma supports f16/int8/int8k' }
+if($kv -notin @('f16','q8_0','int8','int8k','fp8')) { throw 'PolyStrata KV formats: Qwen f16/q8_0, Gemma f16/int8/int8k, Inkling f16/fp8' }
 $arguments+=@('--kv-type',$kv,'--mtp-drafts',[string]$count)
 if($layerwise){$arguments+=@('--draft-method',$mode)}
 $draft=Setting 'DraftModel' ''
@@ -124,7 +126,7 @@ if(Setting 'DryRun' $false) {
         $safeEnv.STRATA_FATTN=$resolved.env.STRATA_FATTN
         $safeEnv.STRATA_FDEC=$resolved.env.STRATA_FDEC
     } finally { $check.Dispose() }
-    @{token_settings=$TokenPlan;effective_parameters=$effective;effective_settings=@{block_tokens=[int](Setting 'BlockTokens' 32);draft_policy=$(if($count){'adaptive'}else{'fixed'});draft_tokens=$count;model_alias=$resolved.model_name;max_tokens=$resolved.kvmem_default_max_tokens;preserve_thinking=$resolved.preserve_thinking;vram_reserve_mib=$resolved.kvmem_vram_reserve_mib};backend='polystrata';native_argv=@($resolved.exe)+@($resolved.args);argv=@($python)+$arguments;environment=$safeEnv;capabilities=@{architectures=@('qwen35moe','gemma4');gpu_count=1;batch_mtp=$false;solo_mtp=($count -gt 0);concurrency=(Setting 'Concurrency' 1);kv_type=$kv;storage_quota='process'}} | ConvertTo-Json -Depth 8
+    @{token_settings=$TokenPlan;effective_parameters=$effective;effective_settings=@{block_tokens=[int](Setting 'BlockTokens' 32);draft_policy=$(if($count){'adaptive'}else{'fixed'});draft_tokens=$count;model_alias=$resolved.model_name;max_tokens=$resolved.kvmem_default_max_tokens;preserve_thinking=$resolved.preserve_thinking;vram_reserve_mib=$resolved.kvmem_vram_reserve_mib};backend='polystrata';native_argv=@($resolved.exe)+@($resolved.args);argv=@($python)+$arguments;environment=$safeEnv;capabilities=@{architectures=@('qwen35moe','gemma4','inkling2_loop');gpu_count=1;batch_mtp=$false;solo_mtp=($count -gt 0);concurrency=(Setting 'Concurrency' 1);kv_type=$kv;storage_quota='process'}} | ConvertTo-Json -Depth 8
     return
 }
 Invoke-KVMemRecallWorkerCheck $worker $effective $Root

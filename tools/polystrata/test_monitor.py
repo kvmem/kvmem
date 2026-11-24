@@ -9,7 +9,7 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]/'backends/polystrata'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]/'backends/polystrata/terminal'))
 from serve.kvmem_monitor import StorageLog, execution, snapshot
 
 

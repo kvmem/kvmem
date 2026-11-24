@@ -85,6 +85,38 @@ class HealthTests(unittest.TestCase):
         assistant=self.root/'assistant.gguf';gguf(assistant,meta={'general.architecture':'gemma4-assistant'})
         self.assertTrue(self.inspect(model,'polystrata',SpeculativeMode='mtp',DraftModel=str(assistant))['can_start'])
 
+    def test_inkling_accepts_one_fp16_text_conversation(self):
+        model = self.root / 'inkling.gguf'
+        gguf(model, meta={'general.architecture': 'inkling2_loop'})
+        ready = self.inspect(model, 'polystrata', KvType='f16', RetainedSessions=1)
+        self.assertTrue(ready['can_start'])
+        self.assertNotIn('poly_arch', {check['code'] for check in ready['checks']})
+        self.assertEqual(ready['model']['kv_types'], ['f16', 'fp8'])
+        self.assertTrue(self.inspect(model, 'polystrata', KvType='fp8', RetainedSessions=1)['can_start'])
+        rejected = self.inspect(model, 'polystrata', KvType='q8_0', RetainedSessions=2, Vision=True,
+                                SpeculativeMode='mtp')
+        self.assertFalse(rejected['can_start'])
+        self.assertEqual({check['code'] for check in rejected['checks'] if check['status'] == 'error'},
+                         {'poly_kv', 'inkling_sessions', 'inkling_vision', 'inkling_draft'})
+
+    def test_inkling_dspark_requires_a_matching_external_draft(self):
+        model = self.root / 'inkling.gguf'
+        draft = self.root / 'draft.gguf'
+        gguf(model, meta={'general.architecture': 'inkling2_loop'})
+        gguf(draft, meta={'general.architecture': 'dflash'}, tensor='markov_w1.weight')
+        for kv_type in ('f16', 'fp8'):
+            result = self.inspect(model, 'polystrata', SpeculativeMode='mtp', DraftTokens=3,
+                                  DraftModel=str(draft), KvType=kv_type)
+            self.assertTrue(result['can_start'])
+            self.assertEqual(result['features']['mtp'], 'external')
+        result = self.inspect(model, 'polystrata', SpeculativeMode='mtp', DraftTokens=3,
+                              DraftModel=str(draft), RetainedSessions=2)
+        self.assertFalse(result['can_start'])
+        gguf(draft, meta={'general.architecture': 'dflash'})
+        result = self.inspect(model, 'polystrata', SpeculativeMode='mtp', DraftTokens=3, DraftModel=str(draft))
+        self.assertFalse(result['can_start'])
+        self.assertIn('inkling_draft_arch', {check['code'] for check in result['checks']})
+
     def test_extension_cannot_disguise_wrong_container(self):
         path=self.root/'fake.gguf'; path.write_bytes(b'not a model'*10)
         self.assertFalse(self.inspect(path)['can_start'])
