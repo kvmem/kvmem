@@ -371,7 +371,7 @@ def main():
                 for line in lines:
                     marker = line.split(' ', 1)[0]
                     recall_report = marker == 'INFO' and 'recall_strategy=layerwise' in line
-                    if line.endswith('\n') and (marker in {'KVMEM_SCORING', 'KVMEM_LIMITS', 'KVMEM_BLOCKS'} or recall_report) and marker not in seen:
+                    if line.endswith('\n') and (marker in {'KVMEM_SCORING', 'KVMEM_LIMITS', 'KVMEM_BLOCKS', 'KVMEM_DSPARK_KV'} or recall_report) and marker not in seen:
                         print(line.rstrip(), flush=True)
                         seen.add(marker)
                 required = {'INFO', 'KVMEM_BLOCKS'} if args.recall_strategy == 'layerwise' else {'KVMEM_SCORING', 'KVMEM_LIMITS', 'KVMEM_BLOCKS'}

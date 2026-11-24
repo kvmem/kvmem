@@ -1020,10 +1020,19 @@ class Controller:
             model = report.get('model', {})
             if model.get('architecture') == 'inkling2_loop' and 'fp8' in model.get('kv_types', []):
                 try:
-                    native_fp8 = supports_inkling_fp8(self.worker_capabilities(parameters['Worker'], 'polystrata'))
+                    worker = self.worker_capabilities(parameters['Worker'], 'polystrata')
                 except (OSError, ValueError):
-                    native_fp8 = False
-                if not native_fp8:
+                    worker = {}
+                if worker.get('inkling2_dspark') is not True:
+                    report['features']['mtp'] = 'unsupported'
+                    if parameters.get('SpeculativeMode', 'none') != 'none' or parameters.get('DraftModel'):
+                        report.update(status='blocked', can_start=False)
+                        report['checks'].append({
+                            'code': 'inkling_dspark_worker', 'layer': 'worker', 'status': 'error',
+                            'zh': '当前后端程序不支持 KVMem Inkling dSpark',
+                            'en': 'This worker does not support KVMem Inkling dSpark',
+                        })
+                if not supports_inkling_fp8(worker):
                     model['kv_types'].remove('fp8')
                     if parameters.get('KvType') == 'fp8':
                         report.update(status='blocked', can_start=False)

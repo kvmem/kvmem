@@ -278,12 +278,19 @@ class Inspection:
                         if assistant.get('general.architecture')!='gemma4-assistant':
                             self.check('gemma_assistant_arch','error','Gemma 草稿架构不匹配','Gemma assistant architecture does not match',str(assistant.get('general.architecture')),'config')
             if arch == 'inkling2_loop':
-                self.report['features'].update(vision='unsupported', mtp='unsupported')
+                self.report['features'].update(vision='unsupported', mtp='external')
                 if self.p.get('Vision'):
                     self.check('inkling_vision', 'error', 'Inkling 2 Mini 的 KVMem 接入只支持文本', 'KVMem Inkling 2 Mini supports text only', 'Vision', 'config', 'disable_vision')
-                if (self.p.get('SpeculativeMode', 'none') != 'none' or self.p.get('MtpDrafts', 0) or
-                        self.p.get('DraftTokens', 0) or self.p.get('DraftModel')):
-                    self.check('inkling_draft', 'error', 'Inkling 2 Mini 的 KVMem 接入只支持普通解码', 'KVMem Inkling 2 Mini supports ordinary decoding only', 'SpeculativeMode', 'config')
+                drafts = self.p.get('DraftTokens', self.p.get('MtpDrafts', 0))
+                mode = self.p.get('SpeculativeMode', 'mtp' if drafts else 'none')
+                draft = self.p.get('DraftModel')
+                if mode != 'none' or drafts or draft:
+                    if mode != 'mtp' or not draft:
+                        self.check('inkling_draft', 'error', 'Inkling 2 Mini 需要配套的 dSpark GGUF', 'Inkling 2 Mini requires its matching dSpark GGUF', 'DraftModel', 'config')
+                    elif self.required_file(self.path(draft), 'dspark_file', 'dSpark 草稿模型', 'dSpark draft model'):
+                        asset = self.gguf(self.path(draft))
+                        if asset['metadata'].get('general.architecture') != 'dflash' or 'markov_w1.weight' not in asset['names']:
+                            self.check('inkling_draft_arch', 'error', '草稿文件不是 Inkling dSpark GGUF', 'The draft asset is not an Inkling dSpark GGUF', 'DraftModel', 'config')
                 if self.p.get('Concurrency', 1) != 1 or self.p.get('RetainedSessions', 1) != 1:
                     self.check('inkling_sessions', 'error', 'Inkling 2 Mini 只支持一个会话', 'KVMem Inkling 2 Mini supports one conversation', 'Concurrency / RetainedSessions', 'config')
         if self.p.get('Vision') and not (self.p['Backend'] == 'polystrata' and arch == 'inkling2_loop'):
