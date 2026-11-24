@@ -25,11 +25,17 @@ The inherited KVMem startup check still rejects the external Gemma 4
 assistant on this revision. The MTP results below refer to earlier
 qualification builds.
 
-The native Windows CUDA worker can opt into experimental DSpark drafting for
-Inkling with FP16 KV, one retained session, and a matching DSpark GGUF. Pass
-`--kvmem-mtp --draft-model FILE --window 4` and omit `--no-draft` with the
-usual managed launch flags. The default console preset uses ordinary decoding.
-Draft acceptance and throughput depend on the workload and expert residency.
+For dSpark on Windows CUDA, select **MTP** and a matching dSpark GGUF in the
+console, or launch the native worker with `--kvmem-mtp --draft-model FILE
+--window 4` and the managed launch flags. Use one retained conversation and
+FP16 or FP8 target KV. The default preset keeps ordinary decoding.
+
+The draft's full-attention layer keeps at most `--kvmem-budget` history rows
+and 64 extra rows for temporary writes. `--kvmem-gen-reserve` applies to the
+target model. Startup rejects a prefill batch larger than the full-attention
+draft ring. Position tags keep overwritten draft rows out of attention.
+Drafting resumes after a fresh feature row on checkpoint restore. Acceptance
+and throughput depend on the workload and expert residency.
 
 ## Inkling 2 Mini
 

@@ -1,8 +1,8 @@
 diff --git a/engine/src/poly/engine.cpp b/engine/src/poly/engine.cpp
-index 1fd6b8b6f6345fcd1ef204d73540e2807f81ec79..9dc4a342f73af9818db37dc4e2cdca86908ebf70 100644
+index 1fd6b8b6f6345fcd1ef204d73540e2807f81ec79..9a3eec270119fa2578c989dc1d9b818233b52e13 100644
 --- a/engine/src/poly/engine.cpp
 +++ b/engine/src/poly/engine.cpp
-@@ -2282,8 +2282,14 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
+@@ -2282,8 +2282,12 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
  #endif
          if (o.kv_format != KvFmt::kFp16 && o.kv_format != KvFmt::kFp8)
              throw std::runtime_error("KVMem Inkling 2 requires FP16 or FP8 KV");
@@ -12,14 +12,12 @@ index 1fd6b8b6f6345fcd1ef204d73540e2807f81ec79..9dc4a342f73af9818db37dc4e2cdca86
 +            throw std::runtime_error("KVMem Inkling 2 requires one sequence on one GPU");
 +        if (o.memory.mtp != !o.draft_model.empty())
 +            throw std::runtime_error("KVMem Inkling 2 requires --kvmem-mtp and a matching --draft-model together");
-+        if (o.memory.mtp && o.kv_format != KvFmt::kFp16)
-+            throw std::runtime_error("KVMem Inkling DSpark currently requires FP16 KV");
 +    } else if (o.memory.budget && o.memory.mtp && !o.draft_model.empty()) {
 +        throw std::runtime_error("KVMem MTP currently requires the model's embedded draft block");
      }
      if (o.memory.budget && !o.layer_split.empty())
          throw std::runtime_error("KVMem layer splitting is not qualified; select one GPU");
-@@ -3591,8 +3597,8 @@ void Engine::load(const Options& o) {
+@@ -3591,8 +3595,8 @@ void Engine::load(const Options& o) {
                   opt_.kv_format == KvFmt::kQ8_0 ? "q8_0" : "fp16");
  #endif
  #ifdef STRATA_KVMEM
@@ -30,7 +28,7 @@ index 1fd6b8b6f6345fcd1ef204d73540e2807f81ec79..9dc4a342f73af9818db37dc4e2cdca86
  #endif
      if (block_ != dg_.get()) dg_.reset();
      hi_ = end_ < 0 ? n_layer_ : end_;
-@@ -4210,7 +4216,7 @@ void Engine::alloc() {
+@@ -4210,7 +4214,7 @@ void Engine::alloc() {
          const auto& arch = gg_->get("general.architecture")->s;
          const bool qwen = arch == "qwen35moe" && !elastic_enabled_ && !draft_ && !block_guess_ && !opt_.memory.mtp;
          two_scratch_ = two_scratch_ && opt_.batch == 0 && opt_.memory.sessions == 1 &&
@@ -39,7 +37,7 @@ index 1fd6b8b6f6345fcd1ef204d73540e2807f81ec79..9dc4a342f73af9818db37dc4e2cdca86
  #endif
      }
  #endif
-@@ -7349,7 +7355,7 @@ void Engine::run(const int32_t* tokens, int n) {
+@@ -7349,7 +7353,7 @@ void Engine::run(const int32_t* tokens, int n) {
      bool replay = opt_.graphs && n <= opt_.window && (windowed_ || block_pass_ || n == 1) && !opt_.dump &&
                    !prompt_scratch_;
  #ifdef STRATA_KVMEM
@@ -49,10 +47,96 @@ index 1fd6b8b6f6345fcd1ef204d73540e2807f81ec79..9dc4a342f73af9818db37dc4e2cdca86
      for (int t = 0; t < n && replay; ++t) replay = !image_at(pos_ + t);
      const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
 diff --git a/engine/src/poly/inkling2.cpp b/engine/src/poly/inkling2.cpp
-index cecd4e2541bd723a35c93e9d5dc2a1d9b0ab08d4..8f7db81a41849fecec9b63cf32ab67bd9b886414 100644
+index cecd4e2541bd723a35c93e9d5dc2a1d9b0ab08d4..bc829f83984d9b08cc7a9a99867908809f493245 100644
 --- a/engine/src/poly/inkling2.cpp
 +++ b/engine/src/poly/inkling2.cpp
-@@ -556,10 +556,17 @@ void Inkling2::guess_block(int32_t token) {
+@@ -314,6 +314,15 @@ void Inkling2::load_geometry() {
+     if (opt_.window == 0) opt_.window = ds_file_ ? ds_block_ : 1;
+ }
+ 
++static constexpr int kDsCacheSlack = 64;
++
++static int64_t ds_history(const Options& opt) {
++#ifdef STRATA_KVMEM
++    if (opt.memory.budget) return std::min<int64_t>(opt.max_context, opt.memory.budget);
++#endif
++    return opt.max_context;
++}
++
+ // --draft-model's DSpark drafter: its shape, checked against what guess_block() runs.
+ void Inkling2::ds_open() {
+     ds_file_ = std::make_unique<Shards>(opt_.draft_model);
+@@ -353,6 +362,15 @@ void Inkling2::ds_open() {
+     for (int k = 0; k < 3; ++k) ds_visit_[k] = (int) targets->items[(size_t) k].u;
+     ds_.assign((size_t) layers, DsLayer{});
+     for (int l = 0; l < layers; ++l) ds_[(size_t) l].swa = swa->items[(size_t) l].u != 0;
++#ifdef STRATA_KVMEM
++    if (opt_.memory.budget && std::any_of(ds_.begin(), ds_.end(), [](const DsLayer& layer) { return !layer.swa; })) {
++        const int64_t rows = ds_history(opt_) + kDsCacheSlack;
++        if (opt_.prompt_batch > rows)
++            throw std::invalid_argument("KVMem Inkling dSpark prefill batch (" + std::to_string(opt_.prompt_batch) +
++                                        ") exceeds the full-attention draft KV ring (" + std::to_string(rows) +
++                                        " rows); increase --kvmem-budget or reduce --prompt-batch");
++    }
++#endif
+ }
+ 
+ // The drafter's weights and caches to VRAM, once (before the expert cache takes the rest).
+@@ -380,6 +398,12 @@ void Inkling2::ds_load() {
+     const uint64_t E = (uint64_t) n_embd_, hq = (uint64_t) n_head_ * head_dim_, kv = (uint64_t) n_kv_ * head_dim_,
+                    ff = (uint64_t) ds_ff_, R = (uint64_t) ds_rank_, V = (uint64_t) n_vocab_;
+     const size_t cell = kv * sizeof(uint16_t);
++    const int64_t history = ds_history(opt_);
++#ifdef STRATA_KVMEM
++    const bool bounded = opt_.memory.budget != 0;
++#else
++    constexpr bool bounded = false;
++#endif
+     for (size_t l = 0; l < ds_.size(); ++l) {
+         DsLayer& L = ds_[l];
+         const std::string b = "blk." + std::to_string(l) + ".";
+@@ -398,15 +422,17 @@ void Inkling2::ds_load() {
+         L.q_norm = f32(b + "attn_q_norm.weight", (uint64_t) head_dim_);
+         L.k_norm = f32(b + "attn_k_norm.weight", (uint64_t) head_dim_);
+         L.k_ctx_norm = f32(b + "attn_k_ctx_norm.weight", (uint64_t) head_dim_);
+-        // a window layer's ring holds its window, a block and room past it; a full layer every position
+-        L.cap = L.swa ? (int64_t) ds_window_ + 64 : (int64_t) opt_.max_context + 64;
++        // Keep room for provisional rows without overwriting any committed row the drafter may attend to.
++        L.cap = (L.swa ? int64_t(ds_window_) : history) + kDsCacheSlack;
+         L.keys = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
+         L.vals = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
+-        if (L.swa) {   // a conversation taken up again from an earlier place finds later positions in the ring
++        if (L.swa || bounded) {   // a resumed conversation may find later positions in the ring
+             L.tags = (long long*) dmalloc((size_t) L.cap * sizeof(long long), "the drafter's caches");
+             ck(cudaMemset(L.tags, 0xff, (size_t) L.cap * sizeof(long long)), "the drafter's caches");
+         }
+     }
++    if (bounded)
++        std::fprintf(stderr, "KVMEM_DSPARK_KV history=%lld slack=%d\n", (long long) history, kDsCacheSlack);
+     {   // each mix's weights over the four features, a softmax (in double) of the file's
+         const TensorInfo* t = find("dspark_fuse.weight", kTypeF32, 4, 4);
+         f.payload(*t);
+@@ -544,6 +570,19 @@ void Inkling2::ds_commit(int n) {
+         DsLayer& L = ds_[l];
+         lin(L.k_ctx, ds_mix_ + l * (size_t) n * E, ds_k_, n);
+         lin(L.v_ctx, ds_mix_ + l * (size_t) n * E, ds_v_, n);
++#ifdef STRATA_KVMEM
++        if (memory_ && L.swa && n > L.cap) {
++            // A fixed sliding-window ring can be shorter than the prompt batch. Write it in order.
++            const size_t cells = (size_t) n_kv_ * head_dim_;
++            for (int first = 0; first < n; first += int(L.cap)) {
++                const int rows = std::min(n - first, int(L.cap));
++                const DsPos chunk{p.at ? p.at + 2 * first : nullptr, p.pos0 + first};
++                ds_rope(ds_k_ + first * cells, n_kv_, rows, L.k_ctx_norm, ds_eps_, ds_theta_, chunk,
++                        L.keys, L.cap, ds_v_ + first * cells, L.vals, st_, L.tags);
++            }
++            continue;
++        }
++#endif
+         ds_rope(ds_k_, n_kv_, n, L.k_ctx_norm, ds_eps_, ds_theta_, p, L.keys, L.cap, ds_v_, L.vals, st_, L.tags);
+     }
+ }
+@@ -556,10 +595,17 @@ void Inkling2::guess_block(int32_t token) {
      block_n_ = 0;
      const int nb = (int) std::min<int64_t>({(int64_t) ds_block_, (int64_t) opt_.window, opt_.max_context - pos_});
      if (!ds_file_ || nb < 2 || pos_ < 1) return;
@@ -71,23 +155,24 @@ index cecd4e2541bd723a35c93e9d5dc2a1d9b0ab08d4..8f7db81a41849fecec9b63cf32ab67bd
          void*& g = ds_graph_[nb];
          if (!g) {
              cudaGraph_t graph = nullptr;
-@@ -610,7 +617,14 @@ void Inkling2::ds_block(int nb) {
+@@ -610,7 +656,15 @@ void Inkling2::ds_block(int nb) {
          ds_rope(ds_q_, n_head_, nb, L.q_norm, ds_eps_, ds_theta_, p, nullptr, 0, nullptr, nullptr, st_);
          ds_rope(ds_k_, n_kv_, nb, L.k_norm, ds_eps_, ds_theta_, p, L.keys, L.cap, ds_v_, L.vals, st_, L.tags);
          // a window layer's context is the window before the block, a full one's every position; and the block
 -        ds_attend(ds_q_, L.keys, L.vals, L.tags, L.cap, p, L.swa ? ds_window_ : 0, nb, n_head_, n_kv_, scale,
 +        int window = L.swa ? ds_window_ : 0;
++        if (!L.swa && L.tags) window = int(L.cap - kDsCacheSlack);
 +#ifdef STRATA_KVMEM
 +        if (memory_ && ds_context_begin_ != 0) {
 +            const int fresh = int(pos_ - ds_context_begin_);
-+            window = L.swa ? std::min(window, fresh) : fresh;
++            window = std::min(window, fresh);
 +        }
 +#endif
 +        ds_attend(ds_q_, L.keys, L.vals, L.tags, L.cap, p, window, nb, n_head_, n_kv_, scale,
                    ds_part_, ds_att_, st_);
          lin(L.wo, ds_att_, ds_y_, nb);
          axpy(ds_y_, 1.f, ds_x_, nb * n_embd_, true, st_);
-@@ -812,10 +826,16 @@ void Inkling2::init_memory() {
+@@ -812,10 +866,16 @@ void Inkling2::init_memory() {
      const size_t samples_size = samples * size_t(memory_page_stride_) * sizeof(float);
      memory_mass_ = static_cast<float*>(dmalloc(samples_size, "Inkling attention feedback"));
      h_memory_mass_ = static_cast<float*>(hmalloc(samples_size, "Inkling attention feedback staging"));
@@ -104,7 +189,7 @@ index cecd4e2541bd723a35c93e9d5dc2a1d9b0ab08d4..8f7db81a41849fecec9b63cf32ab67bd
      memory_capture_staged_ = false;
      const size_t sums = size_t(memory_planes_) * (size_t(memory_groups_) * n_kv_ + n_head_) * head_dim_;
      ck(cudaMemsetAsync(memory_sums_, 0, sums*sizeof(float), cs(st_)), "clear Inkling statistics");
-@@ -848,9 +868,10 @@ void Inkling2::memory_capture_call(int64_t first, int n) {
+@@ -848,9 +908,10 @@ void Inkling2::memory_capture_call(int64_t first, int n) {
      const int64_t local = first - memory_->capture_begin();
      const auto lo = std::lower_bound(samples.begin(), samples.end(), uint32_t(std::max<int64_t>(0, local)));
      const auto hi = std::lower_bound(lo, samples.end(), uint32_t(std::max<int64_t>(0, local+n)));
@@ -117,7 +202,7 @@ index cecd4e2541bd723a35c93e9d5dc2a1d9b0ab08d4..8f7db81a41849fecec9b63cf32ab67bd
      // An empty graph replay never reads the rest of the configuration.
      if (!config[6] && !memory_uploaded_config_[6]) return;
      if (config != memory_uploaded_config_) {
-@@ -895,6 +916,29 @@ void Inkling2::commit_memory_capture(int n) {
+@@ -895,6 +956,29 @@ void Inkling2::commit_memory_capture(int n) {
      memory_->commit(n, h_memory_packed_, key_stride, query ? h_memory_packed_ + memory_planes_*key_stride : nullptr,
          query ? h_memory_query_rows_ : nullptr, size_t(opt_.memory.query_max_tokens) * n_head_ * head_dim_);
  }
@@ -147,7 +232,7 @@ index cecd4e2541bd723a35c93e9d5dc2a1d9b0ab08d4..8f7db81a41849fecec9b63cf32ab67bd
  #endif
  
  // Per-token buffers hold buf_rows_ tokens, row after row.
-@@ -1663,8 +1707,14 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
+@@ -1663,8 +1747,14 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
      if (memory_ && !B.swa) {
          const int block = int(opt_.memory.block_tokens);
          const size_t key_plane = size_t(S.memory_plane) * memory_groups_ * kv;
@@ -164,7 +249,7 @@ index cecd4e2541bd723a35c93e9d5dc2a1d9b0ab08d4..8f7db81a41849fecec9b63cf32ab67bd
          if (memory_->capture_query()) {
              // Engine::run bypasses recording while a Query probe captures rows.
              const int lo = memory_->query_first(pos_, n), hi = memory_->query_last(pos_, n);
-@@ -1956,6 +2006,9 @@ void Inkling2::save_slots(int il, int pass, int64_t pos, uint8_t* dst) {
+@@ -1956,6 +2046,9 @@ void Inkling2::save_slots(int il, int pass, int64_t pos, uint8_t* dst) {
  }
  
  void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
@@ -196,7 +281,7 @@ index 22b098875dfc07b614b5765186d0581c4414e3cc..b0e3fbc322ba1d5f5453e33ba7a44a3a
      bool memory_capture_staged_ = false;
  #endif
 diff --git a/engine/src/poly/main.cpp b/engine/src/poly/main.cpp
-index ac8f95cce6aa636312866c607346f40b66f15dc6..1ba5fc3d59f6fd96b47421ec077d062a91b05089 100644
+index ac8f95cce6aa636312866c607346f40b66f15dc6..8b5324f5bc2967049e41250e05aec304a2676ba8 100644
 --- a/engine/src/poly/main.cpp
 +++ b/engine/src/poly/main.cpp
 @@ -375,6 +375,14 @@ struct CacheFlags {
@@ -262,6 +347,15 @@ index ac8f95cce6aa636312866c607346f40b66f15dc6..1ba5fc3d59f6fd96b47421ec077d062a
          "  --batch N (single-GPU native slots; batch uses ordinary decode, solo execution can resume MTP)\n"
          "  --kvmem-disk-path DIR --kvmem-disk-mib N (optional process-local SSD backing)\n"
          "  --kvmem-sessions N (1..16 retained histories including the GPU owner; requires reuse for N>1)\n"
+@@ -2281,7 +2291,7 @@ int main(int argc, char** argv) {
+ #else
+         constexpr bool inkling2 = false;
+ #endif
+-        std::puts(kvmem::launch_capabilities("polystrata", inkling2, inkling2).c_str());
++        std::puts(kvmem::launch_capabilities("polystrata", inkling2, inkling2, inkling2).c_str());
+         return 0;
+     }
+ #endif
 @@ -2542,8 +2552,6 @@ int main(int argc, char** argv) {
      try {
  #ifdef STRATA_KVMEM
