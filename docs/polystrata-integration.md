@@ -1,7 +1,8 @@
 # PolyStrata integration
 
-The integration pins upstream `v0.2.19-poly.1` at
-`d1f711e11651ef1ff6824af33cf896534120bd17`. The ordered patches in
+The integration pins upstream main at
+`36e654b1b7eb4cb462202445be296ba012c75edf`. This follows
+`v0.2.20-poly.4` and includes the Inkling decode-window fix. The ordered patches in
 `backends/versions.json` carry the native KVMem adapter for Qwen35MoE,
 Gemma 4 and Inkling 2 Mini and the corresponding Terminal frontend. Prepare the source with
 `scripts/prepare-backends.py --backend polystrata` and configure
@@ -15,7 +16,7 @@ KVMem owns those models' compact cache and state boundaries. Upstream
 `--kv-resident` uses its own host-backed cache.
 HIP support remains experimental.
 
-Windows CUDA qualification for this pin used an RTX 5050 Laptop and a
+Windows CUDA qualification for the preceding `v0.2.19-poly.1` pin used an RTX 5050 Laptop and a
 4096-token prefill chunk. Qwen35MoE passed Q8_0 prefix reuse, bounded replay
 with SSD readback, two-slot ordinary decode, and solo embedded MTP. Gemma 4
 passed F16 bounded replay and int8k two-slot ordinary decode, CPU vision
@@ -29,9 +30,9 @@ qualification builds.
 Select **PolyStrata · Inkling 2 Mini** with a Mainline_Support GGUF declaring
 `inkling2_loop`. The first configuration is for a single text conversation on
 one Windows CUDA GPU with FP16 KV. Use the model's own tokenizer and template.
-On this pin, the server ignores the Inkling thinking-token budget. The
-[upstream fix](https://github.com/simplexai-labs/PolyStrata/issues/273) arrived in
-`v0.2.20-poly.2`.
+When the Inkling thinking-token budget expires, the server closes the thinking
+block and lets the model continue with an answer. The final answer omits
+the internal block delimiters.
 
 The Mini's 48 execution slots include eight full-attention slots. Each
 full-attention slot has its own KVMem plane, including repeated uses of the
@@ -41,8 +42,9 @@ token positions determine attention bias and query scaling. KVMem saves the
 boundary. A full FP16 state is about 164 MiB for this model and counts toward
 the RAM quota. Full-attention KV pages can also use the SSD tier.
 
-With a 512-token resident budget, a 22K-token retrieval test missed a cold
-record that native full-context inference found. In a separate test at that
+In the `v0.2.19-poly.1` qualification, a 22K-token retrieval test missed a cold
+record at a 512-token resident budget that native full-context inference found.
+In a separate test at that
 budget, Query restored the page containing the code while leaving the
 preceding page that identified the record outside the working set.
 

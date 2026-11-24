@@ -1,8 +1,8 @@
 diff --git a/engine/cmake/strata_poly.cmake b/engine/cmake/strata_poly.cmake
-index 28f0541..d73055e 100644
+index 11a4ab0..fbf5cce 100644
 --- a/engine/cmake/strata_poly.cmake
 +++ b/engine/cmake/strata_poly.cmake
-@@ -210,6 +210,63 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
+@@ -218,6 +218,63 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
                                             ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
                                             ${_strata_poly_driver}
                                             Threads::Threads)
@@ -67,7 +67,7 @@ index 28f0541..d73055e 100644
    add_executable(poly_expert_parity src/poly/expert_parity.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu)
    target_include_directories(poly_expert_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
 diff --git a/engine/include/strata/poly/kernels.hpp b/engine/include/strata/poly/kernels.hpp
-index a8332c5..b1f3347 100644
+index a13246f..d4d766d 100644
 --- a/engine/include/strata/poly/kernels.hpp
 +++ b/engine/include/strata/poly/kernels.hpp
 @@ -387,6 +387,16 @@ struct RopeYarn {
@@ -88,18 +88,18 @@ index a8332c5..b1f3347 100644
  /// `n = kv_heads * dim`, row-major (`codes[row * n + blk * 32 + j]`, `scales[row * (n / 32) + blk]`).
  /// A q8 read is active wherever `codes` is not null.  The value a block holds is
 diff --git a/engine/src/poly/engine.cpp b/engine/src/poly/engine.cpp
-index 92dfa1b..b852e00 100644
+index 35005b3..485a430 100644
 --- a/engine/src/poly/engine.cpp
 +++ b/engine/src/poly/engine.cpp
-@@ -17,6 +17,7 @@
- #include "mmq.hpp"
+@@ -18,6 +18,7 @@
  #include "qwen35.hpp"
  #include "runtime.hpp"
+ #include "split_plan.hpp"
 +#include "windows_vram.hpp"
  #include "strata/poly/kernels.hpp"
  #if defined(STRATA_GPU_METAL)
  #include "strata/core/conversation_memory.hpp"
-@@ -778,6 +779,10 @@ struct Engine::Swap {
+@@ -851,6 +852,10 @@ struct Engine::Swap {
  Engine::Engine() = default;
  
  Engine::~Engine() {
@@ -110,7 +110,7 @@ index 92dfa1b..b852e00 100644
      next_.reset();
      OnCard here(device_, split_);
      map_quit_.store(true);
-@@ -835,6 +840,7 @@ Engine::~Engine() {
+@@ -908,6 +913,7 @@ Engine::~Engine() {
      vmm_free(work_map_);
      for (unsigned long long h : vpool_) cuMemRelease(h);   // the pool goes back to the card with the engine
      vpool_.clear();
@@ -118,7 +118,7 @@ index 92dfa1b..b852e00 100644
      for (void* p : host_allocs_) cudaFreeHost(p);
      for (void* e : {ev_stage_[0], ev_stage_[1], ev_ahead_, ev_free_, ev_in_[0], ev_in_[1], ev_out_[0], ev_out_[1], ev_hr_,
                      ev_saved_, ev_bell_})
-@@ -1350,7 +1356,7 @@ void Engine::metal_cover(int64_t end) {
+@@ -1481,7 +1487,7 @@ void Engine::metal_cover(int64_t end) {
  
  void* Engine::kv_alloc(size_t bytes, int per) {
      if (again_ != SIZE_MAX) return bufs_.at(again_++).p;
@@ -127,7 +127,7 @@ index 92dfa1b..b852e00 100644
      const size_t all = (size_t) ((cap_rows + per - 1) / per) * bytes;
  #if defined(STRATA_GPU_METAL)
      if (opt_.metal_balanced && opt_.kv_grow) {
-@@ -1391,6 +1397,9 @@ void* Engine::seq_alloc(size_t bytes, const char* what) {
+@@ -1534,6 +1540,9 @@ void* Engine::seq_alloc(size_t bytes, const char* what) {
  // The bound sequence's members to its place in seqs_, and the layers' launches recorded with its buffers.
  void Engine::park_bound() {
      Seq& q = seqs_[(size_t) bound_];
@@ -137,7 +137,7 @@ index 92dfa1b..b852e00 100644
      q.pos = pos_;
      q.kv_rows = kv_rows_;
      q.kv_reach = kv_reach_;
-@@ -1438,6 +1447,13 @@ void Engine::take_bound(int s) {
+@@ -1581,6 +1590,13 @@ void Engine::take_bound(int s) {
      again_ = 0;
      alloc_caches();
      again_ = SIZE_MAX;
@@ -151,7 +151,7 @@ index 92dfa1b..b852e00 100644
  }
  
  void Engine::hold(int s) {
-@@ -1484,6 +1500,52 @@ void Engine::copy_seq(int from, int to) {
+@@ -1627,6 +1643,52 @@ void Engine::copy_seq(int from, int to) {
      if (next_) next_->copy_seq(from, to);
  }
  
@@ -204,7 +204,7 @@ index 92dfa1b..b852e00 100644
  // The attention caches' VRAM for the rows below `end`: rows kv_grow() at a time, kv_ahead() more for the answer to go
  // on.  The expert cache gives it up (shrink_cache()), as if the rows had been there when it was filled: the
  // reserve stays for what is recorded later.  A quarter of the reserve stays free whatever else took VRAM since
-@@ -1498,7 +1560,7 @@ void Engine::cover(int64_t end) {
+@@ -1641,7 +1703,7 @@ void Engine::cover(int64_t end) {
      kv_reach_ = std::max(kv_reach_, end);
      if (kv_.empty() || end <= kv_rows_) return;
      if (opt_.kv_resident > 0 && kv_rows_ >= opt_.kv_resident) return;
@@ -213,7 +213,7 @@ index 92dfa1b..b852e00 100644
      const auto size = [rows](const Kv& k) { return (size_t) ((rows + k.per - 1) / k.per) * k.bytes; };
      size_t more = 0, held = arena_.mapped + other_rows();
      for (const Kv& k : kv_) {
-@@ -1506,7 +1568,10 @@ void Engine::cover(int64_t end) {
+@@ -1659,7 +1721,10 @@ void Engine::cover(int64_t end) {
          if (want > k.mapped) more += want - k.mapped;   // trim_card_kv() leaves a piece it cuts through
          held += k.mapped;
      }
@@ -225,7 +225,7 @@ index 92dfa1b..b852e00 100644
          // What the rows need beyond what the pool holds comes out of the expert cache, which gives its pieces to the
          // pool (shrink_cache()); nothing is asked of the card.  With the cache gone and the pool still short, the
          // maps below throw: the context does not fit the VRAM this engine has.
-@@ -1523,6 +1588,7 @@ void Engine::cover(int64_t end) {
+@@ -1676,6 +1741,7 @@ void Engine::cover(int64_t end) {
      for (Kv& k : kv_)
          vmm_map(k, size(k), (size_t) ((kv_grow() + k.per - 1) / k.per) * k.bytes, "the attention cache");
      kv_rows_ = rows;
@@ -233,7 +233,7 @@ index 92dfa1b..b852e00 100644
  }
  
  int64_t Engine::kv_rows_for(int64_t end) const {
-@@ -1562,7 +1628,16 @@ size_t Engine::trim_card_kv(int64_t end) {
+@@ -1715,7 +1781,16 @@ size_t Engine::trim_card_kv(int64_t end) {
      const int64_t before = kv_reach_;
      kv_reach_ = end;
      if (kv_.empty() || !exp_ || all_cached()) return 0;
@@ -251,7 +251,7 @@ index 92dfa1b..b852e00 100644
      if (rows >= kv_rows_) return 0;
      OnCard here(device_, split_);
      ck(cudaDeviceSynchronize(), "the attention cache");
-@@ -1651,6 +1726,7 @@ void Engine::shrink_cache(size_t bytes) {
+@@ -1804,6 +1879,7 @@ void Engine::shrink_cache(size_t bytes) {
          --cached_;
      }
      ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
@@ -259,7 +259,7 @@ index 92dfa1b..b852e00 100644
      vmm_unmap(arena_, cut);
      if (cut > kTail) zero_vram(exp_ + end, kTail);
      exp_at_ = std::min(exp_at_, end);
-@@ -1667,6 +1743,195 @@ std::vector<std::pair<const uint8_t*, size_t>> Engine::model_views() const {
+@@ -1820,6 +1896,195 @@ std::vector<std::pair<const uint8_t*, size_t>> Engine::model_views() const {
      return gg_ ? gg_->views() : std::vector<std::pair<const uint8_t*, size_t>>{};
  }
  
@@ -455,7 +455,7 @@ index 92dfa1b..b852e00 100644
  int64_t Engine::meta_u(const char* key, int64_t fallback) const {
      const MetaValue* v = gg_ ? gg_->get(key) : nullptr;
      return v && v->is_num() ? (int64_t) v->u : fallback;
-@@ -1848,9 +2113,29 @@ void Engine::load_moe(int il, bool shared) {
+@@ -2002,9 +2267,29 @@ void Engine::load_moe(int il, bool shared) {
  
  // The engine for a model file: its general.architecture says which.
  std::unique_ptr<Engine> Engine::open(const Options& o) {
@@ -485,7 +485,7 @@ index 92dfa1b..b852e00 100644
      // Clover is a qwen35moe model trained to also guess a block of tokens at once (Qwen35)
      const bool qwen35 = name == "qwen35moe" || name == "clover_moe";
      if (o.kv_format == KvFmt::kQ8_0 && !qwen35 && name != "kolibri1" && name != "flint" && name != "lfm2moe" &&
-@@ -2321,7 +2606,9 @@ void Engine::ensure_stage() {
+@@ -2545,7 +2830,9 @@ void Engine::ensure_stage() {
          vmm_map(stage_map_, stage_narrow_ + 256 + kTail, SIZE_MAX, "the expert staging buffer");
          stage_ = (uint8_t*) stage_map_.base;
      } else {
@@ -496,7 +496,7 @@ index 92dfa1b..b852e00 100644
      }
  }
  
-@@ -2424,6 +2711,9 @@ bool Engine::mind_card_vram() {
+@@ -2648,6 +2935,9 @@ bool Engine::mind_card_vram() {
  #if defined(STRATA_GPU_METAL)
      if (opt_.metal_balanced) return metal_mind_memory();
  #endif
@@ -506,7 +506,7 @@ index 92dfa1b..b852e00 100644
      if (!exp_ || reserve_mib_ <= 0) return false;
      // As shrink_cache(): a frozen answer's cache is the one its first token saw.
      if (freeze_experts_) return false;
-@@ -2579,7 +2869,7 @@ void* Engine::seq_buf(int s, const void* p) const {
+@@ -2803,7 +3093,7 @@ void* Engine::seq_buf(int s, const void* p) const {
  #if defined(STRATA_GPU_METAL)
          const size_t all = b.capacity;
  #else
@@ -515,7 +515,7 @@ index 92dfa1b..b852e00 100644
  #endif
          const auto* at = (const uint8_t*) b.p;
          if (q >= at && q < at + all) {
-@@ -3021,6 +3311,11 @@ void Engine::load(const Options& o) {
+@@ -3245,6 +3535,11 @@ void Engine::load(const Options& o) {
      gpu::metal::set_scoped_residency(o.metal_balanced);
  #endif
      opt_ = o;
@@ -527,7 +527,7 @@ index 92dfa1b..b852e00 100644
      if ((!opt_.kv_grow || opt_.batch > 0) && opt_.kv_resident > 0) opt_.kv_resident = 0;
      asked_reserve_mib_ = o.vram_reserve_mib;
      if (opt_.max_context < 16) throw std::runtime_error("the context must be at least 16 tokens");
-@@ -3048,6 +3343,9 @@ void Engine::load(const Options& o) {
+@@ -3272,6 +3567,9 @@ void Engine::load(const Options& o) {
      if (requested_stream_stage)
          std::fprintf(stderr, "strata-poly: STRATA_POLY_STREAM_STAGE: %s\n",
                       stream_stage_ ? "streaming CPU stores for expert staging" : "unsupported CPU build; stock copies");
@@ -537,7 +537,7 @@ index 92dfa1b..b852e00 100644
      gg_ = std::make_unique<Shards>(opt_.model);
      if (!opt_.draft_model.empty() && opt_.draft && opt_.window != 1) dg_ = std::make_unique<Shards>(opt_.draft_model);
  #if defined(STRATA_GPU_METAL)
-@@ -3067,6 +3365,10 @@ void Engine::load(const Options& o) {
+@@ -3291,6 +3589,10 @@ void Engine::load(const Options& o) {
      std::fprintf(stderr, "strata-poly: Metal optimize=%s memory=%s kv=%s\n",
                   opt_.metal_optimize ? "on" : "off", opt_.metal_balanced ? "balanced" : "legacy",
                   opt_.kv_format == KvFmt::kQ8_0 ? "q8_0" : "fp16");
@@ -548,7 +548,7 @@ index 92dfa1b..b852e00 100644
  #endif
      if (block_ != dg_.get()) dg_.reset();
      hi_ = end_ < 0 ? n_layer_ : end_;
-@@ -3195,6 +3497,13 @@ void Engine::load(const Options& o) {
+@@ -3449,6 +3751,13 @@ void Engine::load(const Options& o) {
                     opt_.window > 1 && !split_;
      if (block_guess_) std::fprintf(stderr, "strata-poly: STRATA_BLOCK_GUESS: the model guesses its own blocks\n");
      alloc();
@@ -562,7 +562,7 @@ index 92dfa1b..b852e00 100644
      if (!opt_.profile.empty()) read_profile(opt_.profile, (int) layers_.size(), n_expert_, prior_);
      fill_expert_cache();
  #if !defined(STRATA_GPU_METAL)
-@@ -3234,7 +3543,7 @@ void Engine::load(const Options& o) {
+@@ -3488,7 +3797,7 @@ void Engine::load(const Options& o) {
                      park_bound();
                      take_bound(s);
                  }
@@ -571,7 +571,7 @@ index 92dfa1b..b852e00 100644
              }
          }
      }
-@@ -3504,16 +3813,17 @@ void Engine::shared_scratch() {
+@@ -3758,16 +4067,17 @@ void Engine::shared_scratch() {
      const size_t n = (size_t) buf_rows_, e = n * n_embd_;
      const size_t ff = n * std::max({n_ff_, n_ff_shexp_, 2 * n_ff_exp_});
      // the draft block works in it too (draft_input()); read() keeps two calls' rows in it
@@ -598,7 +598,7 @@ index 92dfa1b..b852e00 100644
      logits_ = fbuf((size_t) n_vocab_);
      if (buf_rows_ >= kStageRows && bf16_max_ > 0) wf_ = fbuf(bf16_max_);   // a BF16 matrix as floats, for lin()
  }
-@@ -3529,10 +3839,30 @@ void Engine::use_scratch(bool batch) {
+@@ -3783,10 +4093,30 @@ void Engine::use_scratch(bool batch) {
  
  // The sequence's state, the caches and every buffer, once the weights are known.
  void Engine::alloc() {
@@ -629,17 +629,17 @@ index 92dfa1b..b852e00 100644
      rec_n_ = recurrent_floats();
      state_n_ = rec_n_ + (draft_ ? (size_t) n_embd_ : 0);
      const size_t state_floats = state_n_ + (draft_ ? (size_t) rows_ * n_embd_ : 0);
-@@ -3608,6 +3938,9 @@ void Engine::alloc() {
-     const int most_step = (opt_.batch + 1) * (opt_.batch_mtp ? 2 : 1);
+@@ -3870,6 +4200,9 @@ void Engine::alloc() {
+ #endif
      two_scratch_ = scratch_layouts() && mmq_ && vmm_ && !split_ && rows_ >= kStageRows &&
-                    std::max(opt_.window, most_step) < kStageRows;
+                    std::max(opt_.window, most_step) < kStageRows && lends;
 +#ifdef STRATA_KVMEM
 +    if (opt_.memory.budget) two_scratch_ = false;
 +#endif
      if (two_scratch_) {
          buf_rows_ = kStageRows - 1;
          scratch_at_ = 0;
-@@ -3849,6 +4182,13 @@ void Engine::save_profile() const {
+@@ -4121,6 +4454,13 @@ void Engine::save_profile() const {
  
  void Engine::reset() {
      OnCard here(device_, split_);
@@ -653,7 +653,7 @@ index 92dfa1b..b852e00 100644
      ck(cudaMemsetAsync(state_, 0, state_n_ * sizeof(float), cs(st_)), "reset");
      pos_ = 0;
      ahead_pos_ = -1;
-@@ -6435,11 +6775,11 @@ void Engine::moe_rows(Layer& L, int il, int n) {
+@@ -6777,11 +7117,11 @@ void Engine::moe_rows(Layer& L, int il, int n) {
  
  // The rows a recorded attention launch is sized for, for n tokens from pos(): the power of two from 1024 that
  // holds their rows and the ones before them, or the context if that is less.  room_key() numbers the sizes.
@@ -667,7 +667,7 @@ index 92dfa1b..b852e00 100644
      return key;
  }
  
-@@ -6474,7 +6814,18 @@ void Engine::run(const int32_t* tokens, int n) {
+@@ -6948,7 +7288,18 @@ void Engine::run(const int32_t* tokens, int n) {
      if (n >= kStageRows) take_prompt();
      if (pos_ + n > opt_.max_context)
          throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
@@ -687,7 +687,7 @@ index 92dfa1b..b852e00 100644
  
      // h_r_ and h_cpu_ may still be the source of the previous call's copies
      ck(cudaStreamSynchronize(cs(st_)), "eval");
-@@ -6511,6 +6862,9 @@ void Engine::run(const int32_t* tokens, int n) {
+@@ -6986,6 +7337,9 @@ void Engine::run(const int32_t* tokens, int n) {
      // (never with the scratch in a prompt batch's layout: the recordings hold the few tokens' buffers)
      bool replay = opt_.graphs && n <= opt_.window && (windowed_ || block_pass_ || n == 1) && !opt_.dump &&
                    !prompt_scratch_;
@@ -697,7 +697,7 @@ index 92dfa1b..b852e00 100644
      for (int t = 0; t < n && replay; ++t) replay = !image_at(pos_ + t);
      const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
          if (made.size() <= key) made.resize(key + 1, nullptr);
-@@ -6519,7 +6873,7 @@ void Engine::run(const int32_t* tokens, int n) {
+@@ -6994,7 +7348,7 @@ void Engine::run(const int32_t* tokens, int n) {
      };
      if (replay) {   // a pair a token: a window's tokens may go one by one, each from its own
          for (int t = 0; t < n; ++t) {
@@ -706,7 +706,7 @@ index 92dfa1b..b852e00 100644
              h_at_[2 * t + 1] = turn(pos_ + t);
          }
          copy2(h_at_, at_, n * 2 * (int) (sizeof(long long) / 4), nullptr, nullptr, 0, st_);
-@@ -6578,6 +6932,11 @@ void Engine::run(const int32_t* tokens, int n) {
+@@ -7053,6 +7407,11 @@ void Engine::run(const int32_t* tokens, int n) {
          // Half k on from layer il, whose experts it has (-1: from its start), to the next router's copy.
          const auto go_on = [&](int k, int il, bool add) {
              const int m = half(k);
@@ -718,7 +718,7 @@ index 92dfa1b..b852e00 100644
              const size_t rec = wn + 2 * (size_t) (n - 1) + (size_t) k;
              if (il >= 0) {
                  if (add) moe_add(m);
-@@ -6778,7 +7137,13 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+@@ -7258,7 +7617,13 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
          const int m = guesses && guesses[i] >= 0 ? 2 : 1;
          if (pos_ + m > opt_.max_context)
              throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
@@ -733,7 +733,7 @@ index 92dfa1b..b852e00 100644
          for (int j = 0; j < m; ++j) {
              rseq.push_back(seqs[i]);
              rtok.push_back(j ? guesses[i] : tokens[i]);
-@@ -6806,7 +7171,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+@@ -7286,7 +7651,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
                  for (size_t k = 0; k < e_row; ++k) r[k] *= scale;
              for (int h = 1; h < streams(); ++h) std::memcpy(r + (size_t) h * e_row, r, e_row * sizeof(float));
          }
@@ -742,7 +742,7 @@ index 92dfa1b..b852e00 100644
          h_at_[2 * i + 1] = turn(at[(size_t) i]);
      }
      copy2(h_r_, r_, R * (int) r_row, nullptr, nullptr, 0, st_);
-@@ -6833,6 +7198,12 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+@@ -7332,6 +7697,12 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
      const auto logits_rows = [&](int r0, int m) {
          float* lg = wlogits_ + (size_t) r0 * n_vocab_;
          output_rows(0, m, xn_);
@@ -755,7 +755,7 @@ index 92dfa1b..b852e00 100644
          lin(output_, xn_, lg, m);
          finish_logits(lg, m);
          if (picks) {
-@@ -6860,7 +7231,13 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+@@ -7359,7 +7730,13 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
      // Once every layer has shown it routes on the card, the step's layers and its logits are one recording, as
      // run()'s are: the card waited 2 to 4 microseconds from one recording to the next, four of them a layer, and
      // after the last for the host's launch of the logits.  The same launches as the layer by layer replays.
@@ -770,16 +770,16 @@ index 92dfa1b..b852e00 100644
      for (int il = lo_; il < hi_ && whole; ++il) {
          const Layer& L = layers_[(size_t) il];
          whole = L.fixed && (!L.moe || (L.card == 1 && !batched(L, R)));
-@@ -6907,7 +7284,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
-     }();
+@@ -7415,7 +7792,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
      int mid = R / 2;
      while (mid < R && mid > 0 && rseq[(size_t) mid] == rseq[(size_t) mid - 1]) ++mid;
--    const bool halved = halves_on && !card && batch_heads() && !all_cached() && R >= 4 && mid > 0 && mid < R &&
-+    const bool halved = !managed_step && halves_on && !card && batch_heads() && !all_cached() && R >= 4 && mid > 0 && mid < R &&
-                         !batched(layers_[(size_t) first_moe_layer()], R);
+     // (not where the tails take the rows: a half's tail is recorded by its place in the buffers, not by sequence)
+-    const bool halved = halves_on && !card && batch_heads() && !tail_by_rows() && !all_cached() && R >= 4 && mid > 0 &&
++    const bool halved = !managed_step && halves_on && !card && batch_heads() && !tail_by_rows() && !all_cached() && R >= 4 && mid > 0 &&
+                         mid < R && !batched(layers_[(size_t) first_moe_layer()], R);
      if (halved) {
          const int first[3] = {0, mid, R};
-@@ -7012,6 +7389,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+@@ -7520,6 +7897,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
              const int64_t keep = pos_;
              key.assign(1, R);
              for (int i = 0; i < R; ++i) {
@@ -789,7 +789,7 @@ index 92dfa1b..b852e00 100644
                  pos_ = at[(size_t) i];
                  key.push_back(rseq[(size_t) i]);
                  key.push_back(head_key(il, 1));
-@@ -7084,7 +7464,22 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+@@ -7626,7 +8006,22 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
      }
      for (int i = 0; i < n; ++i) {
          use(seqs[i]);
@@ -812,7 +812,7 @@ index 92dfa1b..b852e00 100644
          ahead_pos_ = -1;
      }
      use(home);
-@@ -7269,6 +7664,17 @@ void Engine::hand_on(int64_t pos, int n, float* h) {
+@@ -7838,6 +8233,17 @@ void Engine::carry_in(int64_t from, int n) {
  
  void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
      OnCard here(device_, split_);
@@ -830,7 +830,7 @@ index 92dfa1b..b852e00 100644
      run(tokens, n);
      if (next_) {
          hand_on(pos_, n, pass_rows(n));
-@@ -7306,12 +7712,37 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
+@@ -7875,12 +8281,37 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
          } else {
              tail();
          }
@@ -870,7 +870,7 @@ index 92dfa1b..b852e00 100644
  }
  
  // A layer for n tokens, as run() hands it to the card when nothing is replayed or printed.
-@@ -7384,6 +7815,33 @@ void Engine::layer_pack(int il, const Pack& p, float* rows) {
+@@ -7953,6 +8384,33 @@ void Engine::layer_pack(int il, const Pack& p, float* rows) {
  // the layer's state is what save_state() would find there, and it is copied before the next call changes it.
  bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                    const std::function<bool(int, int)>* turn, const CoRead* co, int n_co) {
@@ -904,7 +904,7 @@ index 92dfa1b..b852e00 100644
      const int lead = bound_;
      int all = n;   // the rows of the read and its co-reads
      for (int j = 0; j < n_co; ++j) {
-@@ -7468,7 +7926,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
+@@ -8037,7 +8495,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
          cover(co[j].n);
      }
      hold(lead);
@@ -914,7 +914,7 @@ index 92dfa1b..b852e00 100644
      // On several cards, each reads through its own layers and hands the rows on, and `turn` hears of a card's
      // turns as its share of the model's layers: [lo_, to).
      const std::function<bool(int, int)>* asked = turn;
-@@ -7863,6 +8322,18 @@ void Engine::window(const int32_t* tokens, int t) {
+@@ -8434,6 +8893,18 @@ void Engine::window(const int32_t* tokens, int t) {
      if (t < 1 || t > opt_.window) throw std::logic_error("a window takes 1 to max_window() tokens");
      OnCard here(device_, split_);
      end_read();
@@ -933,7 +933,7 @@ index 92dfa1b..b852e00 100644
      // the two ways are a choice only with experts on the CPU; a call that records launches says nothing of them
      const bool timed = t > 1 && !card_routes();
      const bool recorded = std::exchange(recorded_, false);
-@@ -7881,6 +8352,9 @@ void Engine::window(const int32_t* tokens, int t) {
+@@ -8456,6 +8927,9 @@ void Engine::window(const int32_t* tokens, int t) {
      try {
          run(tokens, t);
      } catch (...) {
@@ -943,7 +943,7 @@ index 92dfa1b..b852e00 100644
          windowed_ = false;
          snap_bits_ = 0;
          recorded_ = recorded_ || recorded;
-@@ -7907,6 +8381,12 @@ void Engine::window(const int32_t* tokens, int t) {
+@@ -8482,6 +8956,12 @@ void Engine::window(const int32_t* tokens, int t) {
      if (timed && !recorded_ && !freeze_experts_) took_way(t, ms_since(t0));
      recorded_ = recorded_ || recorded;
      win_ = t;
@@ -956,7 +956,7 @@ index 92dfa1b..b852e00 100644
  }
  
  // How a window of t tokens goes through the layers: in halves, or its tokens together.  Each way is timed a few
-@@ -7937,6 +8417,10 @@ void Engine::keep(int n) {
+@@ -8512,6 +8992,10 @@ void Engine::keep(int n) {
      OnCard here(device_, split_);
      // The next card reads the window's rows again for the tokens it puts through its layers again: a right token's
      // row is the same, whatever came after it.
@@ -967,7 +967,7 @@ index 92dfa1b..b852e00 100644
      if (n < win_) {
          // The state after the last right token, when that token left it.  Else the one of the last token before
          // it that did, and the right tokens after that one go through the layers again: they come out as they
-@@ -7948,20 +8432,43 @@ void Engine::keep(int n) {
+@@ -8523,20 +9007,43 @@ void Engine::keep(int n) {
             "keep");
          if (from < n) {
              pos_ += from;
@@ -1012,7 +1012,7 @@ index 92dfa1b..b852e00 100644
  }
  
  // The draft block's input for n tokens: each token's embedding and the model's output for the token before it
-@@ -8009,6 +8516,9 @@ float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, i
+@@ -8584,6 +9091,9 @@ float* Engine::draft_input(const int32_t* tokens, int64_t row, const float* h, i
  // and hn_'s row i is the model's output for the token before it.  A row is all a later guess reads of a token, so
  // the rest of the block is not computed for it.  Then the call's last output is the one the next token pairs with.
  void Engine::draft_rows(const int32_t* tokens, int first, int n) {
@@ -1022,7 +1022,7 @@ index 92dfa1b..b852e00 100644
      const size_t e = (size_t) n_embd_;
      if (block_layer_ && first < n) {
          draft_input(tokens + first, pos_ + first, hn_ + (size_t) first * e, n - first);
-@@ -8082,7 +8592,18 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
+@@ -8657,7 +9167,18 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
          *prob = i < block_n_ ? h_block_[i].prob : 0.f;
          return i < block_n_ ? h_block_[i].token : 0;
      }
@@ -1042,7 +1042,7 @@ index 92dfa1b..b852e00 100644
      ck(cudaStreamSynchronize(cs(st_)), "draft");
      draft_step(token, i);
      // The guess and its probability are found on the card.  On the host a vocabulary's softmax takes up to 2 ms
-@@ -8094,6 +8615,13 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
+@@ -8669,6 +9190,13 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
          ahead_tok_ = token;
      }
      *prob = h_guess_->prob;
@@ -1057,7 +1057,7 @@ index 92dfa1b..b852e00 100644
  }
  
 diff --git a/engine/src/poly/engine.hpp b/engine/src/poly/engine.hpp
-index 9c61d67..faeec29 100644
+index ab0e274..17b12b9 100644
 --- a/engine/src/poly/engine.hpp
 +++ b/engine/src/poly/engine.hpp
 @@ -14,6 +14,10 @@
@@ -1092,7 +1092,7 @@ index 9c61d67..faeec29 100644
      bool dump = false;            ///< print a checksum of every stage, for comparing against llama.cpp
      // A prompt batch.  More tokens a call and a larger staging buffer read a prompt faster, and both take VRAM
      // that the expert cache, and so decoding, does without.
-@@ -237,6 +248,17 @@ struct Image {
+@@ -244,6 +255,17 @@ struct Image {
  
  class Engine {
  public:
@@ -1110,7 +1110,7 @@ index 9c61d67..faeec29 100644
      Engine();
      virtual ~Engine();
      Engine(const Engine&) = delete;
-@@ -279,6 +301,7 @@ public:
+@@ -286,6 +308,7 @@ public:
  
      /// Forget the sequence.
      void reset();
@@ -1118,7 +1118,7 @@ index 9c61d67..faeec29 100644
      /// STRATA_FREEZE_EXPERTS: lift the freeze for the caller's own cache change (the serve VRAM
      /// resize); refreeze_experts() puts it back, and the resized cache is what every request reads.
      void unfreeze_experts();
-@@ -317,7 +340,12 @@ public:
+@@ -324,7 +347,12 @@ public:
          const int32_t* tokens;
          int n;
      };
@@ -1132,7 +1132,7 @@ index 9c61d67..faeec29 100644
      bool read(const int32_t* tokens, int n, const Mark* marks = nullptr, int n_marks = 0,
                const std::function<bool(int, int)>* turn = nullptr, const CoRead* co = nullptr, int n_co = 0);
      /// The prompt's reads are done: the expert cache takes back what Options::stage_read_mib lent the staging
-@@ -461,8 +489,33 @@ public:
+@@ -472,8 +500,33 @@ public:
      int step_rows_alone() const;
      /// Sequence `to` becomes what sequence `from` is: its position, state, rows and pictures, copied on the card.
      void copy_seq(int from, int to);
@@ -1166,7 +1166,7 @@ index 9c61d67..faeec29 100644
      // ---- what an architecture supplies ----
      /// The model's shape from its metadata: load_shape() for what every architecture has, then its own.
      virtual void load_geometry() = 0;
-@@ -683,6 +736,8 @@ protected:
+@@ -724,6 +777,8 @@ protected:
      void start_swaps();
      void plan_ahead(Layer& L, int il);
      void run(const int32_t* tokens, int n);
@@ -1175,7 +1175,7 @@ index 9c61d67..faeec29 100644
      bool pick_way(int t);
      void took_way(int t, double ms);
      void layer(int il, int n);
-@@ -731,6 +786,12 @@ protected:
+@@ -779,6 +834,12 @@ protected:
      void embed(int32_t token, float* dst) const;
      void dbg(const char* name, int il, const float* dev, int n);
      float* fbuf(size_t n);
@@ -1188,7 +1188,7 @@ index 9c61d67..faeec29 100644
      int room(int n) const;
      int room_key(int n) const;
      void* dmalloc(size_t bytes, const char* what);
-@@ -761,6 +822,23 @@ protected:
+@@ -809,6 +870,23 @@ protected:
          size_t bytes = 0;   ///< for every `per` rows
          int per = 1;
      };
@@ -1212,7 +1212,7 @@ index 9c61d67..faeec29 100644
      void vmm_reserve(Mapped& m, size_t bytes);
      void vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what);
      void vmm_unmap(Mapped& m, size_t bytes);
-@@ -1001,6 +1079,9 @@ protected:
+@@ -1069,6 +1147,9 @@ protected:
  #endif
      };
      struct Seq {
@@ -1222,7 +1222,7 @@ index 9c61d67..faeec29 100644
          int64_t pos = 0, kv_rows = 0, kv_reach = 0, ahead_pos = -1;
          int32_t ahead_tok = 0;
          float* state = nullptr;
-@@ -1018,6 +1099,9 @@ protected:
+@@ -1086,6 +1167,9 @@ protected:
          size_t twin_mapped = 0;
      };
      std::vector<Seq> seqs_;      ///< the bound one's place holds nothing while it is bound
@@ -1831,7 +1831,7 @@ index 6b88ca5..0ed0f1a 100644
      float *qraw_ = nullptr, *q_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *vraw_ = nullptr, *v_ = nullptr,
            *att_ = nullptr, *score_ = nullptr, *mlp_ = nullptr, *rin_ = nullptr;
 diff --git a/engine/src/poly/inkling2.cpp b/engine/src/poly/inkling2.cpp
-index 1df14ea..5e1a3ac 100644
+index c20d374..9b325cf 100644
 --- a/engine/src/poly/inkling2.cpp
 +++ b/engine/src/poly/inkling2.cpp
 @@ -1,6 +1,9 @@
@@ -1844,10 +1844,10 @@ index 1df14ea..5e1a3ac 100644
  
  #include "runtime.hpp"
  #include "strata/poly/kernels.hpp"
-@@ -554,6 +557,122 @@ void Inkling2::alloc_caches() {
+@@ -778,6 +781,122 @@ void Inkling2::alloc_caches() {
+     }
  }
  
- // Per-token buffers hold rows_ tokens, row after row.
 +#ifdef STRATA_KVMEM
 +void Inkling2::init_memory() {
 +    if (head_dim_ != 128 || n_rel_ != 16 || n_head_ != 3 * n_kv_)
@@ -1964,10 +1964,10 @@ index 1df14ea..5e1a3ac 100644
 +}
 +#endif
 +
+ // Per-token buffers hold buf_rows_ tokens, row after row.
  void Inkling2::assign_scratch() {
-     const size_t n = (size_t) rows_, e = n * n_embd_, heads = n * n_head_ * head_dim_, kv = n * n_kv_ * head_dim_;
-     for (float*& b : bl_) b = fbuf(e);
-@@ -886,6 +1005,10 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
+     const size_t n = (size_t) buf_rows_, e = n * n_embd_, heads = n * n_head_ * head_dim_, kv = n * n_kv_ * head_dim_;
+@@ -1195,6 +1314,10 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
              if (visit == ds_visit_[k]) copy_rows(r_, ds_tap_ + (size_t) k * rows_ * n_embd_, n);
      }
      Slot& S = slots_[(size_t) slot_of(il, pass_of(il))];
@@ -1977,8 +1977,8 @@ index 1df14ea..5e1a3ac 100644
 +#endif
      const size_t ne = (size_t) n * n_embd_;
      const int kv = n_kv_ * head_dim_, hq = n_head_ * head_dim_;
- 
-@@ -1006,6 +1129,12 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
+     // step()'s rows (rows_of_), each a token of its own sequence: what reads or writes a sequence's states, caches or
+@@ -1328,6 +1451,12 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
      }
      const float alpha = B.swa ? 0.f : log_alpha_;
      const long long* at = recording_ ? at_ : nullptr;   // a recorded launch: the tokens' positions from what at_ holds
@@ -1988,19 +1988,19 @@ index 1df14ea..5e1a3ac 100644
 +    constexpr bool managed = false;
 +#endif
 +    const int64_t physical = managed && !B.swa ? cache_position() : pos_;
-     if (n == 1 && head_dim_ <= 128 && n_rel_ <= 128) {   // one launch for all of it, the same bits
-         InkQkv c;
-         c.q = q_;
-@@ -1026,6 +1155,8 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
-         c.vals = S.vals;
-         c.at = at;
-         c.pos = pos_;
-+        c.managed_positions = managed;
-+        c.cache_pos = physical;
-         c.qk_thr = qk_clip_;
-         c.rel_thr = rel_clip_;
-         c.alpha = alpha;
-@@ -1071,6 +1202,8 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
+     // one launch for all of it, the same bits (step()'s rows: a launch a row; load_geometry() takes no other heads)
+     if ((n == 1 || per_row) && head_dim_ <= 128 && n_rel_ <= 128) {
+         for (int i = 0; i < each; ++i) {
+@@ -1353,6 +1482,8 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
+             c.vals = s.vals;
+             c.at = at ? at + 2 * i : nullptr;
+             c.pos = per_row ? rows_of_[i].pos : pos_;
++            c.managed_positions = managed;
++            c.cache_pos = physical;
+             c.qk_thr = qk_clip_;
+             c.rel_thr = rel_clip_;
+             c.alpha = alpha;
+@@ -1415,6 +1546,8 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
          c.eps = rms_eps_;
          c.pos = pos_;
          c.at = at;
@@ -2009,7 +2009,7 @@ index 1df14ea..5e1a3ac 100644
          c.rows = n;
          c.cache[1] = S.keys;   // and the keys and values to their caches
          c.cache[2] = S.vals;
-@@ -1088,9 +1221,15 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
+@@ -1433,9 +1566,15 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
      a.out = att_;
      a.score = score_;
      a.score_n = score_n_;
@@ -2028,8 +2028,8 @@ index 1df14ea..5e1a3ac 100644
      a.rows = n;
      a.n_head = n_head_;
      a.n_kv = n_kv_;
-@@ -1105,7 +1244,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
-     if (n >= kStageRows && ink_attend_batch(a, st_)) {
+@@ -1494,7 +1633,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
+     } else if (n >= kStageRows && ink_attend_batch(a, st_)) {
          // a prompt batch on the tensor cores with no score written out: attend_batch()'s path below wrote 1.6e11
          // scores of a 30,954-token read and read them back, 8.9 of its 16.8 s of attention on the RTX 4070 Laptop
 -    } else if (n >= kStageRows) {
@@ -2037,7 +2037,7 @@ index 1df14ea..5e1a3ac 100644
          // a prompt batch: the engine's products on the tensor cores, which round the queries and the softmax's
          // weights to halves; the sink's own term of the softmax has score 0 (zeros_)
          if (kv8_) throw std::logic_error("Inkling 2: FP8 caches need ink_attend_batch()");
-@@ -1123,6 +1262,31 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
+@@ -1520,6 +1659,31 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
          if (n == 1) a.q8 = xqo_;   // and the output quantized for wo
          ink_attend(a, st_);
      }
@@ -2068,26 +2068,12 @@ index 1df14ea..5e1a3ac 100644
 +#endif
      lin(B.wo, att_, aoraw_, n, n == 1 && n < kStageRows ? xqo_ : nullptr);
      // the first layer of a block starts a new stream from the attention's output; the one it had joins the mixes
-     if (n == 1) {   // the convolution and the stream's update in one launch
+     if (n == 1 || per_row) {   // the convolution and the stream's update in one launch (a launch a row of step()'s)
 diff --git a/engine/src/poly/inkling2.cu b/engine/src/poly/inkling2.cu
-index 5808f15..034b236 100644
+index c5d7266..e3f8799 100644
 --- a/engine/src/poly/inkling2.cu
 +++ b/engine/src/poly/inkling2.cu
-@@ -39,6 +39,13 @@ void launched(const char* what) {
-         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
- }
- 
-+#if defined(__HIPCC__)
-+// HIP has __ldcs and __ldcg for halves only.  The DSpark screen's are cache hints (a copy's words read once, the
-+// tiles' candidates from earlier launches), so on HIP they are plain loads.
-+template <typename T> __device__ __forceinline__ T __ldcs(const T* p) { return *p; }
-+template <typename T> __device__ __forceinline__ T __ldcg(const T* p) { return *p; }
-+#endif
-+
- constexpr int WARP = 32;   // the lanes a shuffle spans: a warp, or half of a 64-lane wavefront
- 
- // The warp's sum of x, in every lane.
-@@ -741,13 +748,14 @@ __global__ void ink_clips_kernel(InkClips c) {
+@@ -843,13 +843,14 @@ __global__ void ink_clips_kernel(InkClips c) {
      while (j < 3 && b >= c.rows * c.heads[j]) b -= c.rows * c.heads[j++];
      const int row = b / c.heads[j], head = b % c.heads[j];
      float* v = c.x[j] + (size_t(row) * c.heads[j] + head) * c.dim[j];
@@ -2102,64 +2088,105 @@ index 5808f15..034b236 100644
 -    if (c.ring > 0) cell %= c.ring;
 +    const long long physical = (c.at ? c.at[0] : c.managed_positions ? c.cache_pos : c.pos) + row;
 +    const long long cell = c.ring > 0 ? (c.managed_positions ? logical : physical) % c.ring : physical;
-     if (KV8) {
-         kv8_store(v, (uint8_t*) c.cache[j], cell, c.heads[j], c.dim[j], head, part);
+     if (KV != kKvF16) {
+         kv_store<KV>(v, c.cache[j], cell, c.heads[j], c.dim[j], head, part);
          return;
-@@ -811,7 +819,7 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
-     pdl_wait();
-     __shared__ float part[128 / WARP];
-     const InkQkv& a = g.a;
+@@ -929,7 +930,7 @@ struct QkvArgs {
+ // ink_qkv(): blocks [0, n_head) Q's heads, then K's n_kv, V's n_kv, and the relative positions' n_head; 128 threads.
+ template <int KV>
+ __device__ __forceinline__ void qkv_block(const InkQkv& a, float k_norm, float v_norm, float* part) {
 -    const long long p = a.at ? a.at[0] : (long long) a.pos;
 +    const long long p = a.at ? a.at[int(a.managed_positions)] : a.pos;
      int b = blockIdx.x;
      if (b < a.n_head) {
          clip_head(a.q + size_t(b) * a.dim, a.q_scale ? a.q_scale + size_t(b) * a.dim : nullptr, a.qk_thr, a.dim,
-@@ -834,7 +842,8 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
+@@ -952,7 +953,8 @@ __device__ __forceinline__ void qkv_block(const InkQkv& a, float k_norm, float v
          float* head = out + size_t(h) * a.dim;
          if (is_v) rms_head(head, a.dim, a.eps, part);
          else clip_head(head, nullptr, a.qk_thr, a.dim, 0.0f, 1.0f, p, part);
 -        const long long row = a.ring > 0 ? p % a.ring : p;
 +        const long long physical = a.at ? a.at[0] : a.managed_positions ? a.cache_pos : a.pos;
 +        const long long row = a.ring > 0 ? p % a.ring : physical;
-         if (KV8) kv8_store(head, (uint8_t*) (is_v ? a.vals : a.keys), row, a.n_kv, a.dim, h, part);
+         if (KV != kKvF16) kv_store<KV>(head, is_v ? a.vals : a.keys, row, a.n_kv, a.dim, h, part);
          else if (i < a.dim)
              ((__half*) (is_v ? a.vals : a.keys))[size_t(row) * channels + size_t(h) * a.dim + i] = __float2half(head[i]);
-@@ -900,6 +909,12 @@ __device__ __forceinline__ void lane_halves(const __half* head, int lane, int n,
+@@ -1072,6 +1074,12 @@ __device__ __forceinline__ void lane_halves(const __half* head, int lane, int n,
+ // The scores of a token's heads on one key head (blockIdx.x) against a block of keys (blockIdx.y).  A warp has
  // kScoreKeys keys, one at a time: its lanes read the key side by side, once for all of the group's heads, and
  // their products with the queries are summed across the warp.  The bias's products are the first n_rel lanes'.
- // t0 is the launch's first token among the call's, nk_max the scores a head has room for.
 +__device__ __forceinline__ long long logical_distance(const InkAttn& a, long long q, long long k) {
 +    if (!a.page_starts) return q - k;
 +    return a.page_starts[q / a.page_tokens] - a.page_starts[k / a.page_tokens] +
 +           q % a.page_tokens - k % a.page_tokens;
 +}
 +
- template <bool KV8>
- __global__ void ink_score_kernel(InkAttn a, int t0, int nk_max) {
-     pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
-@@ -938,7 +953,7 @@ __global__ void ink_score_kernel(InkAttn a, int t0, int nk_max) {
-         if (j0 + u < j1) {
-             if (KV8) lane_fp8(a.keys, row, a.n_kv, a.dim, g, lane, lh, k[u]);
-             else lane_halves((const __half*) a.keys + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, k[u]);
+ // t0 is the launch's first token among the call's, nk_max the scores a head has room for.  ink_attend_rows()'s path
+ // (ink_score_rows_kernel); ink_attend() takes ink_score_kernel below, the same bits a key in fewer instructions.
+ template <int KV>
+@@ -1111,7 +1119,7 @@ __device__ __forceinline__ void score_block(const InkAttn& a, const void* keys,
+             if (KV == kKvFp8) lane_fp8(keys, row, a.n_kv, a.dim, g, lane, lh, k[u]);
+             else if (KV == kKvQ8) lane_q8(keys, row, a.n_kv, a.dim, g, lane, lh, k[u]);
+             else lane_halves((const __half*) keys + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, k[u]);
 -            const long long dist = p - (lo + j0 + u);
 +            const long long dist = logical_distance(a, p, lo + j0 + u);
              rb[u] = lane < a.n_rel && dist < a.extent ? a.rel_bias[size_t(dist) * a.n_rel + lane] : 0.0f;
              if (++row == a.ring) row = 0;
          }
-@@ -1229,7 +1244,7 @@ __global__ void __launch_bounds__(kFlashTokens / 16 * G * 32, 1) ink_flash_kerne
+@@ -1268,7 +1276,7 @@ __global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a,
+         const int jw = j - mine;   // the step's first key
+         if (jw >= nk) break;       // (a whole warp)
+         const bool here = j < nk;
+-        const long long dist = p - (lo + j);
++        const long long dist = here ? logical_distance(a, p, lo + j) : 0;
+         const bool far = p - (lo + jw + kScoreKeys - 1) >= a.extent;   // (the whole warp)
+         // this lane's four shares of key j: its values and bias weights first, so that their reads are on their way
+         float kx[kScoreShares][kLaneHalves], rb[kScoreShares];
+@@ -1705,7 +1713,7 @@ __global__ void __launch_bounds__(TOKENS / 16 * G * 32, 1) ink_flash_kernel(InkA
                      const long long key = k0 + 8 * n + 2 * tig + j % 2;
                      float v = -INFINITY;
-                     if (tok[i] < a.rows && key <= own && (a.window <= 0 || key > own - a.window)) {
+                     if (!edge || (tok[i] < a.rows && key <= own && (a.window <= 0 || key > own - a.window))) {
 -                        const long long d = own - key;
 +                        const long long d = logical_distance(a, own, key);
                          float add = 0.0f;
                          if (d < a.extent) {
-                             const float4* col = reinterpret_cast<const float4*>(a.rel_bias + size_t(d) * NR);
+                             const float4* col = TB ? reinterpret_cast<const float4*>(&tb[buf][d - d0][0])
+@@ -3452,7 +3460,9 @@ int flash_pick(const InkAttn& a, int per) {
+ 
+ // whether the call goes to ink_flash_kernel without LEAN (not Turing's kernel, LEAN's or ink_fast_kernel)
+ bool flash_sized(const InkAttn& a, int per) {
+-    return per > 0 && flash_ptx() >= 80 && !flash_lean() && !(flash_fast() && a.window <= 0 && !a.kvq8);
++    if (per == 0 || flash_ptx() < 80) return false;
++    if (a.page_starts) return true;
++    return !flash_lean() && !(flash_fast() && a.window <= 0 && !a.kvq8);
+ }
+ 
+ }  // namespace
+@@ -3476,8 +3486,9 @@ bool ink_attend_batch_rows(const InkAttn& a, void* stream, int tokens) {
+     if (per == 0) return false;
+     const int ptx = flash_ptx();
+     // Turing: ink_flash75_kernel reads fp16 caches only (FP8 and Q8_0 rows go to attend_batch())
+-    if (ptx < 80) return ptx >= 75 && !a.kv8 && !a.kvq8 && flash75(a, per, stream);
+-    const bool lean = flash_lean();
++    if (ptx < 80) return ptx >= 75 && !a.page_starts && !a.kv8 && !a.kvq8 && flash75(a, per, stream);
++    // The lean and fast kernels assume consecutive logical positions.
++    const bool lean = !a.page_starts && flash_lean();
+     const auto launch = [&](auto kernel, int g, bool ln) {
+         const int t = flash_tokens(ln);
+         const size_t smem = flash_smem(g, ln, t);
+@@ -3485,7 +3496,7 @@ bool ink_attend_batch_rows(const InkAttn& a, void* stream, int tokens) {
+         if (e != cudaSuccess) throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));
+         kernel<<<dim3(grid((size_t) a.rows, t), a.n_kv), t / 16 * g * 32, smem, cs(stream)>>>(a);
+     };
+-    if (flash_fast() && a.window <= 0 && !a.kvq8) {   // ink_fast_kernel reads fp16 and FP8 caches
++    if (!a.page_starts && flash_fast() && a.window <= 0 && !a.kvq8) {   // ink_fast_kernel reads fp16 and FP8 caches
+         // HACC where the tensor cores sum fp16 products into floats at half rate: all but sm_80, sm_90 and sm_100,
+         // whose whitepapers give the same dense FP16 TFLOPS with FP32 accumulation as with FP16
+         static const bool hacc = [] {
 diff --git a/engine/src/poly/inkling2.hpp b/engine/src/poly/inkling2.hpp
-index 0be39f2..d4cc24f 100644
+index 9b3b442..22b0988 100644
 --- a/engine/src/poly/inkling2.hpp
 +++ b/engine/src/poly/inkling2.hpp
-@@ -25,7 +25,13 @@ public:
+@@ -26,7 +26,13 @@ public:
      void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
      void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
      // pictures (inkling2_pictures.cpp): a picture's rows go in a call of their own, and skip the token norm
@@ -2174,8 +2201,8 @@ index 0be39f2..d4cc24f 100644
      int64_t whole(int64_t at, int64_t m) const override;
  
  protected:
-@@ -60,6 +66,14 @@ protected:
-     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
+@@ -78,6 +84,14 @@ protected:
+     void slots_moved() override;
      bool route_card(int il, int n, int32_t* ids, float* w) override;
      void moe_shared(const Layer& L, int il, int n) override;
 +#ifdef STRATA_KVMEM
@@ -2189,7 +2216,7 @@ index 0be39f2..d4cc24f 100644
  
  private:
      static constexpr int kCtrl = 4;     ///< a looped layer's controllers: Q, K, V and the FFN
-@@ -94,7 +108,21 @@ private:
+@@ -112,7 +126,21 @@ private:
          uint16_t* keys = nullptr;   ///< fp16, n_kv * head_dim a row: a row a position, or a window layer's ring
          uint16_t* vals = nullptr;
          float* past = nullptr;      ///< the convolutions' last inputs: K, V, the attention's output, the FFN's
@@ -2212,10 +2239,10 @@ index 0be39f2..d4cc24f 100644
      int slot_of(int il, int pass) const {
          return pass == 0 ? il : n_layer_ + (pass - 1) * (core_end_ - core_start_) + (il - core_start_);
 diff --git a/engine/src/poly/inkling2_kernels.hpp b/engine/src/poly/inkling2_kernels.hpp
-index 0887b25..efe7120 100644
+index 0026015..a15f000 100644
 --- a/engine/src/poly/inkling2_kernels.hpp
 +++ b/engine/src/poly/inkling2_kernels.hpp
-@@ -106,6 +106,9 @@ struct InkClips {
+@@ -120,6 +120,9 @@ struct InkClips {
      long long pos = 0;
      const long long* at = nullptr;
      int rows = 0;
@@ -2225,16 +2252,16 @@ index 0887b25..efe7120 100644
      /// With a job's cache (fp16, heads * dim a cell), its rows then stored at cells pos + row (at[0] + row with at),
      /// modulo ring where ring > 0, as store_f16(), store_f16_at() and ink_store_ring() store them.
      uint16_t* cache[4] = {};
-@@ -167,6 +170,8 @@ struct InkQkv {
+@@ -182,6 +185,8 @@ struct InkQkv {
      int64_t pos = 0;
      float qk_thr = 0.f, rel_thr = 0.f, alpha = 0.f, floor = 1.f, eps = 0.f;
      int n_head = 0, n_kv = 0, dim = 0, n_rel = 0, taps = 0, ring = 0;
 +    bool managed_positions = false;
 +    long long cache_pos = 0;
      bool kv8 = false;   ///< the caches are FP8 (InkAttn::kv8)
+     bool kvq8 = false;  ///< the caches are Q8_0 (InkAttn::kvq8)
  };
- void ink_qkv(const InkQkv& a, void* stream);
-@@ -197,6 +202,9 @@ struct InkAttn {
+@@ -223,6 +228,9 @@ struct InkAttn {
      int room = 0;
      int rows = 0, n_head = 0, n_kv = 0, dim = 0, n_rel = 0, extent = 0, window = 0, ring = 0;
      float scale = 1.f;
@@ -2245,7 +2272,7 @@ index 0887b25..efe7120 100644
      /// over 448), ink_kv8_row() bytes; else fp16, n_kv * dim halves a row
      bool kv8 = false;
 diff --git a/engine/src/poly/kernels.cu b/engine/src/poly/kernels.cu
-index b5a1dfa..7e3512c 100644
+index 256f269..5a2923e 100644
 --- a/engine/src/poly/kernels.cu
 +++ b/engine/src/poly/kernels.cu
 @@ -1447,12 +1447,12 @@ __global__ void add_bias_kernel(const float* __restrict__ b, float* __restrict__
@@ -2305,7 +2332,7 @@ index b5a1dfa..7e3512c 100644
  // The rows the token at position p attends: how many, and the first of them.  They end at its own row, or at row
  // `last` when that is given: the tokens of the call then see each other.
  __device__ __forceinline__ int attn_rows(long long p, int window, long long last, long long* lo) {
-@@ -4081,20 +4109,43 @@ void head_norm_rope(const float* x, int x_stride, const float* w, float* y, int
+@@ -4100,20 +4128,43 @@ void head_norm_rope(const float* x, int x_stride, const float* w, float* y, int
                      float theta_scale, int64_t pos, int rows, float eps, void* stream, const float* freq,
                      const int32_t* axes, int sections, const long long* at) {
      head_norm_rope_kernel<false><<<rows * heads, dim >= 256 ? 256 : 128, 0, cs(stream)>>>(
@@ -4741,7 +4768,7 @@ index 0000000..1942c92
 +} // namespace strata::poly
 +
 diff --git a/engine/src/poly/main.cpp b/engine/src/poly/main.cpp
-index 5c086ed..471224a 100644
+index e7eff91..40bd49e 100644
 --- a/engine/src/poly/main.cpp
 +++ b/engine/src/poly/main.cpp
 @@ -7,6 +7,11 @@
@@ -4762,9 +4789,9 @@ index 5c086ed..471224a 100644
  #include <chrono>
 +#include <cerrno>
  #include <cmath>
+ #include <cctype>
  #include <condition_variable>
- #include <cstdio>
-@@ -224,6 +230,9 @@ uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+@@ -225,6 +231,9 @@ uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
  struct Pictures {
      std::vector<float> rows;
      std::vector<strata::poly::Image> at;
@@ -4774,7 +4801,7 @@ index 5c086ed..471224a 100644
  };
  
  // Reads a request's pictures and finds their places: each takes the next run of `pad` in ids, a token a row.
-@@ -273,6 +282,9 @@ std::string take_pictures(const std::string& path, int32_t pad, int n_embd, std:
+@@ -274,6 +283,9 @@ std::string take_pictures(const std::string& path, int32_t pad, int n_embd, std:
          for (int j = 0; j < r.n; ++j)
              ids[i + (size_t) j] = -1 - (int32_t) ((h + (uint64_t) j * 0x9E3779B97F4A7C15ull) >> 33);
          out.at.push_back({(int64_t) i, r.n, r.nx, rows});
@@ -4784,7 +4811,7 @@ index 5c086ed..471224a 100644
          i += (size_t) r.n;
      }
      if (std::find(ids.begin() + (std::ptrdiff_t) i, ids.end(), pad) != ids.end())
-@@ -367,6 +379,16 @@ struct Session {
+@@ -368,6 +380,16 @@ struct Session {
      std::vector<int32_t> eos;
      CacheFlags flags;
      Conversations<Engine> kept;   // the conversation in the engine, and the parked ones
@@ -4801,7 +4828,7 @@ index 5c086ed..471224a 100644
      Sampler sampler;
      std::mt19937_64 rng{std::random_device{}()};
      const std::vector<int32_t>* follow = nullptr;   // --follow: the answer's tokens, taken in place of the picks
-@@ -391,7 +413,11 @@ struct Session {
+@@ -392,7 +414,11 @@ struct Session {
          : engine(e), eos(std::move(eos_ids)), flags(f), kept(e, with_floor(f)),
            most(lookup > 0 || e.drafts() ? std::min<int>(e.max_window(), strata::spec::DraftPolicy::kMaxT) : 1),
            look(lookup > 0 && most > 1),
@@ -4814,7 +4841,7 @@ index 5c086ed..471224a 100644
  
      static CacheOptions with_floor(const CacheFlags& f) {
          CacheOptions o = f.o;
-@@ -406,11 +432,21 @@ struct Session {
+@@ -407,11 +433,21 @@ struct Session {
  
      struct Result {
          int64_t produced = 0, resume = 0, read = 0;
@@ -4836,7 +4863,7 @@ index 5c086ed..471224a 100644
  
      // Reads the prompt and generates.  on_token gets every token, the end-of-sequence one included.  The rows of
      // the prompt's pictures have ids below zero (take_pictures()); `pad` is the token they stand in for.
-@@ -419,22 +455,135 @@ struct Session {
+@@ -420,22 +456,135 @@ struct Session {
      template<class OnToken, class OnProgress>
      Result generate(const std::vector<int32_t>& ids, const Pictures& pictures, int32_t pad, int64_t turn_at,
                      int64_t max_new, const Sampling& s, const std::atomic<bool>& stop, OnToken on_token,
@@ -4977,7 +5004,7 @@ index 5c086ed..471224a 100644
          on_progress(r.resume, n, 0.0, true);
          if (s.seed != 0) rng.seed(s.seed);
  
-@@ -446,11 +595,67 @@ struct Session {
+@@ -447,11 +596,67 @@ struct Session {
          const bool pictures_any = !pictures.at.empty();
          std::vector<std::pair<int64_t, uint8_t*>> due;
          std::vector<Engine::Mark> marks;
@@ -5046,7 +5073,7 @@ index 5c086ed..471224a 100644
              const bool last = i == n - 1;
              const int64_t most = between ? (int64_t) piece_calls * engine.max_rows() : INT64_MAX;
              // How far the text from i runs: to the next picture's first row, or to the last token, which goes in
-@@ -464,12 +669,27 @@ struct Session {
+@@ -465,12 +670,27 @@ struct Session {
              }
              const int64_t text_run = in_picture ? 0 : std::min<int64_t>(picture_at, n - 1) - i;
              const bool text = !pictures_any || text_run >= engine.max_rows();
@@ -5079,7 +5106,7 @@ index 5c086ed..471224a 100644
                  marks.clear();
                  for (const auto& d : due) marks.push_back({(int) d.first, d.second});
                  // A long prompt is one read.  Between its layers the read says how far it is, and a request that
-@@ -487,7 +707,7 @@ struct Session {
+@@ -488,7 +708,7 @@ struct Session {
                  if (!engine.read(ids.data() + i, (int) m, marks.data(), (int) marks.size(), &turn,
                                   with_co ? co_read.data() : nullptr, (int) co_read.size())) {
                      co_read.clear();
@@ -5088,7 +5115,7 @@ index 5c086ed..471224a 100644
                      r.finish = "cancel";
                      break;
                  }
-@@ -503,7 +723,13 @@ struct Session {
+@@ -504,7 +724,13 @@ struct Session {
                  if (last) engine.end_read();   // the last token, as the answer's, with the whole expert cache
                  engine.eval(ids.data() + i, (int) m, last);
              }
@@ -5103,7 +5130,7 @@ index 5c086ed..471224a 100644
              i += m;
              r.read += m;
              if (ms_since(shown) >= 500.0 || last) {
-@@ -517,12 +743,36 @@ struct Session {
+@@ -518,12 +744,36 @@ struct Session {
              }
          }
          engine.end_read();
@@ -5143,7 +5170,7 @@ index 5c086ed..471224a 100644
          std::replace_if(history.begin(), history.end(), [](int32_t t) { return t < 0; }, pad);
          if (look) {
              repeats.reset();
-@@ -584,7 +834,10 @@ struct Session {
+@@ -585,7 +835,10 @@ struct Session {
                  if (use.t == 1) {
                      if (card_picks) engine.eval_picks();
                      engine.eval(&t, 1, true);
@@ -5155,7 +5182,7 @@ index 5c086ed..471224a 100644
                      t = card_picks ? engine.picked(0) : pick(engine.logits());
                      policy.observe(false, 1, 0, 0, count(1, 1));
                      continue;
-@@ -599,7 +852,10 @@ struct Session {
+@@ -600,7 +853,10 @@ struct Session {
                  t = pick(engine.logits_of(0));
                  while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
                  engine.keep(right + 1);
@@ -5167,7 +5194,7 @@ index 5c086ed..471224a 100644
                  r.guessed += use.t - 1;
                  r.guessed_right += right + (more ? 0 : 1);
                  policy.observe(use.lookup, use.t, right, match, count(use.t, right + 1));
-@@ -607,6 +863,21 @@ struct Session {
+@@ -608,6 +864,21 @@ struct Session {
              }
          }
          r.decode_ms = ms_since(t0);
@@ -5189,7 +5216,7 @@ index 5c086ed..471224a 100644
          return r;
      }
  };
-@@ -615,13 +886,15 @@ struct Session {
+@@ -616,13 +887,15 @@ struct Session {
  // the key image_pad, the token whose runs in the ids are the pictures' places.  turn_at is the place in the ids
  // where the prompt's last turn begins (the server knows the template's turn tokens): a checkpoint goes there.
  bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t& pad, int64_t& turn_at,
@@ -5206,7 +5233,7 @@ index 5c086ed..471224a 100644
      for (;;) {   // key=value tokens, then the file and the ids
          while (*p == ' ') ++p;
          const char* start = p;
-@@ -645,6 +918,24 @@ bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t
+@@ -646,6 +919,24 @@ bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t
          else if (key == "seed") s.seed = std::strtoull(v, nullptr, 10);
          else if (key == "image_pad") pad = (int32_t) std::atoi(v);
          else if (key == "turn_at") turn_at = std::strtoll(v, nullptr, 10);
@@ -5231,7 +5258,7 @@ index 5c086ed..471224a 100644
          // other keys belong to the other engine and are skipped
      }
      pictures.clear();
-@@ -668,6 +959,9 @@ struct Slot {
+@@ -669,6 +960,9 @@ struct Slot {
      std::mt19937_64 rng{std::random_device{}()};
      std::vector<int32_t> held;      // what its sequence has read: the prompt and the tokens fed since
      std::vector<float> first;       // a prompt read ahead (BCO), all of it: the logits its first token is picked from
@@ -5241,7 +5268,7 @@ index 5c086ed..471224a 100644
      Clock::time_point t0;
  };
  
-@@ -909,6 +1203,20 @@ int serve(Session& ss) {
+@@ -910,6 +1204,20 @@ int serve(Session& ss) {
                  engine.threads(), (long long) ss.flags.o.park_mib, ss.flags.o.park_slots, ss.flags.min_free_mib,
                  (long long) engine.vram_free_mib(), (int) slots.size(), !slots.empty() && engine.co_reads() ? 1 : 0,
                  (long long) ss.kept.pinned_tokens());
@@ -5262,7 +5289,7 @@ index 5c086ed..471224a 100644
      std::printf("READY %d stop\n", engine.max_context());
      std::fflush(stdout);
      // READY goes to the server alone: without this line the log of an engine that waits for its first request ends
-@@ -936,10 +1244,25 @@ int serve(Session& ss) {
+@@ -937,10 +1245,25 @@ int serve(Session& ss) {
          guess.clear();
          for (size_t b = 0; b < slots.size(); ++b)
              if (slots[b].active) {
@@ -5289,7 +5316,7 @@ index 5c086ed..471224a 100644
          // --batch-mtp: each slot's draft block guesses the token after its next one, and the step checks it
          const bool guessing = engine.steps_guesses();
          // every slot greedy with no penalty: the card picks, Sampler::pick()'s most_likely() to the token
-@@ -1014,6 +1337,9 @@ int serve(Session& ss) {
+@@ -1015,6 +1338,9 @@ int serve(Session& ss) {
          });
          for (size_t i = 0; i < which.size(); ++i) {
              Slot& sl = slots[which[i]];
@@ -5299,7 +5326,7 @@ index 5c086ed..471224a 100644
              // a token for the slot: false when its answer ends with it
              const auto emit = [&](int32_t t) {
                  ++sl.produced;
-@@ -1023,6 +1349,28 @@ int serve(Session& ss) {
+@@ -1024,6 +1350,28 @@ int serve(Session& ss) {
                  if (fin) {
                      std::printf("BDONE %zu %lld %s %.1f\n", which[i], sl.produced, fin, ms_since(sl.t0));
                      sl.active = false;
@@ -5328,7 +5355,7 @@ index 5c086ed..471224a 100644
                  }
                  return fin == nullptr;
              };
-@@ -1045,13 +1393,49 @@ int serve(Session& ss) {
+@@ -1046,13 +1394,49 @@ int serve(Session& ss) {
                  return false;
              }
          }
@@ -5379,7 +5406,7 @@ index 5c086ed..471224a 100644
          const auto common = [&](const std::vector<int32_t>& a) {
              size_t n = 0;
              while (n < a.size() && n < ids.size() && a[n] == ids[n]) ++n;
-@@ -1104,6 +1488,7 @@ int serve(Session& ss) {
+@@ -1105,6 +1489,7 @@ int serve(Session& ss) {
                  failed = true;
                  throw std::runtime_error("a batch step failed");
              }
@@ -5387,7 +5414,7 @@ index 5c086ed..471224a 100644
          ss.piece_calls = writing() ? 1 : kPiece;
          piece_t0 = Clock::now();
          return true;
-@@ -1175,6 +1560,8 @@ int serve(Session& ss) {
+@@ -1176,6 +1561,8 @@ int serve(Session& ss) {
          std::vector<int32_t> ids;
          int32_t pad = -1;
          int64_t turn_at = -1;
@@ -5396,7 +5423,7 @@ index 5c086ed..471224a 100644
          std::string file;
          // VRAM [reserve_mib], the server's POST /v1/vram: the expert cache sized again between requests, to leave
          // that much VRAM to other programs; alone, back to what the engine started with
-@@ -1245,7 +1632,7 @@ int serve(Session& ss) {
+@@ -1246,7 +1633,7 @@ int serve(Session& ss) {
              std::fflush(stdout);
              continue;
          }
@@ -5405,7 +5432,7 @@ index 5c086ed..471224a 100644
              std::printf("ERR bad request\n");
              std::fflush(stdout);
              continue;
-@@ -1294,7 +1681,7 @@ int serve(Session& ss) {
+@@ -1295,7 +1682,7 @@ int serve(Session& ss) {
                  r.finish = ss.is_eos(first) ? "stop" : lines.stop.load() ? "cancel" : "length";
              } else {
                  engine.bind(0);
@@ -5414,7 +5441,7 @@ index 5c086ed..471224a 100644
                  // The BCO prompts of idle slots go with this read when it is text and they all fit in the read with
                  // it.  A slot's sequence starts again for its prompt: what it held is gone (the server gave the slot
                  // to them).
-@@ -1325,16 +1712,31 @@ int serve(Session& ss) {
+@@ -1326,16 +1713,31 @@ int serve(Session& ss) {
                      std::fprintf(stderr, "strata-poly: the expert cache %d -> %d experts (%.2f GiB) for the VRAM free "
                                           "now, %lld MiB left\n",
                                   had, engine.cached_experts(), engine.cached_gib(), (long long) engine.vram_free_mib());
@@ -5446,7 +5473,7 @@ index 5c086ed..471224a 100644
                              std::printf("RESUME %lld\n", (long long) at);
                          } else {
                              std::printf("PP %lld %lld %.0f %.1f\n", (long long) at, (long long) total, ms,
-@@ -1342,20 +1744,34 @@ int serve(Session& ss) {
+@@ -1343,20 +1745,34 @@ int serve(Session& ss) {
                          }
                          std::fflush(stdout);
                      },
@@ -5484,7 +5511,7 @@ index 5c086ed..471224a 100644
              try { engine.reset(); } catch (const std::exception&) {}
              std::printf("ERR %s\n", e.what());
              std::fflush(stdout);
-@@ -1374,13 +1790,27 @@ int serve(Session& ss) {
+@@ -1375,13 +1791,27 @@ int serve(Session& ss) {
              std::fprintf(stderr, "\n");
          // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused>
          //      <experts from VRAM> <experts> <RAM blobs> <file blobs> <file MB> <prompt tokens read> <offloaded>
@@ -5513,7 +5540,7 @@ index 5c086ed..471224a 100644
          std::fflush(stdout);
          engine.trim();
          ss.kept.release();
-@@ -1390,8 +1820,18 @@ int serve(Session& ss) {
+@@ -1391,8 +1821,18 @@ int serve(Session& ss) {
                                   n + 2 <= engine.max_context();
              sl = Slot{};
              try {
@@ -5534,7 +5561,7 @@ index 5c086ed..471224a 100644
              } catch (const std::exception& e) {
                  std::fprintf(stderr, "strata-poly: batch: %s\n", e.what());
                  std::printf("ERR %s\n", e.what());
-@@ -1602,6 +2042,25 @@ void usage() {
+@@ -1632,6 +2072,25 @@ void usage() {
  #if defined(STRATA_GPU_METAL)
      std::fprintf(stderr, "Metal defaults: optimized expert overlap and compact MMQ (disable: --no-metal-optimize), "
                           "--metal-memory legacy|balanced (default balanced)\n");
@@ -5560,7 +5587,7 @@ index 5c086ed..471224a 100644
  #endif
      std::fprintf(stderr,
                   "usage: strata-poly --model FILE.gguf (--serve | --tokens ID,ID,... [--max-new N])\n"
-@@ -1626,6 +2085,10 @@ void usage() {
+@@ -1656,6 +2115,10 @@ void usage() {
                   "  --expert-profile FILE  expert use counts: read to choose the cached experts, written back on\n"
                   "                         exit and by --serve after an answer, every 10 s at most\n"
                   "  --no-gpu-experts       keep every routed expert on the CPU\n"
@@ -5571,7 +5598,7 @@ index 5c086ed..471224a 100644
                   "  --any-node             on a PC with several NUMA nodes, let the CPU threads run on any of them\n"
                   "                         (default: on the node whose memory holds most of the experts)\n"
                   "  --window N             the most tokens that go through the model at once while an answer is\n"
-@@ -1768,6 +2231,17 @@ void on_terminate() {
+@@ -1810,6 +2273,17 @@ void on_terminate() {
  
  int main(int argc, char** argv) {
      std::set_terminate(on_terminate);
@@ -5589,7 +5616,7 @@ index 5c086ed..471224a 100644
      no_power_throttling();
  #if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
      // The cached experts' warp kernel and 32 of them a launch (native_mmvq_slots_wide()), the HIP build's default,
-@@ -1798,6 +2272,20 @@ int main(int argc, char** argv) {
+@@ -1841,6 +2315,20 @@ int main(int argc, char** argv) {
              }
              return argv[++i];
          };
@@ -5610,7 +5637,7 @@ index 5c086ed..471224a 100644
          if (a == "--model") o.model = val();
          else if (a == "--serve") want_serve = true;
  #if defined(STRATA_GPU_METAL)
-@@ -1819,6 +2307,10 @@ int main(int argc, char** argv) {
+@@ -1862,6 +2350,10 @@ int main(int argc, char** argv) {
          else if (a == "--expert-profile") o.profile = val();
          else if (a == "--pinned-session") pinned = val();
          else if (a == "--no-gpu-experts") o.gpu_experts = false;
@@ -5621,7 +5648,7 @@ index 5c086ed..471224a 100644
          else if (a == "--any-node") o.stay_near = false;
          else if (a == "--lock-experts") o.lock_experts = true;
          else if (a == "--no-graphs") o.graphs = false;
-@@ -1860,6 +2352,45 @@ int main(int argc, char** argv) {
+@@ -1912,6 +2404,45 @@ int main(int argc, char** argv) {
          else if (a == "--prompt-batch") o.prompt_batch = std::atoi(val());
          else if (a == "--stage-mib") o.stage_mib = std::atoi(val());
          else if (a == "--stage-ahead") o.stage_ahead = std::atoi(val());
@@ -5667,7 +5694,7 @@ index 5c086ed..471224a 100644
          else if (a == "--stage-read-mib") o.stage_read_mib = std::atoi(val());
          else if (a == "--cpu-share") o.cpu_share = (float) std::atof(val());
          else if (a == "--prompt-cache") cache.o.checkpoints = std::atoi(val());
-@@ -1939,11 +2470,47 @@ int main(int argc, char** argv) {
+@@ -1991,11 +2522,47 @@ int main(int argc, char** argv) {
          return 2;
      }
  
