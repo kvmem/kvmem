@@ -258,11 +258,12 @@ class Inspection:
         self.check('gguf_directory', 'pass', 'GGUF 目录与分片检查通过', 'GGUF directory and shards checked', f'{len(names)} tensors / {count} files')
         if unknown:
             self.check('gguf_types', 'unknown', '部分量化格式尚未验证尺寸', 'Some quantization sizes are unverified', ', '.join(map(str, sorted(unknown))))
-        poly_kv = {'qwen35moe': {'f16', 'q8_0'}, 'gemma4': {'f16', 'int8', 'int8k'}, 'inkling2_loop': {'f16'}}
+        poly_kv = {'qwen35moe': ('f16', 'q8_0'), 'gemma4': ('f16', 'int8', 'int8k'), 'inkling2_loop': ('f16', 'fp8')}
         if self.p['Backend'] == 'polystrata' and arch not in poly_kv:
             self.check('poly_arch', 'warning', '架构不在当前 PolyStrata 启动器声明范围', 'Architecture outside the current PolyStrata launcher profile', f'actual={arch}, profile={"/".join(poly_kv)}', 'worker')
         if self.p['Backend'] == 'polystrata' and arch in poly_kv:
             allowed = poly_kv[arch]
+            self.report['model']['kv_types'] = list(allowed)
             kv=self.p.get('KvType','f16')
             if kv not in allowed:
                 self.check('poly_kv', 'error', 'KV 格式与模型架构不兼容', 'KV format is incompatible with the model architecture', f'{arch}: {", ".join(sorted(allowed))}', 'config')

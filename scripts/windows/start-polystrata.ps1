@@ -65,7 +65,7 @@ foreach($key in $map.Keys) {
     elseif($defaults.ContainsKey($name)) { $arguments+=@(('--'+$key.ToLowerInvariant()),[string]$defaults[$name]) }
 }
 $kv=Setting 'KvType' 'f16'
-if($kv -notin @('f16','q8_0','int8','int8k')) { throw 'PolyStrata KV formats: Qwen f16/q8_0, Gemma f16/int8/int8k, Inkling f16' }
+if($kv -notin @('f16','q8_0','int8','int8k','fp8')) { throw 'PolyStrata KV formats: Qwen f16/q8_0, Gemma f16/int8/int8k, Inkling f16/fp8' }
 $arguments+=@('--kv-type',$kv,'--mtp-drafts',[string]$count)
 if($layerwise){$arguments+=@('--draft-method',$mode)}
 $draft=Setting 'DraftModel' ''

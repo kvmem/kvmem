@@ -94,7 +94,7 @@ def main():
     parser.add_argument("--graph-alpha", type=float)
     parser.add_argument("--query-max-tokens", type=int, default=512)
     parser.add_argument("--replay-max-tokens", type=int, default=2048)
-    parser.add_argument("--kv-type", choices=("f16","q8_0","int8","int8k"), default="f16")
+    parser.add_argument("--kv-type", choices=("f16","q8_0","int8","int8k","fp8"), default="f16")
     parser.add_argument("--lrfu", action="store_true")
     parser.add_argument("--no-lrfu", action="store_true")
     parser.add_argument("--history-reuse", action=argparse.BooleanOptionalAction, default=True, help="reuse identical managed conversation prefixes")
@@ -291,11 +291,11 @@ def main():
         worker_args += ["--kvmem-sessions", str(args.retained_sessions)]
     if args.cache_min_tokens:
         worker_args += ["--kvmem-cache-min-tokens", str(args.cache_min_tokens)]
-        if not args.dry_run:
-            from launcher.worker import require_launch_features
-            try: require_launch_features(probe_worker(args.worker, 'polystrata'),
-                                         {**recall_parameters, 'CacheMinTokens': args.cache_min_tokens})
-            except ValueError as error: parser.error(str(error))
+    if not args.dry_run and (args.cache_min_tokens or args.kv_type == "fp8"):
+        from launcher.worker import require_launch_features
+        try: require_launch_features(probe_worker(args.worker, 'polystrata'),
+                                     {**recall_parameters, 'CacheMinTokens': args.cache_min_tokens})
+        except ValueError as error: parser.error(str(error))
     worker_args += extra
     indices = [0]
     if args.backend == "hip":
