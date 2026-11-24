@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -151,6 +154,96 @@ class PatchSeriesTest(unittest.TestCase):
         self.source.write_text('modified bundle\n', encoding='utf-8')
         with self.assertRaisesRegex(RuntimeError, 'differs from manifest'):
             prepare.prepare('test', self.entry, True)
+
+
+class HipfireIndexTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.previous_root = prepare.ROOT
+        prepare.ROOT = self.root
+        self.manifest_dir = self.root / 'backends/hipfire'
+        self.manifest_dir.mkdir(parents=True)
+        self.manifest = self.manifest_dir / 'upstream.json'
+        self.entry = {
+            'layout': 'external-checkout-with-patches',
+            'repository': 'https://github.com/example/hipfire.git',
+            'base_commit': 'a' * 40,
+            'patched_tree': 'b' * 40,
+            'patches': [{'id': 'one'}],
+        }
+        self.manifest.write_text(json.dumps(self.entry), encoding='utf-8')
+        self.versions = {'hipfire': {
+            'layout': 'external-checkout-with-patches',
+            'manifest': 'backends/hipfire/upstream.json',
+            'checkout': 'checkout',
+        }}
+        (self.root / 'backends/versions.json').write_text(
+            json.dumps(self.versions), encoding='utf-8')
+
+    def tearDown(self):
+        prepare.ROOT = self.previous_root
+        self.temp.cleanup()
+
+    @staticmethod
+    def run_git(directory, *args):
+        return subprocess.check_output(['git', '-C', str(directory), *args],
+                                       stderr=subprocess.STDOUT)
+
+    def test_repository_index_resolves_the_manifest(self):
+        previous = prepare.ROOT
+        prepare.ROOT = Path(__file__).resolve().parents[1]
+        try:
+            versions = json.loads((prepare.ROOT / 'backends/versions.json').read_text(
+                encoding='utf-8'))
+            entry = prepare.backend_entry(versions, 'hipfire')
+            self.assertEqual(entry['layout'], 'external-checkout-with-patches')
+            self.assertEqual(len(entry['patches']), 3)
+            self.assertEqual(entry['patches'][-1]['after_tree'], entry['patched_tree'])
+        finally:
+            prepare.ROOT = previous
+
+    def test_manifest_layout_mismatch_and_escape_are_rejected(self):
+        self.versions['hipfire']['layout'] = 'git-submodules-with-patches'
+        with self.assertRaisesRegex(RuntimeError, 'layout'):
+            prepare.backend_entry(self.versions, 'hipfire')
+        self.versions['hipfire']['layout'] = 'external-checkout-with-patches'
+        self.versions['hipfire']['manifest'] = '../outside.json'
+        with self.assertRaisesRegex(RuntimeError, 'escapes the repository'):
+            prepare.backend_entry(self.versions, 'hipfire')
+
+    def test_ready_requires_base_and_recorded_patched_tree(self):
+        repo = self.root / 'checkout'
+        repo.mkdir()
+        self.run_git(repo, 'init', '-q')
+        self.run_git(repo, 'config', 'core.autocrlf', 'false')
+        (repo / 'source.txt').write_text('base\n', encoding='utf-8')
+        self.run_git(repo, 'add', '.')
+        self.run_git(repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                     '-c', 'commit.gpgsign=false', 'commit', '-qm', 'base')
+        base = self.run_git(repo, 'rev-parse', 'HEAD').decode().strip()
+        tree = self.run_git(repo, 'rev-parse', 'HEAD^{tree}').decode().strip()
+        self.entry['base_commit'] = base
+        self.entry['patched_tree'] = tree
+        ready, reason = prepare.hipfire_ready(self.entry, repo)
+        self.assertTrue(ready, reason)
+        (repo / 'dirty.txt').write_text('local\n', encoding='utf-8')
+        ready, reason = prepare.hipfire_ready(self.entry, repo)
+        self.assertFalse(ready)
+        self.assertIn('patched tree', reason)
+        (repo / 'dirty.txt').unlink()
+        self.run_git(repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                     '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'extra')
+        ready, reason = prepare.hipfire_ready(self.entry, repo)
+        self.assertFalse(ready)
+        self.assertIn('HEAD', reason)
+
+    def test_all_skips_unprepared_hipfire_without_failing(self):
+        output = io.StringIO()
+        with mock.patch.object(sys, 'argv', ['prepare-backends.py', '--backend', 'all']), \
+                redirect_stdout(output):
+            prepare.main()
+        self.assertIn('hipfire: skipped', output.getvalue())
 
 
 if __name__ == '__main__':

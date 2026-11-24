@@ -8,14 +8,45 @@ packed Q8 bytes live in the KVMem host store. The masked attention kernels
 skip sentinel pages, so an evicted page is invisible until a selection
 restores it.
 
+## Grouped patch series
+
+`upstream.json` lists three group patches rather than the original 73
+underlying changes. Each group is a binary diff between two verified tree
+snapshots, so its `after_tree` is still checked by `prepare-backends.py`. The
+individual series remains in `upstream-73.json`; `upstream-72.json` and older
+archives are kept for history and bisection. The original
+`../patches/hipfire-*.patch` files remain available as source material.
+
+| Group | Individual changes |
+|---|---|
+| `escha-baseline` | 1: standalone Escha/fork baseline; no KVMem crate, controller, taps or paged-attention API |
+| `fork-base` | 2-4: tool recovery, Codex Responses and Bonsai render; independently applicable to the Escha baseline |
+| `kvmem-stack` | 5-73: the contiguous KVMem adapter, layerwise/MTP/content/surface layers, fork features and P0/P1/P2 hook series; these changes rewrite each other's lines, so they are reviewed as one tree diff |
+
+`scripts/repack_hipfire_series.py --write` regenerates the group patches from
+the archived individual series and the pinned checkout; `--check` verifies the
+current group series. Group patches are generated tree diffs and must not be
+hand-edited.
+
+## Upstream maintenance
+
+`.github/workflows/hipfire-merge-drill.yml` runs weekly and on manual dispatch.
+It reconstructs the pinned series in a temporary clone, merges current upstream,
+and reports conflict files/hunks plus the default and `kvmem` host checks. The
+drill is not a pull-request check. See [upstream merge drill](../../docs/upstream-merge.md)
+for the local commands, conflict policy and the deliberate rebase/regeneration
+steps.
+
 ## Pieces
 
 | Piece | Where |
 |---|---|
 | C ABI shim over the portable KVMem host library | `hipfire_kvmem_shim.{h,cpp}` (this directory) |
+| Host source manifest, ABI guard and provenance pin | `../../kvmem/host-sources.txt`, `kvmem.pin` |
 | Rust FFI crate + shim build | hipfire `crates/hipfire-kvmem` (`build.rs`, `KVMEM_ROOT`) |
-| Paged spill primitives (sentinel, page ops, kernel masks, paged split-K verify kernel) | `../patches/hipfire-paged-spill.patch` |
-| Statistics taps, controller, serve wiring; escha-dense baseline, Bonsai TQ2/BQ1 slots admission | `../patches/hipfire-kvmem.patch` |
+| Standalone Escha/fork baseline (no KVMem dependency) | `../patches/hipfire-escha-baseline.patch` |
+| Paged spill primitives, statistics taps, controller and serve wiring on the separated baseline | `../patches/hipfire-kvmem-adapter.patch` |
+| Stable optional serve-engine hooks (stock no-op / KVMem delegation) | `../patches/hipfire-c1-hooks.patch` |
 | RDNA3 (gfx1100) operator pass: MQ3G256V2 q8x verify decode, real escha grouped-WMMA batched prefill (replaces the `kvmem` patch's `prefill_chunk=1` stopgap), escha-pro/xt F16 in_proj handling | `../patches/hipfire-rdna3-opt.patch` |
 | Multi-slot spec-decode admission fix: `--spec mtp`/`dflash` engage under the router's default penalized+sampled requests (exact-AR penalty prepass + greedy/point-mass sampled verify, shared `SpecRetire`) | `../patches/hipfire-spec-accept.patch` |
 | Batched spill/restore: pinned-slab stream-ordered async page copies with one sync per chunk (byte-neutral; `HIPFIRE_KVMEM_BATCH_XFER=0` restores per-page blocking) | `../patches/hipfire-batch-restore.patch` |
@@ -48,20 +79,40 @@ restores it.
 | Think budget in the emitter (`think-budget-emitter`): `ThinkBudget::consume_closing` + `SpecEmit` queue the close span at the budget boundary for every non-schema multi-slot request (previously schema-only), `EngineStats.think_recovery.budget_closes` and `/metrics hipfire_think_budget_closes_total` count them | `../patches/hipfire-think-budget-emitter.patch` |
 | Think knobs + answer room (`think-knobs-answer-room`): `thinking.close_retry` / `loop_recovery` / `repeat_stop_tokens` / `answer_room` are generation-scope config keys (per-model override, request field wins, env fallback); answer room reserves `clamp(max_new/4, 512, max_new/2)` for the answer and closes thinking with the WRAP_UP sentence; loop primitives moved to `hipfire_runtime::reasoning_loop` for the sequential path | `../patches/hipfire-think-knobs-answer-room.patch` |
 | Sequential loop recovery (`sequential-loop-recovery`): PolyStrata #728 for standard serving (multi-slot off) — 512-token cadence coverage check on the raw id stream, stop -> length or recover with the low-effort sentence splice + raw-id carry across passes (gen_start suppressed, budget carried, temp >= 1.0 / presence >= 1.5); `[think-recover]` traces | `../patches/hipfire-sequential-loop-recovery.patch` |
+| KVMem P0 contract (`kvmem-p0-contract`): `crates/hipfire-kvmem/build.rs` reads `kvmem/host-sources.txt` and verifies `kvmem.pin` digests/ABI (`KVMEM_REQUIRE_PIN`, `KVMEM_ALLOW_UNPINNED`, `KVMEM_EXPECTED_COMMIT`), Rust adds `HK_ABI_VERSION` + runtime `hk_abi_version`/`hk_kvmem_commit` guards and compile-time `RawStoreConfig`/`KvStoreConfig` layout asserts; also fixes the probe smoke test's dropped `KvStore`/`RawStore` owners | `../patches/hipfire-kvmem-p0-contract.patch` |
+| KVMem serve-engine split, batch 1 (`kvmem-p1a-serve-engine`): moves the host-only KVMem helpers, Legacy-native image/query lifecycle, KVMem boot-prefix planning, and the run-loop Query/residency/freeze hooks out of upstream `serve_engine.rs` into the `serve_engine_kvmem` child module. `serve_engine.rs` keeps only the generic scheduler/forward wiring; no behavior change (both `--features kvmem` and default builds compile) | `../patches/hipfire-p1a-serve-engine-kvmem.patch` |
+| KVMem serve-engine split, batch 2 (`kvmem-p1a-batch2-serve-engine`): moves Layerwise AR/spec orchestration, native prefix reuse, and the per-step statistics/head-aux feed into the same child module; `serve_engine.rs` keeps only the `fail_all_active`/poison handoff. Behavior-neutral for both feature and default builds | `../patches/hipfire-p1a-batch2-serve-engine.patch` |
+| KVMem controller split (`kvmem-p1c-kvmem-ctl-split`): keeps `KvMemCtl` and its fields in `kvmem_ctl.rs`, moves the inherent methods into `kvmem_ctl/{plan,slot,legacy,prefix,layerwise,step,transfer,import}.rs`, and splits the head-plane tests into `kvmem_ctl/tests/`. Behavior-neutral; feature and default builds compile | `../patches/hipfire-p1c-kvmem-ctl-split.patch` |
+| KVMem forward tap seam (`kvmem-p1d-forward-seam`): adds `qwen35/tap.rs` (`TapBinding` holds the statistics tap + row slot only under `kvmem`), moves the Layerwise Path A decode/attend code to `qwen35/layerwise_attend.rs`, and moves the single-row paged decode helpers to `qwen35/paged_decode.rs`. `qwen35/forward.rs` no longer names `KvMemTaps` and keeps only the feature-gated dispatch/error text; behavior-neutral; feature and default builds compile | `../patches/hipfire-p1d-forward-seam.patch` |
+| KVMem start-time option snapshot (`kvmem-p2a-options`): `KvMemOptions` resolves the controller's policy and diagnostics once at boot from the same `developer_var` snapshot, forces Legacy when a resolved config is present, preserves the strict `HIPFIRE_SLOTS_PAGED_PAGES` lexeme, and removes production `std::env` reads from `kvmem_ctl`; controller tests inject options explicitly. Behavior-neutral; feature and default builds compile | `../patches/hipfire-p2a-kvmem-options.patch` |
+| KVMem recovery (`kvmem-recovery`): optional standalone workspace crate, PR CI for default/kvmem/arch/recording gates, crate-map/rustfmt/SPDX/docs hardening, aligned CMake host flags + page-softmax contract, explicit config/API/diagnostics, default-build tap isolation, and safe serve helper extraction | `../patches/hipfire-kvmem-recovery.patch` |
 
 The shim is host-only C++17: it wraps `RawKvStore` (block statistics),
 `KvMemStore` (block bookkeeping / selection) and the Mean-K retrieval scorer.
 No kvmem symbol reaches a HIP kernel; device transfers stay in hipfire.
+`HK_ABI_VERSION` in the header is checked at runtime by the Rust crate, while
+`RawStoreConfig`/`KvStoreConfig` field offsets are compile-time-asserted on both
+sides of the C ABI. Bump the version for any layout, signature or enum change.
 
 ## Building
 
 `scripts/prepare-backends.py --backend hipfire` clones the pinned base commit
 into `../hipfire` beside this checkout (override with `--hipfire-dir`) and
-applies the verified patch series below; `--backend all` includes it when a
-ROCm toolchain is detected (`HIPFIRE_ROCM_PATH`, `/opt/rocm` or `hipcc`).
-`cargo build` refreshes `Cargo.lock` in the checkout, so `--check` verifies
-the pre-build prepared tree; setup resets the checkout to the pinned base and
-re-prepares it on every build.
+applies the verified 3-group patch series (73 underlying changes); `--backend all` includes hipfire only when
+`--hipfire-dir` is given or the sibling checkout is already at the pinned base
+with the patched tree. `--all` never clones or patches hipfire implicitly, and
+ROCm detection is not a gate. `cargo build` refreshes `Cargo.lock` in the
+checkout, so `--check` verifies the pre-build prepared tree; setup resets the
+checkout to the pinned base and re-prepares it on every build.
+
+`crates/hipfire-kvmem/build.rs` compiles the same `kvmem/host-sources.txt` list
+as kvmem's CMake and verifies `kvmem.pin` (host manifest, `kvmem/include`, shim
+digests and ABI revision). CI runs with `KVMEM_REQUIRE_PIN=1` and
+`KVMEM_EXPECTED_COMMIT`; a developer checkout without a pin warns and builds
+unless `KVMEM_REQUIRE_PIN` is set, while digest mismatches always fail.
+`crates/hipfire-kvmem` is an excluded standalone workspace crate: the stock
+hipfire workspace builds without a KVMem checkout, while the optional path
+dependency is built only with `--features kvmem`.
 
 Point `KVMEM_ROOT` at this checkout (default is the sibling `../kvmem` of the
 hipfire workspace) and build the CLI **and the daemon** with the `kvmem`
@@ -96,6 +147,9 @@ and `crates/hipfire-registry` tests) until the repo carries those sidecars;
 `scripts/test-fmt-sweep-rebase.sh` to `LC_ALL=C` (its assertions match git's
 English conflict text) and routes the loop-recovery trace read through
 `hipfire_config::developer_var_os`.
+
+The per-patch qualification notes below describe the underlying changes before
+the grouped repack; their boundaries and hashes remain in `upstream-73.json`.
 
 The third `rdna3-opt` patch is a gfx1100 (RDNA3) operator pass on top of that
 integration, verified byte-exact (`89e32856d` + the first three patches reproduce

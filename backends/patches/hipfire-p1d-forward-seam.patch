@@ -1,0 +1,1608 @@
+diff --git a/crates/hipfire-arch-qwen35/src/forward_slots.rs b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+index 4f3d52410..e06092018 100644
+--- a/crates/hipfire-arch-qwen35/src/forward_slots.rs
++++ b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+@@ -101,6 +101,9 @@ use crate::qwen35::{
+     LayerType, LayerWeights, MoeFfnWeights, PrefillBatchScratch, Qwen35Config, Qwen35Scratch,
+     Qwen35Weights, StateQuant,
+ };
++use crate::qwen35::paged_decode::paged_decode_reference_layers;
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++use crate::qwen35::paged_decode::paged_decode_layerwise;
+ use hip_bridge::{HipError, HipResult};
+ use hipfire_dispatch::context::DispatchCtx;
+ use hipfire_dispatch::families::fused_qkv::{
+@@ -3956,232 +3959,6 @@ fn run_fullattn_moe_layer_slots(
+     moe_result
+ }
+ 
+-/// Single-row paged decode through the reference's own kernel ladder.
+-///
+-/// [`forward_batch_slots`] normally runs the slots GEMM ladder, which at
+-/// n == 1 is both numerically different from the reference sequential
+-/// decode (WMMA GEMM vs GEMV, batched norms vs the fused decode norms) and
+-/// measurably slower per step on gfx1100. This fork hands the row to
+-/// [`crate::qwen35::forward::forward_scratch_layers_paged`]: the reference's
+-/// `DecodeBinding` layer loop with each full-attention layer bound to the
+-/// slot's block table. The hidden state moves `pbs.x_batch` row 0 → `s.x` →
+-/// back; the per-slot lm_head still runs from `pbs.x_batch` in
+-/// [`final_logits_per_slot`], unchanged.
+-///
+-/// The Q8 arenas are viewed in model-layer order (null tensors on DeltaNet
+-/// layers), the same shape `ModelRig::slot_kv_view` gives the contiguous
+-/// engine — the paged kernels only use those tensors as arena bases.
+-#[allow(clippy::too_many_arguments)]
+-fn paged_decode_reference_layers(
+-    gpu: &mut Gpu,
+-    weights: &Qwen35Weights,
+-    config: &Qwen35Config,
+-    batch: &SlotBatch,
+-    pool: &SlotPool,
+-    slot_idx: usize,
+-    dn_states: &[DeltaNetState],
+-    k_arenas: &[GpuTensor],
+-    v_arenas: &[GpuTensor],
+-    desc_staging: &SlotDescStaging,
+-    pbs: &PrefillBatchScratch,
+-    s: &Qwen35Scratch,
+-    ctx_len: usize,
+-    layer_end: usize,
+-) -> HipResult<()> {
+-    let dim = config.dim;
+-    let row_bytes = dim * 4;
+-    // Hidden state of the decode row in; the reference writes the same
+-    // logical position into pos_buf before its layer loop (the RoPE angle
+-    // and the paged tile/reduce causal bound both read pos_buf[0]).
+-    gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, 0, row_bytes)?;
+-    let pos = batch.positions[0] as usize;
+-    let pos_i32 = pos as i32;
+-    gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
+-
+-    // Borrowed Q8 view of the paged arenas, model-layer order.
+-    let phys_cap = pool.cap_tokens();
+-    let mut k_gpu = Vec::with_capacity(config.n_layers);
+-    let mut v_gpu = Vec::with_capacity(config.n_layers);
+-    let mut fa = 0usize;
+-    for t in &config.layer_types {
+-        if *t == LayerType::FullAttention {
+-            k_gpu.push(k_arenas[fa].sub_offset(0, k_arenas[fa].numel()));
+-            v_gpu.push(v_arenas[fa].sub_offset(0, v_arenas[fa].numel()));
+-            fa += 1;
+-        } else {
+-            k_gpu.push(GpuTensor::null_for_test());
+-            v_gpu.push(GpuTensor::null_for_test());
+-        }
+-    }
+-    let kv_view = KvCache {
+-        k_gpu,
+-        v_gpu,
+-        k_scales: Vec::new(),
+-        v_scales: Vec::new(),
+-        kv_dim: config.n_kv_heads * config.head_dim,
+-        max_seq: phys_cap,
+-        physical_cap: phys_cap,
+-        n_kv_heads: config.n_kv_heads,
+-        head_dim: config.head_dim,
+-        quantized: true,
+-        quant_q8: true,
+-        quant_int8: false,
+-        quant_hfq4: false,
+-        quant_asym4: false,
+-        quant_asym3: false,
+-        quant_asym2: false,
+-        boundary_layers: 0,
+-        givens_cos: None,
+-        givens_sin: None,
+-        quant_fwht: false,
+-        quant_bf16: false,
+-        quant_fp8: false,
+-        v_mode: VMode::Q8,
+-        layer_is_boundary: Vec::new(),
+-        compact_offset: 0,
+-    };
+-    crate::qwen35::forward::forward_scratch_layers_paged(
+-        gpu,
+-        weights,
+-        config,
+-        pos,
+-        &kv_view,
+-        &dn_states[slot_idx],
+-        s,
+-        hipfire_dispatch::pipeline::hybrid::PagedAttentionKv {
+-            positions: &pbs.positions,
+-            descs: &desc_staging.descs_dev,
+-            row_slot: &desc_staging.row_slot_dev,
+-            ctx_len,
+-        },
+-        pbs.kvmem_taps.as_ref(),
+-        &desc_staging.row_slot_dev,
+-        /* layerwise */ None,
+-        /* use_mrope */ false,
+-        layer_end,
+-    )?;
+-    // Back into the [n_slots × dim] batch buffer the head reads.
+-    gpu.memcpy_dtod_at_auto(&pbs.x_batch.buf, 0, &s.x.buf, 0, row_bytes)?;
+-    Ok(())
+-}
+-
+-/// Layerwise single-row q8 paged decode (D4b-3). Mirrors
+-/// [`paged_decode_reference_layers`] but the KV ladder is the carrier's
+-/// composite arena instead of the legacy per-layer slot arenas: every
+-/// FullAttention layer shares the arena base (K) and the shifted V base, and
+-/// the per-layer block table (`staging.descs(fa)`, installed inside
+-/// `run_attend_layerwise`) selects that layer's restored stripe + suffix. The
+-/// `paged` placeholder's descs/positions/ctx_len are overridden per layer by
+-/// the seam, so only the composite `kv_cache` views matter here. Escha-trellis
+-/// dense layers lower to Path C (`forward_scratch_layers_paged_lowered`);
+-/// non-escha dense layers reach the Path A guard until that path is wired
+-/// (fail-closed, never a silent legacy fallback). The carrier is threaded as
+-/// `Some`; the engine passes `None` until D4b-4 orchestration.
+-#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+-#[allow(clippy::too_many_arguments)]
+-fn paged_decode_layerwise(
+-    gpu: &mut Gpu,
+-    weights: &Qwen35Weights,
+-    config: &Qwen35Config,
+-    batch: &SlotBatch,
+-    pool: &SlotPool,
+-    slot_idx: usize,
+-    dn_states: &[DeltaNetState],
+-    desc_staging: &SlotDescStaging,
+-    pbs: &PrefillBatchScratch,
+-    s: &Qwen35Scratch,
+-    lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
+-    layer_end: usize,
+-) -> HipResult<()> {
+-    let dim = config.dim;
+-    let row_bytes = dim * 4;
+-    gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, 0, row_bytes)?;
+-    let pos = batch.positions[0] as usize;
+-    gpu.hip.memcpy_htod(&s.pos_buf, &(pos as i32).to_ne_bytes())?;
+-    // G7 Stage D: a VL decode row (image conversation, past the prompt) carries
+-    // uniform M-RoPE phases `[p+delta; 3]` from the batch. Upload them to the
+-    // single-row scratch so the attention prep can run the 3D RoPE kernel; the
+-    // KV write below still uses the carrier's COMPACT positions, and the phases
+-    // are the absolute ones the prefill stored keys under.
+-    let use_mrope = batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty();
+-    if use_mrope {
+-        let bytes: Vec<u8> = batch.pos3[0].iter().flat_map(|v| v.to_ne_bytes()).collect();
+-        gpu.hip.memcpy_htod(&s.pos_buf3, &bytes)?;
+-    }
+-
+-    // Composite arena views: non-owning aliases (the carrier's arena owns the
+-    // allocation). K base = arena base; V base = arena shifted by one K plane.
+-    // Extracted before the mutable carrier borrow below; never freed here.
+-    let arena_numel = lq.driver.arena().arena().numel();
+-    let mut k_gpu = Vec::with_capacity(config.n_layers);
+-    let mut v_gpu = Vec::with_capacity(config.n_layers);
+-    for t in &config.layer_types {
+-        if *t == LayerType::FullAttention {
+-            k_gpu.push(lq.driver.arena().arena().sub_offset(0, arena_numel));
+-            v_gpu.push(
+-                lq.driver
+-                    .arena()
+-                    .v_cache_view()
+-                    .map_err(|e| HipError::new(0, &e))?,
+-            );
+-        } else {
+-            k_gpu.push(GpuTensor::null_for_test());
+-            v_gpu.push(GpuTensor::null_for_test());
+-        }
+-    }
+-    let phys_cap = pool.cap_tokens();
+-    let kv_view = KvCache {
+-        k_gpu,
+-        v_gpu,
+-        k_scales: Vec::new(),
+-        v_scales: Vec::new(),
+-        kv_dim: config.n_kv_heads * config.head_dim,
+-        max_seq: phys_cap,
+-        physical_cap: phys_cap,
+-        n_kv_heads: config.n_kv_heads,
+-        head_dim: config.head_dim,
+-        quantized: true,
+-        quant_q8: true,
+-        quant_int8: false,
+-        quant_hfq4: false,
+-        quant_asym4: false,
+-        quant_asym3: false,
+-        quant_asym2: false,
+-        boundary_layers: 0,
+-        givens_cos: None,
+-        givens_sin: None,
+-        quant_fwht: false,
+-        quant_bf16: false,
+-        quant_fp8: false,
+-        v_mode: VMode::Q8,
+-        layer_is_boundary: Vec::new(),
+-        compact_offset: 0,
+-    };
+-    crate::qwen35::forward::forward_scratch_layers_paged(
+-        gpu,
+-        weights,
+-        config,
+-        pos,
+-        &kv_view,
+-        &dn_states[slot_idx],
+-        s,
+-        hipfire_dispatch::pipeline::hybrid::PagedAttentionKv {
+-            positions: &pbs.positions,
+-            descs: &desc_staging.descs_dev,
+-            row_slot: &desc_staging.row_slot_dev,
+-            ctx_len: 0, // overridden per layer by run_attend_layerwise
+-        },
+-        pbs.kvmem_taps.as_ref(),
+-        &desc_staging.row_slot_dev,
+-        Some(lq),
+-        use_mrope,
+-        layer_end,
+-    )?;
+-    // Back into the [n_slots × dim] batch buffer the head reads.
+-    gpu.memcpy_dtod_at_auto(&pbs.x_batch.buf, 0, &s.x.buf, 0, row_bytes)?;
+-    Ok(())
+-}
+-
+ /// Final output norm + per-slot last-token logits. Gathers only the last
+ /// row of each ACTIVE slot (`m_per_slot[s] > 0`) into a compact
+ /// `[n_slots × dim]` block before rmsnorm + the lm_head GEMM, rather than
+diff --git a/crates/hipfire-arch-qwen35/src/forward_slots/vmm/exact.rs b/crates/hipfire-arch-qwen35/src/forward_slots/vmm/exact.rs
+index f736db0b3..8d03fd68c 100644
+--- a/crates/hipfire-arch-qwen35/src/forward_slots/vmm/exact.rs
++++ b/crates/hipfire-arch-qwen35/src/forward_slots/vmm/exact.rs
+@@ -1023,8 +1023,7 @@ pub(super) fn decode(
+                         fa_output_prerotated: false,
+                         defer_routed_combine: false,
+                         paged: None,
+-                        kvmem_taps: None,
+-                        row_slot: None,
++                        tap: None,
+                         fa_layer_idx: 0,
+                         layerwise: None,
+                     };
+@@ -1373,8 +1372,7 @@ pub(super) fn decode(
+                         fa_output_prerotated: false,
+                         defer_routed_combine: false,
+                         paged: None,
+-                        kvmem_taps: None,
+-                        row_slot: None,
++                        tap: None,
+                         fa_layer_idx: 0,
+                         layerwise: None,
+                     };
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index 5938f0905..60938a4fd 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -6820,8 +6820,7 @@ mod tests {
+                     fa_output_prerotated: false,
+                     defer_routed_combine: false,
+                     paged: None,
+-                    kvmem_taps: None,
+-                    row_slot: None,
++                    tap: None,
+                     fa_layer_idx: l,
+                     layerwise: Some(&mut carrier),
+                 };
+@@ -6947,6 +6946,7 @@ mod tests {
+     fn layerwise_path_a_forward_matches_legacy_paged() {
+         use crate::kvmem_taps::KvMemTaps;
+         use crate::qwen35::forward::{forward_scratch_layers_paged, Qwen35Scratch};
++        use crate::qwen35::TapBinding;
+         use crate::qwen35::weights::{DeltaNetState, LayerWeights, Qwen35Weights, StateQuant};
+         use hipfire_dispatch::pipeline::hybrid::PagedAttentionKv;
+         use hipfire_runtime::llama::EmbeddingFormat;
+@@ -7105,8 +7105,7 @@ mod tests {
+             &dn_state,
+             &s,
+             ref_paged, // FA layers override it with their own restored view
+-            Some(&taps),
+-            &ref_row_slot,
++            Some(TapBinding::new(&taps, &ref_row_slot)),
+             Some(&mut carrier),
+             /* use_mrope */ false,
+             NL,
+@@ -7183,8 +7182,7 @@ mod tests {
+             &dn_state,
+             &s,
+             ref_paged,
+-            Some(&taps),
+-            &ref_row_slot,
++            Some(TapBinding::new(&taps, &ref_row_slot)),
+             None,
+             /* use_mrope */ false,
+             NL,
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35.rs b/crates/hipfire-arch-qwen35/src/qwen35.rs
+index 3e9a8be8e..0220ec46f 100644
+--- a/crates/hipfire-arch-qwen35/src/qwen35.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35.rs
+@@ -17,6 +17,11 @@ pub mod escha;
+ pub mod forward;
+ pub mod load;
+ pub mod mesh_tp;
++pub(crate) mod paged_decode;
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++pub(crate) mod layerwise_attend;
++mod tap;
++pub(crate) use tap::TapBinding;
+ #[cfg(feature = "moe-oracle")]
+ pub mod oracle;
+ pub mod prefill;
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs b/crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs
+index ecb42b0ed..a540fe97b 100644
+--- a/crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs
+@@ -2895,8 +2895,7 @@ pub fn forward_ep(
+                 fa_output_prerotated: false,
+                 defer_routed_combine: false,
+                 paged: None,
+-                kvmem_taps: None,
+-                row_slot: None,
++                tap: None,
+                 fa_layer_idx: 0,
+                 layerwise: None,
+             });
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/forward.rs b/crates/hipfire-arch-qwen35/src/qwen35/forward.rs
+index 99fe1bd4f..b04906a26 100644
+--- a/crates/hipfire-arch-qwen35/src/qwen35/forward.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35/forward.rs
+@@ -19,6 +19,7 @@ use super::weights::LayerWeights;
+ use super::weights::MoeFfnWeights;
+ use super::weights::Qwen35Weights;
+ use super::weights::StateQuant;
++use super::tap::TapBinding;
+ use crate::speculative::GdnTape;
+ use crate::speculative::HiddenStateRingBuffer;
+ use hip_bridge::HipError;
+@@ -28,7 +29,7 @@ use hipfire_dispatch::families::moe::{routed_codebook_pair_batched_supported, Mo
+ use hipfire_dispatch::pipeline::batched::{BatchEpilogue, DenseBatchMath};
+ use hipfire_dispatch::pipeline::dump_hidden_localize;
+ use hipfire_dispatch::pipeline::execute_steps;
+-use hipfire_dispatch::pipeline::gated_mlp::{GatedMlpOp, MlpOutput};
++use hipfire_dispatch::pipeline::gated_mlp::MlpOutput;
+ use hipfire_dispatch::pipeline::hybrid;
+ use hipfire_dispatch::pipeline::hybrid::{AttentionTap, MixerOutput};
+ use hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof;
+@@ -2759,7 +2760,7 @@ fn forward_scratch_layers(
+     Ok(())
+ }
+ 
+-/// Paged-KVMem single-row decode of the whole stack, stopping before the
++/// Paged single-row decode of the whole stack, stopping before the
+ /// final norm / lm_head: the reference sequential engine's own per-layer
+ /// ladder (the body of [`forward_scratch_layers`]) with every full-attention
+ /// layer bound to the slot's block table instead of a contiguous slab.
+@@ -2796,8 +2797,7 @@ pub(crate) fn forward_scratch_layers_paged(
+     dn_state: &DeltaNetState,
+     s: &Qwen35Scratch,
+     paged: hybrid::PagedAttentionKv<'_>,
+-    kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
+-    row_slot: &GpuTensor,
++    tap: Option<TapBinding<'_>>,
+     mut layerwise: crate::LayerwiseFwd<'_, '_>,
+     use_mrope: bool,
+     layer_end: usize,
+@@ -2807,7 +2807,7 @@ pub(crate) fn forward_scratch_layers_paged(
+     // lower to the same coarse-super-op program the single-GPU lowered decode
+     // uses, whose run_proj/run_residual_gemv bypass dispatch via
+     // escha_run_proj/escha_run_resid. The attention core is projection-agnostic
+-    // and threads `paged`, so the paged KVMem Q8_0 write + GQA tile are
++    // and threads `paged`, so the paged Q8_0 write + GQA tile are
+     // identical either way. Non-escha dense models (MQ/Bonsai) keep the
+     // certified dispatch path below untouched. A VL row cannot ride the
+     // lowered executor (no M-RoPE arm): fail closed rather than rotate 1D.
+@@ -2820,7 +2820,7 @@ pub(crate) fn forward_scratch_layers_paged(
+             ));
+         }
+         return forward_scratch_layers_paged_lowered(
+-            gpu, weights, config, pos, kv_cache, dn_state, s, paged, kvmem_taps, row_slot,
++            gpu, weights, config, pos, kv_cache, dn_state, s, paged, tap,
+             layerwise, layer_end,
+         );
+     }
+@@ -2833,8 +2833,8 @@ pub(crate) fn forward_scratch_layers_paged(
+     // the score+restore at the post-norm/pre-RoPE tap, exactly as Path C.
+     #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+     if let Some(lq) = layerwise.as_deref_mut() {
+-        return forward_scratch_layers_paged_layerwise(
+-            gpu, weights, config, pos, kv_cache, dn_state, s, paged, kvmem_taps, row_slot, lq,
++        return crate::qwen35::layerwise_attend::forward_scratch_layers_paged_layerwise(
++            gpu, weights, config, pos, kv_cache, dn_state, s, paged, tap, lq,
+             use_mrope, layer_end,
+         );
+     }
+@@ -2863,23 +2863,24 @@ pub(crate) fn forward_scratch_layers_paged(
+             layer,
+             LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_)
+         );
+-        // KVMem statistics tap: post-Q/K-norm, pre-RoPE, the same seam the
++        // Statistics tap: post-Q/K-norm, pre-RoPE, the same seam the
+         // slots engine taps. Its presence keeps the unfused prep, which is
+         // certified byte-identical to the fused prep — a pure copy either way.
+         let fa_idx = fa_layer_idx;
++        let tap_on = tap.is_some();
+         let tap_fn = |gpu: &mut Gpu| {
+-            kvmem_taps
+-                .expect("tap closure built only when taps are on")
+-                .tap_layer(gpu, fa_idx, &s.fa_q, &s.fa_k, row_slot, 1)
++            tap.expect("tap closure built only when taps are on")
++                .tap_layer(gpu, fa_idx, &s.fa_q, &s.fa_k, 1)
+                 .map_err(|e| DispatchError::Hip(e.to_string()))
+         };
+-        let tap = (is_fa && kvmem_taps.is_some()).then_some(&tap_fn as AttentionTap<'_>);
++        let attention_tap =
++            (is_fa && tap_on).then_some(&tap_fn as AttentionTap<'_>);
+         let mixer = binding.mixer(
+             layer,
+             layer_idx,
+             delta_layer_idx,
+             false,
+-            tap,
++            attention_tap,
+             MixerOutput::Residual,
+         );
+         execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
+@@ -2907,11 +2908,11 @@ pub(crate) fn forward_scratch_layers_paged(
+     Ok(())
+ }
+ 
+-/// Paged KVMem decode for escha-trellis dense models. Mirrors
++/// Paged decode for escha-trellis dense models. Mirrors
+ /// [`forward_scratch_layers_lowered`] (the coarse-super-op executor whose
+ /// `run_proj`/`run_residual_gemv` bypass dispatch through
+ /// `escha_run_proj`/`escha_run_resid`), but threads the slot's block-table
+-/// address (`paged`) and the KVMem statistics tap into every full-attention
++/// address (`paged`) and the statistics tap into every full-attention
+ /// layer, and truncates at `layer_end`. The attention core (`run_attend` →
+ /// `mixer` → `attend`) is projection-agnostic: with the tap present it keeps
+ /// the unfused prep (certified byte-identical to the fused prep) and resolves
+@@ -2933,8 +2934,7 @@ pub(crate) fn forward_scratch_layers_paged_lowered(
+     dn_state: &DeltaNetState,
+     s: &Qwen35Scratch,
+     paged: hybrid::PagedAttentionKv<'_>,
+-    kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
+-    row_slot: &GpuTensor,
++    tap: Option<TapBinding<'_>>,
+     mut layerwise: crate::LayerwiseFwd<'_, '_>,
+     layer_end: usize,
+ ) -> HipResult<()> {
+@@ -2978,8 +2978,7 @@ pub(crate) fn forward_scratch_layers_paged_lowered(
+                 fa_output_prerotated: false,
+                 defer_routed_combine: false,
+                 paged: Some(paged),
+-                kvmem_taps,
+-                row_slot: Some(row_slot),
++                tap,
+                 fa_layer_idx,
+                 layerwise: layerwise.as_deref_mut(),
+             };
+@@ -2996,131 +2995,6 @@ pub(crate) fn forward_scratch_layers_paged_lowered(
+     Ok(())
+ }
+ 
+-/// Layerwise paged decode for non-escha dense models (D4b-3 Path A). The
+-/// legacy [`forward_scratch_layers_paged`] body with ONE structural change:
+-/// every full-attention layer rebuilds its binding through
+-/// [`layerwise_fa_attend`], which swaps the row's block-table address for this
+-/// layer's restored composite-arena view and fires the per-layer score+restore
+-/// at the post-norm/pre-RoPE tap. A one-shot `DecodeBinding` cannot carry a
+-/// per-layer paged override, hence the rebuild (design §3.9b "转 Path C 形").
+-///
+-/// Everything else stays on the certified legacy executor: the mixer step runs
+-/// `execute_gated_attention` (project + attend + output in one op, so the QKV
+-/// projection and the output-gate/rotation handshake are untouched) and the
+-/// FFN runs `dense_ffn`'s `Step::GatedMlp` — NOT the lowered program's split
+-/// PROJ_GATE_UP/RESID_DOWN_SWIGLU ops, whose numerics differ. DeltaNet layers
+-/// keep the caller's `paged` (their recurrent state never reads a block table).
+-///
+-/// `kv_cache` is the caller's composite-arena view (shared K/V arena bases,
+-/// per-layer addressing via the block table); `paged` is only read by the
+-/// non-FA layers, the FA layers take their address from the carrier's staging.
+-/// Dense-FFN only, no final norm / lm_head — same contract as the legacy
+-/// sibling.
+-#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+-#[allow(clippy::too_many_arguments)]
+-fn forward_scratch_layers_paged_layerwise(
+-    gpu: &mut Gpu,
+-    weights: &Qwen35Weights,
+-    config: &Qwen35Config,
+-    pos: usize,
+-    kv_cache: &llama::KvCache,
+-    dn_state: &DeltaNetState,
+-    s: &Qwen35Scratch,
+-    paged: hybrid::PagedAttentionKv<'_>,
+-    kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
+-    row_slot: &GpuTensor,
+-    lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
+-    // G7 Stage D: `true` when the decode row's 3D M-RoPE phases were uploaded to
+-    // `s.pos_buf3` by the caller; the FA seam must rotate with them instead of
+-    // the 1D `pos_buf`. `false` reproduces the text path byte-for-byte.
+-    use_mrope: bool,
+-    layer_end: usize,
+-) -> HipResult<()> {
+-    let ctx = DispatchCtx::new(gpu);
+-    let dims = super::program::hybrid_dims(config);
+-    let mut delta_layer_idx = 0usize;
+-    let mut fa_layer_idx = 0usize;
+-    for layer_idx in 0..layer_end {
+-        let layer = &weights.layers[layer_idx];
+-        if matches!(
+-            layer,
+-            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+-        ) {
+-            return Err(HipError::new(
+-                0,
+-                "layerwise paged decode admits dense-FFN models only \
+-                 (the slots engine keeps its own MoE kernels)",
+-            ));
+-        }
+-        if matches!(layer, LayerWeights::FullAttn(_)) {
+-            let fa = fa_layer_idx;
+-            // The all-in-one legacy attention op: `execute_gated_attention`
+-            // projects, attends (firing our tap between Q/K norm and RoPE) and
+-            // runs the output projection with the epilogue's own prerotated
+-            // flag, so the returned flag is consumed internally here.
+-            layerwise_fa_attend(
+-                gpu,
+-                &ctx,
+-                s,
+-                config,
+-                kv_cache,
+-                dn_state,
+-                pos,
+-                fa,
+-                kvmem_taps,
+-                Some(row_slot),
+-                lq,
+-                use_mrope.then_some(config.mrope_section),
+-                |gpu, ctx, binding, tap| {
+-                    let mixer = binding.mixer(
+-                        layer,
+-                        layer_idx,
+-                        delta_layer_idx,
+-                        false,
+-                        Some(tap),
+-                        MixerOutput::Residual,
+-                    );
+-                    execute_steps(gpu, ctx, &[mixer])?;
+-                    Ok(false)
+-                },
+-            )
+-            .map_err(|e| HipError::new(0, &e.to_string()))?;
+-            fa_layer_idx += 1;
+-        } else {
+-            let binding = super::program::DecodeBinding {
+-                dims,
+-                s,
+-                kv_cache,
+-                dn_state,
+-                position: pos,
+-                mrope_section: None,
+-                paged: Some(paged),
+-            };
+-            let mixer = binding.mixer(
+-                layer,
+-                layer_idx,
+-                delta_layer_idx,
+-                false,
+-                None,
+-                MixerOutput::Residual,
+-            );
+-            execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
+-            delta_layer_idx += 1;
+-        }
+-        match super::program::dense_ffn(&dims, s, layer, MlpOutput::Residual) {
+-            Some(ffn) => execute_steps(gpu, &ctx, &[Step::GatedMlp(ffn)])
+-                .map_err(|e| HipError::new(0, &e.to_string()))?,
+-            None => {
+-                return Err(HipError::new(
+-                    0,
+-                    "layerwise paged decode admits dense-FFN models only",
+-                ))
+-            }
+-        }
+-    }
+-    Ok(())
+-}
+-
+ /// One dense layer's decode steps on `s.x` at `pos` (position already in
+ /// `s.pos_buf`): the batched prefill's per-row fallback for full-attention
+ /// layers the batched attention does not admit.
+@@ -5753,15 +5627,15 @@ pub(crate) struct Qwen35Bindings<'a, 'b> {
+     pub(crate) precomputed_attn_x_rot: bool,
+     pub(crate) fa_output_prerotated: bool,
+     pub(crate) defer_routed_combine: bool,
+-    /// Paged KVMem decode addressing (`None` = contiguous cache). Threaded into
++    /// Paged decode addressing (`None` = contiguous cache). Threaded into
+     /// the attention core via [`Self::program`]; the escha projections are
+     /// dtype-agnostic to it. Only the paged escha executor sets this.
+     pub(crate) paged: Option<hipfire_dispatch::pipeline::hybrid::PagedAttentionKv<'a>>,
+-    /// KVMem statistics tap context for full-attention layers (`None` = the
+-    /// legacy triattn diagnostic tap). Set only by the paged escha executor.
+-    pub(crate) kvmem_taps: Option<&'a crate::kvmem_taps::KvMemTaps>,
+-    pub(crate) row_slot: Option<&'a GpuTensor>,
+-    /// Full-attention layer index (0..n_fa_layers) for the KVMem tap.
++    /// Opaque statistics tap context for full-attention layers
++    /// (`None` = the legacy triattn diagnostic tap). Set only by the paged
++    /// executors; the concrete tap type stays behind `TapBinding`.
++    pub(crate) tap: Option<TapBinding<'a>>,
++    /// Full-attention layer index (0..n_fa_layers) for the statistics tap.
+     pub(crate) fa_layer_idx: usize,
+     /// Layerwise recall forward handle (`None` = legacy). `'b` is the query's
+     /// store borrow, independent of the binding borrow `'a` so the per-layer
+@@ -5771,10 +5645,15 @@ pub(crate) struct Qwen35Bindings<'a, 'b> {
+     pub(crate) layerwise: crate::LayerwiseFwd<'a, 'b>,
+ }
+ 
+-fn op_code(op: &OpBinding) -> u32 {
++pub(crate) fn op_code(op: &OpBinding) -> u32 {
+     op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
+ }
+ 
++/// Numeric opcode for `ATTEND_FULL`, exposed to the extracted Layerwise seam.
++pub(crate) fn attend_full_opcode() -> u32 {
++    q35_op::ATTEND_FULL
++}
++
+ impl Qwen35Bindings<'_, '_> {
+     fn program(&self) -> super::program::DecodeBinding<'_> {
+         super::program::DecodeBinding {
+@@ -5788,7 +5667,7 @@ impl Qwen35Bindings<'_, '_> {
+         }
+     }
+ 
+-    fn mixer<'s>(&'s self, tap: Option<AttentionTap<'s>>) -> Step<'s> {
++    pub(crate) fn mixer<'s>(&'s self, tap: Option<AttentionTap<'s>>) -> Step<'s> {
+         self.program().mixer(
+             self.layer,
+             self.layer_idx,
+@@ -5799,207 +5678,6 @@ impl Qwen35Bindings<'_, '_> {
+         )
+     }
+ 
+-    fn dense_ffn(&self) -> Result<GatedMlpOp<'_>, DispatchError> {
+-        super::program::dense_ffn(
+-            &super::program::hybrid_dims(self.config),
+-            self.s,
+-            self.layer,
+-            MlpOutput::Residual,
+-        )
+-        .ok_or_else(|| DispatchError::Hip("dense FFN stage on a MoE layer".into()))
+-    }
+-}
+-
+-/// Layerwise per-layer attend (design §3.9d, ②-D4b-3). Clean sibling to the
+-/// legacy copy-only tap: at the post-norm/pre-RoPE seam it feeds the current
+-/// token's K statistics (when taps are on) and runs the carrier's
+-/// `restore_layer` (GPU score → select → COW restore → per-layer block-table /
+-/// descriptor staging), then lets the UNCHANGED paged attention core consume the
+-/// restored compacted working set. The carrier handle persists across layers in
+-/// `self.layerwise`; only FullAttention layers reach here (the `run_attend`
+-/// dispatcher gates on the layer kind).
+-///
+-/// Borrow mechanics: the attention op must hold the per-layer descriptor /
+-/// positions / row_slot handles while the tap mutates the carrier. So the owned
+-/// shallow [`LayerwiseLayerViews`] are extracted FIRST (they alias the staging's
+-/// stable-address buffers), the op references those LOCAL views, and the carrier
+-/// moves into a `RefCell` the tap closure `borrow_mut()`s. `update_layer` takes
+-/// `&self` and the restore's H2D only changes GPU CONTENTS (never the handles),
+-/// so the kernel reads the freshly uploaded table/descriptor at launch.
+-#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+-impl<'a, 'b> Qwen35Bindings<'a, 'b> {
+-    fn run_attend_layerwise(
+-        &mut self,
+-        gpu: &mut Gpu,
+-        ctx: &DispatchCtx,
+-        op: &OpBinding,
+-    ) -> Result<(), DispatchError> {
+-        // Copy the context out of `self` so the executor closure borrows only
+-        // locals, never `self` (the carrier is taken out below and restored after).
+-        let (s, config) = (self.s, self.config);
+-        let fa = self.fa_layer_idx;
+-        let (kvmem_taps, row_slot) = (self.kvmem_taps, self.row_slot);
+-        let (layer, layer_idx, delta_layer_idx) = (self.layer, self.layer_idx, self.delta_layer_idx);
+-        let (kv_cache, dn_state, pos) = (self.kv_cache, self.dn_state, self.pos);
+-        let prerotated_input = self.precomputed_attn_x_rot;
+-        let lq = self
+-            .layerwise
+-            .take()
+-            .expect("run_attend_layerwise called with a layerwise handle");
+-        // Path C executor: the lowered program runs PROJ_QKV / RESID_WO as
+-        // separate ops, so this fires ONLY the attend op (proj already filled
+-        // fa_q_full; the returned prerotated flag feeds the later RESID_WO op).
+-        let prerotated = layerwise_fa_attend(
+-            gpu, ctx, s, config, kv_cache, dn_state, pos, fa, kvmem_taps, row_slot, &mut *lq,
+-            None, // the lowered (escha) executor has no M-RoPE arm
+-            |gpu, ctx, binding, tap| {
+-                let step = binding.mixer(
+-                    layer,
+-                    layer_idx,
+-                    delta_layer_idx,
+-                    prerotated_input,
+-                    Some(tap),
+-                    MixerOutput::Residual,
+-                );
+-                match (op_code(op), step) {
+-                    (q35_op::ATTEND_FULL, Step::GatedAttention(aop)) => aop.attend(gpu, ctx),
+-                    (code, _) => Err(DispatchError::Hip(format!(
+-                        "layerwise ATTEND opcode {code} does not apply to a FullAttention layer"
+-                    ))),
+-                }
+-            },
+-        )?;
+-        self.layerwise = Some(lq);
+-        self.fa_output_prerotated = prerotated;
+-        Ok(())
+-    }
+-}
+-
+-/// Shared Layerwise full-attention seam (D4b-3, design §3.9d). Fires the
+-/// per-layer score+restore at the post-norm/pre-RoPE tap, builds the attention
+-/// binding with the PER-LAYER paged override (the caller's composite `kv_cache`
+-/// + this layer's staging descs/positions/row_slot/ctx_len), runs the caller's
+-/// attention executor, then reports the attended evaluation span. The carrier
+-/// rides a `RefCell` so the `Fn` tap closure can borrow it mutably while the op
+-/// holds only the owned `views` (no conflict); the closure is scoped inside the
+-/// block so it drops before `into_inner` reclaims the carrier. Used by BOTH the
+-/// lowered Path C executor (`run_attend_layerwise`, attend-only op) and the
+-/// non-escha Path A executor (all-in-one `execute_gated_attention`), so the
+-/// restore interleaving lives in exactly one place. Returns the executor's
+-/// `prerotated` flag (Path C feeds it to the separate RESID_WO op; Path A
+-/// consumes it internally and ignores the return).
+-#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+-#[allow(clippy::too_many_arguments)]
+-fn layerwise_fa_attend(
+-    gpu: &mut Gpu,
+-    ctx: &DispatchCtx,
+-    s: &Qwen35Scratch,
+-    config: &Qwen35Config,
+-    kv_cache: &llama::KvCache,
+-    dn_state: &DeltaNetState,
+-    pos: usize,
+-    fa: usize,
+-    kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
+-    row_slot: Option<&GpuTensor>,
+-    lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
+-    // G7 Stage D: `Some(section)` rotates with the 3D phases in `s.pos_buf3`
+-    // (VL decode); `None` keeps the 1D `pos_buf` path byte-identical.
+-    mrope_section: Option<[usize; 3]>,
+-    attend: impl FnOnce(
+-        &mut Gpu,
+-        &DispatchCtx,
+-        &super::program::DecodeBinding<'_>,
+-        AttentionTap<'_>,
+-    ) -> Result<bool, DispatchError>,
+-) -> Result<bool, DispatchError> {
+-    use hipfire_kvmem::NativeCurrentLayerQuery;
+-    use std::cell::RefCell;
+-
+-    // Owned per-layer binding handles, extracted before the carrier borrow.
+-    let views = lq.layer_views(fa).map_err(DispatchError::Hip)?;
+-    let cell = RefCell::new(lq);
+-
+-    // The Q tile the scorer reads: post-norm/pre-RoPE `s.fa_q`, laid out
+-    // `[n_heads, head_dim]` F32 by the unfused prep (one decode row). BYTE
+-    // strides, token axis outermost; attention_scale 0 → 1/sqrt(head_dim).
+-    let qw = config.n_heads * config.head_dim;
+-    let native_q = NativeCurrentLayerQuery {
+-        data: s.fa_q.buf.as_ptr() as *const std::ffi::c_void,
+-        bytes: qw * 4,
+-        layer: fa as u32,
+-        rows: 1,
+-        query_heads: config.n_heads as u32,
+-        kv_heads: config.n_kv_heads as u32,
+-        head_dim: config.head_dim as u32,
+-        attention_scale: 0.0,
+-        scalar: 0, // F32
+-        row_stride: qw * 4,
+-        head_stride: config.head_dim * 4,
+-        dimension_stride: 4,
+-    };
+-
+-    let prerotated = {
+-        // Stats feed (current K → tap buffer) then score+restore. Both borrow
+-        // the carrier through the RefCell; the op holds only the owned `views`.
+-        let tap_fn = |gpu: &mut Gpu| -> Result<(), DispatchError> {
+-            if let (Some(taps), Some(rs)) = (kvmem_taps, row_slot) {
+-                taps.tap_layer(gpu, fa, &s.fa_q, &s.fa_k, rs, 1)
+-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+-            }
+-            cell.borrow_mut()
+-                .restore_layer(gpu, fa, &native_q)
+-                .map_err(DispatchError::Hip)?;
+-            Ok(())
+-        };
+-        let binding = super::program::DecodeBinding {
+-            dims: super::program::hybrid_dims(config),
+-            s,
+-            kv_cache,
+-            dn_state,
+-            position: pos,
+-            mrope_section,
+-            paged: Some(hybrid::PagedAttentionKv {
+-                positions: &views.positions,
+-                descs: &views.descs,
+-                row_slot: &views.row_slot,
+-                ctx_len: views.ctx_len,
+-            }),
+-        };
+-        attend(gpu, ctx, &binding, &tap_fn as AttentionTap<'_>)?
+-    };
+-
+-    // The tap closure and binding are dropped; reclaim the carrier and report
+-    // the attended evaluation span. On the error paths above the carrier is
+-    // dropped with the cell (its GPU buffers are freed by the owner's `free`).
+-    let lq = cell.into_inner();
+-    // ③-E3 mass hook (design §3.10a): sample this layer's per-page attention
+-    // mass at the post-attention boundary. `s.fa_q` is now POST-RoPE — the
+-    // attend op rotated it in place (rope_partial_interleaved_f32, the non-fused
+-    // arm taken whenever the restore tap is present) — the SAME rotational space
+-    // as the restored arena K, and the current token's K is written. No-op unless
+-    // a pressure owner backs the step AND the core `rows()` schedule admitted it
+-    // (the page-first Query steps where the frontier advances). Purely additive:
+-    // the mass kernel reads disjoint workspaces and never touches the attention
+-    // output / arena / view, so the forward residual is byte-identical with or
+-    // without it. This is the Dense Path A/C sibling of the MoE Path B hook in
+-    // `forward_slots::layerwise_fa_slots`; the real Qwen3.5 dense model decodes
+-    // through THIS seam, so the production pressure accept needs it here too.
+-    {
+-        use rdna_compute::kvmem_page_mass::{PageMassQuery, PageMassScalar};
+-        let mass_q = PageMassQuery {
+-            data: s.fa_q.buf.as_ptr() as *const std::ffi::c_void,
+-            rows: 1,
+-            query_heads: config.n_heads as u32,
+-            kv_heads: config.n_kv_heads as u32,
+-            head_dim: config.head_dim as u32,
+-            attention_scale: 0.0,
+-            scalar: PageMassScalar::F32,
+-        };
+-        lq.capture_mass_layer(gpu, fa, &mass_q)
+-            .map_err(DispatchError::Hip)?;
+-    }
+-    lq.attend_complete_layer(fa).map_err(DispatchError::Hip)?;
+-    Ok(prerotated)
+ }
+ 
+ fn wrong_layer(stage: &str) -> DispatchError {
+@@ -6614,34 +6292,26 @@ impl<'a, 'b> ForwardBindings for Qwen35Bindings<'a, 'b> {
+         let triattn_tap_fn = |gpu: &mut Gpu| {
+             triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
+         };
+-        // KVMem statistics tap (paged escha decode): post-Q/K-norm, pre-RoPE,
++        // Statistics tap (paged escha decode): post-Q/K-norm, pre-RoPE,
+         // the same seam the slots engine and the non-escha paged executor tap.
+         // Copy the context out of `self` so the closure does not borrow it.
+-        let (kvmem_taps, row_slot, fa_layer_idx) =
+-            (self.kvmem_taps, self.row_slot, self.fa_layer_idx);
+-        let kvmem_tap_fn = |gpu: &mut Gpu| {
+-            kvmem_taps
+-                .expect("kvmem tap closure built only when taps are on")
+-                .tap_layer(
+-                    gpu,
+-                    fa_layer_idx,
+-                    &s.fa_q,
+-                    &s.fa_k,
+-                    row_slot.expect("kvmem tap closure built only with a row slot"),
+-                    1,
+-                )
++        let (tap, fa_layer_idx) = (self.tap, self.fa_layer_idx);
++        let tap_on = tap.is_some();
++        let tap_fn = |gpu: &mut Gpu| {
++            tap.expect("tap closure built only when taps are on")
++                .tap_layer(gpu, fa_layer_idx, &s.fa_q, &s.fa_k, 1)
+                 .map_err(|e| DispatchError::Hip(e.to_string()))
+         };
+         let is_fa = matches!(
+             self.layer,
+             LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_)
+         );
+-        let tap: Option<AttentionTap<'_>> = if is_fa && kvmem_taps.is_some() {
+-            Some(&kvmem_tap_fn as AttentionTap<'_>)
++        let attention_tap: Option<AttentionTap<'_>> = if is_fa && tap_on {
++            Some(&tap_fn as AttentionTap<'_>)
+         } else {
+             hipfire_runtime::triattn::tap_enabled().then_some(&triattn_tap_fn as AttentionTap<'_>)
+         };
+-        let prerotated = match (op_code(op), self.mixer(tap)) {
++        let prerotated = match (op_code(op), self.mixer(attention_tap)) {
+             (q35_op::ATTEND_FULL, Step::GatedAttention(op)) => op.attend(gpu, ctx)?,
+             (q35_op::ATTEND_DN_PREP, Step::DeltaNetMixer(op)) => return op.prepare(gpu),
+             (code, _) => {
+@@ -7227,8 +6897,7 @@ fn forward_scratch_layers_lowered(
+                 fa_output_prerotated: false,
+                 defer_routed_combine: combine_next_rms && layer_idx + 1 < config.n_layers,
+                 paged: None,
+-                kvmem_taps: None,
+-                row_slot: None,
++                tap: None,
+                 fa_layer_idx: 0,
+                 layerwise: None,
+             };
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/layerwise_attend.rs b/crates/hipfire-arch-qwen35/src/qwen35/layerwise_attend.rs
+new file mode 100644
+index 000000000..f592be3a9
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/qwen35/layerwise_attend.rs
+@@ -0,0 +1,342 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! KVMem Layerwise full-attention path: the non-escha Path A decode loop, the
++//! per-layer attend seam, and the per-layer restore/capture hooks. Split out of
++//! the upstream `forward.rs` spine; the generic forward only dispatches here
++//! when a Layerwise carrier is present.
++
++use super::config::Qwen35Config;
++use super::forward::{attend_full_opcode, op_code, Qwen35Bindings, Qwen35Scratch};
++use super::program::{dense_ffn, hybrid_dims, DecodeBinding};
++use super::weights::{DeltaNetState, LayerWeights, Qwen35Weights};
++use super::TapBinding;
++use hip_bridge::{HipError, HipResult};
++use hipfire_dispatch::context::DispatchCtx;
++use hipfire_dispatch::pipeline::execute_steps;
++use hipfire_dispatch::pipeline::gated_mlp::MlpOutput;
++use hipfire_dispatch::pipeline::hybrid;
++use hipfire_dispatch::pipeline::hybrid::{AttentionTap, MixerOutput};
++use hipfire_dispatch::pipeline::superop::OpBinding;
++use hipfire_dispatch::pipeline::Step;
++use hipfire_dispatch::types::DispatchError;
++use hipfire_runtime::llama;
++use rdna_compute::Gpu;
++
++/// Layerwise paged decode for non-escha dense models (D4b-3 Path A). The
++/// legacy [`forward_scratch_layers_paged`] body with ONE structural change:
++/// every full-attention layer rebuilds its binding through
++/// [`layerwise_fa_attend`], which swaps the row's block-table address for this
++/// layer's restored composite-arena view and fires the per-layer score+restore
++/// at the post-norm/pre-RoPE tap. A one-shot `DecodeBinding` cannot carry a
++/// per-layer paged override, hence the rebuild (design §3.9b "转 Path C 形").
++///
++/// Everything else stays on the certified legacy executor: the mixer step runs
++/// `execute_gated_attention` (project + attend + output in one op, so the QKV
++/// projection and the output-gate/rotation handshake are untouched) and the
++/// FFN runs `dense_ffn`'s `Step::GatedMlp` — NOT the lowered program's split
++/// PROJ_GATE_UP/RESID_DOWN_SWIGLU ops, whose numerics differ. DeltaNet layers
++/// keep the caller's `paged` (their recurrent state never reads a block table).
++///
++/// `kv_cache` is the caller's composite-arena view (shared K/V arena bases,
++/// per-layer addressing via the block table); `paged` is only read by the
++/// non-FA layers, the FA layers take their address from the carrier's staging.
++/// Dense-FFN only, no final norm / lm_head — same contract as the legacy
++/// sibling.
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn forward_scratch_layers_paged_layerwise(
++    gpu: &mut Gpu,
++    weights: &Qwen35Weights,
++    config: &Qwen35Config,
++    pos: usize,
++    kv_cache: &llama::KvCache,
++    dn_state: &DeltaNetState,
++    s: &Qwen35Scratch,
++    paged: hybrid::PagedAttentionKv<'_>,
++    tap: Option<TapBinding<'_>>,
++    lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
++    // G7 Stage D: `true` when the decode row's 3D M-RoPE phases were uploaded to
++    // `s.pos_buf3` by the caller; the FA seam must rotate with them instead of
++    // the 1D `pos_buf`. `false` reproduces the text path byte-for-byte.
++    use_mrope: bool,
++    layer_end: usize,
++) -> HipResult<()> {
++    let ctx = DispatchCtx::new(gpu);
++    let dims = hybrid_dims(config);
++    let mut delta_layer_idx = 0usize;
++    let mut fa_layer_idx = 0usize;
++    for layer_idx in 0..layer_end {
++        let layer = &weights.layers[layer_idx];
++        if matches!(
++            layer,
++            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
++        ) {
++            return Err(HipError::new(
++                0,
++                "layerwise paged decode admits dense-FFN models only \
++                 (the slots engine keeps its own MoE kernels)",
++            ));
++        }
++        if matches!(layer, LayerWeights::FullAttn(_)) {
++            let fa = fa_layer_idx;
++            // The all-in-one legacy attention op: `execute_gated_attention`
++            // projects, attends (firing our tap between Q/K norm and RoPE) and
++            // runs the output projection with the epilogue's own prerotated
++            // flag, so the returned flag is consumed internally here.
++            layerwise_fa_attend(
++                gpu,
++                &ctx,
++                s,
++                config,
++                kv_cache,
++                dn_state,
++                pos,
++                fa,
++                tap,
++                lq,
++                use_mrope.then_some(config.mrope_section),
++                |gpu, ctx, binding, tap| {
++                    let mixer = binding.mixer(
++                        layer,
++                        layer_idx,
++                        delta_layer_idx,
++                        false,
++                        Some(tap),
++                        MixerOutput::Residual,
++                    );
++                    execute_steps(gpu, ctx, &[mixer])?;
++                    Ok(false)
++                },
++            )
++            .map_err(|e| HipError::new(0, &e.to_string()))?;
++            fa_layer_idx += 1;
++        } else {
++            let binding = DecodeBinding {
++                dims,
++                s,
++                kv_cache,
++                dn_state,
++                position: pos,
++                mrope_section: None,
++                paged: Some(paged),
++            };
++            let mixer = binding.mixer(
++                layer,
++                layer_idx,
++                delta_layer_idx,
++                false,
++                None,
++                MixerOutput::Residual,
++            );
++            execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
++            delta_layer_idx += 1;
++        }
++        match dense_ffn(&dims, s, layer, MlpOutput::Residual) {
++            Some(ffn) => execute_steps(gpu, &ctx, &[Step::GatedMlp(ffn)])
++                .map_err(|e| HipError::new(0, &e.to_string()))?,
++            None => {
++                return Err(HipError::new(
++                    0,
++                    "layerwise paged decode admits dense-FFN models only",
++                ))
++            }
++        }
++    }
++    Ok(())
++}
++
++/// Layerwise per-layer attend (design §3.9d, ②-D4b-3). Clean sibling to the
++/// legacy copy-only tap: at the post-norm/pre-RoPE seam it feeds the current
++/// token's K statistics (when taps are on) and runs the carrier's
++/// `restore_layer` (GPU score → select → COW restore → per-layer block-table /
++/// descriptor staging), then lets the UNCHANGED paged attention core consume the
++/// restored compacted working set. The carrier handle persists across layers in
++/// `self.layerwise`; only FullAttention layers reach here (the `run_attend`
++/// dispatcher gates on the layer kind).
++///
++/// Borrow mechanics: the attention op must hold the per-layer descriptor /
++/// positions / row_slot handles while the tap mutates the carrier. So the owned
++/// shallow [`LayerwiseLayerViews`] are extracted FIRST (they alias the staging's
++/// stable-address buffers), the op references those LOCAL views, and the carrier
++/// moves into a `RefCell` the tap closure `borrow_mut()`s. `update_layer` takes
++/// `&self` and the restore's H2D only changes GPU CONTENTS (never the handles),
++/// so the kernel reads the freshly uploaded table/descriptor at launch.
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++impl<'a, 'b> Qwen35Bindings<'a, 'b> {
++    pub(crate) fn run_attend_layerwise(
++        &mut self,
++        gpu: &mut Gpu,
++        ctx: &DispatchCtx,
++        op: &OpBinding,
++    ) -> Result<(), DispatchError> {
++        // Copy the context out of `self` so the executor closure borrows only
++        // locals, never `self` (the carrier is taken out below and restored after).
++        let (s, config) = (self.s, self.config);
++        let fa = self.fa_layer_idx;
++        let tap = self.tap;
++        let (layer, layer_idx, delta_layer_idx) = (self.layer, self.layer_idx, self.delta_layer_idx);
++        let (kv_cache, dn_state, pos) = (self.kv_cache, self.dn_state, self.pos);
++        let prerotated_input = self.precomputed_attn_x_rot;
++        let lq = self
++            .layerwise
++            .take()
++            .expect("run_attend_layerwise called with a layerwise handle");
++        // Path C executor: the lowered program runs PROJ_QKV / RESID_WO as
++        // separate ops, so this fires ONLY the attend op (proj already filled
++        // fa_q_full; the returned prerotated flag feeds the later RESID_WO op).
++        let prerotated = layerwise_fa_attend(
++            gpu, ctx, s, config, kv_cache, dn_state, pos, fa, tap, &mut *lq,
++            None, // the lowered (escha) executor has no M-RoPE arm
++            |gpu, ctx, binding, tap| {
++                let step = binding.mixer(
++                    layer,
++                    layer_idx,
++                    delta_layer_idx,
++                    prerotated_input,
++                    Some(tap),
++                    MixerOutput::Residual,
++                );
++                match (op_code(op), step) {
++                    (opcode, Step::GatedAttention(aop)) if opcode == attend_full_opcode() => {
++                        aop.attend(gpu, ctx)
++                    }
++                    (code, _) => Err(DispatchError::Hip(format!(
++                        "layerwise ATTEND opcode {code} does not apply to a FullAttention layer"
++                    ))),
++                }
++            },
++        )?;
++        self.layerwise = Some(lq);
++        self.fa_output_prerotated = prerotated;
++        Ok(())
++    }
++}
++
++/// Shared Layerwise full-attention seam (D4b-3, design §3.9d). Fires the
++/// per-layer score+restore at the post-norm/pre-RoPE tap, builds the attention
++/// binding with the PER-LAYER paged override (the caller's composite `kv_cache`
++/// + this layer's staging descs/positions/row_slot/ctx_len), runs the caller's
++/// attention executor, then reports the attended evaluation span. The carrier
++/// rides a `RefCell` so the `Fn` tap closure can borrow it mutably while the op
++/// holds only the owned `views` (no conflict); the closure is scoped inside the
++/// block so it drops before `into_inner` reclaims the carrier. Used by BOTH the
++/// lowered Path C executor (`run_attend_layerwise`, attend-only op) and the
++/// non-escha Path A executor (all-in-one `execute_gated_attention`), so the
++/// restore interleaving lives in exactly one place. Returns the executor's
++/// `prerotated` flag (Path C feeds it to the separate RESID_WO op; Path A
++/// consumes it internally and ignores the return).
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn layerwise_fa_attend(
++    gpu: &mut Gpu,
++    ctx: &DispatchCtx,
++    s: &Qwen35Scratch,
++    config: &Qwen35Config,
++    kv_cache: &llama::KvCache,
++    dn_state: &DeltaNetState,
++    pos: usize,
++    fa: usize,
++    tap: Option<TapBinding<'_>>,
++    lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
++    // G7 Stage D: `Some(section)` rotates with the 3D phases in `s.pos_buf3`
++    // (VL decode); `None` keeps the 1D `pos_buf` path byte-identical.
++    mrope_section: Option<[usize; 3]>,
++    attend: impl FnOnce(
++        &mut Gpu,
++        &DispatchCtx,
++        &DecodeBinding<'_>,
++        AttentionTap<'_>,
++    ) -> Result<bool, DispatchError>,
++) -> Result<bool, DispatchError> {
++    use hipfire_kvmem::NativeCurrentLayerQuery;
++    use std::cell::RefCell;
++
++    // Owned per-layer binding handles, extracted before the carrier borrow.
++    let views = lq.layer_views(fa).map_err(DispatchError::Hip)?;
++    let cell = RefCell::new(lq);
++
++    // The Q tile the scorer reads: post-norm/pre-RoPE `s.fa_q`, laid out
++    // `[n_heads, head_dim]` F32 by the unfused prep (one decode row). BYTE
++    // strides, token axis outermost; attention_scale 0 → 1/sqrt(head_dim).
++    let qw = config.n_heads * config.head_dim;
++    let native_q = NativeCurrentLayerQuery {
++        data: s.fa_q.buf.as_ptr() as *const std::ffi::c_void,
++        bytes: qw * 4,
++        layer: fa as u32,
++        rows: 1,
++        query_heads: config.n_heads as u32,
++        kv_heads: config.n_kv_heads as u32,
++        head_dim: config.head_dim as u32,
++        attention_scale: 0.0,
++        scalar: 0, // F32
++        row_stride: qw * 4,
++        head_stride: config.head_dim * 4,
++        dimension_stride: 4,
++    };
++
++    let prerotated = {
++        // Stats feed (current K → tap buffer) then score+restore. Both borrow
++        // the carrier through the RefCell; the op holds only the owned `views`.
++        let tap_fn = |gpu: &mut Gpu| -> Result<(), DispatchError> {
++            if let Some(tap) = tap {
++                tap.tap_layer(gpu, fa, &s.fa_q, &s.fa_k, 1)
++                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
++            }
++            cell.borrow_mut()
++                .restore_layer(gpu, fa, &native_q)
++                .map_err(DispatchError::Hip)?;
++            Ok(())
++        };
++        let binding = DecodeBinding {
++            dims: hybrid_dims(config),
++            s,
++            kv_cache,
++            dn_state,
++            position: pos,
++            mrope_section,
++            paged: Some(hybrid::PagedAttentionKv {
++                positions: &views.positions,
++                descs: &views.descs,
++                row_slot: &views.row_slot,
++                ctx_len: views.ctx_len,
++            }),
++        };
++        attend(gpu, ctx, &binding, &tap_fn as AttentionTap<'_>)?
++    };
++
++    // The tap closure and binding are dropped; reclaim the carrier and report
++    // the attended evaluation span. On the error paths above the carrier is
++    // dropped with the cell (its GPU buffers are freed by the owner's `free`).
++    let lq = cell.into_inner();
++    // ③-E3 mass hook (design §3.10a): sample this layer's per-page attention
++    // mass at the post-attention boundary. `s.fa_q` is now POST-RoPE — the
++    // attend op rotated it in place (rope_partial_interleaved_f32, the non-fused
++    // arm taken whenever the restore tap is present) — the SAME rotational space
++    // as the restored arena K, and the current token's K is written. No-op unless
++    // a pressure owner backs the step AND the core `rows()` schedule admitted it
++    // (the page-first Query steps where the frontier advances). Purely additive:
++    // the mass kernel reads disjoint workspaces and never touches the attention
++    // output / arena / view, so the forward residual is byte-identical with or
++    // without it. This is the Dense Path A/C sibling of the MoE Path B hook in
++    // `forward_slots::layerwise_fa_slots`; the real Qwen3.5 dense model decodes
++    // through THIS seam, so the production pressure accept needs it here too.
++    {
++        use rdna_compute::kvmem_page_mass::{PageMassQuery, PageMassScalar};
++        let mass_q = PageMassQuery {
++            data: s.fa_q.buf.as_ptr() as *const std::ffi::c_void,
++            rows: 1,
++            query_heads: config.n_heads as u32,
++            kv_heads: config.n_kv_heads as u32,
++            head_dim: config.head_dim as u32,
++            attention_scale: 0.0,
++            scalar: PageMassScalar::F32,
++        };
++        lq.capture_mass_layer(gpu, fa, &mass_q)
++            .map_err(DispatchError::Hip)?;
++    }
++    lq.attend_complete_layer(fa).map_err(DispatchError::Hip)?;
++    Ok(prerotated)
++}
++
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/paged_decode.rs b/crates/hipfire-arch-qwen35/src/qwen35/paged_decode.rs
+new file mode 100644
+index 000000000..db2f2b971
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/qwen35/paged_decode.rs
+@@ -0,0 +1,245 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Single-row paged decode helpers: the reference-shaped legacy path and the
++//! Layerwise carrier path. These are the slot-engine KVMem-specific entry
++//! points into [`forward_scratch_layers_paged`]; keeping them out of the
++//! upstream `forward_slots.rs` spine leaves only the dispatch choice there.
++
++use super::batch::PrefillBatchScratch;
++use super::config::{LayerType, Qwen35Config};
++use super::forward::Qwen35Scratch;
++use super::weights::{DeltaNetState, Qwen35Weights};
++use super::TapBinding;
++use crate::forward_slots::SlotDescStaging;
++use hip_bridge::{HipError, HipResult};
++use hipfire_runtime::llama::{KvCache, VMode};
++use hipfire_runtime::slot_batch::SlotBatch;
++use rdna_compute::slot_pool::SlotPool;
++use rdna_compute::{Gpu, GpuTensor};
++
++/// Single-row paged decode through the reference's own kernel ladder.
++///
++/// [`forward_batch_slots`] normally runs the slots GEMM ladder, which at
++/// n == 1 is both numerically different from the reference sequential
++/// decode (WMMA GEMM vs GEMV, batched norms vs the fused decode norms) and
++/// measurably slower per step on gfx1100. This fork hands the row to
++/// [`crate::qwen35::forward::forward_scratch_layers_paged`]: the reference's
++/// `DecodeBinding` layer loop with each full-attention layer bound to the
++/// slot's block table. The hidden state moves `pbs.x_batch` row 0 → `s.x` →
++/// back; the per-slot lm_head still runs from `pbs.x_batch` in
++/// [`final_logits_per_slot`], unchanged.
++///
++/// The Q8 arenas are viewed in model-layer order (null tensors on DeltaNet
++/// layers), the same shape `ModelRig::slot_kv_view` gives the contiguous
++/// engine — the paged kernels only use those tensors as arena bases.
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn paged_decode_reference_layers(
++    gpu: &mut Gpu,
++    weights: &Qwen35Weights,
++    config: &Qwen35Config,
++    batch: &SlotBatch,
++    pool: &SlotPool,
++    slot_idx: usize,
++    dn_states: &[DeltaNetState],
++    k_arenas: &[GpuTensor],
++    v_arenas: &[GpuTensor],
++    desc_staging: &SlotDescStaging,
++    pbs: &PrefillBatchScratch,
++    s: &Qwen35Scratch,
++    ctx_len: usize,
++    layer_end: usize,
++) -> HipResult<()> {
++    let dim = config.dim;
++    let row_bytes = dim * 4;
++    // Hidden state of the decode row in; the reference writes the same
++    // logical position into pos_buf before its layer loop (the RoPE angle
++    // and the paged tile/reduce causal bound both read pos_buf[0]).
++    gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, 0, row_bytes)?;
++    let pos = batch.positions[0] as usize;
++    let pos_i32 = pos as i32;
++    gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
++
++    // Borrowed Q8 view of the paged arenas, model-layer order.
++    let phys_cap = pool.cap_tokens();
++    let mut k_gpu = Vec::with_capacity(config.n_layers);
++    let mut v_gpu = Vec::with_capacity(config.n_layers);
++    let mut fa = 0usize;
++    for t in &config.layer_types {
++        if *t == LayerType::FullAttention {
++            k_gpu.push(k_arenas[fa].sub_offset(0, k_arenas[fa].numel()));
++            v_gpu.push(v_arenas[fa].sub_offset(0, v_arenas[fa].numel()));
++            fa += 1;
++        } else {
++            k_gpu.push(GpuTensor::null_for_test());
++            v_gpu.push(GpuTensor::null_for_test());
++        }
++    }
++    let kv_view = KvCache {
++        k_gpu,
++        v_gpu,
++        k_scales: Vec::new(),
++        v_scales: Vec::new(),
++        kv_dim: config.n_kv_heads * config.head_dim,
++        max_seq: phys_cap,
++        physical_cap: phys_cap,
++        n_kv_heads: config.n_kv_heads,
++        head_dim: config.head_dim,
++        quantized: true,
++        quant_q8: true,
++        quant_int8: false,
++        quant_hfq4: false,
++        quant_asym4: false,
++        quant_asym3: false,
++        quant_asym2: false,
++        boundary_layers: 0,
++        givens_cos: None,
++        givens_sin: None,
++        quant_fwht: false,
++        quant_bf16: false,
++        quant_fp8: false,
++        v_mode: VMode::Q8,
++        layer_is_boundary: Vec::new(),
++        compact_offset: 0,
++    };
++    crate::qwen35::forward::forward_scratch_layers_paged(
++        gpu,
++        weights,
++        config,
++        pos,
++        &kv_view,
++        &dn_states[slot_idx],
++        s,
++        hipfire_dispatch::pipeline::hybrid::PagedAttentionKv {
++            positions: &pbs.positions,
++            descs: &desc_staging.descs_dev,
++            row_slot: &desc_staging.row_slot_dev,
++            ctx_len,
++        },
++        TapBinding::from_optional(pbs.kvmem_taps.as_ref(), &desc_staging.row_slot_dev),
++        /* layerwise */ None,
++        /* use_mrope */ false,
++        layer_end,
++    )?;
++    // Back into the [n_slots × dim] batch buffer the head reads.
++    gpu.memcpy_dtod_at_auto(&pbs.x_batch.buf, 0, &s.x.buf, 0, row_bytes)?;
++    Ok(())
++}
++
++/// Layerwise single-row q8 paged decode (D4b-3). Mirrors
++/// [`paged_decode_reference_layers`] but the KV ladder is the carrier's
++/// composite arena instead of the legacy per-layer slot arenas: every
++/// FullAttention layer shares the arena base (K) and the shifted V base, and
++/// the per-layer block table (`staging.descs(fa)`, installed inside
++/// `run_attend_layerwise`) selects that layer's restored stripe + suffix. The
++/// `paged` placeholder's descs/positions/ctx_len are overridden per layer by
++/// the seam, so only the composite `kv_cache` views matter here. Escha-trellis
++/// dense layers lower to Path C (`forward_scratch_layers_paged_lowered`);
++/// non-escha dense layers reach the Path A guard until that path is wired
++/// (fail-closed, never a silent legacy fallback). The carrier is threaded as
++/// `Some`; the engine passes `None` until D4b-4 orchestration.
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn paged_decode_layerwise(
++    gpu: &mut Gpu,
++    weights: &Qwen35Weights,
++    config: &Qwen35Config,
++    batch: &SlotBatch,
++    pool: &SlotPool,
++    slot_idx: usize,
++    dn_states: &[DeltaNetState],
++    desc_staging: &SlotDescStaging,
++    pbs: &PrefillBatchScratch,
++    s: &Qwen35Scratch,
++    lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
++    layer_end: usize,
++) -> HipResult<()> {
++    let dim = config.dim;
++    let row_bytes = dim * 4;
++    gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, 0, row_bytes)?;
++    let pos = batch.positions[0] as usize;
++    gpu.hip.memcpy_htod(&s.pos_buf, &(pos as i32).to_ne_bytes())?;
++    // G7 Stage D: a VL decode row (image conversation, past the prompt) carries
++    // uniform M-RoPE phases `[p+delta; 3]` from the batch. Upload them to the
++    // single-row scratch so the attention prep can run the 3D RoPE kernel; the
++    // KV write below still uses the carrier's COMPACT positions, and the phases
++    // are the absolute ones the prefill stored keys under.
++    let use_mrope = batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty();
++    if use_mrope {
++        let bytes: Vec<u8> = batch.pos3[0].iter().flat_map(|v| v.to_ne_bytes()).collect();
++        gpu.hip.memcpy_htod(&s.pos_buf3, &bytes)?;
++    }
++
++    // Composite arena views: non-owning aliases (the carrier's arena owns the
++    // allocation). K base = arena base; V base = arena shifted by one K plane.
++    // Extracted before the mutable carrier borrow below; never freed here.
++    let arena_numel = lq.driver.arena().arena().numel();
++    let mut k_gpu = Vec::with_capacity(config.n_layers);
++    let mut v_gpu = Vec::with_capacity(config.n_layers);
++    for t in &config.layer_types {
++        if *t == LayerType::FullAttention {
++            k_gpu.push(lq.driver.arena().arena().sub_offset(0, arena_numel));
++            v_gpu.push(
++                lq.driver
++                    .arena()
++                    .v_cache_view()
++                    .map_err(|e| HipError::new(0, &e))?,
++            );
++        } else {
++            k_gpu.push(GpuTensor::null_for_test());
++            v_gpu.push(GpuTensor::null_for_test());
++        }
++    }
++    let phys_cap = pool.cap_tokens();
++    let kv_view = KvCache {
++        k_gpu,
++        v_gpu,
++        k_scales: Vec::new(),
++        v_scales: Vec::new(),
++        kv_dim: config.n_kv_heads * config.head_dim,
++        max_seq: phys_cap,
++        physical_cap: phys_cap,
++        n_kv_heads: config.n_kv_heads,
++        head_dim: config.head_dim,
++        quantized: true,
++        quant_q8: true,
++        quant_int8: false,
++        quant_hfq4: false,
++        quant_asym4: false,
++        quant_asym3: false,
++        quant_asym2: false,
++        boundary_layers: 0,
++        givens_cos: None,
++        givens_sin: None,
++        quant_fwht: false,
++        quant_bf16: false,
++        quant_fp8: false,
++        v_mode: VMode::Q8,
++        layer_is_boundary: Vec::new(),
++        compact_offset: 0,
++    };
++    crate::qwen35::forward::forward_scratch_layers_paged(
++        gpu,
++        weights,
++        config,
++        pos,
++        &kv_view,
++        &dn_states[slot_idx],
++        s,
++        hipfire_dispatch::pipeline::hybrid::PagedAttentionKv {
++            positions: &pbs.positions,
++            descs: &desc_staging.descs_dev,
++            row_slot: &desc_staging.row_slot_dev,
++            ctx_len: 0, // overridden per layer by run_attend_layerwise
++        },
++        TapBinding::from_optional(pbs.kvmem_taps.as_ref(), &desc_staging.row_slot_dev),
++        Some(lq),
++        use_mrope,
++        layer_end,
++    )?;
++    // Back into the [n_slots × dim] batch buffer the head reads.
++    gpu.memcpy_dtod_at_auto(&pbs.x_batch.buf, 0, &s.x.buf, 0, row_bytes)?;
++    Ok(())
++}
++
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/tap.rs b/crates/hipfire-arch-qwen35/src/qwen35/tap.rs
+new file mode 100644
+index 000000000..938f822d8
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/qwen35/tap.rs
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Opaque attention-tap binding for the paged decode paths.
++//!
++//! `forward.rs` only needs the pair (statistics tap, row-slot map) to build an
++//! [`AttentionTap`](hipfire_dispatch::pipeline::hybrid::AttentionTap) closure.
++//! Keeping the concrete `KvMemTaps` type behind this small binding lets the
++//! upstream forward signatures stay independent of the KVMem module, and the
++//! no-`kvmem` build carries a zero-sized placeholder instead of a concrete
++//! tap reference.
++
++use hip_bridge::HipResult;
++use rdna_compute::{Gpu, GpuTensor};
++
++use crate::kvmem_taps::KvMemTaps;
++
++/// The KVMem statistics tap plus the per-row slot map it consumes.
++#[derive(Clone, Copy)]
++pub(crate) struct TapBinding<'a> {
++    #[cfg(feature = "kvmem")]
++    taps: &'a KvMemTaps,
++    #[cfg(feature = "kvmem")]
++    row_slot: &'a GpuTensor,
++    #[cfg(not(feature = "kvmem"))]
++    _marker: std::marker::PhantomData<&'a ()>,
++}
++
++impl<'a> TapBinding<'a> {
++    /// Bind a concrete tap to the row-slot map uploaded for this step.
++    #[cfg_attr(not(feature = "kvmem"), allow(dead_code))]
++    pub(crate) fn new(taps: &'a KvMemTaps, row_slot: &'a GpuTensor) -> Self {
++        #[cfg(feature = "kvmem")]
++        {
++            Self { taps, row_slot }
++        }
++        #[cfg(not(feature = "kvmem"))]
++        {
++            let _ = (taps, row_slot);
++            Self {
++                _marker: std::marker::PhantomData,
++            }
++        }
++    }
++
++    /// Build an optional binding without exposing `KvMemTaps` to `forward.rs`.
++    pub(crate) fn from_optional(
++        taps: Option<&'a KvMemTaps>,
++        row_slot: &'a GpuTensor,
++    ) -> Option<Self> {
++        #[cfg(feature = "kvmem")]
++        {
++            taps.map(|taps| Self::new(taps, row_slot))
++        }
++        #[cfg(not(feature = "kvmem"))]
++        {
++            let _ = (taps, row_slot);
++            None
++        }
++    }
++
++    /// Copy this step's Q/K rows for one full-attention layer into the tap
++    /// buffers. No-op when the crate was built without `kvmem`.
++    pub(crate) fn tap_layer(
++        &self,
++        gpu: &mut Gpu,
++        layer: usize,
++        q: &GpuTensor,
++        k: &GpuTensor,
++        n_rows: usize,
++    ) -> HipResult<()> {
++        #[cfg(feature = "kvmem")]
++        {
++            self.taps
++                .tap_layer(gpu, layer, q, k, self.row_slot, n_rows)
++        }
++        #[cfg(not(feature = "kvmem"))]
++        {
++            let _ = (gpu, layer, q, k, n_rows);
++            Ok(())
++        }
++    }
++}

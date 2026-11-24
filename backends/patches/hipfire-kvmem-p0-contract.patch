@@ -1,0 +1,612 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 37d68474f..f41bfcb00 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1763,6 +1763,7 @@ name = "hipfire-kvmem"
+ version = "0.4.7"
+ dependencies = [
+  "cc",
++ "sha2",
+ ]
+ 
+ [[package]]
+diff --git a/crates/hipfire-kvmem/Cargo.toml b/crates/hipfire-kvmem/Cargo.toml
+index d49a5e6d5..6f705e7d6 100644
+--- a/crates/hipfire-kvmem/Cargo.toml
++++ b/crates/hipfire-kvmem/Cargo.toml
+@@ -14,3 +14,4 @@ path = "src/lib.rs"
+ 
+ [build-dependencies]
+ cc = "1"
++sha2.workspace = true
+diff --git a/crates/hipfire-kvmem/build.rs b/crates/hipfire-kvmem/build.rs
+index a356a1a59..ec0fca722 100644
+--- a/crates/hipfire-kvmem/build.rs
++++ b/crates/hipfire-kvmem/build.rs
+@@ -6,47 +6,230 @@
+ //! KVMem host library into one static archive.
+ //!
+ //! `KVMEM_ROOT` selects the kvmem checkout (default: the sibling directory
+-//! `<workspace>/../kvmem`, i.e. `/mnt/ai/project/kvmem` for this layout). The
+-//! library is host-only C++17 (`kvmem/CMakeLists.txt`'s `add_library(kvmem)`
+-//! source list, no CUDA/HIP), so a plain C++ compiler is enough; the hipfire
+-//! kernels never see a kvmem symbol.
+-
+-use std::path::PathBuf;
+-
+-/// Source list copied from `kvmem/CMakeLists.txt` (`add_library(kvmem ...)`).
+-/// Keeping it explicit (instead of globbing) makes a kvmem-side file addition
+-/// visible here as a build failure rather than silently missing symbols.
+-const KVMEM_HOST_SOURCES: &[&str] = &[
+-    "kvmem_store.cpp",
+-    "kvmem_runtime.cpp",
+-    "raw_kv_store.cpp",
+-    "mean_key_retrieval.cpp",
+-    "graph_recall.cpp",
+-    "layerwise_scoring.cpp",
+-    "layerwise_query.cpp",
+-    "layerwise_request.cpp",
+-    "layerwise_selection.cpp",
+-    "layerwise_probe_selection.cpp",
+-    "layerwise_memory.cpp",
+-    "layerwise_pressure.cpp",
+-    "layerwise_output_scope.cpp",
+-    "layerwise_window.cpp",
+-    "layerwise_import.cpp",
+-    "layerwise_options.cpp",
+-    "query_projection_tape.cpp",
+-    "memory_contract.cpp",
+-    "kv_content.cpp",
+-    "native_kv_payload.cpp",
+-    "host_kv_storage.cpp",
+-    "spill_io.cpp",
+-    "session_memory.cpp",
+-    "prefix_checkpoint.cpp",
+-    "checkpoint_policy.cpp",
+-    "rope.cpp",
+-];
++//! `<workspace>/../kvmem`). The library is host-only C++17 (`kvmem/CMakeLists.txt`
++//! reads the same `kvmem/host-sources.txt` manifest), so a plain C++ compiler is
++//! enough; the hipfire kernels never see a kvmem symbol.
++
++use sha2::{Digest, Sha256};
++use std::collections::BTreeMap;
++use std::fmt::Write as _;
++use std::fs;
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++fn env_flag(name: &str) -> bool {
++    matches!(
++        std::env::var(name).unwrap_or_default().to_ascii_lowercase().as_str(),
++        "1" | "true" | "yes" | "on"
++    )
++}
++
++fn git_head(root: &Path) -> Option<String> {
++    let output = Command::new("git")
++        .arg("-C")
++        .arg(root)
++        .args(["rev-parse", "HEAD"])
++        .output()
++        .ok()?;
++    if !output.status.success() {
++        return None;
++    }
++    let head = String::from_utf8(output.stdout).ok()?.trim().to_owned();
++    (!head.is_empty()).then_some(head)
++}
++
++fn digest_files(root: &Path, paths: &mut [PathBuf]) -> String {
++    paths.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
++    let mut hasher = Sha256::new();
++    for relative in paths.iter() {
++        let display = relative.to_string_lossy().replace('\\', "/");
++        hasher.update(display.as_bytes());
++        hasher.update([0]);
++        let path = root.join(relative);
++        let bytes = fs::read(&path).unwrap_or_else(|error| {
++            panic!("hipfire-kvmem: cannot read {} for pin check: {error}", path.display())
++        });
++        hasher.update(bytes);
++        hasher.update([0]);
++    }
++    let digest = hasher.finalize();
++    let mut output = String::with_capacity(digest.len() * 2);
++    for byte in digest {
++        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
++    }
++    output
++}
++
++fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) {
++    let entries = fs::read_dir(directory).unwrap_or_else(|error| {
++        panic!("hipfire-kvmem: cannot read {}: {error}", directory.display())
++    });
++    for entry in entries {
++        let path = entry.expect("reading a directory entry").path();
++        if path.is_dir() {
++            collect_files(&path, files);
++        } else if path.is_file() {
++            files.push(path);
++        }
++    }
++}
++
++fn include_digest(root: &Path) -> String {
++    let include = root.join("kvmem/include");
++    let mut files = Vec::new();
++    collect_files(&include, &mut files);
++    if files.is_empty() {
++        panic!("hipfire-kvmem: {} has no headers", include.display());
++    }
++    let mut relative: Vec<PathBuf> = files
++        .iter()
++        .map(|path| path.strip_prefix(&include).expect("header under include").to_path_buf())
++        .collect();
++    digest_files(&include, &mut relative)
++}
++
++/// The pin format is intentionally tiny: `key=value` lines, comments allowed.
++fn read_pin(path: &Path) -> BTreeMap<String, String> {
++    let text = fs::read_to_string(path).unwrap_or_else(|error| {
++        panic!("hipfire-kvmem: cannot read pin {}: {error}", path.display())
++    });
++    let mut values = BTreeMap::new();
++    for (lineno, raw) in text.lines().enumerate() {
++        let line = raw.trim();
++        if line.is_empty() || line.starts_with('#') {
++            continue;
++        }
++        let (key, value) = line.split_once('=').unwrap_or_else(|| {
++            panic!("{}:{}: expected key=value", path.display(), lineno + 1)
++        });
++        values.insert(key.trim().to_owned(), value.trim().to_owned());
++    }
++    for key in [
++        "commit",
++        "abi_version",
++        "host_sources_sha256",
++        "include_sha256",
++        "shim_sha256",
++    ] {
++        if !values.contains_key(key) {
++            panic!("hipfire-kvmem: pin {} is missing {key}", path.display());
++        }
++    }
++    values
++}
++
++fn header_abi_version(root: &Path) -> u32 {
++    let path = root.join("backends/hipfire/hipfire_kvmem_shim.h");
++    let text = fs::read_to_string(&path).unwrap_or_else(|error| {
++        panic!("hipfire-kvmem: cannot read {}: {error}", path.display())
++    });
++    for line in text.lines() {
++        let line = line.trim();
++        let Some(rest) = line.strip_prefix("#define HK_ABI_VERSION") else {
++            continue;
++        };
++        let digits: String = rest
++            .trim()
++            .trim_end_matches('u')
++            .chars()
++            .take_while(|character| character.is_ascii_digit())
++            .collect();
++        if let Ok(value) = digits.parse() {
++            return value;
++        }
++    }
++    panic!("hipfire-kvmem: HK_ABI_VERSION is missing from {}", path.display());
++}
++
++fn verify_pin(root: &Path) -> Option<String> {
++    let path = root.join("backends/hipfire/kvmem.pin");
++    if !path.is_file() {
++        if env_flag("KVMEM_REQUIRE_PIN") {
++            panic!(
++                "hipfire-kvmem: {} is missing and KVMEM_REQUIRE_PIN is set",
++                path.display()
++            );
++        }
++        if !env_flag("KVMEM_ALLOW_UNPINNED") {
++            println!(
++                "cargo:warning=hipfire-kvmem: {} is missing; using an unpinned kvmem checkout",
++                path.display()
++            );
++        }
++        return None;
++    }
++
++    let pin = read_pin(&path);
++    let header_abi = header_abi_version(root);
++    let pin_abi: u32 = pin["abi_version"].parse().unwrap_or_else(|_| {
++        panic!("hipfire-kvmem: invalid abi_version in {}", path.display())
++    });
++    if header_abi != pin_abi {
++        panic!(
++            "hipfire-kvmem: abi_version mismatch: pin {pin_abi}, header {header_abi}"
++        );
++    }
++
++    let manifest_digest = {
++        let mut paths = vec![PathBuf::from("host-sources.txt")];
++        digest_files(&root.join("kvmem"), &mut paths)
++    };
++    let actual = [
++        ("host_sources_sha256", manifest_digest),
++        ("include_sha256", include_digest(root)),
++        (
++            "shim_sha256",
++            digest_files(
++                root,
++                &mut [
++                    PathBuf::from("backends/hipfire/hipfire_kvmem_shim.h"),
++                    PathBuf::from("backends/hipfire/hipfire_kvmem_shim.cpp"),
++                ],
++            ),
++        ),
++    ];
++    for (key, digest) in actual {
++        if pin[key] != digest {
++            panic!(
++                "hipfire-kvmem: {key} mismatch: pin {}, actual {digest}; \
++                 run `python3 scripts/hipfire_pin.py --write` in kvmem",
++                pin[key]
++            );
++        }
++    }
++    pin.get("commit").filter(|commit| *commit != "unknown").cloned()
++}
++
++fn verify_expected_commit(root: &Path) {
++    let Ok(expected) = std::env::var("KVMEM_EXPECTED_COMMIT") else {
++        return;
++    };
++    if expected.is_empty() {
++        return;
++    }
++    let expected = expected.to_ascii_lowercase();
++    if expected.len() < 7
++        || expected.len() > 40
++        || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
++    {
++        panic!("hipfire-kvmem: invalid KVMEM_EXPECTED_COMMIT {expected:?}");
++    }
++    let head = git_head(root).unwrap_or_else(|| {
++        panic!(
++            "hipfire-kvmem: cannot verify KVMEM_EXPECTED_COMMIT: {} has no readable git HEAD",
++            root.display()
++        )
++    });
++    if !head.starts_with(&expected) {
++        panic!("hipfire-kvmem: commit mismatch: expected {expected}, actual {head}");
++    }
++}
+ 
+ fn main() {
+     println!("cargo:rerun-if-env-changed=KVMEM_ROOT");
++    println!("cargo:rerun-if-env-changed=KVMEM_REQUIRE_PIN");
++    println!("cargo:rerun-if-env-changed=KVMEM_ALLOW_UNPINNED");
++    println!("cargo:rerun-if-env-changed=KVMEM_EXPECTED_COMMIT");
+     println!("cargo:rerun-if-changed=build.rs");
+ 
+     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+@@ -59,21 +242,42 @@ fn main() {
+     let shim_dir = root.join("backends/hipfire");
+     let host_src = root.join("kvmem/src/host");
+     let shim = shim_dir.join("hipfire_kvmem_shim.cpp");
++    let host_manifest = root.join("kvmem/host-sources.txt");
++    let pin_path = shim_dir.join("kvmem.pin");
+ 
+     for probe in [
+         include.join("kvmem/raw_kv_store.hpp"),
+         shim.clone(),
+         host_src.join("raw_kv_store.cpp"),
++        host_manifest.clone(),
+     ] {
+         if !probe.exists() {
+             panic!(
+                 "hipfire-kvmem: missing {} — point KVMEM_ROOT at a kvmem checkout \
+-                 (kvmem/include + kvmem/src/host + backends/hipfire)",
++                 (kvmem/include + kvmem/src/host + kvmem/host-sources.txt + backends/hipfire)",
+                 probe.display()
+             );
+         }
+     }
+ 
++    let pin_commit = verify_pin(&root);
++    verify_expected_commit(&root);
++    let commit = git_head(&root)
++        .or(pin_commit)
++        .unwrap_or_else(|| "unknown".to_owned());
++
++    let manifest_text = fs::read_to_string(&host_manifest).unwrap_or_else(|error| {
++        panic!("hipfire-kvmem: cannot read {}: {error}", host_manifest.display())
++    });
++    let sources: Vec<&str> = manifest_text
++        .lines()
++        .map(str::trim)
++        .filter(|line| !line.is_empty() && !line.starts_with('#'))
++        .collect();
++    if sources.is_empty() {
++        panic!("hipfire-kvmem: {} lists no host sources", host_manifest.display());
++    }
++
+     let mut build = cc::Build::new();
+     build
+         .cpp(true)
+@@ -90,19 +294,28 @@ fn main() {
+         .include(&shim_dir)
+         .include(&host_src);
+ 
+-    for f in KVMEM_HOST_SOURCES {
+-        let p = host_src.join(f);
+-        if !p.exists() {
++    let commit_define = format!("\"{}\"", commit.replace('\\', "\\\\").replace('"', "\\\""));
++    build.define("KVMEM_COMMIT", Some(commit_define.as_str()));
++
++    for source in sources {
++        let relative = Path::new(source);
++        if relative.is_absolute() || relative.components().any(|part| part.as_os_str() == "..") {
++            panic!("hipfire-kvmem: invalid host source path in manifest: {source}");
++        }
++        let path = root.join("kvmem").join(relative);
++        if !relative.starts_with("src/host") {
++            panic!("hipfire-kvmem: invalid host source path in manifest: {source}");
++        }
++        if !path.exists() {
+             panic!(
+                 "hipfire-kvmem: kvmem host source {} is missing — the kvmem source \
+-                 list moved; update KVMEM_HOST_SOURCES in build.rs",
+-                p.display()
++                 list moved; update kvmem/host-sources.txt",
++                path.display()
+             );
+         }
+-        build.file(p);
++        build.file(path);
+     }
+     build.file(&shim);
+-
+     build.compile("kvmem_hipfire_shim");
+ 
+     // Host-only C++: the Rust link needs the C++ runtime and pthreads.
+@@ -120,4 +333,6 @@ fn main() {
+     println!("cargo:rerun-if-changed={}", include.display());
+     println!("cargo:rerun-if-changed={}", host_src.display());
+     println!("cargo:rerun-if-changed={}", shim_dir.display());
++    println!("cargo:rerun-if-changed={}", host_manifest.display());
++    println!("cargo:rerun-if-changed={}", pin_path.display());
+ }
+diff --git a/crates/hipfire-kvmem/src/abi.rs b/crates/hipfire-kvmem/src/abi.rs
+new file mode 100644
+index 000000000..905d8c4ff
+--- /dev/null
++++ b/crates/hipfire-kvmem/src/abi.rs
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Compile-time guards for the two configuration structs copied into the C ABI.
++//!
++//! The C++ side asserts the same numbers in
++//! `backends/hipfire/hipfire_kvmem_shim.h`. Keep all three in sync when the
++//! shim's `HK_ABI_VERSION` changes.
++
++use std::mem::{align_of, offset_of, size_of};
++
++use super::{KvStoreConfig, RawStoreConfig};
++
++const _: () = {
++    assert!(size_of::<RawStoreConfig>() == 40);
++    assert!(align_of::<RawStoreConfig>() == 8);
++    assert!(offset_of!(RawStoreConfig, n_layer) == 0);
++    assert!(offset_of!(RawStoreConfig, n_embd_k) == 4);
++    assert!(offset_of!(RawStoreConfig, n_embd_v) == 8);
++    assert!(offset_of!(RawStoreConfig, block_tokens) == 12);
++    assert!(offset_of!(RawStoreConfig, k_row_bytes) == 16);
++    assert!(offset_of!(RawStoreConfig, k_gpu_row_bytes) == 24);
++    assert!(offset_of!(RawStoreConfig, v_gpu_row_bytes) == 32);
++};
++
++const _: () = {
++    assert!(size_of::<KvStoreConfig>() == 112);
++    assert!(align_of::<KvStoreConfig>() == 8);
++    assert!(offset_of!(KvStoreConfig, block_tokens) == 0);
++    assert!(offset_of!(KvStoreConfig, select_budget) == 4);
++    assert!(offset_of!(KvStoreConfig, prefill_budget) == 8);
++    assert!(offset_of!(KvStoreConfig, gen_budget) == 12);
++    assert!(offset_of!(KvStoreConfig, sink_blocks) == 16);
++    assert!(offset_of!(KvStoreConfig, recent_blocks) == 20);
++    assert!(offset_of!(KvStoreConfig, select_method) == 24);
++    assert!(offset_of!(KvStoreConfig, retrieval_method) == 28);
++    assert!(offset_of!(KvStoreConfig, update_mode) == 32);
++    assert!(offset_of!(KvStoreConfig, lrfu) == 36);
++    assert!(offset_of!(KvStoreConfig, lrfu_lambda) == 40);
++    assert!(offset_of!(KvStoreConfig, lrfu_top_fraction) == 48);
++    assert!(offset_of!(KvStoreConfig, estimated_gpu_block_capacity) == 56);
++    assert!(offset_of!(KvStoreConfig, gpu_resident_block_bytes) == 64);
++    assert!(offset_of!(KvStoreConfig, estimated_block_bytes) == 72);
++    assert!(offset_of!(KvStoreConfig, cpu_tier_bytes) == 80);
++    assert!(offset_of!(KvStoreConfig, gpu_memory_ratio) == 88);
++    assert!(offset_of!(KvStoreConfig, gpu_high_watermark) == 96);
++    assert!(offset_of!(KvStoreConfig, gpu_low_watermark) == 104);
++};
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index f913c92be..76bd3948c 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -21,6 +21,8 @@ use std::fmt;
+ use std::path::Path;
+ use std::ptr::{self, NonNull};
+ 
++mod abi;
++
+ /// GQA score aggregation for [`mean_key_retrieval_scores`] (Mean = 0, Max = 1).
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum GqaAggregation {
+@@ -50,6 +52,10 @@ impl std::error::Error for KvMemError {}
+ 
+ type Result<T> = std::result::Result<T, KvMemError>;
+ 
++/// C ABI revision implemented by this crate; must match `HK_ABI_VERSION` in
++/// `backends/hipfire/hipfire_kvmem_shim.h`.
++pub const HK_ABI_VERSION: u32 = 1;
++
+ /// `hk_raw_store_config` — mirrors `kvmem::RawKvStoreConfig` (minus the
+ /// storage handle, which is a separate argument).
+ #[repr(C)]
+@@ -1026,6 +1032,8 @@ mod ffi {
+         pub fn hk_last_error() -> *const c_char;
+         pub fn hk_clear_error();
+         pub fn hk_version() -> *const c_char;
++        pub fn hk_abi_version() -> u32;
++        pub fn hk_kvmem_commit() -> *const c_char;
+ 
+         // 期4 speculative contract (kvmem/include/kvmem/speculative.hpp).
+         pub fn hk_speculative_schema_version() -> u32;
+@@ -2154,6 +2162,32 @@ pub fn version() -> String {
+     }
+ }
+ 
++/// The C ABI revision the linked shim actually implements.
++pub fn abi_version() -> u32 {
++    unsafe { ffi::hk_abi_version() }
++}
++
++/// The kvmem commit compiled into the shim (`unknown` for untracked builds).
++pub fn kvmem_commit() -> String {
++    let p = unsafe { ffi::hk_kvmem_commit() };
++    if p.is_null() {
++        String::new()
++    } else {
++        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
++    }
++}
++
++fn ensure_abi() -> Result<()> {
++    let actual = abi_version();
++    if actual != HK_ABI_VERSION {
++        return Err(KvMemError(format!(
++            "C ABI version mismatch: Rust expects {HK_ABI_VERSION}, shim reports {actual}; \
++             rebuild the shim from the same kvmem checkout"
++        )));
++    }
++    Ok(())
++}
++
+ // ── Speculative contract (期4, KVMem/nInfer integration pattern) ──────────
+ //
+ // Configuration/capability/statistics schema shared by every backend. The
+@@ -2207,6 +2241,7 @@ pub struct Storage {
+ 
+ impl Storage {
+     pub fn new_ram(capacity_bytes: u64) -> Result<Self> {
++        ensure_abi()?;
+         Self::new(capacity_bytes, None, 0)
+     }
+ 
+@@ -2215,6 +2250,7 @@ impl Storage {
+         spill_dir: &Path,
+         spill_capacity_bytes: u64,
+     ) -> Result<Self> {
++        ensure_abi()?;
+         Self::new(capacity_bytes, Some(spill_dir), spill_capacity_bytes)
+     }
+ 
+@@ -2280,6 +2316,7 @@ pub struct RawStore {
+ 
+ impl RawStore {
+     pub fn new(cfg: RawStoreConfig, storage: Option<&Storage>) -> Result<Self> {
++        ensure_abi()?;
+         clear_error();
+         let ptr = unsafe {
+             ffi::hk_raw_store_create(
+@@ -2683,6 +2720,7 @@ pub struct KvStore {
+ 
+ impl KvStore {
+     pub fn new(cfg: &KvStoreConfig) -> Result<Self> {
++        ensure_abi()?;
+         clear_error();
+         let ptr = unsafe { ffi::hk_kv_store_create(cfg) };
+         NonNull::new(ptr)
+@@ -3069,6 +3107,7 @@ pub fn mean_key_retrieval_scores(
+     kv_heads: u32,
+     aggregation: GqaAggregation,
+ ) -> Result<Vec<f64>> {
++    ensure_abi()?;
+     let need = layers as usize * query_heads as usize * head_dim as usize;
+     if sums.len() < need {
+         return Err(KvMemError(format!(
+diff --git a/crates/hipfire-kvmem/tests/abi.rs b/crates/hipfire-kvmem/tests/abi.rs
+new file mode 100644
+index 000000000..44986437f
+--- /dev/null
++++ b/crates/hipfire-kvmem/tests/abi.rs
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Runtime ABI diagnostics exposed by the shim. Layout itself is guarded at
++//! compile time by `src/abi.rs`.
++
++use hipfire_kvmem::{abi_version, kvmem_commit, HK_ABI_VERSION};
++
++#[test]
++fn shim_reports_the_expected_abi_and_commit() {
++    assert_eq!(abi_version(), HK_ABI_VERSION);
++    let commit = kvmem_commit();
++    assert!(!commit.is_empty(), "shim must stamp a commit (or 'unknown')");
++}
+diff --git a/crates/hipfire-kvmem/tests/layerwise_probe_smoke.rs b/crates/hipfire-kvmem/tests/layerwise_probe_smoke.rs
+index f0e263dc5..5dab466bb 100644
+--- a/crates/hipfire-kvmem/tests/layerwise_probe_smoke.rs
++++ b/crates/hipfire-kvmem/tests/layerwise_probe_smoke.rs
+@@ -164,7 +164,7 @@ fn append_tile(probe: &ProbeSelection, id: &LayerwiseIdentity, begin: u64, q: &[
+     }
+ }
+ 
+-fn admit(revision: MemoryStamp) -> (ProbeSelection, Storage) {
++fn admit(revision: MemoryStamp) -> (ProbeSelection, Storage, KvStore, RawStore) {
+     let meta = metadata();
+     let pol = policy();
+     let key = keys();
+@@ -173,7 +173,7 @@ fn admit(revision: MemoryStamp) -> (ProbeSelection, Storage) {
+     assert!(bound > 0, "probe metadata bound must be positive");
+     let probe = ProbeSelection::new(&id, &pol, &key, &targets(), move || revision, &meta, &[])
+         .expect("probe create");
+-    (probe, meta)
++    (probe, meta, pol, key)
+ }
+ 
+ #[test]
+@@ -183,7 +183,7 @@ fn global_reduction_selection_and_tiling_invariance() {
+     // tiling-invariant (the core averages L exactly once per token row).
+     let mut reference: Option<Vec<f64>> = None;
+     for chunk in [1u32, 2] {
+-        let (probe, _meta) = admit(stamp());
++        let (probe, _meta, _pol, _key) = admit(stamp());
+         assert_eq!(probe.phase(), ProbePhase::Collecting);
+         assert_eq!(probe.scored_rows(), 0);
+ 
+@@ -278,7 +278,7 @@ fn fail_closed_revision_identity_and_coverage() {
+ 
+     // A foreign request id is Stale; an out-of-order layer is InvalidPlan.
+     {
+-        let (probe, _meta) = admit(stamp());
++        let (probe, _meta, _pol, _key) = admit(stamp());
+         let mut foreign = id;
+         foreign.request += 1;
+         let tile = native_query(&[1.0], 0);
+@@ -312,7 +312,7 @@ fn fail_closed_revision_identity_and_coverage() {
+ 
+ #[test]
+ fn native_scorer_fail_closed() {
+-    let (probe, _meta) = admit(stamp());
++    let (probe, _meta, _pol, _key) = admit(stamp());
+     let id = identity();
+     let tile = native_query(&[1.0, 1.0], 0);
+     // A failing scorer propagates as HK_ERR (never unwinds across the C ABI). The

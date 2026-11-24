@@ -1,31 +1,19 @@
-add_library(kvmem
-    src/host/kvmem_store.cpp
-    src/host/kvmem_runtime.cpp
-    src/host/raw_kv_store.cpp
-    src/host/mean_key_retrieval.cpp
-    src/host/graph_recall.cpp
-    src/host/layerwise_scoring.cpp
-    src/host/layerwise_query.cpp
-    src/host/layerwise_request.cpp
-    src/host/layerwise_selection.cpp
-    src/host/layerwise_probe_selection.cpp
-    src/host/layerwise_memory.cpp
-    src/host/layerwise_pressure.cpp
-    src/host/layerwise_output_scope.cpp
-    src/host/layerwise_window.cpp
-    src/host/layerwise_import.cpp
-    src/host/layerwise_options.cpp
-    src/host/query_projection_tape.cpp
-    src/host/memory_contract.cpp
-    src/host/kv_content.cpp
-    src/host/native_kv_payload.cpp
-    src/host/host_kv_storage.cpp
-    src/host/spill_io.cpp
-    src/host/session_memory.cpp
-    src/host/prefix_checkpoint.cpp
-    src/host/checkpoint_policy.cpp
-    src/host/rope.cpp
-)
+option(KVMEM_BUILD_HIPFIRE_SHIM
+    "Build the hipfire C ABI shim and its host-only smoke test" OFF)
+set(KVMEM_HOST_SOURCES_FILE "${CMAKE_CURRENT_SOURCE_DIR}/host-sources.txt")
+if (NOT EXISTS "${KVMEM_HOST_SOURCES_FILE}")
+    message(FATAL_ERROR "Missing KVMem host source manifest: ${KVMEM_HOST_SOURCES_FILE}")
+endif()
+file(STRINGS "${KVMEM_HOST_SOURCES_FILE}" KVMEM_HOST_SOURCES)
+list(TRANSFORM KVMEM_HOST_SOURCES STRIP)
+list(FILTER KVMEM_HOST_SOURCES EXCLUDE REGEX "^#")
+list(FILTER KVMEM_HOST_SOURCES EXCLUDE REGEX "^$")
+if (NOT KVMEM_HOST_SOURCES)
+    message(FATAL_ERROR "KVMem host source manifest is empty: ${KVMEM_HOST_SOURCES_FILE}")
+endif()
+# Editing the list must reconfigure the embedding build that includes this file.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${KVMEM_HOST_SOURCES_FILE}")
+add_library(kvmem ${KVMEM_HOST_SOURCES})
 add_executable(checkpoint_policy_test tests/checkpoint_policy_test.cpp)
 target_link_libraries(checkpoint_policy_test PRIVATE kvmem)
 add_test(NAME checkpoint_policy_test COMMAND checkpoint_policy_test)
@@ -142,3 +130,28 @@ kvmem_add_test(kvmem_runtime_test)
 kvmem_add_test(raw_kv_store_test)
 kvmem_add_test(packed_kv_snapshot_test)
 kvmem_add_test(token_options_test)
+
+if (KVMEM_BUILD_HIPFIRE_SHIM)
+    set(KVMEM_HIPFIRE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../backends/hipfire")
+    if (NOT EXISTS "${KVMEM_HIPFIRE_DIR}/hipfire_kvmem_shim.cpp")
+        message(FATAL_ERROR "hipfire shim source not found: ${KVMEM_HIPFIRE_DIR}")
+    endif()
+    add_library(kvmem_hipfire_shim STATIC
+        "${KVMEM_HIPFIRE_DIR}/hipfire_kvmem_shim.cpp")
+    target_link_libraries(kvmem_hipfire_shim PUBLIC kvmem)
+    target_include_directories(kvmem_hipfire_shim PUBLIC "${KVMEM_HIPFIRE_DIR}")
+    target_compile_features(kvmem_hipfire_shim PUBLIC cxx_std_17)
+    # Keep the shim's host arithmetic aligned with hipfire's build.rs.
+    target_compile_options(kvmem PRIVATE
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-O2>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-fno-strict-aliasing>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-fopenmp-simd>)
+    target_compile_options(kvmem_hipfire_shim PRIVATE
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-O2>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-fno-strict-aliasing>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-fopenmp-simd>)
+
+    add_executable(hipfire_shim_smoke tests/hipfire_shim_smoke.cpp)
+    target_link_libraries(hipfire_shim_smoke PRIVATE kvmem_hipfire_shim)
+    add_test(NAME hipfire_shim_smoke COMMAND hipfire_shim_smoke)
+endif()

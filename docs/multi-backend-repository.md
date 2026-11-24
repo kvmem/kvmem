@@ -1,9 +1,12 @@
 # Multi-backend repository
 
 The `master` branch contains the 0.18.0 multi-backend KVMem framework.
-The `v0.18.0` tag preserves the release source snapshot. Both engines are
-Git submodules referencing existing upstream projects. The parent commit pins the
-core, adapters, engine revisions and integration patches together.
+The `v0.18.0` tag preserves the release source snapshot. llama.cpp, NInfer and
+PolyStrata are Git submodules referencing existing upstream projects. hipfire is
+an external checkout (`external-checkout-with-patches`) referenced from
+`backends/versions.json` and indexed by `backends/hipfire/upstream.json`; it is
+not a submodule. The parent commit pins the core, adapters, engine revisions and
+integration patches together.
 
 | Path | Ownership |
 |---|---|
@@ -11,6 +14,8 @@ core, adapters, engine revisions and integration patches together.
 | `src/adapter/`, `tools/` | llama.cpp product adapter and serving |
 | `backends/llamacpp/` | Official ggml-org/llama.cpp submodule at a fixed commit |
 | `backends/ninfer/` | iamwavecut/ninfer-all submodule at a fixed commit |
+| `backends/polystrata/` | PolyStrata submodule at a fixed commit |
+| `backends/hipfire/` | hipfire external checkout index, C ABI shim, host-source manifest and `kvmem.pin` |
 | `backends/patches/` | KVMem changes relative to each fixed engine revision |
 | `scripts/windows/` | Build, launcher and packaging entry points |
 | `backends/versions.json` | Baseline revisions, licenses, patch hashes and prepared tree hashes |
@@ -216,6 +221,20 @@ entry records its `id`, repository-relative `path`, SHA-256, preceding `requires
 and exact `after_tree`. The backend's `patched_tree` is the final entry's tree.
 The existing `<backend>-kvmem.patch` stays first. Bonsai format support and its
 optional performance changes are separate layers; see [Bonsai integration](bonsai-integration.md).
+
+hipfire uses a grouped series: `backends/hipfire/upstream.json` contains three
+group patches generated from verified tree snapshots, while
+`upstream-73.json` retains the ordered 73-patch series. The standalone Escha
+baseline and the independently applicable tool/Codex/Bonsai fork base precede
+the contiguous KVMem/feature stack; the later fork patches stay inside that
+stack after the KVMem/legacy layers they depend on. Older archives
+(`upstream-70.json` through `upstream-66.json`) and the original patch files
+under `backends/patches/` remain history, not alternate heads. Regenerate the
+groups with `scripts/repack_hipfire_series.py --write`; validate with `--check`
+or `prepare-backends.py --backend hipfire --check`. Group patches are generated
+diffs and must not be hand-edited. The scheduled upstream merge drill
+reconstructs the series in a temporary clone and reports conflicts without
+touching this checkout; see [upstream merge drill](upstream-merge.md).
 
 Export each binary/full-index Git diff against the preceding prepared tree (the
 first patch uses `base_commit`), including newly added files. Keep patch bytes

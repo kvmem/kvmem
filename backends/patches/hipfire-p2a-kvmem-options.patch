@@ -1,0 +1,1174 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 33735ed1b..593114009 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -72,6 +72,7 @@ use crate::layerwise_mtp::{
+ mod import;
+ mod layerwise;
+ mod legacy;
++mod options;
+ mod plan;
+ mod prefix;
+ mod slot;
+@@ -79,6 +80,7 @@ mod step;
+ mod transfer;
+ 
+ pub use import::*;
++pub use options::{KvMemDiagnostics, KvMemOptions};
+ 
+ /// KVMem blocks are 128 tokens — the engine's page size (`PAGE_TOKENS`).
+ pub const KV_BLOCK_TOKENS: usize = 128;
+@@ -129,31 +131,6 @@ const DEFAULT_GEN_RESERVE: u64 = 1024;
+ /// fits (the slab grows to one page). Mirrors llama's 32 MiB stage-in slab.
+ const XFER_SLAB_CAP: usize = 64 << 20;
+ 
+-fn env_raw(name: &str) -> Option<String> {
+-    hipfire_config::developer_var(name)
+-        .ok()
+-        .map(|v| v.trim().to_string())
+-        .filter(|v| !v.is_empty())
+-}
+-
+-fn env_flag(name: &str) -> bool {
+-    matches!(
+-        env_raw(name).as_deref(),
+-        Some("1") | Some("on") | Some("true")
+-    )
+-}
+-
+-fn env_usize(name: &str) -> Option<usize> {
+-    env_raw(name).and_then(|v| v.parse::<usize>().ok())
+-}
+-
+-/// Diagnostic (`HIPFIRE_KVMEM_VERIFY=1`): checksum spilled/restored page
+-/// bytes and read back each restored page, so a silent page-copy mismatch is
+-/// visible in the log. Debug only; no effect on the copy itself.
+-fn verify_flag() -> bool {
+-    env_flag("HIPFIRE_KVMEM_VERIFY")
+-}
+-
+ fn fnv64(buf: &[u8]) -> u64 {
+     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+     for &b in buf {
+@@ -163,34 +140,6 @@ fn fnv64(buf: &[u8]) -> u64 {
+     h
+ }
+ 
+-/// `HIPFIRE_KVMEM_TIME=1`: print per-call breakdowns of the controller's
+-/// host-side work (feed / selection / spills / restores) so the KVMem cost
+-/// can be separated from the forward's. Off = no clocks taken.
+-fn time_flag() -> bool {
+-    env_flag("HIPFIRE_KVMEM_TIME")
+-}
+-
+-/// `HIPFIRE_KVMEM_BATCH_XFER` (default on): gather spilled/restored pages into
+-/// a reusable pinned slab and move each chunk with stream-ordered async copies
+-/// drained by ONE wait, instead of a blocking null-stream memcpy per page per
+-/// layer. Byte-neutral (same payloads, same arena offsets); set to `0` to fall
+-/// back to the per-page path for A/B timing or rollback. The batched path also
+-/// requires an active steady-copy stream and is skipped during graph capture.
+-fn batch_xfer_flag() -> bool {
+-    !matches!(
+-        env_raw("HIPFIRE_KVMEM_BATCH_XFER").as_deref(),
+-        Some("0") | Some("off") | Some("false")
+-    )
+-}
+-
+-fn env_u64(name: &str) -> Option<u64> {
+-    env_raw(name).and_then(|v| v.parse::<u64>().ok())
+-}
+-
+-fn env_f64(name: &str) -> Option<f64> {
+-    env_raw(name).and_then(|v| v.parse::<f64>().ok())
+-}
+-
+ /// `HIPFIRE_KVMEM_SELECT_METHOD`: `retrieval` (default) | `h2o` | `recency`, or
+ /// the core `KvMemMethod` ordinals 0/1/2. Retrieval feeds the mean-K query
+ /// scores (the historical behaviour); Recency feeds no learned signal so
+@@ -240,7 +189,7 @@ fn parse_recall_strategy(v: &str) -> Option<RecallStrategy> {
+ }
+ 
+ /// Resolve the recall strategy from the raw `HIPFIRE_KVMEM_RECALL_STRATEGY`
+-/// value (already trimmed by [`env_raw`]). Absent → Legacy (the byte-neutral
++/// value (already trimmed by the engine snapshot). Absent → Legacy (the byte-neutral
+ /// default); an unrecognised spelling is rejected loudly rather than silently
+ /// degenerating. Pure so the resolution contract is testable without touching
+ /// the process-start config snapshot.
+@@ -488,7 +437,7 @@ fn resolve_pressure_admission(
+ pub fn requested() -> bool {
+     hipfire_config::active_process_config()
+         .and_then(|process| process.kvmem.as_ref())
+-        .map_or_else(|| env_flag("HIPFIRE_KVMEM"), |config| config.enabled)
++        .is_some_and(|config| config.enabled)
+ }
+ 
+ /// Resolved pool geometry for a KVMem-enabled engine.
+@@ -514,13 +463,15 @@ pub fn resolve_plan(
+     n_slots: usize,
+     cap_tokens: usize,
+     max_step_rows: usize,
++    options: &KvMemOptions,
+ ) -> Result<KvMemPlan, String> {
+     if n_slots == 0 || cap_tokens == 0 {
+         return Err("kvmem: engine has no slots or no token capacity".to_string());
+     }
+     let cap_blocks = cap_tokens.div_ceil(KV_BLOCK_TOKENS).max(1);
+     let grow_blocks = max_step_rows.div_ceil(KV_BLOCK_TOKENS).max(1);
+-    let interval = env_usize("HIPFIRE_KVMEM_SELECT_INTERVAL")
++    let interval = options
++        .plan_select_interval
+         .unwrap_or(DEFAULT_SELECT_INTERVAL)
+         .clamp(1, 256);
+     // Residency transiently overshoots the budget by one step's growth plus
+@@ -531,7 +482,7 @@ pub fn resolve_plan(
+     let headroom = grow_blocks
+         .saturating_add(interval)
+         .saturating_add(1); // the partial tail page
+-    let explicit_pages = env_usize("HIPFIRE_SLOTS_PAGED_PAGES").map(|p| p.max(n_slots));
++    let explicit_pages = options.plan_pages.map(|p| p.max(n_slots));
+     let pages_per_slot = match explicit_pages {
+         Some(total) => (total / n_slots).max(1),
+         None => cap_blocks
+@@ -550,7 +501,7 @@ pub fn resolve_plan(
+             .max(DEFAULT_RESIDENT_FLOOR.min(cap_blocks))
+             .min(pages_per_slot.saturating_sub(1))
+     };
+-    let budget_blocks = match env_usize("HIPFIRE_KVMEM_BUDGET_TOKENS") {
++    let budget_blocks = match options.plan_budget_tokens {
+         Some(tokens) => (tokens / KV_BLOCK_TOKENS).clamp(1, budget_max),
+         None => budget_max,
+     };
+@@ -1001,7 +952,7 @@ pub struct KvMemCtl {
+     /// capacity is `budget_blocks*128 + gen_reserve`. `HIPFIRE_KVMEM_GEN_RESERVE`.
+     gen_reserve: u64,
+     interval: usize,
+-    trace: bool,
++    diagnostics: KvMemDiagnostics,
+     n_fa_layers: usize,
+     n_heads: usize,
+     n_kv_heads: usize,
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
+index 88debaa23..71ca48851 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
+@@ -93,7 +93,7 @@ impl KvMemCtl {
+     pub fn set_layerwise_keep_set(&mut self, slot: usize, keep: Vec<Vec<u64>>) {
+         // D3-A S3 attribution trace (opt-in): the per-layer keep-set is the
+         // refinement input that decides which pages each FA layer attends.
+-        if env_flag("HIPFIRE_KVMEM_TRACE_KEEP") {
++        if self.diagnostics.trace_keep {
+             let mut line = String::new();
+             for (i, ids) in keep.iter().enumerate() {
+                 line.push_str(&format!(" L{i}:"));
+@@ -799,7 +799,7 @@ impl KvMemCtl {
+             return Err(format!("kvmem: feed_rows slot {slot} out of range"));
+         }
+         let n_fa = self.n_fa_layers;
+-        let trace = self.trace;
++        let trace = self.diagnostics.trace;
+         let st = &mut self.slots[slot];
+         if st.fed != pos0 as u32 {
+             return Err(format!(
+@@ -808,7 +808,7 @@ impl KvMemCtl {
+                 st.fed
+             ));
+         }
+-        let timed = time_flag();
++        let timed = self.diagnostics.time;
+         let t_all = std::time::Instant::now();
+         let mut t_read = std::time::Duration::ZERO;
+         let mut t_write = std::time::Duration::ZERO;
+@@ -1031,7 +1031,7 @@ impl KvMemCtl {
+                 GqaAggregation::Mean,
+             )
+             .map_err(|e| format!("kvmem page-softmax scores: {e}"))?;
+-            if self.trace {
++            if self.diagnostics.trace {
+                 let sum: f64 = scores.iter().sum();
+                 let top = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                 eprintln!(
+@@ -1133,6 +1133,7 @@ impl KvMemCtl {
+                 v_page_bytes,
+                 phys,
+                 lp,
++                self.diagnostics.verify,
+             )
+             .map_err(|e| format!("kvmem stage restore: {e}"))?;
+         }
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
+index d99160123..fcebcc469 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
+@@ -211,7 +211,7 @@ impl KvMemCtl {
+             let mut elapsed = std::time::Duration::ZERO;
+             let mut ignored_count = 0;
+             self.flush_spill_batch(
+-                gpu, pool, slot, &spill, k_arenas, v_arenas, time_flag(),
++                gpu, pool, slot, &spill, k_arenas, v_arenas, self.diagnostics.time,
+                 &mut elapsed, &mut ignored_count,
+             )?;
+             self.spill_pages_total += spill.len() as u64;
+@@ -260,7 +260,7 @@ impl KvMemCtl {
+                 copy_legacy_page_to_host(
+                     gpu, &st.raw, &mut self.page_k, &mut self.page_v,
+                     k_arenas, v_arenas, self.k_page_bytes, self.v_page_bytes,
+-                    phys, lp, rows,
++                    phys, lp, rows, self.diagnostics.verify,
+                 )?;
+                 resident_pages.push(lp as u32);
+             } else {
+@@ -370,7 +370,7 @@ impl KvMemCtl {
+             copy_legacy_page_to_device(
+                 gpu, &raw, &mut self.page_k, &mut self.page_v,
+                 k_arenas, v_arenas, self.k_page_bytes, self.v_page_bytes,
+-                phys, lp as usize, rows,
++                phys, lp as usize, rows, self.diagnostics.verify,
+             )?;
+             restored_bytes += (rows * self.n_fa_layers
+                 * (self.k_page_bytes + self.v_page_bytes) / KV_BLOCK_TOKENS) as u64;
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs
+new file mode 100644
+index 000000000..e79824b8c
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs
+@@ -0,0 +1,318 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Start-time KVMem option snapshot.
++//!
++//! The controller must not read the process environment. [`KvMemOptions`] is
++//! built once by the engine from the resolved Legacy config plus the process
++//! snapshot; `KvMemCtl::construct` only consumes the typed fields below.
++
++use super::*;
++
++/// Diagnostic switches. Defaults are all off; callers that need a probe inject
++/// this struct instead of mutating process-global environment in tests.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct KvMemDiagnostics {
++    /// `HIPFIRE_KVMEM_TRACE`: policy/prefix/pack trace lines.
++    pub trace: bool,
++    /// `HIPFIRE_KVMEM_TRACE_KEEP`: per-step keep-set tracing.
++    pub trace_keep: bool,
++    /// `HIPFIRE_KVMEM_TRACE_PAGES`: page pass tracing.
++    pub trace_pages: bool,
++    /// `HIPFIRE_KVMEM_VERIFY`: spill/restore byte checks.
++    pub verify: bool,
++    /// `HIPFIRE_KVMEM_TIME`: host-side timing breakdowns.
++    pub time: bool,
++}
++
++/// Typed start-time snapshot consumed by the controller.
++///
++/// Values are intentionally raw options: field validation and Legacy-over-env
++/// precedence stay in [`KvMemCtl::construct`], except for the page-count
++/// lexeme and strategy spelling, which fail closed here because they gate
++/// admission. The engine is the only place that reads the process snapshot.
++#[derive(Debug, Clone)]
++pub struct KvMemOptions {
++    pub strategy: RecallStrategy,
++    pub plan_select_interval: Option<usize>,
++    pub plan_pages: Option<usize>,
++    pub plan_budget_tokens: Option<usize>,
++    pub sink_blocks: Option<usize>,
++    pub recent_blocks: Option<usize>,
++    pub gen_reserve: Option<u64>,
++    pub checkpoint_policy: Option<String>,
++    pub checkpoint_count: Option<usize>,
++    pub checkpoint_mib: Option<u64>,
++    pub checkpoint_interval: Option<u64>,
++    pub checkpoint_min_gap: Option<u64>,
++    pub lrfu: Option<bool>,
++    pub lrfu_lambda: Option<f64>,
++    pub lrfu_top: Option<f64>,
++    pub select_method: Option<String>,
++    pub watermark_high: Option<f64>,
++    pub watermark_low: Option<f64>,
++    pub query_span: Option<usize>,
++    pub layerwise_mtp_history: Option<String>,
++    pub host_bytes: Option<u64>,
++    pub content_groups: Option<usize>,
++    pub content_cache_dir: Option<String>,
++    pub content_cache_bytes: Option<u64>,
++    pub spill_dir: Option<String>,
++    pub spill_bytes: Option<u64>,
++    pub layerwise_activation_ram_mib: Option<String>,
++    pub layerwise_activation_disk_mib: Option<String>,
++    pub layerwise_staging_mib: Option<String>,
++    pub layerwise_metadata_mib: Option<String>,
++    pub layerwise_activation_metadata_mib: Option<String>,
++    pub batch_xfer: bool,
++    pub diagnostics: KvMemDiagnostics,
++}
++
++impl KvMemOptions {
++    /// Build the snapshot from the resolved Legacy config and a raw value
++    /// getter. The getter is the engine's process snapshot (`developer_var` in
++    /// production, `std::env` in unit tests); this function itself does no I/O.
++    pub fn resolve<F>(
++        config: Option<&hipfire_config::kvmem::ResolvedConfig>,
++        raw: F,
++    ) -> Result<KvMemOptions, String>
++    where
++        F: FnMut(&str) -> Option<String>,
++    {
++        resolve_fields(config, raw)
++    }
++
++    /// Test-only convenience: the same snapshot from the live process
++    /// environment. Production callers pass the engine's `developer_var` getter.
++    #[cfg(test)]
++    pub(crate) fn from_process_env(
++        config: Option<&hipfire_config::kvmem::ResolvedConfig>,
++    ) -> Result<KvMemOptions, String> {
++        KvMemOptions::resolve(config, |name| std::env::var(name).ok())
++    }
++}
++
++impl Default for KvMemOptions {
++    fn default() -> Self {
++        Self {
++            strategy: RecallStrategy::Legacy,
++            plan_select_interval: None,
++            plan_pages: None,
++            plan_budget_tokens: None,
++            sink_blocks: None,
++            recent_blocks: None,
++            gen_reserve: None,
++            checkpoint_policy: None,
++            checkpoint_count: None,
++            checkpoint_mib: None,
++            checkpoint_interval: None,
++            checkpoint_min_gap: None,
++            lrfu: None,
++            lrfu_lambda: None,
++            lrfu_top: None,
++            select_method: None,
++            watermark_high: None,
++            watermark_low: None,
++            query_span: None,
++            layerwise_mtp_history: None,
++            host_bytes: None,
++            content_groups: None,
++            content_cache_dir: None,
++            content_cache_bytes: None,
++            spill_dir: None,
++            spill_bytes: None,
++            layerwise_activation_ram_mib: None,
++            layerwise_activation_disk_mib: None,
++            layerwise_staging_mib: None,
++            layerwise_metadata_mib: None,
++            layerwise_activation_metadata_mib: None,
++            batch_xfer: true,
++            diagnostics: KvMemDiagnostics::default(),
++        }
++    }
++}
++
++fn enabled(raw: Option<&str>) -> bool {
++    matches!(raw, Some("1") | Some("on") | Some("true"))
++}
++
++/// Preserve the two historical page-count contracts: the resolved-config
++/// branch rejects any non-decimal or out-of-range value, while the plain
++/// env branch keeps the old `env_usize` leniency (trim, invalid/empty = unset).
++fn resolve_plan_pages(
++    config_present: bool,
++    raw: Option<String>,
++) -> Result<Option<usize>, String> {
++    if config_present {
++        let Some(value) = raw else {
++            return Ok(None);
++        };
++        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
++            return Err(
++                "kvmem: HIPFIRE_SLOTS_PAGED_PAGES requires a positive decimal integer".to_string(),
++            );
++        }
++        let pages = value
++            .parse::<usize>()
++            .map_err(|_| "kvmem: physical page count overflow".to_string())?;
++        if pages == 0 || pages > i32::MAX as usize {
++            return Err("kvmem: physical page count must be in 1..=2147483647".to_string());
++        }
++        Ok(Some(pages))
++    } else {
++        Ok(raw
++            .map(|v| v.trim().to_string())
++            .filter(|v| !v.is_empty())
++            .and_then(|v| v.parse::<usize>().ok()))
++    }
++}
++
++/// Build the snapshot from the resolved Legacy config and a raw value getter.
++/// The getter is the engine's process snapshot (`developer_var` in production,
++/// `std::env` in unit tests); this function itself performs no I/O.
++fn resolve_fields<F>(
++    config: Option<&hipfire_config::kvmem::ResolvedConfig>,
++    mut raw: F,
++) -> Result<KvMemOptions, String>
++where
++    F: FnMut(&str) -> Option<String>,
++{
++    let plan_pages_raw = raw("HIPFIRE_SLOTS_PAGED_PAGES");
++    let mut get = |name: &str| {
++        raw(name)
++            .map(|v| v.trim().to_string())
++            .filter(|v| !v.is_empty())
++    };
++    let select_interval = get("HIPFIRE_KVMEM_SELECT_INTERVAL").and_then(|v| v.parse().ok());
++    let plan_pages = resolve_plan_pages(config.is_some(), plan_pages_raw)?;
++    let plan_budget_tokens = get("HIPFIRE_KVMEM_BUDGET_TOKENS").and_then(|v| v.parse().ok());
++    let strategy = match config {
++        // A resolved Legacy config owns the public contract; the controller
++        // already rejects any non-Legacy resolution for it.
++        Some(_) => RecallStrategy::Legacy,
++        None => resolve_recall_strategy(get("HIPFIRE_KVMEM_RECALL_STRATEGY"))?,
++    };
++    Ok(KvMemOptions {
++        strategy,
++        plan_select_interval: select_interval,
++        plan_pages,
++        plan_budget_tokens,
++        sink_blocks: get("HIPFIRE_KVMEM_SINK_BLOCKS").and_then(|v| v.parse().ok()),
++        recent_blocks: get("HIPFIRE_KVMEM_RECENT_BLOCKS").and_then(|v| v.parse().ok()),
++        gen_reserve: get("HIPFIRE_KVMEM_GEN_RESERVE").and_then(|v| v.parse().ok()),
++        checkpoint_policy: get("HIPFIRE_KVMEM_CHECKPOINT_POLICY"),
++        checkpoint_count: get("HIPFIRE_KVMEM_CHECKPOINT_COUNT").and_then(|v| v.parse().ok()),
++        checkpoint_mib: get("HIPFIRE_KVMEM_CHECKPOINT_MIB").and_then(|v| v.parse().ok()),
++        checkpoint_interval: get("HIPFIRE_KVMEM_CHECKPOINT_INTERVAL")
++            .and_then(|v| v.parse().ok()),
++        checkpoint_min_gap: get("HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP").and_then(|v| v.parse().ok()),
++        lrfu: get("HIPFIRE_KVMEM_LRFU").map(|v| enabled(Some(&v))),
++        lrfu_lambda: get("HIPFIRE_KVMEM_LRFU_LAMBDA").and_then(|v| v.parse().ok()),
++        lrfu_top: get("HIPFIRE_KVMEM_LRFU_TOP").and_then(|v| v.parse().ok()),
++        select_method: get("HIPFIRE_KVMEM_SELECT_METHOD"),
++        watermark_high: get("HIPFIRE_KVMEM_GPU_HIGH_WATERMARK")
++            .and_then(|v| v.parse().ok()),
++        watermark_low: get("HIPFIRE_KVMEM_GPU_LOW_WATERMARK").and_then(|v| v.parse().ok()),
++        query_span: get("HIPFIRE_KVMEM_QUERY_SPAN").and_then(|v| v.parse().ok()),
++        layerwise_mtp_history: get("HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY"),
++        host_bytes: get("HIPFIRE_KVMEM_HOST_BYTES").and_then(|v| v.parse().ok()),
++        content_groups: get("HIPFIRE_KVMEM_CONTENT_GROUPS").and_then(|v| v.parse().ok()),
++        content_cache_dir: get("HIPFIRE_KVMEM_CACHE_DIR"),
++        content_cache_bytes: get("HIPFIRE_KVMEM_CACHE_BYTES").and_then(|v| v.parse().ok()),
++        spill_dir: get("HIPFIRE_KVMEM_SPILL_DIR"),
++        spill_bytes: get("HIPFIRE_KVMEM_SPILL_BYTES").and_then(|v| v.parse().ok()),
++        layerwise_activation_ram_mib: get("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB"),
++        layerwise_activation_disk_mib: get("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB"),
++        layerwise_staging_mib: get("HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB"),
++        layerwise_metadata_mib: get("HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB"),
++        layerwise_activation_metadata_mib: get(
++            "HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB",
++        ),
++        batch_xfer: !matches!(
++            get("HIPFIRE_KVMEM_BATCH_XFER").as_deref(),
++            Some("0") | Some("off") | Some("false")
++        ),
++        diagnostics: KvMemDiagnostics {
++            trace: enabled(get("HIPFIRE_KVMEM_TRACE").as_deref()),
++            trace_keep: enabled(get("HIPFIRE_KVMEM_TRACE_KEEP").as_deref()),
++            trace_pages: enabled(get("HIPFIRE_KVMEM_TRACE_PAGES").as_deref()),
++            verify: enabled(get("HIPFIRE_KVMEM_VERIFY").as_deref()),
++            time: enabled(get("HIPFIRE_KVMEM_TIME").as_deref()),
++        },
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn snapshot(pairs: &[(&str, &str)]) -> Result<KvMemOptions, String> {
++        KvMemOptions::resolve(None, |name| {
++            pairs
++                .iter()
++                .find_map(|(key, value)| (*key == name).then(|| (*value).to_string()))
++        })
++    }
++
++    #[test]
++    fn snapshot_captures_policy_and_diagnostics_without_io() {
++        let options = snapshot(&[
++            ("HIPFIRE_KVMEM_RECALL_STRATEGY", "layerwise"),
++            ("HIPFIRE_KVMEM_SELECT_INTERVAL", "32"),
++            ("HIPFIRE_SLOTS_PAGED_PAGES", "4096"),
++            ("HIPFIRE_KVMEM_BUDGET_TOKENS", "65536"),
++            ("HIPFIRE_KVMEM_TRACE", "on"),
++            ("HIPFIRE_KVMEM_VERIFY", "1"),
++            ("HIPFIRE_KVMEM_BATCH_XFER", "off"),
++        ])
++        .expect("snapshot");
++        assert_eq!(options.strategy, RecallStrategy::Layerwise);
++        assert_eq!(options.plan_select_interval, Some(32));
++        assert_eq!(options.plan_pages, Some(4096));
++        assert_eq!(options.plan_budget_tokens, Some(65536));
++        assert!(options.diagnostics.trace);
++        assert!(options.diagnostics.verify);
++        assert!(!options.diagnostics.trace_keep);
++        assert!(!options.batch_xfer);
++    }
++
++    #[test]
++    fn plan_pages_config_keeps_the_strict_lexeme_contract() {
++        for bad in ["", "0", "-1", "+1", "1.5", " 1", "1 ", "１２８", "2147483648"] {
++            assert!(
++                resolve_plan_pages(true, Some(bad.into())).is_err(),
++                "pages={bad:?}"
++            );
++        }
++        assert_eq!(
++            resolve_plan_pages(true, Some("2147483647".into())).unwrap(),
++            Some(i32::MAX as usize)
++        );
++        assert_eq!(resolve_plan_pages(true, None).unwrap(), None);
++    }
++
++    #[test]
++    fn plan_pages_env_keeps_the_old_lenient_contract() {
++        for (value, expected) in [
++            (" 1 ", Some(1)),
++            ("+1", Some(1)),
++            ("0", Some(0)),
++            ("", None),
++            ("invalid", None),
++            ("999999999999999999999999999999999999", None),
++        ] {
++            assert_eq!(
++                resolve_plan_pages(false, Some(value.into())).unwrap(),
++                expected,
++                "pages={value:?}"
++            );
++        }
++        assert_eq!(resolve_plan_pages(false, None).unwrap(), None);
++    }
++
++    #[test]
++    fn strategy_spelling_is_fail_closed() {
++        assert!(snapshot(&[("HIPFIRE_KVMEM_RECALL_STRATEGY", "layers")]).is_err());
++    }
++}
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
+index 0ecd51adf..524524200 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
+@@ -10,25 +10,29 @@ impl KvMemCtl {
+         plan: &KvMemPlan,
+         geom: &KvMemGeometry,
+     ) -> Result<Self, String> {
+-        let strategy = resolve_recall_strategy(env_raw("HIPFIRE_KVMEM_RECALL_STRATEGY"))?;
+-        Self::new_with_strategy(n_slots, plan, geom, strategy)
++        #[cfg(test)]
++        let options = KvMemOptions::from_process_env(None)?;
++        #[cfg(not(test))]
++        let options = KvMemOptions::default();
++        Self::construct(n_slots, plan, geom, options, None)
+     }
+ 
+     /// Construct with the recall strategy injected instead of read from the
+-    /// process config. The config is a START-TIME SNAPSHOT
+-    /// (`hipfire_config::active_or_local_process_config` is a `OnceLock`), so a
+-    /// test that `set_var`s `HIPFIRE_KVMEM_RECALL_STRATEGY` after the first
+-    /// config read would be an order-dependent coin flip; injecting the strategy
+-    /// avoids that. `pub(crate)` so the cross-module P4.1② G1 driver fixture can
+-    /// construct a Layerwise controller deterministically (the env-snapshot
+-    /// `new` cannot). Visibility-only widening — no production behaviour change.
++    /// process config. This is the deterministic test seam: callers inject the
++    /// strategy and (under `cfg(test)`) the remaining optional knobs come from
++    /// the test process environment through [`KvMemOptions::from_process_env`].
+     pub(crate) fn new_with_strategy(
+         n_slots: usize,
+         plan: &KvMemPlan,
+         geom: &KvMemGeometry,
+         strategy: RecallStrategy,
+     ) -> Result<Self, String> {
+-        Self::construct(n_slots, plan, geom, strategy, None)
++        #[cfg(test)]
++        let mut options = KvMemOptions::from_process_env(None)?;
++        #[cfg(not(test))]
++        let mut options = KvMemOptions::default();
++        options.strategy = strategy;
++        Self::construct(n_slots, plan, geom, options, None)
+     }
+ 
+     pub fn new_with_config(
+@@ -36,6 +40,7 @@ impl KvMemCtl {
+         plan: &KvMemPlan,
+         geom: &KvMemGeometry,
+         config: Option<&hipfire_config::kvmem::ResolvedConfig>,
++        mut options: KvMemOptions,
+     ) -> Result<Self, String> {
+         match config {
+             Some(config) => {
+@@ -44,9 +49,10 @@ impl KvMemCtl {
+                 {
+                     return Err("kvmem: resolved Legacy configuration differs from admitted pool geometry".into());
+                 }
+-                Self::construct(n_slots, plan, geom, RecallStrategy::Legacy, Some(config.clone()))
++                options.strategy = RecallStrategy::Legacy;
++                Self::construct(n_slots, plan, geom, options, Some(config.clone()))
+             }
+-            None => Self::new(n_slots, plan, geom),
++            None => Self::construct(n_slots, plan, geom, options, None),
+         }
+     }
+ 
+@@ -54,9 +60,10 @@ impl KvMemCtl {
+         n_slots: usize,
+         plan: &KvMemPlan,
+         geom: &KvMemGeometry,
+-        strategy: RecallStrategy,
++        options: KvMemOptions,
+         legacy: Option<hipfire_config::kvmem::ResolvedConfig>,
+     ) -> Result<Self, String> {
++        let strategy = options.strategy;
+         if n_slots == 0 || geom.n_fa_layers == 0 || geom.head_dim == 0 {
+             return Err("kvmem: zero-sized controller request".to_string());
+         }
+@@ -84,11 +91,11 @@ impl KvMemCtl {
+             v_gpu_row_bytes: geom.per_pos_v_bytes as u64,
+         };
+         let sink = legacy.as_ref().map_or_else(
+-            || env_usize("HIPFIRE_KVMEM_SINK_BLOCKS").unwrap_or(1),
++            || options.sink_blocks.unwrap_or(1),
+             |c| c.sink_tokens as usize / KV_BLOCK_TOKENS,
+         );
+         let recent = legacy.as_ref().map_or_else(
+-            || env_usize("HIPFIRE_KVMEM_RECENT_BLOCKS").unwrap_or(1),
++            || options.recent_blocks.unwrap_or(1),
+             |c| c.recent_tokens as usize / KV_BLOCK_TOKENS,
+         );
+         if sink + recent > plan.budget_blocks {
+@@ -101,18 +108,18 @@ impl KvMemCtl {
+         }
+         let budget_tokens = (plan.budget_blocks * KV_BLOCK_TOKENS) as u32;
+         let gen_reserve = legacy.as_ref().map_or_else(
+-            || env_u64("HIPFIRE_KVMEM_GEN_RESERVE").unwrap_or(DEFAULT_GEN_RESERVE),
++            || options.gen_reserve.unwrap_or(DEFAULT_GEN_RESERVE),
+             |c| u64::from(c.gen_reserve_tokens),
+         );
+         if gen_reserve == 0 {
+             return Err("kvmem: HIPFIRE_KVMEM_GEN_RESERVE must be positive".to_string());
+         }
+-        let checkpoint_retention = match env_raw("HIPFIRE_KVMEM_CHECKPOINT_POLICY").as_deref() {
++        let checkpoint_retention = match options.checkpoint_policy.as_deref() {
+             Some("spread") => {
+-                let count = env_usize("HIPFIRE_KVMEM_CHECKPOINT_COUNT").unwrap_or(4).clamp(1, 64);
+-                let mib = env_u64("HIPFIRE_KVMEM_CHECKPOINT_MIB").unwrap_or(512).max(1);
+-                let interval = env_u64("HIPFIRE_KVMEM_CHECKPOINT_INTERVAL").unwrap_or(4096).max(1);
+-                let min_gap = env_u64("HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP").unwrap_or(0);
++                let count = options.checkpoint_count.unwrap_or(4).clamp(1, 64);
++                let mib = options.checkpoint_mib.unwrap_or(512).max(1);
++                let interval = options.checkpoint_interval.unwrap_or(4096).max(1);
++                let min_gap = options.checkpoint_min_gap.unwrap_or(0);
+                 Some((count, mib << 20, interval, min_gap))
+             }
+             _ => None,
+@@ -121,15 +128,15 @@ impl KvMemCtl {
+         // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
+         // LRFU replaces the raw retrieval score with a decaying heavy-hitter
+         // history in the core's `selection_score`; lambda/top tune that decay.
+-        let lrfu = legacy.as_ref().map_or_else(|| env_flag("HIPFIRE_KVMEM_LRFU"), |c| c.lrfu);
++        let lrfu = legacy.as_ref().map_or_else(|| options.lrfu.unwrap_or(false), |c| c.lrfu);
+         let lrfu_lambda = legacy.as_ref().map_or_else(
+-            || env_f64("HIPFIRE_KVMEM_LRFU_LAMBDA").unwrap_or(0.5), |c| c.lrfu_lambda,
++            || options.lrfu_lambda.unwrap_or(0.5), |c| c.lrfu_lambda,
+         );
+         let lrfu_top = legacy.as_ref().map_or_else(
+-            || env_f64("HIPFIRE_KVMEM_LRFU_TOP").unwrap_or(0.9), |c| c.lrfu_top_fraction,
++            || options.lrfu_top.unwrap_or(0.9), |c| c.lrfu_top_fraction,
+         );
+         let select_method = match legacy.as_ref().map(|_| "retrieval".to_string())
+-            .or_else(|| env_raw("HIPFIRE_KVMEM_SELECT_METHOD")) {
++            .or_else(|| options.select_method.clone()) {
+             Some(v) => parse_select_method(&v).ok_or_else(|| {
+                 format!("kvmem: HIPFIRE_KVMEM_SELECT_METHOD={v} invalid (retrieval|h2o|recency)")
+             })?,
+@@ -157,8 +164,8 @@ impl KvMemCtl {
+         }
+         // Watermark ratios are stored on the config; the page thresholds are
+         // derived from the CORE watermark functions after the stores exist.
+-        let wm_high_env = if legacy.is_none() { env_f64("HIPFIRE_KVMEM_GPU_HIGH_WATERMARK") } else { None };
+-        let wm_low_env = if legacy.is_none() { env_f64("HIPFIRE_KVMEM_GPU_LOW_WATERMARK") } else { None };
++        let wm_high_env = if legacy.is_none() { options.watermark_high } else { None };
++        let wm_low_env = if legacy.is_none() { options.watermark_low } else { None };
+         let watermark_enabled = wm_high_env.is_some() || wm_low_env.is_some();
+         let wm_high = wm_high_env.unwrap_or(0.95);
+         let wm_low = wm_low_env.unwrap_or(0.85);
+@@ -176,7 +183,7 @@ impl KvMemCtl {
+         // Query span: 1 keeps the single-row mean-K retrieval (byte-identical);
+         // >1 accumulates a per-slot host Q ring and scores by page-softmax.
+         let query_span = if legacy.is_some() { 1 } else {
+-            env_usize("HIPFIRE_KVMEM_QUERY_SPAN").unwrap_or(1)
++            options.query_span.unwrap_or(1)
+         };
+         if !(1..=512).contains(&query_span) {
+             return Err(format!(
+@@ -195,7 +202,7 @@ impl KvMemCtl {
+         // Layerwise+MTP; UpstreamGlobal opt-in via env). Legacy / AR-only carry
+         // Unspecified unread, so the default serve stays byte-neutral.
+         let layerwise_mtp_history = resolve_layerwise_mtp_history(
+-            env_raw("HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY"),
++            options.layerwise_mtp_history.clone(),
+             strategy,
+             geom.mtp_head,
+         )?;
+@@ -224,12 +231,12 @@ impl KvMemCtl {
+         };
+ 
+         let host_bytes = legacy.as_ref().map_or_else(
+-            || env_u64("HIPFIRE_KVMEM_HOST_BYTES").unwrap_or(DEFAULT_HOST_BYTES).max(1),
++            || options.host_bytes.unwrap_or(DEFAULT_HOST_BYTES).max(1),
+             |c| c.host_bytes,
+         );
+         // 期3 G3: internal content groups (fairness-only; ninfer
+         // `--kvmem-sessions` analogue). 0 keeps the historical LRU catalog.
+-        let content_groups = env_usize("HIPFIRE_KVMEM_CONTENT_GROUPS").unwrap_or(0);
++        let content_groups = options.content_groups.unwrap_or(0);
+         if content_groups > 1024 {
+             return Err(format!(
+                 "kvmem: HIPFIRE_KVMEM_CONTENT_GROUPS={content_groups} out of range [0,1024]"
+@@ -239,12 +246,12 @@ impl KvMemCtl {
+         // pack tier. Packs are the one persistent copy, billed under
+         // `HIPFIRE_KVMEM_CACHE_BYTES` and separate from the spill account;
+         // there is no second storage account (the cache metrics stay 0).
+-        let content_cache_dir = env_raw("HIPFIRE_KVMEM_CACHE_DIR").filter(|d| !d.is_empty());
++        let content_cache_dir = options.content_cache_dir.clone().filter(|d| !d.is_empty());
+         if let Some(dir) = content_cache_dir.as_ref() {
+             let dir = PathBuf::from(dir);
+             std::fs::create_dir_all(&dir)
+                 .map_err(|e| format!("kvmem cache dir {}: {e}", dir.display()))?;
+-            if let Some(spill) = env_raw("HIPFIRE_KVMEM_SPILL_DIR") {
++            if let Some(spill) = options.spill_dir.clone() {
+                 if !spill.is_empty() && PathBuf::from(&spill) == dir {
+                     return Err("kvmem: HIPFIRE_KVMEM_CACHE_DIR must differ from \
+                                 HIPFIRE_KVMEM_SPILL_DIR (separate accounts)"
+@@ -256,7 +263,7 @@ impl KvMemCtl {
+ 
+         // 期3 G3 P1.1: pack files live beside the content account; scanning
+         // here rebuilds the cold index after a restart (metadata only).
+-        let cold_bytes = env_u64("HIPFIRE_KVMEM_CACHE_BYTES")
++        let cold_bytes = options.content_cache_bytes
+             .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES)
+             .max(1);
+         let cold_dir = content_cache_dir;
+@@ -273,8 +280,8 @@ impl KvMemCtl {
+         let (spill_dir, spill_bytes) = match legacy.as_ref() {
+             Some(c) => (c.disk_path.clone(), c.disk_bytes),
+             None => (
+-                env_raw("HIPFIRE_KVMEM_SPILL_DIR").map(PathBuf::from),
+-                env_u64("HIPFIRE_KVMEM_SPILL_BYTES").unwrap_or(DEFAULT_SPILL_BYTES).max(1),
++                options.spill_dir.clone().map(PathBuf::from),
++                options.spill_bytes.unwrap_or(DEFAULT_SPILL_BYTES).max(1),
+             ),
+         };
+         let storage = match spill_dir {
+@@ -350,7 +357,7 @@ impl KvMemCtl {
+             None
+         };
+ 
+-        if (time_flag() || env_flag("HIPFIRE_KVMEM_TRACE"))
++        if (options.diagnostics.time || options.diagnostics.trace)
+             && (lrfu || select_method != 0 || watermark_enabled || query_span > 1 || strategy.is_layerwise())
+         {
+             eprintln!(
+@@ -366,12 +373,12 @@ impl KvMemCtl {
+         // change the byte-neutral default path (design §3.11).
+         let layerwise_quotas = if strategy.is_layerwise() {
+             resolve_layerwise_quotas(
+-                env_raw("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB"),
+-                env_raw("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB"),
+-                env_raw("HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB"),
+-                env_raw("HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB"),
+-                env_raw("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB"),
+-                env_raw("HIPFIRE_KVMEM_SPILL_DIR").map(PathBuf::from),
++                options.layerwise_activation_ram_mib.clone(),
++                options.layerwise_activation_disk_mib.clone(),
++                options.layerwise_staging_mib.clone(),
++                options.layerwise_metadata_mib.clone(),
++                options.layerwise_activation_metadata_mib.clone(),
++                options.spill_dir.clone().map(PathBuf::from),
+             )?
+         } else {
+             LayerwiseQuotas::default()
+@@ -385,7 +392,7 @@ impl KvMemCtl {
+             legacy,
+             budget_blocks: plan.budget_blocks,
+             interval: plan.interval,
+-            trace: env_flag("HIPFIRE_KVMEM_TRACE"),
++            diagnostics: options.diagnostics,
+             n_fa_layers: geom.n_fa_layers,
+             n_heads: geom.n_heads,
+             n_kv_heads: geom.n_kv_heads,
+@@ -412,7 +419,7 @@ impl KvMemCtl {
+                 c
+             },
+             xfer_slab: None,
+-            batch_xfer: batch_xfer_flag(),
++            batch_xfer: options.batch_xfer,
+             strategy,
+             layerwise_quotas,
+             select_method,
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
+index f144ba1bd..631825301 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
+@@ -130,11 +130,7 @@ impl KvMemCtl {
+         entry.group = st.convo_group;
+         entry.media_digest = media_digest;
+         entry.media_spans = media_spans.clone();
+-        if self.content_groups > 0
+-            && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+-                .ok()
+-                .is_some_and(|v| v == "1" || v == "on" || v == "true")
+-        {
++        if self.content_groups > 0 && self.diagnostics.trace {
+             eprintln!(
+                 "[kvmem-content] freeze slot={slot} frontier={frontier} group={} entries={}",
+                 st.convo_group,
+@@ -181,10 +177,7 @@ impl KvMemCtl {
+                     .map(|m| m.len() >= SIDECAR_MIN_BYTES)
+                     .unwrap_or(false);
+             let written = if complete_pair {
+-                if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+-                    .ok()
+-                    .is_some_and(|v| v == "1" || v == "on" || v == "true")
+-                {
++                if self.diagnostics.trace {
+                     eprintln!(
+                         "[kvmem-pack] reuse complete pack+sidecar frontier={frontier}"
+                     );
+@@ -216,11 +209,7 @@ impl KvMemCtl {
+                         });
+                     }
+                     let removed = self.cold_packs.prune_to(self.cold_bytes);
+-                    if !removed.is_empty()
+-                        && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+-                            .ok()
+-                            .is_some_and(|v| v == "1" || v == "on" || v == "true")
+-                    {
++                    if !removed.is_empty() && self.diagnostics.trace {
+                         eprintln!(
+                             "[kvmem-pack] pruned {} pack(s), {} bytes retained",
+                             removed.len(),
+@@ -304,10 +293,7 @@ impl KvMemCtl {
+                     }
+                     self.cold_pack_hits_total += 1;
+                     self.prefix_hits_total += 1;
+-                    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+-                        .ok()
+-                        .is_some_and(|v| v == "1" || v == "on" || v == "true")
+-                    {
++                    if self.diagnostics.trace {
+                         eprintln!(
+                             "[kvmem-pack] cold hit frontier={} path={}",
+                             pack.meta.frontier,
+@@ -325,10 +311,7 @@ impl KvMemCtl {
+         // G7 Stage E probe: distinguish a media-identity refusal from a token
+         // proof miss. The candidate below proves by FULL token equality; only
+         // the image identity gate refused it. Trace-only, read-only.
+-        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+-            .ok()
+-            .is_some_and(|v| v == "1" || v == "on" || v == "true")
+-        {
++        if self.diagnostics.trace {
+             let layout = layout_fingerprint(&self.raw_cfg);
+             let rejected = self
+                 .prefix_catalog
+@@ -446,10 +429,7 @@ impl KvMemCtl {
+         } else {
+             // G7 Stage E probe: a capped lookup narrowed to `max_frontier` can
+             // miss on the media identity alone; name the refused candidate.
+-            if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+-                .ok()
+-                .is_some_and(|v| v == "1" || v == "on" || v == "true")
+-            {
++            if self.diagnostics.trace {
+                 if let Some((frontier, digest)) =
+                     self.prefix_catalog.probe_media_reject(prompt, layout, media)
+                 {
+@@ -622,11 +602,7 @@ impl KvMemCtl {
+             return;
+         }
+         let removed = self.cold_packs.prune_to(self.cold_bytes);
+-        if !removed.is_empty()
+-            && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+-                .ok()
+-                .is_some_and(|v| v == "1" || v == "on" || v == "true")
+-        {
++        if !removed.is_empty() && self.diagnostics.trace {
+             eprintln!(
+                 "[kvmem-pack] pruned {} pack(s), {} disk bytes retained",
+                 removed.len(),
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/step.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/step.rs
+index b31b640a2..27ffd0421 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/step.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/step.rs
+@@ -21,7 +21,7 @@ impl KvMemCtl {
+         debug_assert_eq!(k_arenas.len(), self.n_fa_layers);
+         debug_assert_eq!(v_arenas.len(), self.n_fa_layers);
+         let n_slots = self.slots.len();
+-        let timed = time_flag();
++        let timed = self.diagnostics.time;
+         let t_all = std::time::Instant::now();
+         let mut t_select = std::time::Duration::ZERO;
+         let mut t_spill = std::time::Duration::ZERO;
+@@ -199,7 +199,7 @@ impl KvMemCtl {
+                 &mut t_spill,
+                 &mut n_spilled,
+             )?;
+-            if self.trace {
++            if self.diagnostics.trace {
+                 eprintln!(
+                     "[kvmem] slot {s} ({}): {pages} pages, full {full_pages}, \
+                      budget {}, kept {}, spilled {}, restore {}",
+@@ -217,7 +217,7 @@ impl KvMemCtl {
+                     spill.len(),
+                     restore.len(),
+                 );
+-                if env_flag("HIPFIRE_KVMEM_TRACE_PAGES") {
++                if self.diagnostics.trace_pages {
+                     eprintln!(
+                         "[kvmem] slot {s} picked {picked:?} restore {restore:?}"
+                     );
+@@ -364,7 +364,7 @@ impl KvMemCtl {
+                     .map_err(|e| format!("kvmem restore bind: {e}"))?;
+                 restore_batch.push((s, lp, phys));
+             }
+-            if verify_flag() {
++            if self.diagnostics.verify {
+                 if let Some(bt) = pool.block_table(SlotId(s)) {
+                     let mut seen: std::collections::HashMap<u32, usize> =
+                         std::collections::HashMap::new();
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/transfer.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/transfer.rs
+index 9cbaf6a1d..837d983a1 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/transfer.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/transfer.rs
+@@ -21,7 +21,7 @@ impl KvMemCtl {
+                 .hip
+                 .transfer_buffer(alloc)
+                 .map_err(|e| format!("kvmem transfer slab alloc ({alloc} B): {e:?}"))?;
+-            if time_flag() {
++            if self.diagnostics.time {
+                 eprintln!("[kvmem-time] xfer slab alloc {alloc} B (need {need})");
+             }
+             self.xfer_slab = Some(buf);
+@@ -84,6 +84,7 @@ impl KvMemCtl {
+                     self.v_page_bytes,
+                     phys,
+                     lp,
++                    self.diagnostics.verify,
+                 )?;
+                 pool.stage_out_page(SlotId(s), lp)
+                     .map_err(|e| format!("kvmem stage-out: {e}"))?;
+@@ -154,7 +155,7 @@ impl KvMemCtl {
+                         .write_layer_v_gpu(pos0, KV_BLOCK_TOKENS as u32, il as u32, vsrc)
+                         .map_err(|e| format!("kvmem spill V store (layer {il}): {e}"))?;
+                     off += vpb;
+-                    if il == 0 && verify_flag() {
++                    if il == 0 && self.diagnostics.verify {
+                         eprintln!(
+                             "[kvmem-verify] spill lp={lp} phys={phys} \
+                              k={:016x} v={:016x}",
+@@ -221,6 +222,7 @@ impl KvMemCtl {
+                     self.v_page_bytes,
+                     phys,
+                     lp,
++                    self.diagnostics.verify,
+                 )?;
+                 if timed {
+                     *t_restore += t.elapsed();
+@@ -234,7 +236,7 @@ impl KvMemCtl {
+         let kpb = self.k_page_bytes;
+         let vpb = self.v_page_bytes;
+         let n_layers = self.n_fa_layers;
+-        let verify = verify_flag();
++        let verify = self.diagnostics.verify;
+         for chunk in batch.chunks(chunk_pages) {
+             let t = std::time::Instant::now();
+             self.ensure_xfer_slab(gpu, chunk.len() * per_page)?;
+@@ -352,6 +354,7 @@ pub(super) fn copy_legacy_page_to_host(
+     phys: u32,
+     lp: usize,
+     rows: usize,
++    verify: bool,
+ ) -> Result<(), String> {
+     if rows == 0 || rows > KV_BLOCK_TOKENS
+         || k_arenas.len() != v_arenas.len()
+@@ -376,7 +379,7 @@ pub(super) fn copy_legacy_page_to_host(
+             .map_err(|e| format!("kvmem capture K archive layer {layer}: {e}"))?;
+         raw.write_layer_v_gpu(pos, rows as u32, layer as u32, &page_v[..vlen])
+             .map_err(|e| format!("kvmem capture V archive layer {layer}: {e}"))?;
+-        if verify_flag() {
++        if verify {
+             eprintln!(
+                 "[kvmem-verify] capture layer={layer} lp={lp} rows={rows} k={:016x} v={:016x}",
+                 fnv64(&page_k[..klen]), fnv64(&page_v[..vlen])
+@@ -399,6 +402,7 @@ pub(super) fn copy_legacy_page_to_device(
+     phys: u32,
+     lp: usize,
+     rows: usize,
++    verify: bool,
+ ) -> Result<(), String> {
+     if rows == 0 || rows > KV_BLOCK_TOKENS
+         || k_arenas.len() != v_arenas.len()
+@@ -421,7 +425,7 @@ pub(super) fn copy_legacy_page_to_device(
+         gpu.hip.memcpy_htod_offset(&v_arenas[layer].buf,
+             phys as usize * v_page_bytes, &page_v[..vlen])
+             .map_err(|e| format!("kvmem restore V layer {layer}: {e:?}"))?;
+-        if verify_flag() {
++        if verify {
+             let mut actual_k = vec![0u8; klen];
+             let mut actual_v = vec![0u8; vlen];
+             gpu.hip.memcpy_dtoh_at(&mut actual_k, &k_arenas[layer].buf,
+@@ -456,6 +460,7 @@ fn spill_page(
+     v_page_bytes: usize,
+     phys: u32,
+     lp: usize,
++    verify: bool,
+ ) -> Result<(), String> {
+     debug_assert_eq!(page_k.len(), k_page_bytes);
+     debug_assert_eq!(page_v.len(), v_page_bytes);
+@@ -471,7 +476,7 @@ fn spill_page(
+             .map_err(|e| format!("kvmem spill V read (layer {il}): {e:?}"))?;
+         raw.write_layer_v_gpu(pos0, KV_BLOCK_TOKENS as u32, il as u32, page_v)
+             .map_err(|e| format!("kvmem spill V store (layer {il}): {e}"))?;
+-        if il == 0 && verify_flag() {
++        if il == 0 && verify {
+             eprintln!(
+                 "[kvmem-verify] spill lp={lp} phys={phys} \
+                  k={:016x} v={:016x}",
+@@ -498,6 +503,7 @@ pub(super) fn restore_page(
+     v_page_bytes: usize,
+     phys: u32,
+     lp: usize,
++    verify: bool,
+ ) -> Result<(), String> {
+     let block = lp as u32;
+     for il in 0..k_arenas.len() {
+@@ -517,7 +523,7 @@ pub(super) fn restore_page(
+         gpu.hip
+             .memcpy_htod_offset(&v_arenas[il].buf, phys as usize * v_page_bytes, page_v)
+             .map_err(|e| format!("kvmem restore V write (layer {il}): {e:?}"))?;
+-        if il == 0 && verify_flag() {
++        if il == 0 && verify {
+             let mut rb_k = vec![0u8; page_k.len()];
+             let mut rb_v = vec![0u8; page_v.len()];
+             gpu.hip
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 488e8bd50..7eb2389dc 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -73,7 +73,16 @@ use self::kvmem_engine::{
+ /// offload path was exercised when it was not.
+ #[cfg(feature = "kvmem")]
+ fn kvmem_requested() -> Result<bool, String> {
+-    Ok(crate::kvmem_ctl::requested())
++    if let Some(config) =
++        hipfire_config::active_process_config().and_then(|process| process.kvmem.as_ref())
++    {
++        return Ok(config.enabled);
++    }
++    let raw = hipfire_config::developer_var("HIPFIRE_KVMEM")
++        .ok()
++        .map(|value| value.trim().to_string())
++        .filter(|value| !value.is_empty());
++    Ok(matches!(raw.as_deref(), Some("1") | Some("on") | Some("true")))
+ }
+ 
+ #[cfg(not(feature = "kvmem"))]
+@@ -1668,6 +1677,8 @@ impl Rig {
+         let kvmem_checkpoint_policy = prefix_boot.checkpoint_policy;
+         #[cfg(feature = "kvmem")]
+         let kvmem_plan = prefix_boot.plan;
++        #[cfg(feature = "kvmem")]
++        let kvmem_options = prefix_boot.options;
+         #[cfg(not(feature = "kvmem"))]
+         let (
+             kvmem_prefix_pin,
+@@ -2584,6 +2595,8 @@ impl Rig {
+                         mtp_head: mtp_head.is_some() && mtp_k > 0,
+                     },
+                     legacy_config.as_ref(),
++                    kvmem_options
++                        .ok_or("kvmem: missing start-time option snapshot")?,
+                 )?)
+             }
+             None => None,
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+index b06672d4e..73b676763 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+@@ -1462,6 +1462,9 @@ pub(super) struct PrefixBoot {
+     pub prefix_coverage_interval: usize,
+     pub checkpoint_policy: Option<(u64, u64)>,
+     pub plan: Option<crate::kvmem_ctl::KvMemPlan>,
++    /// One start-time KVMem option snapshot. The controller consumes this
++    /// instead of reading the process environment.
++    pub options: Option<crate::kvmem_ctl::KvMemOptions>,
+ }
+ 
+ pub(super) fn resolve_prefix_boot(
+@@ -1470,6 +1473,14 @@ pub(super) fn resolve_prefix_boot(
+     prefill_chunk: usize,
+     spec_rows: usize,
+ ) -> Result<PrefixBoot, String> {
++    let options = if kvmem_on {
++        Some(crate::kvmem_ctl::KvMemOptions::resolve(
++            cfg.kvmem.as_ref(),
++            |name| hipfire_config::developer_var(name).ok(),
++        )?)
++    } else {
++        None
++    };
+     let prefix_pin = kvmem_on
+         && hipfire_config::developer_var("HIPFIRE_KVMEM_PREFIX_PIN")
+             .ok()
+@@ -1537,26 +1548,7 @@ pub(super) fn resolve_prefix_boot(
+     }
+     let plan = if kvmem_on {
+         Some(if let Some(config) = &cfg.kvmem {
+-            let explicit_pages = hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
+-                .ok()
+-                .map(|value| {
+-                    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+-                        return Err(
+-                            "kvmem: HIPFIRE_SLOTS_PAGED_PAGES requires a positive decimal integer"
+-                                .to_string(),
+-                        );
+-                    }
+-                    let pages = value
+-                        .parse::<usize>()
+-                        .map_err(|_| "kvmem: physical page count overflow".to_string())?;
+-                    if pages == 0 || pages > i32::MAX as usize {
+-                        return Err(
+-                            "kvmem: physical page count must be in 1..=2147483647".to_string()
+-                        );
+-                    }
+-                    Ok(pages)
+-                })
+-                .transpose()?;
++            let explicit_pages = options.as_ref().and_then(|options| options.plan_pages);
+             let budget_tokens = crate::kvmem_ctl::effective_legacy_budget(
+                 config.budget_tokens as usize,
+                 crate::kvmem_ctl::implicit_legacy_budget(config),
+@@ -1583,6 +1575,9 @@ pub(super) fn resolve_prefix_boot(
+                 cfg.n_slots,
+                 cfg.cap_tokens,
+                 prefill_chunk.max(spec_rows),
++                options
++                    .as_ref()
++                    .ok_or("kvmem: missing start-time option snapshot")?,
+             )?
+         })
+     } else {
+@@ -1594,6 +1589,7 @@ pub(super) fn resolve_prefix_boot(
+         prefix_coverage_interval,
+         checkpoint_policy,
+         plan,
++        options,
+     })
+ }
+ 

@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 
@@ -144,7 +143,41 @@ def finish_prepare(name, directory, entry, patches, check_only, base=None):
     print(f'{name}: {head[:12]} + {len(patches)} patches ready', flush=True)
 
 
-def hipfire_entry():
+def backend_entry(versions, name):
+    entry = versions.get(name)
+    if not isinstance(entry, dict):
+        raise RuntimeError(f'{name}: missing backend entry')
+    manifest_value = entry.get('manifest')
+    if not manifest_value:
+        return entry
+    manifest_rel = Path(manifest_value)
+    if manifest_rel.is_absolute():
+        raise RuntimeError(f'{name}: manifest path must be relative: {manifest_value}')
+    manifest = (ROOT / manifest_rel).resolve()
+    if not manifest.is_relative_to(ROOT.resolve()):
+        raise RuntimeError(f'{name}: manifest path escapes the repository: {manifest}')
+    try:
+        data = json.loads(manifest.read_text(encoding='utf-8'))
+    except OSError as error:
+        raise RuntimeError(f'{name}: cannot read manifest {manifest}: {error}') from error
+    if not isinstance(data, dict):
+        raise RuntimeError(f'{name}: manifest is not an object: {manifest}')
+    if entry.get('layout') != data.get('layout'):
+        raise RuntimeError(
+            f'{name}: versions.json layout {entry.get("layout")!r} differs from '
+            f'{manifest} layout {data.get("layout")!r}')
+    for key in ('repository', 'base_commit', 'patched_tree', 'patches'):
+        if key not in data:
+            raise RuntimeError(f'{name}: {manifest} missing {key}')
+    return data
+
+
+def hipfire_entry(versions=None):
+    if versions is None:
+        versions = json.loads((ROOT / 'backends/versions.json').read_text(encoding='utf-8'))
+    if 'hipfire' in versions:
+        return backend_entry(versions, 'hipfire')
+    # Compatibility for one release: an unindexed upstream.json still prepares.
     entry = json.loads((HIPFIRE_DIR / 'upstream.json').read_text(encoding='utf-8'))
     if entry.get('layout') != 'external-checkout-with-patches':
         raise RuntimeError('hipfire: unsupported upstream.json layout')
@@ -154,19 +187,47 @@ def hipfire_entry():
     return entry
 
 
-def rocm_present():
-    env_root = os.environ.get('HIPFIRE_ROCM_PATH')
-    if env_root and Path(env_root).is_dir():
-        return True
-    return Path('/opt/rocm').is_dir() or shutil.which('hipcc') is not None
+def hipfire_manifest_dir(versions):
+    entry = versions.get('hipfire')
+    if isinstance(entry, dict) and entry.get('manifest'):
+        return (ROOT / Path(entry['manifest'])).resolve().parent
+    return HIPFIRE_DIR
+
+
+def hipfire_checkout(versions, override):
+    if override is not None:
+        return override
+    entry = versions.get('hipfire')
+    if isinstance(entry, dict) and entry.get('checkout'):
+        checkout = Path(entry['checkout'])
+        return checkout if checkout.is_absolute() else (ROOT / checkout).resolve()
+    return ROOT.parent / 'hipfire'
+
+
+def hipfire_ready(entry, directory):
+    if not (directory / '.git').exists():
+        return False, f'{directory} is not a git checkout'
+    head = git(directory, 'rev-parse', 'HEAD', check=False)
+    if head.returncode != 0:
+        return False, f'{directory} has no readable HEAD'
+    if head.stdout.strip() != entry['base_commit']:
+        return False, f'{directory} HEAD is not the pinned base commit'
+    try:
+        tree = source_tree(directory)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        return False, f'{directory} tree cannot be read: {error}'
+    if tree != entry['patched_tree']:
+        return False, f'{directory} working tree is not the recorded patched tree'
+    return True, ''
 
 
 def normalized_remote(url):
     return url.rstrip('/').removesuffix('.git')
 
 
-def prepare_hipfire(entry, directory, check_only):
-    patches = patch_series('hipfire', entry, HIPFIRE_DIR)
+def prepare_hipfire(entry, directory, check_only, base=None):
+    base = HIPFIRE_DIR if base is None else base
+    patches = patch_series('hipfire', entry, base)
     if not (directory / '.git').exists():
         if check_only:
             raise RuntimeError(f'hipfire: {directory} is missing; '
@@ -186,7 +247,7 @@ def prepare_hipfire(entry, directory, check_only):
     if normalized_remote(remote) != normalized_remote(entry['repository']):
         raise RuntimeError(f'hipfire: {directory} has remote {remote}, '
                            f'expected {entry["repository"]}; preserving it')
-    finish_prepare('hipfire', directory, entry, patches, check_only, HIPFIRE_DIR)
+    finish_prepare('hipfire', directory, entry, patches, check_only, base)
 
 
 def main():
@@ -198,19 +259,30 @@ def main():
                         help='external hipfire checkout (default: hipfire beside this repository)')
     args = parser.parse_args()
     versions = json.loads((ROOT / 'backends/versions.json').read_text(encoding='utf-8'))
-    hipfire_dir = args.hipfire_dir or ROOT.parent / 'hipfire'
+    hipfire_dir = hipfire_checkout(versions, args.hipfire_dir)
     try:
         if args.backend == 'hipfire':
-            prepare_hipfire(hipfire_entry(), hipfire_dir, args.check)
+            prepare_hipfire(hipfire_entry(versions), hipfire_dir, args.check,
+                            hipfire_manifest_dir(versions))
             return
-        names = tuple(name for name,entry in versions.items() if isinstance(entry,dict) and 'path' in entry) if args.backend == 'all' else (args.backend,)
+        names = tuple(name for name, entry in versions.items()
+                      if isinstance(entry, dict) and 'path' in entry) if args.backend == 'all' else (args.backend,)
         for name in names:
             prepare(name, versions[name], args.check)
         if args.backend == 'all':
-            if rocm_present():
-                prepare_hipfire(hipfire_entry(), hipfire_dir, args.check)
+            if 'hipfire' not in versions:
+                print('hipfire: skipped (not indexed)', flush=True)
+            elif args.hipfire_dir is not None:
+                prepare_hipfire(hipfire_entry(versions), hipfire_dir, args.check,
+                                hipfire_manifest_dir(versions))
             else:
-                print('hipfire: skipped (no ROCm toolchain detected)', flush=True)
+                entry = hipfire_entry(versions)
+                ready, reason = hipfire_ready(entry, hipfire_dir)
+                if ready:
+                    prepare_hipfire(entry, hipfire_dir, args.check,
+                                    hipfire_manifest_dir(versions))
+                else:
+                    print(f'hipfire: skipped ({reason})', flush=True)
     except (OSError, RuntimeError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
         parser.exit(1, f'Backend preparation failed: {detail}\n')

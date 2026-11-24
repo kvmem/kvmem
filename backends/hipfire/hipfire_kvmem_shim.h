@@ -14,10 +14,17 @@
 //   * byte buffers are HOST pointers. Device transfers stay in hipfire;
 //     callers hand this shim the packed Q8 rows after D2H, and memcpy the
 //     returned rows back H2D on restore.
+//
+// ABI compatibility: bump HK_ABI_VERSION when changing a struct field's type,
+// order, size, alignment, a function signature, or an enum ordinal. Appending
+// new functions or new structs at the end is additive and does not require a
+// bump. Rust callers validate the version before constructing any object.
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
+
+#define HK_ABI_VERSION 1u
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,10 +72,50 @@ typedef struct hk_kv_store_config {
     double   gpu_low_watermark;
 } hk_kv_store_config;
 
+#ifdef __cplusplus
+static_assert(HK_OK == 0, "HK_OK ABI changed");
+static_assert(HK_ERR == -1, "HK_ERR ABI changed");
+static_assert(HK_ERR_TRUNCATED == -2, "HK_ERR_TRUNCATED ABI changed");
+#if UINTPTR_MAX == UINT64_MAX
+static_assert(sizeof(hk_raw_store_config) == 40, "hk_raw_store_config size ABI changed");
+static_assert(alignof(hk_raw_store_config) == 8, "hk_raw_store_config alignment ABI changed");
+static_assert(offsetof(hk_raw_store_config, n_layer) == 0, "hk_raw_store_config.n_layer ABI changed");
+static_assert(offsetof(hk_raw_store_config, n_embd_k) == 4, "hk_raw_store_config.n_embd_k ABI changed");
+static_assert(offsetof(hk_raw_store_config, n_embd_v) == 8, "hk_raw_store_config.n_embd_v ABI changed");
+static_assert(offsetof(hk_raw_store_config, block_tokens) == 12, "hk_raw_store_config.block_tokens ABI changed");
+static_assert(offsetof(hk_raw_store_config, k_row_bytes) == 16, "hk_raw_store_config.k_row_bytes ABI changed");
+static_assert(offsetof(hk_raw_store_config, k_gpu_row_bytes) == 24, "hk_raw_store_config.k_gpu_row_bytes ABI changed");
+static_assert(offsetof(hk_raw_store_config, v_gpu_row_bytes) == 32, "hk_raw_store_config.v_gpu_row_bytes ABI changed");
+static_assert(sizeof(hk_kv_store_config) == 112, "hk_kv_store_config size ABI changed");
+static_assert(alignof(hk_kv_store_config) == 8, "hk_kv_store_config alignment ABI changed");
+static_assert(offsetof(hk_kv_store_config, block_tokens) == 0, "hk_kv_store_config.block_tokens ABI changed");
+static_assert(offsetof(hk_kv_store_config, select_budget) == 4, "hk_kv_store_config.select_budget ABI changed");
+static_assert(offsetof(hk_kv_store_config, prefill_budget) == 8, "hk_kv_store_config.prefill_budget ABI changed");
+static_assert(offsetof(hk_kv_store_config, gen_budget) == 12, "hk_kv_store_config.gen_budget ABI changed");
+static_assert(offsetof(hk_kv_store_config, sink_blocks) == 16, "hk_kv_store_config.sink_blocks ABI changed");
+static_assert(offsetof(hk_kv_store_config, recent_blocks) == 20, "hk_kv_store_config.recent_blocks ABI changed");
+static_assert(offsetof(hk_kv_store_config, select_method) == 24, "hk_kv_store_config.select_method ABI changed");
+static_assert(offsetof(hk_kv_store_config, retrieval_method) == 28, "hk_kv_store_config.retrieval_method ABI changed");
+static_assert(offsetof(hk_kv_store_config, update_mode) == 32, "hk_kv_store_config.update_mode ABI changed");
+static_assert(offsetof(hk_kv_store_config, lrfu) == 36, "hk_kv_store_config.lrfu ABI changed");
+static_assert(offsetof(hk_kv_store_config, lrfu_lambda) == 40, "hk_kv_store_config.lrfu_lambda ABI changed");
+static_assert(offsetof(hk_kv_store_config, lrfu_top_fraction) == 48, "hk_kv_store_config.lrfu_top_fraction ABI changed");
+static_assert(offsetof(hk_kv_store_config, estimated_gpu_block_capacity) == 56, "hk_kv_store_config.estimated_gpu_block_capacity ABI changed");
+static_assert(offsetof(hk_kv_store_config, gpu_resident_block_bytes) == 64, "hk_kv_store_config.gpu_resident_block_bytes ABI changed");
+static_assert(offsetof(hk_kv_store_config, estimated_block_bytes) == 72, "hk_kv_store_config.estimated_block_bytes ABI changed");
+static_assert(offsetof(hk_kv_store_config, cpu_tier_bytes) == 80, "hk_kv_store_config.cpu_tier_bytes ABI changed");
+static_assert(offsetof(hk_kv_store_config, gpu_memory_ratio) == 88, "hk_kv_store_config.gpu_memory_ratio ABI changed");
+static_assert(offsetof(hk_kv_store_config, gpu_high_watermark) == 96, "hk_kv_store_config.gpu_high_watermark ABI changed");
+static_assert(offsetof(hk_kv_store_config, gpu_low_watermark) == 104, "hk_kv_store_config.gpu_low_watermark ABI changed");
+#endif
+#endif
+
 // ── diagnostics ──
 const char * hk_last_error(void);
 void hk_clear_error(void);
 const char * hk_version(void);
+uint32_t hk_abi_version(void);
+const char * hk_kvmem_commit(void);
 
 // ── host payload storage (RawKvStore packed rows; optional RAM/disk tiers) ──
 // `spill_dir` NULL/empty keeps the storage RAM-only; capacity_bytes 0 means

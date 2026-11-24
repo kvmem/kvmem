@@ -41,6 +41,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifndef KVMEM_COMMIT
+#define KVMEM_COMMIT "unknown"
+#endif
+
 namespace {
 
 thread_local std::string g_error;
@@ -109,6 +113,14 @@ extern "C" void hk_clear_error(void) {
 
 extern "C" const char * hk_version(void) {
     return "kvmem-hipfire-shim-1";
+}
+
+extern "C" uint32_t hk_abi_version(void) {
+    return HK_ABI_VERSION;
+}
+
+extern "C" const char * hk_kvmem_commit(void) {
+    return KVMEM_COMMIT;
 }
 
 // ── host payload storage ──

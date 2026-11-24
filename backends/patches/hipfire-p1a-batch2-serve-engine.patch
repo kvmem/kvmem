@@ -1,0 +1,2674 @@
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index 7dc50f6f7..5938f0905 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -7058,6 +7058,7 @@ mod tests {
+             ],
+             mq3v2_symmetric: false,
+             moe_has_mq6: false,
++            moe_host_topk: Default::default(),
+             pager: None,
+             lm_head_aliases_embd: false,
+             ep_shard: None,
+@@ -7374,6 +7375,7 @@ mod tests {
+             ],
+             mq3v2_symmetric: false,
+             moe_has_mq6: false,
++            moe_host_topk: Default::default(),
+             pager: None,
+             lm_head_aliases_embd: false,
+             ep_shard: None,
+@@ -7678,6 +7680,7 @@ mod tests {
+             ],
+             mq3v2_symmetric: false,
+             moe_has_mq6: false,
++            moe_host_topk: Default::default(),
+             pager: None,
+             lm_head_aliases_embd: false,
+             ep_shard: None,
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 5a722a9a3..488e8bd50 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -6605,634 +6605,21 @@ fn run_loop(
+             // The post-forward statistics feed runs after the restore, so the
+             // host store still advances this step's row.
+             #[cfg(feature = "kvmem")]
+-            let fwd = {
+-                match layerwise_admissible(&rig, &batch, &slots, &work, any_verify, any_dflash_rows)
+-                {
+-                    Some((slot, session_id, media_pages)) => {
+-                        let mut kvmem = rig.model.kvmem.take();
+-                        let n_fa = rig
+-                            .model
+-                            .config
+-                            .layer_types
+-                            .iter()
+-                            .filter(|t| **t == LayerType::FullAttention)
+-                            .count();
+-                        let fa_layers: Vec<u32> = (0..n_fa as u32).collect();
+-                        // Ensure + DETACH the persistent OUTPUT-scope owner (A'-1:
+-                        // AR decode rides the same OutputPressure infrastructure as
+-                        // MTP verify, design §3.10a borrow resolution): the carrier
+-                        // borrows `&ctl` (keys/policy), so the owner is taken out into
+-                        // an independent local to allow `&mut` accept after the
+-                        // forward, then restored on EVERY exit path. Layerwise-only
+-                        // (ensure fails closed under Legacy, which never reaches
+-                        // this arm). The slot keeps its keep-set / counters.
+-                        let mut output_owner = None;
+-                        // [P4.1② fix] consume the per-request Query gate in the
+-                        // mutable window (before the immutable ctl borrow below).
+-                        let mut force_query = false;
+-                        if let Some(k) = kvmem.as_mut() {
+-                            let incarnation =
+-                                k.layerwise_counters(slot).map(|(inc, _)| inc).unwrap_or(0);
+-                            if let Err(e) = k.ensure_layerwise_output_pressure(
+-                                slot,
+-                                session_id,
+-                                incarnation,
+-                                &fa_layers,
+-                            ) {
+-                                rig.model.kvmem = kvmem;
+-                                fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                poison = Some(e);
+-                                break 'serve;
+-                            }
+-                            output_owner = k.take_layerwise_output_pressure(slot);
+-                            force_query = k.take_layerwise_query_due(slot);
+-                        }
+-                        let ctl = kvmem
+-                            .as_ref()
+-                            .expect("admissible layerwise step has a controller");
+-                        // G5: the accepted frontier this restore opens at (the
+-                        // single AR decode row's position). The head aux history is
+-                        // bound from the first FA layer's restored view here, so
+-                        // the first MTP draft (next step) has a selection to take.
+-                        let begin = ctl.fed_tokens(slot).unwrap_or(0) as u64;
+-                        // Fresh page-aligned selection policy over the sealed
+-                        // full pages only (the core picker rejects a partial
+-                        // tail). The slot's shared `kv` store keeps tracking all
+-                        // fed tokens for Legacy and is never borrowed/mutated by
+-                        // Layerwise; this policy is scoped to the query and
+-                        // dropped after the carrier is freed.
+-                        let lw_policy =
+-                            match ctl.layerwise_policy(ctl.fed_tokens(slot).unwrap_or(0)) {
+-                                Ok(p) => p,
+-                                Err(e) => {
+-                                    if let Some(p) = output_owner {
+-                                        if let Some(k) = kvmem.as_mut() {
+-                                            k.restore_layerwise_output_pressure(slot, p);
+-                                        }
+-                                    }
+-                                    rig.model.kvmem = kvmem;
+-                                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                    poison = Some(e);
+-                                    break 'serve;
+-                                }
+-                            };
+-                        // A'-1: AR decode rides engine_carrier_rows (OutputPressure,
+-                        // native mass tracking) with width=1 / query=None / prefill=None
+-                        // ⇒ always scorer Query selection (mirrors MTP verify). The
+-                        // page-aligned PrefillPressure mid-page freeze that lost needles
+-                        // is gone; the OutputPressure window advances accepted_end
+-                        // natively (fed→fed+1) but does not drive selection (prefill=None).
+-                        let built = crate::layerwise_driver::engine_carrier_rows(
+-                            &mut rig.gpu,
+-                            ctl,
+-                            &lw_policy,
+-                            slot,
+-                            session_id,
+-                            n_fa,
+-                            rig.model.config.n_heads,
+-                            rig.model.config.n_kv_heads,
+-                            rig.model.config.head_dim,
+-                            rig.cap_tokens as u32,
+-                            "qwen35",
+-                            1,
+-                            None,
+-                            output_owner
+-                                .as_mut()
+-                                .expect("admissible layerwise AR step has an output owner"),
+-                            None,
+-                            force_query,
+-                            &media_pages,
+-                        );
+-                        match built {
+-                            Ok(Some(mut carrier)) => {
+-                                let fwd = rig.model.forward_step(
+-                                    &mut rig.gpu,
+-                                    &batch,
+-                                    &mut rig.pool,
+-                                    &mut graph,
+-                                    &lm_head_skip,
+-                                    any_verify,
+-                                    any_dflash_rows,
+-                                    Some(&mut carrier),
+-                                );
+-                                // Keep-set contribution (design §3.10a, A'-1): read the
+-                                // previous resident pool while the carrier still borrows
+-                                // ctl, then REPLACE with this step's restored pages. AR
+-                                // decode is always scorer Query (OutputPressure, prefill=None),
+-                                // so the keep-set is replaced every step — the scorer's
+-                                // restored view re-admits cold-recalled needle pages, and a
+-                                // growing union would diverge per-layer extents (bug #8).
+-                                let head_plane = ctl.head_plane_enabled();
+-                                // P4.1③ H2a/H4: UpstreamGlobal head-history probe
+-                                // over the carrier's CAPTURED activation Q tapes,
+-                                // run BEFORE `free` ends the carrier borrow (the
+-                                // tapes live in the per-step carrier). Pure host
+-                                // selection — no KV mutation, no rollback. FirstLayer
+-                                // (the auto-default) skips this and binds from the
+-                                // first restored ordinal after free (② G5). Legacy /
+-                                // AR-only never reach it (byte-neutral).
+-                                let mtp_history = ctl.layerwise_mtp_history();
+-                                let probe_aux: Option<
+-                                    Result<crate::layerwise_mtp::AuxiliarySelection, String>,
+-                                > = if head_plane
+-                                    && mtp_history
+-                                        == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
+-                                {
+-                                    Some(match carrier.activation() {
+-                                            Some(act) => match ctl.layerwise_stores(slot) {
+-                                                Some((keys, _)) => {
+-                                                    crate::layerwise_probe::probe_head_history(
+-                                                        &mut rig.gpu,
+-                                                        act,
+-                                                        &lw_policy,
+-                                                        keys,
+-                                                        rig.model.config.n_heads as u32,
+-                                                        rig.model.config.n_kv_heads as u32,
+-                                                        rig.model.config.head_dim as u32,
+-                                                        0.0,
+-                                                        crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u32,
+-                                                        begin,
+-                                                    )
+-                                                }
+-                                                None => Err(
+-                                                    "layerwise probe: slot has no keys store".to_string(),
+-                                                ),
+-                                            },
+-                                            None => Err(
+-                                                "layerwise probe: UpstreamGlobal carrier has no activation"
+-                                                    .to_string(),
+-                                            ),
+-                                        })
+-                                } else {
+-                                    None
+-                                };
+-                                let prev_keep: Vec<Vec<u64>> = ctl
+-                                    .layerwise_keep_set(slot)
+-                                    .map(|s| s.to_vec())
+-                                    .unwrap_or_default();
+-                                let restored_res = carrier.restored_keep_set();
+-                                // G5: the first FA ordinal's restored canonical ids
+-                                // for the FirstLayer head aux binding, captured before
+-                                // `free` ends the carrier borrow. `None` on a restore
+-                                // error (surfaced through `keep_res` below). Cloned out
+-                                // so `restored_res` still moves into `keep_res` (owned Err).
+-                                let aux_first: Option<Vec<u64>> =
+-                                    restored_res.as_ref().ok().and_then(|r| r.first().cloned());
+-                                let keep_res = restored_res.map(|restored| {
+-                                    // A'-1: AR decode is always scorer Query (prefill=None
+-                                    // ⇒ no Pressure refinement), so REPLACE the keep-set
+-                                    // every step (fresh current-Q re-selection, consistent
+-                                    // per-layer extent) exactly like the MTP verify regime
+-                                    // (bug #8). UNION with a non-empty prior diverges the
+-                                    // per-layer resident counts and trips the catalog
+-                                    // geometry guard; the scorer's restored view already
+-                                    // re-admits cold-recalled needle pages each step, so a
+-                                    // growing union is redundant. Always-Query also satisfies
+-                                    // the continuation fix (current question re-scored).
+-                                    crate::layerwise_driver::combine_keep_set(
+-                                        &prev_keep, &restored, true, n_fa,
+-                                    )
+-                                });
+-                                // Accept the captured native mass into the detached
+-                                // OUTPUT-scope owner at the confirmed AR prefix (accepted=1:
+-                                // the single decode row is always accepted). Advances the
+-                                // window's accepted_end to fed+1 for the next step's begin.
+-                                // The &mut owner is independent of the carrier's ctl borrow,
+-                                // so this runs before free. AR publishes immediately (no
+-                                // MTP-style deferred pending_output: the prefix is known).
+-                                let accept_res = match output_owner.as_mut() {
+-                                    Some(p) => carrier
+-                                        .accept_output_pressure(p, session_id + 1, begin, 1)
+-                                        .map(|_| false),
+-                                    None => Ok(false),
+-                                };
+-                                // Release the carrier exactly once (its GPU
+-                                // buffers have no Drop). `free` consumes it,
+-                                // ending its borrow of `kvmem`/`lw_policy` before
+-                                // the mutable counter bump / keep-set / restore.
+-                                let free_res = carrier.free(&mut rig.gpu);
+-                                // G5: FirstLayer head aux binding (pure-host, after the
+-                                // carrier borrow ends). `head_plane` ⇒ Layerwise + MTP ⇒
+-                                // FirstLayer under ②. `Ok(None)` when the head plane is
+-                                // inactive (AR-only) or the restore errored (handled below).
+-                                let aux_res = if head_plane {
+-                                    if mtp_history
+-                                        == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
+-                                    {
+-                                        probe_aux.transpose()
+-                                    } else {
+-                                        aux_first
+-                                            .as_deref()
+-                                            .map(|first| {
+-                                                crate::layerwise_mtp::bind_first_layer_auxiliary(
+-                                                    first,
+-                                                    begin,
+-                                                    crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS
+-                                                        as u64,
+-                                                )
+-                                            })
+-                                            .transpose()
+-                                    }
+-                                } else {
+-                                    Ok(None)
+-                                };
+-                                // Return the detached owner on EVERY path so the
+-                                // session-lifetime pressure state persists.
+-                                if let Some(p) = output_owner {
+-                                    if let Some(k) = kvmem.as_mut() {
+-                                        k.restore_layerwise_output_pressure(slot, p);
+-                                    }
+-                                }
+-                                if let Some(e) = accept_res.err().or_else(|| free_res.err()) {
+-                                    rig.model.kvmem = kvmem;
+-                                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                    poison = Some(e);
+-                                    break 'serve;
+-                                }
+-                                let new_keep = match keep_res {
+-                                    Ok(k) => k,
+-                                    Err(e) => {
+-                                        rig.model.kvmem = kvmem;
+-                                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                        poison = Some(e);
+-                                        break 'serve;
+-                                    }
+-                                };
+-                                let aux_sel = match aux_res {
+-                                    Ok(s) => s,
+-                                    Err(e) => {
+-                                        rig.model.kvmem = kvmem;
+-                                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                        poison = Some(e);
+-                                        break 'serve;
+-                                    }
+-                                };
+-                                if let Some(k) = kvmem.as_mut() {
+-                                    k.advance_layerwise_seq(slot);
+-                                    k.set_layerwise_keep_set(slot, new_keep);
+-                                    if let Some(s) = aux_sel {
+-                                        k.set_aux_selection(slot, s);
+-                                    }
+-                                }
+-                                rig.model.kvmem = kvmem;
+-                                fwd
+-                            }
+-                            // Before the fixed-block floor (see
+-                            // `layerwise_floor_tokens`): restore the controller +
+-                            // owner and run Legacy; no transaction.
+-                            Ok(None) => {
+-                                if let Some(p) = output_owner {
+-                                    if let Some(k) = kvmem.as_mut() {
+-                                        k.restore_layerwise_output_pressure(slot, p);
+-                                    }
+-                                }
+-                                rig.model.kvmem = kvmem;
+-                                rig.model.forward_step(
+-                                    &mut rig.gpu,
+-                                    &batch,
+-                                    &mut rig.pool,
+-                                    &mut graph,
+-                                    &lm_head_skip,
+-                                    any_verify,
+-                                    any_dflash_rows,
+-                                    None,
+-                                )
+-                            }
+-                            Err(e) => {
+-                                if let Some(p) = output_owner {
+-                                    if let Some(k) = kvmem.as_mut() {
+-                                        k.restore_layerwise_output_pressure(slot, p);
+-                                    }
+-                                }
+-                                rig.model.kvmem = kvmem;
+-                                fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                poison = Some(e);
+-                                break 'serve;
+-                            }
+-                        }
+-                    }
+-                    None => {
+-                        // P4.1② (design §A.6 / §B D1.4②): AR admission rejects
+-                        // `any_verify`, so a Layerwise MTP verify span lands here.
+-                        // Admit it before falling back to Legacy: multi-row trunk
+-                        // accepted-only write-through + drop-evict + restore over
+-                        // the verify batch (Path B), through the OUTPUT-scope owner
+-                        // (partial acceptance). The accepted prefix is published
+-                        // post-sampling in `mtp_verify_accept_step`, not here.
+-                        if let Some((slot, session_id, width)) = layerwise_mtp_verify_admissible(
+-                            &rig,
+-                            &batch,
+-                            &slots,
+-                            &work,
+-                            any_verify,
+-                            any_dflash_rows,
+-                        ) {
+-                            let mut kvmem = rig.model.kvmem.take();
+-                            let n_fa = rig
+-                                .model
+-                                .config
+-                                .layer_types
+-                                .iter()
+-                                .filter(|t| **t == LayerType::FullAttention)
+-                                .count();
+-                            let fa_layers: Vec<u32> = (0..n_fa as u32).collect();
+-                            // Ensure + DETACH the persistent OUTPUT-scope owner
+-                            // (the MTP-verify sibling of the AR prefill owner). A
+-                            // verify span accepts a PREFIX of its rows, which the
+-                            // all-or-nothing prefill owner cannot express. Taken
+-                            // out so `begin_scope`/`prepare_scope`/`accept` use
+-                            // `&mut OutputPressure` independently of the carrier's
+-                            // `&ctl` borrow; restored on EVERY exit path.
+-                            let mut output_owner = None;
+-                            // [P4.1② fix] consume the per-request Query gate in the
+-                            // mutable window (before the immutable ctl borrow).
+-                            let mut force_query = false;
+-                            if let Some(k) = kvmem.as_mut() {
+-                                let incarnation =
+-                                    k.layerwise_counters(slot).map(|(inc, _)| inc).unwrap_or(0);
+-                                if let Err(e) = k.ensure_layerwise_output_pressure(
+-                                    slot,
+-                                    session_id,
+-                                    incarnation,
+-                                    &fa_layers,
+-                                ) {
+-                                    rig.model.kvmem = kvmem;
+-                                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                    poison = Some(e);
+-                                    break 'serve;
+-                                }
+-                                output_owner = k.take_layerwise_output_pressure(slot);
+-                                force_query = k.take_layerwise_query_due(slot);
+-                            }
+-                            let ctl = kvmem
+-                                .as_ref()
+-                                .expect("admissible layerwise verify has a controller");
+-                            // Native consumed-row frontier the output window opens
+-                            // at (== the verify span's first position); the accepted
+-                            // prefix advances it by `result.advance` post-sampling.
+-                            let begin = ctl.fed_tokens(slot).unwrap_or(0) as u64;
+-                            let request = session_id + 1;
+-                            let lw_policy =
+-                                match ctl.layerwise_policy(ctl.fed_tokens(slot).unwrap_or(0)) {
+-                                    Ok(p) => p,
+-                                    Err(e) => {
+-                                        if let Some(p) = output_owner {
+-                                            if let Some(k) = kvmem.as_mut() {
+-                                                k.restore_layerwise_output_pressure(slot, p);
+-                                            }
+-                                        }
+-                                        rig.model.kvmem = kvmem;
+-                                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                        poison = Some(e);
+-                                        break 'serve;
+-                                    }
+-                                };
+-                            let built = crate::layerwise_driver::engine_carrier_rows(
+-                                &mut rig.gpu,
+-                                ctl,
+-                                &lw_policy,
+-                                slot,
+-                                session_id,
+-                                n_fa,
+-                                rig.model.config.n_heads,
+-                                rig.model.config.n_kv_heads,
+-                                rig.model.config.head_dim,
+-                                rig.cap_tokens as u32,
+-                                "qwen35",
+-                                width,
+-                                None,
+-                                output_owner
+-                                    .as_mut()
+-                                    .expect("admissible layerwise verify has an output owner"),
+-                                None,
+-                                force_query,
+-                                &[],
+-                            );
+-                            match built {
+-                                Ok(Some(mut carrier)) => {
+-                                    let fwd = rig.model.forward_step(
+-                                        &mut rig.gpu,
+-                                        &batch,
+-                                        &mut rig.pool,
+-                                        &mut graph,
+-                                        &lm_head_skip,
+-                                        any_verify,
+-                                        any_dflash_rows,
+-                                        Some(&mut carrier),
+-                                    );
+-                                    let head_plane = ctl.head_plane_enabled();
+-                                    // P4.1③ H2a/H4: UpstreamGlobal head-history probe
+-                                    // over the carrier's CAPTURED activation Q tapes,
+-                                    // run BEFORE `free` (the tapes live in the per-step
+-                                    // carrier). Pure host selection — no KV mutation, no
+-                                    // rollback. FirstLayer binds from the first restored
+-                                    // ordinal after free (② G5). Legacy / AR-only never
+-                                    // reach it (byte-neutral).
+-                                    let mtp_history = ctl.layerwise_mtp_history();
+-                                    let probe_aux: Option<Result<crate::layerwise_mtp::AuxiliarySelection, String>> =
+-                                        if head_plane
+-                                            && mtp_history
+-                                                == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
+-                                        {
+-                                            Some(match carrier.activation() {
+-                                                Some(act) => match ctl.layerwise_stores(slot) {
+-                                                    Some((keys, _)) => {
+-                                                        crate::layerwise_probe::probe_head_history(
+-                                                            &mut rig.gpu,
+-                                                            act,
+-                                                            &lw_policy,
+-                                                            keys,
+-                                                            rig.model.config.n_heads as u32,
+-                                                            rig.model.config.n_kv_heads as u32,
+-                                                            rig.model.config.head_dim as u32,
+-                                                            0.0,
+-                                                            crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u32,
+-                                                            begin,
+-                                                        )
+-                                                    }
+-                                                    None => Err(
+-                                                        "layerwise probe: slot has no keys store".to_string(),
+-                                                    ),
+-                                                },
+-                                                None => Err(
+-                                                    "layerwise probe: UpstreamGlobal carrier has no activation"
+-                                                        .to_string(),
+-                                                ),
+-                                            })
+-                                        } else {
+-                                            None
+-                                        };
+-                                    let restored_res = carrier.restored_keep_set();
+-                                    // G5: the first FA ordinal's restored canonical ids
+-                                    // for the FirstLayer head aux binding, captured before
+-                                    // `free` ends the carrier borrow. `None` on a restore
+-                                    // error (surfaced through `keep_res` below). Cloned out
+-                                    // so `restored_res` still moves into `keep_res` (owned Err).
+-                                    let aux_first: Option<Vec<u64>> =
+-                                        restored_res.as_ref().ok().and_then(|r| r.first().cloned());
+-                                    // Keep-set (design §3.10a, ninfer REPLACE): the
+-                                    // MTP composite verify regime forces REPLACE
+-                                    // (pressure = true, empty prev). The trunk+aux
+-                                    // planes select asymmetric page ids, so a growing
+-                                    // union diverges the per-layer resident counts and
+-                                    // trips the catalog's cross-layer extent invariant
+-                                    // (bug #8). The restored view already admits the
+-                                    // scorer's full re-selection (cold recall included).
+-                                    let keep_res = restored_res.map(|restored| {
+-                                        crate::layerwise_driver::combine_keep_set(
+-                                            &[],
+-                                            &restored,
+-                                            true,
+-                                            n_fa,
+-                                        )
+-                                    });
+-                                    // Extract the OWNED acceptance snapshot before
+-                                    // freeing the carrier: the accepted prefix
+-                                    // (`result.advance`) is known only post-sampling,
+-                                    // so the publish runs in `mtp_verify_accept_step`
+-                                    // (after `feed_rows`), outside this scoped take.
+-                                    let snap_res =
+-                                        carrier.extract_output_acceptance(request, begin);
+-                                    let free_res = carrier.free(&mut rig.gpu);
+-                                    // G5: FirstLayer head aux binding (pure-host, after the
+-                                    // carrier borrow ends). `head_plane` ⇒ Layerwise + MTP ⇒
+-                                    // FirstLayer under ②. The head consume (post-accept) and
+-                                    // the next span's draft take this binding. `Ok(None)` when
+-                                    // the head plane is inactive or the restore errored.
+-                                    let aux_res = if head_plane {
+-                                        if mtp_history
+-                                            == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
+-                                        {
+-                                            probe_aux.transpose()
+-                                        } else {
+-                                            aux_first
+-                                                .as_deref()
+-                                                .map(|first| {
+-                                                    crate::layerwise_mtp::bind_first_layer_auxiliary(
+-                                                        first,
+-                                                        begin,
+-                                                        crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS
+-                                                            as u64,
+-                                                    )
+-                                                })
+-                                                .transpose()
+-                                        }
+-                                    } else {
+-                                        Ok(None)
+-                                    };
+-                                    if let Some(p) = output_owner {
+-                                        if let Some(k) = kvmem.as_mut() {
+-                                            k.restore_layerwise_output_pressure(slot, p);
+-                                        }
+-                                    }
+-                                    if let Some(e) = free_res.err() {
+-                                        rig.model.kvmem = kvmem;
+-                                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                        poison = Some(e);
+-                                        break 'serve;
+-                                    }
+-                                    let new_keep = match keep_res {
+-                                        Ok(k) => k,
+-                                        Err(e) => {
+-                                            rig.model.kvmem = kvmem;
+-                                            fail_all_active(
+-                                                &mut rig,
+-                                                &mut slots,
+-                                                &mut work,
+-                                                e.clone(),
+-                                            );
+-                                            poison = Some(e);
+-                                            break 'serve;
+-                                        }
+-                                    };
+-                                    let snap = match snap_res {
+-                                        Ok(s) => s,
+-                                        Err(e) => {
+-                                            rig.model.kvmem = kvmem;
+-                                            fail_all_active(
+-                                                &mut rig,
+-                                                &mut slots,
+-                                                &mut work,
+-                                                e.clone(),
+-                                            );
+-                                            poison = Some(e);
+-                                            break 'serve;
+-                                        }
+-                                    };
+-                                    let aux_sel = match aux_res {
+-                                        Ok(s) => s,
+-                                        Err(e) => {
+-                                            rig.model.kvmem = kvmem;
+-                                            fail_all_active(
+-                                                &mut rig,
+-                                                &mut slots,
+-                                                &mut work,
+-                                                e.clone(),
+-                                            );
+-                                            poison = Some(e);
+-                                            break 'serve;
+-                                        }
+-                                    };
+-                                    if let Some(k) = kvmem.as_mut() {
+-                                        k.advance_layerwise_seq(slot);
+-                                        k.set_layerwise_keep_set(slot, new_keep);
+-                                        if let Some(s) = snap {
+-                                            k.set_layerwise_pending_output(slot, s);
+-                                        }
+-                                        if let Some(s) = aux_sel {
+-                                            k.set_aux_selection(slot, s);
+-                                        }
+-                                    }
+-                                    rig.model.kvmem = kvmem;
+-                                    fwd
+-                                }
+-                                // Before the fixed-block floor (see
+-                                // `layerwise_floor_tokens`): restore the owner +
+-                                // controller and run Legacy; the verify still
+-                                // commits via `feed_rows`, no output publish.
+-                                Ok(None) => {
+-                                    if let Some(p) = output_owner {
+-                                        if let Some(k) = kvmem.as_mut() {
+-                                            k.restore_layerwise_output_pressure(slot, p);
+-                                        }
+-                                    }
+-                                    rig.model.kvmem = kvmem;
+-                                    rig.model.forward_step(
+-                                        &mut rig.gpu,
+-                                        &batch,
+-                                        &mut rig.pool,
+-                                        &mut graph,
+-                                        &lm_head_skip,
+-                                        any_verify,
+-                                        any_dflash_rows,
+-                                        None,
+-                                    )
+-                                }
+-                                Err(e) => {
+-                                    if let Some(p) = output_owner {
+-                                        if let Some(k) = kvmem.as_mut() {
+-                                            k.restore_layerwise_output_pressure(slot, p);
+-                                        }
+-                                    }
+-                                    rig.model.kvmem = kvmem;
+-                                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                                    poison = Some(e);
+-                                    break 'serve;
+-                                }
+-                            }
+-                        } else {
+-                            rig.model.forward_step(
+-                                &mut rig.gpu,
+-                                &batch,
+-                                &mut rig.pool,
+-                                &mut graph,
+-                                &lm_head_skip,
+-                                any_verify,
+-                                any_dflash_rows,
+-                                None,
+-                            )
+-                        }
+-                    }
++            let fwd = match kvmem_engine::layerwise_forward(
++                &mut rig,
++                &batch,
++                &slots,
++                &work,
++                &mut graph,
++                &lm_head_skip,
++                any_verify,
++                any_dflash_rows,
++            ) {
++                Ok(fwd) => fwd,
++                Err(e) => {
++                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
++                    poison = Some(e);
++                    break 'serve;
+                 }
+             };
+             #[cfg(not(feature = "kvmem"))]
+@@ -7514,129 +6901,13 @@ fn run_loop(
+                     }
+                 }
+             }
+-            // ── KVMem statistics feed (HIPFIRE_KVMEM) ───────────────────────
+-            // Every KV row this step wrote (prefill chunk or plain decode row)
+-            // is summarized into the slot's host store now, from the taps the
+-            // forward captured. Verify steps are fed in the accept path
+-            // instead — only the committed prefix of their rows survives, and
+-            // its size is not known until after the sampler reads the hidden
+-            // rows. Fed positions are contiguous by construction: a slot's
+-            // batch rows always start at the store's current length.
+             #[cfg(feature = "kvmem")]
+-            if rig.model.kvmem.is_some() {
+-                let mut row = 0usize;
+-                let mut feed_err: Option<String> = None;
+-                // P4.1③ root-cause fix: take the controller OUT so the AR-decode
+-                // head aux co-archive below can borrow head/weights/hidden
+-                // disjointly alongside `&mut ctl` (mirrors the MTP verify accept
+-                // path's `self.kvmem.take()`).
+-                let mut kvmem = rig.model.kvmem.take();
+-                for s in 0..n {
+-                    let m = batch.m_per_slot[s];
+-                    if m == 0 {
+-                        continue;
+-                    }
+-                    let row_start = row;
+-                    let pos0 = batch.positions[row] as usize;
+-                    row += m;
+-                    if spec_drafts[s].is_some() {
+-                        continue;
+-                    }
+-                    let fed: Result<(), String> = (|| {
+-                        let ctl = kvmem.as_mut().unwrap();
+-                        let taps = rig
+-                            .model
+-                            .pbs
+-                            .kvmem_taps
+-                            .as_ref()
+-                            .expect("kvmem controller without statistics taps");
+-                        ctl.feed_rows(
+-                            &rig.gpu,
+-                            taps,
+-                            s,
+-                            pos0,
+-                            m,
+-                            row_start,
+-                            &rig.pool,
+-                            &rig.model.k_arenas,
+-                            &rig.model.v_arenas,
+-                        )?;
+-                        // P4.1③ root-cause fix (AR-decode head aux co-archive):
+-                        // the head aux plane was co-archived ONLY in MTP prefill
+-                        // (mtp_prefill) + MTP verify accept; plain AR-decode rows
+-                        // fed here advanced the trunk Main plane but NOT the aux
+-                        // ordinal, so the head aux frontier lagged the trunk. The
+-                        // next composite (Main+aux) suffix-block export then threw
+-                        // "packed KV layer ... partial frontier" (masked downstream
+-                        // as "layer 0 mass not captured"). Co-archive the head K/V
+-                        // for these accepted AR rows exactly like the verify accept:
+-                        // norm the trunk PRE-final-norm residual (pbs.x_batch) into
+-                        // the head's post-norm staging, recompute the head K/V, and
+-                        // seal at the GLOBAL pos. Prefill rows (decoding=false) are
+-                        // already co-archived by mtp_prefill ⇒ skipped (no double).
+-                        if work[s].decoding && ctl.head_plane_enabled() {
+-                            if let (Some(head), Some(state)) = (
+-                                rig.model.mtp_head.as_ref(),
+-                                rig.model.mtp_states[s].as_mut(),
+-                            ) {
+-                                let tokens: Vec<u32> = slots[s]
+-                                    .as_ref()
+-                                    .map(|f| f.session)
+-                                    .and_then(|sid| rig.sessions.get(sid))
+-                                    .map(|sess| sess.tokens[pos0..pos0 + m].to_vec())
+-                                    .unwrap_or_default();
+-                                if tokens.len() == m {
+-                                    let dim = rig.model.config.dim;
+-                                    let rope_shift = ctl.head_prefill_shift(pos0 + m);
+-                                    let raw =
+-                                        rig.model.pbs.x_batch.sub_offset(row_start * dim, m * dim);
+-                                    let staged = state.takeover_fill_hidden.sub_offset(0, m * dim);
+-                                    rig.gpu
+-                                        .rmsnorm_batched(
+-                                            &raw,
+-                                            &rig.model.weights.output_norm,
+-                                            &staged,
+-                                            m,
+-                                            dim,
+-                                            rig.model.config.norm_eps,
+-                                        )
+-                                        .map_err(|e| format!("kvmem AR head hidden norm: {e:?}"))?;
+-                                    crate::mtp_spec::mtp_takeover_fill_head_kv(
+-                                        &mut rig.gpu,
+-                                        head,
+-                                        state,
+-                                        &rig.model.weights,
+-                                        pos0,
+-                                        &tokens,
+-                                        rope_shift,
+-                                    )
+-                                    .map_err(|e| format!("kvmem AR head fill: {e}"))?;
+-                                    ctl.head_write_through_archive(
+-                                        &rig.gpu,
+-                                        &state.mtp_kv.inner.k_gpu[0],
+-                                        &state.mtp_kv.inner.v_gpu[0],
+-                                        s,
+-                                        pos0,
+-                                        m,
+-                                        pos0 - rope_shift,
+-                                    )?;
+-                                    ctl.accept_head_append(s, pos0 as u64, (pos0 + m) as u64)?;
+-                                }
+-                            }
+-                        }
+-                        Ok(())
+-                    })();
+-                    if let Err(e) = fed {
+-                        feed_err = Some(e);
+-                        break;
+-                    }
+-                }
+-                rig.model.kvmem = kvmem;
+-                if let Some(e) = feed_err {
+-                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+-                    poison = Some(e);
+-                    break 'serve;
+-                }
++            if let Err(e) =
++                kvmem_engine::kvmem_feed_step(&mut rig, &batch, &slots, &work, &spec_drafts, n)
++            {
++                fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
++                poison = Some(e);
++                break 'serve;
+             }
+             if check_pool_invariants {
+                 if let Some(pp) = rig.pool.page_pool() {
+@@ -9754,462 +9025,9 @@ fn admit(
+     let mut prefix_reused: usize = 0;
+     let mut prefix_hit = false;
+     #[cfg(feature = "kvmem")]
+-    let req_media: Option<u64> = req
+-        .visual_data
+-        .as_ref()
+-        .map(|vd| vd.media_digest())
+-        .or_else(|| rig.sessions.get(id).and_then(|s| s.media_digest));
+-    // G7 Stage C: the reuse frontier goes through the Stage A media anchor.
+-    // The restored prefix must never split a vision span of the incoming
+-    // prompt; a frozen checkpoint already satisfies this by construction, so a
+-    // failure here is an invariant violation and the reuse closes to cold.
+-    #[cfg(feature = "kvmem")]
+-    let req_media_spans: Vec<crate::kvmem_media::MediaSpan> = {
+-        let n_visual = req
+-            .visual_data
+-            .as_ref()
+-            .map(|vd| vd.n_visual_tokens)
+-            .or_else(|| rig.sessions.get(id).map(|s| s.media_n_visual))
+-            .unwrap_or(0);
+-        match (req_media, rig.tokenizer.special_token_id("<|image_pad|>")) {
+-            (Some(_), Some(pad)) if n_visual > 0 => {
+-                crate::kvmem_media::spans_from_pad_runs(&req.prompt_tokens, pad, n_visual)
+-            }
+-            _ => Vec::new(),
+-        }
+-    };
+-    #[cfg(feature = "kvmem")]
+-    let anchor_reuse = |frontier: u32| -> Result<u32, String> {
+-        if req_media_spans.is_empty() {
+-            return Ok(frontier);
+-        }
+-        let aligned = crate::kvmem_media::media_anchored_frontier(
+-            0,
+-            frontier as u64,
+-            req.prompt_tokens.len() as u64,
+-            &req_media_spans,
+-            crate::kvmem_ctl::KV_BLOCK_TOKENS as u64,
+-        )
+-        .map_err(|e| format!("kvmem reuse: media anchor: {e}"))?;
+-        if aligned != frontier as u64 {
+-            return Err(format!(
+-                "kvmem reuse: media anchor moves frontier {frontier} -> {aligned}"
+-            ));
+-        }
+-        // G7 Stage E probe: the live media replay anchor accepted this
+-        // frontier (block-aligned and not splitting any image span).
+-        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+-            .ok()
+-            .is_some_and(|v| v == "1" || v == "on" || v == "true")
+-        {
+-            let fmt = |d: Option<u64>| {
+-                d.map(|x| format!("{x:016x}"))
+-                    .unwrap_or_else(|| "none".to_string())
+-            };
+-            eprintln!(
+-                "[kvmem-media] reuse anchor accept digest={} spans={} candidate={frontier} \
+-                 aligned={aligned}",
+-                fmt(req_media),
+-                req_media_spans.len()
+-            );
+-        }
+-        Ok(frontier)
+-    };
+-    #[cfg(feature = "kvmem")]
+-    if rig.kvmem_prefix_pin {
+-        // 期3 G3 P1.1: a cold pack hit publishes a catalog entry and may
+-        // displace others; release their GPU cache refs outside the borrow.
+-        let mut cold_displaced = Vec::new();
+-        let hit = rig.model.kvmem.as_mut().and_then(|ctl| {
+-            let hit = ctl.prefix_lookup_media(&req.prompt_tokens, req_media);
+-            cold_displaced = ctl.take_cold_displaced();
+-            hit
+-        });
+-        for d in cold_displaced {
+-            if let Some(pp) = rig.pool.page_pool_mut() {
+-                for &phys in &d.gpu_pages {
+-                    let _ = pp.release_cache_ref(phys);
+-                }
+-            }
+-        }
+-        if let Some(ckpt_id) = hit {
+-            let reuse = (|| -> Result<usize, String> {
+-                let ctl = rig
+-                    .model
+-                    .kvmem
+-                    .as_mut()
+-                    .ok_or_else(|| "kvmem reuse: no controller".to_string())?;
+-                // 1. Host fork: validates the FULL provenance (geometry +
+-                // fingerprint + token proof) before any mutation.
+-                // Stage C: the candidate frontier must pass the media anchor
+-                // BEFORE the fork mutates the slot; a violation closes the
+-                // reuse to a cold prefill (the slot is still the earlier
+-                // reset state here).
+-                let candidate = ctl
+-                    .prefix_checkpoint(ckpt_id)
+-                    .map(|c| c.frontier)
+-                    .ok_or_else(|| format!("kvmem reuse: checkpoint {ckpt_id} missing"))?;
+-                anchor_reuse(candidate)?;
+-                let mut frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
+-                let mut reuse_id = ckpt_id;
+-                // G3 cold-reuse fix: a page-less import (restart pack load or an
+-                // admission-demoted entry) has no resident prefix pages for a
+-                // first-step Query selection to score. A Pressure import with a
+-                // NEW question would reselect over empty residency and drop the
+-                // whole prefix; keep the source's selected views instead and
+-                // suppress the first-step Query.
+-                let page_less = ctl
+-                    .prefix_checkpoint(reuse_id)
+-                    .map(|c| c.gpu_pages.is_empty())
+-                    .unwrap_or(false);
+-                // 1b. P2.2a/P2.2b fenced-import admission (ninfer
+-                // `prepare_import_start`): the restored exact prefix is measured
+-                // against the layerwise window capacity B+R. A pressure import
+-                // arms a one-shot selection budget for the first Layerwise step.
+-                // When the FULL checkpoint would have to narrow, fall back to the
+-                // longest coverage checkpoint at or below the narrowed extent
+-                // (its DeltaNet state exists at its own page-aligned frontier);
+-                // no such checkpoint closes the reuse to cold.
+-                if ctl.strategy().is_layerwise() {
+-                    // 期2.3: the import decision carries the frontend query
+-                    // identity — KeepSelected (already effective at the
+-                    // source) suppresses the per-request Query; a NEW proven
+-                    // question arms it. Unproven spans keep the historical
+-                    // behaviour (no forced Query on the cold-reuse path).
+-                    let mut keep_selected = false;
+-                    let admission = (|| -> Result<Option<u32>, String> {
+-                        let prev = ctl.prefix_original_query(reuse_id);
+-                        let query = if page_less { prev } else { req.query };
+-                        let decision = ctl
+-                            .import_window(
+-                                req.prompt_tokens.len() as u64,
+-                                req.max_tokens as u64,
+-                                frontier,
+-                                query,
+-                                prev,
+-                            )
+-                            .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
+-                        keep_selected = decision.keep_selected;
+-                        let start = decision.start;
+-                        if !start.pressure() {
+-                            return Ok(None);
+-                        }
+-                        if start.restore_tokens < frontier as u64 {
+-                            let cap = start.restore_tokens as u32;
+-                            let shorter =
+-                                ctl.prefix_lookup_capped_media(&req.prompt_tokens, cap, req_media);
+-                            let Some(sid) = shorter.filter(|&sid| sid != reuse_id) else {
+-                                return Err(format!(
+-                                    "kvmem reuse: import pressure narrows {} -> {} tokens \
+-                                     and no coverage checkpoint fits",
+-                                    frontier, start.restore_tokens
+-                                ));
+-                            };
+-                            let candidate = ctl
+-                                .prefix_checkpoint(sid)
+-                                .map(|c| c.frontier)
+-                                .ok_or_else(|| format!("kvmem reuse: checkpoint {sid} missing"))?;
+-                            anchor_reuse(candidate)?;
+-                            frontier = ctl.fork_prefix_into(slot.0, sid, &req.prompt_tokens)?;
+-                            reuse_id = sid;
+-                            let prev = ctl.prefix_original_query(reuse_id);
+-                            let query = if page_less { prev } else { req.query };
+-                            let decision = ctl
+-                                .import_window(
+-                                    req.prompt_tokens.len() as u64,
+-                                    req.max_tokens as u64,
+-                                    frontier,
+-                                    query,
+-                                    prev,
+-                                )
+-                                .map_err(|e| format!("kvmem reuse: import retry: {e}"))?;
+-                            keep_selected = decision.keep_selected;
+-                            let retry = decision.start;
+-                            if retry.pressure() {
+-                                if retry.restore_tokens < frontier as u64 {
+-                                    return Err(format!(
+-                                        "kvmem reuse: coverage checkpoint {} narrows {} -> {} tokens",
+-                                        reuse_id, frontier, retry.restore_tokens
+-                                    ));
+-                                }
+-                                let blocks = (retry.selection_budget
+-                                    / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
+-                                    as u32;
+-                                return Ok(Some(blocks));
+-                            }
+-                            return Ok(None);
+-                        }
+-                        let blocks = (start.selection_budget
+-                            / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
+-                            as u32;
+-                        Ok(Some(blocks))
+-                    })();
+-                    match admission {
+-                        Ok(Some(blocks)) => ctl
+-                            .set_layerwise_import_blocks(slot.0, blocks)
+-                            .map_err(|e| format!("kvmem reuse: import budget: {e}"))?,
+-                        Ok(None) => {}
+-                        Err(e) => {
+-                            // The fork already reset this slot to the checkpoint
+-                            // prefix; a refused admission must hand it back cold.
+-                            let _ = ctl.reset_slot(slot.0);
+-                            let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+-                            return Err(e);
+-                        }
+-                    }
+-                    // 期2.3: arm the first-step Query only for a NEW proven
+-                    // question. KeepSelected leaves it clear so the source's
+-                    // selected views stand; an unproven span keeps the
+-                    // historical (no forced Query on the cold-reuse path).
+-                    let due = req.query.is_some() && !keep_selected && !page_less;
+-                    if req.query.is_some() {
+-                        ctl.set_layerwise_query_due(slot.0, due);
+-                    }
+-                    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+-                        .ok()
+-                        .is_some_and(|v| v == "1" || v == "on" || v == "true")
+-                    {
+-                        eprintln!(
+-                            "[kvmem-query] reuse slot {} query={:?} page_less={} keep_selected={} -> due={}",
+-                            slot.0,
+-                            req.query,
+-                            page_less,
+-                            keep_selected,
+-                            due
+-                        );
+-                    }
+-                }
+-                let gpu_pages = ctl
+-                    .prefix_checkpoint(reuse_id)
+-                    .map(|c| c.gpu_pages.clone())
+-                    .unwrap_or_default();
+-                // 2. DeltaNet restore (fail-closed pairing, spec §5.4 S4):
+-                // shared KV must never pair with a zeroed/partial recurrent
+-                // state. On any failure below, reset BOTH halves.
+-                let domain = rig
+-                    .cache_domain
+-                    .as_ref()
+-                    .ok_or_else(|| "kvmem reuse: no cache domain".to_string())?;
+-                let ckpt_pool = rig
+-                    .model
+-                    .checkpoint_pool
+-                    .as_mut()
+-                    .ok_or_else(|| "kvmem reuse: no checkpoint pool".to_string())?;
+-                // G7 Stage C: the recurrent state is keyed by the checkpoint's
+-                // media identity. The catalog gate proved it equals the
+-                // request's digest when the prefix covers an image span; a
+-                // pre-image/plain prefix carries no media and keeps the
+-                // historical key.
+-                let ckpt_media = ctl.prefix_checkpoint(reuse_id).and_then(|c| c.media_digest);
+-                let fp = crate::checkpoint::checkpoint_fingerprint(
+-                    &req.prompt_tokens[..frontier as usize],
+-                    ckpt_media,
+-                );
+-                // 期3 G3 P1.1 dn-persist: rebuild the recurrent checkpoint from
+-                // the pack sidecar when this process has no pool entry (restart).
+-                if ckpt_pool.peek(domain, frontier as u64, fp).is_none() {
+-                    if let Some(pack) = ctl.prefix_pack_path(reuse_id) {
+-                        let dn_path = std::path::PathBuf::from(format!("{}.dn", pack.display()));
+-                        match std::fs::read(&dn_path) {
+-                            Ok(bytes) => {
+-                                match crate::speculative::DeltaNetSnapshot::new_for(
+-                                    &mut rig.gpu,
+-                                    &rig.model.dn_states[slot.0],
+-                                ) {
+-                                    Ok(mut snap) => match snap.import_host(&rig.gpu, &bytes) {
+-                                        Ok(()) => {
+-                                            let (cid, displaced) = ckpt_pool.insert(
+-                                                domain.clone(),
+-                                                frontier as u64,
+-                                                fp,
+-                                                snap,
+-                                            );
+-                                            for d in displaced {
+-                                                d.free_gpu(&mut rig.gpu);
+-                                            }
+-                                            if cid != crate::checkpoint::CheckpointId::NONE
+-                                                && hipfire_config::developer_var(
+-                                                    "HIPFIRE_KVMEM_TRACE",
+-                                                )
+-                                                .ok()
+-                                                .is_some_and(|v| {
+-                                                    v == "1" || v == "on" || v == "true"
+-                                                })
+-                                            {
+-                                                eprintln!(
+-                                                    "[kvmem-pack] DN restored from sidecar frontier={frontier}"
+-                                                );
+-                                            }
+-                                        }
+-                                        Err(e) => {
+-                                            eprintln!("[kvmem-pack] DN sidecar rejected: {e}")
+-                                        }
+-                                    },
+-                                    Err(e) => {
+-                                        eprintln!("[kvmem-pack] DN sidecar alloc failed: {e:?}")
+-                                    }
+-                                }
+-                            }
+-                            Err(e) => eprintln!("[kvmem-pack] DN sidecar missing: {e}"),
+-                        }
+-                    }
+-                }
+-                let restored = ckpt_pool
+-                    .peek(domain, frontier as u64, fp)
+-                    .map(|snapshot| {
+-                        snapshot
+-                            .restore_to(&mut rig.model.dn_states[slot.0], &mut rig.gpu)
+-                            .is_ok()
+-                    })
+-                    .unwrap_or(false);
+-                if !restored {
+-                    let _ = ctl.reset_slot(slot.0);
+-                    let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+-                    return Err("kvmem reuse: DeltaNet checkpoint restore failed".to_string());
+-                }
+-                // 3. Share the pinned pages into the (empty) block table.
+-                // 期3 G3 P1.1: a restart-loaded pack carries no pinned GPU
+-                // pages. Layerwise restores pages from the sealed archive on
+-                // demand (carrier restore), so the share is skipped; Legacy
+-                // has no cold restore path and fails closed to a cold prefill.
+-                if gpu_pages.is_empty() {
+-                    if !ctl.strategy().is_layerwise() {
+-                        let _ = ctl.reset_slot(slot.0);
+-                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+-                        return Err(
+-                            "kvmem reuse: no pinned pages (restart) and Legacy has no cold restore"
+-                                .to_string(),
+-                        );
+-                    }
+-                    // G3 cold-reuse fix: a page-less import has no bound prefix
+-                    // pages, so the suffix prefill would attend over unbound
+-                    // rows and lose the imported context. Materialize the
+-                    // prefix from the archived store into pool pages first,
+-                    // then pin them so later reuses are hot.
+-                    let staged = ctl.stage_page_less_import(
+-                        &rig.gpu,
+-                        &mut rig.pool,
+-                        &rig.model.k_arenas,
+-                        &rig.model.v_arenas,
+-                        slot.0,
+-                        frontier,
+-                    );
+-                    let pages = match staged {
+-                        Ok(pages) => pages,
+-                        Err(e) => {
+-                            let _ = ctl.reset_slot(slot.0);
+-                            let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+-                            return Err(format!("kvmem reuse: cold prefix staging failed: {e}"));
+-                        }
+-                    };
+-                    let mut taken: Vec<u32> = Vec::new();
+-                    let mut ref_err = None;
+-                    if let Some(pp) = rig.pool.page_pool_mut() {
+-                        for &phys in &pages {
+-                            match pp.add_cache_ref(phys) {
+-                                Ok(()) => taken.push(phys),
+-                                Err(e) => {
+-                                    ref_err = Some(e);
+-                                    break;
+-                                }
+-                            }
+-                        }
+-                    } else {
+-                        ref_err = Some("not paged".to_string());
+-                    }
+-                    if let Some(e) = ref_err {
+-                        if let Some(pp) = rig.pool.page_pool_mut() {
+-                            for &phys in &taken {
+-                                let _ = pp.release_cache_ref(phys);
+-                            }
+-                        }
+-                        let _ = ctl.reset_slot(slot.0);
+-                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+-                        return Err(format!("kvmem reuse: cold prefix pin failed: {e}"));
+-                    }
+-                    if let Some(ckpt) = ctl.prefix_checkpoint_mut(reuse_id) {
+-                        ckpt.gpu_pages = pages;
+-                    }
+-                    ctl.note_prefix_restore_hit();
+-                } else if rig.pool.share_published_pages(slot, &gpu_pages).is_err() {
+-                    let _ = ctl.reset_slot(slot.0);
+-                    let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+-                    return Err("kvmem reuse: GPU page share failed".to_string());
+-                }
+-                // 4. 期4: restore the DFlash2 draft conditioning image that
+-                //    rides with this checkpoint (nInfer native full-state
+-                //    serialization; logical ring + captured watermarks). A
+-                //    missing/unrestorable image reseeds the draft from scratch
+-                //    — acceptance degrades, output stays verify-exact.
+-                if let Some(shared) = rig.model.dflash.as_ref() {
+-                    let restored = {
+-                        match ctl
+-                            .prefix_checkpoint(reuse_id)
+-                            .and_then(|c| c.draft_image.as_ref())
+-                        {
+-                            Some(img) => {
+-                                if rig.model.dflash_states[slot.0].is_none() {
+-                                    match crate::dflash_slot::new_dflash_slot_state(
+-                                        &mut rig.gpu,
+-                                        shared,
+-                                        &rig.model.config,
+-                                        &rig.model.dn_states[slot.0],
+-                                    ) {
+-                                        Ok(st) => rig.model.dflash_states[slot.0] = Some(st),
+-                                        Err(e) => {
+-                                            eprintln!("[kvmem-draft-image] state alloc failed: {e}")
+-                                        }
+-                                    }
+-                                }
+-                                match rig.model.dflash_states[slot.0].as_mut() {
+-                                    Some(st) => match crate::dflash_slot::dflash_restore_image(
+-                                        &mut rig.gpu,
+-                                        shared,
+-                                        st,
+-                                        img,
+-                                        id.0,
+-                                        frontier as usize,
+-                                    ) {
+-                                        Ok(()) => true,
+-                                        Err(e) => {
+-                                            eprintln!("[kvmem-draft-image] restore skipped: {e}");
+-                                            false
+-                                        }
+-                                    },
+-                                    None => false,
+-                                }
+-                            }
+-                            None => false,
+-                        }
+-                    };
+-                    if restored {
+-                        ctl.note_draft_image_hit();
+-                    } else {
+-                        ctl.note_draft_image_miss();
+-                        if let Some(st) = rig.model.dflash_states[slot.0].as_mut() {
+-                            crate::dflash_slot::reset_dflash_slot(st, id.0);
+-                        }
+-                    }
+-                }
+-                Ok(frontier as usize)
+-            })();
+-            match reuse {
+-                Ok(frontier) => {
+-                    prefix_reused = frontier;
+-                    prefix_hit = true;
+-                    if rig.gpu.slot_trace() {
+-                        eprintln!(
+-                            "[slot-trace] KVMem prefix HIT: reused {}/{} tokens",
+-                            frontier,
+-                            req.prompt_tokens.len()
+-                        );
+-                    }
+-                }
+-                Err(e) => {
+-                    eprintln!("[kvmem-prefix] reuse did not convert: {e} — cold prefill");
+-                }
+-            }
+-        }
++    if let Some(frontier) = kvmem_engine::kvmem_prefix_reuse(&mut *rig, slot, id, &req) {
++        prefix_reused = frontier;
++        prefix_hit = true;
+     }
+ 
+     // ── Prefix cache lookup (spec §4.5–4.6) ──────────────────────────────
+@@ -10379,78 +9197,8 @@ fn admit(
+         }
+     }
+ 
+-    // ── P4.3 canonical-prefix reclaim under page pressure ────────────────
+-    // Pinned canonical prefixes hold pool pages beyond the per-slot working
+-    // sets. When the free list cannot back one slot's resident budget plus
+-    // headroom, Layerwise DEMOTES the LRU catalog entries: pinned pages drop,
+-    // the catalog entry survives, and a later reuse restores pages from the
+-    // sealed archive (nInfer keeps the directory separate from residency).
+-    // Legacy reuse requires resident pages, so it keeps the historical pop
+-    // (entry removed). Pages still held by live block tables survive the ref
+-    // release. Bounded: an entry demotes once and the catalog is finite.
+     #[cfg(feature = "kvmem")]
+-    if rig.kvmem_prefix_pin {
+-        let headroom = rig
+-            .model
+-            .kvmem
+-            .as_ref()
+-            .map(|ctl| ctl.budget_blocks() + 2)
+-            .unwrap_or(2);
+-        let layerwise = rig
+-            .model
+-            .kvmem
+-            .as_ref()
+-            .map(|ctl| ctl.strategy().is_layerwise())
+-            .unwrap_or(false);
+-        loop {
+-            let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+-            if free >= headroom {
+-                break;
+-            }
+-            if layerwise {
+-                let Some((id, pages)) = rig
+-                    .model
+-                    .kvmem
+-                    .as_mut()
+-                    .and_then(|ctl| ctl.demote_lru_prefix())
+-                else {
+-                    break;
+-                };
+-                if let Some(pp) = rig.pool.page_pool_mut() {
+-                    for &phys in &pages {
+-                        let _ = pp.release_cache_ref(phys);
+-                    }
+-                }
+-                if rig.gpu.slot_trace() {
+-                    eprintln!(
+-                        "[kvmem-prefix] demoted canonical prefix {id} ({} pages) under \
+-                         admission pressure; catalog entry retained",
+-                        pages.len()
+-                    );
+-                }
+-            } else {
+-                let victim = rig
+-                    .model
+-                    .kvmem
+-                    .as_mut()
+-                    .and_then(|ctl| ctl.pop_lru_prefix());
+-                let Some(victim) = victim else { break };
+-                if let Some(pp) = rig.pool.page_pool_mut() {
+-                    for &phys in &victim.gpu_pages {
+-                        let _ = pp.release_cache_ref(phys);
+-                    }
+-                }
+-                if rig.gpu.slot_trace() {
+-                    eprintln!(
+-                        "[kvmem-prefix] reclaimed canonical prefix {} ({} pages) under \
+-                         admission pressure",
+-                        victim.id,
+-                        victim.gpu_pages.len()
+-                    );
+-                }
+-            }
+-        }
+-    }
++    kvmem_engine::kvmem_reclaim_prefixes(rig);
+ 
+     // ── Idle-session reclaim under page pressure (spec §5.4 S4 row 3) ──
+     // Radix-leaf eviction only frees cache-only pages. Pages held by idle
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+index 69f0b2580..b06672d4e 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+@@ -7,13 +7,18 @@
+ // scheduling and batch execution stay in `serve_engine.rs`.
+ 
+ use super::EngineConfig;
++use crate::qwen35::LayerType;
+ use hipfire_runtime::scheduler::{PendingWork, SpecKind};
+ use hipfire_runtime::session_table::SessionId;
+ use hipfire_runtime::slot_batch::SlotBatch;
+ use rdna_compute::page_pool::PAGE_TOKENS;
+ use rdna_compute::slot_pool::SlotId;
++use rdna_compute::HipResult;
+ 
+-use super::{convo_group, kvmem_legacy_enabled, InFlight, Rig};
++use super::{
++    convo_group, kvmem_legacy_enabled, layerwise_admissible, layerwise_mtp_verify_admissible,
++    InFlight, Rig, SlotDecodeGraph, SpecDraftRows, SubmitRequest,
++};
+ 
+ /// G7: the session's media identity + image spans over `tokens` (the frozen
+ /// prefix). Text-only sessions and pre-image prefixes yield `(None, vec![])`.
+@@ -1591,3 +1596,1285 @@ pub(super) fn resolve_prefix_boot(
+         plan,
+     })
+ }
++
++/// Layerwise AR decode / spec-verify step (P1-A). The caller handles
++/// admission failure so the scheduler can poison every active slot; every
++/// controller/output-owner restore stays inside this helper.
++#[allow(clippy::too_many_arguments)]
++pub(super) fn layerwise_forward(
++    rig: &mut Rig,
++    batch: &SlotBatch,
++    slots: &[Option<InFlight>],
++    work: &[PendingWork],
++    graph: &mut SlotDecodeGraph,
++    lm_head_skip: &[bool],
++    any_verify: bool,
++    any_dflash_rows: bool,
++) -> Result<HipResult<()>, String> {
++    Ok(
++        match layerwise_admissible(&rig, batch, &slots, &work, any_verify, any_dflash_rows) {
++            Some((slot, session_id, media_pages)) => {
++                let mut kvmem = rig.model.kvmem.take();
++                let n_fa = rig
++                    .model
++                    .config
++                    .layer_types
++                    .iter()
++                    .filter(|t| **t == LayerType::FullAttention)
++                    .count();
++                let fa_layers: Vec<u32> = (0..n_fa as u32).collect();
++                // Ensure + DETACH the persistent OUTPUT-scope owner (A'-1:
++                // AR decode rides the same OutputPressure infrastructure as
++                // MTP verify, design §3.10a borrow resolution): the carrier
++                // borrows `&ctl` (keys/policy), so the owner is taken out into
++                // an independent local to allow `&mut` accept after the
++                // forward, then restored on EVERY exit path. Layerwise-only
++                // (ensure fails closed under Legacy, which never reaches
++                // this arm). The slot keeps its keep-set / counters.
++                let mut output_owner = None;
++                // [P4.1② fix] consume the per-request Query gate in the
++                // mutable window (before the immutable ctl borrow below).
++                let mut force_query = false;
++                if let Some(k) = kvmem.as_mut() {
++                    let incarnation = k.layerwise_counters(slot).map(|(inc, _)| inc).unwrap_or(0);
++                    if let Err(e) = k.ensure_layerwise_output_pressure(
++                        slot,
++                        session_id,
++                        incarnation,
++                        &fa_layers,
++                    ) {
++                        rig.model.kvmem = kvmem;
++                        return Err(e);
++                    }
++                    output_owner = k.take_layerwise_output_pressure(slot);
++                    force_query = k.take_layerwise_query_due(slot);
++                }
++                let ctl = kvmem
++                    .as_ref()
++                    .expect("admissible layerwise step has a controller");
++                // G5: the accepted frontier this restore opens at (the
++                // single AR decode row's position). The head aux history is
++                // bound from the first FA layer's restored view here, so
++                // the first MTP draft (next step) has a selection to take.
++                let begin = ctl.fed_tokens(slot).unwrap_or(0) as u64;
++                // Fresh page-aligned selection policy over the sealed
++                // full pages only (the core picker rejects a partial
++                // tail). The slot's shared `kv` store keeps tracking all
++                // fed tokens for Legacy and is never borrowed/mutated by
++                // Layerwise; this policy is scoped to the query and
++                // dropped after the carrier is freed.
++                let lw_policy = match ctl.layerwise_policy(ctl.fed_tokens(slot).unwrap_or(0)) {
++                    Ok(p) => p,
++                    Err(e) => {
++                        if let Some(p) = output_owner {
++                            if let Some(k) = kvmem.as_mut() {
++                                k.restore_layerwise_output_pressure(slot, p);
++                            }
++                        }
++                        rig.model.kvmem = kvmem;
++                        return Err(e);
++                    }
++                };
++                // A'-1: AR decode rides engine_carrier_rows (OutputPressure,
++                // native mass tracking) with width=1 / query=None / prefill=None
++                // ⇒ always scorer Query selection (mirrors MTP verify). The
++                // page-aligned PrefillPressure mid-page freeze that lost needles
++                // is gone; the OutputPressure window advances accepted_end
++                // natively (fed→fed+1) but does not drive selection (prefill=None).
++                let built = crate::layerwise_driver::engine_carrier_rows(
++                    &mut rig.gpu,
++                    ctl,
++                    &lw_policy,
++                    slot,
++                    session_id,
++                    n_fa,
++                    rig.model.config.n_heads,
++                    rig.model.config.n_kv_heads,
++                    rig.model.config.head_dim,
++                    rig.cap_tokens as u32,
++                    "qwen35",
++                    1,
++                    None,
++                    output_owner
++                        .as_mut()
++                        .expect("admissible layerwise AR step has an output owner"),
++                    None,
++                    force_query,
++                    &media_pages,
++                );
++                match built {
++                    Ok(Some(mut carrier)) => {
++                        let fwd = rig.model.forward_step(
++                            &mut rig.gpu,
++                            batch,
++                            &mut rig.pool,
++                            graph,
++                            lm_head_skip,
++                            any_verify,
++                            any_dflash_rows,
++                            Some(&mut carrier),
++                        );
++                        // Keep-set contribution (design §3.10a, A'-1): read the
++                        // previous resident pool while the carrier still borrows
++                        // ctl, then REPLACE with this step's restored pages. AR
++                        // decode is always scorer Query (OutputPressure, prefill=None),
++                        // so the keep-set is replaced every step — the scorer's
++                        // restored view re-admits cold-recalled needle pages, and a
++                        // growing union would diverge per-layer extents (bug #8).
++                        let head_plane = ctl.head_plane_enabled();
++                        // P4.1③ H2a/H4: UpstreamGlobal head-history probe
++                        // over the carrier's CAPTURED activation Q tapes,
++                        // run BEFORE `free` ends the carrier borrow (the
++                        // tapes live in the per-step carrier). Pure host
++                        // selection — no KV mutation, no rollback. FirstLayer
++                        // (the auto-default) skips this and binds from the
++                        // first restored ordinal after free (② G5). Legacy /
++                        // AR-only never reach it (byte-neutral).
++                        let mtp_history = ctl.layerwise_mtp_history();
++                        let probe_aux: Option<
++                            Result<crate::layerwise_mtp::AuxiliarySelection, String>,
++                        > = if head_plane
++                            && mtp_history
++                                == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
++                        {
++                            Some(match carrier.activation() {
++                                Some(act) => match ctl.layerwise_stores(slot) {
++                                    Some((keys, _)) => crate::layerwise_probe::probe_head_history(
++                                        &mut rig.gpu,
++                                        act,
++                                        &lw_policy,
++                                        keys,
++                                        rig.model.config.n_heads as u32,
++                                        rig.model.config.n_kv_heads as u32,
++                                        rig.model.config.head_dim as u32,
++                                        0.0,
++                                        crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u32,
++                                        begin,
++                                    ),
++                                    None => {
++                                        Err("layerwise probe: slot has no keys store".to_string())
++                                    }
++                                },
++                                None => {
++                                    Err("layerwise probe: UpstreamGlobal carrier has no activation"
++                                        .to_string())
++                                }
++                            })
++                        } else {
++                            None
++                        };
++                        let prev_keep: Vec<Vec<u64>> = ctl
++                            .layerwise_keep_set(slot)
++                            .map(|s| s.to_vec())
++                            .unwrap_or_default();
++                        let restored_res = carrier.restored_keep_set();
++                        // G5: the first FA ordinal's restored canonical ids
++                        // for the FirstLayer head aux binding, captured before
++                        // `free` ends the carrier borrow. `None` on a restore
++                        // error (surfaced through `keep_res` below). Cloned out
++                        // so `restored_res` still moves into `keep_res` (owned Err).
++                        let aux_first: Option<Vec<u64>> =
++                            restored_res.as_ref().ok().and_then(|r| r.first().cloned());
++                        let keep_res = restored_res.map(|restored| {
++                            // A'-1: AR decode is always scorer Query (prefill=None
++                            // ⇒ no Pressure refinement), so REPLACE the keep-set
++                            // every step (fresh current-Q re-selection, consistent
++                            // per-layer extent) exactly like the MTP verify regime
++                            // (bug #8). UNION with a non-empty prior diverges the
++                            // per-layer resident counts and trips the catalog
++                            // geometry guard; the scorer's restored view already
++                            // re-admits cold-recalled needle pages each step, so a
++                            // growing union is redundant. Always-Query also satisfies
++                            // the continuation fix (current question re-scored).
++                            crate::layerwise_driver::combine_keep_set(
++                                &prev_keep, &restored, true, n_fa,
++                            )
++                        });
++                        // Accept the captured native mass into the detached
++                        // OUTPUT-scope owner at the confirmed AR prefix (accepted=1:
++                        // the single decode row is always accepted). Advances the
++                        // window's accepted_end to fed+1 for the next step's begin.
++                        // The &mut owner is independent of the carrier's ctl borrow,
++                        // so this runs before free. AR publishes immediately (no
++                        // MTP-style deferred pending_output: the prefix is known).
++                        let accept_res = match output_owner.as_mut() {
++                            Some(p) => carrier
++                                .accept_output_pressure(p, session_id + 1, begin, 1)
++                                .map(|_| false),
++                            None => Ok(false),
++                        };
++                        // Release the carrier exactly once (its GPU
++                        // buffers have no Drop). `free` consumes it,
++                        // ending its borrow of `kvmem`/`lw_policy` before
++                        // the mutable counter bump / keep-set / restore.
++                        let free_res = carrier.free(&mut rig.gpu);
++                        // G5: FirstLayer head aux binding (pure-host, after the
++                        // carrier borrow ends). `head_plane` ⇒ Layerwise + MTP ⇒
++                        // FirstLayer under ②. `Ok(None)` when the head plane is
++                        // inactive (AR-only) or the restore errored (handled below).
++                        let aux_res = if head_plane {
++                            if mtp_history
++                                == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
++                            {
++                                probe_aux.transpose()
++                            } else {
++                                aux_first
++                                    .as_deref()
++                                    .map(|first| {
++                                        crate::layerwise_mtp::bind_first_layer_auxiliary(
++                                            first,
++                                            begin,
++                                            crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u64,
++                                        )
++                                    })
++                                    .transpose()
++                            }
++                        } else {
++                            Ok(None)
++                        };
++                        // Return the detached owner on EVERY path so the
++                        // session-lifetime pressure state persists.
++                        if let Some(p) = output_owner {
++                            if let Some(k) = kvmem.as_mut() {
++                                k.restore_layerwise_output_pressure(slot, p);
++                            }
++                        }
++                        if let Some(e) = accept_res.err().or_else(|| free_res.err()) {
++                            rig.model.kvmem = kvmem;
++                            return Err(e);
++                        }
++                        let new_keep = match keep_res {
++                            Ok(k) => k,
++                            Err(e) => {
++                                rig.model.kvmem = kvmem;
++                                return Err(e);
++                            }
++                        };
++                        let aux_sel = match aux_res {
++                            Ok(s) => s,
++                            Err(e) => {
++                                rig.model.kvmem = kvmem;
++                                return Err(e);
++                            }
++                        };
++                        if let Some(k) = kvmem.as_mut() {
++                            k.advance_layerwise_seq(slot);
++                            k.set_layerwise_keep_set(slot, new_keep);
++                            if let Some(s) = aux_sel {
++                                k.set_aux_selection(slot, s);
++                            }
++                        }
++                        rig.model.kvmem = kvmem;
++                        fwd
++                    }
++                    // Before the fixed-block floor (see
++                    // `layerwise_floor_tokens`): restore the controller +
++                    // owner and run Legacy; no transaction.
++                    Ok(None) => {
++                        if let Some(p) = output_owner {
++                            if let Some(k) = kvmem.as_mut() {
++                                k.restore_layerwise_output_pressure(slot, p);
++                            }
++                        }
++                        rig.model.kvmem = kvmem;
++                        rig.model.forward_step(
++                            &mut rig.gpu,
++                            batch,
++                            &mut rig.pool,
++                            graph,
++                            lm_head_skip,
++                            any_verify,
++                            any_dflash_rows,
++                            None,
++                        )
++                    }
++                    Err(e) => {
++                        if let Some(p) = output_owner {
++                            if let Some(k) = kvmem.as_mut() {
++                                k.restore_layerwise_output_pressure(slot, p);
++                            }
++                        }
++                        rig.model.kvmem = kvmem;
++                        return Err(e);
++                    }
++                }
++            }
++            None => {
++                // P4.1② (design §A.6 / §B D1.4②): AR admission rejects
++                // `any_verify`, so a Layerwise MTP verify span lands here.
++                // Admit it before falling back to Legacy: multi-row trunk
++                // accepted-only write-through + drop-evict + restore over
++                // the verify batch (Path B), through the OUTPUT-scope owner
++                // (partial acceptance). The accepted prefix is published
++                // post-sampling in `mtp_verify_accept_step`, not here.
++                if let Some((slot, session_id, width)) = layerwise_mtp_verify_admissible(
++                    &rig,
++                    batch,
++                    &slots,
++                    &work,
++                    any_verify,
++                    any_dflash_rows,
++                ) {
++                    let mut kvmem = rig.model.kvmem.take();
++                    let n_fa = rig
++                        .model
++                        .config
++                        .layer_types
++                        .iter()
++                        .filter(|t| **t == LayerType::FullAttention)
++                        .count();
++                    let fa_layers: Vec<u32> = (0..n_fa as u32).collect();
++                    // Ensure + DETACH the persistent OUTPUT-scope owner
++                    // (the MTP-verify sibling of the AR prefill owner). A
++                    // verify span accepts a PREFIX of its rows, which the
++                    // all-or-nothing prefill owner cannot express. Taken
++                    // out so `begin_scope`/`prepare_scope`/`accept` use
++                    // `&mut OutputPressure` independently of the carrier's
++                    // `&ctl` borrow; restored on EVERY exit path.
++                    let mut output_owner = None;
++                    // [P4.1② fix] consume the per-request Query gate in the
++                    // mutable window (before the immutable ctl borrow).
++                    let mut force_query = false;
++                    if let Some(k) = kvmem.as_mut() {
++                        let incarnation =
++                            k.layerwise_counters(slot).map(|(inc, _)| inc).unwrap_or(0);
++                        if let Err(e) = k.ensure_layerwise_output_pressure(
++                            slot,
++                            session_id,
++                            incarnation,
++                            &fa_layers,
++                        ) {
++                            rig.model.kvmem = kvmem;
++                            return Err(e);
++                        }
++                        output_owner = k.take_layerwise_output_pressure(slot);
++                        force_query = k.take_layerwise_query_due(slot);
++                    }
++                    let ctl = kvmem
++                        .as_ref()
++                        .expect("admissible layerwise verify has a controller");
++                    // Native consumed-row frontier the output window opens
++                    // at (== the verify span's first position); the accepted
++                    // prefix advances it by `result.advance` post-sampling.
++                    let begin = ctl.fed_tokens(slot).unwrap_or(0) as u64;
++                    let request = session_id + 1;
++                    let lw_policy = match ctl.layerwise_policy(ctl.fed_tokens(slot).unwrap_or(0)) {
++                        Ok(p) => p,
++                        Err(e) => {
++                            if let Some(p) = output_owner {
++                                if let Some(k) = kvmem.as_mut() {
++                                    k.restore_layerwise_output_pressure(slot, p);
++                                }
++                            }
++                            rig.model.kvmem = kvmem;
++                            return Err(e);
++                        }
++                    };
++                    let built = crate::layerwise_driver::engine_carrier_rows(
++                        &mut rig.gpu,
++                        ctl,
++                        &lw_policy,
++                        slot,
++                        session_id,
++                        n_fa,
++                        rig.model.config.n_heads,
++                        rig.model.config.n_kv_heads,
++                        rig.model.config.head_dim,
++                        rig.cap_tokens as u32,
++                        "qwen35",
++                        width,
++                        None,
++                        output_owner
++                            .as_mut()
++                            .expect("admissible layerwise verify has an output owner"),
++                        None,
++                        force_query,
++                        &[],
++                    );
++                    match built {
++                        Ok(Some(mut carrier)) => {
++                            let fwd = rig.model.forward_step(
++                                &mut rig.gpu,
++                                batch,
++                                &mut rig.pool,
++                                graph,
++                                lm_head_skip,
++                                any_verify,
++                                any_dflash_rows,
++                                Some(&mut carrier),
++                            );
++                            let head_plane = ctl.head_plane_enabled();
++                            // P4.1③ H2a/H4: UpstreamGlobal head-history probe
++                            // over the carrier's CAPTURED activation Q tapes,
++                            // run BEFORE `free` (the tapes live in the per-step
++                            // carrier). Pure host selection — no KV mutation, no
++                            // rollback. FirstLayer binds from the first restored
++                            // ordinal after free (② G5). Legacy / AR-only never
++                            // reach it (byte-neutral).
++                            let mtp_history = ctl.layerwise_mtp_history();
++                            let probe_aux: Option<
++                                Result<crate::layerwise_mtp::AuxiliarySelection, String>,
++                            > = if head_plane
++                                && mtp_history
++                                    == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
++                            {
++                                Some(match carrier.activation() {
++                                    Some(act) => {
++                                        match ctl.layerwise_stores(slot) {
++                                            Some((keys, _)) => {
++                                                crate::layerwise_probe::probe_head_history(
++                                                    &mut rig.gpu,
++                                                    act,
++                                                    &lw_policy,
++                                                    keys,
++                                                    rig.model.config.n_heads as u32,
++                                                    rig.model.config.n_kv_heads as u32,
++                                                    rig.model.config.head_dim as u32,
++                                                    0.0,
++                                                    crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS
++                                                        as u32,
++                                                    begin,
++                                                )
++                                            }
++                                            None => Err("layerwise probe: slot has no keys store"
++                                                .to_string()),
++                                        }
++                                    }
++                                    None => Err(
++                                        "layerwise probe: UpstreamGlobal carrier has no activation"
++                                            .to_string(),
++                                    ),
++                                })
++                            } else {
++                                None
++                            };
++                            let restored_res = carrier.restored_keep_set();
++                            // G5: the first FA ordinal's restored canonical ids
++                            // for the FirstLayer head aux binding, captured before
++                            // `free` ends the carrier borrow. `None` on a restore
++                            // error (surfaced through `keep_res` below). Cloned out
++                            // so `restored_res` still moves into `keep_res` (owned Err).
++                            let aux_first: Option<Vec<u64>> =
++                                restored_res.as_ref().ok().and_then(|r| r.first().cloned());
++                            // Keep-set (design §3.10a, ninfer REPLACE): the
++                            // MTP composite verify regime forces REPLACE
++                            // (pressure = true, empty prev). The trunk+aux
++                            // planes select asymmetric page ids, so a growing
++                            // union diverges the per-layer resident counts and
++                            // trips the catalog's cross-layer extent invariant
++                            // (bug #8). The restored view already admits the
++                            // scorer's full re-selection (cold recall included).
++                            let keep_res = restored_res.map(|restored| {
++                                crate::layerwise_driver::combine_keep_set(
++                                    &[],
++                                    &restored,
++                                    true,
++                                    n_fa,
++                                )
++                            });
++                            // Extract the OWNED acceptance snapshot before
++                            // freeing the carrier: the accepted prefix
++                            // (`result.advance`) is known only post-sampling,
++                            // so the publish runs in `mtp_verify_accept_step`
++                            // (after `feed_rows`), outside this scoped take.
++                            let snap_res = carrier.extract_output_acceptance(request, begin);
++                            let free_res = carrier.free(&mut rig.gpu);
++                            // G5: FirstLayer head aux binding (pure-host, after the
++                            // carrier borrow ends). `head_plane` ⇒ Layerwise + MTP ⇒
++                            // FirstLayer under ②. The head consume (post-accept) and
++                            // the next span's draft take this binding. `Ok(None)` when
++                            // the head plane is inactive or the restore errored.
++                            let aux_res = if head_plane {
++                                if mtp_history
++                                    == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
++                                {
++                                    probe_aux.transpose()
++                                } else {
++                                    aux_first
++                                        .as_deref()
++                                        .map(|first| {
++                                            crate::layerwise_mtp::bind_first_layer_auxiliary(
++                                                first,
++                                                begin,
++                                                crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS
++                                                    as u64,
++                                            )
++                                        })
++                                        .transpose()
++                                }
++                            } else {
++                                Ok(None)
++                            };
++                            if let Some(p) = output_owner {
++                                if let Some(k) = kvmem.as_mut() {
++                                    k.restore_layerwise_output_pressure(slot, p);
++                                }
++                            }
++                            if let Some(e) = free_res.err() {
++                                rig.model.kvmem = kvmem;
++                                return Err(e);
++                            }
++                            let new_keep = match keep_res {
++                                Ok(k) => k,
++                                Err(e) => {
++                                    rig.model.kvmem = kvmem;
++                                    return Err(e);
++                                }
++                            };
++                            let snap = match snap_res {
++                                Ok(s) => s,
++                                Err(e) => {
++                                    rig.model.kvmem = kvmem;
++                                    return Err(e);
++                                }
++                            };
++                            let aux_sel = match aux_res {
++                                Ok(s) => s,
++                                Err(e) => {
++                                    rig.model.kvmem = kvmem;
++                                    return Err(e);
++                                }
++                            };
++                            if let Some(k) = kvmem.as_mut() {
++                                k.advance_layerwise_seq(slot);
++                                k.set_layerwise_keep_set(slot, new_keep);
++                                if let Some(s) = snap {
++                                    k.set_layerwise_pending_output(slot, s);
++                                }
++                                if let Some(s) = aux_sel {
++                                    k.set_aux_selection(slot, s);
++                                }
++                            }
++                            rig.model.kvmem = kvmem;
++                            fwd
++                        }
++                        // Before the fixed-block floor (see
++                        // `layerwise_floor_tokens`): restore the owner +
++                        // controller and run Legacy; the verify still
++                        // commits via `feed_rows`, no output publish.
++                        Ok(None) => {
++                            if let Some(p) = output_owner {
++                                if let Some(k) = kvmem.as_mut() {
++                                    k.restore_layerwise_output_pressure(slot, p);
++                                }
++                            }
++                            rig.model.kvmem = kvmem;
++                            rig.model.forward_step(
++                                &mut rig.gpu,
++                                batch,
++                                &mut rig.pool,
++                                graph,
++                                lm_head_skip,
++                                any_verify,
++                                any_dflash_rows,
++                                None,
++                            )
++                        }
++                        Err(e) => {
++                            if let Some(p) = output_owner {
++                                if let Some(k) = kvmem.as_mut() {
++                                    k.restore_layerwise_output_pressure(slot, p);
++                                }
++                            }
++                            rig.model.kvmem = kvmem;
++                            return Err(e);
++                        }
++                    }
++                } else {
++                    rig.model.forward_step(
++                        &mut rig.gpu,
++                        batch,
++                        &mut rig.pool,
++                        graph,
++                        lm_head_skip,
++                        any_verify,
++                        any_dflash_rows,
++                        None,
++                    )
++                }
++            }
++        },
++    )
++}
++
++/// KVMem-native canonical-prefix reuse (P4.3). Returns the reused token
++/// frontier when the lookup converts, or `None` after unwinding to cold.
++pub(super) fn kvmem_prefix_reuse(
++    rig: &mut Rig,
++    slot: SlotId,
++    session_id: SessionId,
++    req: &SubmitRequest,
++) -> Option<usize> {
++    #[cfg(feature = "kvmem")]
++    let req_media: Option<u64> = req
++        .visual_data
++        .as_ref()
++        .map(|vd| vd.media_digest())
++        .or_else(|| rig.sessions.get(session_id).and_then(|s| s.media_digest));
++    // G7 Stage C: the reuse frontier goes through the Stage A media anchor.
++    // The restored prefix must never split a vision span of the incoming
++    // prompt; a frozen checkpoint already satisfies this by construction, so a
++    // failure here is an invariant violation and the reuse closes to cold.
++    #[cfg(feature = "kvmem")]
++    let req_media_spans: Vec<crate::kvmem_media::MediaSpan> = {
++        let n_visual = req
++            .visual_data
++            .as_ref()
++            .map(|vd| vd.n_visual_tokens)
++            .or_else(|| rig.sessions.get(session_id).map(|s| s.media_n_visual))
++            .unwrap_or(0);
++        match (req_media, rig.tokenizer.special_token_id("<|image_pad|>")) {
++            (Some(_), Some(pad)) if n_visual > 0 => {
++                crate::kvmem_media::spans_from_pad_runs(&req.prompt_tokens, pad, n_visual)
++            }
++            _ => Vec::new(),
++        }
++    };
++    #[cfg(feature = "kvmem")]
++    let anchor_reuse = |frontier: u32| -> Result<u32, String> {
++        if req_media_spans.is_empty() {
++            return Ok(frontier);
++        }
++        let aligned = crate::kvmem_media::media_anchored_frontier(
++            0,
++            frontier as u64,
++            req.prompt_tokens.len() as u64,
++            &req_media_spans,
++            crate::kvmem_ctl::KV_BLOCK_TOKENS as u64,
++        )
++        .map_err(|e| format!("kvmem reuse: media anchor: {e}"))?;
++        if aligned != frontier as u64 {
++            return Err(format!(
++                "kvmem reuse: media anchor moves frontier {frontier} -> {aligned}"
++            ));
++        }
++        // G7 Stage E probe: the live media replay anchor accepted this
++        // frontier (block-aligned and not splitting any image span).
++        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++            .ok()
++            .is_some_and(|v| v == "1" || v == "on" || v == "true")
++        {
++            let fmt = |d: Option<u64>| {
++                d.map(|x| format!("{x:016x}"))
++                    .unwrap_or_else(|| "none".to_string())
++            };
++            eprintln!(
++                "[kvmem-media] reuse anchor accept digest={} spans={} candidate={frontier} \
++             aligned={aligned}",
++                fmt(req_media),
++                req_media_spans.len()
++            );
++        }
++        Ok(frontier)
++    };
++    #[cfg(feature = "kvmem")]
++    if rig.kvmem_prefix_pin {
++        // 期3 G3 P1.1: a cold pack hit publishes a catalog entry and may
++        // displace others; release their GPU cache refs outside the borrow.
++        let mut cold_displaced = Vec::new();
++        let hit = rig.model.kvmem.as_mut().and_then(|ctl| {
++            let hit = ctl.prefix_lookup_media(&req.prompt_tokens, req_media);
++            cold_displaced = ctl.take_cold_displaced();
++            hit
++        });
++        for d in cold_displaced {
++            if let Some(pp) = rig.pool.page_pool_mut() {
++                for &phys in &d.gpu_pages {
++                    let _ = pp.release_cache_ref(phys);
++                }
++            }
++        }
++        if let Some(ckpt_id) = hit {
++            let reuse = (|| -> Result<usize, String> {
++                let ctl = rig
++                    .model
++                    .kvmem
++                    .as_mut()
++                    .ok_or_else(|| "kvmem reuse: no controller".to_string())?;
++                // 1. Host fork: validates the FULL provenance (geometry +
++                // fingerprint + token proof) before any mutation.
++                // Stage C: the candidate frontier must pass the media anchor
++                // BEFORE the fork mutates the slot; a violation closes the
++                // reuse to a cold prefill (the slot is still the earlier
++                // reset state here).
++                let candidate = ctl
++                    .prefix_checkpoint(ckpt_id)
++                    .map(|c| c.frontier)
++                    .ok_or_else(|| format!("kvmem reuse: checkpoint {ckpt_id} missing"))?;
++                anchor_reuse(candidate)?;
++                let mut frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
++                let mut reuse_id = ckpt_id;
++                // G3 cold-reuse fix: a page-less import (restart pack load or an
++                // admission-demoted entry) has no resident prefix pages for a
++                // first-step Query selection to score. A Pressure import with a
++                // NEW question would reselect over empty residency and drop the
++                // whole prefix; keep the source's selected views instead and
++                // suppress the first-step Query.
++                let page_less = ctl
++                    .prefix_checkpoint(reuse_id)
++                    .map(|c| c.gpu_pages.is_empty())
++                    .unwrap_or(false);
++                // 1b. P2.2a/P2.2b fenced-import admission (ninfer
++                // `prepare_import_start`): the restored exact prefix is measured
++                // against the layerwise window capacity B+R. A pressure import
++                // arms a one-shot selection budget for the first Layerwise step.
++                // When the FULL checkpoint would have to narrow, fall back to the
++                // longest coverage checkpoint at or below the narrowed extent
++                // (its DeltaNet state exists at its own page-aligned frontier);
++                // no such checkpoint closes the reuse to cold.
++                if ctl.strategy().is_layerwise() {
++                    // 期2.3: the import decision carries the frontend query
++                    // identity — KeepSelected (already effective at the
++                    // source) suppresses the per-request Query; a NEW proven
++                    // question arms it. Unproven spans keep the historical
++                    // behaviour (no forced Query on the cold-reuse path).
++                    let mut keep_selected = false;
++                    let admission = (|| -> Result<Option<u32>, String> {
++                        let prev = ctl.prefix_original_query(reuse_id);
++                        let query = if page_less { prev } else { req.query };
++                        let decision = ctl
++                            .import_window(
++                                req.prompt_tokens.len() as u64,
++                                req.max_tokens as u64,
++                                frontier,
++                                query,
++                                prev,
++                            )
++                            .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
++                        keep_selected = decision.keep_selected;
++                        let start = decision.start;
++                        if !start.pressure() {
++                            return Ok(None);
++                        }
++                        if start.restore_tokens < frontier as u64 {
++                            let cap = start.restore_tokens as u32;
++                            let shorter =
++                                ctl.prefix_lookup_capped_media(&req.prompt_tokens, cap, req_media);
++                            let Some(sid) = shorter.filter(|&sid| sid != reuse_id) else {
++                                return Err(format!(
++                                    "kvmem reuse: import pressure narrows {} -> {} tokens \
++                                 and no coverage checkpoint fits",
++                                    frontier, start.restore_tokens
++                                ));
++                            };
++                            let candidate = ctl
++                                .prefix_checkpoint(sid)
++                                .map(|c| c.frontier)
++                                .ok_or_else(|| format!("kvmem reuse: checkpoint {sid} missing"))?;
++                            anchor_reuse(candidate)?;
++                            frontier = ctl.fork_prefix_into(slot.0, sid, &req.prompt_tokens)?;
++                            reuse_id = sid;
++                            let prev = ctl.prefix_original_query(reuse_id);
++                            let query = if page_less { prev } else { req.query };
++                            let decision = ctl
++                                .import_window(
++                                    req.prompt_tokens.len() as u64,
++                                    req.max_tokens as u64,
++                                    frontier,
++                                    query,
++                                    prev,
++                                )
++                                .map_err(|e| format!("kvmem reuse: import retry: {e}"))?;
++                            keep_selected = decision.keep_selected;
++                            let retry = decision.start;
++                            if retry.pressure() {
++                                if retry.restore_tokens < frontier as u64 {
++                                    return Err(format!(
++                                    "kvmem reuse: coverage checkpoint {} narrows {} -> {} tokens",
++                                    reuse_id, frontier, retry.restore_tokens
++                                ));
++                                }
++                                let blocks = (retry.selection_budget
++                                    / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
++                                    as u32;
++                                return Ok(Some(blocks));
++                            }
++                            return Ok(None);
++                        }
++                        let blocks = (start.selection_budget
++                            / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
++                            as u32;
++                        Ok(Some(blocks))
++                    })();
++                    match admission {
++                        Ok(Some(blocks)) => ctl
++                            .set_layerwise_import_blocks(slot.0, blocks)
++                            .map_err(|e| format!("kvmem reuse: import budget: {e}"))?,
++                        Ok(None) => {}
++                        Err(e) => {
++                            // The fork already reset this slot to the checkpoint
++                            // prefix; a refused admission must hand it back cold.
++                            let _ = ctl.reset_slot(slot.0);
++                            let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
++                            return Err(e);
++                        }
++                    }
++                    // 期2.3: arm the first-step Query only for a NEW proven
++                    // question. KeepSelected leaves it clear so the source's
++                    // selected views stand; an unproven span keeps the
++                    // historical (no forced Query on the cold-reuse path).
++                    let due = req.query.is_some() && !keep_selected && !page_less;
++                    if req.query.is_some() {
++                        ctl.set_layerwise_query_due(slot.0, due);
++                    }
++                    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++                        .ok()
++                        .is_some_and(|v| v == "1" || v == "on" || v == "true")
++                    {
++                        eprintln!(
++                        "[kvmem-query] reuse slot {} query={:?} page_less={} keep_selected={} -> due={}",
++                        slot.0,
++                        req.query,
++                        page_less,
++                        keep_selected,
++                        due
++                    );
++                    }
++                }
++                let gpu_pages = ctl
++                    .prefix_checkpoint(reuse_id)
++                    .map(|c| c.gpu_pages.clone())
++                    .unwrap_or_default();
++                // 2. DeltaNet restore (fail-closed pairing, spec §5.4 S4):
++                // shared KV must never pair with a zeroed/partial recurrent
++                // state. On any failure below, reset BOTH halves.
++                let domain = rig
++                    .cache_domain
++                    .as_ref()
++                    .ok_or_else(|| "kvmem reuse: no cache domain".to_string())?;
++                let ckpt_pool = rig
++                    .model
++                    .checkpoint_pool
++                    .as_mut()
++                    .ok_or_else(|| "kvmem reuse: no checkpoint pool".to_string())?;
++                // G7 Stage C: the recurrent state is keyed by the checkpoint's
++                // media identity. The catalog gate proved it equals the
++                // request's digest when the prefix covers an image span; a
++                // pre-image/plain prefix carries no media and keeps the
++                // historical key.
++                let ckpt_media = ctl.prefix_checkpoint(reuse_id).and_then(|c| c.media_digest);
++                let fp = crate::checkpoint::checkpoint_fingerprint(
++                    &req.prompt_tokens[..frontier as usize],
++                    ckpt_media,
++                );
++                // 期3 G3 P1.1 dn-persist: rebuild the recurrent checkpoint from
++                // the pack sidecar when this process has no pool entry (restart).
++                if ckpt_pool.peek(domain, frontier as u64, fp).is_none() {
++                    if let Some(pack) = ctl.prefix_pack_path(reuse_id) {
++                        let dn_path = std::path::PathBuf::from(format!("{}.dn", pack.display()));
++                        match std::fs::read(&dn_path) {
++                            Ok(bytes) => {
++                                match crate::speculative::DeltaNetSnapshot::new_for(
++                                    &mut rig.gpu,
++                                    &rig.model.dn_states[slot.0],
++                                ) {
++                                    Ok(mut snap) => match snap.import_host(&rig.gpu, &bytes) {
++                                        Ok(()) => {
++                                            let (cid, displaced) = ckpt_pool.insert(
++                                                domain.clone(),
++                                                frontier as u64,
++                                                fp,
++                                                snap,
++                                            );
++                                            for d in displaced {
++                                                d.free_gpu(&mut rig.gpu);
++                                            }
++                                            if cid != crate::checkpoint::CheckpointId::NONE
++                                                && hipfire_config::developer_var(
++                                                    "HIPFIRE_KVMEM_TRACE",
++                                                )
++                                                .ok()
++                                                .is_some_and(|v| {
++                                                    v == "1" || v == "on" || v == "true"
++                                                })
++                                            {
++                                                eprintln!(
++                                                "[kvmem-pack] DN restored from sidecar frontier={frontier}"
++                                            );
++                                            }
++                                        }
++                                        Err(e) => {
++                                            eprintln!("[kvmem-pack] DN sidecar rejected: {e}")
++                                        }
++                                    },
++                                    Err(e) => {
++                                        eprintln!("[kvmem-pack] DN sidecar alloc failed: {e:?}")
++                                    }
++                                }
++                            }
++                            Err(e) => eprintln!("[kvmem-pack] DN sidecar missing: {e}"),
++                        }
++                    }
++                }
++                let restored = ckpt_pool
++                    .peek(domain, frontier as u64, fp)
++                    .map(|snapshot| {
++                        snapshot
++                            .restore_to(&mut rig.model.dn_states[slot.0], &mut rig.gpu)
++                            .is_ok()
++                    })
++                    .unwrap_or(false);
++                if !restored {
++                    let _ = ctl.reset_slot(slot.0);
++                    let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
++                    return Err("kvmem reuse: DeltaNet checkpoint restore failed".to_string());
++                }
++                // 3. Share the pinned pages into the (empty) block table.
++                // 期3 G3 P1.1: a restart-loaded pack carries no pinned GPU
++                // pages. Layerwise restores pages from the sealed archive on
++                // demand (carrier restore), so the share is skipped; Legacy
++                // has no cold restore path and fails closed to a cold prefill.
++                if gpu_pages.is_empty() {
++                    if !ctl.strategy().is_layerwise() {
++                        let _ = ctl.reset_slot(slot.0);
++                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
++                        return Err(
++                            "kvmem reuse: no pinned pages (restart) and Legacy has no cold restore"
++                                .to_string(),
++                        );
++                    }
++                    // G3 cold-reuse fix: a page-less import has no bound prefix
++                    // pages, so the suffix prefill would attend over unbound
++                    // rows and lose the imported context. Materialize the
++                    // prefix from the archived store into pool pages first,
++                    // then pin them so later reuses are hot.
++                    let staged = ctl.stage_page_less_import(
++                        &rig.gpu,
++                        &mut rig.pool,
++                        &rig.model.k_arenas,
++                        &rig.model.v_arenas,
++                        slot.0,
++                        frontier,
++                    );
++                    let pages = match staged {
++                        Ok(pages) => pages,
++                        Err(e) => {
++                            let _ = ctl.reset_slot(slot.0);
++                            let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
++                            return Err(format!("kvmem reuse: cold prefix staging failed: {e}"));
++                        }
++                    };
++                    let mut taken: Vec<u32> = Vec::new();
++                    let mut ref_err = None;
++                    if let Some(pp) = rig.pool.page_pool_mut() {
++                        for &phys in &pages {
++                            match pp.add_cache_ref(phys) {
++                                Ok(()) => taken.push(phys),
++                                Err(e) => {
++                                    ref_err = Some(e);
++                                    break;
++                                }
++                            }
++                        }
++                    } else {
++                        ref_err = Some("not paged".to_string());
++                    }
++                    if let Some(e) = ref_err {
++                        if let Some(pp) = rig.pool.page_pool_mut() {
++                            for &phys in &taken {
++                                let _ = pp.release_cache_ref(phys);
++                            }
++                        }
++                        let _ = ctl.reset_slot(slot.0);
++                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
++                        return Err(format!("kvmem reuse: cold prefix pin failed: {e}"));
++                    }
++                    if let Some(ckpt) = ctl.prefix_checkpoint_mut(reuse_id) {
++                        ckpt.gpu_pages = pages;
++                    }
++                    ctl.note_prefix_restore_hit();
++                } else if rig.pool.share_published_pages(slot, &gpu_pages).is_err() {
++                    let _ = ctl.reset_slot(slot.0);
++                    let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
++                    return Err("kvmem reuse: GPU page share failed".to_string());
++                }
++                // 4. 期4: restore the DFlash2 draft conditioning image that
++                //    rides with this checkpoint (nInfer native full-state
++                //    serialization; logical ring + captured watermarks). A
++                //    missing/unrestorable image reseeds the draft from scratch
++                //    — acceptance degrades, output stays verify-exact.
++                if let Some(shared) = rig.model.dflash.as_ref() {
++                    let restored = {
++                        match ctl
++                            .prefix_checkpoint(reuse_id)
++                            .and_then(|c| c.draft_image.as_ref())
++                        {
++                            Some(img) => {
++                                if rig.model.dflash_states[slot.0].is_none() {
++                                    match crate::dflash_slot::new_dflash_slot_state(
++                                        &mut rig.gpu,
++                                        shared,
++                                        &rig.model.config,
++                                        &rig.model.dn_states[slot.0],
++                                    ) {
++                                        Ok(st) => rig.model.dflash_states[slot.0] = Some(st),
++                                        Err(e) => {
++                                            eprintln!("[kvmem-draft-image] state alloc failed: {e}")
++                                        }
++                                    }
++                                }
++                                match rig.model.dflash_states[slot.0].as_mut() {
++                                    Some(st) => match crate::dflash_slot::dflash_restore_image(
++                                        &mut rig.gpu,
++                                        shared,
++                                        st,
++                                        img,
++                                        session_id.0,
++                                        frontier as usize,
++                                    ) {
++                                        Ok(()) => true,
++                                        Err(e) => {
++                                            eprintln!("[kvmem-draft-image] restore skipped: {e}");
++                                            false
++                                        }
++                                    },
++                                    None => false,
++                                }
++                            }
++                            None => false,
++                        }
++                    };
++                    if restored {
++                        ctl.note_draft_image_hit();
++                    } else {
++                        ctl.note_draft_image_miss();
++                        if let Some(st) = rig.model.dflash_states[slot.0].as_mut() {
++                            crate::dflash_slot::reset_dflash_slot(st, session_id.0);
++                        }
++                    }
++                }
++                Ok(frontier as usize)
++            })();
++            match reuse {
++                Ok(frontier) => {
++                    if rig.gpu.slot_trace() {
++                        eprintln!(
++                            "[slot-trace] KVMem prefix HIT: reused {}/{} tokens",
++                            frontier,
++                            req.prompt_tokens.len()
++                        );
++                    }
++                    return Some(frontier);
++                }
++                Err(e) => {
++                    eprintln!("[kvmem-prefix] reuse did not convert: {e} — cold prefill");
++                }
++            }
++        }
++    }
++    None
++}
++
++/// Feed every KV row this step wrote into the host store, including the
++/// AR-decode head aux co-archive. Returns an error for the caller to poison.
++pub(super) fn kvmem_feed_step(
++    rig: &mut Rig,
++    batch: &SlotBatch,
++    slots: &[Option<InFlight>],
++    work: &[PendingWork],
++    spec_drafts: &[Option<SpecDraftRows>],
++    n: usize,
++) -> Result<(), String> {
++    // ── KVMem statistics feed (HIPFIRE_KVMEM) ───────────────────────
++    // Every KV row this step wrote (prefill chunk or plain decode row)
++    // is summarized into the slot's host store now, from the taps the
++    // forward captured. Verify steps are fed in the accept path
++    // instead — only the committed prefix of their rows survives, and
++    // its size is not known until after the sampler reads the hidden
++    // rows. Fed positions are contiguous by construction: a slot's
++    // batch rows always start at the store's current length.
++    if rig.model.kvmem.is_none() {
++        return Ok(());
++    }
++    {
++        let mut row = 0usize;
++        let mut feed_err: Option<String> = None;
++        // P4.1③ root-cause fix: take the controller OUT so the AR-decode
++        // head aux co-archive below can borrow head/weights/hidden
++        // disjointly alongside `&mut ctl` (mirrors the MTP verify accept
++        // path's `self.kvmem.take()`).
++        let mut kvmem = rig.model.kvmem.take();
++        for s in 0..n {
++            let m = batch.m_per_slot[s];
++            if m == 0 {
++                continue;
++            }
++            let row_start = row;
++            let pos0 = batch.positions[row] as usize;
++            row += m;
++            if spec_drafts[s].is_some() {
++                continue;
++            }
++            let fed: Result<(), String> = (|| {
++                let ctl = kvmem.as_mut().unwrap();
++                let taps = rig
++                    .model
++                    .pbs
++                    .kvmem_taps
++                    .as_ref()
++                    .expect("kvmem controller without statistics taps");
++                ctl.feed_rows(
++                    &rig.gpu,
++                    taps,
++                    s,
++                    pos0,
++                    m,
++                    row_start,
++                    &rig.pool,
++                    &rig.model.k_arenas,
++                    &rig.model.v_arenas,
++                )?;
++                // P4.1③ root-cause fix (AR-decode head aux co-archive):
++                // the head aux plane was co-archived ONLY in MTP prefill
++                // (mtp_prefill) + MTP verify accept; plain AR-decode rows
++                // fed here advanced the trunk Main plane but NOT the aux
++                // ordinal, so the head aux frontier lagged the trunk. The
++                // next composite (Main+aux) suffix-block export then threw
++                // "packed KV layer ... partial frontier" (masked downstream
++                // as "layer 0 mass not captured"). Co-archive the head K/V
++                // for these accepted AR rows exactly like the verify accept:
++                // norm the trunk PRE-final-norm residual (pbs.x_batch) into
++                // the head's post-norm staging, recompute the head K/V, and
++                // seal at the GLOBAL pos. Prefill rows (decoding=false) are
++                // already co-archived by mtp_prefill ⇒ skipped (no double).
++                if work[s].decoding && ctl.head_plane_enabled() {
++                    if let (Some(head), Some(state)) = (
++                        rig.model.mtp_head.as_ref(),
++                        rig.model.mtp_states[s].as_mut(),
++                    ) {
++                        let tokens: Vec<u32> = slots[s]
++                            .as_ref()
++                            .map(|f| f.session)
++                            .and_then(|sid| rig.sessions.get(sid))
++                            .map(|sess| sess.tokens[pos0..pos0 + m].to_vec())
++                            .unwrap_or_default();
++                        if tokens.len() == m {
++                            let dim = rig.model.config.dim;
++                            let rope_shift = ctl.head_prefill_shift(pos0 + m);
++                            let raw = rig.model.pbs.x_batch.sub_offset(row_start * dim, m * dim);
++                            let staged = state.takeover_fill_hidden.sub_offset(0, m * dim);
++                            rig.gpu
++                                .rmsnorm_batched(
++                                    &raw,
++                                    &rig.model.weights.output_norm,
++                                    &staged,
++                                    m,
++                                    dim,
++                                    rig.model.config.norm_eps,
++                                )
++                                .map_err(|e| format!("kvmem AR head hidden norm: {e:?}"))?;
++                            crate::mtp_spec::mtp_takeover_fill_head_kv(
++                                &mut rig.gpu,
++                                head,
++                                state,
++                                &rig.model.weights,
++                                pos0,
++                                &tokens,
++                                rope_shift,
++                            )
++                            .map_err(|e| format!("kvmem AR head fill: {e}"))?;
++                            ctl.head_write_through_archive(
++                                &rig.gpu,
++                                &state.mtp_kv.inner.k_gpu[0],
++                                &state.mtp_kv.inner.v_gpu[0],
++                                s,
++                                pos0,
++                                m,
++                                pos0 - rope_shift,
++                            )?;
++                            ctl.accept_head_append(s, pos0 as u64, (pos0 + m) as u64)?;
++                        }
++                    }
++                }
++                Ok(())
++            })();
++            if let Err(e) = fed {
++                feed_err = Some(e);
++                break;
++            }
++        }
++        rig.model.kvmem = kvmem;
++        if let Some(e) = feed_err {
++            return Err(e);
++        }
++    }
++    Ok(())
++}
++
++/// P4.3 canonical-prefix reclaim under page pressure (admission path).
++pub(super) fn kvmem_reclaim_prefixes(rig: &mut Rig) {
++// ── P4.3 canonical-prefix reclaim under page pressure ────────────────
++// Pinned canonical prefixes hold pool pages beyond the per-slot working
++// sets. When the free list cannot back one slot's resident budget plus
++// headroom, Layerwise DEMOTES the LRU catalog entries: pinned pages drop,
++// the catalog entry survives, and a later reuse restores pages from the
++// sealed archive (nInfer keeps the directory separate from residency).
++// Legacy reuse requires resident pages, so it keeps the historical pop
++// (entry removed). Pages still held by live block tables survive the ref
++// release. Bounded: an entry demotes once and the catalog is finite.
++if !rig.kvmem_prefix_pin {
++    return;
++}
++{
++    let headroom = rig
++        .model
++        .kvmem
++        .as_ref()
++        .map(|ctl| ctl.budget_blocks() + 2)
++        .unwrap_or(2);
++    let layerwise = rig
++        .model
++        .kvmem
++        .as_ref()
++        .map(|ctl| ctl.strategy().is_layerwise())
++        .unwrap_or(false);
++    loop {
++        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
++        if free >= headroom {
++            break;
++        }
++        if layerwise {
++            let Some((id, pages)) = rig
++                .model
++                .kvmem
++                .as_mut()
++                .and_then(|ctl| ctl.demote_lru_prefix())
++            else {
++                break;
++            };
++            if let Some(pp) = rig.pool.page_pool_mut() {
++                for &phys in &pages {
++                    let _ = pp.release_cache_ref(phys);
++                }
++            }
++            if rig.gpu.slot_trace() {
++                eprintln!(
++                    "[kvmem-prefix] demoted canonical prefix {id} ({} pages) under \
++                     admission pressure; catalog entry retained",
++                    pages.len()
++                );
++            }
++        } else {
++            let victim = rig
++                .model
++                .kvmem
++                .as_mut()
++                .and_then(|ctl| ctl.pop_lru_prefix());
++            let Some(victim) = victim else { break };
++            if let Some(pp) = rig.pool.page_pool_mut() {
++                for &phys in &victim.gpu_pages {
++                    let _ = pp.release_cache_ref(phys);
++                }
++            }
++            if rig.gpu.slot_trace() {
++                eprintln!(
++                    "[kvmem-prefix] reclaimed canonical prefix {} ({} pages) under \
++                     admission pressure",
++                    victim.id,
++                    victim.gpu_pages.len()
++                );
++            }
++        }
++    }
++}
++}
