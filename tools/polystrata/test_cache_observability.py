@@ -6,7 +6,7 @@ import threading
 import unittest
 from types import SimpleNamespace
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'backends/polystrata'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'backends/polystrata/terminal'))
 import serve.kvmem_monitor as monitor
 
 class CacheProtocolTest(unittest.TestCase):

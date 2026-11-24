@@ -62,7 +62,7 @@ from launcher.config import (SPECULATIVE_PROFILES, DEFAULTS, ENGINE_DEFAULTS,
     without_secrets, normalize)
 from launcher.plan import build_plan, capabilities as launcher_capabilities, scoring_settings
 from launcher.export import export_profile, read_revision
-from launcher.worker import require_launch_features, strategy_profile
+from launcher.worker import require_launch_features, strategy_profile, supports_inkling_fp8
 
 
 def private_log(path, *, truncate=False):
@@ -1017,6 +1017,29 @@ class Controller:
             report = json.loads(run.stdout)
             if not isinstance(report, dict) or report.get('schema_version') != 1 or type(report.get('can_start')) is not bool:
                 return unchecked('Unsupported inspector response')
+            model = report.get('model', {})
+            if model.get('architecture') == 'inkling2_loop' and 'fp8' in model.get('kv_types', []):
+                try:
+                    worker = self.worker_capabilities(parameters['Worker'], 'polystrata')
+                except (OSError, ValueError):
+                    worker = {}
+                if worker.get('inkling2_dspark') is not True:
+                    report['features']['mtp'] = 'unsupported'
+                    if parameters.get('SpeculativeMode', 'none') != 'none' or parameters.get('DraftModel'):
+                        report.update(status='blocked', can_start=False)
+                        report['checks'].append({
+                            'code': 'inkling_dspark_worker', 'layer': 'worker', 'status': 'error',
+                            'zh': '当前后端程序不支持 KVMem Inkling dSpark',
+                            'en': 'This worker does not support KVMem Inkling dSpark',
+                        })
+                if not supports_inkling_fp8(worker):
+                    model['kv_types'].remove('fp8')
+                    if parameters.get('KvType') == 'fp8':
+                        report.update(status='blocked', can_start=False)
+                        report['checks'].append({
+                            'code': 'inkling_fp8_worker', 'layer': 'worker', 'status': 'error',
+                            'zh': '当前后端程序不支持 Inkling FP8 KV', 'en': 'Worker does not support Inkling FP8 KV',
+                        })
             return report
         except (OSError, subprocess.TimeoutExpired, ValueError):
             return unchecked('Inspector unavailable or timed out; retry or attempt launch')

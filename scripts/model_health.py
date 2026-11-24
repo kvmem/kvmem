@@ -258,10 +258,12 @@ class Inspection:
         self.check('gguf_directory', 'pass', 'GGUF 目录与分片检查通过', 'GGUF directory and shards checked', f'{len(names)} tensors / {count} files')
         if unknown:
             self.check('gguf_types', 'unknown', '部分量化格式尚未验证尺寸', 'Some quantization sizes are unverified', ', '.join(map(str, sorted(unknown))))
-        if self.p['Backend'] == 'polystrata' and arch not in {'qwen35moe','gemma4'}:
-            self.check('poly_arch', 'warning', '架构不在当前 PolyStrata 启动器声明范围', 'Architecture outside the current PolyStrata launcher profile', f'actual={arch}, profile=qwen35moe/gemma4', 'worker')
-        if self.p['Backend'] == 'polystrata' and arch in {'qwen35moe','gemma4'}:
-            allowed={'f16','int8','int8k'} if arch=='gemma4' else {'f16','q8_0'}
+        poly_kv = {'qwen35moe': ('f16', 'q8_0'), 'gemma4': ('f16', 'int8', 'int8k'), 'inkling2_loop': ('f16', 'fp8')}
+        if self.p['Backend'] == 'polystrata' and arch not in poly_kv:
+            self.check('poly_arch', 'warning', '架构不在当前 PolyStrata 启动器声明范围', 'Architecture outside the current PolyStrata launcher profile', f'actual={arch}, profile={"/".join(poly_kv)}', 'worker')
+        if self.p['Backend'] == 'polystrata' and arch in poly_kv:
+            allowed = poly_kv[arch]
+            self.report['model']['kv_types'] = list(allowed)
             kv=self.p.get('KvType','f16')
             if kv not in allowed:
                 self.check('poly_kv', 'error', 'KV 格式与模型架构不兼容', 'KV format is incompatible with the model architecture', f'{arch}: {", ".join(sorted(allowed))}', 'config')
@@ -275,7 +277,23 @@ class Inspection:
                         assistant=self.gguf(self.path(draft))['metadata']
                         if assistant.get('general.architecture')!='gemma4-assistant':
                             self.check('gemma_assistant_arch','error','Gemma 草稿架构不匹配','Gemma assistant architecture does not match',str(assistant.get('general.architecture')),'config')
-        if self.p.get('Vision'):
+            if arch == 'inkling2_loop':
+                self.report['features'].update(vision='unsupported', mtp='external')
+                if self.p.get('Vision'):
+                    self.check('inkling_vision', 'error', 'Inkling 2 Mini 的 KVMem 接入只支持文本', 'KVMem Inkling 2 Mini supports text only', 'Vision', 'config', 'disable_vision')
+                drafts = self.p.get('DraftTokens', self.p.get('MtpDrafts', 0))
+                mode = self.p.get('SpeculativeMode', 'mtp' if drafts else 'none')
+                draft = self.p.get('DraftModel')
+                if mode != 'none' or drafts or draft:
+                    if mode != 'mtp' or not draft:
+                        self.check('inkling_draft', 'error', 'Inkling 2 Mini 需要配套的 dSpark GGUF', 'Inkling 2 Mini requires its matching dSpark GGUF', 'DraftModel', 'config')
+                    elif self.required_file(self.path(draft), 'dspark_file', 'dSpark 草稿模型', 'dSpark draft model'):
+                        asset = self.gguf(self.path(draft))
+                        if asset['metadata'].get('general.architecture') != 'dflash' or 'markov_w1.weight' not in asset['names']:
+                            self.check('inkling_draft_arch', 'error', '草稿文件不是 Inkling dSpark GGUF', 'The draft asset is not an Inkling dSpark GGUF', 'DraftModel', 'config')
+                if self.p.get('Concurrency', 1) != 1 or self.p.get('RetainedSessions', 1) != 1:
+                    self.check('inkling_sessions', 'error', 'Inkling 2 Mini 只支持一个会话', 'KVMem Inkling 2 Mini supports one conversation', 'Concurrency / RetainedSessions', 'config')
+        if self.p.get('Vision') and not (self.p['Backend'] == 'polystrata' and arch == 'inkling2_loop'):
             if self.p['Backend'] == 'polystrata':
                 explicit = self.p.get('Mmproj')
                 if explicit:

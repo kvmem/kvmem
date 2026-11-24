@@ -1,0 +1,222 @@
+diff --git a/engine/src/poly/engine.cpp b/engine/src/poly/engine.cpp
+index 485a430dae4560f85d4cbf4e3c97b80880267fef..586500caffe06a479ef708ae66fd84ea64c5fc6b 100644
+--- a/engine/src/poly/engine.cpp
++++ b/engine/src/poly/engine.cpp
+@@ -2280,8 +2280,8 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
+ #if !defined(_WIN32) || defined(STRATA_USE_HIP)
+         throw std::runtime_error("KVMem Inkling 2 requires Windows CUDA");
+ #endif
+-        if (o.kv_format != KvFmt::kFp16)
+-            throw std::runtime_error("KVMem Inkling 2 requires FP16 KV");
++        if (o.kv_format != KvFmt::kFp16 && o.kv_format != KvFmt::kFp8)
++            throw std::runtime_error("KVMem Inkling 2 requires FP16 or FP8 KV");
+         if (o.batch || o.memory.sessions != 1 || o.memory.mtp || !o.draft_model.empty() || o.expert_gpu >= 0)
+             throw std::runtime_error("KVMem Inkling 2 requires one sequence on one GPU without a drafter");
+     }
+diff --git a/engine/src/poly/inkling2.cpp b/engine/src/poly/inkling2.cpp
+index 9b325cf2af330edb3de217d34de9006ce3e286ab..cecd4e2541bd723a35c93e9d5dc2a1d9b0ab08d4 100644
+--- a/engine/src/poly/inkling2.cpp
++++ b/engine/src/poly/inkling2.cpp
+@@ -1681,7 +1681,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
+         if (samples > 0)
+             kvmem_inkling_page_mass(q_, S.keys, rr_, fp(B.rel_bias), B.extent, memory_pages_, n_head_, n_kv_,
+                 samples, memory_config_, memory_samples_, memory_mass_, memory_page_stride_, memory_planes_, block,
+-                st_, score_, score_n_);
++                st_, score_, score_n_, kv8_);
+     }
+ #endif
+     lin(B.wo, att_, aoraw_, n, n == 1 && n < kStageRows ? xqo_ : nullptr);
+diff --git a/engine/src/poly/kvmem.cpp b/engine/src/poly/kvmem.cpp
+index 2d2f9aeb9145acd11aa547ef488611ff772fb769..b99ee02efcaf0ae11a48d054848f7d8409608f4b 100644
+--- a/engine/src/poly/kvmem.cpp
++++ b/engine/src/poly/kvmem.cpp
+@@ -1,5 +1,6 @@
+ #include "kvmem.hpp"
+ #include "engine.hpp"
++#include "inkling2_kernels.hpp"
+ #include "runtime.hpp"
+ #include "kvmem/token_options.hpp"
+ 
+@@ -79,18 +80,21 @@ KvmemMemory::KvmemMemory(Engine& engine, std::vector<KvmemPlane> planes,
+     require(!planes_.empty(), "KVMem requires at least one full-attention layer");
+     const auto& arch = engine.gg_->get("general.architecture")->s;
+     const bool gemma = arch == "gemma4", inkling = arch == "inkling2_loop";
++    const bool fp8 = inkling && engine.opt_.kv_format == KvFmt::kFp8;
+     descriptor_.identity = {"polystrata", "974552f+kvmem-v2",
+         std::filesystem::absolute(engine.opt_.model).string(),
+-        inkling ? "inkling2-loop-f16-v1" : gemma ? "gemma4-swa-v1" : "qwen35-gdn-f32-v1"};
++        inkling ? (fp8 ? "inkling2-loop-fp8-v1" : "inkling2-loop-f16-v1") :
++        gemma ? "gemma4-swa-v1" : "qwen35-gdn-f32-v1"};
+     auto& layout = descriptor_.layout;
+     const bool q8 = engine.opt_.kv_format == KvFmt::kQ8_0 || engine.opt_.kv_format == KvFmt::kInt8 || engine.opt_.kv_format == KvFmt::kInt8K;
+     const bool mixed = engine.opt_.kv_format == KvFmt::kInt8K;
+-    layout.format = inkling ? "polystrata-inkling2-native-f16-v1" : gemma ? (mixed ? "polystrata-gemma4-native-int8k-v1" :
++    layout.format = inkling ? (fp8 ? "polystrata-inkling2-native-fp8-v1" : "polystrata-inkling2-native-f16-v1") :
++        gemma ? (mixed ? "polystrata-gemma4-native-int8k-v1" :
+         q8 ? "polystrata-gemma4-native-int8-v1" : "polystrata-gemma4-native-f16-v1") :
+         q8 ? "polystrata-qwen35-native-q8_0-v1" : "polystrata-qwen35-native-f16-v1";
+     layout.version = 1;
+     layout.block_tokens = block_tokens;
+-    layout.alignment = alignof(uint16_t);
++    layout.alignment = fp8 ? alignof(float) : alignof(uint16_t);
+     const auto add = [&](uint32_t layer, kvmem::PayloadPlaneKind kind, void* pointer, uint64_t row, uint64_t alignment) {
+         require(pointer != nullptr, "KVMem native plane has no device allocation");
+         layout.planes.push_back({layer,kind,layout.record_bytes,row*block_tokens,alignment,row});
+@@ -106,6 +110,11 @@ KvmemMemory::KvmemMemory(Engine& engine, std::vector<KvmemPlane> planes,
+                 add(plane.layer,kvmem::PayloadPlaneKind::Value,plane.value_codes,key_width_,1);
+                 add(plane.layer,kvmem::PayloadPlaneKind::ValueScale,plane.value_scales,key_width_/32*2,2);
+             }
++        } else if (fp8) {
++            // Inkling stores each row's E4M3 codes and per-head float scales together.
++            const size_t row = ink_kv8_row(kv_heads_, dim_);
++            add(plane.layer,kvmem::PayloadPlaneKind::Key,plane.keys,row,alignof(float));
++            add(plane.layer,kvmem::PayloadPlaneKind::Value,plane.values,row,alignof(float));
+         } else {
+             add(plane.layer,kvmem::PayloadPlaneKind::Key,plane.keys,uint64_t(key_width_)*2,2);
+             add(plane.layer,kvmem::PayloadPlaneKind::Value,plane.values,uint64_t(key_width_)*2,2);
+@@ -177,7 +186,8 @@ void KvmemMemory::ensure_staging(uint64_t out_rows,uint64_t in_rows) {
+ void KvmemMemory::rebind(std::vector<KvmemPlane> planes) {
+     require(!transaction_ && planes.size()==planes_.size(),"cannot rebind incompatible or busy KVMem planes");
+     planes_=std::move(planes);payload_.clear();
+-    const bool q8=engine_.opt_.kv_format!=KvFmt::kFp16;
++    const auto format = engine_.opt_.kv_format;
++    const bool q8 = format == KvFmt::kQ8_0 || format == KvFmt::kInt8 || format == KvFmt::kInt8K;
+     const bool mixed=engine_.opt_.kv_format==KvFmt::kInt8K;
+     for(const auto& p:planes_) {
+         if(q8) {
+@@ -261,7 +271,7 @@ std::vector<uint64_t> KvmemMemory::select(bool retrieval) const {
+         const uint32_t count=uint32_t(query_frame_.starts.size());
+         std::vector<uint32_t> rows(planes_.size(),uint32_t(query_tokens_));
+         uint32_t target_slots = uint32_t(engine_.n_layer_);
+-        if (descriptor_.identity.state_schema == "inkling2-loop-f16-v1") {
++        if (engine_.gg_->get("general.architecture")->s == "inkling2_loop") {
+             // Only target runs have planes. Repeated runs extend the slot range.
+             target_slots += uint32_t(engine_.shape_i("loop.count") - 1) *
+                             uint32_t(engine_.shape_i("loop.end") - engine_.shape_i("loop.start"));
+diff --git a/engine/src/poly/kvmem_capture.cu b/engine/src/poly/kvmem_capture.cu
+index 6f817d59eba7203dc4572efc838873767eeea137..53a6bbf80e6eec5f1a96868408ee90e770a54ca2 100644
+--- a/engine/src/poly/kvmem_capture.cu
++++ b/engine/src/poly/kvmem_capture.cu
+@@ -1,5 +1,9 @@
+ #include "kvmem_capture.hpp"
++#include "inkling2_kernels.hpp"
+ #include <cuda_fp16.h>
++#if !defined(__HIPCC__)
++#include <cuda_fp8.h>
++#endif
+ #include <cuda_runtime.h>
+ #include <math_constants.h>
+ #include <cmath>
+@@ -174,8 +178,9 @@ struct InklingBias {
+     const float* table;
+     const int64_t* logical_pages;
+     int extent, first_sample, sample_count;
++    size_t fp8_row_bytes;
+ };
+-template<int BlockTokens,int Dim,bool Quantized,int Group,bool Inkling=false>
++template<int BlockTokens,int Dim,bool Quantized,int Group,bool Inkling=false,bool InklingFp8=false>
+ __global__ void page_mass_warp_parts(const float* q,const uint16_t* keys,Kvq8 quant,int heads,int kv_heads,
+     const int64_t* cfg,const int32_t* map,float2* parts,int stride,float scale,InklingBias bias = {}) {
+     const int lane=int(threadIdx.x)&31,warp=int(threadIdx.x)>>5,pages=int(cfg[4]);
+@@ -206,11 +211,24 @@ __global__ void page_mass_warp_parts(const float* q,const uint16_t* keys,Kvq8 qu
+             float dot[Group]={};
+             if(key<end) {
+                 const size_t base=(size_t(key)*kv_heads+kv)*Dim;
++                const uint8_t* fp8_codes = nullptr;
++                float fp8_scale = 0;
++                if constexpr (InklingFp8) {
++                    const auto* row = reinterpret_cast<const uint8_t*>(keys) + size_t(key)*bias.fp8_row_bytes;
++                    fp8_codes = row + size_t(kv)*Dim;
++                    fp8_scale = reinterpret_cast<const float*>(row + size_t(kv_heads)*Dim)[kv];
++                }
+                 #pragma unroll
+                 for(int d=lane;d<Dim;d+=32) {
+                     const size_t at=base+d;
+-                    const float k=Quantized ? float(quant.codes[at])*__half2float(reinterpret_cast<const __half*>(quant.scales)[at/32])
+-                                            : __half2float(reinterpret_cast<const __half*>(keys)[at]);
++                    float k;
++#if !defined(__HIPCC__)
++                    if constexpr (InklingFp8)
++                        k = __half2float(__half(__nv_cvt_fp8_to_halfraw(fp8_codes[d], __NV_E4M3))) * fp8_scale;
++                    else
++#endif
++                        k = Quantized ? float(quant.codes[at])*__half2float(reinterpret_cast<const __half*>(quant.scales)[at/32])
++                                      : __half2float(reinterpret_cast<const __half*>(keys)[at]);
+                     #pragma unroll
+                     for(int g=0;g<Group;++g)dot[g]+=query[g][d/32]*k;
+                 }
+@@ -335,7 +353,8 @@ void kvmem_page_mass(const float* query,const uint16_t* keys,Kvq8 q8,int dim,int
+     else throw std::invalid_argument("KVMem block tokens must be 32 or 64");
+ }
+ 
+-void kvmem_inkling_page_mass(const float* query,const uint16_t* keys,const float* relative,const float* bias,
++template<bool Fp8>
++void inkling_page_mass(const float* query,const uint16_t* keys,const float* relative,const float* bias,
+     int extent,const int64_t* logical_pages,int heads,int kv_heads,int rows,const int64_t* cfg,
+     const int32_t* samples,float* mass,int stride,int slots,int block_tokens,void* stream,
+     float* scratch,size_t scratch_floats) {
+@@ -348,15 +367,29 @@ void kvmem_inkling_page_mass(const float* query,const uint16_t* keys,const float
+     const float scale = 1.f/std::sqrt(128.f);
+     for (int offset = 0; offset < rows; offset += step) {
+         const int count = std::min(step, rows-offset);
+-        const InklingBias extra{relative,bias,logical_pages,extent,offset,count};
++        const InklingBias extra{relative,bias,logical_pages,extent,offset,count,Fp8 ? ink_kv8_row(kv_heads,128) : 0};
+         if (block_tokens == 32)
+-            page_mass_warp_parts<32,128,false,3,true><<<256,128,0,st>>>(
++            page_mass_warp_parts<32,128,false,3,true,Fp8><<<256,128,0,st>>>(
+                 query,keys,{},heads,kv_heads,cfg,samples,parts,stride,scale,extra);
+         else
+-            page_mass_warp_parts<64,128,false,3,true><<<256,128,0,st>>>(
++            page_mass_warp_parts<64,128,false,3,true,Fp8><<<256,128,0,st>>>(
+                 query,keys,{},heads,kv_heads,cfg,samples,parts,stride,scale,extra);
+         page_mass_merge<<<dim3(heads,count),256,0,st>>>(parts,cfg,samples,mass,stride,heads,slots,offset);
+     }
+ }
+ 
++void kvmem_inkling_page_mass(const float* query,const uint16_t* keys,const float* relative,const float* bias,
++    int extent,const int64_t* logical_pages,int heads,int kv_heads,int rows,const int64_t* cfg,
++    const int32_t* samples,float* mass,int stride,int slots,int block_tokens,void* stream,
++    float* scratch,size_t scratch_floats,bool fp8) {
++#if defined(__HIPCC__)
++    if (fp8) throw std::invalid_argument("Inkling FP8 page mass requires CUDA");
++    constexpr auto dispatch = inkling_page_mass<false>;
++#else
++    const auto dispatch = fp8 ? inkling_page_mass<true> : inkling_page_mass<false>;
++#endif
++    dispatch(query,keys,relative,bias,extent,logical_pages,heads,kv_heads,rows,cfg,samples,mass,stride,
++             slots,block_tokens,stream,scratch,scratch_floats);
++}
++
+ }
+diff --git a/engine/src/poly/kvmem_capture.hpp b/engine/src/poly/kvmem_capture.hpp
+index 18a22ab9665f21be9fa2ec18acac4df827c7e865..fd43df1914375fdd465490a8640ff40a0dbc19a8 100644
+--- a/engine/src/poly/kvmem_capture.hpp
++++ b/engine/src/poly/kvmem_capture.hpp
+@@ -15,5 +15,5 @@ void kvmem_page_mass(const float* query,const uint16_t* keys,Kvq8 q8,int dim,int
+ void kvmem_inkling_page_mass(const float* query,const uint16_t* keys,const float* relative,const float* bias,
+     int extent,const int64_t* logical_pages,int heads,int kv_heads,int rows,const int64_t* cfg,
+     const int32_t* samples,float* mass,int stride,int slots,int block_tokens,void* stream,
+-    float* scratch,size_t scratch_floats);
++    float* scratch,size_t scratch_floats,bool fp8);
+ }
+diff --git a/engine/src/poly/main.cpp b/engine/src/poly/main.cpp
+index 40bd49e996204799cb12b43c88bdd14943a314ae..ac8f95cce6aa636312866c607346f40b66f15dc6 100644
+--- a/engine/src/poly/main.cpp
++++ b/engine/src/poly/main.cpp
+@@ -1212,6 +1212,7 @@ int serve(Session& ss) {
+                     "kvmem_block_tokens=%u kv_type=%s history_reuse=%d history_scope=%s kvmem_sessions=%u mtp=%d mtp_drafts=%d vision=%d ssd=%d kvmem_disk_mib=%llu query_scorer=%s graph_alpha=%.6g query_max_tokens=%u query_replay_max_tokens=%u batch_mtp=0 slot_cache=1 storage_scope=process gpu_scope=single\n",
+                     m.budget, m.reserve, (unsigned long long)m.host_mib,m.block_tokens,
+                     engine.int8k() ? "int8k" : engine.int8() ? "int8" :
++                    engine.kv_format() == int(KvFmt::kFp8) ? "fp8" :
+                     engine.memory().descriptor().layout.format.find("q8_0")!=std::string::npos ? "q8_0" : "f16", int(m.history_reuse),
+                     m.sessions > 1 ? "prefix_pool" : "current", m.sessions, int(m.mtp && engine.drafts()), m.mtp ? engine.max_window()-1 : 0,
+                     int(engine.sees()), int(m.disk_mib>0),(unsigned long long)m.disk_mib,
+@@ -2280,7 +2281,7 @@ int main(int argc, char** argv) {
+ #else
+         constexpr bool inkling2 = false;
+ #endif
+-        std::puts(kvmem::launch_capabilities("polystrata", inkling2).c_str());
++        std::puts(kvmem::launch_capabilities("polystrata", inkling2, inkling2).c_str());
+         return 0;
+     }
+ #endif

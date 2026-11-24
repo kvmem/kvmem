@@ -97,6 +97,24 @@ class BackendLaunch(unittest.TestCase):
             self.assertEqual(argv[argv.index('--draft-model')+1],str(assistant.resolve()))
             self.assertIn('--kvmem-mtp',argv)
 
+    def test_inkling_fp8_requires_the_worker_contract_and_keeps_kvmem(self):
+        uuid = 'GPU-12345678'
+        args = ['--gpu', uuid, '--kv-type', 'fp8', '--prefill', '4096', '--reserve', '4096']
+        devices = '0, ' + uuid + '\n'
+        for supported in (False, True):
+            formats = ['f16', 'fp8'] if supported else ['f16']
+            capabilities = {'model_kv_formats': {'inkling2_loop': formats}}
+            with mock.patch.object(self.launcher, 'probe_worker', return_value=capabilities):
+                if not supported:
+                    with self.assertRaises(SystemExit):
+                        self.invoke(args, dry=False, devices=devices)
+                    continue
+                cfg = self.invoke(args, dry=False, devices=devices)
+                worker_args = cfg['args']
+                self.assertEqual(worker_args[worker_args.index('--kv') + 1], 'fp8')
+                self.assertEqual(worker_args[worker_args.index('--prompt-batch') + 1], '4096')
+                self.assertIn('--kvmem-budget', worker_args)
+
 
 if __name__ == "__main__":
     unittest.main()
