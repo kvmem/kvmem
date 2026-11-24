@@ -6,6 +6,7 @@
   let info, busy=false, activeTab=0, runtime=null, startPending=false, launchFailure="";
   let budgetPending=false, budgetAdjustment=null;
   let health=null, healthKey='', healthTimer=null, healthAbort=null, healthSequence=0, healthState='idle';
+  let modelKv=null;
   let workerContract=null, workerKey='', workerTimer=null, workerAbort=null, workerSequence=0, workerError='';
   // A running process owns the displayed configuration; browser drafts cannot replace it.
   let configLocked=false, configUncertain=false, runningParameters=null, pendingParameters=null, runningView='';
@@ -243,9 +244,37 @@
       finally{clearTimeout(timeout);if(sequence===workerSequence&&!configurationLocked()){syncDependencies();updateStatus(runtime);}}
     },force?0:250);
   }
+  function kvTypes(backend,current){
+    if(backend==='polystrata'){
+      const types=['f16','q8_0','int8','int8k'];
+      if(current==='fp8')types.push(current);
+      return types;
+    }
+    if(backend==='radiance')return ['fp8','bf16','fp8_v4','k6_v4'];
+    return ['int8','bf16','fp8','nvfp4','k8v4','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'];
+  }
+  function syncKvTypes(backend,modelKey){
+    const select=root.querySelector('[data-param=KvType]');
+    if(!select)return null;
+    const previous=select.value;
+    const checked=modelKv?.key===modelKey;
+    const detected=checked?modelKv.types:null;
+    const types=Array.isArray(detected)&&detected.length?detected:kvTypes(backend,checked?null:previous);
+    if([...select.options].map(option=>option.value).join(',')===types.join(','))return null;
+    select.replaceChildren(...types.map(value=>make('option',{value},value)));
+    select.value=types.includes(previous)?previous:types[0];
+    return select.value!==previous?select.value:null;
+  }
   function scheduleHealth(force=false){
     if(!info||configurationLocked())return;
-    const parameters=healthParameters(),key=JSON.stringify(parameters);
+    const parameters=healthParameters(),modelKey=JSON.stringify([parameters.Backend,parameters.Model,parameters.Worker]);
+    if(modelKv?.key!==modelKey)modelKv=null;
+    const kv=syncKvTypes(parameters.Backend,modelKey);
+    if(kv!==null){
+      parameters.KvType=kv;
+      scheduleSave();
+    }
+    const key=JSON.stringify(parameters);
     if(!force&&key===healthKey)return;
     healthKey=key;health=null;clearTimeout(healthTimer);healthAbort?.abort();
     const sequence=++healthSequence;
@@ -261,6 +290,13 @@
         if(!response.ok||result.schema_version!==1||typeof result.can_start!=='boolean')throw Error('Inspection unavailable');
         if(sequence!==healthSequence)return;
         health=result;healthState=result.status;
+        if(result.model?.architecture){
+          modelKv={key:modelKey,types:result.model.kv_types};
+          if(syncKvTypes(parameters.Backend,modelKey)!==null){
+            scheduleSave();
+            scheduleHealth(true);
+          }
+        }
       }catch(error){if(sequence!==healthSequence)return;healthState='unavailable';}
       finally{clearTimeout(timeout);if(sequence===healthSequence){renderHealth();updateStatus(runtime);}}
     },force?0:400);
@@ -1123,7 +1159,7 @@
       help(kvTitle,tr('KV 格式','KV format'),tr('K 和 V 可分别选择：q8_0、q5_0、q4_0 可互配；f16、f32 可互配。浮点与量化不能混搭。','Choose K and V independently: q8_0, q5_0 and q4_0 can be combined; f16 and f32 can be combined. Floating-point and quantized types cannot be mixed.'));
       kvField.append(kvTitle,pair,make('p',{class:'l-muted l-error l-kv-status','data-kv-pair-status':'','aria-live':'polite',hidden:''}));panels[0].append(kvField);
     }else{
-      const kv=rad?['fp8','bf16','fp8_v4','k6_v4']:poly?['f16','q8_0','int8','int8k']:['int8','bf16','fp8','nvfp4','k8v4','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'];
+      const kv=kvTypes(b,p.KvType);
       field(panels[0],{...p,KvType:p.KvType||kv[0]},'KvType','KV 格式','KV format','text',kv.map(v=>[v,v]));
     }
     if(b==='llamacpp'){

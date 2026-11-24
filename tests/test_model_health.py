@@ -91,6 +91,8 @@ class HealthTests(unittest.TestCase):
         ready = self.inspect(model, 'polystrata', KvType='f16', RetainedSessions=1)
         self.assertTrue(ready['can_start'])
         self.assertNotIn('poly_arch', {check['code'] for check in ready['checks']})
+        self.assertEqual(ready['model']['kv_types'], ['f16', 'fp8'])
+        self.assertTrue(self.inspect(model, 'polystrata', KvType='fp8', RetainedSessions=1)['can_start'])
         rejected = self.inspect(model, 'polystrata', KvType='q8_0', RetainedSessions=2, Vision=True,
                                 SpeculativeMode='mtp')
         self.assertFalse(rejected['can_start'])

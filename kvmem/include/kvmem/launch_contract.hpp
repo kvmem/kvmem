@@ -3,7 +3,7 @@
 
 namespace kvmem {
 // Model-free CLI contract used by the local console before launching a worker.
-inline std::string launch_capabilities(const char* backend, bool inkling2 = false) {
+inline std::string launch_capabilities(const char* backend, bool inkling2 = false, bool inkling2_fp8 = false) {
     const auto query_limits = std::string(backend) == "ninfer"
         ? "\"legacy_query_replay_revision\":1,\"query_limits\":{\"query_max_tokens\":0,\"query_replay_max_tokens\":0}}"
         : "\"query_limits\":{\"query_max_tokens\":512,\"query_replay_max_tokens\":2048}}";
@@ -14,7 +14,8 @@ inline std::string launch_capabilities(const char* backend, bool inkling2 = fals
         models = "\"model_architectures\":[\"qwen35moe\",\"gemma4\"";
         if (inkling2) models += ",\"inkling2_loop\"";
         models += "],\"model_kv_formats\":{\"qwen35moe\":[\"f16\",\"q8_0\"],\"gemma4\":[\"f16\",\"int8\",\"int8k\"]";
-        if (inkling2) models += ",\"inkling2_loop\":[\"f16\"]";
+        if (inkling2) models += inkling2_fp8 ? ",\"inkling2_loop\":[\"f16\",\"fp8\"]"
+                                            : ",\"inkling2_loop\":[\"f16\"]";
         models += "},";
     }
     return std::string("{\"schema_version\":1,\"backend\":\"") + backend +

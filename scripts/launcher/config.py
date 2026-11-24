@@ -277,8 +277,8 @@ def normalize(data, backends, *, path_root=None):
             if draft and (Path(draft).suffix.lower() != '.gguf' or not Path(draft).is_file()):
                 raise ValueError('DraftModel must be an existing GGUF file')
     if p['Backend']=='polystrata':
-        if p.get('KvType','f16') not in {'f16','q8_0','int8','int8k'}:
-            raise ValueError('PolyStrata KV formats: Qwen f16/q8_0, Gemma f16/int8/int8k, Inkling f16')
+        if p.get('KvType','f16') not in {'f16','q8_0','int8','int8k','fp8'}:
+            raise ValueError('PolyStrata KV formats: Qwen f16/q8_0, Gemma f16/int8/int8k, Inkling f16/fp8')
         if ',' in p.get('Gpu',''): raise ValueError('PolyStrata currently supports one GPU')
         if p.get('ReasoningEffort') not in (None,'none','low','medium','high','xhigh'): raise ValueError('PolyStrata reasoning effort must be none, low, medium or high')
         if p.get('ThinkingMode')=='on' and p.get('ReasoningEffort')=='none': raise ValueError('ThinkingMode conflicts with ReasoningEffort none')

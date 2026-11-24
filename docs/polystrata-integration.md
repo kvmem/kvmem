@@ -11,7 +11,7 @@ Gemma 4 and Inkling 2 Mini and the corresponding Terminal frontend. Prepare the 
 frontend layout used by existing packaged launchers.
 
 Qwen35MoE uses F16 or Q8_0 for KVMem. Gemma 4 uses F16, int8 or int8k.
-Inkling 2 Mini uses FP16 KV for KVMem on Windows CUDA.
+Inkling 2 Mini supports FP16 and FP8 E4M3 KV for KVMem on Windows CUDA.
 KVMem owns those models' compact cache and state boundaries. Upstream
 `--kv-resident` uses its own host-backed cache.
 HIP support remains experimental.
@@ -28,8 +28,9 @@ qualification builds.
 ## Inkling 2 Mini
 
 Select **PolyStrata · Inkling 2 Mini** with a Mainline_Support GGUF declaring
-`inkling2_loop`. The first configuration is for a single text conversation on
-one Windows CUDA GPU with FP16 KV. Use the model's own tokenizer and template.
+`inkling2_loop`. Run a single text conversation on one Windows CUDA GPU.
+FP16 is the default. FP8 requires an Ampere or newer NVIDIA GPU and Inkling
+Flash Attention. Use the model's own tokenizer and template.
 When the Inkling thinking-token budget expires, the server closes the thinking
 block and lets the model continue with an answer. The final answer omits
 the internal block delimiters.
