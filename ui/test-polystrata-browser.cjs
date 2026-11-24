@@ -33,7 +33,7 @@ const server=http.createServer(async(req,res)=>{
   res.end('data: '+JSON.stringify({choices:[{delta:{reasoning_content:'exact reasoning'},finish_reason:null}]})+'\n\n'+
    'data: '+JSON.stringify({choices:[{delta:{},finish_reason:'length'}],usage:{completion_tokens:12},timings:{predicted_per_second:40}})+'\n\ndata: [DONE]\n\n');return;
  }
- const file=p.startsWith('/monitor/')?path.join(source,'ui',p.endsWith('/')?p+'index.html':p):path.join(source,'backends/polystrata/serve/web',p==='/'?'index.html':p.replace(/^\/web\//,''));
+ const file=p.startsWith('/monitor/')?path.join(source,'ui',p.endsWith('/')?p+'index.html':p):path.join(source,'backends/polystrata/terminal/serve/web',p==='/'?'kvmem-index.html':p.replace(/^\/web\//,'').replace(/^(app\.js|app\.css|tokens\.css|components\.css)$/,'kvmem-$1'));
  if(!fs.existsSync(file)||!fs.statSync(file).isFile()){res.statusCode=404;res.end('{}');return;}
  const ext=path.extname(file);res.setHeader('Content-Type',({'.js':'text/javascript','.html':'text/html','.css':'text/css','.svg':'image/svg+xml'})[ext]||'application/octet-stream');res.end(fs.readFileSync(file));
 });
@@ -69,6 +69,14 @@ let browser;
  await page.locator('[data-action=preview]').click();await page.locator('[data-check-summary]').filter({hasText:'检查通过'}).waitFor();
  assert.equal(previews[0].parameters.RetainedSessions,4);assert.equal(previews[0].parameters.PreserveThinking,false);assert.equal(previews[0].parameters.VramReserveMiB,256);
  await page.locator('[data-dialog=check] [data-dialog-close]').click();await page.reload();await page.locator('[data-param=Backend]').waitFor();await page.locator('#launch-tab-6').click();assert.equal(await idle.inputValue(),'3');
+ await page.locator('[data-preset=polystrata-inkling2]').click();
+ await page.locator('[data-action=preview]').click();await page.locator('[data-check-summary]').filter({hasText:'检查通过'}).waitFor();
+ const inkling=previews.at(-1).parameters;
+ assert.equal(inkling.ModelAlias,'kvmem-polystrata-inkling2');assert.equal(inkling.KvType,'f16');
+ assert.equal(inkling.RetainedSessions,1);assert.equal(inkling.Prefill,4096);assert.equal(inkling.SpeculativeMode,'none');
+ assert.equal(inkling.ThinkingMode,'off');assert.equal(inkling.ReasoningEffort,undefined);
+ assert.deepEqual(inkling.WorkerArgs,['--attn-requant','q5_0','--loop-bf16','--expert-swaps','0']);
+ await page.locator('[data-dialog=check] [data-dialog-close]').click();await page.locator('[data-preset-undo]').click();
  await page.locator('[data-page=monitor]').click();await page.locator('[data-value=decode-mean]').filter({hasText:'42'}).waitFor();
  assert.equal(await page.locator('[data-live-speed]').isVisible(),false);assert.ok((await page.locator('[data-value=prefill-tokens]').textContent()).includes('62'));
  assert.ok((await page.locator('[data-requests]').textContent()).includes('思考阶段达到输出上限'));
@@ -77,5 +85,5 @@ let browser;
  await page.reload();await page.locator('[data-chat-link][href="/chat/"]').waitFor({state:'attached'});
  assert.equal(await page.locator('[data-page=chat]').isVisible(),true);
  assert.equal(await page.locator('[data-chat-link]').getAttribute('href'),'/chat/');
- assert.deepEqual(errors,[]);console.log('PASS: chat thinking controls/defaults/overrides/reasoning, mobile layout, idle-session migration, MTP default, explicit false, mean/finish/TTFT monitor');
+ assert.deepEqual(errors,[]);console.log('PASS: chat thinking controls/defaults/overrides/reasoning, mobile layout, idle-session migration, MTP default, Inkling preset, explicit false, mean/finish/TTFT monitor');
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(async()=>{if(browser)await browser.close();server.close();});

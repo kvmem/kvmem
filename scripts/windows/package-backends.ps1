@@ -232,8 +232,8 @@ if ($PolystrataWorker) {
     $polyHelpExit=$process.ExitCode
     if($polyHelpExit -notin @(0,2) -or ($stdout.Result+$stderr.Result) -notmatch 'usage: strata-poly --model' -or ($stdout.Result+$stderr.Result) -notmatch '--kvmem-budget') {throw 'PolyStrata failed with a clean runtime PATH'}
     $process.Dispose()
-    $workerInfo['polystrata']=@{sha256=(Get-FileHash -LiteralPath $polyExe).Hash.ToLowerInvariant();path='workers/polystrata/strata-poly.exe';clean_path_help_passed=$true;help_exit_code=$polyHelpExit;architecture='qwen35moe';batch_mtp=$false}
-    [IO.File]::AppendAllText((Join-Path $OutputDir 'README.md'), "`n## PolyStrata`n`nThis package also contains the single-GPU qwen35moe PolyStrata backend and its portable Python frontend. Start the common console with START-HERE-EN.bat or START-HERE-CN.bat. Select a model GGUF and GPU; an omitted Tokenizer is exported locally from that GGUF on first start. No model download occurs. The model's matching mmproj is required for vision. See provenance/polystrata-validation.json for measured scope and known limitations.`n", [Text.UTF8Encoding]::new($false))
+    $workerInfo['polystrata']=@{sha256=(Get-FileHash -LiteralPath $polyExe).Hash.ToLowerInvariant();path='workers/polystrata/strata-poly.exe';clean_path_help_passed=$true;help_exit_code=$polyHelpExit;architecture='qwen35moe';architectures=@('qwen35moe','gemma4','inkling2_loop');batch_mtp=$false}
+    [IO.File]::AppendAllText((Join-Path $OutputDir 'README.md'), "`n## PolyStrata`n`nThe single-GPU PolyStrata backend serves Qwen3.5 MoE, Gemma 4 and Inkling 2 Mini. Use the Inkling preset for FP16 KV and one text conversation. Start the common console with START-HERE-EN.bat or START-HERE-CN.bat. Select a model GGUF and GPU. When Tokenizer is omitted, it is exported locally from that GGUF on first start. Vision models require their matching mmproj. See provenance/polystrata-validation.json for measured scope and known limitations.`n", [Text.UTF8Encoding]::new($false))
 }
 $manifest = @{ version=(Get-Content -LiteralPath (Join-Path $source 'VERSION') -Raw).Trim();
     workers=$workerInfo; models_included=$false; kv_cross_backend_transfer=$false;

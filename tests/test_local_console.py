@@ -102,6 +102,20 @@ class ConsoleTests(unittest.TestCase):
             with self.assertRaises(ValueError): validate(['--elastic-experts'],backend)
             with self.assertRaises(ValueError): validate(['--elastic-headroom-mib','512'],backend)
 
+    def test_inkling_polystrata_preset_native_options(self):
+        def validate(args, backend='polystrata'):
+            config = {'schema_version': 1, 'parameters': {'Backend': backend, 'WorkerArgs': args}}
+            return console.normalize(config, ['polystrata', 'ninfer', 'llamacpp'])['parameters']['WorkerArgs']
+
+        args = ['--attn-requant', 'q5_0', '--loop-bf16', '--expert-swaps', '0']
+        self.assertEqual(validate(args), args)
+        for invalid in (['--attn-requant'], ['--attn-requant', 'f16'], ['--expert-swaps', '-1']):
+            with self.subTest(args=invalid), self.assertRaises(ValueError):
+                validate(invalid)
+        for backend in ('ninfer', 'llamacpp'):
+            with self.subTest(backend=backend), self.assertRaises(ValueError):
+                validate(args, backend)
+
     def test_reply_handles_abandoned_browser_during_headers_and_body(self):
         for stage in ('end_headers', 'body'):
             with self.subTest(stage=stage):

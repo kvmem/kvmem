@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-SOURCE = Path(os.environ.get("POLYSTRATA_SOURCE", Path(__file__).resolve().parents[2] / "backends/polystrata"))
+SOURCE = Path(os.environ.get("POLYSTRATA_SOURCE", Path(__file__).resolve().parents[2] / "backends/polystrata/terminal"))
 sys.path.insert(0, str(SOURCE))
 from serve import runconfig, server
 from serve.frontend import ChatTemplate

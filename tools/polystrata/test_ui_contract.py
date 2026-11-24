@@ -9,7 +9,7 @@ import urllib.request
 import urllib.error
 from unittest import mock
 
-SOURCE = Path(os.environ.get('POLYSTRATA_SOURCE', Path(__file__).resolve().parents[2]/'backends/polystrata'))
+SOURCE = Path(os.environ.get('POLYSTRATA_SOURCE', Path(__file__).resolve().parents[2]/'backends/polystrata/terminal'))
 sys.path.insert(0,str(SOURCE))
 from serve.server import Service, MockEngine, ByteTokenizer, serve, CTX_SLACK
 from serve.frontend import ChatTemplate
@@ -93,7 +93,9 @@ class UiContract(unittest.TestCase):
             self.svc.kvmem_default_max_tokens = before
             self.engine.info = before_info
     def test_history_is_client_owned_and_false_is_explicit(self):
-        svc=Service.__new__(Service)
+        tokenizer = ByteTokenizer()
+        engine = RecordingEngine(tokenizer, '', max_context=4096)
+        svc = Service(engine, tokenizer, ChatTemplate(SOURCE/'serve/chat_template.jinja'))
         svc.kvmem_default_max_tokens=17;svc.client_reasoning_history=True;svc.preserve_thinking=True
         svc._note_unreadable_tool_images=lambda *a:{}
         svc.restore_reasoning=lambda *a:self.fail('text-keyed recovery must not run')
