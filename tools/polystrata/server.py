@@ -187,6 +187,8 @@ def main():
         if getattr(args, name) is None:
             continue
         setattr(args, name, getattr(args, name).resolve())
+    from assets import frontend_root
+    args.source = frontend_root(args.source)
     if not (args.source / "serve/server.py").is_file() or not (args.source / "serve/kvmem.py").is_file():
         parser.error("--source must contain the prepared PolyStrata frontend")
     if not args.worker.is_file() or not args.model.is_file():

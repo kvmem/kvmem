@@ -16,7 +16,13 @@ def tokenizer_files(target: Path) -> tuple[str, ...]:
     return tuple(merge if name=='merges.txt' else name for name in FILES)
 
 
+def frontend_root(source: Path) -> Path:
+    terminal = source / 'terminal'
+    return terminal if (terminal / 'serve/server.py').is_file() else source
+
+
 def model_identity(model: Path, source: Path) -> dict:
+    source = frontend_root(source)
     stat = model.stat()
     with model.open('rb') as stream:
         header = hashlib.sha256(stream.read(1024 * 1024)).hexdigest()
@@ -27,6 +33,7 @@ def model_identity(model: Path, source: Path) -> dict:
 
 
 def tokenizer_path(model: Path, source: Path, *, prepare: bool, cache: Path | None = None) -> Path:
+    source = frontend_root(source)
     identity = model_identity(model, source)
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     if cache is None:

@@ -110,6 +110,12 @@
     {id:'polystrata-default',title:['PolyStrata · 默认模板','PolyStrata · Default template'],parameters:{...commonPreset,Backend:'polystrata',Budget:36*1024,Reserve:4*1024,ThinkingBudget:0,ThinkingMode:'on',KvType:'q8_0',Prefill:512,DraftTokens:2,DraftPolicy:'adaptive',Vision:false,RetainedSessions:2,VramReserveMiB:256,WorkerArgs:['--elastic-experts-headroom','--elastic-headroom-mib','128','--elastic-physical-reserve-mib','512']},
       note:['256K 上下文 · 36K 驻留 · 4K 生成预留 · 思考不限额','256K context · 36K resident · 4K reserve · no fixed thinking cap']},
     {id:'polystrata-gemma4',title:['PolyStrata · Gemma 4 26B-A4B','PolyStrata · Gemma 4 26B-A4B'],parameters:{...commonPreset,Backend:'polystrata',Budget:32768,Reserve:2048,KvType:'f16',Prefill:512,ThinkingMode:'on',ThinkingBudget:0,SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',ModelAlias:'kvmem-polystrata-gemma4',Vision:false,RetainedSessions:2,VramReserveMiB:512},note:['Gemma 4 26B-A4B；启用 MTP 时选择匹配的 assistant GGUF。','Gemma 4 26B-A4B; select its matching assistant GGUF to enable MTP.']},
+    {id:'polystrata-inkling2',title:['PolyStrata · Inkling 2 Mini','PolyStrata · Inkling 2 Mini'],
+      parameters:{...commonPreset,Backend:'polystrata',Context:16384,Budget:8192,Reserve:4096,HostMiB:2048,
+        KvType:'f16',Prefill:4096,SinkTokens:128,RecentTokens:256,ThinkingMode:'off',ThinkingBudget:0,
+        SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',ModelAlias:'kvmem-polystrata-inkling2',Vision:false,
+        RetainedSessions:1,VramReserveMiB:256,WorkerArgs:['--attn-requant','q5_0','--loop-bf16','--expert-swaps','0']},
+      note:['Windows CUDA · Mainline_Support 权重 · FP16 KV · 单会话文本','Windows CUDA · Mainline_Support weights · FP16 KV · single text session']},
     ...['ninfer','llamacpp','polystrata'].map(backend=>({
       id:backend+'-layerwise',title:[backend+' · 分层召回',backend+' · Layerwise'],
       note:['文本、无草稿起点；仍需当前 worker 确认该组合。','Text without drafts; the selected worker must qualify this combination.'],
@@ -993,7 +999,7 @@
     const layout=make('div',{class:'l-layout'}),main=make('div',{class:'l-main'}),side=make('aside',{class:'l-side'});layout.append(main,side);root.append(layout);
     const form=make('form',{'aria-label':tr('启动配置','Launch configuration')});form.style.display='contents';main.append(form);form.addEventListener('submit',e=>e.preventDefault());
     const core=make('section',{class:'s-card l-essential'});core.append(make('h2',{class:'s-title'},tr('模型与资源','Model & resources')));const fields=make('div',{class:'l-fields l-core'});core.append(fields);form.append(core);
-    const backend=field(fields,p,'Backend','推理引擎','Backend','text',Object.entries(names).filter(([v])=>info.backends.length!==1||info.backends.includes(v)).map(([v,t])=>[v,t]),['按 KVMem 当前支持范围区分：Dense 为稠密模型，MoE 为混合专家模型。PolyStrata 支持 Qwen3.5 MoE（包括 Tiel）和 Gemma 4 26B-A4B。','Labels describe current KVMem support: Dense for dense models, MoE for mixture-of-experts models. PolyStrata supports Qwen3.5 MoE (including Tiel) and Gemma 4 26B-A4B.']);Array.from(backend.options).forEach(o=>{o.disabled=!info.backends.includes(o.value);if(o.disabled)o.textContent+=' · '+tr('未安装','not installed');});
+    const backend=field(fields,p,'Backend','推理引擎','Backend','text',Object.entries(names).filter(([v])=>info.backends.length!==1||info.backends.includes(v)).map(([v,t])=>[v,t]),['按 KVMem 当前支持范围区分：Dense 为稠密模型，MoE 为混合专家模型。PolyStrata 支持 Qwen3.5 MoE（包括 Tiel）、Gemma 4 26B-A4B 和 Inkling 2 Mini。','Labels describe current KVMem support: Dense for dense models, MoE for mixture-of-experts models. PolyStrata supports Qwen3.5 MoE (including Tiel), Gemma 4 26B-A4B and Inkling 2 Mini.']);Array.from(backend.options).forEach(o=>{o.disabled=!info.backends.includes(o.value);if(o.disabled)o.textContent+=' · '+tr('未安装','not installed');});
     modelPicker(fields,p);
     fields.append(make('section',{class:'l-model-health l-wide','data-model-health':'','aria-label':tr('模型体检','Model inspection')}));
     const gpu=field(fields,p,'Gpu','推理显卡','Inference GPUs','text',info.gpus.map(g=>[g.uuid,g.name+' · '+g.uuid.slice(-8)]),['选择要使用的显卡。勾选至少两张兼容显卡后，在“多卡设置”页签调整执行顺序与分配；切换引擎保留当前选择。','Choose the GPUs to use. Select at least two compatible GPUs, then adjust their order and allocation in Multi-GPU. Switching engines retains your selection.']);

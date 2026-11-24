@@ -1,6 +1,6 @@
 // Pure functions from the shipped chat: no network or model required.
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
-const app=fs.readFileSync(path.join(__dirname,'../backends/polystrata/serve/web/app.js'),'utf8');
+const app=fs.readFileSync(path.join(__dirname,'../backends/polystrata/terminal/serve/web/kvmem-app.js'),'utf8');
 const start=app.indexOf('function assistantMessages(m) {'),end=app.indexOf('\nfunction setBusy(',start);
 const messages=new Function(app.slice(start,end)+';return assistantMessages;')();
 assert.deepEqual(messages({text:'Done.',reasoning:'correct task-specific reasoning'}),[{role:'assistant',content:'Done.',reasoning_content:'correct task-specific reasoning'}]);

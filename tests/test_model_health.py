@@ -85,6 +85,18 @@ class HealthTests(unittest.TestCase):
         assistant=self.root/'assistant.gguf';gguf(assistant,meta={'general.architecture':'gemma4-assistant'})
         self.assertTrue(self.inspect(model,'polystrata',SpeculativeMode='mtp',DraftModel=str(assistant))['can_start'])
 
+    def test_inkling_accepts_one_fp16_text_conversation(self):
+        model = self.root / 'inkling.gguf'
+        gguf(model, meta={'general.architecture': 'inkling2_loop'})
+        ready = self.inspect(model, 'polystrata', KvType='f16', RetainedSessions=1)
+        self.assertTrue(ready['can_start'])
+        self.assertNotIn('poly_arch', {check['code'] for check in ready['checks']})
+        rejected = self.inspect(model, 'polystrata', KvType='q8_0', RetainedSessions=2, Vision=True,
+                                SpeculativeMode='mtp')
+        self.assertFalse(rejected['can_start'])
+        self.assertEqual({check['code'] for check in rejected['checks'] if check['status'] == 'error'},
+                         {'poly_kv', 'inkling_sessions', 'inkling_vision', 'inkling_draft'})
+
     def test_extension_cannot_disguise_wrong_container(self):
         path=self.root/'fake.gguf'; path.write_bytes(b'not a model'*10)
         self.assertFalse(self.inspect(path)['can_start'])

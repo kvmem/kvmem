@@ -4,7 +4,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 import sys,threading,unittest
 from types import SimpleNamespace
-sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'backends/polystrata'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'backends/polystrata/terminal'))
 from serve.server import make_handler
 
 class Routes(unittest.TestCase):
