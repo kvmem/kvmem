@@ -108,6 +108,10 @@ async function until(fn){for(let i=0;i<100;i++){try{if(await fn())return;}catch{
   await until(async()=>await card.getAttribute('data-state')==='ready');
   assert.equal(await kv.inputValue(),'f16','switching from Qwen to Gemma replaces incompatible q8_0');
   await kv.selectOption('int8k');
+  // The older worker fixture supports one Inkling session.
+  await page.locator('[data-param=RetainedSessions]').evaluate(input=>{
+    input.value='0';input.dispatchEvent(new Event('input',{bubbles:true}));
+  });
   await modelInput.fill(ggufModels.inkling2_loop);
   await until(async()=>JSON.stringify(await options())===JSON.stringify(['f16']));
   await until(async()=>await card.getAttribute('data-state')==='ready');
