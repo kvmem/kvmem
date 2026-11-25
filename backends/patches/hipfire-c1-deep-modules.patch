@@ -33,7 +33,7 @@ index 502046cb9..35ece809f 100644
          desc_staging.n_slots, n_slots,
          "forward_batch_slots: desc_staging was built for a different n_slots"
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
-index aa2066b22..6f8fcc187 100644
+index aa2066b22..75619bbe0 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 @@ -71,7 +71,9 @@ use crate::layerwise_layout::LayerwiseMtpQ8Layout;
@@ -89,7 +89,18 @@ index aa2066b22..6f8fcc187 100644
      n_heads: usize,
      n_kv_heads: usize,
      head_dim: usize,
-@@ -1093,6 +1104,21 @@ pub struct KvMemCtl {
+@@ -1029,6 +1040,10 @@ pub struct KvMemCtl {
+     /// ordinals) and every head-plane path. False under Legacy / AR-only, so the
+     /// default serve keeps the historical `n_fa_layers` record byte-neutral.
+     head_plane: bool,
++    /// P1b: Legacy + native MTP pages the live head KV through the composite
++    /// aux plane (`HIPFIRE_KVMEM_HEAD_LIVE=1`). Layerwise keeps `head_plane`;
++    /// this flag never enables Layerwise-only carriers or live maps.
++    head_live: bool,
+     /// P4.1③ H5: resolved `HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY` head-history
+     /// policy. FirstLayer (the ninfer auto-default) binds the head aux from the
+     /// trunk's first-layer restored view; UpstreamGlobal runs the global Mean-K
+@@ -1093,6 +1108,21 @@ pub struct KvMemCtl {
      draft_images_total: u64,
      draft_image_hits_total: u64,
      draft_image_misses_total: u64,
@@ -233,8 +244,223 @@ index 000000000..242623988
 +        assert!(ring.get(128, 1).is_none());
 +    }
 +}
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
+index 5f1cc8b61..d293e2baf 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
+@@ -279,6 +279,19 @@ impl KvMemCtl {
+         self.head_plane
+     }
+ 
++    /// P1b: Legacy + native MTP pages its live head KV through the composite
++    /// aux plane. Only the bounded cache / archive / carrier paths read this;
++    /// Layerwise-only live maps keep `head_plane_enabled`.
++    pub fn head_live_enabled(&self) -> bool {
++        self.head_live
++    }
++
++    /// Either head plane owns a bounded aux record, so the composite record,
++    /// write-through, bounded capacity and prefill shift apply.
++    pub fn head_composite_enabled(&self) -> bool {
++        self.head_plane || self.head_live
++    }
++
+     /// P4.1③ H5: the resolved head-history policy (FirstLayer auto-default under
+     /// Layerwise+MTP; UpstreamGlobal opt-in). The orchestration branches the head
+     /// aux binding on this at the prefill-seed and the decode/verify carrier
+@@ -322,8 +335,10 @@ impl KvMemCtl {
+     /// admission ceiling here (unlike the trunk pressure owners); the map starts
+     /// empty and the first FirstLayer binding (G5) populates it.
+     pub fn ensure_head_plane(&mut self, slot: usize) -> Result<(), String> {
+-        if !self.head_plane {
+-            return Err("kvmem: head plane requires layerwise recall and native MTP".to_string());
++        if !self.head_composite_enabled() {
++            return Err(
++                "kvmem: head plane requires layerwise recall or Legacy live MTP".to_string(),
++            );
+         }
+         let st = self
+             .slots
+@@ -424,9 +439,9 @@ impl KvMemCtl {
+         k_rows: &[u8],
+         v_rows: &[u8],
+     ) -> Result<(), String> {
+-        if !self.head_plane {
++        if !self.head_composite_enabled() {
+             return Err(
+-                "kvmem head write-through: head plane inactive (requires Layerwise + MTP)"
++                "kvmem head write-through: head plane inactive (requires Layerwise or Legacy live MTP)"
+                     .to_string(),
+             );
+         }
+@@ -475,9 +490,9 @@ impl KvMemCtl {
+         n_rows: usize,
+         src_pos0: usize,
+     ) -> Result<(), String> {
+-        if !self.head_plane {
++        if !self.head_composite_enabled() {
+             return Err(
+-                "kvmem head write-through: head plane inactive (requires Layerwise + MTP)"
++                "kvmem head write-through: head plane inactive (requires Layerwise or Legacy live MTP)"
+                     .to_string(),
+             );
+         }
+@@ -510,6 +525,70 @@ impl KvMemCtl {
+         self.seal_head_plane(slot, pos0, n_rows, &k_rows, &v_rows)
+     }
+ 
++    /// P1b: direct-copy one Legacy head aux page into caller-owned packed rows.
++    /// Unlike the Layerwise restore (which goes through the payload layout and
++    /// host records), the Legacy composite record is already the exact packed
++    /// byte image, so the carrier can `copy_k_gpu`/`copy_v_gpu` straight into
++    /// the head arena stripe. `rows <= KV_BLOCK_TOKENS`.
++    pub fn copy_legacy_head_page(
++        &self,
++        slot: usize,
++        page: u32,
++        rows: u32,
++        k_rows: &mut [u8],
++        v_rows: &mut [u8],
++    ) -> Result<(), String> {
++        if !self.head_live {
++            return Err("kvmem Legacy head copy: live head paging is off".to_string());
++        }
++        let st = self
++            .slots
++            .get(slot)
++            .ok_or_else(|| format!("kvmem Legacy head copy: slot {slot} out of range"))?;
++        let krow = self.k_page_bytes / KV_BLOCK_TOKENS;
++        let vrow = self.v_page_bytes / KV_BLOCK_TOKENS;
++        if k_rows.len() < rows as usize * krow || v_rows.len() < rows as usize * vrow {
++            return Err(format!(
++                "kvmem Legacy head copy: buffers {}x{} / {}x{} too small for {rows} rows",
++                k_rows.len(),
++                krow,
++                v_rows.len(),
++                vrow
++            ));
++        }
++        if !st.raw.copy_k_gpu(
++            page,
++            self.aux_ordinal,
++            &mut k_rows[..rows as usize * krow],
++            rows,
++        ) {
++            return Err(format!(
++                "kvmem Legacy head copy: K page {page} aux {} unavailable",
++                self.aux_ordinal
++            ));
++        }
++        if !st.raw.copy_v_gpu(
++            page,
++            self.aux_ordinal,
++            &mut v_rows[..rows as usize * vrow],
++            rows,
++        ) {
++            return Err(format!(
++                "kvmem Legacy head copy: V page {page} aux {} unavailable",
++                self.aux_ordinal
++            ));
++        }
++        Ok(())
++    }
++
++    /// P1b: the packed per-row byte strides of the head aux plane.
++    pub fn head_row_bytes(&self) -> (usize, usize) {
++        (
++            self.k_page_bytes / KV_BLOCK_TOKENS,
++            self.v_page_bytes / KV_BLOCK_TOKENS,
++        )
++    }
++
+     /// P4.1② G3c: the MTP head's BOUNDED token capacity (design §A.8 Q1, the
+     /// hipfire analog of ninfer `layerwise_mtp_auxiliary_capacity`): the trunk
+     /// layerwise working-set window (`window_tokens`) PLUS ONE native draft-scratch
+@@ -519,9 +598,10 @@ impl KvMemCtl {
+     /// Fail-closed off the Layerwise+MTP path and on a non-page-aligned / zero
+     /// window (the ① [`mtp_auxiliary_capacity`] guard), keeping Legacy byte-neutral.
+     pub fn head_pool_capacity(&self, window_tokens: usize) -> Result<usize, String> {
+-        if !self.head_plane {
++        if !self.head_composite_enabled() {
+             return Err(
+-                "kvmem head pool: head plane inactive (requires Layerwise + MTP)".to_string(),
++                "kvmem head pool: head plane inactive (requires Layerwise or Legacy live MTP)"
++                    .to_string(),
+             );
+         }
+         mtp_auxiliary_capacity(window_tokens, KV_BLOCK_TOKENS)
+@@ -536,10 +616,16 @@ impl KvMemCtl {
+     /// non-page-aligned / zero window fails closed to `None` rather than bounding
+     /// to a bad geometry.
+     pub fn head_bounded_capacity(&self) -> Option<usize> {
+-        if !self.head_plane {
++        if !self.head_composite_enabled() {
+             return None;
+         }
+         let window = self.budget_blocks().checked_mul(KV_BLOCK_TOKENS)?;
++        if self.head_live {
++            // Legacy's contiguous cache keeps two trunk windows: the live
++            // window plus one window of slack for the draft/verify burst that
++            // may run before the next block-aligned slide.
++            return window.checked_mul(2);
++        }
+         self.head_pool_capacity(window).ok()
+     }
+ 
+@@ -552,11 +638,23 @@ impl KvMemCtl {
+     /// per-chunk archive staging under Layerwise (the G4 carrier is the attention
+     /// source), so each chunk re-stages independently — no slide.
+     pub fn head_prefill_shift(&self, frontier: usize) -> usize {
+-        if !self.head_plane {
++        if !self.head_composite_enabled() {
+             return 0;
+         }
+         let window = self.budget_blocks().saturating_mul(KV_BLOCK_TOKENS);
+-        frontier.saturating_sub(window)
++        let removed = frontier.saturating_sub(window);
++        if self.head_live {
++            // A contiguous Legacy cache can only slide in whole blocks (its
++            // rows are addressable by `global - shift`); Layerwise's paged aux
++            // arena tiles rows and keeps the exact shift. Round the shift UP to
++            // the next block: a floor would leave up to one block of the trunk
++            // window above `window`, consuming the cache's draft-scratch block
++            // and leaving no room for the next draft row (compact end could
++            // reach `window + KV_BLOCK_TOKENS - 1`).
++            removed.div_ceil(KV_BLOCK_TOKENS) * KV_BLOCK_TOKENS
++        } else {
++            removed
++        }
+     }
+ 
+     /// P4.1② G3c: build the MTP head's bounded composite-slot pool geometry (①
+@@ -569,9 +667,10 @@ impl KvMemCtl {
+     /// replacing the historical full-resident head `KvCache`. Fail-closed off the
+     /// Layerwise+MTP path; Legacy / AR-only allocate nothing (byte-neutral).
+     pub fn head_pool(&self, window_tokens: usize) -> Result<LayerwisePagePool, String> {
+-        if !self.head_plane {
++        if !self.head_composite_enabled() {
+             return Err(
+-                "kvmem head pool: head plane inactive (requires Layerwise + MTP)".to_string(),
++                "kvmem head pool: head plane inactive (requires Layerwise or Legacy live MTP)"
++                    .to_string(),
+             );
+         }
+         mtp_head_pool(
+@@ -800,9 +899,10 @@ impl KvMemCtl {
+     /// head map, or on a map that does not reconstruct `end` — Legacy / AR-only
+     /// never publish a head append (byte-neutral).
+     pub fn accept_head_append(&mut self, slot: usize, begin: u64, end: u64) -> Result<(), String> {
+-        if !self.head_plane {
++        if !self.head_composite_enabled() {
+             return Err(
+-                "kvmem head append: head plane inactive (requires Layerwise + MTP)".to_string(),
++                "kvmem head append: head plane inactive (requires Layerwise or Legacy live MTP)"
++                    .to_string(),
+             );
+         }
+         let head = self
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
-index e006689ec..e59e4e1c9 100644
+index e006689ec..49d566ffa 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
 @@ -65,6 +65,7 @@ impl KvMemCtl {
@@ -314,11 +540,55 @@ index e006689ec..e59e4e1c9 100644
              );
          }
          Ok(())
+@@ -400,7 +424,7 @@ impl KvMemCtl {
+                 )?;
+                 resident_pages.push(lp as u32);
+             } else {
+-                for layer in 0..self.n_fa_layers {
++                for layer in 0..self.n_record_layers {
+                     if !st.raw.has_k_gpu(lp as u32, layer as u32, rows as u32)
+                         || !st.raw.has_v_gpu(lp as u32, layer as u32, rows as u32)
+                     {
+@@ -426,7 +450,7 @@ impl KvMemCtl {
+         let sealed = raw
+             .capture_snapshot(blocks as u32, None)
+             .map_err(|e| format!("kvmem snapshot manifest: {e}"))?;
+-        if !sealed.ready() || !sealed.covers_packed(blocks as u32, self.n_fa_layers as u32) {
++        if !sealed.ready() || !sealed.covers_packed(blocks as u32, self.n_record_layers as u32) {
+             return Err("kvmem: Legacy snapshot is not a complete all-layer image".into());
+         }
+         let retrieval = st
+@@ -483,7 +507,7 @@ impl KvMemCtl {
+         if !source.sealed.ready()
+             || !source
+                 .sealed
+-                .covers_packed(blocks as u32, self.n_fa_layers as u32)
++                .covers_packed(blocks as u32, self.n_record_layers as u32)
+         {
+             return Err("kvmem: Legacy restore source is incomplete".into());
+         }
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-index 93f27c59f..d1763a410 100644
+index 93f27c59f..c39f3f8ec 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-@@ -140,6 +140,19 @@ impl KvMemCtl {
+@@ -92,7 +92,15 @@ impl KvMemCtl {
+         // the default record is byte-neutral. The trunk GPU paged arena is
+         // UNCHANGED; only this host record gains the aux layer.
+         let head_plane = strategy.is_layerwise() && geom.mtp_head;
+-        let n_record_layers = if head_plane {
++        // P1b: Legacy + native MTP can page the live head KV too. The switch is
++        // opt-in until the bounded carrier has an E2E run; `HEAD_LIVE=0`
++        // explicitly keeps the historical full-resident head.
++        let head_live = !strategy.is_layerwise()
++            && geom.mtp_head
++            && hipfire_config::developer_var("HIPFIRE_KVMEM_HEAD_LIVE")
++                .is_ok_and(|v| !matches!(v.trim(), "0" | "false" | "off"));
++        let head_composite = head_plane || head_live;
++        let n_record_layers = if head_composite {
+             geom.n_fa_layers + 1
+         } else {
+             geom.n_fa_layers
+@@ -140,6 +148,19 @@ impl KvMemCtl {
              }
              _ => None,
          };
@@ -338,7 +608,7 @@ index 93f27c59f..d1763a410 100644
  
          // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
          // LRFU replaces the raw retrieval score with a decaying heavy-hitter
-@@ -434,6 +447,7 @@ impl KvMemCtl {
+@@ -434,6 +455,7 @@ impl KvMemCtl {
              interval: plan.interval,
              diagnostics: options.diagnostics,
              n_fa_layers: geom.n_fa_layers,
@@ -346,7 +616,33 @@ index 93f27c59f..d1763a410 100644
              n_heads: geom.n_heads,
              n_kv_heads: geom.n_kv_heads,
              head_dim: geom.head_dim,
-@@ -515,6 +529,13 @@ impl KvMemCtl {
+@@ -445,7 +467,7 @@ impl KvMemCtl {
+             page_v: vec![0u8; KV_BLOCK_TOKENS * geom.per_pos_v_bytes],
+             wt_k: vec![
+                 0u8;
+-                if strategy.is_layerwise() {
++                if strategy.is_layerwise() || head_live {
+                     geom.max_rows * geom.per_pos_bytes
+                 } else {
+                     0
+@@ -453,7 +475,7 @@ impl KvMemCtl {
+             ],
+             wt_v: vec![
+                 0u8;
+-                if strategy.is_layerwise() {
++                if strategy.is_layerwise() || head_live {
+                     geom.max_rows * geom.per_pos_v_bytes
+                 } else {
+                     0
+@@ -482,6 +504,7 @@ impl KvMemCtl {
+             q_span: vec![0f32; ring_cap],
+             q_layer_rows: vec![0u32; if query_span > 1 { n_record_layers } else { 0 }],
+             head_plane,
++            head_live,
+             layerwise_mtp_history,
+             aux_ordinal: geom.n_fa_layers as u32,
+             n_record_layers,
+@@ -515,6 +538,13 @@ impl KvMemCtl {
              draft_images_total: 0,
              draft_image_hits_total: 0,
              draft_image_misses_total: 0,
@@ -361,7 +657,7 @@ index 93f27c59f..d1763a410 100644
      }
  
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
-index 6b9f7b1be..c9b87e3a4 100644
+index 6b9f7b1be..570906584 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 @@ -203,6 +203,7 @@ impl KvMemCtl {
@@ -465,8 +761,8 @@ index 6b9f7b1be..c9b87e3a4 100644
              enabled: true,
              layerwise: self.strategy.is_layerwise(),
 +            trunk_managed: true,
-+            mtp_head_managed: self.head_plane_enabled(),
-+            mtp_head_history_managed: self.mtp_head,
++            mtp_head_managed: self.head_plane_enabled() || self.head_live,
++            mtp_head_history_managed: self.head_composite_enabled(),
 +            // S2: the working state is still engine scratch while a slot is
 +            // active, but parking demotes it into a native history image and a
 +            // cold admission reallocates/restores it. Together with the host
@@ -945,6 +1241,290 @@ index 2ed18f4a6..525e1be5b 100644
      /// Publish a complete immutable image supplied by the caller. This call
      /// attests that all native components in `value` cover `frontier`; metadata
      /// alone cannot validate native completeness. Zero/out-of-range frontiers
+diff --git a/crates/hipfire-arch-qwen35/src/mtp_cb.rs b/crates/hipfire-arch-qwen35/src/mtp_cb.rs
+index c491309b5..e719d9ea0 100644
+--- a/crates/hipfire-arch-qwen35/src/mtp_cb.rs
++++ b/crates/hipfire-arch-qwen35/src/mtp_cb.rs
+@@ -614,6 +614,7 @@ pub fn mtp_cb_draft(
+         k,
+         false,
+         None,
++        0,
+     )
+ }
+ 
+diff --git a/crates/hipfire-arch-qwen35/src/mtp_dense_tp.rs b/crates/hipfire-arch-qwen35/src/mtp_dense_tp.rs
+index 2d42898dc..3d91cf093 100644
+--- a/crates/hipfire-arch-qwen35/src/mtp_dense_tp.rs
++++ b/crates/hipfire-arch-qwen35/src/mtp_dense_tp.rs
+@@ -588,6 +588,7 @@ pub fn spec_step_mtp_dense_tp(
+             max_n,
+             /* skip_proposal_graph */ true,
+             None,
++            0,
+         )
+         .map_err(|e| format!("dense TP MTP draft: {e}"))?
+     };
+diff --git a/crates/hipfire-arch-qwen35/src/mtp_head.rs b/crates/hipfire-arch-qwen35/src/mtp_head.rs
+index 08e2508e4..905c34941 100644
+--- a/crates/hipfire-arch-qwen35/src/mtp_head.rs
++++ b/crates/hipfire-arch-qwen35/src/mtp_head.rs
+@@ -789,6 +789,14 @@ pub struct Qwen35MtpHeadKvCache {
+     pub n_head_kv: usize,
+     pub head_dim: usize,
+     pub kv_mode: MtpKvMode,
++    /// P1b: first GLOBAL token still addressable at compact row 0. Zero for the
++    /// full-resident cache and for a freshly bounded cache; advanced in whole
++    /// blocks by [`Self::slide_to_shift`] as the window moves.
++    pub head_shift: usize,
++    /// One K/V-buffer-sized device scratch for the in-place window slide. The
++    /// two-hop D2D copy keeps the slide graph-capturable (memcpy nodes cannot
++    /// overlap source and destination).
++    slide_buf: Option<GpuTensor>,
+ }
+ 
+ impl Qwen35MtpHeadKvCache {
+@@ -853,15 +861,72 @@ impl Qwen35MtpHeadKvCache {
+                 max_seq,
+             )?,
+         };
++        let slide_buf = match inner.k_gpu.first() {
++            Some(t) => Some(gpu.alloc_tensor(&t.shape, t.dtype)?),
++            None => None,
++        };
+         Ok(Self {
+             inner,
+             max_seq,
+             n_head_kv: config.n_head_kv,
+             head_dim: config.head_dim,
+             kv_mode,
++            head_shift: 0,
++            slide_buf,
+         })
+     }
+ 
++    /// P1b: slide the bounded contiguous window left when the block-quantized
++    /// `shift` advances (whole `KV_BLOCK_TOKENS` at a time). Copies the live
++    /// K/V bytes down by `delta` rows so compact row `r` always means global
++    /// `shift + r`; rows before the new shift are dropped. No-op for the
++    /// full-resident cache (`shift == 0` for its whole life).
++    pub fn slide_to_shift(&mut self, gpu: &mut Gpu, shift: usize) -> HipResult<()> {
++        if shift <= self.head_shift {
++            return Ok(());
++        }
++        let delta = shift - self.head_shift;
++        self.head_shift = shift;
++        eprintln!("[kvmem-head] slide shift={shift} delta={delta}");
++        for buf in self.inner.k_gpu.iter().chain(self.inner.v_gpu.iter()) {
++            let size = buf.buf.size();
++            let row = if size >= self.max_seq {
++                size / self.max_seq
++            } else {
++                0
++            };
++            let drop = delta.saturating_mul(row);
++            if row == 0 || drop >= size {
++                continue;
++            }
++            let scratch = self
++                .slide_buf
++                .as_ref()
++                .filter(|scratch| scratch.buf.size() >= size)
++                .ok_or_else(|| {
++                    hip_bridge::HipError::new(
++                        1,
++                        &format!("mtp head slide: no {size}-byte scratch buffer"),
++                    )
++                })?;
++            let bytes = size - drop;
++            // Two-hop, non-overlapping D2D. Ordered on the active stream so a
++            // captured graph replays it; the host never sees the bytes.
++            if let Some(stream) = gpu.active_stream.as_ref() {
++                gpu.hip
++                    .memcpy_dtod_async_at(&scratch.buf, 0, &buf.buf, drop, bytes, stream)?;
++                gpu.hip
++                    .memcpy_dtod_async_at(&buf.buf, 0, &scratch.buf, 0, bytes, stream)?;
++            } else {
++                gpu.hip
++                    .memcpy_dtod_at(&scratch.buf, 0, &buf.buf, drop, bytes)?;
++                gpu.hip
++                    .memcpy_dtod_at(&buf.buf, 0, &scratch.buf, 0, bytes)?;
++            }
++        }
++        Ok(())
++    }
++
+     /// Reset positions to all-zeros. Q8 K/V slots are 34 B per 32-element
+     /// block stored inside an F32-typed buffer; zeroing the underlying
+     /// buffer is equivalent to "no positions written" at the kernel level.
+@@ -870,6 +935,7 @@ impl Qwen35MtpHeadKvCache {
+     /// bytes across the full K/V buffers. Setting the flag to `0` preserves
+     /// the original host-zero allocation and H2D-copy path.
+     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
++        self.head_shift = 0;
+         if mtp_fill_fast_enabled() {
+             gpu.bind_thread()?;
+             for layer in 0..self.inner.k_gpu.len() {
+@@ -910,6 +976,9 @@ impl Qwen35MtpHeadKvCache {
+         // leaks the k_gpu/v_gpu buffers. Free them explicitly. (The old
+         // "they free on Drop" comment was false; see mtp_spec/mtp_compose
+         // which already bypass this wrapper for the same reason.)
++        if let Some(slide) = self.slide_buf {
++            let _ = gpu.free_tensor(slide);
++        }
+         let _ = self.inner.free_gpu(gpu);
+     }
+ }
+diff --git a/crates/hipfire-arch-qwen35/src/mtp_spec.rs b/crates/hipfire-arch-qwen35/src/mtp_spec.rs
+index d2551a6fa..ed0e9e674 100644
+--- a/crates/hipfire-arch-qwen35/src/mtp_spec.rs
++++ b/crates/hipfire-arch-qwen35/src/mtp_spec.rs
+@@ -4252,6 +4252,7 @@ pub fn spec_step_mtp(
+     // MTP step k writes its own KV slot at position cur_pos + k (same as
+     // before — a per-step single-layer transformer cache).
+     let dim_bytes = dim * 4;
++    let head_shift = state.mtp_kv.head_shift;
+     for k in 0..max_n {
+         // Step 0 reads from state.prev_hidden (trunk's last post-norm
+         // hidden, snapshot from the previous cycle / prefill) and embeds
+@@ -4259,7 +4260,7 @@ pub fn spec_step_mtp(
+         // (k-1) of mtp_t_outs and uses that same row as the embedding
+         // override (lossy substitute for embed[predicted_token_{k-1}]).
+         if k == 0 {
+-            mtp_head::mtp_head_forward_block_only(
++            mtp_head_block_forward_dispatch(
+                 gpu,
+                 head,
+                 &state.mtp_scratch,
+@@ -4268,11 +4269,14 @@ pub fn spec_step_mtp(
+                 &state.prev_hidden,
+                 None,
+                 cur_pos + k,
++                0,
+                 trunk_weights,
++                None,
++                head_shift,
+             )?;
+         } else {
+             let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+-            mtp_head::mtp_head_forward_block_only(
++            mtp_head_block_forward_dispatch(
+                 gpu,
+                 head,
+                 &state.mtp_scratch,
+@@ -4281,7 +4285,10 @@ pub fn spec_step_mtp(
+                 &prev_row,       // prev_hidden = step k-1's t_mtp_out
+                 Some(&prev_row), // embed override = step k-1's t_mtp_out (lossy)
+                 cur_pos + k,
++                0,
+                 trunk_weights,
++                None,
++                head_shift,
+             )?;
+         }
+         // Capture this step's t_mtp_out into row k of mtp_t_outs so the
+@@ -5108,6 +5115,7 @@ fn mtp_head_block_forward_dispatch(
+     row: usize,
+     trunk_weights: &Qwen35Weights,
+     head_lw: Option<&mut HeadLayerwise<'_>>,
++    head_shift: usize,
+ ) -> HipResult<()> {
+     match head_lw {
+         Some(hlw) => {
+@@ -5148,6 +5156,41 @@ fn mtp_head_block_forward_dispatch(
+                 unreachable!("mtp head layerwise draft requires the kvmem feature")
+             }
+         }
++        None if head_shift > 0 => {
++            // P1b: Legacy bounded head cache. KV writes address the COMPACT
++            // slot (`pos - shift`) while RoPE reads the GLOBAL position from
++            // `pos_buf` — the contiguous sibling of the Layerwise paged handle.
++            let compact = pos.checked_sub(head_shift).ok_or_else(|| {
++                hip_bridge::HipError::new(
++                    0,
++                    &format!(
++                        "mtp head draft: pos {pos} < head shift {head_shift} \
++                         (draft span exceeds the head window)"
++                    ),
++                )
++            })?;
++            let rope = i32::try_from(pos).map_err(|_| {
++                hip_bridge::HipError::new(
++                    0,
++                    &format!("mtp head draft: rope pos {pos} overflow i32"),
++                )
++            })?;
++            gpu.hip.memcpy_htod(&scratch.pos_buf, &rope.to_ne_bytes())?;
++            mtp_head::mtp_head_forward_block_only_with_pos_buf(
++                gpu,
++                head,
++                scratch,
++                kv,
++                next_token,
++                prev_hidden,
++                next_token_embed,
++                &scratch.pos_buf,
++                compact,
++                kv.max_seq,
++                trunk_weights,
++                None,
++            )
++        }
+         None => mtp_head::mtp_head_forward_block_only(
+             gpu,
+             head,
+@@ -5174,6 +5217,7 @@ pub fn mtp_draft_phase_inner(
+     k: usize,
+     skip_proposal_graph: bool,
+     mut head_lw: Option<&mut HeadLayerwise<'_>>,
++    head_shift: usize,
+ ) -> HipResult<MtpDraftOutput> {
+     // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
+     // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
+@@ -5479,6 +5523,7 @@ pub fn mtp_draft_phase_inner(
+                     k,
+                     trunk_weights,
+                     head_lw.as_deref_mut(),
++                    head_shift,
+                 )?;
+                 // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
+                 // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
+@@ -5518,6 +5563,7 @@ pub fn mtp_draft_phase_inner(
+                     k,
+                     trunk_weights,
+                     head_lw.as_deref_mut(),
++                    head_shift,
+                 )?;
+                 mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
+             } else {
+@@ -5543,6 +5589,7 @@ pub fn mtp_draft_phase_inner(
+                     k,
+                     trunk_weights,
+                     head_lw.as_deref_mut(),
++                    head_shift,
+                 )?;
+                 mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
+             }
+@@ -5882,6 +5929,7 @@ pub fn spec_step_mtp_compressed_serial_inner(
+         k,
+         skip_proposal_graph,
+         None,
++        0,
+     )?;
+ 
+     mtp_shared_verify_accept_rollback_inner(
+@@ -6086,6 +6134,11 @@ pub(crate) fn mtp_takeover_fill_head_kv(
+     rope_shift: usize,
+ ) -> HipResult<()> {
+     let n = tokens.len();
++    // P1b: a block-quantized Legacy window advanced; slide the contiguous
++    // cache before this verify span writes at `pos - rope_shift`.
++    if rope_shift > 0 && rope_shift % crate::kvmem_ctl::KV_BLOCK_TOKENS == 0 {
++        state.mtp_kv.slide_to_shift(gpu, rope_shift)?;
++    }
+     let dim = head.config.n_embd;
+     let dim_bytes = dim * 4;
+     if n > 1 {
 diff --git a/crates/hipfire-arch-qwen35/src/qwen35/weights.rs b/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
 index dd17541e7..cb8e404ee 100644
 --- a/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
@@ -5832,7 +6412,7 @@ index 000000000..0d2cbd401
 +    }
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-index add3ddc20..dda54a571 100644
+index add3ddc20..2891f883d 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 @@ -7,7 +7,7 @@
@@ -6055,7 +6635,50 @@ index add3ddc20..dda54a571 100644
          let draft = match &self.draft {
              LegacyDraftImage::None => 0,
              LegacyDraftImage::Mtp(image) => image.host_bytes(),
-@@ -641,9 +757,91 @@ pub(super) fn park_legacy_history(
+@@ -443,6 +559,10 @@ impl LegacyNativeImage {
+         matches!(
+             (kind, &self.draft),
+             (SpecKind::None, _)
++                // P1b: a bounded live Legacy head archives only the composite
++                // aux plane, so its history image carries no private head
++                // payload; the window is refilled from the trunk store.
++                | (SpecKind::Mtp, LegacyDraftImage::None)
+                 | (SpecKind::Mtp, LegacyDraftImage::Mtp(_))
+                 | (SpecKind::Dflash, LegacyDraftImage::Dflash(_))
+         ) || self.store.frontier == 0
+@@ -475,6 +595,11 @@ fn capture_legacy_native_image(
+     let frontier = ctl
+         .fed_tokens(slot)
+         .ok_or("kvmem: snapshot slot out of range")? as usize;
++    // P1b: a bounded live head holds only the recent window; the full-history
++    // park image cannot represent it (payload_lengths requires
++    // frontier <= capacity). The composite aux pages in the native store carry
++    // the head history instead, and the window is refilled from them on reuse.
++    let head_live = ctl.head_live_enabled();
+     let dn = crate::speculative::DeltaNetSnapshot::export_host_from_state(
+         &rig.gpu,
+         &rig.model.dn_states[slot],
+@@ -484,6 +609,7 @@ fn capture_legacy_native_image(
+     } else {
+         match kind {
+             SpecKind::None => LegacyDraftImage::None,
++            SpecKind::Mtp if head_live => LegacyDraftImage::None,
+             SpecKind::Mtp => LegacyDraftImage::Mtp(crate::legacy_draft::LegacyMtpImage::capture(
+                 &rig.gpu,
+                 rig.model.mtp_states[slot]
+@@ -574,6 +700,11 @@ pub(super) fn park_legacy_history(
+     // persist, so the capture either proves its native frontier or reports a
+     // miss (then the target-only image is parked).
+     let run_kind = rig.legacy_spec_kind[slot.0];
++    let head_live = rig
++        .model
++        .kvmem
++        .as_ref()
++        .is_some_and(|ctl| ctl.head_live_enabled());
+     if run_kind == SpecKind::Dflash {
+         // The idle slot may still hold the last cycle's unconsumed draft
+         // (request-local scratch). Park only the published conditioning state.
+@@ -641,9 +772,98 @@ pub(super) fn park_legacy_history(
          source,
          catalog.len()
      );
@@ -6071,7 +6694,14 @@ index add3ddc20..dda54a571 100644
 +    // P1: same ownership rule for the MTP head cache. The parked image holds
 +    // the full head KV; the idle slot's private copy is redundant. A cold
 +    // catalog restore allocates a fresh empty cache and reinstalls the image.
-+    if run_kind == SpecKind::Mtp {
++    // P1b: a bounded live head is NOT full history and must stay on the idle
++    // slot; its composite aux pages travel with the trunk pack instead.
++    let head_live = rig
++        .model
++        .kvmem
++        .as_ref()
++        .is_some_and(|ctl| ctl.head_live_enabled());
++    if run_kind == SpecKind::Mtp && !head_live {
 +        if let Some(state) = rig.model.mtp_states[slot.0].take() {
 +            state.free_gpu(&mut rig.gpu);
 +            eprintln!("[kvmem-legacy] HistoryPark slot={} mtp_freed=1", slot.0);
@@ -6147,7 +6777,7 @@ index add3ddc20..dda54a571 100644
  /// Restore target and draft as one execution frontier. The source stays owned
  /// by its caller; any error invalidates this destination before more inference.
  #[cfg(feature = "kvmem")]
-@@ -660,6 +858,10 @@ pub(super) fn restore_legacy_native_image(
+@@ -660,6 +880,10 @@ pub(super) fn restore_legacy_native_image(
              "kvmem: cached source has no complete {kind:?} history"
          ));
      }
@@ -6158,7 +6788,7 @@ index add3ddc20..dda54a571 100644
      rig.gpu
          .hip
          .device_synchronize()
-@@ -688,6 +890,9 @@ pub(super) fn restore_legacy_native_image(
+@@ -688,6 +912,9 @@ pub(super) fn restore_legacy_native_image(
          snapshot
              .restore_to(&mut rig.model.dn_states[slot], &mut rig.gpu)
              .map_err(|e| format!("kvmem restore DN: {e}"))?;
@@ -6168,7 +6798,7 @@ index add3ddc20..dda54a571 100644
          if source.store.frontier == 0 {
              if let Some(state) = rig.model.mtp_states[slot].as_mut() {
                  state
-@@ -699,13 +904,37 @@ pub(super) fn restore_legacy_native_image(
+@@ -699,13 +926,37 @@ pub(super) fn restore_legacy_native_image(
              }
          } else {
              match (&source.draft, kind) {
@@ -6213,7 +6843,117 @@ index add3ddc20..dda54a571 100644
                  (LegacyDraftImage::Dflash(image), SpecKind::Dflash) => {
                      // Cold admission frees the previous occupant's draft state;
                      // allocate the empty destination the same way the first
-@@ -885,6 +1114,7 @@ enum LegacyQueryDecision {
+@@ -736,6 +987,9 @@ pub(super) fn restore_legacy_native_image(
+                         source.store.frontier as usize,
+                     )?
+                 }
++                (LegacyDraftImage::None, SpecKind::Mtp) => {
++                    restore_live_head_window(rig, slot, source.store.frontier as usize)?;
++                }
+                 (_, SpecKind::None) => {
+                     // A non-zero frontier can be restored without a native
+                     // draft image (the catalog parks store+DN only), but the
+@@ -771,6 +1025,99 @@ pub(super) fn restore_legacy_native_image(
+     result
+ }
+ 
++/// P1b: refill a bounded Legacy head cache from the composite aux pages of the
++/// just-restored trunk pack. Only the `window_pages` immediately before the
++/// frontier can ever be addressed again: `head_prefill_shift` places them at
++/// compact rows `0..window`, with global RoPE unchanged. Called only for a
++/// native image whose head plane was NOT full-history captured (`head_live`).
++#[cfg(feature = "kvmem")]
++fn restore_live_head_window(rig: &mut Rig, slot: usize, frontier: usize) -> Result<(), String> {
++    let head_live = rig
++        .model
++        .kvmem
++        .as_ref()
++        .is_some_and(|ctl| ctl.head_live_enabled());
++    if !head_live {
++        return Err("kvmem: MTP head image missing for a non-live head restore".into());
++    }
++    let head_cap = super::kvmem_hooks::mtp_head_capacity(&rig.model)
++        .ok_or("kvmem: live head restore without a bounded capacity")?;
++    if rig.model.mtp_states[slot].is_none() {
++        let head = rig
++            .model
++            .mtp_head
++            .as_ref()
++            .ok_or("kvmem: missing destination MTP head")?;
++        let st = crate::mtp_spec::MtpSpecState::new_for_components(
++            &mut rig.gpu,
++            &rig.model.config,
++            &rig.model.dn_states[slot],
++            head,
++            rig.model.mtp_k,
++            crate::mtp_head::MtpKvMode::Q8,
++            Some(head_cap),
++        )
++        .map_err(|e| format!("kvmem live head restore alloc: {e}"))?;
++        rig.model.mtp_states[slot] = Some(st);
++    }
++    let block = crate::kvmem_ctl::KV_BLOCK_TOKENS as usize;
++    let blocks = frontier.div_ceil(block);
++    let shift = rig
++        .model
++        .kvmem
++        .as_ref()
++        .ok_or("kvmem: live head restore without controller")?
++        .head_prefill_shift(frontier);
++    let first_page = shift / block;
++    let skip = shift % block;
++    let (k_row, v_row) = rig.model.kvmem.as_ref().unwrap().head_row_bytes();
++    let mut k_buf = vec![0u8; block * k_row];
++    let mut v_buf = vec![0u8; block * v_row];
++    let mut copied = 0usize;
++    for page in first_page..blocks {
++        let rows = block.min(frontier - page * block);
++        let first = if page == first_page { skip } else { 0 };
++        let take = rows.saturating_sub(first);
++        if take == 0 {
++            continue;
++        }
++        rig.model
++            .kvmem
++            .as_ref()
++            .unwrap()
++            .copy_legacy_head_page(slot, page as u32, rows as u32, &mut k_buf, &mut v_buf)
++            .map_err(|e| format!("kvmem live head page {page}: {e}"))?;
++        let state = rig.model.mtp_states[slot]
++            .as_mut()
++            .ok_or("kvmem: live head state vanished")?;
++        let compact = page * block + first - shift;
++        rig.gpu
++            .hip
++            .memcpy_htod_offset(
++                &state.mtp_kv.inner.k_gpu[0].buf,
++                compact * k_row,
++                &k_buf[first * k_row..rows * k_row],
++            )
++            .map_err(|e| format!("kvmem live head K page {page}: {e}"))?;
++        rig.gpu
++            .hip
++            .memcpy_htod_offset(
++                &state.mtp_kv.inner.v_gpu[0].buf,
++                compact * v_row,
++                &v_buf[first * v_row..rows * v_row],
++            )
++            .map_err(|e| format!("kvmem live head V page {page}: {e}"))?;
++        copied += take;
++    }
++    if let Some(state) = rig.model.mtp_states[slot].as_mut() {
++        state.mtp_kv.head_shift = shift;
++    }
++    eprintln!(
++        "[kvmem-head] window restored slot={slot} frontier={frontier} rows={copied} shift={shift}"
++    );
++    Ok(())
++}
++
+ #[cfg(feature = "kvmem")]
+ pub(super) fn prepare_legacy_query_checkpoints(
+     rig: &mut Rig,
+@@ -885,6 +1232,7 @@ enum LegacyQueryDecision {
  fn plan_legacy_query_replay(
      rig: &Rig,
      run: &mut LegacyQueryRun,
@@ -6221,7 +6961,7 @@ index add3ddc20..dda54a571 100644
  ) -> Result<LegacyQueryDecision, String> {
      let Some(control) = rig.model.kvmem.as_ref() else {
          return Ok(LegacyQueryDecision::Skip {
-@@ -906,15 +1136,16 @@ fn plan_legacy_query_replay(
+@@ -906,15 +1254,16 @@ fn plan_legacy_query_replay(
              scores: None,
          });
      }
@@ -6247,7 +6987,7 @@ index add3ddc20..dda54a571 100644
      let prompt_end = run.query.prompt_end() as u64;
      let restore_begin = run.query.restore_begin() as u64;
      let window_tokens = control.window_capacity_tokens();
-@@ -1032,7 +1263,19 @@ pub(super) fn advance_legacy_query_replay(
+@@ -1032,7 +1381,19 @@ pub(super) fn advance_legacy_query_replay(
              Some(run) => run,
              None => continue,
          };
@@ -6268,7 +7008,7 @@ index add3ddc20..dda54a571 100644
          match decision {
              LegacyQueryDecision::Skip { reason, scores } => {
                  if let Some(scores) = scores {
-@@ -1165,6 +1408,15 @@ pub(super) fn prepare_kvmem_step(
+@@ -1165,6 +1526,15 @@ pub(super) fn prepare_kvmem_step(
      batch: &SlotBatch,
      n: usize,
  ) -> Result<(), String> {
@@ -6284,7 +7024,7 @@ index add3ddc20..dda54a571 100644
      // ── KVMem residency pass (HIPFIRE_KVMEM) ────────────────────────
      // Runs BEFORE provisioning: a step's new pages come from the
      // pool's free list, so the pages this step sheds must be back in
-@@ -1219,6 +1471,23 @@ pub(super) fn prepare_kvmem_step(
+@@ -1219,6 +1589,23 @@ pub(super) fn prepare_kvmem_step(
                          })
                  })
                  .collect();
@@ -6308,7 +7048,7 @@ index add3ddc20..dda54a571 100644
              let ctl = rig.model.kvmem.as_mut().unwrap();
              ctl.prepare_legacy_step(
                  &mut rig.gpu,
-@@ -1228,6 +1497,7 @@ pub(super) fn prepare_kvmem_step(
+@@ -1228,6 +1615,7 @@ pub(super) fn prepare_kvmem_step(
                  &incoming,
                  &decoding,
                  &replaying,
@@ -6316,7 +7056,7 @@ index add3ddc20..dda54a571 100644
                  &rig.model.k_arenas,
                  &rig.model.v_arenas,
              )
-@@ -2455,10 +2725,38 @@ pub(super) fn kvmem_prefix_reuse(
+@@ -2455,10 +2843,38 @@ pub(super) fn kvmem_prefix_reuse(
                      &req.prompt_tokens[..frontier as usize],
                      ckpt_media,
                  );
@@ -6356,7 +7096,7 @@ index add3ddc20..dda54a571 100644
                          let dn_path = std::path::PathBuf::from(format!("{}.dn", pack.display()));
                          match std::fs::read(&dn_path) {
                              Ok(bytes) => {
-@@ -2591,6 +2889,29 @@ pub(super) fn kvmem_prefix_reuse(
+@@ -2591,6 +3007,29 @@ pub(super) fn kvmem_prefix_reuse(
                  //    serialization; logical ring + captured watermarks). A
                  //    missing/unrestorable image reseeds the draft from scratch
                  //    — acceptance degrades, output stays verify-exact.
@@ -6386,7 +7126,7 @@ index add3ddc20..dda54a571 100644
                  if let Some(shared) = rig.model.dflash.as_ref() {
                      let restored = {
                          match ctl
-@@ -3334,6 +3655,11 @@ pub(super) fn build_kvmem_controller(
+@@ -3334,6 +3773,11 @@ pub(super) fn build_kvmem_controller(
          }
          config
      });
@@ -6398,7 +7138,7 @@ index add3ddc20..dda54a571 100644
      if let Some(config) = legacy_config.as_ref() {
          eprintln!(
              "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
-@@ -3369,6 +3695,35 @@ pub(super) fn build_kvmem_controller(
+@@ -3369,6 +3813,39 @@ pub(super) fn build_kvmem_controller(
              cfg.cap_tokens,
          );
      }
@@ -6407,9 +7147,13 @@ index add3ddc20..dda54a571 100644
 +    } else {
 +        "layerwise"
 +    };
++    let head_live = hipfire_config::developer_var("HIPFIRE_KVMEM_HEAD_LIVE")
++        .is_ok_and(|v| !matches!(v.trim(), "0" | "false" | "off"));
 +    let head_owner = if mtp_head {
 +        if legacy_config.is_none() {
 +            "aux-plane"
++        } else if head_live {
++            "live-bounded"
 +        } else {
 +            "park-image"
 +        }
@@ -6435,7 +7179,7 @@ index add3ddc20..dda54a571 100644
          n_slots,
          &plan,
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
-index 33ae973c0..970b29c05 100644
+index 33ae973c0..40571b1ca 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 @@ -389,12 +389,12 @@ pub(super) fn evict_for_admit(
@@ -6453,7 +7197,33 @@ index 33ae973c0..970b29c05 100644
      }
  }
  
-@@ -733,7 +733,45 @@ pub(super) fn note_stats(rig: &Rig, stats: &mut EngineStats) {
+@@ -573,6 +573,25 @@ pub(super) fn accept_dflash_verify(
+     }
+ }
+ 
++/// P1b: either the Layerwise aux plane or the Legacy live composite plane is
++/// active. Prefill/consume write-through and bounded capacity gate on this;
++/// Layerwise-only live maps keep gating on `head_plane_enabled`.
++pub(super) fn head_composite_enabled(model: &ModelRig) -> bool {
++    #[cfg(feature = "kvmem")]
++    {
++        model
++            .kvmem
++            .as_ref()
++            .map(|ctl| ctl.head_composite_enabled())
++            .unwrap_or(false)
++    }
++    #[cfg(not(feature = "kvmem"))]
++    {
++        let _ = model;
++        false
++    }
++}
++
+ pub(super) fn mtp_head_capacity(model: &ModelRig) -> Option<usize> {
+     #[cfg(feature = "kvmem")]
+     {
+@@ -733,7 +752,45 @@ pub(super) fn note_stats(rig: &Rig, stats: &mut EngineStats) {
      #[cfg(feature = "kvmem")]
      {
          if let Some(kvmem) = rig.model.kvmem.as_ref() {
@@ -6502,10 +7272,10 @@ index 33ae973c0..970b29c05 100644
      #[cfg(not(feature = "kvmem"))]
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_model.rs b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
 new file mode 100644
-index 000000000..2a86b44ce
+index 000000000..8f634f9d1
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
-@@ -0,0 +1,1120 @@
+@@ -0,0 +1,1157 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -7028,10 +7798,27 @@ index 000000000..2a86b44ce
 +                .collect()
 +        };
 +
++        let head_cap = state.mtp_kv.max_seq;
++        if let Some(&last) = compact_positions.last() {
++            if last < 0 || last as usize >= head_cap {
++                self.mtp_states[slot.0] = Some(state);
++                return Err(format!(
++                    "mtp head prefill: compact position {last} outside head cache {head_cap}"
++                ));
++            }
++        }
 +        // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
 +        // `gpu`/`weights`/head separately. No closure — it would capture all of
 +        // `rig` and collide with the scratch borrow.
 +        let mtp_outcome = norm_outcome.and_then(|()| {
++            // P1b: block-quantized Legacy shift — move the live window before
++            // this chunk stages its compact rows.
++            if rope_shift > 0 && rope_shift % crate::kvmem_ctl::KV_BLOCK_TOKENS == 0 {
++                state
++                    .mtp_kv
++                    .slide_to_shift(&mut gpu, rope_shift)
++                    .map_err(|e| format!("mtp head slide: {e}"))?;
++            }
 +            crate::mtp_head::mtp_head_forward_block_batched(
 +                &mut gpu,
 +                head,
@@ -7080,11 +7867,7 @@ index 000000000..2a86b44ce
 +        let mut outcome = hidden_outcome;
 +        #[cfg(feature = "kvmem")]
 +        if outcome.is_ok() {
-+            let head_plane = self
-+                .kvmem
-+                .as_ref()
-+                .map(|k| k.head_plane_enabled())
-+                .unwrap_or(false);
++            let head_plane = kvmem_hooks::head_composite_enabled(self);
 +            if head_plane {
 +                let pos0 = chunk_positions[0] as usize;
 +                let mut kvmem = self.kvmem.take();
@@ -7226,6 +8009,20 @@ index 000000000..2a86b44ce
 +        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
 +        type HeadLw<'a> = core::marker::PhantomData<&'a ()>;
 +
++        // P1b: Legacy's bounded live head is addressed by COMPACT KV rows while
++        // RoPE stays on the global position. The shift is fixed for this draft
++        // span; a span that would start before the window fails loudly instead
++        // of aliasing another page.
++        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
++        let head_shift = self
++            .kvmem
++            .as_ref()
++            .filter(|ctl| ctl.head_composite_enabled())
++            .map(|ctl| ctl.head_prefill_shift(pos + self.mtp_k))
++            .unwrap_or(0);
++        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
++        let head_shift = 0usize;
++
 +        // The draft body, factored so the restore helper can run it through the
 +        // head handle (kvmem) or full-resident (fallback / default build). `gpu`
 +        // and the handle are parameters; the rest is captured disjointly.
@@ -7243,6 +8040,15 @@ index 000000000..2a86b44ce
 +                .save_from(&mut self.dn_states[slot.0], gpu)
 +                .map_err(|e| format!("mtp dn snapshot: {e}"))?;
 +
++            // P1b: slide the bounded Legacy window once, before the draft
++            // (and before any proposal graph capture — a host copy inside a
++            // captured region would not replay).
++            if hlw.is_none() && head_shift > 0 {
++                state
++                    .mtp_kv
++                    .slide_to_shift(gpu, head_shift)
++                    .map_err(|e| format!("mtp head draft slide: {e}"))?;
++            }
 +            let draft_outcome = crate::mtp_spec::mtp_draft_phase_inner(
 +                gpu,
 +                &self.weights,
@@ -7254,6 +8060,7 @@ index 000000000..2a86b44ce
 +                self.mtp_k,
 +                /* skip_proposal_graph */ true,
 +                hlw,
++                head_shift,
 +            )
 +            .map_err(|e| format!("mtp draft: {e}"));
 +            if crate::mtp_spec::mtp_trace_enabled() {
@@ -7353,7 +8160,7 @@ index 000000000..2a86b44ce
 +            // overwrites `state.prev_hidden` with the last accepted verify row
 +            // (h_{pos+advance-1}) before returning. Legacy / AR-only skip this
 +            // (head_plane_enabled() == false ⇒ byte-neutral).
-+            let head_consume = kvmem_hooks::head_plane_enabled(self);
++            let head_consume = kvmem_hooks::head_composite_enabled(self);
 +            if head_consume {
 +                let dim = self.config.dim;
 +                gpu.hip
