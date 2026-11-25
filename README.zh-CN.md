@@ -128,6 +128,8 @@ NInfer worker 也可以构建成容器镜像：`scripts/docker/build.sh` 先准�
 
 ## 致谢与许可证
 
+KVMem 的自有源代码和文档采用 [Apache License 2.0](LICENSE) 授权。
+
 感谢 [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)、[Neroued/ninfer](https://github.com/Neroued/ninfer)、[iamwavecut/ninfer-all](https://github.com/iamwavecut/ninfer-all) 及社区贡献者，包括 Ryan-gsq、3090/4090 适配、自适应 MTP、快速 prefill 和 ngram 的贡献者。LRFU/GQA max 参考 [melis2023/kvmem-actkv](https://github.com/melis2023/kvmem-actkv)。感谢 melis、redsnow23 等测试者。
 
 各后端保留原许可证和第三方声明，详见 [后端清单](backends/versions.json) 与随包许可证。cuBLAS 遵循 CUDA EULA；模型另行分发并遵循各自条款。
