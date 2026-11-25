@@ -121,11 +121,17 @@ class HealthTests(unittest.TestCase):
         self.assertFalse(result['can_start'])
         self.assertIn('inkling_draft_arch', {check['code'] for check in result['checks']})
 
-    def test_inkling_multi_session_requires_a_compatible_worker(self):
+    def polystrata_console(self):
         spec = importlib.util.spec_from_file_location('health_console', ROOT / 'scripts/local-console.py')
         console = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(console)
         controller = console.Controller(ROOT, self.root / 'state', 18299)
+        # Exercise the worker contract even on hosts that do not ship PolyStrata.
+        controller.backends = ['polystrata']
+        return console, controller
+
+    def test_inkling_multi_session_requires_a_compatible_worker(self):
+        console, controller = self.polystrata_console()
         model = self.root / 'inkling.gguf'
         gguf(model, meta={'general.architecture': 'inkling2_loop'})
         worker = self.root / 'worker.exe'
@@ -144,10 +150,7 @@ class HealthTests(unittest.TestCase):
                              not supported)
 
     def test_inkling_dspark_batch_requires_a_compatible_worker(self):
-        spec = importlib.util.spec_from_file_location('health_console', ROOT / 'scripts/local-console.py')
-        console = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(console)
-        controller = console.Controller(ROOT, self.root / 'state', 18299)
+        console, controller = self.polystrata_console()
         model, draft, worker = (self.root / name for name in ('inkling.gguf', 'draft.gguf', 'worker.exe'))
         gguf(model, meta={'general.architecture': 'inkling2_loop'})
         gguf(draft, meta={'general.architecture': 'dflash'}, tensor='markov_w1.weight')
