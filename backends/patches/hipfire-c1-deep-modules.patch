@@ -14,10 +14,20 @@ index f2e4de2b0..ab597a1d6 100644
    - `apply_source_dispatch_flags`
    - `census_dense_weights`
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
-index aa2066b22..63c0001bf 100644
+index aa2066b22..62e157d84 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
-@@ -650,10 +650,11 @@ pub struct KvMemGeometry {
+@@ -71,7 +71,9 @@ use crate::layerwise_layout::LayerwiseMtpQ8Layout;
+ use crate::layerwise_mtp::{
+     auxiliary_removed_tokens, auxiliary_visible_tokens, AuxiliarySelection, LayerwiseMtpHistory,
+ };
++use dn_ring::DnRing;
+ 
++mod dn_ring;
+ mod import;
+ mod layerwise;
+ mod legacy;
+@@ -650,10 +652,11 @@ pub struct KvMemGeometry {
      /// `mtp_head.is_some() && mtp_k > 0` enablement). Under Layerwise this turns
      /// the host co-archive into the COMPOSITE `kvmem-main-mtp-pages-v4` record
      /// (`n_fa_layers + 1` ordinals, the head aux plane at ordinal `n_fa_layers`)
@@ -33,7 +43,7 @@ index aa2066b22..63c0001bf 100644
      pub mtp_head: bool,
  }
  
-@@ -965,6 +966,10 @@ pub struct KvMemCtl {
+@@ -965,6 +968,10 @@ pub struct KvMemCtl {
      interval: usize,
      diagnostics: KvMemDiagnostics,
      n_fa_layers: usize,
@@ -44,16 +54,143 @@ index aa2066b22..63c0001bf 100644
      n_heads: usize,
      n_kv_heads: usize,
      head_dim: usize,
-@@ -1093,6 +1098,9 @@ pub struct KvMemCtl {
+@@ -1093,6 +1100,14 @@ pub struct KvMemCtl {
      draft_images_total: u64,
      draft_image_hits_total: u64,
      draft_image_misses_total: u64,
 +    /// P3: `<pack>.draft` sidecars written and their on-disk bytes.
 +    draft_sidecars_total: u64,
 +    draft_sidecar_bytes: u64,
++    /// P2: host-resident ring of page-aligned DeltaNet checkpoints. The live
++    /// recurrent state stays engine scratch; this ring is the persistent
++    /// ownership tier and the fallback when the GPU checkpoint pool misses.
++    /// Capacity is `HIPFIRE_KVMEM_DN_HOST_MIB` (default 512, 0 disables).
++    dn_ring: DnRing,
  }
  
  /// `SPILLED_PAGE` is re-exported for engine-side diagnostics; keep the import
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/dn_ring.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/dn_ring.rs
+new file mode 100644
+index 000000000..242623988
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/dn_ring.rs
+@@ -0,0 +1,116 @@
++//! P2: host-resident DeltaNet checkpoint ring.
++//!
++//! The recurrent state is small per slot (~115 MiB at 48 linear layers) but
++//! it cannot be rebuilt from tokens cheaply, and the GPU checkpoint pool is
++//! bounded by VRAM. The ring keeps page-aligned `DeltaNetSnapshot` exports in
++//! host memory, keyed by `(frontier, fingerprint)`, so a cold prefix reuse can
++//! restore the exact state without a live GPU snapshot. The live state stays
++//! engine-owned scratch; the persistent checkpoints are KVMem-managed.
++
++use std::collections::VecDeque;
++
++struct DnEntry {
++    frontier: u64,
++    fp: u64,
++    bytes: Vec<u8>,
++}
++
++/// LRU ring of serialized DeltaNet states. `cap_bytes == 0` disables it.
++pub struct DnRing {
++    entries: VecDeque<DnEntry>,
++    bytes: u64,
++    cap_bytes: u64,
++}
++
++impl DnRing {
++    pub fn new(cap_bytes: u64) -> Self {
++        Self {
++            entries: VecDeque::new(),
++            bytes: 0,
++            cap_bytes,
++        }
++    }
++
++    pub fn enabled(&self) -> bool {
++        self.cap_bytes > 0
++    }
++
++    pub fn len(&self) -> usize {
++        self.entries.len()
++    }
++
++    pub fn total_bytes(&self) -> u64 {
++        self.bytes
++    }
++
++    pub fn get(&self, frontier: u64, fp: u64) -> Option<&[u8]> {
++        self.entries
++            .iter()
++            .find(|e| e.frontier == frontier && e.fp == fp)
++            .map(|e| e.bytes.as_slice())
++    }
++
++    /// Insert or refresh one checkpoint. Returns `false` when the blob cannot
++    /// fit even in an empty ring (the caller keeps its existing source).
++    pub fn insert(&mut self, frontier: u64, fp: u64, bytes: Vec<u8>) -> bool {
++        if !self.enabled() {
++            return false;
++        }
++        let size = bytes.len() as u64;
++        if size > self.cap_bytes {
++            return false;
++        }
++        if let Some(pos) = self
++            .entries
++            .iter()
++            .position(|e| e.frontier == frontier && e.fp == fp)
++        {
++            let old = self.entries.remove(pos).expect("position is valid");
++            self.bytes = self.bytes.saturating_sub(old.bytes.len() as u64);
++        }
++        while self.bytes.saturating_add(size) > self.cap_bytes {
++            let Some(old) = self.entries.pop_front() else {
++                break;
++            };
++            self.bytes = self.bytes.saturating_sub(old.bytes.len() as u64);
++        }
++        self.bytes = self.bytes.saturating_add(size);
++        self.entries.push_back(DnEntry {
++            frontier,
++            fp,
++            bytes,
++        });
++        true
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn evicts_oldest_and_replaces_same_key() {
++        let mut ring = DnRing::new(10);
++        assert!(ring.insert(128, 1, vec![0; 4]));
++        assert!(ring.insert(256, 2, vec![0; 4]));
++        assert_eq!(ring.len(), 2);
++        assert!(ring.insert(384, 3, vec![0; 4]));
++        // 4+4+4 > 10: the oldest (128) is gone.
++        assert!(ring.get(128, 1).is_none());
++        assert!(ring.get(256, 2).is_some());
++        assert!(ring.get(384, 3).is_some());
++        // Same key replaces without growing the queue.
++        assert!(ring.insert(256, 2, vec![1; 4]));
++        assert_eq!(ring.len(), 2);
++        assert_eq!(ring.total_bytes(), 8);
++    }
++
++    #[test]
++    fn disabled_or_oversized_refuses() {
++        let mut ring = DnRing::new(0);
++        assert!(!ring.insert(128, 1, vec![0; 4]));
++        let mut ring = DnRing::new(4);
++        assert!(!ring.insert(128, 1, vec![0; 5]));
++        assert!(ring.get(128, 1).is_none());
++    }
++}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
 index e006689ec..e59e4e1c9 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
@@ -136,10 +273,30 @@ index e006689ec..e59e4e1c9 100644
          }
          Ok(())
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-index 93f27c59f..e61dad5bd 100644
+index 93f27c59f..7d450bda6 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-@@ -434,6 +434,7 @@ impl KvMemCtl {
+@@ -140,6 +140,19 @@ impl KvMemCtl {
+             }
+             _ => None,
+         };
++        // P2: persistent DN checkpoints are host-resident. The GPU pool remains
++        // a fast cache; the ring is the ownership tier and the fallback when
++        // the pool misses. 0 disables the ring (GPU pool only).
++        let dn_host_mib: u64 = hipfire_config::developer_var("HIPFIRE_KVMEM_DN_HOST_MIB")
++            .ok()
++            .and_then(|v| v.trim().parse::<u64>().ok())
++            .unwrap_or(512);
++        if dn_host_mib > 0 {
++            eprintln!(
++                "[kvmem] P2 DN host ring: {} MiB (HIPFIRE_KVMEM_DN_HOST_MIB)",
++                dn_host_mib
++            );
++        }
+ 
+         // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
+         // LRFU replaces the raw retrieval score with a decaying heavy-hitter
+@@ -434,6 +447,7 @@ impl KvMemCtl {
              interval: plan.interval,
              diagnostics: options.diagnostics,
              n_fa_layers: geom.n_fa_layers,
@@ -147,17 +304,18 @@ index 93f27c59f..e61dad5bd 100644
              n_heads: geom.n_heads,
              n_kv_heads: geom.n_kv_heads,
              head_dim: geom.head_dim,
-@@ -515,6 +516,8 @@ impl KvMemCtl {
+@@ -515,6 +529,9 @@ impl KvMemCtl {
              draft_images_total: 0,
              draft_image_hits_total: 0,
              draft_image_misses_total: 0,
 +            draft_sidecars_total: 0,
 +            draft_sidecar_bytes: 0,
++            dn_ring: DnRing::new(dn_host_mib.saturating_mul(1 << 20)),
          })
      }
  
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
-index 6b9f7b1be..fa709be9d 100644
+index 6b9f7b1be..d93246444 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 @@ -203,6 +203,7 @@ impl KvMemCtl {
@@ -168,7 +326,7 @@ index 6b9f7b1be..fa709be9d 100644
                              stamp: 0,
                          });
                      }
-@@ -511,6 +512,27 @@ impl KvMemCtl {
+@@ -511,6 +512,67 @@ impl KvMemCtl {
          demoted
      }
  
@@ -193,27 +351,69 @@ index 6b9f7b1be..fa709be9d 100644
 +        }
 +    }
 +
++    /// P2: whether KVMem owns persistent DeltaNet checkpoints in host memory.
++    pub fn dn_ring_enabled(&self) -> bool {
++        self.dn_ring.enabled()
++    }
++
++    /// P2: store one serialized `DeltaNetSnapshot`. The engine exports the
++    /// live state at a page boundary; the ring evicts oldest checkpoints to
++    /// stay within `HIPFIRE_KVMEM_DN_HOST_MIB`.
++    pub fn note_dn_checkpoint(&mut self, frontier: u64, fp: u64, bytes: Vec<u8>) {
++        let len = bytes.len();
++        if self.dn_ring.insert(frontier, fp, bytes) {
++            if self.diagnostics.trace {
++                eprintln!(
++                    "[kvmem-dn] host checkpoint frontier={frontier} fp={fp:#x} bytes={len} \
++                     ring_bytes={}",
++                    self.dn_ring.total_bytes()
++                );
++            }
++        } else if self.diagnostics.trace {
++            eprintln!(
++                "[kvmem-dn] host checkpoint refused frontier={frontier} bytes={len} \
++                 cap={}",
++                self.dn_ring.total_bytes()
++            );
++        }
++    }
++
++    /// P2: exact host checkpoint lookup (frontier + token/media fingerprint).
++    pub fn dn_checkpoint(&self, frontier: u64, fp: u64) -> Option<&[u8]> {
++        self.dn_ring.get(frontier, fp)
++    }
++
++    pub fn dn_ring_len(&self) -> u32 {
++        self.dn_ring.len() as u32
++    }
++
++    pub fn dn_ring_bytes(&self) -> u64 {
++        self.dn_ring.total_bytes()
++    }
++
      /// Live observability snapshot (`/metrics` via `EngineStats.kvmem`).
      /// Cheap integer reads from the host stores: no device work, no
      /// allocation, and no path reads it back into selection/residency, so it
-@@ -529,6 +551,16 @@ impl KvMemCtl {
+@@ -529,6 +591,18 @@ impl KvMemCtl {
          KvMemStats {
              enabled: true,
              layerwise: self.strategy.is_layerwise(),
 +            trunk_managed: true,
 +            mtp_head_managed: self.head_plane_enabled(),
 +            mtp_head_history_managed: self.mtp_head,
-+            dn_state_managed: false,
++            dn_state_managed: self.dn_ring.enabled(),
 +            dflash_managed: false,
++            // The live recurrent state is engine scratch; the host ring is the
++            // KVMem-owned persistent tier.
 +            dn_state_bytes: 0,
 +            dn_state_slots: 0,
-+            dn_checkpoints: 0,
-+            dn_checkpoint_bytes: 0,
++            dn_checkpoints: self.dn_ring.len() as u32,
++            dn_checkpoint_bytes: self.dn_ring.total_bytes(),
 +            media_pins: true,
              host_charged_bytes: self.storage.charged_bytes(),
              disk_bytes: self.storage.disk_bytes(),
              payload_bytes,
-@@ -561,6 +593,8 @@ impl KvMemCtl {
+@@ -561,6 +635,8 @@ impl KvMemCtl {
              draft_images: self.draft_images_total,
              draft_image_hits: self.draft_image_hits_total,
              draft_image_misses: self.draft_image_misses_total,
@@ -5290,7 +5490,7 @@ index 000000000..0d2cbd401
 +    }
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-index add3ddc20..e309a7b88 100644
+index add3ddc20..ffc831917 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 @@ -51,6 +51,29 @@ pub(super) fn kvmem_session_media(rig: &Rig, session: SessionId) -> (Option<u64>
@@ -5354,7 +5554,148 @@ index add3ddc20..e309a7b88 100644
      }
      // 期3 G3 P1.1 dn-persist: co-locate the recurrent state with the pack.
      // Live-frontier freezes export the live DN state; endpoint/coverage
-@@ -641,6 +688,24 @@ pub(super) fn park_legacy_history(
+@@ -181,11 +228,26 @@ pub(super) fn kvmem_catalog_and_pin(
+                         .and_then(|pool| pool.peek(domain, boundary as u64, fp))
+                     {
+                         Some(snapshot) => snapshot.export_host(&rig.gpu),
+-                        None => Err("no recurrent checkpoint at the frozen frontier".to_string()),
++                        // P2: the host ring is the fallback when the GPU pool
++                        // no longer holds the boundary (evicted or disabled).
++                        None => ctl
++                            .dn_checkpoint(boundary as u64, fp)
++                            .map(|bytes| bytes.to_vec())
++                            .ok_or_else(|| {
++                                "no recurrent checkpoint at the frozen frontier".to_string()
++                            }),
+                     }
+                 };
+                 match exported {
+                     Ok(bytes) => {
++                        // P2: every frozen pack has an exact page-aligned DN
++                        // image; retain it in the host ring so reuse does not
++                        // depend on the GPU checkpoint pool still holding it.
++                        let fp = crate::checkpoint::checkpoint_fingerprint(
++                            &tokens[..boundary as usize],
++                            media_digest,
++                        );
++                        ctl.note_dn_checkpoint(boundary as u64, fp, bytes.clone());
+                         let tmp = std::path::PathBuf::from(format!("{}.tmp", dn_path.display()));
+                         match std::fs::write(&tmp, &bytes)
+                             .and_then(|_| std::fs::rename(&tmp, &dn_path))
+@@ -257,35 +319,89 @@ pub(super) fn kvmem_coverage_capture(
+         }
+         let tokens: Vec<u32> = sess.tokens[..boundary as usize].to_vec();
+         let fp = crate::checkpoint::checkpoint_fingerprint(&tokens, None);
+-        let model = &mut rig.model;
+-        let Some(pool) = model.checkpoint_pool.as_mut() else {
+-            continue;
++        // P2: export the live recurrent state into the host ring even when the
++        // GPU pool refuses (or is disabled for the run). The ring is the
++        // ownership tier; the pool is only a fast-restore cache.
++        let dn_host = if rig
++            .model
++            .kvmem
++            .as_ref()
++            .is_some_and(|ctl| ctl.dn_ring_enabled())
++        {
++            match crate::speculative::DeltaNetSnapshot::export_host_from_state(
++                &rig.gpu,
++                &rig.model.dn_states[s],
++            ) {
++                Ok(bytes) => Some(bytes),
++                Err(e) => {
++                    eprintln!("[kvmem-dn] host export skipped at {fed}: {e}");
++                    None
++                }
++            }
++        } else {
++            None
+         };
+-        if pool.peek(&domain, fed, fp).is_some() {
+-            continue;
+-        }
+-        let state = &model.dn_states[s];
+-        match crate::checkpoint::capture_checkpoint(
+-            &mut rig.gpu,
+-            pool,
+-            &domain,
+-            fed,
+-            &tokens,
+-            None, // coverage is text-only (vision sessions skip it)
+-            state,
+-        ) {
+-            Ok(id) if id == crate::checkpoint::CheckpointId::NONE => {
+-                // Pool ceiling refused capture; the boundary stays unreusable.
++        let gpu_pool =
++            hipfire_config::developer_var("HIPFIRE_KVMEM_DN_GPU").map_or(true, |v| v.trim() != "0");
++        let mut stored = false;
++        {
++            let model = &mut rig.model;
++            let Some(pool) = model.checkpoint_pool.as_mut() else {
++                if let Some(bytes) = dn_host {
++                    if let Some(ctl) = model.kvmem.as_mut() {
++                        ctl.note_dn_checkpoint(fed, fp, bytes);
++                        stored = true;
++                    }
++                }
++                if stored {
++                    if let Some(f) = slots[s].as_mut() {
++                        f.last_coverage_boundary = fed as usize;
++                    }
++                }
++                continue;
++            };
++            if pool.peek(&domain, fed, fp).is_some() {
++                // The GPU pool already owns this boundary; the host ring is a
++                // fallback, not a duplicate.
++                continue;
+             }
+-            Ok(_) => {
+-                if let Some(f) = slots[s].as_mut() {
+-                    f.last_coverage_boundary = fed as usize;
++            if gpu_pool {
++                let state = &model.dn_states[s];
++                match crate::checkpoint::capture_checkpoint(
++                    &mut rig.gpu,
++                    pool,
++                    &domain,
++                    fed,
++                    &tokens,
++                    None, // coverage is text-only (vision sessions skip it)
++                    state,
++                ) {
++                    Ok(id) if id == crate::checkpoint::CheckpointId::NONE => {
++                        // Pool ceiling refused capture; the host ring below is
++                        // still a valid anchor.
++                    }
++                    Ok(_) => stored = true,
++                    Err(e) => eprintln!("[kvmem-prefix] coverage capture skipped: {e:?}"),
+                 }
++            }
++        }
++        if let Some(bytes) = dn_host {
++            let len = bytes.len();
++            if let Some(ctl) = rig.model.kvmem.as_mut() {
++                ctl.note_dn_checkpoint(fed, fp, bytes);
++                stored = true;
+                 if rig.gpu.slot_trace() {
+-                    eprintln!("[kvmem-prefix] slot {s} coverage checkpoint at {fed}");
++                    eprintln!("[kvmem-prefix] slot {s} host DN checkpoint at {fed} ({len} B)");
+                 }
+             }
+-            Err(e) => eprintln!("[kvmem-prefix] coverage capture skipped: {e:?}"),
++        }
++        if stored {
++            if let Some(f) = slots[s].as_mut() {
++                f.last_coverage_boundary = fed as usize;
++            }
++            if rig.gpu.slot_trace() {
++                eprintln!("[kvmem-prefix] slot {s} coverage checkpoint at {fed}");
++            }
+         }
+     }
+ }
+@@ -641,6 +757,24 @@ pub(super) fn park_legacy_history(
          source,
          catalog.len()
      );
@@ -5379,7 +5720,7 @@ index add3ddc20..e309a7b88 100644
      Ok(Some(publication.id))
  }
  
-@@ -699,13 +764,37 @@ pub(super) fn restore_legacy_native_image(
+@@ -699,13 +833,37 @@ pub(super) fn restore_legacy_native_image(
              }
          } else {
              match (&source.draft, kind) {
@@ -5424,7 +5765,7 @@ index add3ddc20..e309a7b88 100644
                  (LegacyDraftImage::Dflash(image), SpecKind::Dflash) => {
                      // Cold admission frees the previous occupant's draft state;
                      // allocate the empty destination the same way the first
-@@ -885,6 +974,7 @@ enum LegacyQueryDecision {
+@@ -885,6 +1043,7 @@ enum LegacyQueryDecision {
  fn plan_legacy_query_replay(
      rig: &Rig,
      run: &mut LegacyQueryRun,
@@ -5432,7 +5773,7 @@ index add3ddc20..e309a7b88 100644
  ) -> Result<LegacyQueryDecision, String> {
      let Some(control) = rig.model.kvmem.as_ref() else {
          return Ok(LegacyQueryDecision::Skip {
-@@ -906,15 +996,16 @@ fn plan_legacy_query_replay(
+@@ -906,15 +1065,16 @@ fn plan_legacy_query_replay(
              scores: None,
          });
      }
@@ -5458,7 +5799,7 @@ index add3ddc20..e309a7b88 100644
      let prompt_end = run.query.prompt_end() as u64;
      let restore_begin = run.query.restore_begin() as u64;
      let window_tokens = control.window_capacity_tokens();
-@@ -1032,7 +1123,19 @@ pub(super) fn advance_legacy_query_replay(
+@@ -1032,7 +1192,19 @@ pub(super) fn advance_legacy_query_replay(
              Some(run) => run,
              None => continue,
          };
@@ -5479,7 +5820,7 @@ index add3ddc20..e309a7b88 100644
          match decision {
              LegacyQueryDecision::Skip { reason, scores } => {
                  if let Some(scores) = scores {
-@@ -1219,6 +1322,23 @@ pub(super) fn prepare_kvmem_step(
+@@ -1219,6 +1391,23 @@ pub(super) fn prepare_kvmem_step(
                          })
                  })
                  .collect();
@@ -5503,7 +5844,7 @@ index add3ddc20..e309a7b88 100644
              let ctl = rig.model.kvmem.as_mut().unwrap();
              ctl.prepare_legacy_step(
                  &mut rig.gpu,
-@@ -1228,6 +1348,7 @@ pub(super) fn prepare_kvmem_step(
+@@ -1228,6 +1417,7 @@ pub(super) fn prepare_kvmem_step(
                  &incoming,
                  &decoding,
                  &replaying,
@@ -5511,7 +5852,47 @@ index add3ddc20..e309a7b88 100644
                  &rig.model.k_arenas,
                  &rig.model.v_arenas,
              )
-@@ -2591,6 +2712,29 @@ pub(super) fn kvmem_prefix_reuse(
+@@ -2455,10 +2645,38 @@ pub(super) fn kvmem_prefix_reuse(
+                     &req.prompt_tokens[..frontier as usize],
+                     ckpt_media,
+                 );
++                // P2: the host ring is the first fallback after the GPU pool;
++                // the pack sidecar is the cold-restart tier. Copy the blob out
++                // before the pool mutable borrow below.
++                let host_dn = ctl
++                    .dn_checkpoint(frontier as u64, fp)
++                    .map(|bytes| bytes.to_vec());
+                 // 期3 G3 P1.1 dn-persist: rebuild the recurrent checkpoint from
+                 // the pack sidecar when this process has no pool entry (restart).
+                 if ckpt_pool.peek(domain, frontier as u64, fp).is_none() {
+-                    if let Some(pack) = ctl.prefix_pack_path(reuse_id) {
++                    if let Some(bytes) = host_dn {
++                        match crate::speculative::DeltaNetSnapshot::new_for(
++                            &mut rig.gpu,
++                            &rig.model.dn_states[slot.0],
++                        ) {
++                            Ok(mut snap) => match snap.import_host(&rig.gpu, &bytes) {
++                                Ok(()) => {
++                                    let (cid, displaced) =
++                                        ckpt_pool.insert(domain.clone(), frontier as u64, fp, snap);
++                                    for d in displaced {
++                                        d.free_gpu(&mut rig.gpu);
++                                    }
++                                    if cid != crate::checkpoint::CheckpointId::NONE {
++                                        eprintln!(
++                                            "[kvmem-dn] DN restored from host ring frontier={frontier}"
++                                        );
++                                    }
++                                }
++                                Err(e) => eprintln!("[kvmem-dn] host ring DN rejected: {e}"),
++                            },
++                            Err(e) => eprintln!("[kvmem-dn] host ring DN alloc failed: {e:?}"),
++                        }
++                    } else if let Some(pack) = ctl.prefix_pack_path(reuse_id) {
+                         let dn_path = std::path::PathBuf::from(format!("{}.dn", pack.display()));
+                         match std::fs::read(&dn_path) {
+                             Ok(bytes) => {
+@@ -2591,6 +2809,29 @@ pub(super) fn kvmem_prefix_reuse(
                  //    serialization; logical ring + captured watermarks). A
                  //    missing/unrestorable image reseeds the draft from scratch
                  //    — acceptance degrades, output stays verify-exact.
@@ -5541,7 +5922,7 @@ index add3ddc20..e309a7b88 100644
                  if let Some(shared) = rig.model.dflash.as_ref() {
                      let restored = {
                          match ctl
-@@ -3334,6 +3478,11 @@ pub(super) fn build_kvmem_controller(
+@@ -3334,6 +3575,11 @@ pub(super) fn build_kvmem_controller(
          }
          config
      });
@@ -5553,7 +5934,7 @@ index add3ddc20..e309a7b88 100644
      if let Some(config) = legacy_config.as_ref() {
          eprintln!(
              "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
-@@ -3369,6 +3518,25 @@ pub(super) fn build_kvmem_controller(
+@@ -3369,6 +3615,35 @@ pub(super) fn build_kvmem_controller(
              cfg.cap_tokens,
          );
      }
@@ -5571,16 +5952,26 @@ index add3ddc20..e309a7b88 100644
 +    } else {
 +        "private-resident"
 +    };
++    let dn_owner = if hipfire_config::developer_var("HIPFIRE_KVMEM_DN_HOST_MIB")
++        .ok()
++        .and_then(|v| v.trim().parse::<u64>().ok())
++        .unwrap_or(512)
++        > 0
++    {
++        "host-ring+live"
++    } else {
++        "private-resident"
++    };
 +    eprintln!(
 +        "[kvmem-ownership] strategy={ownership_strategy} trunk=managed \
-+         mtp_head={head_owner} dn_state=private-resident \
++         mtp_head={head_owner} dn_state={dn_owner} \
 +         dflash=checkpoint-image media_pins=mandatory vision_kv=none"
 +    );
      Ok(Some(crate::kvmem_ctl::KvMemCtl::new_with_config(
          n_slots,
          &plan,
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
-index 33ae973c0..40664b39d 100644
+index 33ae973c0..10c9e4b66 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 @@ -389,12 +389,12 @@ pub(super) fn evict_for_admit(
@@ -5598,7 +5989,7 @@ index 33ae973c0..40664b39d 100644
      }
  }
  
-@@ -733,7 +733,23 @@ pub(super) fn note_stats(rig: &Rig, stats: &mut EngineStats) {
+@@ -733,7 +733,27 @@ pub(super) fn note_stats(rig: &Rig, stats: &mut EngineStats) {
      #[cfg(feature = "kvmem")]
      {
          if let Some(kvmem) = rig.model.kvmem.as_ref() {
@@ -5614,9 +6005,13 @@ index 33ae973c0..40664b39d 100644
 +            }
 +            snapshot.dn_state_bytes = dn_bytes;
 +            snapshot.dn_state_slots = rig.model.dn_states.len() as u32;
-+            if let Some(pool) = rig.model.checkpoint_pool.as_ref() {
-+                snapshot.dn_checkpoints = pool.len() as u32;
-+                snapshot.dn_checkpoint_bytes = pool.total_bytes();
++            // P2: when the host ring owns persistent DN checkpoints, report its
++            // count/bytes (the GPU pool is a cache, not the ownership tier).
++            if !kvmem.dn_ring_enabled() {
++                if let Some(pool) = rig.model.checkpoint_pool.as_ref() {
++                    snapshot.dn_checkpoints = pool.len() as u32;
++                    snapshot.dn_checkpoint_bytes = pool.total_bytes();
++                }
 +            }
 +            snapshot.dflash_managed = rig.model.dflash_states.iter().any(|s| s.is_some());
 +            stats.note_kvmem(snapshot);
