@@ -1,0 +1,663 @@
+diff --git a/engine/src/poly/engine.cpp b/engine/src/poly/engine.cpp
+index 9a3eec270119fa2578c989dc1d9b818233b52e13..a37c048f7b4a5edcde300c1f387b00876007d52f 100644
+--- a/engine/src/poly/engine.cpp
++++ b/engine/src/poly/engine.cpp
+@@ -2282,8 +2282,8 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
+ #endif
+         if (o.kv_format != KvFmt::kFp16 && o.kv_format != KvFmt::kFp8)
+             throw std::runtime_error("KVMem Inkling 2 requires FP16 or FP8 KV");
+-        if (o.batch || o.memory.sessions != 1 || o.expert_gpu >= 0)
+-            throw std::runtime_error("KVMem Inkling 2 requires one sequence on one GPU");
++        if (o.expert_gpu >= 0)
++            throw std::runtime_error("KVMem Inkling 2 requires one GPU");
+         if (o.memory.mtp != !o.draft_model.empty())
+             throw std::runtime_error("KVMem Inkling 2 requires --kvmem-mtp and a matching --draft-model together");
+     } else if (o.memory.budget && o.memory.mtp && !o.draft_model.empty()) {
+@@ -2376,6 +2376,16 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
+     }
+     if (starts.empty()) {
+         std::unique_ptr<Engine> engine = make();
++#ifdef STRATA_KVMEM
++        if (o.memory.budget && name == "inkling2_loop" && o.batch && o.graphs) {
++            // Recordings from the single-sequence decode layout are unsafe across managed slot switches.
++            Options concurrent = o;
++            concurrent.graphs = false;
++            std::fprintf(stderr, "strata-poly: CUDA Graph disabled for managed Inkling batch slots\n");
++            engine->load(concurrent);
++            return engine;
++        }
++#endif
+         engine->load(o);
+         return engine;
+     }
+@@ -7608,14 +7618,48 @@ int Engine::step_rows_alone() const { return std::min(rows_, kStageRows - 1); }
+ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* guesses) {
+     // step_picks() asks this step only: taken first, so a step that throws (KvFull below) leaves no ask for the next
+     const bool picks = std::exchange(step_picks_, false) && d_picks_;
++    if (n < 1 || n > std::min(rows_, sequences())) throw std::logic_error("step takes 1 to sequences() tokens");
++    if (guesses && !steps_guesses()) throw std::logic_error("step: guesses need --batch-mtp, a draft block and one card");
++    if (!step_seqs_.empty()) throw std::logic_error("step: the rows of the step before are not kept yet (keep_step())");
++    for (int i = 0; i < n; ++i)
++        if (seqs[i] < 0 || seqs[i] >= sequences() || std::count(seqs, seqs + i, seqs[i]))
++            throw std::logic_error("step: no such sequence, or one twice");
++#ifdef STRATA_KVMEM
++    if (memory_ready_ && dynamic_cast<Inkling2*>(this)) {
++        // Inkling's fused rows use one page map. Bind the sequence before computing each token with its
++        // own compact pages, original positions, convolution state and per-token capture buffers.
++        OnCard here(device_, split_);
++        const int home = bound_;
++        std::vector<Likeliest> chosen(picks ? (size_t) n : 0);
++        try {
++            for (int i = 0; i < n; ++i) {
++                hold(seqs[i]);
++                if (pos_ >= opt_.max_context)
++                    throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
++                memory_->before(1);
++                cover(cache_position() + 1);
++            }
++            for (int i = 0; i < n; ++i) {
++                hold(seqs[i]);
++                if (picks) eval_picks();
++                eval(tokens + i, 1, true);
++                if (picks) chosen[(size_t) i] = h_picks_[0];
++                else std::copy_n(h_logits_, n_vocab_, h_wlogits_ + (size_t) i * n_vocab_);
++            }
++        } catch (...) {
++            hold(home);
++            throw;
++        }
++        if (picks) std::copy(chosen.begin(), chosen.end(), h_picks_);
++        hold(home);
++        return;
++    }
++#endif
+     ++step_no_;   // (step_replay()'s clock)
+     struct InStep {
+         bool& on;
+         ~InStep() { on = false; }
+     } in_step{in_step_ = true};
+-    if (n < 1 || n > std::min(rows_, sequences())) throw std::logic_error("step takes 1 to sequences() tokens");
+-    if (guesses && !steps_guesses()) throw std::logic_error("step: guesses need --batch-mtp, a draft block and one card");
+-    if (!step_seqs_.empty()) throw std::logic_error("step: the rows of the step before are not kept yet (keep_step())");
+     OnCard here(device_, split_);
+     end_read();
+     const int home = bound_;
+@@ -7626,8 +7670,6 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t*
+     std::vector<int64_t> at;
+     std::vector<float*> rsnap;
+     for (int i = 0; i < n; ++i) {
+-        if (seqs[i] < 0 || seqs[i] >= sequences() || std::count(seqs, seqs + i, seqs[i]))
+-            throw std::logic_error("step: no such sequence, or one twice");
+         use(seqs[i]);
+         const int m = guesses && guesses[i] >= 0 ? 2 : 1;
+         if (pos_ + m > opt_.max_context)
+diff --git a/engine/src/poly/inkling2.cpp b/engine/src/poly/inkling2.cpp
+index bc829f83984d9b08cc7a9a99867908809f493245..b0fdae4a52e192e3b956bc18b6d70bdb6687c375 100644
+--- a/engine/src/poly/inkling2.cpp
++++ b/engine/src/poly/inkling2.cpp
+@@ -134,7 +134,10 @@ void Inkling2::load_geometry() {
+     // the _rows kernels are the fused q/k/v and clips kernels HIP does not run (inkling2.cu: clips_apart())
+     one_sequence(false, "on AMD");
+ #endif
+-    one_sequence(opt_.draft_model.empty(), "with --draft-model");
++#ifdef STRATA_KVMEM
++    if (!opt_.memory.budget)
++#endif
++        one_sequence(opt_.draft_model.empty(), "with --draft-model");
+     // On several cards (--layer-split) a card runs a run of the layers, and the loop's (core_start_ to core_end_ - 1)
+     // are on one card: next_layer() runs them again for a later pass.  Engine::open() starts no card inside them.
+     // The drafter stays on one card: its features are three layer runs' inputs, which may be another card's.
+@@ -404,6 +407,8 @@ void Inkling2::ds_load() {
+ #else
+     constexpr bool bounded = false;
+ #endif
++    ds_sequences_.resize(size_t(opt_.batch) + 1);
++    for (DsSequence& sequence : ds_sequences_) sequence.layers.resize(ds_.size());
+     for (size_t l = 0; l < ds_.size(); ++l) {
+         DsLayer& L = ds_[l];
+         const std::string b = "blk." + std::to_string(l) + ".";
+@@ -424,11 +429,14 @@ void Inkling2::ds_load() {
+         L.k_ctx_norm = f32(b + "attn_k_ctx_norm.weight", (uint64_t) head_dim_);
+         // Keep room for provisional rows without overwriting any committed row the drafter may attend to.
+         L.cap = (L.swa ? int64_t(ds_window_) : history) + kDsCacheSlack;
+-        L.keys = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
+-        L.vals = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
+-        if (L.swa || bounded) {   // a resumed conversation may find later positions in the ring
+-            L.tags = (long long*) dmalloc((size_t) L.cap * sizeof(long long), "the drafter's caches");
+-            ck(cudaMemset(L.tags, 0xff, (size_t) L.cap * sizeof(long long)), "the drafter's caches");
++        for (DsSequence& sequence : ds_sequences_) {
++            DsCache& cache = sequence.layers[l];
++            cache.keys = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
++            cache.vals = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
++            if (L.swa || bounded) {
++                cache.tags = (long long*) dmalloc((size_t) L.cap * sizeof(long long), "the drafter's caches");
++                ck(cudaMemset(cache.tags, 0xff, (size_t) L.cap * sizeof(long long)), "the drafter's caches");
++            }
+         }
+     }
+     if (bounded)
+@@ -488,7 +496,8 @@ void Inkling2::ds_load() {
+     }
+     ds_fold_ = Dev{dmalloc(V * (R / 32) * 34, "the drafter"), 8u, (int) R, (int) V};
+     ds_fold_b_ = (float*) dmalloc(V * 4, "the drafter");
+-    ds_ring_ = (float*) dmalloc((size_t) kDsRing * E * 4, "the drafter");
++    for (DsSequence& sequence : ds_sequences_)
++        sequence.ring = (float*) dmalloc((size_t) kDsRing * E * 4, "the drafter");
+     ds_prev_ = (int32_t*) dmalloc(64, "the drafter");
+     ds_pick_ = (Likeliest*) dmalloc((size_t) ds_block_ * sizeof(Likeliest), "the drafter");
+     ds_at_ = (long long*) dmalloc((2 * kDsRows + 1) * sizeof(long long), "the drafter");
+@@ -562,12 +571,14 @@ void Inkling2::ds_commit(int n) {
+     for (int l = 0; l < 3; ++l) m.norm[l] = ds_[(size_t) l].dflare;
+     m.norm[3] = ds_mnorm_;
+     m.out = ds_mix_;
+-    m.ring = ds_ring_;
++    const DsSequence& sequence = ds_sequence();
++    m.ring = sequence.ring;
+     m.ring_rows = kDsRing;
+     m.pos = p;
+     ds_mix(m, n_embd_, n, ds_eps_, st_);
+     for (size_t l = 0; l < ds_.size(); ++l) {
+         DsLayer& L = ds_[l];
++        const DsCache& cache = sequence.layers[l];
+         lin(L.k_ctx, ds_mix_ + l * (size_t) n * E, ds_k_, n);
+         lin(L.v_ctx, ds_mix_ + l * (size_t) n * E, ds_v_, n);
+ #ifdef STRATA_KVMEM
+@@ -578,12 +589,12 @@ void Inkling2::ds_commit(int n) {
+                 const int rows = std::min(n - first, int(L.cap));
+                 const DsPos chunk{p.at ? p.at + 2 * first : nullptr, p.pos0 + first};
+                 ds_rope(ds_k_ + first * cells, n_kv_, rows, L.k_ctx_norm, ds_eps_, ds_theta_, chunk,
+-                        L.keys, L.cap, ds_v_ + first * cells, L.vals, st_, L.tags);
++                        cache.keys, L.cap, ds_v_ + first * cells, cache.vals, st_, cache.tags);
+             }
+             continue;
+         }
+ #endif
+-        ds_rope(ds_k_, n_kv_, n, L.k_ctx_norm, ds_eps_, ds_theta_, p, L.keys, L.cap, ds_v_, L.vals, st_, L.tags);
++        ds_rope(ds_k_, n_kv_, n, L.k_ctx_norm, ds_eps_, ds_theta_, p, cache.keys, L.cap, ds_v_, cache.vals, st_, cache.tags);
+     }
+ }
+ 
+@@ -597,8 +608,9 @@ void Inkling2::guess_block(int32_t token) {
+     if (!ds_file_ || nb < 2 || pos_ < 1) return;
+ #ifdef STRATA_KVMEM
+     // A target checkpoint has no DSpark features. Wait for the first fresh feature row.
+-    if (memory_ && pos_ <= ds_context_begin_) return;
+-    const bool full_draft_context = !memory_ || ds_context_begin_ == 0;
++    const int64_t context_begin = ds_sequence().context_begin;
++    if (memory_ && pos_ <= context_begin) return;
++    const bool full_draft_context = !memory_ || context_begin == 0;
+ #else
+     constexpr bool full_draft_context = true;
+ #endif
+@@ -645,26 +657,29 @@ void Inkling2::ds_block(int nb) {
+     ck(cudaMemcpyAsync(ds_y_, h_ds_row_, E * 4, cudaMemcpyHostToDevice, cs(st_)), "the drafter");
+     rms_norm(ds_y_, fp(tok_norm_), ds_x_, n_embd_, 1, rms_eps_, st_);
+     const DsPos p{ds_at_, 0};
+-    ds_block_in(ds_x_, ds_mask_, n_embd_, nb, p, ds_at_ + 2 * kDsRows, ds_state_, ds_rank_, ds_prev_, ds_ring_,
++    const DsSequence& sequence = ds_sequence();
++    ds_block_in(ds_x_, ds_mask_, n_embd_, nb, p, ds_at_ + 2 * kDsRows, ds_state_, ds_rank_, ds_prev_, sequence.ring,
+                 kDsRing, ds_frc_, st_);
+     const float scale = 1.f / std::sqrt((float) head_dim_);
+-    for (DsLayer& L : ds_) {
++    for (size_t l = 0; l < ds_.size(); ++l) {
++        const DsLayer& L = ds_[l];
++        const DsCache& cache = sequence.layers[l];
+         rms_norm(ds_x_, L.attn_norm, ds_y_, n_embd_, nb, ds_eps_, st_);
+         kernels::native_quantize_q8_1(ds_y_, ds_yq_, n_embd_ * nb, 1, st_);
+         lin(L.wq, ds_y_, ds_q_, nb, ds_yq_);
+         lin_pair(L.wk, L.wv, ds_y_, ds_k_, ds_v_, nb, ds_yq_);
+         ds_rope(ds_q_, n_head_, nb, L.q_norm, ds_eps_, ds_theta_, p, nullptr, 0, nullptr, nullptr, st_);
+-        ds_rope(ds_k_, n_kv_, nb, L.k_norm, ds_eps_, ds_theta_, p, L.keys, L.cap, ds_v_, L.vals, st_, L.tags);
++        ds_rope(ds_k_, n_kv_, nb, L.k_norm, ds_eps_, ds_theta_, p, cache.keys, L.cap, ds_v_, cache.vals, st_, cache.tags);
+         // a window layer's context is the window before the block, a full one's every position; and the block
+         int window = L.swa ? ds_window_ : 0;
+-        if (!L.swa && L.tags) window = int(L.cap - kDsCacheSlack);
++        if (!L.swa && cache.tags) window = int(L.cap - kDsCacheSlack);
+ #ifdef STRATA_KVMEM
+-        if (memory_ && ds_context_begin_ != 0) {
+-            const int fresh = int(pos_ - ds_context_begin_);
++        if (memory_ && sequence.context_begin != 0) {
++            const int fresh = int(pos_ - sequence.context_begin);
+             window = std::min(window, fresh);
+         }
+ #endif
+-        ds_attend(ds_q_, L.keys, L.vals, L.tags, L.cap, p, window, nb, n_head_, n_kv_, scale,
++        ds_attend(ds_q_, cache.keys, cache.vals, cache.tags, L.cap, p, window, nb, n_head_, n_kv_, scale,
+                   ds_part_, ds_att_, st_);
+         lin(L.wo, ds_att_, ds_y_, nb);
+         axpy(ds_y_, 1.f, ds_x_, nb * n_embd_, true, st_);
+@@ -875,7 +890,7 @@ void Inkling2::init_memory() {
+ }
+ 
+ void Inkling2::clear_memory_capture() {
+-    if (pos_ == 0) ds_context_begin_ = 0;
++    if (pos_ == 0 && !ds_sequences_.empty()) ds_sequence().context_begin = 0;
+     memory_capture_staged_ = false;
+     const size_t sums = size_t(memory_planes_) * (size_t(memory_groups_) * n_kv_ + n_head_) * head_dim_;
+     ck(cudaMemsetAsync(memory_sums_, 0, sums*sizeof(float), cs(st_)), "clear Inkling statistics");
+@@ -1071,7 +1086,7 @@ void Inkling2::assign_scratch() {
+         ds_latq_ = bytes(kernels::native_q8_1_bytes(ds_rank_));
+         ds_approx_ = fbuf(B * (size_t) ds_screen_rows(n_unpadded_));
+         ds_hscr_ = (float*) bytes(ds_screen_scratch_bytes(n_unpadded_));
+-        if (!ds_ring_ && scratch_) ds_load();
++        if (ds_sequences_.empty() && scratch_) ds_load();
+     }
+     if (!side_) {
+         cudaStream_t s = nullptr;
+@@ -2047,7 +2062,7 @@ void Inkling2::save_slots(int il, int pass, int64_t pos, uint8_t* dst) {
+ 
+ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
+ #ifdef STRATA_KVMEM
+-    if (memory_ && ds_file_) ds_context_begin_ = pos;
++    if (memory_ && !ds_sequences_.empty()) ds_sequence().context_begin = pos;
+ #endif
+     const size_t row = kv_row();
+     for (const Slot& s : slots_) {
+diff --git a/engine/src/poly/inkling2.hpp b/engine/src/poly/inkling2.hpp
+index b0e3fbc322ba1d5f5453e33ba7a44a3a0b3f7c46..99a8d3f074b8592e9136d4b40b9d39942ca4a1ac 100644
+--- a/engine/src/poly/inkling2.hpp
++++ b/engine/src/poly/inkling2.hpp
+@@ -140,7 +140,6 @@ private:
+     float *memory_sums_ = nullptr, *memory_packed_ = nullptr, *memory_mass_ = nullptr;
+     float *h_memory_packed_ = nullptr, *h_memory_query_rows_ = nullptr, *h_memory_mass_ = nullptr;
+     float *memory_window_keys_ = nullptr, *h_memory_window_keys_ = nullptr;
+-    int64_t ds_context_begin_ = 0;
+     int memory_sample_count_ = 0;
+     bool memory_capture_staged_ = false;
+ #endif
+@@ -239,18 +238,27 @@ private:
+         const float *attn_norm = nullptr, *ffn_norm = nullptr, *dflare = nullptr, *q_norm = nullptr,
+                     *k_norm = nullptr, *k_ctx_norm = nullptr;
+         bool swa = false;
+-        uint16_t *keys = nullptr, *vals = nullptr;   ///< fp16, n_kv * head_dim a cell, position p at cell p % cap
+-        long long* tags = nullptr;   ///< a window layer's: the position each cell holds (-1: none)
+         int64_t cap = 0;
+     };
+-    static constexpr int kDsRing = 16;   ///< positions whose Markov-head context ds_ring_ keeps
++    struct DsCache {
++        uint16_t *keys = nullptr, *vals = nullptr;   ///< position p at cell p % cap
++        long long* tags = nullptr;                  ///< position each ring cell holds (-1: none)
++    };
++    struct DsSequence {
++        std::vector<DsCache> layers;
++        float* ring = nullptr;
++        int64_t context_begin = 0;
++    };
++    DsSequence& ds_sequence() { return ds_sequences_[size_t(bound())]; }
++    static constexpr int kDsRing = 16;   ///< positions whose Markov-head context the ring keeps
+     static constexpr int kDsRows = 8;    ///< a block's rows at most
+     std::unique_ptr<Shards> ds_file_;
+     std::vector<DsLayer> ds_;
++    std::vector<DsSequence> ds_sequences_;
+     int ds_block_ = 0, ds_window_ = 0, ds_ff_ = 0, ds_rank_ = 0, ds_visit_[3] = {};
+     float ds_theta_ = 0, ds_eps_ = 0, ds_cap_ = 0;
+     float *ds_alpha_ = nullptr, *ds_mask_ = nullptr, *ds_norm_ = nullptr, *ds_mnorm_ = nullptr, *ds_jb_ = nullptr,
+-          *ds_ob_ = nullptr, *ds_wt_ = nullptr, *ds_fold_b_ = nullptr, *ds_ring_ = nullptr, *h_ds_row_ = nullptr;
++          *ds_ob_ = nullptr, *ds_wt_ = nullptr, *ds_fold_b_ = nullptr, *h_ds_row_ = nullptr;
+     uint16_t* ds_w1_ = nullptr;   ///< the Markov head's token rows, BF16 [vocabulary][rank]
+     Dev ds_wsp_, ds_wh_, ds_wf_, ds_fold_;
+     // the screen of the pick (ds_screen()): 2-bit copies of the output matrix's rows and the fold's, where the output
+diff --git a/engine/src/poly/main.cpp b/engine/src/poly/main.cpp
+index 8b5324f5bc2967049e41250e05aec304a2676ba8..3217a11d01e28784847b7e8d8cf0805d213cd33d 100644
+--- a/engine/src/poly/main.cpp
++++ b/engine/src/poly/main.cpp
+@@ -8,6 +8,7 @@
+ #include "conversations.hpp"
+ #include "engine.hpp"
+ #ifdef STRATA_KVMEM
++#include "inkling2.hpp"
+ #include "kvmem/launch_contract.hpp"
+ #include "kvmem_history.hpp"
+ #include "kvmem_sessions.hpp"
+@@ -971,6 +972,7 @@ struct Slot {
+     std::vector<float> first;       // a prompt read ahead (BCO), all of it: the logits its first token is picked from
+ #ifdef STRATA_KVMEM
+     strata::poly::KvmemHistory managed_history;
++    long long drafts_offered = 0, drafts_accepted = 0;
+ #endif
+     Clock::time_point t0;
+ };
+@@ -1197,6 +1199,12 @@ bool session_file(Session& ss, bool save, const std::string& name, bool batch) {
+ int serve(Session& ss) {
+     Engine& engine = ss.engine;
+     std::vector<Slot> slots((size_t) engine.sequences() - 1);
++#ifdef STRATA_KVMEM
++    const bool inkling_slots = engine.kvmem_enabled() && dynamic_cast<strata::poly::Inkling2*>(&engine);
++    const bool dspark_slots = inkling_slots && !slots.empty() && engine.memory_options().mtp && drafting_enabled(engine);
++#else
++    constexpr bool inkling_slots = false;
++#endif
+     if (!ss.pinned.empty()) {
+         // A file that cannot be used is named and the engine starts without it: the first request that brings the
+         // prompt reads it then.
+@@ -1218,7 +1226,7 @@ int serve(Session& ss) {
+         const auto& m = engine.memory_options();
+         std::fprintf(stderr,"KVMEM_BLOCKS block_tokens=%u\n",m.block_tokens);
+         std::printf("INFO backend=polystrata kvmem=1 kvmem_budget=%u kvmem_reserve=%u kvmem_host_mib=%llu "
+-                    "kvmem_block_tokens=%u kv_type=%s history_reuse=%d history_scope=%s kvmem_sessions=%u mtp=%d mtp_drafts=%d vision=%d ssd=%d kvmem_disk_mib=%llu query_scorer=%s graph_alpha=%.6g query_max_tokens=%u query_replay_max_tokens=%u batch_mtp=0 slot_cache=1 storage_scope=process gpu_scope=single\n",
++                    "kvmem_block_tokens=%u kv_type=%s history_reuse=%d history_scope=%s kvmem_sessions=%u mtp=%d mtp_drafts=%d vision=%d ssd=%d kvmem_disk_mib=%llu query_scorer=%s graph_alpha=%.6g query_max_tokens=%u query_replay_max_tokens=%u batch_mtp=%d slot_cache=1 storage_scope=process gpu_scope=single\n",
+                     m.budget, m.reserve, (unsigned long long)m.host_mib,m.block_tokens,
+                     engine.int8k() ? "int8k" : engine.int8() ? "int8" :
+                     engine.kv_format() == int(KvFmt::kFp8) ? "fp8" :
+@@ -1226,7 +1234,7 @@ int serve(Session& ss) {
+                     m.sessions > 1 ? "prefix_pool" : "current", m.sessions, int(m.mtp && drafting_enabled(engine)),
+                     m.mtp ? engine.max_window()-1 : 0,
+                     int(engine.sees()), int(m.disk_mib>0),(unsigned long long)m.disk_mib,
+-                    kvmem::query_scorer_name(m.scorer),m.graph_alpha,m.query_max_tokens,m.replay_max_tokens);
++                    kvmem::query_scorer_name(m.scorer),m.graph_alpha,m.query_max_tokens,m.replay_max_tokens,int(dspark_slots));
+     }
+ #endif
+     std::printf("READY %d stop\n", engine.max_context());
+@@ -1249,6 +1257,102 @@ int serve(Session& ss) {
+     std::vector<int> seqs, kept, row_of;
+     std::vector<int32_t> feed, guess, picked;
+     std::vector<size_t> which;
++    // Only committed inputs are in held and in the retained checkpoint. The last emitted token is still pending.
++    const auto finish_slot = [&](size_t b, const char* finish) {
++        Slot& sl = slots[b];
++        std::printf("BDONE %zu %lld %s %.1f", b, sl.produced, finish, ms_since(sl.t0));
++#ifdef STRATA_KVMEM
++        if (dspark_slots) std::printf(" drafts=%lld:%lld", sl.drafts_offered, sl.drafts_accepted);
++#endif
++        std::printf("\n");
++        sl.active = false;
++#ifdef STRATA_KVMEM
++        if (engine.kvmem_enabled() && engine.memory_options().history_reuse) {
++            engine.bind(int(b) + 1);
++            try {
++                const auto stamp = engine.memory().stamp();
++                auto checkpoint = ss.managed_sessions.admit_history(stamp.valid ?
++                    std::min<uint64_t>(stamp.frontier, sl.managed_history.size()) : 0) ?
++                    ss.managed_sessions.checkpoint(engine.memory(), sl.managed_history, sl.held.size(), false) : nullptr;
++                if (checkpoint) {
++                    sl.managed_history.remember(checkpoint);
++                    auto entry = std::make_unique<strata::poly::KvmemSessions::Entry>();
++                    entry->history = std::move(sl.managed_history);
++                    entry->memory = engine.memory().park(*checkpoint);
++                    ss.managed_sessions.save(std::move(entry));
++                } else sl.managed_history.clear();
++            } catch (const std::exception& e) {
++                engine.memory().invalidate();
++                sl.managed_history.clear();
++                std::fprintf(stderr, "KVMEM_BATCH retain failed slot=%zu: %s\n", b, e.what());
++            }
++            sl.held.clear();
++        }
++#endif
++    };
++    const auto finish_reason = [&](const Slot& sl, int32_t token, long long produced) -> const char* {
++        if (ss.is_eos(token)) return "stop";
++        if (sl.stop) return "cancel";
++        if (produced >= sl.max_new || (long long) sl.held.size() + 2 > engine.max_context()) return "length";
++        return nullptr;
++    };
++    const auto emit = [&](size_t b, int32_t token) {
++        Slot& sl = slots[b];
++        ++sl.produced;
++        std::printf("BT %zu %d\n", b, (int) token);
++        const char* finish = finish_reason(sl, token, sl.produced);
++        if (finish) finish_slot(b, finish);
++        return finish == nullptr;
++    };
++#ifdef STRATA_KVMEM
++    const auto dspark_step = [&](size_t b) {
++        Slot& sl = slots[b];
++        engine.bind(int(b) + 1);
++        const auto pick = [&](const float* logits) {
++            return (int32_t) samplers[b].pick(logits, engine.n_vocab(), sl.s, sl.held, sl.rng);
++        };
++        std::array<int32_t, strata::spec::DraftPolicy::kMaxT> window;
++        window[0] = sl.next;
++        int rows = 1;
++        if (!sl.stop) {
++            const int limit = int(std::min<long long>({engine.max_window(), (long long) window.size(),
++                sl.max_new - sl.produced, engine.max_context() - engine.pos() - 1}));
++            for (; rows < limit; ++rows) {
++                float probability = 0.f;
++                window[rows] = engine.draft(window[rows - 1], rows - 1, &probability);
++                if (!(probability > 0.f)) break;
++            }
++        }
++        int committed = 1;
++        if (rows == 1) {
++            engine.eval(window.data(), 1, true);
++            sl.held.push_back(window[0]);
++            sl.next = pick(engine.logits());
++            sl.held.pop_back();
++        } else {
++            engine.window(window.data(), rows);
++            const size_t held = sl.held.size();
++            sl.held.push_back(window[0]);
++            sl.next = pick(engine.logits_of(0));
++            while (committed < rows && sl.next == window[committed]) {
++                ++sl.drafts_accepted;
++                if (finish_reason(sl, sl.next, sl.produced + committed)) break;
++                sl.held.push_back(sl.next);
++                sl.next = pick(engine.logits_of(committed++));
++            }
++            sl.held.resize(held);
++            engine.keep(committed);
++            sl.drafts_offered += rows - 1;
++        }
++        if (engine.memory_options().history_reuse)
++            sl.managed_history.append(window.data(), size_t(committed));
++        for (int i = 0; i < committed; ++i) {
++            sl.held.push_back(window[i]);
++            if (i != 0) emit(b, window[i]);
++        }
++        emit(b, sl.next);
++    };
++#endif
+     const auto step = [&] {
+         seqs.clear();
+         feed.clear();
+@@ -1275,6 +1379,26 @@ int serve(Session& ss) {
+                 which.push_back(b);
+             }
+         if(seqs.empty()) {engine.bind(0);std::fflush(stdout);return true;}
++#ifdef STRATA_KVMEM
++        if (dspark_slots) {
++            for (size_t b : which) {
++                try {
++                    dspark_step(b);
++                } catch (const strata::poly::KvFull& e) {
++                    std::fprintf(stderr, "strata-poly: batch slot %zu: %s\n", b, e.what());
++                    finish_slot(b, "length");
++                } catch (const std::exception& e) {
++                    std::fprintf(stderr, "strata-poly: batch slot %zu: %s\n", b, e.what());
++                    std::printf("ERR %s\n", e.what());
++                    std::fflush(stdout);
++                    return false;
++                }
++            }
++            engine.bind(0);
++            std::fflush(stdout);
++            return true;
++        }
++#endif
+         // --batch-mtp: each slot's draft block guesses the token after its next one, and the step checks it
+         const bool guessing = engine.steps_guesses();
+         // every slot greedy with no penalty: the card picks, Sampler::pick()'s most_likely() to the token
+@@ -1352,46 +1476,12 @@ int serve(Session& ss) {
+ #ifdef STRATA_KVMEM
+             if(engine.kvmem_enabled() && engine.memory_options().history_reuse) sl.managed_history.append(&feed[i],1);
+ #endif
+-            // a token for the slot: false when its answer ends with it
+-            const auto emit = [&](int32_t t) {
+-                ++sl.produced;
+-                std::printf("BT %zu %d\n", which[i], (int) t);
+-                const char* fin = ss.is_eos(t) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+-                                : (long long) sl.held.size() + 2 > engine.max_context() ? "length" : nullptr;
+-                if (fin) {
+-                    std::printf("BDONE %zu %lld %s %.1f\n", which[i], sl.produced, fin, ms_since(sl.t0));
+-                    sl.active = false;
+-#ifdef STRATA_KVMEM
+-                    if(engine.kvmem_enabled() && engine.memory_options().history_reuse) {
+-                        engine.bind(int(which[i])+1);
+-                        try {
+-                            const auto stamp=engine.memory().stamp();
+-                            auto checkpoint=ss.managed_sessions.admit_history(stamp.valid ?
+-                                std::min<uint64_t>(stamp.frontier,sl.managed_history.size()) : 0) ?
+-                                ss.managed_sessions.checkpoint(engine.memory(), sl.managed_history, sl.held.size(), false) : nullptr;
+-                            if (checkpoint) {
+-                                sl.managed_history.remember(checkpoint);
+-                                auto entry=std::make_unique<strata::poly::KvmemSessions::Entry>();
+-                                entry->history=std::move(sl.managed_history);
+-                                entry->memory=engine.memory().park(*checkpoint);
+-                                ss.managed_sessions.save(std::move(entry));
+-                            } else sl.managed_history.clear();
+-                        } catch(const std::exception& e) {
+-                            engine.memory().invalidate();sl.managed_history.clear();
+-                            std::fprintf(stderr,"KVMEM_BATCH retain failed slot=%zu: %s\n",which[i],e.what());
+-                        }
+-                        sl.held.clear();
+-                    }
+-#endif
+-                }
+-                return fin == nullptr;
+-            };
+             int32_t t = picked[2 * i];
+-            if (emit(t) && picked[2 * i + 1] >= 0) {
++            if (emit(which[i], t) && picked[2 * i + 1] >= 0) {
+                 sl.held.push_back(t);
+                 kept[i] = 2;
+                 t = picked[2 * i + 1];
+-                emit(t);
++                emit(which[i], t);
+             }
+             sl.next = t;
+         }
+@@ -1488,7 +1578,7 @@ int serve(Session& ss) {
+         }
+         int to = -1;
+         for (const std::string& l : lines.take("BYIELD")) to = l.size() > 7 ? std::atoi(l.c_str() + 7) : -1;
+-        if (to >= 0 && to < (int) slots.size() && !slots[(size_t) to].active && (admit < 0 || to == admit) && text &&
++        if (!inkling_slots && to >= 0 && to < (int) slots.size() && !slots[(size_t) to].active && (admit < 0 || to == admit) && text &&
+             ids_n - at > (long long) engine.max_rows()) {
+             gives_to = to;
+             return false;
+@@ -1500,7 +1590,7 @@ int serve(Session& ss) {
+                 failed = true;
+                 throw std::runtime_error("a batch step failed");
+             }
+-        engine.bind(0);
++        engine.bind(inkling_slots && admit >= 0 ? admit + 1 : 0);
+         ss.piece_calls = writing() ? 1 : kPiece;
+         piece_t0 = Clock::now();
+         return true;
+@@ -1692,8 +1782,13 @@ int serve(Session& ss) {
+                 r.produced = 1;
+                 r.finish = ss.is_eos(first) ? "stop" : lines.stop.load() ? "cancel" : "length";
+             } else {
+-                engine.bind(0);
+-                from_slot(ids, cache_owner);
++                const bool read_in_slot = inkling_slots && admit >= 0;
++                engine.bind(read_in_slot ? admit + 1 : 0);
++#ifdef STRATA_KVMEM
++                if (read_in_slot) ss.managed_history = std::move(slots[(size_t) admit].managed_history);
++                else
++#endif
++                    from_slot(ids, cache_owner);
+                 // The BCO prompts of idle slots go with this read when it is text and they all fit in the read with
+                 // it.  A slot's sequence starts again for its prompt: what it held is gone (the server gave the slot
+                 // to them).
+@@ -1714,7 +1809,7 @@ int serve(Session& ss) {
+                     co_rows += (int64_t) c.ids.size() - 1;
+                     ss.co_read.push_back({c.slot + 1, c.ids.data(), (int) c.ids.size() - 1});
+                 }
+-                engine.bind(0);
++                engine.bind(read_in_slot ? admit + 1 : 0);
+                 ids_n = n;
+                 text = pictures.at.empty();
+                 ss.piece_calls = writing() ? 1 : kPiece;
+@@ -1834,7 +1929,7 @@ int serve(Session& ss) {
+             try {
+ #ifdef STRATA_KVMEM
+                 if(engine.kvmem_enabled()) {
+-                    engine.move_memory_seq(0,admit+1);
++                    if (!inkling_slots) engine.move_memory_seq(0,admit+1);
+                     sl.managed_history=std::move(ss.managed_history);
+                     sl.held=engine.memory_options().history_reuse?sl.managed_history.tokens():ids;
+                     ss.managed_history={};
+@@ -1861,6 +1956,7 @@ int serve(Session& ss) {
+             }
+             std::printf("BADM %d %d\n", admit, goes_on ? 1 : 0);
+             std::fflush(stdout);
++            if (inkling_slots) engine.bind(0);
+         }
+         // The BCO prompts read with this one: their last tokens in one step, so that each slot holds its whole prompt
+         // and the logits of its first token (Slot::first).  Each on its own in its BGEN took 14 ms of Qwen3.6 at
+@@ -2291,7 +2387,7 @@ int main(int argc, char** argv) {
+ #else
+         constexpr bool inkling2 = false;
+ #endif
+-        std::puts(kvmem::launch_capabilities("polystrata", inkling2, inkling2, inkling2).c_str());
++        std::puts(kvmem::launch_capabilities("polystrata", inkling2, inkling2, inkling2, inkling2, inkling2).c_str());
+         return 0;
+     }
+ #endif
+diff --git a/terminal/serve/server.py b/terminal/serve/server.py
+index 67d6c8f3d384d73b9dfc15c66d00012feb11f4a4..7099b19fab950dac1a44f7f18a972b00b9f9f0b6 100644
+--- a/terminal/serve/server.py
++++ b/terminal/serve/server.py
+@@ -786,6 +786,7 @@ class StrataEngine:
+     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
+     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
+     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
++    inkling_model = False                # set by the service from the model's tokenizer
+     turn_ids = frozenset()               # Service: the tokens that open a chat turn (turn_key()); survives restart()
+     # Service: the tokens the engine itself ends a reply on (its default --eos-ids); survives restart().  A slot request
+     # whose last token is one of them has its BDONE right behind it.  EOS_IDS is ChatML's: a Gemma reply ending at
+@@ -2123,11 +2124,16 @@ class StrataEngine:
+     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
+     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
+ 
++    @property
++    def pin_parallel_slots(self) -> bool:
++        # Keep the accepted compact view when another managed Inkling request arrives.
++        return self.inkling_model and (self.info or {}).get("kvmem") in (1, "1")
++
+     def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
+         """A request decoding in a slot that is alone now (no other slot busy, nobody waiting) goes back to the solo
+         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
+         slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
+-        if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
++        if (self.pin_parallel_slots or embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
+                 not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
+             return False
+         if self.slot_read and self._several_chats():        # its next turn is read in this slot: it stays
+@@ -2251,7 +2257,7 @@ class StrataEngine:
+                     lines_q, sq = self.lines, self.slot_q           # (it holds no slot of the engine before: nothing to lose)
+                 with self.slot_cv:
+                     alone = not any(self.slot_busy) and self.waiting == 0
+-                if alone and left > 1 and not (not embeddings and self._turn_in_slot(prompt)):
++                if not self.pin_parallel_slots and alone and left > 1 and not (not embeddings and self._turn_in_slot(prompt)):
+                     pf = self.pen_from_key(orig_len, len(prompt))
+                     head = f"GENI {left}{leg_keys()}{pf} {embeddings}" if embeddings else f"GEN {left}{leg_keys()}{pf}"
+                     self._last_done = None                  # (#879: this request's DONE decides below)
+@@ -2416,7 +2422,7 @@ class StrataEngine:
+ 
+                     def ask():        # as give_way above, for the slot this admission reads into
+                         nonlocal asked
+-                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
++                        if (not self.pin_parallel_slots and not asked and not embeddings and yields < self.YIELDS_MAX and
+                                 self._shorter_waiting(len(prompt))):
+                             self._send_for(born, f"BYIELD {slot}")
+                             asked = True
+@@ -4538,6 +4544,7 @@ class Service:
+         self.call_format = "glm" if pre in ("glm4", "glm5", "flint", "laguna") else "gemma" if pre == "gemma4" else \
+             "dsml" if pre in ("joyai-llm", "deepseek-v3") else "lfm2" if pre == "lfm2" else \
+             "inkling" if pre == "inkling2" else "function"
++        self.engine.inkling_model = self.call_format == "inkling"
+         self.text_open_ids = []
+         if self.call_format == "inkling":       # its replies are typed blocks, whatever its template says of tools
+             self.parser_cls = InklingOutputParser
+@@ -8683,7 +8690,7 @@ def make_handler(svc: Service):
+                                   "graph_alpha":float(info.get("graph_alpha",0)),
+                                   "query_max_tokens":int(info.get("query_max_tokens",512)),
+                                   "query_replay_max_tokens":int(info.get("query_replay_max_tokens",2048)),
+-                                  "batch_mtp":False,"solo_mtp":info.get("mtp") in (1,"1"),
++                                  "batch_mtp":info.get("batch_mtp") in (1,"1"),"solo_mtp":info.get("mtp") in (1,"1"),
+                                   "mtp": info.get("mtp") in (1,"1"), "mtp_drafts":int(info.get("mtp_drafts",0)),
+                                   "vision": svc.vision is not None, "ssd":info.get("ssd") in (1,"1"),
+                                   "disk_mib":int(info.get("kvmem_disk_mib",0)),

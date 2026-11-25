@@ -1023,15 +1023,33 @@ class Controller:
                     worker = self.worker_capabilities(parameters['Worker'], 'polystrata')
                 except (OSError, ValueError):
                     worker = {}
+                multi_session = max(parameters.get('Concurrency', 1), parameters.get('RetainedSessions', 1)) > 1
+                drafting = bool(parameters.get('DraftModel') or
+                                parameters.get('SpeculativeMode', 'none') != 'none' or
+                                parameters.get('DraftTokens') or parameters.get('MtpDrafts'))
+                if multi_session and worker.get('inkling2_multi_session') is not True:
+                    report.update(status='blocked', can_start=False)
+                    report['checks'].append({
+                        'code': 'inkling_multi_session_worker', 'layer': 'worker', 'status': 'error',
+                        'zh': '当前后端程序不支持 Inkling 多会话，请更新后端程序',
+                        'en': 'This worker does not support Inkling multi-session. Update the worker.',
+                    })
                 if worker.get('inkling2_dspark') is not True:
                     report['features']['mtp'] = 'unsupported'
-                    if parameters.get('SpeculativeMode', 'none') != 'none' or parameters.get('DraftModel'):
+                    if drafting:
                         report.update(status='blocked', can_start=False)
                         report['checks'].append({
                             'code': 'inkling_dspark_worker', 'layer': 'worker', 'status': 'error',
                             'zh': '当前后端程序不支持 KVMem Inkling dSpark',
                             'en': 'This worker does not support KVMem Inkling dSpark',
                         })
+                elif drafting and multi_session and worker.get('inkling2_dspark_batch') is not True:
+                    report.update(status='blocked', can_start=False)
+                    report['checks'].append({
+                        'code': 'inkling_dspark_batch_worker', 'layer': 'worker', 'status': 'error',
+                        'zh': '当前后端程序的 Inkling dSpark 只支持一个活跃请求和一个保留会话，请更新后端程序',
+                        'en': 'This worker only supports Inkling dSpark with one active request and one retained conversation. Update the worker.',
+                    })
                 if not supports_inkling_fp8(worker):
                     model['kv_types'].remove('fp8')
                     if parameters.get('KvType') == 'fp8':

@@ -109,10 +109,28 @@ if($PythonRuntime) {
 if($ValidationReport) { Copy-Item -LiteralPath $ValidationReport -Destination (Join-Path $out $(if($ComponentOnly){'provenance/polystrata-validation.json'}else{'provenance/validation.json'})) }
 if($ComponentOnly) { Write-Output "Added PolyStrata component: $out";return }
 Copy-Item -LiteralPath $ChatUiDir -Destination (Join-Path $out 'ui/dist') -Recurse
+$inklingConcurrency = 1
+$inklingRetained = 1
+$inklingDraft = $false
+$inklingDraftBatch = $false
+try {
+    $workerContract = & (Join-Path $out 'workers/polystrata/strata-poly.exe') --kvmem-capabilities 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $properties = ($workerContract | ConvertFrom-Json).PSObject.Properties
+        if ($properties['inkling2_multi_session'] -and $properties['inkling2_multi_session'].Value -eq $true) {
+            $inklingConcurrency = 8
+            $inklingRetained = 16
+        }
+        $inklingDraft = $properties['inkling2_dspark'] -and $properties['inkling2_dspark'].Value -eq $true
+        $inklingDraftBatch = $properties['inkling2_dspark_batch'] -and $properties['inkling2_dspark_batch'].Value -eq $true
+    }
+} catch {
+    # Older workers may not expose capabilities.
+}
 $manifest=@{backend='polystrata';architecture='qwen35moe';architectures=@('qwen35moe','gemma4','inkling2_loop');models_included=$false;offline_python_included=[bool]$PythonRuntime;
     source=(Get-Content -LiteralPath (Join-Path $root 'backends/versions.json') -Raw|ConvertFrom-Json).polystrata;
     capability_scope=@{gpu_count=1;kv=@('f16','q8_0','int8','int8k','fp8');max_concurrency=8;solo_mtp_drafts=@(0..3);batch_mtp=$false;
-        inkling2=@{platform='windows-cuda';kv=@('f16','fp8');max_concurrency=1;max_retained_sessions=1;vision=$false;speculative_decoding=$false}};
+        inkling2=@{platform='windows-cuda';kv=@('f16','fp8');max_concurrency=$inklingConcurrency;max_retained_sessions=$inklingRetained;vision=$false;speculative_decoding=$inklingDraft;batch_mtp=$inklingDraftBatch}};
     validation='provenance/validation.json records configurations actually qualified; packaging alone is not runtime qualification'}
 $manifest|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $out 'BUILD-INFO.json') -Encoding utf8
 $hashes=foreach($file in Get-ChildItem -LiteralPath $out -Recurse -File|Sort-Object FullName) { (Get-FileHash -LiteralPath $file.FullName).Hash.ToLowerInvariant()+'  '+$file.FullName.Substring($out.Length+1).Replace('\','/') }
