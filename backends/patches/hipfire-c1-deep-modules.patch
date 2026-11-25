@@ -10995,3 +10995,351 @@ index f7b8cc9436fc8bb806215405bf8836b056b0e95a..6ed1233888331fe10e7f60c32f45cfd6
      /// 期3 G3: distinct content groups retained in the prefix directory.
      pub content_groups: u64,
      /// Entries retired by the group-aware publication plan.
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+index 4418152275489d3950815fe3478ec5aafc823ce6..79208930e743a5420a984128c833cf5075a587d0 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+@@ -3749,6 +3749,43 @@ pub(super) fn enable_kvmem_taps(
+     Ok(())
+ }
+ 
++/// P5: the operator-facing ownership record. Pure so the legal matrix can be
++/// regression-tested without a GPU or a model load.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(super) struct KvMemOwnership {
++    pub head: &'static str,
++    pub dn: &'static str,
++}
++
++pub(super) fn kvmem_ownership_labels(
++    legacy: bool,
++    mtp_head: bool,
++    head_live: bool,
++    dn_host_mib: u64,
++    dn_idle: bool,
++    dn_disk: bool,
++) -> KvMemOwnership {
++    let head = if !mtp_head {
++        "private-resident"
++    } else if !legacy {
++        "aux-plane"
++    } else if head_live {
++        // P1b plane-only: the live head has no contiguous KV window; the
++        // 128-token row cache is a prefill/draft placeholder only.
++        "paged-plane"
++    } else {
++        "park-image"
++    };
++    let dn = match (dn_host_mib > 0, dn_idle, dn_disk) {
++        (false, _, _) => "private-resident",
++        (true, false, false) => "host-ring+live",
++        (true, true, false) => "host-ring+live+idle",
++        (true, false, true) => "host-ring+live+disk",
++        (true, true, true) => "host-ring+live+idle+disk",
++    };
++    KvMemOwnership { head, dn }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub(super) fn build_kvmem_controller(
+     cfg: &EngineConfig,
+@@ -3838,31 +3875,35 @@ pub(super) fn build_kvmem_controller(
+     };
+     let head_live = hipfire_config::developer_var("HIPFIRE_KVMEM_HEAD_LIVE")
+         .is_ok_and(|v| !matches!(v.trim(), "0" | "false" | "off"));
+-    let head_owner = if mtp_head {
+-        if legacy_config.is_none() {
+-            "aux-plane"
+-        } else if head_live {
+-            "live-bounded"
+-        } else {
+-            "park-image"
+-        }
+-    } else {
+-        "private-resident"
+-    };
+-    let dn_owner = if hipfire_config::developer_var("HIPFIRE_KVMEM_DN_HOST_MIB")
++    let dn_mib = hipfire_config::developer_var("HIPFIRE_KVMEM_DN_HOST_MIB")
+         .ok()
+         .and_then(|v| v.trim().parse::<u64>().ok())
+-        .unwrap_or(512)
+-        > 0
+-    {
+-        "host-ring+live"
+-    } else {
+-        "private-resident"
+-    };
++        .unwrap_or(512);
++    let dn_idle = options
++        .as_ref()
++        .and_then(|options| options.dn_idle)
++        .unwrap_or(false);
++    let dn_ring_dir = options
++        .as_ref()
++        .and_then(|options| options.dn_ring_dir.as_deref())
++        .is_some_and(|dir| !dir.trim().is_empty());
++    let dn_disk_mib = options
++        .as_ref()
++        .and_then(|options| options.dn_disk_mib)
++        .unwrap_or(if dn_ring_dir { 512 } else { 0 });
++    let owners = kvmem_ownership_labels(
++        legacy_config.is_some(),
++        mtp_head,
++        head_live,
++        dn_mib,
++        dn_idle,
++        dn_ring_dir || dn_disk_mib > 0,
++    );
+     eprintln!(
+         "[kvmem-ownership] strategy={ownership_strategy} trunk=managed \
+-         mtp_head={head_owner} dn_state={dn_owner} \
+-         dflash=checkpoint-image media_pins=mandatory vision_kv=none"
++         mtp_head={} dn_state={} \
++         dflash=checkpoint-image media_pins=mandatory vision_kv=none",
++        owners.head, owners.dn
+     );
+     Ok(Some(crate::kvmem_ctl::KvMemCtl::new_with_config(
+         n_slots,
+@@ -4037,7 +4078,7 @@ impl ModelRig {
+ 
+ #[cfg(test)]
+ mod kvmem_dflash_validation_tests {
+-    use super::kvmem_dflash_validation_error;
++    use super::{kvmem_dflash_validation_error, kvmem_ownership_labels};
+ 
+     /// 期4 rejection matrix (KVMem/nInfer integration pattern): unsupported
+     /// combinations are refused at load; everything outside the KVMem+DFlash
+@@ -4064,4 +4105,68 @@ mod kvmem_dflash_validation_tests {
+         let e = kvmem_dflash_validation_error(true, true, 0, 2).expect("must reject");
+         assert!(e.contains("single-slot"), "{e}");
+     }
++
++    /// P5 legal-combination matrix: the operator-facing labels are a pure
++    /// function of (strategy, MTP, head live, DN host ring, idle, disk). The
++    /// startup log prints these exact strings, so no GPU is needed to pin the
++    /// matrix and keep docs/log/tests in lockstep.
++    #[test]
++    fn ownership_labels_cover_the_strategy_matrix() {
++        assert_eq!(
++            kvmem_ownership_labels(false, false, false, 512, false, false),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "host-ring+live"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, true, false, 512, false, false),
++            super::KvMemOwnership {
++                head: "park-image",
++                dn: "host-ring+live"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, true, true, 512, false, false),
++            super::KvMemOwnership {
++                head: "paged-plane",
++                dn: "host-ring+live"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(false, true, false, 512, false, false),
++            super::KvMemOwnership {
++                head: "aux-plane",
++                dn: "host-ring+live"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, false, false, 0, false, false),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "private-resident"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, false, false, 512, true, true),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "host-ring+live+idle+disk"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, false, false, 512, false, true),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "host-ring+live+disk"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, false, false, 512, true, false),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "host-ring+live+idle"
++            }
++        );
++    }
+ }
+diff --git a/crates/hipfire-cli/src/fit/mod.rs b/crates/hipfire-cli/src/fit/mod.rs
+index 51c2e94b3c5343bd279d19b0f8c1846e062d153f..e4cc2a8c600899ee19f8dba5a3eb278979847f3d 100644
+--- a/crates/hipfire-cli/src/fit/mod.rs
++++ b/crates/hipfire-cli/src/fit/mod.rs
+@@ -528,6 +528,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
+     notes.extend(host_notes);
+     notes.push("Free memory is sampled without opening the GPU; HIP reports slightly less once a process opens it. Fit reserves no cards: device availability, locks and memory counters can change before the real load.".into());
+     notes.push("Admission assumes HIP VMM is available on native Linux ROCm; the loader still applies its platform refusal rules.".into());
++    notes.push(kvmem_fit_ledger_note());
+     let report = Report {
+         schema: "hipfire-fit-1",
+         hipfire: json!({"version": env!("HIPFIRE_BUILD_VERSION"), "commit": crate::BUILD_COMMIT}),
+@@ -1362,6 +1363,93 @@ fn safe_name(input: &str) -> String {
+ /// Error strings from the loader/network may carry a local path. The public
+ /// JSON contract intentionally contains only basenames, never home paths or
+ /// PCI addresses; scrub nested findings/notes as well as the explicit file.
++/// P5: pure formatter for the read-only KVMem ledger note. `fit` projects
++/// device residency from file headers; the host KV pool, MTP head plane, DN
++/// ring/idle images and media pins are owned by the serve engine and must not
++/// silently change the capacity math here.
++fn kvmem_fit_ledger_text(
++    kvmem_build: bool,
++    enabled: bool,
++    strategy: &str,
++    budget_tokens: u64,
++    host_mib: u64,
++    head_live: bool,
++    dn_mib: u64,
++    dn_idle: bool,
++    dn_disk: bool,
++) -> String {
++    format!(
++        "KVMem ledger ({}): configured={} strategy={} trunk=managed \
++         budget_tokens={} host={host_mib}MiB head_live={} dn_ring={dn_mib}MiB \
++         dn_idle={} dn_disk={}; fit projects device residency only and \
++         excludes host KV pool, MTP head plane, DN ring/idle images and media pins",
++        if kvmem_build {
++            "kvmem-build"
++        } else {
++            "stock-build"
++        },
++        if enabled { "on" } else { "off" },
++        strategy,
++        budget_tokens,
++        if head_live { "on" } else { "off" },
++        if dn_idle { "on" } else { "off" },
++        if dn_disk { "on" } else { "off" },
++    )
++}
++
++/// Read the installed process-start snapshot; never `std::env::var` and never
++/// mutate config. The same snapshot the daemon would use at serve time.
++fn kvmem_fit_ledger_note() -> String {
++    fn env_u64(name: &str, default: u64) -> u64 {
++        hipfire_config::developer_var(name)
++            .ok()
++            .and_then(|v| v.trim().parse::<u64>().ok())
++            .unwrap_or(default)
++    }
++    fn env_flag(name: &str) -> bool {
++        hipfire_config::developer_var(name).is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true"))
++    }
++
++    let resolved = hipfire_config::active_process_config().and_then(|p| p.kvmem.as_ref());
++    let enabled = resolved
++        .map(|c| c.enabled)
++        .unwrap_or_else(|| env_flag("HIPFIRE_KVMEM"));
++    let strategy_owned = hipfire_config::developer_var("HIPFIRE_KVMEM_RECALL_STRATEGY")
++        .ok()
++        .filter(|v| !v.trim().is_empty())
++        .unwrap_or_else(|| "legacy".to_owned());
++    let strategy = match resolved {
++        Some(c) => match c.recall_strategy {
++            hipfire_config::kvmem::RecallStrategy::Legacy => "legacy",
++        },
++        None => strategy_owned.as_str(),
++    };
++    let budget_tokens = resolved
++        .map(|c| c.budget_tokens as u64)
++        .unwrap_or_else(|| env_u64("HIPFIRE_KVMEM_BUDGET_TOKENS", 0));
++    let host_mib = resolved
++        .map(|c| c.host_bytes >> 20)
++        .unwrap_or_else(|| env_u64("HIPFIRE_KVMEM_HOST_BYTES", 0) >> 20);
++    let head_live = hipfire_config::developer_var("HIPFIRE_KVMEM_HEAD_LIVE")
++        .is_ok_and(|v| !matches!(v.trim(), "0" | "false" | "off"));
++    let dn_mib = env_u64("HIPFIRE_KVMEM_DN_HOST_MIB", 512);
++    let dn_idle = env_flag("HIPFIRE_KVMEM_DN_IDLE");
++    let dn_disk = env_u64("HIPFIRE_KVMEM_DN_DISK_MIB", 0) > 0
++        || hipfire_config::developer_var("HIPFIRE_KVMEM_DN_RING_DIR")
++            .is_ok_and(|v| !v.trim().is_empty());
++    kvmem_fit_ledger_text(
++        cfg!(feature = "kvmem"),
++        enabled,
++        strategy,
++        budget_tokens,
++        host_mib,
++        head_live,
++        dn_mib,
++        dn_idle,
++        dn_disk,
++    )
++}
++
+ fn json_report(report: &Report) -> Result<Value> {
+     let mut value = serde_json::to_value(report)?;
+     fn scrub_with_home(value: &mut Value, home: Option<&str>) {
+@@ -1936,6 +2024,16 @@ mod tests {
+     use super::*;
+     use clap::Parser;
+ 
++    #[test]
++    fn kvmem_ledger_note_is_a_read_only_accounting_note() {
++        let note = kvmem_fit_ledger_text(true, true, "legacy", 1024, 2048, true, 512, true, true);
++        assert!(note.starts_with("KVMem ledger (kvmem-build): configured=on strategy=legacy"));
++        assert!(note.contains("budget_tokens=1024 host=2048MiB head_live=on"));
++        assert!(note.contains("dn_ring=512MiB dn_idle=on dn_disk=on"));
++        assert!(note
++            .contains("excludes host KV pool, MTP head plane, DN ring/idle images and media pins"));
++    }
++
+     #[test]
+     fn unchecked_context_is_undetermined_and_advisory() {
+         let p = projection();
+diff --git a/docs/env-vars.md b/docs/env-vars.md
+index 0f4b632d948abbda75b9c3caf5d1200de8459afd..fbdd1f35f3f5992524fe0732e8c2a33d2856c64d 100644
+--- a/docs/env-vars.md
++++ b/docs/env-vars.md
+@@ -1109,6 +1109,7 @@ KVMem keeps a small per-slot paged KV pool and spills the rest to a host store;
+ | `HIPFIRE_KVMEM_LRFU` / `_LRFU_LAMBDA` / `_LRFU_TOP` | `0` / `0.5` / `0.9` | Decaying heavy-hitter history replaces the raw retrieval score (requires `retrieval`). |
+ | `HIPFIRE_KVMEM_BATCH_XFER` | `1` | Batched pinned-slab spill/restore; `0` is the per-page blocking path (byte-identical). |
+ | `HIPFIRE_KVMEM_GQA_DECODE` | `1` | Native q8 GQA decode kernel; `0` is the generic route. |
++| `HIPFIRE_KVMEM_HEAD_LIVE` | `0` (off) | Legacy MTP head: page the live head KV through the composite aux plane (128-token placeholder, no contiguous window). Requires `--spec mtp`; Layerwise already pages the head. |
+ | `HIPFIRE_KVMEM_HOST_BYTES` | 16 GiB | Host KV storage account (RAM tier). |
+ | `HIPFIRE_KVMEM_SPILL_DIR` / `HIPFIRE_KVMEM_SPILL_BYTES` | unset (RAM only) / 64 GiB | Disk spill tier directory and capacity (tiered storage instead of RAM-only). |
+ | `HIPFIRE_KVMEM_RECALL_STRATEGY` | `legacy` | `legacy` (global page policy, default) or `layerwise` (per-layer selection with import/checkpoint semantics; fail-closed rejects the global policy knobs). |
+@@ -1119,6 +1120,11 @@ KVMem keeps a small per-slot paged KV pool and spills the rest to a host store;
+ | `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | unset (`spread` opt-in) | `spread` enables the coverage-retention policy below; unset keeps every cataloged checkpoint. |
+ | `HIPFIRE_KVMEM_CHECKPOINT_COUNT` / `_MIB` / `_INTERVAL` / `_MIN_GAP` | `4` / `512` / `4096` / `0` | Retention caps for the spread policy: count, unique host bytes, frontier spacing, minimum gap. |
+ | `HIPFIRE_KVMEM_CONTENT_GROUPS` | `0` (off, 0..1024) | Internal content groups in the prefix directory; whole-group LRU retirement and dedup before entry trimming. |
++| `HIPFIRE_KVMEM_DN_HOST_MIB` | `512` (`0` disables) | Host-memory ring of page-aligned DeltaNet checkpoints; the fallback when the GPU checkpoint pool misses. |
++| `HIPFIRE_KVMEM_DN_RING_DIR` | unset | Explicit persistent DN ring directory (DNR1 files). Setting it defaults `DN_DISK_MIB` to 512. |
++| `HIPFIRE_KVMEM_DN_DISK_MIB` | `0` (or 512 with an explicit ring dir) | Disk mirror capacity for the DN ring. Without an explicit ring dir the files live in `<CACHE_DIR>/dn-ring`. |
++| `HIPFIRE_KVMEM_DN_IDLE` | `0` (off) | Whole-image DeltaNet demotion for idle sessions between turns; exact session/frontier/fingerprint restore. Active decode remains device-resident. |
++| `HIPFIRE_KVMEM_DN_GPU` | `1` | Developer knob: `0` skips GPU checkpoint-pool writes to force the host-ring restore path. |
+ | `HIPFIRE_KVMEM_CACHE_DIR` / `HIPFIRE_KVMEM_CACHE_BYTES` | unset / 2 GiB | Persistent content-pack tier (named `*.hkpack` files + DN sidecars). Must differ from `SPILL_DIR`; packs are the only persistent copy (single-tier). The byte cap covers packs **and** their `.dn` sidecars; LRU eviction removes the pair together. |
+ | `HIPFIRE_KVMEM_TRACE` / `_TRACE_PAGES` / `_TRACE_KEEP` | off | Per-step residency / picked-page / keep-set traces (diagnostics, zero effect on bytes). |
+ | `HIPFIRE_KVMEM_VERIFY` / `HIPFIRE_KVMEM_TIME` / `HIPFIRE_KVMEM_TAP_COPY` | off / off / `1` | Page checksums + block-table readback, per-step timing lines, and the tap-copy kill switch (timing only). |
+@@ -2265,11 +2271,17 @@ Presence in the inventory means the token appears in source; it does **not** mea
+ | `HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+ | `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+ | `HIPFIRE_KVMEM_CONTENT_GROUPS` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_DN_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
++| `HIPFIRE_KVMEM_DN_GPU` | crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
++| `HIPFIRE_KVMEM_DN_HOST_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs, crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
++| `HIPFIRE_KVMEM_DN_IDLE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
++| `HIPFIRE_KVMEM_DN_RING_DIR` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
+ | `HIPFIRE_KVMEM_GEN_RESERVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
+ | `HIPFIRE_KVMEM_GPU_HIGH` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
+ | `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
+ | `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
+ | `HIPFIRE_KVMEM_GQA_DECODE` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_KVMEM_HEAD_LIVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
+ | `HIPFIRE_KVMEM_HOST_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-config/src/kvmem.rs | developer |
+ | `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
+ | `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |

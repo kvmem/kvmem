@@ -41142,10 +41142,10 @@ index 000000000..6c729a80f
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 new file mode 100644
-index 000000000..441815227
+index 000000000..79208930e
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-@@ -0,0 +1,4067 @@
+@@ -0,0 +1,4172 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -44897,6 +44897,43 @@ index 000000000..441815227
 +    Ok(())
 +}
 +
++/// P5: the operator-facing ownership record. Pure so the legal matrix can be
++/// regression-tested without a GPU or a model load.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(super) struct KvMemOwnership {
++    pub head: &'static str,
++    pub dn: &'static str,
++}
++
++pub(super) fn kvmem_ownership_labels(
++    legacy: bool,
++    mtp_head: bool,
++    head_live: bool,
++    dn_host_mib: u64,
++    dn_idle: bool,
++    dn_disk: bool,
++) -> KvMemOwnership {
++    let head = if !mtp_head {
++        "private-resident"
++    } else if !legacy {
++        "aux-plane"
++    } else if head_live {
++        // P1b plane-only: the live head has no contiguous KV window; the
++        // 128-token row cache is a prefill/draft placeholder only.
++        "paged-plane"
++    } else {
++        "park-image"
++    };
++    let dn = match (dn_host_mib > 0, dn_idle, dn_disk) {
++        (false, _, _) => "private-resident",
++        (true, false, false) => "host-ring+live",
++        (true, true, false) => "host-ring+live+idle",
++        (true, false, true) => "host-ring+live+disk",
++        (true, true, true) => "host-ring+live+idle+disk",
++    };
++    KvMemOwnership { head, dn }
++}
++
 +#[allow(clippy::too_many_arguments)]
 +pub(super) fn build_kvmem_controller(
 +    cfg: &EngineConfig,
@@ -44986,31 +45023,35 @@ index 000000000..441815227
 +    };
 +    let head_live = hipfire_config::developer_var("HIPFIRE_KVMEM_HEAD_LIVE")
 +        .is_ok_and(|v| !matches!(v.trim(), "0" | "false" | "off"));
-+    let head_owner = if mtp_head {
-+        if legacy_config.is_none() {
-+            "aux-plane"
-+        } else if head_live {
-+            "live-bounded"
-+        } else {
-+            "park-image"
-+        }
-+    } else {
-+        "private-resident"
-+    };
-+    let dn_owner = if hipfire_config::developer_var("HIPFIRE_KVMEM_DN_HOST_MIB")
++    let dn_mib = hipfire_config::developer_var("HIPFIRE_KVMEM_DN_HOST_MIB")
 +        .ok()
 +        .and_then(|v| v.trim().parse::<u64>().ok())
-+        .unwrap_or(512)
-+        > 0
-+    {
-+        "host-ring+live"
-+    } else {
-+        "private-resident"
-+    };
++        .unwrap_or(512);
++    let dn_idle = options
++        .as_ref()
++        .and_then(|options| options.dn_idle)
++        .unwrap_or(false);
++    let dn_ring_dir = options
++        .as_ref()
++        .and_then(|options| options.dn_ring_dir.as_deref())
++        .is_some_and(|dir| !dir.trim().is_empty());
++    let dn_disk_mib = options
++        .as_ref()
++        .and_then(|options| options.dn_disk_mib)
++        .unwrap_or(if dn_ring_dir { 512 } else { 0 });
++    let owners = kvmem_ownership_labels(
++        legacy_config.is_some(),
++        mtp_head,
++        head_live,
++        dn_mib,
++        dn_idle,
++        dn_ring_dir || dn_disk_mib > 0,
++    );
 +    eprintln!(
 +        "[kvmem-ownership] strategy={ownership_strategy} trunk=managed \
-+         mtp_head={head_owner} dn_state={dn_owner} \
-+         dflash=checkpoint-image media_pins=mandatory vision_kv=none"
++         mtp_head={} dn_state={} \
++         dflash=checkpoint-image media_pins=mandatory vision_kv=none",
++        owners.head, owners.dn
 +    );
 +    Ok(Some(crate::kvmem_ctl::KvMemCtl::new_with_config(
 +        n_slots,
@@ -45185,7 +45226,7 @@ index 000000000..441815227
 +
 +#[cfg(test)]
 +mod kvmem_dflash_validation_tests {
-+    use super::kvmem_dflash_validation_error;
++    use super::{kvmem_dflash_validation_error, kvmem_ownership_labels};
 +
 +    /// 期4 rejection matrix (KVMem/nInfer integration pattern): unsupported
 +    /// combinations are refused at load; everything outside the KVMem+DFlash
@@ -45211,6 +45252,70 @@ index 000000000..441815227
 +    fn rejects_multi_slot_kvmem_dflash() {
 +        let e = kvmem_dflash_validation_error(true, true, 0, 2).expect("must reject");
 +        assert!(e.contains("single-slot"), "{e}");
++    }
++
++    /// P5 legal-combination matrix: the operator-facing labels are a pure
++    /// function of (strategy, MTP, head live, DN host ring, idle, disk). The
++    /// startup log prints these exact strings, so no GPU is needed to pin the
++    /// matrix and keep docs/log/tests in lockstep.
++    #[test]
++    fn ownership_labels_cover_the_strategy_matrix() {
++        assert_eq!(
++            kvmem_ownership_labels(false, false, false, 512, false, false),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "host-ring+live"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, true, false, 512, false, false),
++            super::KvMemOwnership {
++                head: "park-image",
++                dn: "host-ring+live"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, true, true, 512, false, false),
++            super::KvMemOwnership {
++                head: "paged-plane",
++                dn: "host-ring+live"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(false, true, false, 512, false, false),
++            super::KvMemOwnership {
++                head: "aux-plane",
++                dn: "host-ring+live"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, false, false, 0, false, false),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "private-resident"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, false, false, 512, true, true),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "host-ring+live+idle+disk"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, false, false, 512, false, true),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "host-ring+live+disk"
++            }
++        );
++        assert_eq!(
++            kvmem_ownership_labels(true, false, false, 512, true, false),
++            super::KvMemOwnership {
++                head: "private-resident",
++                dn: "host-ring+live+idle"
++            }
++        );
 +    }
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
@@ -47998,6 +48103,129 @@ index 384bd858d..2f31402ef 100644
          }
      }
  
+diff --git a/crates/hipfire-cli/src/fit/mod.rs b/crates/hipfire-cli/src/fit/mod.rs
+index 51c2e94b3..e4cc2a8c6 100644
+--- a/crates/hipfire-cli/src/fit/mod.rs
++++ b/crates/hipfire-cli/src/fit/mod.rs
+@@ -528,6 +528,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
+     notes.extend(host_notes);
+     notes.push("Free memory is sampled without opening the GPU; HIP reports slightly less once a process opens it. Fit reserves no cards: device availability, locks and memory counters can change before the real load.".into());
+     notes.push("Admission assumes HIP VMM is available on native Linux ROCm; the loader still applies its platform refusal rules.".into());
++    notes.push(kvmem_fit_ledger_note());
+     let report = Report {
+         schema: "hipfire-fit-1",
+         hipfire: json!({"version": env!("HIPFIRE_BUILD_VERSION"), "commit": crate::BUILD_COMMIT}),
+@@ -1362,6 +1363,93 @@ fn safe_name(input: &str) -> String {
+ /// Error strings from the loader/network may carry a local path. The public
+ /// JSON contract intentionally contains only basenames, never home paths or
+ /// PCI addresses; scrub nested findings/notes as well as the explicit file.
++/// P5: pure formatter for the read-only KVMem ledger note. `fit` projects
++/// device residency from file headers; the host KV pool, MTP head plane, DN
++/// ring/idle images and media pins are owned by the serve engine and must not
++/// silently change the capacity math here.
++fn kvmem_fit_ledger_text(
++    kvmem_build: bool,
++    enabled: bool,
++    strategy: &str,
++    budget_tokens: u64,
++    host_mib: u64,
++    head_live: bool,
++    dn_mib: u64,
++    dn_idle: bool,
++    dn_disk: bool,
++) -> String {
++    format!(
++        "KVMem ledger ({}): configured={} strategy={} trunk=managed \
++         budget_tokens={} host={host_mib}MiB head_live={} dn_ring={dn_mib}MiB \
++         dn_idle={} dn_disk={}; fit projects device residency only and \
++         excludes host KV pool, MTP head plane, DN ring/idle images and media pins",
++        if kvmem_build {
++            "kvmem-build"
++        } else {
++            "stock-build"
++        },
++        if enabled { "on" } else { "off" },
++        strategy,
++        budget_tokens,
++        if head_live { "on" } else { "off" },
++        if dn_idle { "on" } else { "off" },
++        if dn_disk { "on" } else { "off" },
++    )
++}
++
++/// Read the installed process-start snapshot; never `std::env::var` and never
++/// mutate config. The same snapshot the daemon would use at serve time.
++fn kvmem_fit_ledger_note() -> String {
++    fn env_u64(name: &str, default: u64) -> u64 {
++        hipfire_config::developer_var(name)
++            .ok()
++            .and_then(|v| v.trim().parse::<u64>().ok())
++            .unwrap_or(default)
++    }
++    fn env_flag(name: &str) -> bool {
++        hipfire_config::developer_var(name).is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true"))
++    }
++
++    let resolved = hipfire_config::active_process_config().and_then(|p| p.kvmem.as_ref());
++    let enabled = resolved
++        .map(|c| c.enabled)
++        .unwrap_or_else(|| env_flag("HIPFIRE_KVMEM"));
++    let strategy_owned = hipfire_config::developer_var("HIPFIRE_KVMEM_RECALL_STRATEGY")
++        .ok()
++        .filter(|v| !v.trim().is_empty())
++        .unwrap_or_else(|| "legacy".to_owned());
++    let strategy = match resolved {
++        Some(c) => match c.recall_strategy {
++            hipfire_config::kvmem::RecallStrategy::Legacy => "legacy",
++        },
++        None => strategy_owned.as_str(),
++    };
++    let budget_tokens = resolved
++        .map(|c| c.budget_tokens as u64)
++        .unwrap_or_else(|| env_u64("HIPFIRE_KVMEM_BUDGET_TOKENS", 0));
++    let host_mib = resolved
++        .map(|c| c.host_bytes >> 20)
++        .unwrap_or_else(|| env_u64("HIPFIRE_KVMEM_HOST_BYTES", 0) >> 20);
++    let head_live = hipfire_config::developer_var("HIPFIRE_KVMEM_HEAD_LIVE")
++        .is_ok_and(|v| !matches!(v.trim(), "0" | "false" | "off"));
++    let dn_mib = env_u64("HIPFIRE_KVMEM_DN_HOST_MIB", 512);
++    let dn_idle = env_flag("HIPFIRE_KVMEM_DN_IDLE");
++    let dn_disk = env_u64("HIPFIRE_KVMEM_DN_DISK_MIB", 0) > 0
++        || hipfire_config::developer_var("HIPFIRE_KVMEM_DN_RING_DIR")
++            .is_ok_and(|v| !v.trim().is_empty());
++    kvmem_fit_ledger_text(
++        cfg!(feature = "kvmem"),
++        enabled,
++        strategy,
++        budget_tokens,
++        host_mib,
++        head_live,
++        dn_mib,
++        dn_idle,
++        dn_disk,
++    )
++}
++
+ fn json_report(report: &Report) -> Result<Value> {
+     let mut value = serde_json::to_value(report)?;
+     fn scrub_with_home(value: &mut Value, home: Option<&str>) {
+@@ -1936,6 +2024,16 @@ mod tests {
+     use super::*;
+     use clap::Parser;
+ 
++    #[test]
++    fn kvmem_ledger_note_is_a_read_only_accounting_note() {
++        let note = kvmem_fit_ledger_text(true, true, "legacy", 1024, 2048, true, 512, true, true);
++        assert!(note.starts_with("KVMem ledger (kvmem-build): configured=on strategy=legacy"));
++        assert!(note.contains("budget_tokens=1024 host=2048MiB head_live=on"));
++        assert!(note.contains("dn_ring=512MiB dn_idle=on dn_disk=on"));
++        assert!(note
++            .contains("excludes host KV pool, MTP head plane, DN ring/idle images and media pins"));
++    }
++
+     #[test]
+     fn unchecked_context_is_undetermined_and_advisory() {
+         let p = projection();
 diff --git a/crates/hipfire-cli/src/main.rs b/crates/hipfire-cli/src/main.rs
 index c3da2cc31..f0882d646 100644
 --- a/crates/hipfire-cli/src/main.rs
@@ -74024,7 +74252,7 @@ index 4ed485e49..57d9def22 100644
  
  `/health` carries a `capabilities` object built once at startup from the
 diff --git a/docs/env-vars.md b/docs/env-vars.md
-index b0ba83804..0f4b632d9 100644
+index b0ba83804..fbdd1f35f 100644
 --- a/docs/env-vars.md
 +++ b/docs/env-vars.md
 @@ -3,7 +3,7 @@
@@ -74036,7 +74264,7 @@ index b0ba83804..0f4b632d9 100644
  
  For persistent user configuration, prefer `hipfire config set ...` and
  `~/.hipfire/config.toml`. Schema-declared environment variables are retained as
-@@ -1094,6 +1094,35 @@ All developer-only, read once at load through the `[developer]` namespace (`hipf
+@@ -1094,6 +1094,41 @@ All developer-only, read once at load through the `[developer]` namespace (`hipf
  | `HIPFIRE_RAON_SHARED_FFN` | **unset → `qt44`**; `q8f16`, `bf16` | Quantizer only (`crates/hipfire-quantize/src/raon.rs`): storage of the always-active FFN weights (shared-expert gate/up/down of every MoE layer and the dense layer-0 gate/up/down). `q8f16` stores them as Q8F16 (qt3, group 32), `bf16` as source-exact BF16 (qt16); neither carries an AWQ sidecar, and the shared `down_proj` keeps physical K 1280 (zero-padded columns) for both. Recorded as `hipfire_raon.shared_ffn` in the artifact metadata (`q8f16`/`bf16`, or `<storage>:shared` / `<storage>:shared-gateup` / `<storage>:dense` for a partial-scope swap). An unknown value is a conversion error. `hipfire-quantize --raon-shared-ffn <q8f16\|bf16> --input <shipped.hfq> --raon-source <checkpoint dir> --output <out.hfq>` builds the same variant from a shipped qt44 artifact without re-running calibration; `--raon-shared-ffn-scope <all\|shared\|shared-gateup\|dense>` (default `all`) restricts it to the MoE layers' shared experts (or only their gate/up weights) or to the dense layer-0 MLP, and `--raon-shared-ffn-verify` takes the same scope flag. |
  | `HIPFIRE_RAON_TOKENIZER` | unset → test skips | Test-only: HF `tokenizer.json` path (or its directory) for the `#[ignore]`d Raon tokenizer HF-parity check in `crates/hipfire-runtime/src/tokenizer.rs`; never read by runtime code. |
  
@@ -74055,6 +74283,7 @@ index b0ba83804..0f4b632d9 100644
 +| `HIPFIRE_KVMEM_LRFU` / `_LRFU_LAMBDA` / `_LRFU_TOP` | `0` / `0.5` / `0.9` | Decaying heavy-hitter history replaces the raw retrieval score (requires `retrieval`). |
 +| `HIPFIRE_KVMEM_BATCH_XFER` | `1` | Batched pinned-slab spill/restore; `0` is the per-page blocking path (byte-identical). |
 +| `HIPFIRE_KVMEM_GQA_DECODE` | `1` | Native q8 GQA decode kernel; `0` is the generic route. |
++| `HIPFIRE_KVMEM_HEAD_LIVE` | `0` (off) | Legacy MTP head: page the live head KV through the composite aux plane (128-token placeholder, no contiguous window). Requires `--spec mtp`; Layerwise already pages the head. |
 +| `HIPFIRE_KVMEM_HOST_BYTES` | 16 GiB | Host KV storage account (RAM tier). |
 +| `HIPFIRE_KVMEM_SPILL_DIR` / `HIPFIRE_KVMEM_SPILL_BYTES` | unset (RAM only) / 64 GiB | Disk spill tier directory and capacity (tiered storage instead of RAM-only). |
 +| `HIPFIRE_KVMEM_RECALL_STRATEGY` | `legacy` | `legacy` (global page policy, default) or `layerwise` (per-layer selection with import/checkpoint semantics; fail-closed rejects the global policy knobs). |
@@ -74065,6 +74294,11 @@ index b0ba83804..0f4b632d9 100644
 +| `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | unset (`spread` opt-in) | `spread` enables the coverage-retention policy below; unset keeps every cataloged checkpoint. |
 +| `HIPFIRE_KVMEM_CHECKPOINT_COUNT` / `_MIB` / `_INTERVAL` / `_MIN_GAP` | `4` / `512` / `4096` / `0` | Retention caps for the spread policy: count, unique host bytes, frontier spacing, minimum gap. |
 +| `HIPFIRE_KVMEM_CONTENT_GROUPS` | `0` (off, 0..1024) | Internal content groups in the prefix directory; whole-group LRU retirement and dedup before entry trimming. |
++| `HIPFIRE_KVMEM_DN_HOST_MIB` | `512` (`0` disables) | Host-memory ring of page-aligned DeltaNet checkpoints; the fallback when the GPU checkpoint pool misses. |
++| `HIPFIRE_KVMEM_DN_RING_DIR` | unset | Explicit persistent DN ring directory (DNR1 files). Setting it defaults `DN_DISK_MIB` to 512. |
++| `HIPFIRE_KVMEM_DN_DISK_MIB` | `0` (or 512 with an explicit ring dir) | Disk mirror capacity for the DN ring. Without an explicit ring dir the files live in `<CACHE_DIR>/dn-ring`. |
++| `HIPFIRE_KVMEM_DN_IDLE` | `0` (off) | Whole-image DeltaNet demotion for idle sessions between turns; exact session/frontier/fingerprint restore. Active decode remains device-resident. |
++| `HIPFIRE_KVMEM_DN_GPU` | `1` | Developer knob: `0` skips GPU checkpoint-pool writes to force the host-ring restore path. |
 +| `HIPFIRE_KVMEM_CACHE_DIR` / `HIPFIRE_KVMEM_CACHE_BYTES` | unset / 2 GiB | Persistent content-pack tier (named `*.hkpack` files + DN sidecars). Must differ from `SPILL_DIR`; packs are the only persistent copy (single-tier). The byte cap covers packs **and** their `.dn` sidecars; LRU eviction removes the pair together. |
 +| `HIPFIRE_KVMEM_TRACE` / `_TRACE_PAGES` / `_TRACE_KEEP` | off | Per-step residency / picked-page / keep-set traces (diagnostics, zero effect on bytes). |
 +| `HIPFIRE_KVMEM_VERIFY` / `HIPFIRE_KVMEM_TIME` / `HIPFIRE_KVMEM_TAP_COPY` | off / off / `1` | Page checksums + block-table readback, per-step timing lines, and the tap-copy kill switch (timing only). |
@@ -74072,7 +74306,7 @@ index b0ba83804..0f4b632d9 100644
  ## Manual — tokenizer differential test (dev-only, not runtime)
  
  Read only by `crates/hipfire-runtime/tests/hf_tokenizer_differential.rs` (see [`CONTRIBUTING.md`](../CONTRIBUTING.md#tokenizer-differential-test-hf-oracle)); the pure-Rust HF `tokenizers` oracle is a `[dev-dependencies]` entry and never ships.
-@@ -1232,7 +1261,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -1232,7 +1267,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  
  **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
  **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
@@ -74081,7 +74315,7 @@ index b0ba83804..0f4b632d9 100644
  
  | Variable | Example source path(s) | Lifecycle |
  |---|---|---|
-@@ -1760,9 +1789,17 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -1760,9 +1795,17 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_EP_UNIT_TAIL_PREFILL` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail_rank.rs | developer |
  | `HIPFIRE_EP_UNIT_TAIL_RETIRE_IDS` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
  | `HIPFIRE_EP_UNIT_TAIL_STAGE_GAP` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs, crates/hipfire-arch-qwen4/src/gpu_forward/slab_stage.rs | developer |
@@ -74099,7 +74333,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_F1LITE` | crates/hipfire-dispatch/src/pipeline/batched.rs, crates/rdna-compute/src/gemm.rs | developer |
  | `HIPFIRE_F1_REAL_MODEL` | crates/hipfire-runtime/tests/mq4_planar_real.rs | harness |
  | `HIPFIRE_FA2_A4_EPILOGUE` | crates/rdna-compute/src/kernels.rs | developer |
-@@ -1827,7 +1864,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -1827,7 +1870,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_FORCE_ANSWER_SECS` | scripts/test-qwen35-think-cap.sh | harness |
  | `HIPFIRE_FORCE_REBUILD` | crates/hipfire-cli/src/main.rs | developer |
  | `HIPFIRE_FORCE_UNFUSED` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
@@ -74108,7 +74342,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_FORWARD_ORACLE` | crates/hipfire-dispatch/src/pipeline/superop.rs | developer |
  | `HIPFIRE_FP16` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | stable |
  | `HIPFIRE_FP16_LAYER_MAX` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
-@@ -1886,7 +1923,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -1886,7 +1929,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_GATED_DELTA_VECTOR_PM` | crates/rdna-compute/src/gated_delta_vector_pm.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
  | `HIPFIRE_GATED_NORM_FP8_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
  | `HIPFIRE_GATED_NORM_FP8_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
@@ -74117,7 +74351,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
  | `HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
  | `HIPFIRE_GATED_NORM_WAVE_GROUP` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
-@@ -1905,7 +1942,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -1905,7 +1948,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_GDN_CHUNK_PM` | crates/rdna-compute/src/gated_delta_chunk_pm.rs, crates/rdna-compute/src/kernels.rs | developer |
  | `HIPFIRE_GDN_CHUNK_PREP_PM` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/pipeline/batched_deltanet.rs | developer |
  | `HIPFIRE_GDN_CHUNK_SIZE` | crates/rdna-compute/src/norm.rs | developer |
@@ -74126,7 +74360,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_GDN_COMPACT2_SHAPE` | crates/rdna-compute/src/norm.rs, crates/rdna-compute/src/rows_batched.rs | developer |
  | `HIPFIRE_GDN_COMPACT3` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
  | `HIPFIRE_GDN_DPP_REDUCE` | crates/rdna-compute/src/dflash_gdn_replay.rs, crates/rdna-compute/src/kernels.rs | developer |
-@@ -1975,7 +2012,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -1975,7 +2018,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_GFX1100_PM_BUNDLE` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
  | `HIPFIRE_GFX1100_PM_GEMM` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
  | `HIPFIRE_GFX1100_Q8X_VERIFY` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv_q8x.rs | developer |
@@ -74135,7 +74369,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN` | crates/hipfire-dispatch/src/pipeline/batched_attention.rs, crates/rdna-compute/src/attention_wmma_verify.rs | developer |
  | `HIPFIRE_GFX1101_GFX1100_CAMPAIGN` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/src/norm.rs | developer |
  | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP` | crates/rdna-compute/src/attention.rs | developer |
-@@ -2217,6 +2254,51 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -2217,6 +2260,57 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_KLD_NGL` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/eval_gguf.rs | harness |
  | `HIPFIRE_KLD_TEACHER` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
  | `HIPFIRE_KV` | crates/saddle-lab/examples/oracle_xcheck.rs | harness |
@@ -74150,11 +74384,17 @@ index b0ba83804..0f4b632d9 100644
 +| `HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 +| `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 +| `HIPFIRE_KVMEM_CONTENT_GROUPS` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-config/src/kvmem.rs | developer |
++| `HIPFIRE_KVMEM_DN_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
++| `HIPFIRE_KVMEM_DN_GPU` | crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
++| `HIPFIRE_KVMEM_DN_HOST_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs, crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
++| `HIPFIRE_KVMEM_DN_IDLE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
++| `HIPFIRE_KVMEM_DN_RING_DIR` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 +| `HIPFIRE_KVMEM_GEN_RESERVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 +| `HIPFIRE_KVMEM_GPU_HIGH` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 +| `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 +| `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 +| `HIPFIRE_KVMEM_GQA_DECODE` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
++| `HIPFIRE_KVMEM_HEAD_LIVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
 +| `HIPFIRE_KVMEM_HOST_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-config/src/kvmem.rs | developer |
 +| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
 +| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
@@ -74187,7 +74427,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_KV_ADAPTIVE` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-config/src/lib.rs | stable |
  | `HIPFIRE_KV_BACKEND` | crates/hipfire-loader/src/admission.rs, scripts/guard_gfx1201_baseline.py | developer |
  | `HIPFIRE_KV_BF16` | crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-dispatch/src/families/kv_tier.rs | developer |
-@@ -2270,6 +2352,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -2270,6 +2364,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_LOCAL` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-cli/src/main.rs | stable |
  | `HIPFIRE_LOCK_DIR` | crates/hipfire-cli/src/doctor/probe.rs, crates/hipfire-cli/src/main.rs | developer |
  | `HIPFIRE_LOG` | crates/hipfire-daemon/src/process_init.rs | developer |
@@ -74195,7 +74435,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_LOG_FORMAT` | crates/hipfire-daemon/src/process_init.rs, scripts/check-env-docs.py | developer |
  | `HIPFIRE_LOWBIT_WMMA_WAVES` | crates/rdna-compute/src/gemm.rs | developer |
  | `HIPFIRE_M7_TEST_CASE` | crates/peacemaker-isa/src/pm_check.rs, scripts/check-env-docs.py | developer |
-@@ -2382,7 +2465,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -2382,7 +2477,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_MOE_PROJECTION_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
  | `HIPFIRE_MOE_ROTATE_I4_PM` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/moe_rotate_i4_pm_oracle.rs | developer |
  | `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
@@ -74204,7 +74444,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
  | `HIPFIRE_MOE_ROUTE_DUMP` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
  | `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
-@@ -2437,12 +2520,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -2437,12 +2532,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_MQ6_RESID_PM_GFX1100` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
  | `HIPFIRE_MQ6_RESID_PORT_GFX1100` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
  | `HIPFIRE_MQ6_ROWS_SPLIT` | crates/rdna-compute/examples/mq6_rows_split_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
@@ -74221,7 +74461,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_MTP_AR_FLOOR` | crates/hipfire-arch-qwen4/src/mesh_lane_protocol.rs, crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
  | `HIPFIRE_MTP_BYTE_IDENTITY_HEAD` | crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs, crates/hipfire-arch-qwen35/tests/mtp_step_oracle.rs | harness |
  | `HIPFIRE_MTP_BYTE_IDENTITY_MODEL` | crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs, crates/hipfire-arch-qwen35/tests/mtp_step_oracle.rs | harness |
-@@ -2574,6 +2660,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -2574,6 +2672,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_PP_RESET_MODEL` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
  | `HIPFIRE_PREFILL_BATCHED` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs | stable |
  | `HIPFIRE_PREFILL_CHUNK` | crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
@@ -74229,7 +74469,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/examples/prefill_ragged_oracle.rs | stable |
  | `HIPFIRE_PREFILL_IU4_C8_PM` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
  | `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
-@@ -3001,6 +3088,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -3001,6 +3100,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_RDNA3_SIGMOID_M2048` | crates/rdna-compute/src/kernels.rs | developer |
  | `HIPFIRE_RDNA3_SIGMOID_ROWS4` | crates/rdna-compute/src/kernels.rs | developer |
  | `HIPFIRE_REAP_PLAN` | crates/hipfire-arch-deepseek4/src/deepseek4.rs, crates/hipfire-arch-lfm2moe/src/config.rs | developer |
@@ -74238,7 +74478,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_REDLINE_DISPATCH_PROFILE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/pm4_ledger.rs | experimental |
  | `HIPFIRE_REDLINE_GAP_TIMING` | crates/rdna-compute/src/gap_timing.rs | developer |
  | `HIPFIRE_REDLINE_IB_POOL` | crates/rdna-compute/src/replay.rs | developer |
-@@ -3013,6 +3102,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -3013,6 +3114,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_REGISTRY_URL` | crates/hipfire-cli/src/main.rs, crates/hipfire-config/src/lib.rs | stable |
  | `HIPFIRE_RELEASES_LATEST_API` | scripts/install.sh, scripts/test_install_revision.py | harness |
  | `HIPFIRE_REMOTE` | scripts/mi300x_bootstrap.sh | harness |
@@ -74246,7 +74486,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_REPLAY_BACKEND` | crates/hipfire-arch-qwen35/examples/mq4_prefill_state_oracle.rs, crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs | stable |
  | `HIPFIRE_REPLAY_BINDINGS_VERIFY` | crates/rdna-compute/src/replay.rs | developer |
  | `HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE` | crates/hipfire-dispatch/src/pipeline/sealed_moe.rs | developer |
-@@ -3183,8 +3273,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -3183,8 +3285,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_SLOTS_ATTN_CROSSOVER` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/rdna-compute/src/feature_flags.rs | developer |
  | `HIPFIRE_SLOTS_DECODE_GRAPH` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/rdna-compute/src/feature_flags.rs | developer |
  | `HIPFIRE_SLOTS_PAGED` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
@@ -74257,7 +74497,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_SLOWLINK_HW_MODEL` | crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs | harness |
  | `HIPFIRE_SLOWLINK_HW_ROWS` | crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs | harness |
  | `HIPFIRE_SLOW_TOKEN_LOG` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs | harness |
-@@ -3196,7 +3286,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -3196,7 +3298,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_SPECULATION` | crates/hipfire-config/src/lib.rs, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | stable |
  | `HIPFIRE_SPEC_LOOKUP_TAIL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-config/src/lib.rs | developer |
  | `HIPFIRE_SPEC_PHASES` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
@@ -74266,7 +74506,7 @@ index b0ba83804..0f4b632d9 100644
  | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-config/src/lib.rs | developer |
  | `HIPFIRE_SPE_OUT_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
  | `HIPFIRE_SPILL_DIR` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/pipeline.rs | stable |
-@@ -3219,7 +3309,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
+@@ -3219,7 +3321,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
  | `HIPFIRE_TEST_REQUIRE_ROCM` | crates/peacemaker-cdna/src/oracle.rs, crates/peacemaker-cdna/tests/enc_sop.rs | developer |
  | `HIPFIRE_TEST_TARGET` | crates/hipfire-arch-qwen35/examples/dflash_draft_emit_oracle.rs, crates/hipfire-arch-qwen35/tests/dflash_lookup_state_oracle.rs | harness |
  | `HIPFIRE_TEXT_OUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
