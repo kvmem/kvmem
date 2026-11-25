@@ -3781,10 +3781,10 @@ index 70e956368..8d03fd68c 100644
                          gpu.conv1d_silu_split_qknorm(
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 new file mode 100644
-index 000000000..01188e6dd
+index 000000000..3f98f30f1
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
-@@ -0,0 +1,1136 @@
+@@ -0,0 +1,1140 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -4905,6 +4905,10 @@ index 000000000..01188e6dd
 +    /// ownership tier and the fallback when the GPU checkpoint pool misses.
 +    /// Capacity is `HIPFIRE_KVMEM_DN_HOST_MIB` (default 512, 0 disables).
 +    dn_ring: DnRing,
++    /// S2: opt-in idle-session DeltaNet demotion (`HIPFIRE_KVMEM_DN_IDLE`).
++    /// The live state of a decoding slot cannot be paged; this only releases
++    /// an idle slot between turns and restores its exact image on continuation.
++    dn_idle: bool,
 +    /// S2 state-image ledger: live-to-image demotions, image-to-live
 +    /// promotions, successful image installs, and the host bytes currently
 +    /// charged by parked DN images.
@@ -4923,10 +4927,10 @@ index 000000000..01188e6dd
 +mod tests;
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/dn_ring.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/dn_ring.rs
 new file mode 100644
-index 000000000..242623988
+index 000000000..77b49605e
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/dn_ring.rs
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,443 @@
 +//! P2: host-resident DeltaNet checkpoint ring.
 +//!
 +//! The recurrent state is small per slot (~115 MiB at 48 linear layers) but
@@ -4935,13 +4939,31 @@ index 000000000..242623988
 +//! host memory, keyed by `(frontier, fingerprint)`, so a cold prefix reuse can
 +//! restore the exact state without a live GPU snapshot. The live state stays
 +//! engine-owned scratch; the persistent checkpoints are KVMem-managed.
++//!
++//! The ring can also mirror each checkpoint to one immutable file under a
++//! cache directory. Files carry a model/layout identity so a ring written by a
++//! different geometry is discarded instead of being decoded with the wrong
++//! shape. The in-memory queue remains authoritative for LRU order; the disk
++//! mirror is a startup seed, not a second cache.
 +
 +use std::collections::VecDeque;
++use std::fs;
++use std::io::Write;
++use std::path::{Path, PathBuf};
++use std::time::SystemTime;
++
++const DNR_MAGIC: [u8; 4] = *b"DNR1";
++const DNR_VERSION: u32 = 1;
++const DNR_HEADER: usize = 40;
++const DNR_SUFFIX: &str = "dnr";
 +
 +struct DnEntry {
 +    frontier: u64,
 +    fp: u64,
 +    bytes: Vec<u8>,
++    /// Immutable mirror of `bytes`; `None` when persistence is off, the entry
++    /// was recovered from a different process, or the write failed.
++    disk: Option<PathBuf>,
 +}
 +
 +/// LRU ring of serialized DeltaNet states. `cap_bytes == 0` disables it.
@@ -4949,6 +4971,11 @@ index 000000000..242623988
 +    entries: VecDeque<DnEntry>,
 +    bytes: u64,
 +    cap_bytes: u64,
++    disk_dir: Option<PathBuf>,
++    disk_cap_bytes: u64,
++    disk_bytes: u64,
++    identity: u64,
++    trace: bool,
 +}
 +
 +impl DnRing {
@@ -4957,7 +4984,41 @@ index 000000000..242623988
 +            entries: VecDeque::new(),
 +            bytes: 0,
 +            cap_bytes,
++            disk_dir: None,
++            disk_cap_bytes: 0,
++            disk_bytes: 0,
++            identity: 0,
++            trace: false,
 +        }
++    }
++
++    /// Build a ring that also mirrors checkpoints under `dir` and seeds itself
++    /// from the files already there. `identity` is the ring's model/layout
++    /// fingerprint; files with a different identity are discarded.
++    pub fn new_persistent(
++        cap_bytes: u64,
++        dir: &Path,
++        disk_cap_bytes: u64,
++        identity: u64,
++        trace: bool,
++    ) -> Result<Self, String> {
++        if cap_bytes == 0 || disk_cap_bytes == 0 {
++            return Ok(Self::new(cap_bytes));
++        }
++        fs::create_dir_all(dir)
++            .map_err(|e| format!("create DN ring directory {}: {e}", dir.display()))?;
++        let mut ring = Self {
++            entries: VecDeque::new(),
++            bytes: 0,
++            cap_bytes,
++            disk_dir: Some(dir.to_path_buf()),
++            disk_cap_bytes: disk_cap_bytes.min(cap_bytes),
++            disk_bytes: 0,
++            identity,
++            trace,
++        };
++        ring.recover()?;
++        Ok(ring)
 +    }
 +
 +    pub fn enabled(&self) -> bool {
@@ -4970,6 +5031,11 @@ index 000000000..242623988
 +
 +    pub fn total_bytes(&self) -> u64 {
 +        self.bytes
++    }
++
++    /// Payload bytes currently mirrored on disk (excludes file headers).
++    pub fn disk_bytes(&self) -> u64 {
++        self.disk_bytes
 +    }
 +
 +    pub fn get(&self, frontier: u64, fp: u64) -> Option<&[u8]> {
@@ -4994,28 +5060,238 @@ index 000000000..242623988
 +            .iter()
 +            .position(|e| e.frontier == frontier && e.fp == fp)
 +        {
-+            let old = self.entries.remove(pos).expect("position is valid");
-+            self.bytes = self.bytes.saturating_sub(old.bytes.len() as u64);
++            self.remove_entry_at(pos);
 +        }
 +        while self.bytes.saturating_add(size) > self.cap_bytes {
-+            let Some(old) = self.entries.pop_front() else {
++            if !self.pop_front() {
 +                break;
-+            };
-+            self.bytes = self.bytes.saturating_sub(old.bytes.len() as u64);
++            }
 +        }
++
++        // Keep the disk mirror inside its own cap without evicting entries
++        // that are too large to persist at all.
++        let mut disk = None;
++        if self.disk_dir.is_some() && size <= self.disk_cap_bytes {
++            while self.disk_bytes.saturating_add(size) > self.disk_cap_bytes {
++                let Some(pos) = self.entries.iter().position(|e| e.disk.is_some()) else {
++                    break;
++                };
++                self.remove_entry_at(pos);
++            }
++            if let Some(dir) = self.disk_dir.clone() {
++                match write_entry(&dir, frontier, fp, self.identity, &bytes) {
++                    Ok(path) => {
++                        self.disk_bytes = self.disk_bytes.saturating_add(size);
++                        disk = Some(path);
++                    }
++                    Err(e) => {
++                        if self.trace {
++                            eprintln!("[kvmem-dn] ring disk write frontier={frontier} failed: {e}");
++                        }
++                    }
++                }
++            }
++        }
++
 +        self.bytes = self.bytes.saturating_add(size);
 +        self.entries.push_back(DnEntry {
 +            frontier,
 +            fp,
 +            bytes,
++            disk,
 +        });
 +        true
 +    }
++
++    fn recover(&mut self) -> Result<(), String> {
++        let Some(dir) = self.disk_dir.clone() else {
++            return Ok(());
++        };
++        let mut files = Vec::new();
++        let read = fs::read_dir(&dir)
++            .map_err(|e| format!("read DN ring directory {}: {e}", dir.display()))?;
++        for entry in read {
++            let entry = entry.map_err(|e| format!("read DN ring entry: {e}"))?;
++            let path = entry.path();
++            if path.extension().and_then(|s| s.to_str()) != Some(DNR_SUFFIX) {
++                continue;
++            }
++            let modified = entry
++                .metadata()
++                .and_then(|m| m.modified())
++                .unwrap_or(SystemTime::UNIX_EPOCH);
++            files.push((modified, path));
++        }
++        files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
++
++        for (_, path) in files {
++            let size = match fs::metadata(&path) {
++                Ok(meta) => meta.len(),
++                Err(e) => {
++                    if self.trace {
++                        eprintln!("[kvmem-dn] ring drop {}: {e}", path.display());
++                    }
++                    let _ = fs::remove_file(&path);
++                    continue;
++                }
++            };
++            if size < DNR_HEADER as u64 || size - DNR_HEADER as u64 > self.cap_bytes {
++                let _ = fs::remove_file(&path);
++                continue;
++            }
++            let (frontier, fp, bytes) = match read_entry(&path, self.identity) {
++                Ok(v) => v,
++                Err(e) => {
++                    if self.trace {
++                        eprintln!("[kvmem-dn] ring drop {}: {e}", path.display());
++                    }
++                    let _ = fs::remove_file(&path);
++                    continue;
++                }
++            };
++            let bytes_len = bytes.len() as u64;
++            if bytes_len > self.cap_bytes || bytes_len > self.disk_cap_bytes {
++                let _ = fs::remove_file(&path);
++                continue;
++            }
++            if let Some(pos) = self
++                .entries
++                .iter()
++                .position(|e| e.frontier == frontier && e.fp == fp)
++            {
++                self.remove_entry_at(pos);
++            }
++            while self.bytes.saturating_add(bytes_len) > self.cap_bytes {
++                if !self.pop_front() {
++                    break;
++                }
++            }
++            while self.disk_bytes.saturating_add(bytes_len) > self.disk_cap_bytes {
++                let Some(pos) = self.entries.iter().position(|e| e.disk.is_some()) else {
++                    break;
++                };
++                self.remove_entry_at(pos);
++            }
++            self.bytes = self.bytes.saturating_add(bytes_len);
++            self.disk_bytes = self.disk_bytes.saturating_add(bytes_len);
++            self.entries.push_back(DnEntry {
++                frontier,
++                fp,
++                bytes,
++                disk: Some(path),
++            });
++        }
++        if self.trace && !self.entries.is_empty() {
++            eprintln!(
++                "[kvmem-dn] ring recovered entries={} bytes={} disk={}",
++                self.entries.len(),
++                self.bytes,
++                self.disk_bytes
++            );
++        }
++        Ok(())
++    }
++
++    fn pop_front(&mut self) -> bool {
++        if self.entries.is_empty() {
++            return false;
++        }
++        self.remove_entry_at(0);
++        true
++    }
++
++    fn remove_entry_at(&mut self, pos: usize) {
++        let Some(entry) = self.entries.remove(pos) else {
++            return;
++        };
++        let size = entry.bytes.len() as u64;
++        self.bytes = self.bytes.saturating_sub(size);
++        if let Some(path) = entry.disk {
++            self.disk_bytes = self.disk_bytes.saturating_sub(size);
++            if let Err(e) = fs::remove_file(&path) {
++                if self.trace && e.kind() != std::io::ErrorKind::NotFound {
++                    eprintln!("[kvmem-dn] ring unlink {}: {e}", path.display());
++                }
++            }
++        }
++    }
++}
++
++fn entry_path(dir: &Path, frontier: u64, fp: u64) -> PathBuf {
++    dir.join(format!("{frontier:016x}-{fp:016x}.{DNR_SUFFIX}"))
++}
++
++fn write_entry(
++    dir: &Path,
++    frontier: u64,
++    fp: u64,
++    identity: u64,
++    bytes: &[u8],
++) -> Result<PathBuf, String> {
++    let path = entry_path(dir, frontier, fp);
++    let tmp = path.with_extension(format!("{DNR_SUFFIX}.tmp"));
++    let result = (|| -> Result<(), String> {
++        let mut file =
++            fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
++        file.write_all(&DNR_MAGIC)
++            .and_then(|_| file.write_all(&DNR_VERSION.to_le_bytes()))
++            .and_then(|_| file.write_all(&identity.to_le_bytes()))
++            .and_then(|_| file.write_all(&frontier.to_le_bytes()))
++            .and_then(|_| file.write_all(&fp.to_le_bytes()))
++            .and_then(|_| file.write_all(&(bytes.len() as u64).to_le_bytes()))
++            .and_then(|_| file.write_all(bytes))
++            .and_then(|_| file.sync_all())
++            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
++        drop(file);
++        fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))
++    })();
++    if result.is_err() {
++        let _ = fs::remove_file(&tmp);
++    }
++    result.map(|_| path)
++}
++
++fn read_entry(path: &Path, identity: u64) -> Result<(u64, u64, Vec<u8>), String> {
++    let data = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
++    if data.len() < DNR_HEADER {
++        return Err("truncated header".into());
++    }
++    if data[0..4] != DNR_MAGIC {
++        return Err("bad magic".into());
++    }
++    let version = u32::from_le_bytes(data[4..8].try_into().expect("4 bytes"));
++    if version != DNR_VERSION {
++        return Err(format!("unsupported version {version}"));
++    }
++    let stored_identity = u64::from_le_bytes(data[8..16].try_into().expect("8 bytes"));
++    if stored_identity != identity {
++        return Err(format!(
++            "identity {stored_identity:016x} does not match {identity:016x}"
++        ));
++    }
++    let frontier = u64::from_le_bytes(data[16..24].try_into().expect("8 bytes"));
++    let fp = u64::from_le_bytes(data[24..32].try_into().expect("8 bytes"));
++    let len = u64::from_le_bytes(data[32..40].try_into().expect("8 bytes"));
++    if len != (data.len() - DNR_HEADER) as u64 {
++        return Err(format!(
++            "payload length {len} does not match file {}",
++            data.len() - DNR_HEADER
++        ));
++    }
++    Ok((frontier, fp, data[DNR_HEADER..].to_vec()))
 +}
 +
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
++
++    fn temp_dir() -> PathBuf {
++        let unique = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
++        std::env::temp_dir().join(format!("hipfire-dn-ring-{}-{unique}", std::process::id()))
++    }
 +
 +    #[test]
 +    fn evicts_oldest_and_replaces_same_key() {
@@ -5041,6 +5317,61 @@ index 000000000..242623988
 +        let mut ring = DnRing::new(4);
 +        assert!(!ring.insert(128, 1, vec![0; 5]));
 +        assert!(ring.get(128, 1).is_none());
++    }
++
++    #[test]
++    fn persistent_ring_survives_restart() {
++        let dir = temp_dir();
++        let mut ring = DnRing::new_persistent(1024, &dir, 1024, 0x1234, false).unwrap();
++        assert!(ring.insert(128, 7, vec![1; 16]));
++        assert_eq!(ring.disk_bytes(), 16);
++        drop(ring);
++
++        let mut ring = DnRing::new_persistent(1024, &dir, 1024, 0x1234, false).unwrap();
++        assert_eq!(ring.len(), 1);
++        assert_eq!(ring.get(128, 7), Some(&[1u8; 16][..]));
++        assert_eq!(ring.disk_bytes(), 16);
++        assert!(ring.insert(256, 8, vec![2; 16]));
++        drop(ring);
++
++        let ring = DnRing::new_persistent(1024, &dir, 1024, 0x1234, false).unwrap();
++        assert_eq!(ring.len(), 2);
++        assert_eq!(ring.get(128, 7), Some(&[1u8; 16][..]));
++        assert_eq!(ring.get(256, 8), Some(&[2u8; 16][..]));
++        let _ = fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn persistent_ring_discards_foreign_identity() {
++        let dir = temp_dir();
++        let mut ring = DnRing::new_persistent(1024, &dir, 1024, 0x1234, false).unwrap();
++        assert!(ring.insert(128, 7, vec![1; 16]));
++        drop(ring);
++
++        let ring = DnRing::new_persistent(1024, &dir, 1024, 0x5678, false).unwrap();
++        assert_eq!(ring.len(), 0);
++        assert_eq!(ring.disk_bytes(), 0);
++        let files = fs::read_dir(&dir).unwrap().count();
++        assert_eq!(files, 0);
++        let _ = fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn persistent_ring_respects_disk_cap() {
++        let dir = temp_dir();
++        let mut ring = DnRing::new_persistent(1024, &dir, 32, 0x1234, false).unwrap();
++        assert!(ring.insert(128, 1, vec![0; 16]));
++        assert!(ring.insert(256, 2, vec![0; 16]));
++        assert!(ring.insert(384, 3, vec![0; 16]));
++        assert_eq!(ring.len(), 2);
++        assert_eq!(ring.disk_bytes(), 32);
++        assert!(ring.get(128, 1).is_none());
++        assert!(ring.get(256, 2).is_some());
++        assert!(ring.get(384, 3).is_some());
++        drop(ring);
++        let ring = DnRing::new_persistent(1024, &dir, 32, 0x1234, false).unwrap();
++        assert_eq!(ring.len(), 2);
++        let _ = fs::remove_dir_all(&dir);
 +    }
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/import.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/import.rs
@@ -7888,10 +8219,10 @@ index 000000000..f61671fb6
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs
 new file mode 100644
-index 000000000..a0637730e
+index 000000000..84c341c6d
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,332 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -7952,6 +8283,14 @@ index 000000000..a0637730e
 +    pub(crate) content_groups: Option<usize>,
 +    pub(crate) content_cache_dir: Option<String>,
 +    pub(crate) content_cache_bytes: Option<u64>,
++    /// `HIPFIRE_KVMEM_DN_IDLE`: demote an idle session's DeltaNet state to a
++    /// host image and restore it on the next continuation. Default off.
++    pub(crate) dn_idle: Option<bool>,
++    /// `HIPFIRE_KVMEM_DN_RING_DIR`: mirror page-aligned DN checkpoints here so
++    /// they survive a process restart. Defaults to `<cache dir>/dn-ring`.
++    pub(crate) dn_ring_dir: Option<String>,
++    /// `HIPFIRE_KVMEM_DN_DISK_MIB`: disk mirror cap; `0` disables persistence.
++    pub(crate) dn_disk_mib: Option<u64>,
 +    pub(crate) spill_dir: Option<String>,
 +    pub(crate) spill_bytes: Option<u64>,
 +    pub(crate) layerwise_activation_ram_mib: Option<String>,
@@ -8005,6 +8344,9 @@ index 000000000..a0637730e
 +            content_groups: None,
 +            content_cache_dir: None,
 +            content_cache_bytes: None,
++            dn_idle: None,
++            dn_ring_dir: None,
++            dn_disk_mib: None,
 +            spill_dir: None,
 +            spill_bytes: None,
 +            layerwise_activation_ram_mib: None,
@@ -8100,6 +8442,9 @@ index 000000000..a0637730e
 +        content_groups: get("HIPFIRE_KVMEM_CONTENT_GROUPS").and_then(|v| v.parse().ok()),
 +        content_cache_dir: get("HIPFIRE_KVMEM_CACHE_DIR"),
 +        content_cache_bytes: get("HIPFIRE_KVMEM_CACHE_BYTES").and_then(|v| v.parse().ok()),
++        dn_idle: get("HIPFIRE_KVMEM_DN_IDLE").map(|v| enabled(Some(&v))),
++        dn_ring_dir: get("HIPFIRE_KVMEM_DN_RING_DIR"),
++        dn_disk_mib: get("HIPFIRE_KVMEM_DN_DISK_MIB").and_then(|v| v.parse().ok()),
 +        spill_dir: get("HIPFIRE_KVMEM_SPILL_DIR"),
 +        spill_bytes: get("HIPFIRE_KVMEM_SPILL_BYTES").and_then(|v| v.parse().ok()),
 +        layerwise_activation_ram_mib: get("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB"),
@@ -8143,6 +8488,9 @@ index 000000000..a0637730e
 +            ("HIPFIRE_KVMEM_TRACE", "on"),
 +            ("HIPFIRE_KVMEM_VERIFY", "1"),
 +            ("HIPFIRE_KVMEM_BATCH_XFER", "off"),
++            ("HIPFIRE_KVMEM_DN_IDLE", "on"),
++            ("HIPFIRE_KVMEM_DN_RING_DIR", "/tmp/dn-ring"),
++            ("HIPFIRE_KVMEM_DN_DISK_MIB", "256"),
 +        ])
 +        .expect("snapshot");
 +        assert_eq!(options.strategy, RecallStrategy::Layerwise);
@@ -8153,6 +8501,9 @@ index 000000000..a0637730e
 +        assert!(options.diagnostics.verify);
 +        assert!(!options.diagnostics.trace_keep);
 +        assert!(!options.batch_xfer);
++        assert_eq!(options.dn_idle, Some(true));
++        assert_eq!(options.dn_ring_dir.as_deref(), Some("/tmp/dn-ring"));
++        assert_eq!(options.dn_disk_mib, Some(256));
 +    }
 +
 +    #[test]
@@ -8206,10 +8557,10 @@ index 000000000..a0637730e
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
 new file mode 100644
-index 000000000..c39f3f8ec
+index 000000000..a22c4ca17
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,710 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -8362,16 +8713,46 @@ index 000000000..c39f3f8ec
 +        };
 +        // P2: persistent DN checkpoints are host-resident. The GPU pool remains
 +        // a fast cache; the ring is the ownership tier and the fallback when
-+        // the pool misses. 0 disables the ring (GPU pool only).
++        // the pool misses. 0 disables the ring (GPU pool only). An optional
++        // immutable disk mirror seeds the ring after a process restart.
 +        let dn_host_mib: u64 = hipfire_config::developer_var("HIPFIRE_KVMEM_DN_HOST_MIB")
 +            .ok()
 +            .and_then(|v| v.trim().parse::<u64>().ok())
 +            .unwrap_or(512);
++        // S2: opt-in idle-session DN demotion. The live recurrent state of a
++        // decoding slot cannot be paged, so this only releases an idle slot
++        // between turns and restores the exact image on continuation.
++        let dn_idle = options.dn_idle.unwrap_or(false);
++        let explicit_dn_ring_dir = options
++            .dn_ring_dir
++            .clone()
++            .filter(|d| !d.is_empty())
++            .map(PathBuf::from);
++        let dn_disk_mib = options
++            .dn_disk_mib
++            .unwrap_or(if explicit_dn_ring_dir.is_some() {
++                512
++            } else {
++                0
++            });
 +        if dn_host_mib > 0 {
 +            eprintln!(
-+                "[kvmem] P2 DN host ring: {} MiB (HIPFIRE_KVMEM_DN_HOST_MIB)",
-+                dn_host_mib
++                "[kvmem] P2 DN host ring: {} MiB (HIPFIRE_KVMEM_DN_HOST_MIB); idle demote={}; disk={} MiB",
++                dn_host_mib,
++                if dn_idle { "on" } else { "off" },
++                dn_disk_mib,
 +            );
++        }
++        if dn_disk_mib > 0 && explicit_dn_ring_dir.is_none() {
++            let has_cache_dir = options
++                .content_cache_dir
++                .as_ref()
++                .is_some_and(|d| !d.is_empty());
++            if !has_cache_dir {
++                eprintln!(
++                    "[kvmem] P2 DN ring: disk mirror requested with no ring/cache directory; memory only"
++                );
++            }
 +        }
 +
 +        // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
@@ -8528,6 +8909,31 @@ index 000000000..c39f3f8ec
 +            }
 +        }
 +        let content_cache_dir = content_cache_dir.map(PathBuf::from);
++        let layout_identity = layout_fingerprint(&raw_cfg);
++        // P2 disk mirror: an explicit ring directory wins; otherwise the
++        // content cache directory hosts `<cache>/dn-ring`. Persistence is off
++        // unless `HIPFIRE_KVMEM_DN_DISK_MIB` (or an explicit ring dir, whose
++        // default is 512 MiB) asks for it.
++        let dn_ring_dir = explicit_dn_ring_dir
++            .or_else(|| content_cache_dir.as_ref().map(|dir| dir.join("dn-ring")));
++        let dn_ring_bytes = dn_disk_mib.saturating_mul(1 << 20);
++        let dn_ring = if dn_host_mib == 0 {
++            DnRing::new(0)
++        } else if dn_ring_bytes > 0 {
++            match dn_ring_dir.as_ref() {
++                Some(dir) => DnRing::new_persistent(
++                    dn_host_mib.saturating_mul(1 << 20),
++                    dir,
++                    dn_ring_bytes,
++                    layout_identity,
++                    options.diagnostics.trace,
++                )
++                .map_err(|e| format!("kvmem DN ring: {e}"))?,
++                None => DnRing::new(dn_host_mib.saturating_mul(1 << 20)),
++            }
++        } else {
++            DnRing::new(dn_host_mib.saturating_mul(1 << 20))
++        };
 +
 +        // 期3 G3 P1.1: pack files live beside the content account; scanning
 +        // here rebuilds the cold index after a restart (metadata only).
@@ -8539,7 +8945,7 @@ index 000000000..c39f3f8ec
 +        let cold_packs = match cold_dir.as_ref() {
 +            Some(dir) => ColdPackIndex::scan(
 +                dir,
-+                layout_fingerprint(&raw_cfg),
++                layout_identity,
 +                n_record_layers as u32,
 +                KV_BLOCK_TOKENS as u32,
 +                1 << 20,
@@ -8752,7 +9158,8 @@ index 000000000..c39f3f8ec
 +            draft_image_misses_total: 0,
 +            draft_sidecars_total: 0,
 +            draft_sidecar_bytes: 0,
-+            dn_ring: DnRing::new(dn_host_mib.saturating_mul(1 << 20)),
++            dn_ring,
++            dn_idle,
 +            state_host_bytes: 0,
 +            state_demotions_total: 0,
 +            state_promotions_total: 0,
@@ -8866,10 +9273,10 @@ index 000000000..c39f3f8ec
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 new file mode 100644
-index 000000000..570906584
+index 000000000..ade164172
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,725 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -9408,6 +9815,12 @@ index 000000000..570906584
 +    /// P2: whether KVMem owns persistent DeltaNet checkpoints in host memory.
 +    pub fn dn_ring_enabled(&self) -> bool {
 +        self.dn_ring.enabled()
++    }
++
++    /// S2: whether an idle session's DeltaNet state may be demoted to a host
++    /// image (`HIPFIRE_KVMEM_DN_IDLE`, default off).
++    pub fn dn_idle_enabled(&self) -> bool {
++        self.dn_idle
 +    }
 +
 +    /// P2: store one serialized `DeltaNetSnapshot`. The engine exports the
@@ -34627,7 +35040,7 @@ index dd17541e7..cb8e404ee 100644
      ///
      /// The ordinary state has an implicit batch of one.  This variant keeps
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
-index 82fbdd9cd..708124aee 100644
+index 82fbdd9cd..c58d22629 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
 @@ -53,6 +53,48 @@ use hipfire_runtime::serve_wait::WaitQueue;
@@ -34749,7 +35162,24 @@ index 82fbdd9cd..708124aee 100644
      fn close(&self, session: u64) -> Result<(), String> {
          SlotEngine::close(self, session)
      }
-@@ -442,6 +517,16 @@ struct ModelRig {
+@@ -437,11 +512,38 @@ const REPEAT_WINDOW_MAX: usize = 2048;
+ /// All model-owned GPU state for the slot engine, grouped so `Rig`'s other
+ /// fields stay family-neutral. Field-for-field with the former `Rig` model
+ /// members; this is the concrete bundle a future `SlotModel` impl owns.
++/// S2 idle tier: a host-only copy of one slot's DeltaNet state, keyed by the
++/// session and the exact `(frontier, fingerprint)` it was captured at. Unlike
++/// a catalog image this is not a KV payload owner; it only lets an idle
++/// session's recurrent state leave the device between turns.
++#[cfg(feature = "kvmem")]
++struct IdleDnImage {
++    session: SessionId,
++    frontier: u32,
++    fp: u64,
++    bytes: Vec<u8>,
++}
++
+ struct ModelRig {
+     weights: Qwen35Weights,
      config: qwen35::Qwen35Config,
      scratch: Qwen35Scratch,
      dn_states: Vec<DeltaNetState>,
@@ -34758,6 +35188,11 @@ index 82fbdd9cd..708124aee 100644
 +    /// and stores the published image id here.
 +    #[cfg(feature = "kvmem")]
 +    dn_images: Vec<Option<crate::kvmem_ctl::StateImageId>>,
++    /// S2 (`HIPFIRE_KVMEM_DN_IDLE`): host image of an idle session's live DN
++    /// state. The slot keeps a tombstone until the next continuation restores
++    /// this exact image; a cold admit drops it.
++    #[cfg(feature = "kvmem")]
++    dn_idle_images: Vec<Option<IdleDnImage>>,
 +    /// P1b paged Legacy MTP-head arenas, one per slot. Each draft rebuilds the
 +    /// sink + retained page window from the composite aux plane; no per-slot
 +    /// copy of the full head history is held on the device.
@@ -34766,7 +35201,7 @@ index 82fbdd9cd..708124aee 100644
      k_arenas: Vec<GpuTensor>,
      v_arenas: Vec<GpuTensor>,
      desc_staging: SlotDescStaging,
-@@ -456,9 +541,10 @@ struct ModelRig {
+@@ -456,9 +558,10 @@ struct ModelRig {
      /// Per-slot MTP spec state. None for slots that haven't started MTP yet
      /// or when MTP is off. Allocated lazily on first MTP prefill.
      mtp_states: Vec<Option<crate::mtp_spec::MtpSpecState>>,
@@ -34780,7 +35215,7 @@ index 82fbdd9cd..708124aee 100644
      /// Batched scratch (+ per-row FWHT-rot buffer) for MTP head-KV prefill
      /// from the scheduler's batched prompt chunks. None when MTP is off.
      mtp_prefill_batched: Option<(crate::mtp_head::Qwen35MtpHeadBatchedScratch, GpuTensor)>,
-@@ -476,6 +562,11 @@ struct ModelRig {
+@@ -476,6 +579,11 @@ struct ModelRig {
      /// both exist — the tape stride and graph-shape check use this uniform
      /// width).
      spec_rows: usize,
@@ -34792,7 +35227,7 @@ index 82fbdd9cd..708124aee 100644
      /// Shared DFlash2 draft state (weights + hidden staging). None when
      /// DFlash is off.
      dflash: Option<crate::dflash_slot::DflashShared>,
-@@ -500,63 +591,34 @@ struct ModelRig {
+@@ -500,63 +608,34 @@ struct ModelRig {
      /// Cross-session recurrent-state checkpoint pool (spec §4.5 C5).
      /// None when `prefix_cache` is off.
      checkpoint_pool: Option<crate::checkpoint::CheckpointPool<DeltaNetSnapshot>>,
@@ -34881,7 +35316,7 @@ index 82fbdd9cd..708124aee 100644
  }
  
  struct Rig {
-@@ -580,6 +642,21 @@ struct Rig {
+@@ -580,6 +659,21 @@ struct Rig {
      /// the only paged-compatible mode).
      vl_sequential: bool,
      sessions: SessionTable,
@@ -34903,7 +35338,7 @@ index 82fbdd9cd..708124aee 100644
      adm: AdmissionController,
      swap: SwapManager,
      stamp: SnapshotStamp,
-@@ -613,6 +690,25 @@ struct Rig {
+@@ -613,6 +707,25 @@ struct Rig {
      cache_domain: Option<hipfire_runtime::serve_contract::CacheDomain>,
      /// True when cross-session prefix reuse is enabled.
      prefix_cache: bool,
@@ -34929,7 +35364,7 @@ index 82fbdd9cd..708124aee 100644
      /// The configured `serve.prefix_cache_max_bytes` ceiling. Retained on
      /// the Rig so the Reset path can re-apply it to the replacement index
      /// (`PrefixIndex::new` starts with no ceiling; losing it on reset
-@@ -747,6 +843,31 @@ fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
+@@ -747,6 +860,31 @@ fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
  }
  
  impl Rig {
@@ -34961,7 +35396,7 @@ index 82fbdd9cd..708124aee 100644
      /// Resolve the placement the slots path loads with.
      ///
      /// `Full`/`Full` returns the all-device placement with no capacity check — the
-@@ -895,7 +1016,7 @@ impl Rig {
+@@ -895,7 +1033,7 @@ impl Rig {
          use hipfire_runtime::tokenizer::Tokenizer;
          use rdna_compute::kv_slots::preflight_alloc;
  
@@ -34970,7 +35405,7 @@ index 82fbdd9cd..708124aee 100644
          let mut hfq = HfqFile::open(&cfg.model_path).map_err(|e| format!("open model: {e}"))?;
          let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("config: {e}"))?;
          let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-@@ -966,7 +1087,39 @@ impl Rig {
+@@ -966,7 +1104,39 @@ impl Rig {
          .map_err(|e| format!("kv mode {kv_mode:?}: {e}"))?;
          let per_pos_bytes = kv_plan.k_bytes_per_pos;
          let per_pos_v_bytes = kv_plan.v_bytes_per_pos;
@@ -35010,7 +35445,7 @@ index 82fbdd9cd..708124aee 100644
          // DFlash2 draft config pre-parse: the runtime block size B sets
          // `spec_rows` (verify rows per spec slot), which `max_batch` and the
          // verify tape are sized by — both allocated before the GPU-side
-@@ -1007,10 +1160,96 @@ impl Rig {
+@@ -1007,10 +1177,96 @@ impl Rig {
          // set_seq_len errors before any kernel writes through the missing
          // page); a larger count over-subscribes physical VRAM and is the
          // operator's call.
@@ -35108,7 +35543,7 @@ index 82fbdd9cd..708124aee 100644
          let paged_pages = if prefix_cache {
              let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
              // Cache-retained pages share the same physical pool as active slots.
-@@ -1029,6 +1268,11 @@ impl Rig {
+@@ -1029,6 +1285,11 @@ impl Rig {
                      .map(|p| p.max(1))
                      .unwrap_or_else(|| legacy_equivalent.saturating_add(cache_headroom)),
              )
@@ -35120,7 +35555,7 @@ index 82fbdd9cd..708124aee 100644
          } else {
              match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
                  .ok()
-@@ -1040,10 +1284,7 @@ impl Rig {
+@@ -1040,10 +1301,7 @@ impl Rig {
                      // forced the legacy sequential VL path — that path writes
                      // through a flat contiguous slab view which aliases every
                      // slot onto the arena prefix in paged mode.
@@ -35132,7 +35567,7 @@ index 82fbdd9cd..708124aee 100644
                          eprintln!(
                              "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
                               requires contiguous KV slots"
-@@ -1635,6 +1876,15 @@ impl Rig {
+@@ -1635,6 +1893,15 @@ impl Rig {
          let pbs = PrefillBatchScratch::new_opt(g.gpu.as_mut().unwrap(), &config, max_batch, false)
              .map_err(|e| format!("pbs: {e}"))?;
          g.pbs = Some(pbs);
@@ -35148,7 +35583,7 @@ index 82fbdd9cd..708124aee 100644
          let scratch =
              Qwen35Scratch::new_with_kv_max(g.gpu.as_mut().unwrap(), &config, 64, cfg.cap_tokens)
                  .map_err(|e| format!("scratch: {e}"))?;
-@@ -1685,9 +1935,6 @@ impl Rig {
+@@ -1685,9 +1952,6 @@ impl Rig {
          let vl_ext_devs: Vec<Option<GpuTensor>> = (0..cfg.n_slots).map(|_| None).collect();
          let vl_tower_jobs: Vec<Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>> =
              (0..cfg.n_slots).map(|_| None).collect();
@@ -35158,7 +35593,7 @@ index 82fbdd9cd..708124aee 100644
          if vl_sequential && !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
              return Err(
                  "HIPFIRE_VL_SEQUENTIAL=1 writes KV through the q8-only flat slab \
-@@ -1720,14 +1967,31 @@ impl Rig {
+@@ -1720,14 +1984,31 @@ impl Rig {
              dn_bytes,
          };
  
@@ -35192,7 +35627,7 @@ index 82fbdd9cd..708124aee 100644
                  pinned_host_bytes,
              },
              vram_total as u64,
-@@ -1769,6 +2033,27 @@ impl Rig {
+@@ -1769,6 +2050,27 @@ impl Rig {
          let scratch = g.scratch.take().unwrap();
          let logits_out = g.logits_out.take().unwrap();
          let out_tokens = g.out_tokens.take().unwrap();
@@ -35220,7 +35655,7 @@ index 82fbdd9cd..708124aee 100644
          // MTP head-KV prefill scratch, sized for one scheduler prompt chunk.
          // Allocated after the guard commit (transactional ownership is no
          // longer needed past this point: everything above already committed).
-@@ -1817,15 +2102,17 @@ impl Rig {
+@@ -1817,15 +2119,17 @@ impl Rig {
          // ── Prefix cache (spec §4.1–4.6) ──────────────────────────────────
          // Build the CacheDomain ONCE from available identities. When
          // prefix_cache is off, all three are None and the existing path is
@@ -35241,7 +35676,7 @@ index 82fbdd9cd..708124aee 100644
                  return Err(
                      "serve.prefix_cache requires serve.prefix_cache_max_bytes > 0 \
                       (0 means no retained cache, never unlimited)"
-@@ -1903,24 +2190,47 @@ impl Rig {
+@@ -1903,24 +2207,47 @@ impl Rig {
                      domain_id: "default".to_string(),
                  },
              };
@@ -35307,7 +35742,7 @@ index 82fbdd9cd..708124aee 100644
          } else {
              (None, None, None)
          };
-@@ -1953,6 +2263,21 @@ impl Rig {
+@@ -1953,6 +2280,21 @@ impl Rig {
          // therefore not a sound deadline base (spec §5.3 S3).
          let wait_queue = WaitQueue::new(cfg.wait_max_count, cfg.wait_max_bytes, u64::MAX)
              .map_err(|e| format!("wait queue: {e}"))?;
@@ -35329,18 +35764,20 @@ index 82fbdd9cd..708124aee 100644
          Ok(Rig {
              gpu,
              tokenizer,
-@@ -1962,6 +2287,10 @@ impl Rig {
+@@ -1962,6 +2304,12 @@ impl Rig {
                  config,
                  scratch,
                  dn_states,
 +                #[cfg(feature = "kvmem")]
 +                dn_images: (0..cfg.n_slots).map(|_| None).collect(),
 +                #[cfg(feature = "kvmem")]
++                dn_idle_images: (0..cfg.n_slots).map(|_| None).collect(),
++                #[cfg(feature = "kvmem")]
 +                legacy_head_planes: (0..cfg.n_slots).map(|_| None).collect(),
                  k_arenas,
                  v_arenas,
                  desc_staging,
-@@ -1970,12 +2299,13 @@ impl Rig {
+@@ -1970,12 +2318,13 @@ impl Rig {
                  logits_out,
                  mtp_head,
                  mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
@@ -35355,7 +35792,7 @@ index 82fbdd9cd..708124aee 100644
                  dflash,
                  dflash_states: (0..cfg.n_slots).map(|_| None).collect(),
                  vision_weights,
-@@ -1983,12 +2313,38 @@ impl Rig {
+@@ -1983,12 +2332,38 @@ impl Rig {
                  vl_ext_devs,
                  vl_tower_jobs,
                  checkpoint_pool,
@@ -35394,7 +35831,7 @@ index 82fbdd9cd..708124aee 100644
              adm,
              swap,
              stamp,
-@@ -2004,6 +2360,11 @@ impl Rig {
+@@ -2004,6 +2379,11 @@ impl Rig {
              prefix_index,
              cache_domain,
              prefix_cache,
@@ -35406,7 +35843,7 @@ index 82fbdd9cd..708124aee 100644
              prefix_cache_max_bytes: if prefix_cache {
                  Some(cfg.prefix_cache_max_bytes as usize)
              } else {
-@@ -2047,6 +2408,8 @@ impl Rig {
+@@ -2047,6 +2427,8 @@ impl Rig {
                      k_arenas,
                      v_arenas,
                      dn_states,
@@ -35415,7 +35852,7 @@ index 82fbdd9cd..708124aee 100644
                      desc_staging,
                      pbs,
                      scratch,
-@@ -2084,6 +2447,10 @@ impl Rig {
+@@ -2084,6 +2466,10 @@ impl Rig {
          for dn in dn_states.into_iter().rev() {
              dn.free_gpu(&mut gpu);
          }
@@ -35426,7 +35863,7 @@ index 82fbdd9cd..708124aee 100644
          // Arenas were allocated per FA layer as k then v; free reverse layers
          // as v then k.
          let mut k_arenas = k_arenas;
-@@ -2140,813 +2507,6 @@ impl Rig {
+@@ -2140,813 +2526,6 @@ impl Rig {
      }
  }
  
@@ -36240,7 +36677,7 @@ index 82fbdd9cd..708124aee 100644
  /// One slot's in-flight spec draft between the draft phase and the
  /// post-forward accept. `Mtp` carries the head's K-step chain output;
  /// `Dflash` carries the DFlash2 selector block. Both expose the verify-row
-@@ -3062,13 +2622,13 @@ fn clear_work_slot(work: &mut PendingWork) {
+@@ -3062,13 +2641,13 @@ fn clear_work_slot(work: &mut PendingWork) {
      work.vl_prefill = None;
      work.spec = SpecKind::None;
      work.pos3_delta = 0;
@@ -36261,7 +36698,7 @@ index 82fbdd9cd..708124aee 100644
  }
  
  /// Release a request's prefix-cache pin on every terminal path (spec §4.4
-@@ -3190,28 +2750,15 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
+@@ -3190,28 +2769,15 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
  /// batched forward provisions `set_seq_len(max_pos + 1)` before its KV write
  /// and fails the whole step closed when that exceeds the cap, which rejects
  /// every active slot; MTP must retire before drafting instead.
@@ -36295,7 +36732,7 @@ index 82fbdd9cd..708124aee 100644
  ///
  /// `repeat_window == 0` does NOT neutralize the penalties: OpenAI-style
  /// presence/frequency penalties are defined over the whole context, so a zero
-@@ -3243,17 +2790,6 @@ fn effective_repeat_window(
+@@ -3243,17 +2809,6 @@ fn effective_repeat_window(
      }
  }
  
@@ -36313,7 +36750,7 @@ index 82fbdd9cd..708124aee 100644
  /// Install a request's sampling parameters (including token penalties and
  /// min_p) on its slot's sampler state.
  fn install_sample_params(rig: &mut Rig, slot: SlotId, req: &SubmitRequest) {
-@@ -3400,6 +2936,7 @@ fn publish_generated_prefix(
+@@ -3400,6 +2955,7 @@ fn publish_generated_prefix(
                  domain,
                  new_boundary as u64,
                  &tokens,
@@ -36321,7 +36758,7 @@ index 82fbdd9cd..708124aee 100644
                  &rig.model.dn_states[s],
              ) {
                  Ok(id) if id.is_some() => Some(id),
-@@ -3494,6 +3031,20 @@ fn commit_sampled_token(
+@@ -3494,6 +3050,20 @@ fn commit_sampled_token(
          // instead of a successful done (spec §7.1 G1, A17). ClientGone is
          // never overridden: the receiver is already dropped.
          lock_stats(stats).note_slot_released();
@@ -36342,7 +36779,7 @@ index 82fbdd9cd..708124aee 100644
          if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
              let _ = send_event(
                  &f.reply,
-@@ -3521,11 +3072,28 @@ fn commit_sampled_token(
+@@ -3521,11 +3091,32 @@ fn commit_sampled_token(
          // the fairness budget (spec §5.3 S3). Idempotent (NotFound ignored).
          let _ = rig.fair_queue.remove(session.0);
          clear_work_slot(&mut work[s]);
@@ -36359,8 +36796,12 @@ index 82fbdd9cd..708124aee 100644
 +            // Nobody will follow up on a vanished client, so hand the slot
 +            // back at once.
              rig.swap.forget(session.0);
++            self::kvmem_hooks::drop_idle_dn(rig, s);
              rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
          } else {
++            // S2: between turns the recurrent state may leave the device. The
++            // exact host image is reinstalled by the next continuation.
++            self::kvmem_hooks::demote_idle_dn(rig, s, session);
 +            // Keep the session resident so its next turn can extend it in
 +            // place. Under KVMem that reuse is the whole KV: the trunk pages
 +            // (resident plus spilled payloads and their row statistics in
@@ -36371,7 +36812,7 @@ index 82fbdd9cd..708124aee 100644
              rig.sessions.touch(session);
          }
      } else {
-@@ -3537,14 +3105,81 @@ fn commit_sampled_token(
+@@ -3537,11 +3128,78 @@ fn commit_sampled_token(
      }
  }
  
@@ -36381,9 +36822,6 @@ index 82fbdd9cd..708124aee 100644
 -/// Telemetry only: if the engine thread ever panicked while holding the
 -/// lock, a poisoning `expect` here would panic the CALLER's thread (HTTP
 -/// handler) on the next stats read — turning a contained engine fault into
--/// a serve-wide failure. The counters stay readable after a poison.
--fn lock_stats(stats: &std::sync::Mutex<EngineStats>) -> std::sync::MutexGuard<'_, EngineStats> {
--    stats.lock().unwrap_or_else(|p| p.into_inner())
 +/// Think-recovery control plane: the daemon asks for the pass to end between
 +/// tokens (closed-think continuation / reasoning-loop recovery), then starts a
 +/// follow-up pass whose prompt extends the accepted token stream. The mirror of
@@ -36454,13 +36892,10 @@ index 82fbdd9cd..708124aee 100644
 +/// Telemetry only: if the engine thread ever panicked while holding the
 +/// lock, a poisoning `expect` here would panic the CALLER's thread (HTTP
 +/// handler) on the next stats read — turning a contained engine fault into
-+/// a serve-wide failure. The counters stay readable after a poison.
-+fn lock_stats(stats: &std::sync::Mutex<EngineStats>) -> std::sync::MutexGuard<'_, EngineStats> {
-+    stats.lock().unwrap_or_else(|p| p.into_inner())
- }
- 
- /// Swap failures are not fatal (the session re-prefills), but they must not be
-@@ -3602,6 +3237,17 @@ struct InFlight {
+ /// a serve-wide failure. The counters stay readable after a poison.
+ fn lock_stats(stats: &std::sync::Mutex<EngineStats>) -> std::sync::MutexGuard<'_, EngineStats> {
+     stats.lock().unwrap_or_else(|p| p.into_inner())
+@@ -3602,6 +3260,17 @@ struct InFlight {
      /// that shared pages from a prefix cache hit are not re-published.
      /// 0 when prefix_cache is off.
      last_published_boundary: usize,
@@ -36478,7 +36913,7 @@ index 82fbdd9cd..708124aee 100644
      /// Per-request grammar constraint for structured output (spec §7 G1/G2).
      /// `None` for unconstrained requests. When present, a grammar mask is
      /// applied to the slot's logits row BEFORE the GPU sampler's
-@@ -3926,6 +3572,11 @@ fn run_loop(
+@@ -3926,6 +3595,11 @@ fn run_loop(
  ) -> Result<(), String> {
      let n = rig.n_slots;
      let mut slots: Vec<Option<InFlight>> = (0..n).map(|_| None).collect();
@@ -36490,7 +36925,7 @@ index 82fbdd9cd..708124aee 100644
      let mut work: Vec<PendingWork> = (0..n)
          .map(|s| PendingWork {
              slot: SlotId(s),
-@@ -3934,9 +3585,7 @@ fn run_loop(
+@@ -3934,9 +3608,7 @@ fn run_loop(
              decoding: false,
              vl_prefill: None,
              spec: SpecKind::None,
@@ -36501,7 +36936,7 @@ index 82fbdd9cd..708124aee 100644
              pos3_delta: 0,
          })
          .collect();
-@@ -3969,6 +3618,13 @@ fn run_loop(
+@@ -3969,6 +3641,13 @@ fn run_loop(
                  rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
                  let _ = rig.fair_queue.remove(sid.0);
                  clear_work_slot(&mut work[s]);
@@ -36515,7 +36950,7 @@ index 82fbdd9cd..708124aee 100644
                  rig.model.clear_slot_vl_state(&mut rig.gpu, s);
              }
          }
-@@ -3997,9 +3653,16 @@ fn run_loop(
+@@ -3997,9 +3676,16 @@ fn run_loop(
                          .max(std::time::Duration::from_secs(1))
                  }) {
                      Some(wait) => match rx.recv_timeout(wait) {
@@ -36534,7 +36969,7 @@ index 82fbdd9cd..708124aee 100644
                              let mut st = stats.lock().expect("stats");
                              st.note_swap(&rig.swap);
                              drop(st);
-@@ -4008,14 +3671,28 @@ fn run_loop(
+@@ -4008,14 +3694,28 @@ fn run_loop(
                          Err(RecvTimeoutError::Disconnected) => break 'serve,
                      },
                      None => match rx.recv() {
@@ -36565,7 +37000,7 @@ index 82fbdd9cd..708124aee 100644
                      Err(TryRecvError::Empty) => break,
                      Err(TryRecvError::Disconnected) => {
                          if slots.iter().all(|s| s.is_none()) {
-@@ -4037,8 +3714,13 @@ fn run_loop(
+@@ -4037,8 +3737,13 @@ fn run_loop(
                  if let Some(pp) = rig.pool.page_pool() {
                      st.note_pool_pages(pp.free_pages(), pp.n_pages());
                  }
@@ -36579,7 +37014,7 @@ index 82fbdd9cd..708124aee 100644
              // Expire timed-out waiters → typed queue timeout rejection. The
              // deadline is WALL-CLOCK (`serve.queue_timeout_ms` against the
              // enqueue Instant), not a tick count: ticks advance once per serve
-@@ -4094,7 +3776,7 @@ fn run_loop(
+@@ -4094,7 +3799,7 @@ fn run_loop(
                  };
                  let active_before = slots.iter().filter(|s| s.is_some()).count();
                  rig.pending_repark_age = Some(parked.enqueued_at);
@@ -36588,7 +37023,7 @@ index 82fbdd9cd..708124aee 100644
                  rig.pending_repark_age = None;
                  let active_after = slots.iter().filter(|s| s.is_some()).count();
                  // If admit did not place the request in a slot (it may have
-@@ -4125,12 +3807,39 @@ fn run_loop(
+@@ -4125,12 +3830,39 @@ fn run_loop(
                      .min()
                      .unwrap_or(std::time::Duration::from_millis(50));
                  match rx.recv_timeout(sleep_for) {
@@ -36629,7 +37064,7 @@ index 82fbdd9cd..708124aee 100644
              // Slot occupancy for this step, after admission. Each terminal
              // below releases its slot in the stats BEFORE posting its event,
              // so the snapshot a `done` reads counts only slots still busy.
-@@ -4296,11 +4005,12 @@ fn run_loop(
+@@ -4296,11 +4028,12 @@ fn run_loop(
                          let seed = work[s].remaining_prompt.last().copied();
                          // Token penalties scope the verify rows against this
                          // request's emitted history (`sess.tokens` past the
@@ -36646,7 +37081,7 @@ index 82fbdd9cd..708124aee 100644
                                      .as_ref()
                                      .filter(|c| c.sampling.penalized())
                                      .map(|c| c.prompt_len);
-@@ -4318,13 +4028,23 @@ fn run_loop(
+@@ -4318,13 +4051,23 @@ fn run_loop(
                              _ => Vec::new(),
                          };
                          let outcome = match work[s].spec {
@@ -36675,7 +37110,7 @@ index 82fbdd9cd..708124aee 100644
                                  .map(SpecDraftRows::Dflash),
                              SpecKind::None => {
                                  unreachable!("spec.active() gate above")
-@@ -4332,6 +4052,12 @@ fn run_loop(
+@@ -4332,6 +4075,12 @@ fn run_loop(
                          };
                          match outcome {
                              Ok(draft) => {
@@ -36688,7 +37123,7 @@ index 82fbdd9cd..708124aee 100644
                                  spec_seeds[s] = seed;
                                  spec_drafts[s] = Some(draft);
                              }
-@@ -4487,11 +4213,30 @@ fn run_loop(
+@@ -4487,11 +4236,30 @@ fn run_loop(
                      eligible[s] = granted_ids.contains(&f.session.0);
                  }
              }
@@ -36720,7 +37155,7 @@ index 82fbdd9cd..708124aee 100644
              );
  
              // Count prefill + decode rows the scheduler emitted.
-@@ -4602,6 +4347,29 @@ fn run_loop(
+@@ -4602,6 +4370,29 @@ fn run_loop(
              if batch.is_empty() {
                  continue;
              }
@@ -36750,7 +37185,7 @@ index 82fbdd9cd..708124aee 100644
              // Provision every slot's write frontier before any COW or kernel work.
              // If retained cache-only pages consumed the free list, evict unpinned
              // radix leaves and retry once. `forward_batch_slots` repeats this call
-@@ -4889,11 +4657,55 @@ fn run_loop(
+@@ -4889,11 +4680,55 @@ fn run_loop(
                  work[s].spec == SpecKind::Dflash
                      && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
              });
@@ -36806,7 +37241,7 @@ index 82fbdd9cd..708124aee 100644
              let fwd = rig.model.forward_step(
                  &mut rig.gpu,
                  &batch,
-@@ -4902,6 +4714,7 @@ fn run_loop(
+@@ -4902,6 +4737,7 @@ fn run_loop(
                  &lm_head_skip,
                  any_verify,
                  any_dflash_rows,
@@ -36814,7 +37249,7 @@ index 82fbdd9cd..708124aee 100644
              );
              let forward_ns = t_forward.elapsed().as_nanos() as u64;
              // ── Publication (spec §4.6 C6) ──────────────────────────────────
-@@ -5020,6 +4833,7 @@ fn run_loop(
+@@ -5020,6 +4856,7 @@ fn run_loop(
                                      domain,
                                      new_boundary as u64,
                                      &tokens,
@@ -36822,7 +37257,7 @@ index 82fbdd9cd..708124aee 100644
                                      &rig.model.dn_states[s],
                                  ) {
                                      Ok(id) if id.is_some() => Some(id),
-@@ -5102,6 +4916,28 @@ fn run_loop(
+@@ -5102,6 +4939,28 @@ fn run_loop(
                  poison = Some(reason);
                  break 'serve;
              }
@@ -36851,7 +37286,7 @@ index 82fbdd9cd..708124aee 100644
              if check_pool_invariants {
                  if let Some(pp) = rig.pool.page_pool() {
                      pp.check_invariants();
-@@ -5115,6 +4951,30 @@ fn run_loop(
+@@ -5115,6 +4974,30 @@ fn run_loop(
              if let Some(pp) = rig.pool.page_pool_mut() {
                  pp.drain_completed();
              }
@@ -36882,7 +37317,7 @@ index 82fbdd9cd..708124aee 100644
              // Penalty windows: for each slot whose request carries non-neutral
              // token penalties, clamp the requested window to what the session
              // actually holds and upload that tail (most recent last). The kernel
-@@ -5380,6 +5240,17 @@ fn run_loop(
+@@ -5380,6 +5263,17 @@ fn run_loop(
              let t_emit = std::time::Instant::now();
  
              for s in 0..n {
@@ -36900,7 +37335,7 @@ index 82fbdd9cd..708124aee 100644
                  // Spec verify/accept: process slots that produced draft outputs.
                  if let Some(draft) = spec_drafts[s].take() {
                      if slots[s].is_none() {
-@@ -5432,54 +5303,61 @@ fn run_loop(
+@@ -5432,54 +5326,61 @@ fn run_loop(
                      };
                      match accept_outcome {
                          Ok(tokens) => {
@@ -37003,7 +37438,7 @@ index 82fbdd9cd..708124aee 100644
                                      }
                                  }
                              }
-@@ -5676,6 +5554,20 @@ fn run_loop(
+@@ -5676,6 +5577,20 @@ fn run_loop(
                      // G1, A17). ClientGone is never overridden: the receiver is
                      // already dropped.
                      lock_stats(&stats).note_slot_released();
@@ -37024,7 +37459,7 @@ index 82fbdd9cd..708124aee 100644
                      if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
                          let _ = send_event(
                              &f.reply,
-@@ -5704,6 +5596,14 @@ fn run_loop(
+@@ -5704,6 +5619,14 @@ fn run_loop(
                      // publish_generated_prefix never publishes a page whose
                      // rows were not written.
                      publish_generated_prefix(&mut rig, &mut slots, s, work[s].next_pos);
@@ -37039,7 +37474,7 @@ index 82fbdd9cd..708124aee 100644
                      // Hand the slot back — the session stays resident for
                      // continuation, but slot occupancy must end at terminal
                      // (matching commit_sampled_token). Wave 8's unpin edit
-@@ -5713,6 +5613,17 @@ fn run_loop(
+@@ -5713,17 +5636,35 @@ fn run_loop(
                      slots[s] = None;
                      let _ = rig.fair_queue.remove(session.0);
                      clear_work_slot(&mut work[s]);
@@ -37057,14 +37492,18 @@ index 82fbdd9cd..708124aee 100644
                      rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                      if matches!(reason, DoneReason::ClientGone) {
                          // Nobody will follow up on a vanished client, so hand the
-@@ -5720,10 +5631,13 @@ fn run_loop(
+                         // slot back at once.
                          rig.swap.forget(session.0);
++                        self::kvmem_hooks::drop_idle_dn(&mut rig, s);
                          rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
                      } else {
 -                        // state are exactly what a follow-up turn continuing this
 -                        // conversation needs; closing here is what made multi-turn
 -                        // reuse impossible. LRU eviction reclaims the slot when
 -                        // someone else needs it.
++                        // S2: release the idle recurrent state to its exact
++                        // host image; the next continuation reinstalls it.
++                        self::kvmem_hooks::demote_idle_dn(&mut rig, s, session);
 +                        // Keep the session resident: the trunk KV (under KVMem
 +                        // including the host store's statistics and spilled
 +                        // pages), DeltaNet and MTP head state are exactly what a
@@ -37075,7 +37514,7 @@ index 82fbdd9cd..708124aee 100644
                          rig.sessions.touch(session);
                      }
                  } else {
-@@ -5741,6 +5655,15 @@ fn run_loop(
+@@ -5741,6 +5682,15 @@ fn run_loop(
                      rig.sessions.touch(session);
                  }
              }
@@ -37091,7 +37530,7 @@ index 82fbdd9cd..708124aee 100644
              let emit_ns = t_emit.elapsed().as_nanos() as u64;
              let total_ns = t_step.elapsed().as_nanos() as u64;
              if hipfire_dispatch::moe_trace_enabled() {
-@@ -5805,6 +5728,7 @@ fn run_loop(
+@@ -5805,6 +5755,7 @@ fn run_loop(
          (None, Err(e)) => Err(e),
      }
  }
@@ -37099,7 +37538,7 @@ index 82fbdd9cd..708124aee 100644
  fn should_retain_terminal_tok(reason: DoneReason) -> bool {
      matches!(reason, DoneReason::MaxTokens)
  }
-@@ -5824,6 +5748,7 @@ fn handle_command(
+@@ -5824,6 +5775,7 @@ fn handle_command(
      slots: &mut [Option<InFlight>],
      work: &mut [PendingWork],
      stats: &Arc<Mutex<EngineStats>>,
@@ -37107,7 +37546,7 @@ index 82fbdd9cd..708124aee 100644
      cmd: EngineCommand,
  ) {
      match cmd {
-@@ -5860,7 +5785,7 @@ fn handle_command(
+@@ -5860,7 +5812,7 @@ fn handle_command(
                      }
                  }
              } else {
@@ -37116,7 +37555,7 @@ index 82fbdd9cd..708124aee 100644
              }
          }
          EngineCommand::CancelWaiting { request_tag } => {
-@@ -5903,6 +5828,11 @@ fn handle_command(
+@@ -5903,6 +5855,11 @@ fn handle_command(
                      drop(inflight.reply);
                  }
                  clear_work_slot(&mut work[idx]);
@@ -37128,7 +37567,7 @@ index 82fbdd9cd..708124aee 100644
                  rig.model.clear_slot_vl_state(&mut rig.gpu, idx);
                  let _ = rig.fair_queue.remove(session);
              }
-@@ -5910,6 +5840,22 @@ fn handle_command(
+@@ -5910,6 +5867,22 @@ fn handle_command(
              rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
              let _ = reply.send(Ok(()));
          }
@@ -37151,7 +37590,7 @@ index 82fbdd9cd..708124aee 100644
          EngineCommand::Reset { reply } => {
              if slots.iter().any(|s| s.is_some()) {
                  let _ = reply.send(Err("reset rejected: requests in flight".to_string()));
-@@ -5927,6 +5873,27 @@ fn handle_command(
+@@ -5927,6 +5900,27 @@ fn handle_command(
                  rig.sessions
                      .close(&mut rig.pool, &mut rig.adm, SessionId(id));
              }
@@ -37179,7 +37618,7 @@ index 82fbdd9cd..708124aee 100644
              // Drop prefix cache state so subsequent lookups miss (spec §4.6).
              // The radix index owns cache leases taken at publication: it
              // MUST release them into the pool before being replaced, or
-@@ -6043,1546 +6010,101 @@ fn sync_fair_needs(
+@@ -6043,1546 +6037,101 @@ fn sync_fair_needs(
      let _ = q.set_uncached_prefill(id, uncached);
  }
  
@@ -38816,7 +39255,7 @@ index 82fbdd9cd..708124aee 100644
          }
      }
  
-@@ -7669,7 +6191,7 @@ mod tests {
+@@ -7669,7 +6218,7 @@ mod tests {
      /// exact joint acceptance is implemented and validated").
      #[test]
      fn grammar_constrained_requests_select_ar_not_mtp() {
@@ -38825,7 +39264,7 @@ index 82fbdd9cd..708124aee 100644
          // req.json_schema is Some. This test documents the invariant: a
          // grammar-constrained request must NOT activate MTP.
          let grammar_constrained = true;
-@@ -8324,3 +6846,49 @@ mod mtp_spill_decline_tests {
+@@ -8324,3 +6873,49 @@ mod mtp_spill_decline_tests {
          assert_eq!(slot_mtp_k(MtpMode::On, 0, false), 0);
      }
  }
@@ -38877,10 +39316,10 @@ index 82fbdd9cd..708124aee 100644
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_admit.rs b/crates/hipfire-arch-qwen35/src/serve_engine_admit.rs
 new file mode 100644
-index 000000000..0d2cbd401
+index 000000000..6c729a80f
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_admit.rs
-@@ -0,0 +1,1817 @@
+@@ -0,0 +1,1820 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -40425,6 +40864,9 @@ index 000000000..0d2cbd401
 +            }
 +        }
 +    }
++    // S2: a cold admit never installs a stale idle recurrent image; the
++    // prefix/cold path will build the new state itself.
++    kvmem_hooks::drop_idle_dn(rig, slot.0);
 +    rig.sample_params[slot.0] = sample_params;
 +    // A prefix-cache hit's shared pages are already radix-owned up to
 +    // `reused`; seed both the session and the InFlight so this request's
@@ -40700,10 +41142,10 @@ index 000000000..0d2cbd401
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 new file mode 100644
-index 000000000..ec4572785
+index 000000000..441815227
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-@@ -0,0 +1,4026 @@
+@@ -0,0 +1,4067 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -41418,7 +41860,7 @@ index 000000000..ec4572785
 +            crate::dflash_slot::dflash_abandon_inflight(&mut rig.gpu, st);
 +        }
 +    }
-+    let image = match capture_legacy_native_image(rig, slot.0, run_kind) {
++    let mut image = match capture_legacy_native_image(rig, slot.0, run_kind) {
 +        Ok(image) => image,
 +        Err(e) => {
 +            eprintln!(
@@ -41434,6 +41876,38 @@ index 000000000..ec4572785
 +            }
 +        }
 +    };
++    // S2: an idle slot's recurrent state is a host image, not device scratch.
++    // Move those exact bytes into the native-history image (the catalog then
++    // becomes their only owner); a stale/missing idle image cannot be parked.
++    if rig.model.dn_states[slot.0].is_empty() {
++        match rig.model.dn_idle_images[slot.0].take() {
++            Some(idle)
++                if idle.session == session
++                    && idle.frontier as usize == image.store.frontier as usize =>
++            {
++                image.dn = idle.bytes;
++                eprintln!(
++                    "[kvmem-legacy] HistoryPark slot={} dn_idle=1 bytes={}",
++                    slot.0,
++                    image.dn.len()
++                );
++            }
++            Some(_) => {
++                eprintln!(
++                    "[kvmem-legacy] HistoryPark slot={} idle DN image mismatch at frontier {}; skipped",
++                    slot.0, image.store.frontier
++                );
++                return Ok(None);
++            }
++            None => {
++                eprintln!(
++                    "[kvmem-legacy] HistoryPark slot={} parked DN state unavailable at frontier {}; skipped",
++                    slot.0, image.store.frontier
++                );
++                return Ok(None);
++            }
++        }
++    }
 +    if image.store.frontier == 0 {
 +        return Ok(None);
 +    }
@@ -41443,6 +41917,7 @@ index 000000000..ec4572785
 +        .ok_or("kvmem: history image size overflow")?;
 +    let source = image.store.frontier as usize;
 +    let payload = image.store.payload_bytes();
++    let image_dn_bytes = image.dn.len();
 +    let catalog = rig
 +        .legacy_history
 +        .as_mut()
@@ -41520,6 +41995,14 @@ index 000000000..ec4572785
 +        }
 +        eprintln!(
 +            "[kvmem-legacy] HistoryPark slot={} dn_freed=1 bytes={dn_bytes}",
++            slot.0
++        );
++    } else {
++        // The idle image already left the device and is now owned by the
++        // catalog publication; only its handle moves here.
++        rig.model.dn_images[slot.0] = Some(crate::kvmem_ctl::StateImageId::new(publication.id));
++        eprintln!(
++            "[kvmem-legacy] HistoryPark slot={} dn_idle_owned=1 bytes={image_dn_bytes}",
 +            slot.0
 +        );
 +    }
@@ -44732,10 +45215,10 @@ index 000000000..ec4572785
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 new file mode 100644
-index 000000000..4c0aa63da
+index 000000000..8bafb212e
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
-@@ -0,0 +1,836 @@
+@@ -0,0 +1,1020 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -44744,6 +45227,8 @@ index 000000000..4c0aa63da
 +// engine calls these hooks unconditionally; feature builds delegate to the
 +// KVMem implementation, while stock builds compile to explicit no-ops.
 +
++#[cfg(feature = "kvmem")]
++use super::IdleDnImage;
 +use super::{convo_group, EngineConfig, InFlight, ModelRig, Rig, SpecDraftRows};
 +use hipfire_runtime::scheduler::{PendingWork, Scheduler};
 +use hipfire_runtime::serve::{EngineStats, SubmitRequest};
@@ -45023,6 +45508,11 @@ index 000000000..4c0aa63da
 +        if !super::kvmem_enabled(rig) {
 +            return Ok(());
 +        }
++        // S2: an idle session may have released its recognisable recurrent
++        // state. Install it before any truncation/forward decision; a mismatch
++        // drops the image, and an empty slot below a nonzero frontier is
++        // refused rather than decoded against a parked state.
++        let _ = restore_idle_dn(rig, slot.0, existing, reused, extended)?;
 +        // A continuation resuming below the stored frontier truncates only
 +        // when a DeltaNet checkpoint at exactly that frontier pairs with it.
 +        if rig.kvmem_prefix_pin {
@@ -45070,6 +45560,14 @@ index 000000000..4c0aa63da
 +                    }
 +                }
 +            }
++        }
++        // An idle demotion without a matching image (or a failed truncation
++        // checkpoint restore) must never decode against a parked tombstone.
++        if reused > 0 && rig.model.dn_states[slot.0].is_empty() {
++            return Err(
++                "kvmem continuation: DeltaNet state is parked without a matching idle image"
++                    .to_string(),
++            );
 +        }
 +        let _ = rig.model.kvmem.as_mut().map(|ctl| {
 +            ctl.set_request_query(slot.0, req.query)
@@ -45124,6 +45622,7 @@ index 000000000..4c0aa63da
 +                );
 +            }
 +            rig.swap.forget(victim.0);
++            drop_idle_dn_session(rig, victim);
 +            rig.sessions.close(&mut rig.pool, &mut rig.adm, victim);
 +            true
 +        } else {
@@ -45525,14 +46024,23 @@ index 000000000..4c0aa63da
 +            // images. Count entries and charge their DN/draft payloads from
 +            // the images themselves; the slot handles are only locators and
 +            // are cleared when a slot is reused for a different request.
++            let mut idle_images = 0u32;
++            let mut idle_bytes = 0u64;
++            for image in rig.model.dn_idle_images.iter().flatten() {
++                idle_images = idle_images.saturating_add(1);
++                idle_bytes = idle_bytes.saturating_add(image.bytes.len() as u64);
++            }
 +            if let Some(catalog) = rig.legacy_history.as_ref() {
-+                snapshot.state_images = catalog.len() as u32;
-+                let mut host_bytes = 0u64;
++                snapshot.state_images = (catalog.len() as u32).saturating_add(idle_images);
++                let mut host_bytes = idle_bytes;
 +                for image in catalog.values() {
 +                    host_bytes =
 +                        host_bytes.saturating_add(image.auxiliary_bytes().unwrap_or(0) as u64);
 +                }
 +                snapshot.state_host_bytes = host_bytes;
++            } else {
++                snapshot.state_images = idle_images;
++                snapshot.state_host_bytes = idle_bytes;
 +            }
 +            stats.note_kvmem(snapshot);
 +        }
@@ -45540,6 +46048,165 @@ index 000000000..4c0aa63da
 +    #[cfg(not(feature = "kvmem"))]
 +    {
 +        let _ = (rig, stats);
++    }
++}
++
++/// S2 (`HIPFIRE_KVMEM_DN_IDLE`): release the recurrent state of a session that
++/// just finished a turn. Active decode cannot be paged by token, so the whole
++/// state is exported once and the slot keeps a tombstone until the next turn.
++pub(super) fn demote_idle_dn(rig: &mut Rig, slot: usize, session: SessionId) {
++    #[cfg(feature = "kvmem")]
++    {
++        let Some(ctl) = rig.model.kvmem.as_ref() else {
++            return;
++        };
++        if !ctl.dn_idle_enabled() || rig.model.dn_states[slot].is_empty() {
++            return;
++        }
++        let Some(frontier) = ctl.fed_tokens(slot).filter(|f| *f > 0) else {
++            return;
++        };
++        let Some(sess) = rig.sessions.get(session) else {
++            return;
++        };
++        if sess.tokens.len() < frontier as usize {
++            return;
++        }
++        let media = sess.media_digest.filter(|_| sess.has_image);
++        let fp =
++            crate::checkpoint::checkpoint_fingerprint(&sess.tokens[..frontier as usize], media);
++        let bytes = match crate::speculative::DeltaNetSnapshot::export_host_from_state(
++            &rig.gpu,
++            &rig.model.dn_states[slot],
++        ) {
++            Ok(bytes) => bytes,
++            Err(e) => {
++                eprintln!("[kvmem-dn] idle demote slot={slot} export failed: {e}");
++                return;
++            }
++        };
++        if bytes.is_empty() {
++            return;
++        }
++        let host_bytes = bytes.len() as u64;
++        let quant = rig.model.dn_states[slot].quant;
++        let live = std::mem::replace(
++            &mut rig.model.dn_states[slot],
++            crate::qwen35::DeltaNetState::empty(quant),
++        );
++        let _ = live.free_gpu(&mut rig.gpu);
++        rig.model.dn_idle_images[slot] = Some(IdleDnImage {
++            session,
++            frontier,
++            fp,
++            bytes,
++        });
++        if let Some(ctl) = rig.model.kvmem.as_mut() {
++            ctl.note_state_demotion(host_bytes);
++        }
++        eprintln!(
++            "[kvmem-dn] idle demote slot={slot} session={} frontier={frontier} bytes={host_bytes}",
++            session.0
++        );
++    }
++    #[cfg(not(feature = "kvmem"))]
++    {
++        let _ = (rig, slot, session);
++    }
++}
++
++/// Drop a slot's idle DN image without installing it (cold reuse, eviction, or
++/// a vanished client).
++pub(super) fn drop_idle_dn(rig: &mut Rig, slot: usize) {
++    #[cfg(feature = "kvmem")]
++    {
++        rig.model.dn_idle_images[slot] = None;
++    }
++    #[cfg(not(feature = "kvmem"))]
++    {
++        let _ = (rig, slot);
++    }
++}
++
++/// Drop every idle image owned by `session` (session sweep / close).
++pub(super) fn drop_idle_dn_session(rig: &mut Rig, session: SessionId) {
++    #[cfg(feature = "kvmem")]
++    {
++        for image in &mut rig.model.dn_idle_images {
++            if image.as_ref().is_some_and(|i| i.session == session) {
++                *image = None;
++            }
++        }
++    }
++    #[cfg(not(feature = "kvmem"))]
++    {
++        let _ = (rig, session);
++    }
++}
++
++/// S2: install the idle image for the exact frontier a continuation resumes at.
++/// Returns `false` when there is no image or it belongs to another session /
++/// prefix; the caller then follows the normal checkpoint/cold path.
++pub(super) fn restore_idle_dn(
++    rig: &mut Rig,
++    slot: usize,
++    session: SessionId,
++    reused: usize,
++    tokens: &[u32],
++) -> Result<bool, String> {
++    #[cfg(feature = "kvmem")]
++    {
++        let Some(image) = rig.model.dn_idle_images[slot].take() else {
++            return Ok(false);
++        };
++        let media = rig.sessions.get(session).and_then(|s| s.media_digest);
++        let fp = if reused <= tokens.len() {
++            crate::checkpoint::checkpoint_fingerprint(&tokens[..reused], media)
++        } else {
++            0
++        };
++        if image.session != session || image.frontier as usize != reused || image.fp != fp {
++            eprintln!(
++                "[kvmem-dn] idle image dropped slot={slot} session={} image_frontier={} reused={reused}",
++                session.0, image.frontier
++            );
++            return Ok(false);
++        }
++        let quant = rig.model.dn_states[slot].quant;
++        let old = std::mem::replace(
++            &mut rig.model.dn_states[slot],
++            crate::qwen35::DeltaNetState::empty(quant),
++        );
++        let _ = old.free_gpu(&mut rig.gpu);
++        super::kvmem_engine::ensure_dn_live(rig, slot, "restore")?;
++        rig.gpu
++            .hip
++            .device_synchronize()
++            .map_err(|e| format!("kvmem idle restore drain: {e}"))?;
++        let mut snapshot =
++            crate::speculative::DeltaNetSnapshot::new_for(&mut rig.gpu, &rig.model.dn_states[slot])
++                .map_err(|e| format!("kvmem idle restore DN scratch: {e}"))?;
++        snapshot
++            .import_host(&rig.gpu, &image.bytes)
++            .map_err(|e| format!("kvmem idle restore DN image: {e}"))?;
++        snapshot
++            .restore_to(&mut rig.model.dn_states[slot], &mut rig.gpu)
++            .map_err(|e| format!("kvmem idle restore DN copy: {e}"))?;
++        if let Some(ctl) = rig.model.kvmem.as_mut() {
++            ctl.note_state_restore();
++            ctl.note_state_promotion(image.bytes.len() as u64);
++        }
++        eprintln!(
++            "[kvmem-dn] idle restore slot={slot} session={} frontier={reused} bytes={}",
++            session.0,
++            image.bytes.len()
++        );
++        Ok(true)
++    }
++    #[cfg(not(feature = "kvmem"))]
++    {
++        let _ = (rig, slot, session, reused, tokens);
++        Ok(false)
 +    }
 +}
 +
