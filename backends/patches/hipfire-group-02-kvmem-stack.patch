@@ -7079,10 +7079,10 @@ index 000000000..49d566ffa
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy_head.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy_head.rs
 new file mode 100644
-index 000000000..e2c52c2de
+index 000000000..68247649f
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy_head.rs
-@@ -0,0 +1,515 @@
+@@ -0,0 +1,694 @@
 +#![allow(dead_code)]
 +
 +//! Legacy MTP-head paged window (P1b follow-up).
@@ -7115,6 +7115,12 @@ index 000000000..e2c52c2de
 +/// Logical page size of the head KV. Must match `KV_BLOCK_TOKENS` and the
 +/// layerwise page geometry; the head shares the trunk's Q8 row layout.
 +pub const HEAD_PAGE_TOKENS: u32 = 128;
++
++/// Widest accepted span the head plane stages at once: a full prompt prefill
++/// chunk (`HIPFIRE_PREFILL_CHUNK` default 1024, capped at 1024) or an MTP
++/// verify burst (`mtp_k + 1`, ceiling 64). Larger override chunks fall back to
++/// the contiguous path for that chunk.
++const HEAD_STAGE_ROWS: usize = 1024;
 +
 +/// The head's bounded window in LOGICAL pages.
 +///
@@ -7214,14 +7220,15 @@ index 000000000..e2c52c2de
 +    }
 +
 +    /// Physical slot for a logical page in the bounded head cache. The sink is
-+    /// slot 0; window pages use `1 + (page - 1) % window_pages`. The window is
-+    /// contiguous, so this is collision-free for every retained page, and a
-+    /// page keeps its physical slot when the window slides (no byte move).
++    /// slot 0; window pages use `1 + (page - 1) % (window_pages + 1)`. Retained
++    /// pages are collision-free, and the extra modulo slot is the draft's
++    /// spare page (one page beyond the retained frontier). A page keeps its
++    /// physical slot when the window slides, so no retained byte moves.
 +    pub fn physical_slot(&self, page: u32) -> u32 {
 +        if page == self.sink_page() {
 +            0
 +        } else {
-+            1 + (page - 1) % self.window_pages
++            1 + (page - 1) % (self.window_pages + 1)
 +        }
 +    }
 +
@@ -7267,10 +7274,23 @@ index 000000000..e2c52c2de
 +        page == self.sink_page() || self.pages.iter().any(|&p| p == page)
 +    }
 +
++    /// Compact-frame offset of `page`, or `None` when the page is not mapped.
++    /// The sink is compact 0; the retained window follows it oldest first.
++    pub fn compact_index(&self, page: u32) -> Option<u32> {
++        if page == self.sink_page() {
++            return Some(0);
++        }
++        let first = self.first_window_page()?;
++        if !self.contains(page) {
++            return None;
++        }
++        Some(HEAD_PAGE_TOKENS + (page - first) * HEAD_PAGE_TOKENS)
++    }
++
 +    /// Largest token count the bounded cache can address in the compact frame:
-+    /// the sink plus every retained window page, fully populated.
++    /// the sink, every retained window page, and the draft's spare page.
 +    pub fn capacity_tokens(&self) -> u32 {
-+        (self.window_pages + 1) * HEAD_PAGE_TOKENS
++        (self.window_pages + 2) * HEAD_PAGE_TOKENS
 +    }
 +}
 +
@@ -7292,9 +7312,17 @@ index 000000000..e2c52c2de
 +    v_view: GpuTensor,
 +    rope_pos: DeviceBuffer,
 +    visible: u32,
++    /// Frontier whose accepted rows this arena already holds. `restore` may
++    /// skip the archive copy when the caller asks for exactly this frontier
++    /// (the normal verify -> next draft path).
++    synced_frontier: Option<u32>,
 +    /// Last compact page reported by `restore`, so E2E logs prove the paged
 +    /// path (not the contiguous fallback) served a frontier.
 +    reported_page: u32,
++    /// Last page reported by a successful `mark_filled`.
++    reported_fill_page: u32,
++    /// `HIPFIRE_KVMEM_TRACE` diagnostics (the normal path is silent).
++    trace: bool,
 +}
 +
 +impl LegacyHeadPlane {
@@ -7311,10 +7339,12 @@ index 000000000..e2c52c2de
 +        let window = LegacyHeadWindow::new(window_pages)?;
 +        let layout = LayerwiseQ8Layout::resolve(kv_mode, 1, n_kv_heads, head_dim, &[0])
 +            .map_err(|e| format!("legacy head plane layout: {e}"))?;
-+        let capacity = (window_pages + 1) as usize;
++        // Sink + retained window + one draft spare page.
++        let capacity = (window_pages + 2) as usize;
 +        let mut arena = LayerwiseArena::new(gpu, &layout, capacity)
 +            .map_err(|e| format!("legacy head plane arena: {e}"))?;
-+        let staging = match LayerwiseDescStaging::new(gpu, 1, capacity) {
++        let staging = match LayerwiseDescStaging::new_with_width(gpu, 1, capacity, HEAD_STAGE_ROWS)
++        {
 +            Ok(s) => s,
 +            Err(e) => {
 +                let _ = arena.free(gpu);
@@ -7370,12 +7400,28 @@ index 000000000..e2c52c2de
 +            v_view,
 +            rope_pos,
 +            visible: 0,
++            synced_frontier: None,
 +            reported_page: u32::MAX,
++            reported_fill_page: u32::MAX,
++            trace: std::env::var("HIPFIRE_KVMEM_TRACE")
++                .map(|v| !v.is_empty() && v != "0")
++                .unwrap_or(false),
 +        })
 +    }
 +
 +    pub fn window(&self) -> &LegacyHeadWindow {
 +        &self.window
++    }
++
++    /// Compact-position → physical arena slot. Each logical page keeps the
++    /// slot [`LegacyHeadWindow::physical_slot`] assigns it, so a window slide
++    /// only changes the table order; no retained page's bytes move.
++    fn compact_phys_slots(&self) -> Vec<u32> {
++        self.window
++            .compact_pages()
++            .into_iter()
++            .map(|page| self.slots[self.window.physical_slot(page) as usize].phys)
++            .collect()
 +    }
 +
 +    /// Rebuild the arena's sink + recent window from the composite aux plane.
@@ -7388,8 +7434,22 @@ index 000000000..e2c52c2de
 +        slot: usize,
 +        frontier: u32,
 +    ) -> Result<(), String> {
++        // The verify/prefill fill writes accepted rows straight into this
++        // arena (`stage_rows` + `mark_filled`), so the next draft usually
++        // asks for the exact frontier already resident. Copying the append
++        // pages back from the archive would undo that work.
++        if self.synced_frontier == Some(frontier) && self.window.frontier() == frontier {
++            if self.trace {
++                eprintln!(
++                    "[kvmem-head] paged restore hit slot={slot} frontier={frontier} visible={}",
++                    self.visible
++                );
++            }
++            return Ok(());
++        }
 +        self.window.set_frontier(frontier);
 +        self.visible = self.window.visible_tokens();
++        self.synced_frontier = None;
 +        let pages = self.window.compact_pages();
 +        if pages.len() > self.slots.len() {
 +            return Err(format!(
@@ -7402,7 +7462,10 @@ index 000000000..e2c52c2de
 +        let page_tokens = HEAD_PAGE_TOKENS as usize;
 +        let mut k_buf = vec![0u8; page_tokens * k_row];
 +        let mut v_buf = vec![0u8; page_tokens * v_row];
-+        for (idx, &page) in pages.iter().enumerate() {
++        for &page in &pages {
++            // Pages keep their physical slot across window slides, so a
++            // retained page never moves bytes when the window advances.
++            let idx = self.window.physical_slot(page) as usize;
 +            let phys = self.slots[idx].phys;
 +            let resident = self.arena.pool_ref().stripe_page(phys, 0) == Some(page);
 +            // The sink and the last two window pages are append frontiers:
@@ -7446,14 +7509,17 @@ index 000000000..e2c52c2de
 +        }
 +        // Bind exactly the compact pages in the table. Sink first, then the
 +        // retained window oldest-to-newest.
-+        let compact_slots: Vec<u32> = pages
-+            .iter()
-+            .enumerate()
-+            .map(|(idx, _)| self.slots[idx].phys)
-+            .collect();
++        let compact_slots = self.compact_phys_slots();
 +        self.staging
 +            .update_layer(gpu, 0, &compact_slots, None, None, self.visible as i32)
 +            .map_err(|e| format!("legacy head plane table: {e}"))?;
++        if self.visible > 0 {
++            let bounds = [self.visible as i32 - 1];
++            self.staging
++                .upload_positions(gpu, 0, &bounds)
++                .map_err(|e| format!("legacy head plane positions: {e}"))?;
++        }
++        self.synced_frontier = Some(frontier);
 +        let page = self.visible / HEAD_PAGE_TOKENS;
 +        if page != self.reported_page {
 +            self.reported_page = page;
@@ -7468,6 +7534,104 @@ index 000000000..e2c52c2de
 +        Ok(())
 +    }
 +
++    /// Stage an accepted `rows`-token span that begins exactly at the current
++    /// frontier and ends at `frontier_after`. The window is remapped for the
++    /// post-fill frontier (so a span that crosses a page boundary lands in the
++    /// newly mapped page), every destination page must stay resident, and the
++    /// compact write slots are returned with the global-to-compact RoPE shift.
++    /// The caller must call [`Self::mark_filled`] only after the forward
++    /// succeeds; a failed forward leaves the arena un-synced so the next draft
++    /// restores from the archive.
++    pub fn stage_rows(
++        &mut self,
++        gpu: &mut Gpu,
++        start_pos: u32,
++        rows: u32,
++        frontier_after: u32,
++    ) -> Result<HeadPagedKv<'_>, String> {
++        if rows == 0 {
++            return Err("legacy head plane: stage_rows with zero rows".to_string());
++        }
++        if start_pos.checked_add(rows) != Some(frontier_after) {
++            return Err(format!(
++                "legacy head plane: stage_rows span {start_pos}+{rows} != {frontier_after}"
++            ));
++        }
++        let old_frontier = self.window.frontier();
++        let old_visible = self.visible;
++        if start_pos != old_frontier {
++            return Err(format!(
++                "legacy head plane: stage_rows starts at {start_pos}, frontier is {old_frontier}"
++            ));
++        }
++        self.window.set_frontier(frontier_after);
++        let rollback = |this: &mut Self| {
++            this.window.set_frontier(old_frontier);
++            this.visible = old_visible;
++        };
++        let visible = self.window.visible_tokens();
++        let page_tokens = HEAD_PAGE_TOKENS;
++        let start_page = start_pos / page_tokens;
++        let end_page = (frontier_after - 1) / page_tokens;
++        let Some(page_base) = self.window.compact_index(start_page) else {
++            rollback(self);
++            return Err(format!(
++                "legacy head plane: stage start page {start_page} left the window"
++            ));
++        };
++        if !self.window.contains(end_page) {
++            rollback(self);
++            return Err(format!(
++                "legacy head plane: stage end page {end_page} left the window"
++            ));
++        }
++        let compact_start = page_base + start_pos % page_tokens;
++        let Some(end) = compact_start.checked_add(rows) else {
++            rollback(self);
++            return Err("legacy head plane: compact stage span overflow".to_string());
++        };
++        if end != visible || end > self.window.capacity_tokens() {
++            rollback(self);
++            return Err(format!(
++                "legacy head plane: compact span {}..{end} does not end at visible {visible}",
++                compact_start
++            ));
++        }
++        let compact_slots = self.compact_phys_slots();
++        if let Err(e) = self
++            .staging
++            .update_layer(gpu, 0, &compact_slots, None, None, end as i32)
++        {
++            rollback(self);
++            return Err(format!("legacy head plane stage rows: {e}"));
++        }
++        let positions: Vec<i32> = (compact_start..end).map(|p| p as i32).collect();
++        if let Err(e) = self.staging.upload_positions(gpu, 0, &positions) {
++            rollback(self);
++            return Err(format!("legacy head plane stage rows positions: {e}"));
++        }
++        self.visible = visible;
++        self.synced_frontier = None;
++        Ok(self.paged_kv())
++    }
++
++    /// Record that a [`Self::stage_rows`] span reached the archive and the
++    /// arena now holds `frontier` exactly.
++    pub fn mark_filled(&mut self, frontier: u32) {
++        if self.window.frontier() == frontier {
++            self.synced_frontier = Some(frontier);
++            let page = frontier / HEAD_PAGE_TOKENS;
++            if self.trace && page != self.reported_fill_page {
++                self.reported_fill_page = page;
++                eprintln!(
++                    "[kvmem-head] paged fill slot-synced frontier={frontier} visible={} pages={}",
++                    self.visible,
++                    self.window.retained_pages()
++                );
++            }
++        }
++    }
++
 +    /// Advance the descriptor's COMPACT write position for one draft row and
 +    /// return the kernel-facing view. `row` is the 0-based draft row within the
 +    /// chain; the global RoPE position is written separately by the caller.
@@ -7477,16 +7641,27 @@ index 000000000..e2c52c2de
 +            .checked_add(row as u32)
 +            .and_then(|v| v.checked_add(1))
 +            .ok_or("legacy head plane: draft position overflow")?;
-+        let compact_slots: Vec<u32> = self
-+            .window
-+            .compact_pages()
-+            .iter()
-+            .enumerate()
-+            .map(|(idx, _)| self.slots[idx].phys)
-+            .collect();
++        let mut compact_slots = self.compact_phys_slots();
++        // A draft span may start a page the accepted frontier has not reached
++        // yet. The spare physical slot holds exactly that page; appending it
++        // makes the block table cover the whole draft span without evicting a
++        // retained page.
++        let draft_page = (seq_len - 1) / HEAD_PAGE_TOKENS;
++        if !self.window.contains(draft_page) {
++            let phys = self.window.physical_slot(draft_page);
++            let slot = self
++                .slots
++                .get(phys as usize)
++                .ok_or_else(|| format!("legacy head plane: spare slot {phys} missing"))?;
++            compact_slots.push(slot.phys);
++        }
 +        self.staging
 +            .update_layer(gpu, 0, &compact_slots, None, None, seq_len as i32)
 +            .map_err(|e| format!("legacy head plane stage row {row}: {e}"))?;
++        let bounds = [seq_len as i32 - 1];
++        self.staging
++            .upload_positions(gpu, 0, &bounds)
++            .map_err(|e| format!("legacy head plane stage row {row} positions: {e}"))?;
 +        Ok(self.paged_kv())
 +    }
 +
@@ -7567,19 +7742,23 @@ index 000000000..e2c52c2de
 +        let mut w = LegacyHeadWindow::new(4).unwrap();
 +        w.set_frontier(9 * HEAD_PAGE_TOKENS);
 +        let before = w.compact_slots();
-+        assert_eq!(before, vec![0, 1, 2, 3, 4]);
++        assert_eq!(before, vec![0, 5, 1, 2, 3]);
 +        w.advance(HEAD_PAGE_TOKENS);
 +        let after = w.compact_slots();
-+        assert_eq!(after, vec![0, 2, 3, 4, 1]);
-+        // The page that stayed in both windows kept the same slot.
++        assert_eq!(after, vec![0, 1, 2, 3, 4]);
++        // The pages that stayed in both windows kept the same slot.
 +        for page in [6, 7, 8, 9] {
-+            assert_eq!(w.physical_slot(page), 1 + (page - 1) % 4);
++            assert_eq!(w.physical_slot(page), 1 + (page - 1) % 5);
 +        }
++        // The draft's next page uses the spare slot, not a retained one.
++        assert_eq!(w.physical_slot(10), 5);
++        assert!(!w.contains(10));
 +        // All compact slots are distinct (no aliasing in the arena).
 +        let mut slots = after.clone();
 +        slots.sort_unstable();
 +        slots.dedup();
 +        assert_eq!(slots.len(), after.len());
++        assert_eq!(w.capacity_tokens(), (4 + 2) * HEAD_PAGE_TOKENS);
 +    }
 +
 +    #[test]
@@ -16490,10 +16669,10 @@ index 0dbffb184..a7c7b8171 100644
      DeltaNetLayerWeights, DeltaNetMoeLayerWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
 diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
 new file mode 100644
-index 000000000..420a0b54b
+index 000000000..9b9bc74da
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
-@@ -0,0 +1,10111 @@
+@@ -0,0 +1,10145 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -17100,6 +17279,40 @@ index 000000000..420a0b54b
 +        gpu.hip
 +            .memcpy_htod(&self.positions[layer].buf, unsafe {
 +                std::slice::from_raw_parts(bounds.as_ptr() as *const u8, self.width * 4)
++            })
++            .map_err(|e| format!("layerwise desc staging: positions H2D layer {layer}: {e:?}"))?;
++        Ok(())
++    }
++
++    /// Upload explicit compact positions for `layer` (at most `width`).
++    /// [`Self::update_layer`] derives the usual `seq_len - width + i` span; a
++    /// paged window that writes an arbitrary accepted span (frontier fill)
++    /// needs its own compact coordinates instead.
++    pub fn upload_positions(
++        &self,
++        gpu: &mut Gpu,
++        layer: usize,
++        positions: &[i32],
++    ) -> Result<(), String> {
++        let buf = self.positions.get(layer).ok_or_else(|| {
++            format!(
++                "layerwise desc staging: positions layer {layer} >= n_layers {}",
++                self.n_layers
++            )
++        })?;
++        if positions.len() > self.width {
++            return Err(format!(
++                "layerwise desc staging: {} positions > width {}",
++                positions.len(),
++                self.width
++            ));
++        }
++        if positions.is_empty() {
++            return Ok(());
++        }
++        gpu.hip
++            .memcpy_htod(&buf.buf, unsafe {
++                std::slice::from_raw_parts(positions.as_ptr() as *const u8, positions.len() * 4)
 +            })
 +            .map_err(|e| format!("layerwise desc staging: positions H2D layer {layer}: {e:?}"))?;
 +        Ok(())
@@ -31214,19 +31427,20 @@ index b27530321..621e24000 100644
  }
  
 diff --git a/crates/hipfire-arch-qwen35/src/mtp_compose.rs b/crates/hipfire-arch-qwen35/src/mtp_compose.rs
-index ad547338f..a59076785 100644
+index ad547338f..49bd47052 100644
 --- a/crates/hipfire-arch-qwen35/src/mtp_compose.rs
 +++ b/crates/hipfire-arch-qwen35/src/mtp_compose.rs
-@@ -1030,6 +1030,7 @@ pub fn spec_step_dflash_mtp_tree(
+@@ -1030,6 +1030,8 @@ pub fn spec_step_dflash_mtp_tree(
          trunk_weights,
          Some(&state.gemm_rotate_scratch),
          false,
 +        /* rope_shift */ 0,
++        None,
      )?;
  
      // ── 3. Batched MTP lm_head + top-K extraction ─────────────────────────
 diff --git a/crates/hipfire-arch-qwen35/src/mtp_dense_tp.rs b/crates/hipfire-arch-qwen35/src/mtp_dense_tp.rs
-index 8d6ec27ff..661d67eb5 100644
+index 8d6ec27ff..88acab190 100644
 --- a/crates/hipfire-arch-qwen35/src/mtp_dense_tp.rs
 +++ b/crates/hipfire-arch-qwen35/src/mtp_dense_tp.rs
 @@ -235,6 +235,7 @@ impl MtpTpRuntime {
@@ -31247,16 +31461,17 @@ index 8d6ec27ff..661d67eb5 100644
          )
          .map_err(|e| format!("dense TP MTP draft: {e}"))?
      };
-@@ -781,6 +785,7 @@ pub fn prefill_trunk_and_mtp_cache_dense_tp(
+@@ -781,6 +785,8 @@ pub fn prefill_trunk_and_mtp_cache_dense_tp(
                          &target.weights[0],
                          Some(rot),
                          true,
 +                        /* rope_shift */ 0,
++                        None,
                      )
                      .map_err(|e| format!("dense TP MTP batched head fill: {e}"))?;
                  }
 diff --git a/crates/hipfire-arch-qwen35/src/mtp_head.rs b/crates/hipfire-arch-qwen35/src/mtp_head.rs
-index 1485fcb61..905c34941 100644
+index 1485fcb61..29671fe59 100644
 --- a/crates/hipfire-arch-qwen35/src/mtp_head.rs
 +++ b/crates/hipfire-arch-qwen35/src/mtp_head.rs
 @@ -64,7 +64,9 @@ use hip_bridge::{DeviceBuffer, HipError, HipResult};
@@ -31549,7 +31764,7 @@ index 1485fcb61..905c34941 100644
              q: &scratch.q,
              k: &scratch.k,
              v: &scratch.v,
-@@ -3446,6 +3600,13 @@ pub fn mtp_head_forward_block_batched(
+@@ -3446,6 +3600,18 @@ pub fn mtp_head_forward_block_batched(
      trunk_weights: &Qwen35Weights,
      rotated_x_scratch: Option<&GpuTensor>,
      kv_only: bool,
@@ -31560,10 +31775,31 @@ index 1485fcb61..905c34941 100644
 +    // while K/V land at `positions`. `0` ⇒ compact == global (full-resident /
 +    // Legacy): byte-identical to the pre-E single-coordinate path.
 +    rope_shift: i32,
++    // P1b: optional bounded Legacy head arena. When set (kv_only Q8 fill) the
++    // same K/V rows are also written at the arena's compact coordinates, so
++    // the next draft reads them in place instead of re-copying the append
++    // pages from the archive.
++    paged: Option<&HeadPagedKv<'_>>,
  ) -> HipResult<()> {
      // qt53 has only the serial decode route: typed refusal before ANY launch
      // (attention included), never the generic batched-MoE panic below.
-@@ -3709,6 +3870,20 @@ pub fn mtp_head_forward_block_batched(
+@@ -3471,6 +3637,15 @@ pub fn mtp_head_forward_block_batched(
+         prev_hiddens_stacked.numel(),
+         n * dim
+     );
++    if paged.is_some() {
++        assert!(
++            kv_only,
++            "paged head KV writes require the kv_only fill path"
++        );
++        if kv.kv_mode != MtpKvMode::Q8 {
++            return Err(HipError::new(0, "paged head KV writes require Q8 head KV"));
++        }
++    }
+     for &p in positions {
+         assert!(
+             (p as usize) < kv.max_seq,
+@@ -3709,6 +3884,20 @@ pub fn mtp_head_forward_block_batched(
      // ── 5. Batched RoPE on Q + K ─────────────────────────────────────────
      // fast_fill (kv_only): Q is never consumed (return follows the K/V cache
      // writes), so rope runs with zero Q heads over the same valid q_view.
@@ -31584,7 +31820,7 @@ index 1485fcb61..905c34941 100644
      gpu.rope_partial_interleaved_f32_batched(
          &q_view,
          &k_view,
-@@ -3722,6 +3897,11 @@ pub fn mtp_head_forward_block_batched(
+@@ -3722,6 +3911,11 @@ pub fn mtp_head_forward_block_batched(
          // pos_offset=0: MTP head has its own non-compacted KV. Unchanged behavior.
          0,
      )?;
@@ -31596,8 +31832,42 @@ index 1485fcb61..905c34941 100644
  
      // ── 6. v1 simplification: per-slot K/V writes + attention = V
      // ─────────────────────────────────────────────────────────────────────
+@@ -3746,6 +3940,33 @@ pub fn mtp_head_forward_block_batched(
+         cfg.head_dim,
+         n,
+     )?;
++    // P1b: mirror the same rows into the bounded Legacy arena at its compact
++    // coordinates. The contiguous write above stays the archive source; this
++    // copy makes the next draft's restore a no-copy fast path.
++    if let Some(paged) = paged {
++        gpu.kv_cache_write_q8_0_batched_slots(
++            paged.k_view,
++            &k_view,
++            paged.positions,
++            cfg.n_head_kv,
++            cfg.head_dim,
++            n,
++            Some(paged.descs),
++            Some(paged.row_slot),
++            false,
++        )?;
++        gpu.kv_cache_write_q8_0_batched_slots(
++            paged.v_view,
++            &v_view,
++            paged.positions,
++            cfg.n_head_kv,
++            cfg.head_dim,
++            n,
++            Some(paged.descs),
++            Some(paged.row_slot),
++            true,
++        )?;
++    }
+     if kv_only {
+         return Ok(());
+     }
 diff --git a/crates/hipfire-arch-qwen35/src/mtp_spec.rs b/crates/hipfire-arch-qwen35/src/mtp_spec.rs
-index 14d9a12ed..f6cc63b74 100644
+index 14d9a12ed..aa34779b6 100644
 --- a/crates/hipfire-arch-qwen35/src/mtp_spec.rs
 +++ b/crates/hipfire-arch-qwen35/src/mtp_spec.rs
 @@ -33,6 +33,17 @@
@@ -31772,7 +32042,7 @@ index 14d9a12ed..f6cc63b74 100644
 -            sampling,
 -        )?;
 +        mtp_penalty_apply_row(gpu, penalty, repeat_buf, &row, k, vocab, sampling)?;
-     }
++    }
 +    Ok(())
 +}
 +
@@ -31789,7 +32059,7 @@ index 14d9a12ed..f6cc63b74 100644
 +) -> HipResult<()> {
 +    if !sampling.penalized() {
 +        return Ok(());
-+    }
+     }
 +    let t0 = MtpPenaltyTiming::start();
 +    spec_apply_verify_penalties(
 +        gpu,
@@ -31822,15 +32092,16 @@ index 14d9a12ed..f6cc63b74 100644
              &logits_view,
              &draft.draft_softmaxes,
              &draft.draft_probs,
-@@ -3948,6 +4031,7 @@ where
+@@ -3948,6 +4031,8 @@ where
                          &target.weights,
                          Some(rot),
                          true,
 +                        /* rope_shift */ 0,
++                        None,
                      )?;
                      slice_off = slice_end;
                  }
-@@ -4169,6 +4253,7 @@ pub fn spec_step_mtp(
+@@ -4169,6 +4254,7 @@ pub fn spec_step_mtp(
      // MTP step k writes its own KV slot at position cur_pos + k (same as
      // before — a per-step single-layer transformer cache).
      let dim_bytes = dim * 4;
@@ -31838,7 +32109,7 @@ index 14d9a12ed..f6cc63b74 100644
      for k in 0..max_n {
          // Step 0 reads from state.prev_hidden (trunk's last post-norm
          // hidden, snapshot from the previous cycle / prefill) and embeds
-@@ -4176,7 +4261,7 @@ pub fn spec_step_mtp(
+@@ -4176,7 +4262,7 @@ pub fn spec_step_mtp(
          // (k-1) of mtp_t_outs and uses that same row as the embedding
          // override (lossy substitute for embed[predicted_token_{k-1}]).
          if k == 0 {
@@ -31847,7 +32118,7 @@ index 14d9a12ed..f6cc63b74 100644
                  gpu,
                  head,
                  &state.mtp_scratch,
-@@ -4185,11 +4270,15 @@ pub fn spec_step_mtp(
+@@ -4185,11 +4271,15 @@ pub fn spec_step_mtp(
                  &state.prev_hidden,
                  None,
                  cur_pos + k,
@@ -31864,7 +32135,7 @@ index 14d9a12ed..f6cc63b74 100644
                  gpu,
                  head,
                  &state.mtp_scratch,
-@@ -4198,7 +4287,11 @@ pub fn spec_step_mtp(
+@@ -4198,7 +4288,11 @@ pub fn spec_step_mtp(
                  &prev_row,       // prev_hidden = step k-1's t_mtp_out
                  Some(&prev_row), // embed override = step k-1's t_mtp_out (lossy)
                  cur_pos + k,
@@ -31876,7 +32147,7 @@ index 14d9a12ed..f6cc63b74 100644
              )?;
          }
          // Capture this step's t_mtp_out into row k of mtp_t_outs so the
-@@ -4836,9 +4929,9 @@ pub fn spec_step_mtp_compressed(
+@@ -4836,9 +4930,9 @@ pub fn spec_step_mtp_compressed(
  /// empty). RNG draw count/order is identical to the learned-draft path.
  #[allow(clippy::too_many_arguments)]
  #[allow(clippy::too_many_arguments)]
@@ -31888,7 +32159,7 @@ index 14d9a12ed..f6cc63b74 100644
      logits_view: &GpuTensor,
      draft_softmaxes: &[Vec<f32>],
      draft_probs: &[f32],
-@@ -4902,7 +4995,7 @@ fn mtp_sampled_accept(
+@@ -4902,7 +4996,7 @@ fn mtp_sampled_accept(
          let target_row_k = target_row_at(k);
          let p_d = draft_probs[k].max(f32::MIN_POSITIVE);
          let p_t = target_row_k[candidates[k] as usize];
@@ -31897,7 +32168,7 @@ index 14d9a12ed..f6cc63b74 100644
          if u * p_d <= p_t {
              // Accept.
              committed.push(candidates[k]);
-@@ -4916,7 +5009,7 @@ fn mtp_sampled_accept(
+@@ -4916,7 +5010,7 @@ fn mtp_sampled_accept(
              // across the MISMATCHED per-side nuclei. Both rows are full-vocab
              // length `vocab` (different zero-support), so sample_residual's
              // element-wise subtraction is well-formed.
@@ -31906,7 +32177,7 @@ index 14d9a12ed..f6cc63b74 100644
              let bonus = if point_mass {
                  sample_residual_point_mass(&target_row_k, candidates[k], u2)
              } else {
-@@ -4935,7 +5028,7 @@ fn mtp_sampled_accept(
+@@ -4935,7 +5029,7 @@ fn mtp_sampled_accept(
          // All `drafts_generated` accepted (and none was EOS): sample the bonus
          // from the target nucleus at position `*accept_count` (== drafts_generated).
          let row = target_row_at(*accept_count);
@@ -31915,7 +32186,7 @@ index 14d9a12ed..f6cc63b74 100644
          let bonus = sample_categorical(&row, u);
          committed.push(bonus);
          if bonus == eos_token_id {
-@@ -5002,6 +5095,139 @@ pub fn spec_step_mtp_compressed_serial(
+@@ -5002,6 +5096,139 @@ pub fn spec_step_mtp_compressed_serial(
  /// calls this then `mtp_shared_verify_accept_rollback_inner`; the slot engine
  /// calls this per-slot, then does a batched `forward_batch_slots_graphed`,
  /// then `mtp_batched_verify_accept_from_batch` per-slot.
@@ -32055,7 +32326,7 @@ index 14d9a12ed..f6cc63b74 100644
  #[allow(clippy::too_many_arguments)]
  pub fn mtp_draft_phase_inner(
      gpu: &mut Gpu,
-@@ -5013,6 +5239,9 @@ pub fn mtp_draft_phase_inner(
+@@ -5013,6 +5240,9 @@ pub fn mtp_draft_phase_inner(
      last_committed: u32,
      k: usize,
      skip_proposal_graph: bool,
@@ -32065,7 +32336,7 @@ index 14d9a12ed..f6cc63b74 100644
  ) -> HipResult<MtpDraftOutput> {
      // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
      // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
-@@ -5177,7 +5406,13 @@ pub fn mtp_draft_phase_inner(
+@@ -5177,7 +5407,13 @@ pub fn mtp_draft_phase_inner(
          );
      }
      let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
@@ -32079,7 +32350,7 @@ index 14d9a12ed..f6cc63b74 100644
          && max_n > 0
          && !state.mtp_proposal_graph_disabled
          && mtp_proposal_graph_eligible_for(
-@@ -5287,32 +5522,34 @@ pub fn mtp_draft_phase_inner(
+@@ -5287,32 +5523,34 @@ pub fn mtp_draft_phase_inner(
              // call. In full-vocab mode we run block_only here and do the
              // rmsnorm + trunk-lm_head GEMV manually below.
              if use_full_vocab {
@@ -32139,7 +32410,7 @@ index 14d9a12ed..f6cc63b74 100644
                  // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
                  // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
                  // kernel (gemv_mq4g256_with_rotate / gemv_q8_0 / etc.) on the
-@@ -5330,58 +5567,58 @@ pub fn mtp_draft_phase_inner(
+@@ -5330,58 +5568,58 @@ pub fn mtp_draft_phase_inner(
                      &full_vocab_logits_view,
                  )?;
              } else if use_device_token_chain {
@@ -32246,7 +32517,7 @@ index 14d9a12ed..f6cc63b74 100644
              }
  
              // Pick the logits buffer to argmax over (mode-dependent).
-@@ -5718,6 +5955,9 @@ pub fn spec_step_mtp_compressed_serial_inner(
+@@ -5718,6 +5956,9 @@ pub fn spec_step_mtp_compressed_serial_inner(
          last_committed,
          k,
          skip_proposal_graph,
@@ -32256,15 +32527,16 @@ index 14d9a12ed..f6cc63b74 100644
      )?;
  
      mtp_shared_verify_accept_rollback_inner(
-@@ -5892,6 +6132,7 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
+@@ -5892,6 +6133,8 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
          &target.weights,
          cur_pos,
          &mtp_takeover_fill_tokens(last_committed, candidates, result.advance),
 +        /* rope_shift: Legacy sequential verify stays full-resident */ 0,
++        None,
      )?;
  
      // External windows are never truncated; ensure result fields cohere even
-@@ -5909,15 +6150,23 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
+@@ -5909,15 +6152,27 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
  /// KV-only head pass (same gate and kernels as the batched prompt fill) and
  /// falls back to per-row decode forwards otherwise. Rows are independent:
  /// each slot's K/V depends only on its own token and hidden.
@@ -32279,6 +32551,10 @@ index 14d9a12ed..f6cc63b74 100644
 +    // P4.1② f2 (E): the bounded-head COMPACT-write shift (= ninfer removed_tokens).
 +    // `0` ⇒ full-resident global positions (Legacy / AR-only, byte-neutral).
 +    rope_shift: usize,
++    // P1b: optional bounded Legacy arena. When present the same accepted rows
++    // are mirrored into it at compact coordinates, so the following draft can
++    // read them without re-copying the append pages from the archive.
++    mut paged_plane: Option<&mut crate::kvmem_ctl::LegacyHeadPlane>,
  ) -> HipResult<()> {
      let n = tokens.len();
 +    // P1b: a block-quantized Legacy window advanced; slide the contiguous
@@ -32289,7 +32565,7 @@ index 14d9a12ed..f6cc63b74 100644
      let dim = head.config.n_embd;
      let dim_bytes = dim * 4;
      if n > 1 {
-@@ -5957,7 +6206,21 @@ fn mtp_takeover_fill_head_kv(
+@@ -5957,9 +6212,37 @@ fn mtp_takeover_fill_head_kv(
              .takeover_fill_batched
              .as_mut()
              .expect("takeover fill scratch allocated above");
@@ -32310,14 +32586,40 @@ index 14d9a12ed..f6cc63b74 100644
 +            .map(|p| p as i32)
 +            .collect();
          let hidden = state.takeover_fill_hidden.sub_offset(0, n * dim);
-         mtp_head::mtp_head_forward_block_batched(
+-        mtp_head::mtp_head_forward_block_batched(
++        // P1b: mirror the accepted rows into the bounded Legacy arena at the
++        // arena's own compact coordinates. A stale/mismatched plane (cold
++        // start, span left the window) falls back to the contiguous write;
++        // the next draft then restores from the archive as before.
++        let mut paged_view = None;
++        if let Some(plane) = paged_plane.as_deref_mut() {
++            if let (Ok(start), Ok(rows)) = (u32::try_from(cur_pos), u32::try_from(n)) {
++                if let Some(end) = start.checked_add(rows) {
++                    if let Ok(view) = plane.stage_rows(gpu, start, rows, end) {
++                        paged_view = Some(view);
++                    }
++                }
++            }
++        }
++        let result = mtp_head::mtp_head_forward_block_batched(
              gpu,
-@@ -5971,8 +6234,19 @@ fn mtp_takeover_fill_head_kv(
+             head,
+             scratch,
+@@ -5971,8 +6254,27 @@ fn mtp_takeover_fill_head_kv(
              trunk_weights,
              Some(rot),
              true,
+-        )
 +            /* rope_shift */ rope_shift as i32,
-         )
++            paged_view.as_ref(),
++        );
++        drop(paged_view);
++        if result.is_ok() {
++            if let (Some(plane), Ok(end)) = (paged_plane, u32::try_from(cur_pos + n)) {
++                plane.mark_filled(end);
++            }
++        }
++        result
      } else {
 +        // P4.1② f2 (E): the bounded head staging pool requires the batched
 +        // kv_only fill (compact write + global RoPE). The per-row decode fallback
@@ -40104,10 +40406,10 @@ index 000000000..0d2cbd401
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 new file mode 100644
-index 000000000..7a1090bde
+index 000000000..878c3f05c
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-@@ -0,0 +1,4049 @@
+@@ -0,0 +1,4050 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -43318,6 +43620,7 @@ index 000000000..7a1090bde
 +                                pos0,
 +                                &tokens,
 +                                rope_shift,
++                                None,
 +                            )
 +                            .map_err(|e| format!("kvmem AR head fill: {e}"))?;
 +                            ctl.head_write_through_archive(
@@ -44159,10 +44462,10 @@ index 000000000..7a1090bde
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 new file mode 100644
-index 000000000..40571b1ca
+index 000000000..64fa01407
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
-@@ -0,0 +1,830 @@
+@@ -0,0 +1,831 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -44647,6 +44950,7 @@ index 000000000..40571b1ca
 +                    pos,
 +                    &tokens,
 +                    rope_shift,
++                    model.legacy_head_planes[slot.0].as_mut(),
 +                )
 +                .map_err(|e| format!("mtp head consume fill: {e}"))?;
 +                ctl.head_write_through_archive(
@@ -44995,10 +45299,10 @@ index 000000000..40571b1ca
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_model.rs b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
 new file mode 100644
-index 000000000..518ab5038
+index 000000000..22380f76e
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
-@@ -0,0 +1,1215 @@
+@@ -0,0 +1,1317 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -45530,6 +45834,57 @@ index 000000000..518ab5038
 +                ));
 +            }
 +        }
++        // P1b: mirror the chunk's K/V into the paged head arena as well. The
++        // arena is restored at the chunk's global start (cold 0 or a prefix
++        // checkpoint), then `stage_rows` maps this span and the batched forward
++        // writes it alongside the contiguous archive staging. The first draft
++        // after the prompt then restores with no archive copy.
++        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
++        let mut legacy_plane: Option<crate::kvmem_ctl::LegacyHeadPlane> =
++            if self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled()) {
++                let (kv_mode, window_pages) = {
++                    let ctl = self.kvmem.as_ref().unwrap();
++                    let window = ctl.budget_blocks().saturating_mul(2).saturating_add(1);
++                    (
++                        ctl.kv_mode(),
++                        u32::try_from(window)
++                            .map_err(|_| format!("mtp head plane: window {window} overflow"))?,
++                    )
++                };
++                if window_pages == 0 {
++                    self.mtp_states[slot.0] = Some(state);
++                    return Err("mtp head plane: head window is empty".to_string());
++                }
++                let mut plane = match self.legacy_head_planes[slot.0].take() {
++                    Some(p) => p,
++                    None => crate::kvmem_ctl::LegacyHeadPlane::new(
++                        &mut gpu,
++                        kv_mode,
++                        head.config.n_head_kv,
++                        head.config.head_dim,
++                        window_pages,
++                    )?,
++                };
++                let start = u32::try_from(chunk_positions[0]).map_err(|_| {
++                    format!("mtp head plane: start {} overflow", chunk_positions[0])
++                })?;
++                let restored = {
++                    let ctl = self.kvmem.as_ref().unwrap();
++                    plane.restore(&mut gpu, ctl, slot.0, start)
++                };
++                match restored {
++                    Ok(()) => Some(plane),
++                    Err(e) => {
++                        eprintln!(
++                        "[kvmem-head] prefill paged restore skipped slot={slot:?} pos={start}: {e}"
++                    );
++                        let _ = plane.free(&mut gpu);
++                        None
++                    }
++                }
++            } else {
++                None
++            };
 +        // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
 +        // `gpu`/`weights`/head separately. No closure — it would capture all of
 +        // `rig` and collide with the scratch borrow.
@@ -45542,21 +45897,65 @@ index 000000000..518ab5038
 +                    .slide_to_shift(&mut gpu, rope_shift)
 +                    .map_err(|e| format!("mtp head slide: {e}"))?;
 +            }
-+            crate::mtp_head::mtp_head_forward_block_batched(
-+                &mut gpu,
-+                head,
-+                scratch,
-+                &mut state.mtp_kv,
-+                chunk_tokens,
-+                &staged,
-+                &compact_positions,
-+                m,
-+                &self.weights,
-+                Some(rot),
-+                /* kv_only */ true,
-+                /* rope_shift */ rope_shift as i32,
-+            )
-+            .map_err(|e| format!("mtp head prefill: {e}"))
++            #[cfg(all(feature = "deltanet", feature = "kvmem"))]
++            {
++                let start = chunk_positions[0] as u32;
++                let end = start.saturating_add(m as u32);
++                let mut paged_view = match legacy_plane.as_mut() {
++                    Some(plane) => match plane.stage_rows(&mut gpu, start, m as u32, end) {
++                        Ok(view) => Some(view),
++                        Err(e) => {
++                            eprintln!(
++                                "[kvmem-head] prefill paged stage skipped slot={slot:?} pos={start} rows={m}: {e}"
++                            );
++                            None
++                        }
++                    },
++                    None => None,
++                };
++                let res = crate::mtp_head::mtp_head_forward_block_batched(
++                    &mut gpu,
++                    head,
++                    scratch,
++                    &mut state.mtp_kv,
++                    chunk_tokens,
++                    &staged,
++                    &compact_positions,
++                    m,
++                    &self.weights,
++                    Some(rot),
++                    /* kv_only */ true,
++                    /* rope_shift */ rope_shift as i32,
++                    paged_view.as_ref(),
++                )
++                .map_err(|e| format!("mtp head prefill: {e}"));
++                drop(paged_view);
++                if res.is_ok() {
++                    if let Some(plane) = legacy_plane.as_mut() {
++                        plane.mark_filled(end);
++                    }
++                }
++                res
++            }
++            #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
++            {
++                crate::mtp_head::mtp_head_forward_block_batched(
++                    &mut gpu,
++                    head,
++                    scratch,
++                    &mut state.mtp_kv,
++                    chunk_tokens,
++                    &staged,
++                    &compact_positions,
++                    m,
++                    &self.weights,
++                    Some(rot),
++                    /* kv_only */ true,
++                    /* rope_shift */ rope_shift as i32,
++                    None,
++                )
++                .map_err(|e| format!("mtp head prefill: {e}"))
++            }
 +        });
 +        // Seed hidden for the first draft cycle: the (normed) trunk hidden of
 +        // the chunk's last token — same convention as the verify-path capture.
@@ -45622,6 +46021,10 @@ index 000000000..518ab5038
 +                    outcome = Err(e);
 +                }
 +            }
++        }
++        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
++        {
++            self.legacy_head_planes[slot.0] = legacy_plane;
 +        }
 +        self.mtp_states[slot.0] = Some(state);
 +        outcome
@@ -45754,7 +46157,10 @@ index 000000000..518ab5038
 +            if self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled()) {
 +                let (kv_mode, window_pages) = {
 +                    let ctl = self.kvmem.as_ref().unwrap();
-+                    let window = ctl.budget_blocks().saturating_mul(2);
++                    // One spare page absorbs a verify span that crosses the
++                    // window front, so its first row's destination page is
++                    // still resident when the fill remaps the frontier.
++                    let window = ctl.budget_blocks().saturating_mul(2).saturating_add(1);
 +                    (
 +                        ctl.kv_mode(),
 +                        u32::try_from(window)
