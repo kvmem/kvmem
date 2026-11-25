@@ -13,8 +13,27 @@ index f2e4de2b0..ab597a1d6 100644
  - [`src/shared_weights.rs`](src/shared_weights.rs)
    - `apply_source_dispatch_flags`
    - `census_dense_weights`
+diff --git a/crates/hipfire-arch-qwen35/src/forward_slots.rs b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+index 502046cb9..35ece809f 100644
+--- a/crates/hipfire-arch-qwen35/src/forward_slots.rs
++++ b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+@@ -5267,6 +5267,14 @@ pub fn forward_batch_slots_opts(
+         "forward_batch_slots: dn_states.len() ({}) must equal n_slots ({n_slots})",
+         dn_states.len()
+     );
++    // S1 parked-slot invariant: an idle slot may own an empty DeltaNet
++    // placeholder, but the scheduler must never put it in this batch.
++    for (slot, &rows) in batch.m_per_slot.iter().enumerate() {
++        assert!(
++            rows == 0 || !dn_states[slot].is_empty(),
++            "forward_batch_slots: slot {slot} is active but its DeltaNet state is parked"
++        );
++    }
+     assert_eq!(
+         desc_staging.n_slots, n_slots,
+         "forward_batch_slots: desc_staging was built for a different n_slots"
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
-index aa2066b22..62e157d84 100644
+index aa2066b22..6f8fcc187 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 @@ -71,7 +71,9 @@ use crate::layerwise_layout::LayerwiseMtpQ8Layout;
@@ -27,7 +46,23 @@ index aa2066b22..62e157d84 100644
  mod import;
  mod layerwise;
  mod legacy;
-@@ -650,10 +652,11 @@ pub struct KvMemGeometry {
+@@ -79,11 +81,15 @@ mod options;
+ mod plan;
+ mod prefix;
+ mod slot;
++mod state_image;
+ mod step;
+ mod transfer;
+ 
+ pub use import::*;
+ pub(crate) use options::{KvMemDiagnostics, KvMemOptions};
++pub(crate) use state_image::{
++    StateImage, StateImageId, StateImageKind, StateImageResidency, StateImageRole, StateImageStamp,
++};
+ 
+ /// KVMem blocks are 128 tokens — the engine's page size (`PAGE_TOKENS`).
+ pub const KV_BLOCK_TOKENS: usize = 128;
+@@ -650,10 +656,11 @@ pub struct KvMemGeometry {
      /// `mtp_head.is_some() && mtp_k > 0` enablement). Under Layerwise this turns
      /// the host co-archive into the COMPOSITE `kvmem-main-mtp-pages-v4` record
      /// (`n_fa_layers + 1` ordinals, the head aux plane at ordinal `n_fa_layers`)
@@ -43,7 +78,7 @@ index aa2066b22..62e157d84 100644
      pub mtp_head: bool,
  }
  
-@@ -965,6 +968,10 @@ pub struct KvMemCtl {
+@@ -965,6 +972,10 @@ pub struct KvMemCtl {
      interval: usize,
      diagnostics: KvMemDiagnostics,
      n_fa_layers: usize,
@@ -54,7 +89,7 @@ index aa2066b22..62e157d84 100644
      n_heads: usize,
      n_kv_heads: usize,
      head_dim: usize,
-@@ -1093,6 +1100,14 @@ pub struct KvMemCtl {
+@@ -1093,6 +1104,21 @@ pub struct KvMemCtl {
      draft_images_total: u64,
      draft_image_hits_total: u64,
      draft_image_misses_total: u64,
@@ -66,6 +101,13 @@ index aa2066b22..62e157d84 100644
 +    /// ownership tier and the fallback when the GPU checkpoint pool misses.
 +    /// Capacity is `HIPFIRE_KVMEM_DN_HOST_MIB` (default 512, 0 disables).
 +    dn_ring: DnRing,
++    /// S2 state-image ledger: live-to-image demotions, image-to-live
++    /// promotions, successful image installs, and the host bytes currently
++    /// charged by parked DN images.
++    state_demotions_total: u64,
++    state_promotions_total: u64,
++    state_restores_total: u64,
++    state_host_bytes: u64,
  }
  
  /// `SPILLED_PAGE` is re-exported for engine-side diagnostics; keep the import
@@ -273,7 +315,7 @@ index e006689ec..e59e4e1c9 100644
          }
          Ok(())
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-index 93f27c59f..7d450bda6 100644
+index 93f27c59f..d1763a410 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
 @@ -140,6 +140,19 @@ impl KvMemCtl {
@@ -304,18 +346,22 @@ index 93f27c59f..7d450bda6 100644
              n_heads: geom.n_heads,
              n_kv_heads: geom.n_kv_heads,
              head_dim: geom.head_dim,
-@@ -515,6 +529,9 @@ impl KvMemCtl {
+@@ -515,6 +529,13 @@ impl KvMemCtl {
              draft_images_total: 0,
              draft_image_hits_total: 0,
              draft_image_misses_total: 0,
 +            draft_sidecars_total: 0,
 +            draft_sidecar_bytes: 0,
 +            dn_ring: DnRing::new(dn_host_mib.saturating_mul(1 << 20)),
++            state_host_bytes: 0,
++            state_demotions_total: 0,
++            state_promotions_total: 0,
++            state_restores_total: 0,
          })
      }
  
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
-index 6b9f7b1be..12ab147a6 100644
+index 6b9f7b1be..c9b87e3a4 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 @@ -203,6 +203,7 @@ impl KvMemCtl {
@@ -326,7 +372,7 @@ index 6b9f7b1be..12ab147a6 100644
                              stamp: 0,
                          });
                      }
-@@ -511,6 +512,67 @@ impl KvMemCtl {
+@@ -511,6 +512,87 @@ impl KvMemCtl {
          demoted
      }
  
@@ -391,31 +437,59 @@ index 6b9f7b1be..12ab147a6 100644
 +        self.dn_ring.total_bytes()
 +    }
 +
++    /// S2: a live slot's recurrent bytes moved into a parked native image.
++    /// The legacy catalog already owns those bytes; this ledger tracks the
++    /// state-image share so `/metrics` reports it without double-counting
++    /// host storage.
++    pub fn note_state_demotion(&mut self, bytes: u64) {
++        self.state_demotions_total = self.state_demotions_total.saturating_add(1);
++        self.state_host_bytes = self.state_host_bytes.saturating_add(bytes);
++    }
++
++    /// S2: a parked image was promoted back into a live allocation.
++    pub fn note_state_promotion(&mut self, bytes: u64) {
++        self.state_promotions_total = self.state_promotions_total.saturating_add(1);
++        self.state_host_bytes = self.state_host_bytes.saturating_sub(bytes);
++    }
++
++    /// S2: a parked image was successfully installed into a live state.
++    pub fn note_state_restore(&mut self) {
++        self.state_restores_total = self.state_restores_total.saturating_add(1);
++    }
++
      /// Live observability snapshot (`/metrics` via `EngineStats.kvmem`).
      /// Cheap integer reads from the host stores: no device work, no
      /// allocation, and no path reads it back into selection/residency, so it
-@@ -529,6 +591,20 @@ impl KvMemCtl {
+@@ -529,6 +611,28 @@ impl KvMemCtl {
          KvMemStats {
              enabled: true,
              layerwise: self.strategy.is_layerwise(),
 +            trunk_managed: true,
 +            mtp_head_managed: self.head_plane_enabled(),
 +            mtp_head_history_managed: self.mtp_head,
-+            // The live recurrent state remains engine-resident; the ring owns
-+            // page-aligned history anchors, not the slot's working state.
-+            dn_state_managed: false,
++            // S2: the working state is still engine scratch while a slot is
++            // active, but parking demotes it into a native history image and a
++            // cold admission reallocates/restores it. Together with the host
++            // ring, that makes the recurrent state a KVMem-owned tier.
++            dn_state_managed: true,
 +            dflash_managed: false,
-+            // The live recurrent state is engine scratch; the host ring is the
-+            // KVMem-owned persistent tier.
++            // The engine fills live and parked bytes in `note_stats`.
 +            dn_state_bytes: 0,
 +            dn_state_slots: 0,
 +            dn_checkpoints: self.dn_ring.len() as u32,
 +            dn_checkpoint_bytes: self.dn_ring.total_bytes(),
++            // S0/S2: the engine fills the parked-image count in `note_stats`;
++            // the lifecycle counters below are controller-owned.
++            state_images: 0,
++            state_host_bytes: self.state_host_bytes,
++            state_demotions: self.state_demotions_total,
++            state_promotions: self.state_promotions_total,
++            state_restores: self.state_restores_total,
 +            media_pins: true,
              host_charged_bytes: self.storage.charged_bytes(),
              disk_bytes: self.storage.disk_bytes(),
              payload_bytes,
-@@ -561,6 +637,8 @@ impl KvMemCtl {
+@@ -561,6 +665,8 @@ impl KvMemCtl {
              draft_images: self.draft_images_total,
              draft_image_hits: self.draft_image_hits_total,
              draft_image_misses: self.draft_image_misses_total,
@@ -424,6 +498,199 @@ index 6b9f7b1be..12ab147a6 100644
          }
      }
  
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/state_image.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/state_image.rs
+new file mode 100644
+index 000000000..9fede512a
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/state_image.rs
+@@ -0,0 +1,187 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! State-image vocabulary shared by the KVMem takeover stages.
++//!
++//! A [`StateImage`] is an immutable copy of one piece of engine-owned
++//! recurrent/draft state (DeltaNet, DFlash, MTP head). The engine keeps the
++//! live object while a slot is active; the image is what the host tier may
++//! retain after the live object is parked. This module deliberately contains
++//! only the vocabulary and accounting identity — S0 adds no lifecycle and no
++//! device work.
++
++#![allow(dead_code)]
++
++/// Which engine-owned state an image contains.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub(crate) enum StateImageKind {
++    /// DeltaNet recurrent + convolution state (`DeltaNetState`).
++    Dn,
++    /// DFlash draft slot state (`DflashSlotState`).
++    Dflash,
++    /// Legacy MTP head KV (`Qwen35MtpHeadKvCache`).
++    MtpHead,
++}
++
++impl StateImageKind {
++    pub(crate) const fn label(self) -> &'static str {
++        match self {
++            Self::Dn => "dn",
++            Self::Dflash => "dflash",
++            Self::MtpHead => "mtp_head",
++        }
++    }
++}
++
++/// Who may mutate the image.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum StateImageRole {
++    /// The image backs a live slot and can still advance.
++    Active,
++    /// Immutable history anchor; reusable after the frontier is validated.
++    Checkpoint,
++    /// Only a host copy exists; the device replica may be absent.
++    HostOnly,
++}
++
++/// Where the bytes currently live.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum StateImageResidency {
++    Device,
++    Host,
++    Both,
++}
++
++/// Stable image identity inside one engine instance.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
++pub(crate) struct StateImageId(pub(crate) u64);
++
++impl StateImageId {
++    pub(crate) const fn new(raw: u64) -> Self {
++        Self(raw)
++    }
++
++    pub(crate) const fn get(self) -> u64 {
++        self.0
++    }
++}
++
++/// Reuse proof bound to an image.
++///
++/// The fingerprints are deliberately opaque integers: the layouts and token
++/// ledgers that produce them stay in their owning modules. An image is only
++/// restorable when every field matches the target request exactly.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct StateImageStamp {
++    /// Model identity (weights + quantization).
++    pub(crate) model: u64,
++    /// Execution/layout identity (KV tier, RoPE, render configuration).
++    pub(crate) layout: u64,
++    /// Token-ledger identity at the image frontier.
++    pub(crate) tokens: u64,
++    /// Sticky media digest; `None` for text-only continuations.
++    pub(crate) media: Option<u64>,
++    /// Token frontier covered by the image.
++    pub(crate) frontier: u32,
++}
++
++/// Metadata for one retained state image. The payload stays owned by the
++/// state store; this record is what the catalog and metrics can inspect
++/// without touching device or host bytes.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct StateImage {
++    pub(crate) id: StateImageId,
++    pub(crate) kind: StateImageKind,
++    pub(crate) role: StateImageRole,
++    pub(crate) residency: StateImageResidency,
++    pub(crate) stamp: StateImageStamp,
++    /// Host bytes charged for this image (0 when device-only).
++    pub(crate) host_bytes: u64,
++}
++
++impl StateImage {
++    pub(crate) const fn new(
++        id: StateImageId,
++        kind: StateImageKind,
++        role: StateImageRole,
++        residency: StateImageResidency,
++        stamp: StateImageStamp,
++        host_bytes: u64,
++    ) -> Self {
++        Self {
++            id,
++            kind,
++            role,
++            residency,
++            stamp,
++            host_bytes,
++        }
++    }
++
++    /// True when the image is safe to hold without a live slot: immutable and
++    /// backed by a host copy.
++    pub(crate) const fn is_host_checkpoint(self) -> bool {
++        matches!(
++            self.role,
++            StateImageRole::Checkpoint | StateImageRole::HostOnly
++        ) && matches!(
++            self.residency,
++            StateImageResidency::Host | StateImageResidency::Both
++        )
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn stamp() -> StateImageStamp {
++        StateImageStamp {
++            model: 1,
++            layout: 2,
++            tokens: 3,
++            media: None,
++            frontier: 128,
++        }
++    }
++
++    #[test]
++    fn labels_are_stable() {
++        assert_eq!(StateImageKind::Dn.label(), "dn");
++        assert_eq!(StateImageKind::Dflash.label(), "dflash");
++        assert_eq!(StateImageKind::MtpHead.label(), "mtp_head");
++    }
++
++    #[test]
++    fn only_immutable_host_backed_images_are_checkpoints() {
++        let checkpoint = StateImage::new(
++            StateImageId::new(1),
++            StateImageKind::Dn,
++            StateImageRole::Checkpoint,
++            StateImageResidency::Both,
++            stamp(),
++            4096,
++        );
++        assert!(checkpoint.is_host_checkpoint());
++
++        let active = StateImage {
++            role: StateImageRole::Active,
++            ..checkpoint
++        };
++        assert!(!active.is_host_checkpoint());
++
++        let device_only = StateImage {
++            residency: StateImageResidency::Device,
++            ..checkpoint
++        };
++        assert!(!device_only.is_host_checkpoint());
++
++        let host_only = StateImage {
++            role: StateImageRole::HostOnly,
++            residency: StateImageResidency::Host,
++            ..checkpoint
++        };
++        assert!(host_only.is_host_checkpoint());
++    }
++}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
 index 6fc0db750..151b57241 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
@@ -662,8 +929,60 @@ index 6fc0db750..151b57241 100644
              stamp: 1,
          });
          assert_eq!(
+diff --git a/crates/hipfire-arch-qwen35/src/legacy_catalog.rs b/crates/hipfire-arch-qwen35/src/legacy_catalog.rs
+index 2ed18f4a6..525e1be5b 100644
+--- a/crates/hipfire-arch-qwen35/src/legacy_catalog.rs
++++ b/crates/hipfire-arch-qwen35/src/legacy_catalog.rs
+@@ -225,6 +225,11 @@ impl<T> LegacyHistoryCatalog<T> {
+         self.slots.iter().flatten().find(|entry| entry.id == id)
+     }
+ 
++    /// Every live entry, for accounting that the catalog itself does not own.
++    pub fn values(&self) -> impl Iterator<Item = &T> {
++        self.slots.iter().flatten().map(|entry| &entry.value)
++    }
++
+     /// Publish a complete immutable image supplied by the caller. This call
+     /// attests that all native components in `value` cover `frontier`; metadata
+     /// alone cannot validate native completeness. Zero/out-of-range frontiers
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/weights.rs b/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
+index dd17541e7..cb8e404ee 100644
+--- a/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
+@@ -3715,6 +3715,31 @@ impl DeltaNetState {
+         Self::new_batched_with_quant(gpu, config, quant, 1)
+     }
+ 
++    /// A parked-slot placeholder with no device allocations.
++    ///
++    /// The slot keeps its `quant` so the state store can reallocate the same
++    /// representation on promotion without consulting the model again. An
++    /// empty state is never a valid forward operand: the serve forward entry
++    /// rejects active slots in this state, and `free_gpu` on it is a no-op.
++    pub fn empty(quant: StateQuant) -> Self {
++        Self {
++            s_matrices: Vec::new(),
++            s_scales: Vec::new(),
++            conv_states: Vec::new(),
++            s_ef_residual: Vec::new(),
++            quant,
++        }
++    }
++
++    /// True when this is the parked placeholder from [`Self::empty`].
++    #[inline]
++    pub fn is_empty(&self) -> bool {
++        self.s_matrices.is_empty()
++            && self.s_scales.is_empty()
++            && self.conv_states.is_empty()
++            && self.s_ef_residual.is_empty()
++    }
++
+     /// Allocate lane-major recurrent state for independent-sequence decode.
+     ///
+     /// The ordinary state has an implicit batch of one.  This variant keeps
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
-index bd174c223..183fb2121 100644
+index bd174c223..81c28b93d 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
 @@ -60,6 +60,12 @@ mod kvmem_engine;
@@ -679,7 +998,19 @@ index bd174c223..183fb2121 100644
  use self::kvmem_hooks::{
      kvmem_dflash_validation_error, kvmem_enabled, kvmem_legacy_enabled, kvmem_requested,
      legacy_continuation_matches, trace_continuation_divergence,
-@@ -583,73 +589,6 @@ struct ModelRig {
+@@ -511,6 +517,11 @@ struct ModelRig {
+     config: qwen35::Qwen35Config,
+     scratch: Qwen35Scratch,
+     dn_states: Vec<DeltaNetState>,
++    /// S1 parked-image handles, one per slot. `None` while the live state is
++    /// engine-resident; S2 replaces the live state with `DeltaNetState::empty`
++    /// and stores the published image id here.
++    #[cfg(feature = "kvmem")]
++    dn_images: Vec<Option<crate::kvmem_ctl::StateImageId>>,
+     k_arenas: Vec<GpuTensor>,
+     v_arenas: Vec<GpuTensor>,
+     desc_staging: SlotDescStaging,
+@@ -583,73 +594,6 @@ struct ModelRig {
      kvmem: Option<crate::kvmem_ctl::KvMemCtl>,
  }
  
@@ -753,7 +1084,7 @@ index bd174c223..183fb2121 100644
  #[derive(Clone, Copy, Debug, Default)]
  struct SpecCounters {
      requested: bool,
-@@ -1067,7 +1006,7 @@ impl Rig {
+@@ -1067,7 +1011,7 @@ impl Rig {
          use hipfire_runtime::tokenizer::Tokenizer;
          use rdna_compute::kv_slots::preflight_alloc;
  
@@ -762,7 +1093,16 @@ index bd174c223..183fb2121 100644
          let mut hfq = HfqFile::open(&cfg.model_path).map_err(|e| format!("open model: {e}"))?;
          let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("config: {e}"))?;
          let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-@@ -2548,1052 +2487,6 @@ impl Rig {
+@@ -2338,6 +2282,8 @@ impl Rig {
+                 config,
+                 scratch,
+                 dn_states,
++                #[cfg(feature = "kvmem")]
++                dn_images: (0..cfg.n_slots).map(|_| None).collect(),
+                 k_arenas,
+                 v_arenas,
+                 desc_staging,
+@@ -2548,1052 +2494,6 @@ impl Rig {
      }
  }
  
@@ -1815,7 +2155,7 @@ index bd174c223..183fb2121 100644
  /// One slot's in-flight spec draft between the draft phase and the
  /// post-forward accept. `Mtp` carries the head's K-step chain output;
  /// `Dflash` carries the DFlash2 selector block. Both expose the verify-row
-@@ -4749,7 +3642,7 @@ fn run_loop(
+@@ -4749,7 +3649,7 @@ fn run_loop(
                              cmd,
                          ),
                          Err(RecvTimeoutError::Timeout) => {
@@ -1824,7 +2164,7 @@ index bd174c223..183fb2121 100644
                              let mut st = stats.lock().expect("stats");
                              st.note_swap(&rig.swap);
                              drop(st);
-@@ -4863,7 +3756,7 @@ fn run_loop(
+@@ -4863,7 +3763,7 @@ fn run_loop(
                  };
                  let active_before = slots.iter().filter(|s| s.is_some()).count();
                  rig.pending_repark_age = Some(parked.enqueued_at);
@@ -1833,7 +2173,7 @@ index bd174c223..183fb2121 100644
                  rig.pending_repark_age = None;
                  let active_after = slots.iter().filter(|s| s.is_some()).count();
                  // If admit did not place the request in a slot (it may have
-@@ -6872,7 +5765,7 @@ fn handle_command(
+@@ -6872,7 +5772,7 @@ fn handle_command(
                      }
                  }
              } else {
@@ -1842,7 +2182,7 @@ index bd174c223..183fb2121 100644
              }
          }
          EngineCommand::CancelWaiting { request_tag } => {
-@@ -7097,1816 +5990,6 @@ fn sync_fair_needs(
+@@ -7097,1816 +5997,6 @@ fn sync_fair_needs(
      let _ = q.set_uncached_prefill(id, uncached);
  }
  
@@ -3659,7 +3999,7 @@ index bd174c223..183fb2121 100644
  #[cfg(test)]
  mod tests {
      use super::*;
-@@ -9088,7 +6171,7 @@ mod tests {
+@@ -9088,7 +6178,7 @@ mod tests {
      /// exact joint acceptance is implemented and validated").
      #[test]
      fn grammar_constrained_requests_select_ar_not_mtp() {
@@ -5492,9 +5832,18 @@ index 000000000..0d2cbd401
 +    }
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-index add3ddc20..ffc831917 100644
+index add3ddc20..dda54a571 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+@@ -7,7 +7,7 @@
+ // scheduling and batch execution stay in `serve_engine.rs`.
+ 
+ use super::EngineConfig;
+-use crate::qwen35::LayerType;
++use crate::qwen35::{DeltaNetState, LayerType};
+ use hipfire_runtime::scheduler::{PendingWork, SpecKind};
+ use hipfire_runtime::session_table::SessionId;
+ use hipfire_runtime::slot_batch::SlotBatch;
 @@ -51,6 +51,29 @@ pub(super) fn kvmem_session_media(rig: &Rig, session: SessionId) -> (Option<u64>
      (sess.media_digest, spans)
  }
@@ -5697,7 +6046,16 @@ index add3ddc20..ffc831917 100644
          }
      }
  }
-@@ -641,6 +757,24 @@ pub(super) fn park_legacy_history(
+@@ -427,7 +543,7 @@ pub(super) struct LegacyNativeImage {
+ 
+ #[cfg(feature = "kvmem")]
+ impl LegacyNativeImage {
+-    fn auxiliary_bytes(&self) -> Result<usize, String> {
++    pub(super) fn auxiliary_bytes(&self) -> Result<usize, String> {
+         let draft = match &self.draft {
+             LegacyDraftImage::None => 0,
+             LegacyDraftImage::Mtp(image) => image.host_bytes(),
+@@ -641,9 +757,91 @@ pub(super) fn park_legacy_history(
          source,
          catalog.len()
      );
@@ -5719,10 +6077,98 @@ index add3ddc20..ffc831917 100644
 +            eprintln!("[kvmem-legacy] HistoryPark slot={} mtp_freed=1", slot.0);
 +        }
 +    }
++    // S2: the native-history image also owns the recurrent/conv state. The
++    // idle slot keeps only a tombstone so its VRAM can fund another session;
++    // restore or cold admission reallocates the same representation.
++    let dn_bytes = crate::speculative::DeltaNetSnapshot::bytes_for(&rig.model.dn_states[slot.0]);
++    if dn_bytes > 0 {
++        let quant = rig.model.dn_states[slot.0].quant;
++        let live = std::mem::replace(
++            &mut rig.model.dn_states[slot.0],
++            DeltaNetState::empty(quant),
++        );
++        live.free_gpu(&mut rig.gpu);
++        rig.model.dn_images[slot.0] = Some(crate::kvmem_ctl::StateImageId::new(publication.id));
++        if let Some(ctl) = rig.model.kvmem.as_mut() {
++            ctl.note_state_demotion(dn_bytes);
++        }
++        eprintln!(
++            "[kvmem-legacy] HistoryPark slot={} dn_freed=1 bytes={dn_bytes}",
++            slot.0
++        );
++    }
      Ok(Some(publication.id))
  }
  
-@@ -699,13 +833,37 @@ pub(super) fn restore_legacy_native_image(
++/// S2: give an active slot its live recurrent state again.
++///
++/// `park_legacy_history` replaces the slot's `DeltaNetState` with a tombstone
++/// after publishing the native image, so a cold admission (or a resumed
++/// session) must allocate the representation the image expects before any
++/// forward or restore runs. The image handle is cleared and the promotion is
++/// charged to the state-image ledger; the caller still owns the install.
++#[cfg(feature = "kvmem")]
++pub(super) fn ensure_dn_live(rig: &mut Rig, slot: usize, reason: &str) -> Result<(), String> {
++    if !rig.model.dn_states[slot].is_empty() {
++        return Ok(());
++    }
++    let quant = rig.model.dn_states[slot].quant;
++    let state = DeltaNetState::new_with_quant(&mut rig.gpu, &rig.model.config, quant)
++        .map_err(|e| format!("kvmem: DN state alloc for slot {slot}: {e}"))?;
++    let bytes = crate::speculative::DeltaNetSnapshot::bytes_for(&state);
++    let image = rig.model.dn_images[slot].take();
++    let restoring = reason == "restore";
++    rig.model.dn_states[slot] = state;
++    if restoring {
++        if let Some(ctl) = rig.model.kvmem.as_mut() {
++            if image.is_some() {
++                ctl.note_state_promotion(bytes);
++            }
++        }
++    }
++    if let Some(id) = image {
++        if restoring {
++            eprintln!(
++                "[kvmem-dn] slot={slot} live state promoted image={} bytes={bytes} reason={reason}",
++                id.get()
++            );
++        } else {
++            // The catalog still owns this image; the slot was reused for a
++            // different request, so only the slot-local handle is stale.
++            eprintln!(
++                "[kvmem-dn] slot={slot} parked image handle dropped image={} bytes={bytes} reason={reason}",
++                id.get()
++            );
++        }
++    }
++    Ok(())
++}
++
+ /// Restore target and draft as one execution frontier. The source stays owned
+ /// by its caller; any error invalidates this destination before more inference.
+ #[cfg(feature = "kvmem")]
+@@ -660,6 +858,10 @@ pub(super) fn restore_legacy_native_image(
+             "kvmem: cached source has no complete {kind:?} history"
+         ));
+     }
++    // S2: cold admission may reuse a slot whose recurrent state was parked
++    // with the image. Allocate the destination before building the import
++    // scratch so `new_for` sees the real geometry.
++    ensure_dn_live(rig, slot, "restore")?;
+     rig.gpu
+         .hip
+         .device_synchronize()
+@@ -688,6 +890,9 @@ pub(super) fn restore_legacy_native_image(
+         snapshot
+             .restore_to(&mut rig.model.dn_states[slot], &mut rig.gpu)
+             .map_err(|e| format!("kvmem restore DN: {e}"))?;
++        if let Some(ctl) = rig.model.kvmem.as_mut() {
++            ctl.note_state_restore();
++        }
+         if source.store.frontier == 0 {
+             if let Some(state) = rig.model.mtp_states[slot].as_mut() {
+                 state
+@@ -699,13 +904,37 @@ pub(super) fn restore_legacy_native_image(
              }
          } else {
              match (&source.draft, kind) {
@@ -5767,7 +6213,7 @@ index add3ddc20..ffc831917 100644
                  (LegacyDraftImage::Dflash(image), SpecKind::Dflash) => {
                      // Cold admission frees the previous occupant's draft state;
                      // allocate the empty destination the same way the first
-@@ -885,6 +1043,7 @@ enum LegacyQueryDecision {
+@@ -885,6 +1114,7 @@ enum LegacyQueryDecision {
  fn plan_legacy_query_replay(
      rig: &Rig,
      run: &mut LegacyQueryRun,
@@ -5775,7 +6221,7 @@ index add3ddc20..ffc831917 100644
  ) -> Result<LegacyQueryDecision, String> {
      let Some(control) = rig.model.kvmem.as_ref() else {
          return Ok(LegacyQueryDecision::Skip {
-@@ -906,15 +1065,16 @@ fn plan_legacy_query_replay(
+@@ -906,15 +1136,16 @@ fn plan_legacy_query_replay(
              scores: None,
          });
      }
@@ -5801,7 +6247,7 @@ index add3ddc20..ffc831917 100644
      let prompt_end = run.query.prompt_end() as u64;
      let restore_begin = run.query.restore_begin() as u64;
      let window_tokens = control.window_capacity_tokens();
-@@ -1032,7 +1192,19 @@ pub(super) fn advance_legacy_query_replay(
+@@ -1032,7 +1263,19 @@ pub(super) fn advance_legacy_query_replay(
              Some(run) => run,
              None => continue,
          };
@@ -5822,7 +6268,23 @@ index add3ddc20..ffc831917 100644
          match decision {
              LegacyQueryDecision::Skip { reason, scores } => {
                  if let Some(scores) = scores {
-@@ -1219,6 +1391,23 @@ pub(super) fn prepare_kvmem_step(
+@@ -1165,6 +1408,15 @@ pub(super) fn prepare_kvmem_step(
+     batch: &SlotBatch,
+     n: usize,
+ ) -> Result<(), String> {
++    // S2: a Legacy park leaves a tombstone plus an image handle. Reallocate
++    // before the batch is provisioned so every scheduled slot has real
++    // recurrent buffers (and so the forward guard is a contract, not a trap).
++    #[cfg(feature = "kvmem")]
++    for (slot, flight) in slots.iter().take(n).enumerate() {
++        if flight.is_some() {
++            ensure_dn_live(rig, slot, "active")?;
++        }
++    }
+     // ── KVMem residency pass (HIPFIRE_KVMEM) ────────────────────────
+     // Runs BEFORE provisioning: a step's new pages come from the
+     // pool's free list, so the pages this step sheds must be back in
+@@ -1219,6 +1471,23 @@ pub(super) fn prepare_kvmem_step(
                          })
                  })
                  .collect();
@@ -5846,7 +6308,7 @@ index add3ddc20..ffc831917 100644
              let ctl = rig.model.kvmem.as_mut().unwrap();
              ctl.prepare_legacy_step(
                  &mut rig.gpu,
-@@ -1228,6 +1417,7 @@ pub(super) fn prepare_kvmem_step(
+@@ -1228,6 +1497,7 @@ pub(super) fn prepare_kvmem_step(
                  &incoming,
                  &decoding,
                  &replaying,
@@ -5854,7 +6316,7 @@ index add3ddc20..ffc831917 100644
                  &rig.model.k_arenas,
                  &rig.model.v_arenas,
              )
-@@ -2455,10 +2645,38 @@ pub(super) fn kvmem_prefix_reuse(
+@@ -2455,10 +2725,38 @@ pub(super) fn kvmem_prefix_reuse(
                      &req.prompt_tokens[..frontier as usize],
                      ckpt_media,
                  );
@@ -5894,7 +6356,7 @@ index add3ddc20..ffc831917 100644
                          let dn_path = std::path::PathBuf::from(format!("{}.dn", pack.display()));
                          match std::fs::read(&dn_path) {
                              Ok(bytes) => {
-@@ -2591,6 +2809,29 @@ pub(super) fn kvmem_prefix_reuse(
+@@ -2591,6 +2889,29 @@ pub(super) fn kvmem_prefix_reuse(
                  //    serialization; logical ring + captured watermarks). A
                  //    missing/unrestorable image reseeds the draft from scratch
                  //    — acceptance degrades, output stays verify-exact.
@@ -5924,7 +6386,7 @@ index add3ddc20..ffc831917 100644
                  if let Some(shared) = rig.model.dflash.as_ref() {
                      let restored = {
                          match ctl
-@@ -3334,6 +3575,11 @@ pub(super) fn build_kvmem_controller(
+@@ -3334,6 +3655,11 @@ pub(super) fn build_kvmem_controller(
          }
          config
      });
@@ -5936,7 +6398,7 @@ index add3ddc20..ffc831917 100644
      if let Some(config) = legacy_config.as_ref() {
          eprintln!(
              "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
-@@ -3369,6 +3615,35 @@ pub(super) fn build_kvmem_controller(
+@@ -3369,6 +3695,35 @@ pub(super) fn build_kvmem_controller(
              cfg.cap_tokens,
          );
      }
@@ -5973,7 +6435,7 @@ index add3ddc20..ffc831917 100644
          n_slots,
          &plan,
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
-index 33ae973c0..10c9e4b66 100644
+index 33ae973c0..970b29c05 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 @@ -389,12 +389,12 @@ pub(super) fn evict_for_admit(
@@ -5991,7 +6453,7 @@ index 33ae973c0..10c9e4b66 100644
      }
  }
  
-@@ -733,7 +733,27 @@ pub(super) fn note_stats(rig: &Rig, stats: &mut EngineStats) {
+@@ -733,7 +733,45 @@ pub(super) fn note_stats(rig: &Rig, stats: &mut EngineStats) {
      #[cfg(feature = "kvmem")]
      {
          if let Some(kvmem) = rig.model.kvmem.as_ref() {
@@ -6006,7 +6468,12 @@ index 33ae973c0..10c9e4b66 100644
 +                }
 +            }
 +            snapshot.dn_state_bytes = dn_bytes;
-+            snapshot.dn_state_slots = rig.model.dn_states.len() as u32;
++            snapshot.dn_state_slots = rig
++                .model
++                .dn_states
++                .iter()
++                .filter(|state| !state.is_empty())
++                .count() as u32;
 +            // P2: when the host ring owns persistent DN checkpoints, report its
 +            // count/bytes (the GPU pool is a cache, not the ownership tier).
 +            if !kvmem.dn_ring_enabled() {
@@ -6016,6 +6483,19 @@ index 33ae973c0..10c9e4b66 100644
 +                }
 +            }
 +            snapshot.dflash_managed = rig.model.dflash_states.iter().any(|s| s.is_some());
++            // S2: the catalog is the authoritative owner of parked native
++            // images. Count entries and charge their DN/draft payloads from
++            // the images themselves; the slot handles are only locators and
++            // are cleared when a slot is reused for a different request.
++            if let Some(catalog) = rig.legacy_history.as_ref() {
++                snapshot.state_images = catalog.len() as u32;
++                let mut host_bytes = 0u64;
++                for image in catalog.values() {
++                    host_bytes =
++                        host_bytes.saturating_add(image.auxiliary_bytes().unwrap_or(0) as u64);
++                }
++                snapshot.state_host_bytes = host_bytes;
++            }
 +            stats.note_kvmem(snapshot);
          }
      }
@@ -7147,10 +7627,10 @@ index 000000000..2a86b44ce
 +    }
 +}
 diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
-index 5bf032571..0de488b78 100644
+index 5bf032571..fc11aee3b 100644
 --- a/crates/hipfire-cli/src/serve/metrics.rs
 +++ b/crates/hipfire-cli/src/serve/metrics.rs
-@@ -557,6 +557,66 @@ impl Metrics {
+@@ -557,6 +557,96 @@ impl Metrics {
                      "1 when the KVMem controller runs the Layerwise per-layer recall strategy.",
                      flag(s.kvmem.layerwise),
                  );
@@ -7204,6 +7684,36 @@ index 5bf032571..0de488b78 100644
 +                );
 +                gauge(
 +                    &mut out,
++                    "hipfire_kvmem_state_images",
++                    "Retained DN/DFlash/MTP state images.",
++                    s.kvmem.state_images as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_state_host_bytes",
++                    "Host bytes charged by retained state images.",
++                    s.kvmem.state_host_bytes as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_state_demotions_total",
++                    "Live-to-image state demotions since engine start.",
++                    s.kvmem.state_demotions as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_state_promotions_total",
++                    "Image-to-live state promotions since engine start.",
++                    s.kvmem.state_promotions as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_state_restores_total",
++                    "Successful state-image installs since engine start.",
++                    s.kvmem.state_restores as f64,
++                );
++                gauge(
++                    &mut out,
 +                    "hipfire_kvmem_dflash_managed",
 +                    "1 when the DFlash draft-context KV is KVMem-managed.",
 +                    flag(s.kvmem.dflash_managed),
@@ -7217,7 +7727,7 @@ index 5bf032571..0de488b78 100644
                  gauge(
                      &mut out,
                      "hipfire_kvmem_host_bytes",
-@@ -695,6 +755,18 @@ impl Metrics {
+@@ -695,6 +785,18 @@ impl Metrics {
                      "Prefix reuses with no restorable DFlash2 draft image (draft reseeds).",
                      s.kvmem.draft_image_misses,
                  );
@@ -7237,10 +7747,10 @@ index 5bf032571..0de488b78 100644
                      &mut out,
                      "hipfire_kvmem_content_groups",
 diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
-index f7b8cc943..1b829085c 100644
+index f7b8cc943..6ed123388 100644
 --- a/crates/hipfire-runtime/src/serve/mod.rs
 +++ b/crates/hipfire-runtime/src/serve/mod.rs
-@@ -249,6 +249,28 @@ pub struct KvMemStats {
+@@ -249,6 +249,36 @@ pub struct KvMemStats {
      pub enabled: bool,
      /// Layerwise recall strategy active (per-layer selection) vs Legacy.
      pub layerwise: bool,
@@ -7263,13 +7773,21 @@ index f7b8cc943..1b829085c 100644
 +    /// Page-aligned recurrent checkpoints currently in the engine pool.
 +    pub dn_checkpoints: u32,
 +    pub dn_checkpoint_bytes: u64,
++    /// S0 state-image ledger: retained DN/DFlash/MTP images, their charged
++    /// host bytes, and cumulative lifecycle transitions. All zero until the
++    /// state store starts retaining images.
++    pub state_images: u32,
++    pub state_host_bytes: u64,
++    pub state_demotions: u64,
++    pub state_promotions: u64,
++    pub state_restores: u64,
 +    /// Media (vision) pages are pinned as indivisible prefix groups. Legacy
 +    /// gained this in P4; Layerwise has always pinned them.
 +    pub media_pins: bool,
      /// Host KV storage charged bytes (live + sealed payload + metadata).
      pub host_charged_bytes: u64,
      /// Host KV storage spilled to the disk tier.
-@@ -288,6 +310,10 @@ pub struct KvMemStats {
+@@ -288,6 +318,10 @@ pub struct KvMemStats {
      pub draft_images: u64,
      pub draft_image_hits: u64,
      pub draft_image_misses: u64,

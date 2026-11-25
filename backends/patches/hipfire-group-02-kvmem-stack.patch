@@ -1504,7 +1504,7 @@ index bd7d4f858..f40f598e4 100644
      // Clamp to the commit budget and truncate on an auxiliary eot inside the
      // kept prefix — mirrors mtp_batched_verify_accept_from_batch exactly so
 diff --git a/crates/hipfire-arch-qwen35/src/forward_slots.rs b/crates/hipfire-arch-qwen35/src/forward_slots.rs
-index 72f0cc565..502046cb9 100644
+index 72f0cc565..35ece809f 100644
 --- a/crates/hipfire-arch-qwen35/src/forward_slots.rs
 +++ b/crates/hipfire-arch-qwen35/src/forward_slots.rs
 @@ -94,6 +94,9 @@
@@ -2870,13 +2870,10 @@ index 72f0cc565..502046cb9 100644
              }
          }
      }
-@@ -2879,53 +3670,72 @@ fn run_fullattn_layer_slots(
-     )?;
-     gpu.rmsnorm_batched(
+@@ -2882,50 +3673,69 @@ fn run_fullattn_layer_slots(
+         &layer.k_norm,
          &pbs.fa_k_batch,
--        &layer.k_norm,
--        &pbs.fa_k_batch,
--        n * config.n_kv_heads,
+         n * config.n_kv_heads,
 -        config.head_dim,
 -        config.norm_eps,
 -    )?;
@@ -2899,9 +2896,6 @@ index 72f0cc565..502046cb9 100644
 -            config.head_dim,
 -            n_rot,
 -            config.rope_theta,
-+        &layer.k_norm,
-+        &pbs.fa_k_batch,
-+        n * config.n_kv_heads,
 +        config.head_dim,
 +        config.norm_eps,
 +    )?;
@@ -3289,7 +3283,22 @@ index 72f0cc565..502046cb9 100644
  ) -> HipResult<()> {
      if batch.is_empty() {
          return Ok(());
-@@ -4507,6 +5420,30 @@ pub fn forward_batch_slots_opts(
+@@ -4354,6 +5267,14 @@ pub fn forward_batch_slots_opts(
+         "forward_batch_slots: dn_states.len() ({}) must equal n_slots ({n_slots})",
+         dn_states.len()
+     );
++    // S1 parked-slot invariant: an idle slot may own an empty DeltaNet
++    // placeholder, but the scheduler must never put it in this batch.
++    for (slot, &rows) in batch.m_per_slot.iter().enumerate() {
++        assert!(
++            rows == 0 || !dn_states[slot].is_empty(),
++            "forward_batch_slots: slot {slot} is active but its DeltaNet state is parked"
++        );
++    }
+     assert_eq!(
+         desc_staging.n_slots, n_slots,
+         "forward_batch_slots: desc_staging was built for a different n_slots"
+@@ -4507,6 +5428,30 @@ pub fn forward_batch_slots_opts(
                  .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
              pool.mark_uploaded();
          }
@@ -3320,7 +3329,7 @@ index 72f0cc565..502046cb9 100644
      }
  
      let physical_cap = pool.cap_tokens();
-@@ -4542,6 +5479,64 @@ pub fn forward_batch_slots_opts(
+@@ -4542,6 +5487,64 @@ pub fn forward_batch_slots_opts(
          None
      };
  
@@ -3385,7 +3394,7 @@ index 72f0cc565..502046cb9 100644
      // `n > active_slots` means at least one slot contributes more than one row
      // this step -- i.e. there is prompt left to prefill. A step where every
      // active slot contributes exactly one row is pure decode, and there the
-@@ -4580,8 +5575,8 @@ pub fn forward_batch_slots_opts(
+@@ -4580,8 +5583,8 @@ pub fn forward_batch_slots_opts(
      // layer" upload policy.
      let n_tiles: Option<usize> = if kv.is_q8()
          && single_slot.is_none()
@@ -3395,7 +3404,7 @@ index 72f0cc565..502046cb9 100644
          && q8_flash_prefill_wmma_eligible(gpu, config.head_dim, n)
      {
          let (tile_slot, tile_row0, tile_qbase) = build_tiles(&batch.m_per_slot, WMMA_M_TILE);
-@@ -4610,30 +5605,231 @@ pub fn forward_batch_slots_opts(
+@@ -4610,30 +5613,231 @@ pub fn forward_batch_slots_opts(
  
      // ── 4. Per-layer loop ─────────────────────────────────────────────────
      let layer_end = config.n_layers.min(max_layer.unwrap_or(usize::MAX));
@@ -3651,7 +3660,7 @@ index 72f0cc565..502046cb9 100644
  
      if max_layer.is_some() {
          // Early-exit for bisection: mirror the reference's `do_lm_head =
-@@ -4676,7 +5872,12 @@ pub fn forward_batch_slots_opts(
+@@ -4676,7 +5880,12 @@ pub fn forward_batch_slots_opts(
  /// The per-layer body shared by the arena and VMM slots forwards. `kv_addr`
  /// yields the KV storage for FullAttention layer `kv_layer_idx`.
  #[allow(clippy::too_many_arguments)]
@@ -3665,7 +3674,7 @@ index 72f0cc565..502046cb9 100644
      gpu: &mut Gpu,
      weights: &Qwen35Weights,
      config: &Qwen35Config,
-@@ -4693,6 +5894,7 @@ fn run_layers_slots<'a, D, F>(
+@@ -4693,6 +5902,7 @@ fn run_layers_slots<'a, D, F>(
      use_mrope: bool,
      layer_end: usize,
      mut spec_capture: Option<&mut SpecVerifyCapture>,
@@ -3673,7 +3682,7 @@ index 72f0cc565..502046cb9 100644
  ) -> HipResult<()>
  where
      D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
-@@ -4730,7 +5932,9 @@ where
+@@ -4730,7 +5940,9 @@ where
                      n,
                      physical_cap,
                      max_ctx_len,
@@ -3683,7 +3692,7 @@ index 72f0cc565..502046cb9 100644
                  )?;
                  kv_layer_idx += 1;
              }
-@@ -4764,7 +5968,9 @@ where
+@@ -4764,7 +5976,9 @@ where
                      physical_cap,
                      max_ctx_len,
                      weights.moe_has_mq6,
@@ -3693,7 +3702,7 @@ index 72f0cc565..502046cb9 100644
                  )?;
                  kv_layer_idx += 1;
              }
-@@ -5024,11 +6230,7 @@ mod tests {
+@@ -5024,11 +6238,7 @@ mod tests {
              Ok(GroupPlan::Uniform(DType::MQ4G256V2))
          );
          // Out-of-scope containers refuse at admission.
@@ -3706,7 +3715,7 @@ index 72f0cc565..502046cb9 100644
              assert!(
                  plan_proj_group_dtypes(&[m(dt), m(DType::MQ4G256V2)], arch).is_err(),
                  "{dt:?} must not be admitted"
-@@ -5042,7 +6244,10 @@ mod tests {
+@@ -5042,7 +6252,10 @@ mod tests {
              assert!(slots_proj_admissible(dt, arch), "{dt:?} must be admitted");
              assert!(slots_is_lowbit(dt), "{dt:?} must be lowbit");
              assert!(!slots_weight_rotated(dt), "{dt:?} is flat, not rotated");
@@ -3718,7 +3727,7 @@ index 72f0cc565..502046cb9 100644
              assert_eq!(
                  plan_proj_group_dtypes(&[m(dt), m(dt)], arch),
                  Ok(GroupPlan::Mixed {
-@@ -5052,7 +6257,10 @@ mod tests {
+@@ -5052,7 +6265,10 @@ mod tests {
                  "{dt:?} uniform group must lower to plain Mixed, never Uniform fused"
              );
              // A lowbit residual role is admitted (plain GEMM + add, no key).
@@ -3772,10 +3781,10 @@ index 70e956368..8d03fd68c 100644
                          gpu.conv1d_silu_split_qknorm(
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 new file mode 100644
-index 000000000..62e157d84
+index 000000000..6f8fcc187
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
-@@ -0,0 +1,1119 @@
+@@ -0,0 +1,1130 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -3859,11 +3868,15 @@ index 000000000..62e157d84
 +mod plan;
 +mod prefix;
 +mod slot;
++mod state_image;
 +mod step;
 +mod transfer;
 +
 +pub use import::*;
 +pub(crate) use options::{KvMemDiagnostics, KvMemOptions};
++pub(crate) use state_image::{
++    StateImage, StateImageId, StateImageKind, StateImageResidency, StateImageRole, StateImageStamp,
++};
 +
 +/// KVMem blocks are 128 tokens — the engine's page size (`PAGE_TOKENS`).
 +pub const KV_BLOCK_TOKENS: usize = 128;
@@ -4886,6 +4899,13 @@ index 000000000..62e157d84
 +    /// ownership tier and the fallback when the GPU checkpoint pool misses.
 +    /// Capacity is `HIPFIRE_KVMEM_DN_HOST_MIB` (default 512, 0 disables).
 +    dn_ring: DnRing,
++    /// S2 state-image ledger: live-to-image demotions, image-to-live
++    /// promotions, successful image installs, and the host bytes currently
++    /// charged by parked DN images.
++    state_demotions_total: u64,
++    state_promotions_total: u64,
++    state_restores_total: u64,
++    state_host_bytes: u64,
 +}
 +
 +/// `SPILLED_PAGE` is re-exported for engine-side diagnostics; keep the import
@@ -7271,10 +7291,10 @@ index 000000000..a0637730e
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
 new file mode 100644
-index 000000000..7d450bda6
+index 000000000..d1763a410
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-@@ -0,0 +1,641 @@
+@@ -0,0 +1,645 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -7809,6 +7829,10 @@ index 000000000..7d450bda6
 +            draft_sidecars_total: 0,
 +            draft_sidecar_bytes: 0,
 +            dn_ring: DnRing::new(dn_host_mib.saturating_mul(1 << 20)),
++            state_host_bytes: 0,
++            state_demotions_total: 0,
++            state_promotions_total: 0,
++            state_restores_total: 0,
 +        })
 +    }
 +
@@ -7918,10 +7942,10 @@ index 000000000..7d450bda6
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 new file mode 100644
-index 000000000..12ab147a6
+index 000000000..c9b87e3a4
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
-@@ -0,0 +1,691 @@
+@@ -0,0 +1,719 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -8497,6 +8521,26 @@ index 000000000..12ab147a6
 +        self.dn_ring.total_bytes()
 +    }
 +
++    /// S2: a live slot's recurrent bytes moved into a parked native image.
++    /// The legacy catalog already owns those bytes; this ledger tracks the
++    /// state-image share so `/metrics` reports it without double-counting
++    /// host storage.
++    pub fn note_state_demotion(&mut self, bytes: u64) {
++        self.state_demotions_total = self.state_demotions_total.saturating_add(1);
++        self.state_host_bytes = self.state_host_bytes.saturating_add(bytes);
++    }
++
++    /// S2: a parked image was promoted back into a live allocation.
++    pub fn note_state_promotion(&mut self, bytes: u64) {
++        self.state_promotions_total = self.state_promotions_total.saturating_add(1);
++        self.state_host_bytes = self.state_host_bytes.saturating_sub(bytes);
++    }
++
++    /// S2: a parked image was successfully installed into a live state.
++    pub fn note_state_restore(&mut self) {
++        self.state_restores_total = self.state_restores_total.saturating_add(1);
++    }
++
 +    /// Live observability snapshot (`/metrics` via `EngineStats.kvmem`).
 +    /// Cheap integer reads from the host stores: no device work, no
 +    /// allocation, and no path reads it back into selection/residency, so it
@@ -8518,16 +8562,24 @@ index 000000000..12ab147a6
 +            trunk_managed: true,
 +            mtp_head_managed: self.head_plane_enabled(),
 +            mtp_head_history_managed: self.mtp_head,
-+            // The live recurrent state remains engine-resident; the ring owns
-+            // page-aligned history anchors, not the slot's working state.
-+            dn_state_managed: false,
++            // S2: the working state is still engine scratch while a slot is
++            // active, but parking demotes it into a native history image and a
++            // cold admission reallocates/restores it. Together with the host
++            // ring, that makes the recurrent state a KVMem-owned tier.
++            dn_state_managed: true,
 +            dflash_managed: false,
-+            // The live recurrent state is engine scratch; the host ring is the
-+            // KVMem-owned persistent tier.
++            // The engine fills live and parked bytes in `note_stats`.
 +            dn_state_bytes: 0,
 +            dn_state_slots: 0,
 +            dn_checkpoints: self.dn_ring.len() as u32,
 +            dn_checkpoint_bytes: self.dn_ring.total_bytes(),
++            // S0/S2: the engine fills the parked-image count in `note_stats`;
++            // the lifecycle counters below are controller-owned.
++            state_images: 0,
++            state_host_bytes: self.state_host_bytes,
++            state_demotions: self.state_demotions_total,
++            state_promotions: self.state_promotions_total,
++            state_restores: self.state_restores_total,
 +            media_pins: true,
 +            host_charged_bytes: self.storage.charged_bytes(),
 +            disk_bytes: self.storage.disk_bytes(),
@@ -8981,6 +9033,199 @@ index 000000000..8f730122b
 +            .map_err(|e| format!("kvmem: test_set_fed append: {e}"))?;
 +        st.fed = fed;
 +        Ok(())
++    }
++}
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/state_image.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/state_image.rs
+new file mode 100644
+index 000000000..9fede512a
+--- /dev/null
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/state_image.rs
+@@ -0,0 +1,187 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! State-image vocabulary shared by the KVMem takeover stages.
++//!
++//! A [`StateImage`] is an immutable copy of one piece of engine-owned
++//! recurrent/draft state (DeltaNet, DFlash, MTP head). The engine keeps the
++//! live object while a slot is active; the image is what the host tier may
++//! retain after the live object is parked. This module deliberately contains
++//! only the vocabulary and accounting identity — S0 adds no lifecycle and no
++//! device work.
++
++#![allow(dead_code)]
++
++/// Which engine-owned state an image contains.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub(crate) enum StateImageKind {
++    /// DeltaNet recurrent + convolution state (`DeltaNetState`).
++    Dn,
++    /// DFlash draft slot state (`DflashSlotState`).
++    Dflash,
++    /// Legacy MTP head KV (`Qwen35MtpHeadKvCache`).
++    MtpHead,
++}
++
++impl StateImageKind {
++    pub(crate) const fn label(self) -> &'static str {
++        match self {
++            Self::Dn => "dn",
++            Self::Dflash => "dflash",
++            Self::MtpHead => "mtp_head",
++        }
++    }
++}
++
++/// Who may mutate the image.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum StateImageRole {
++    /// The image backs a live slot and can still advance.
++    Active,
++    /// Immutable history anchor; reusable after the frontier is validated.
++    Checkpoint,
++    /// Only a host copy exists; the device replica may be absent.
++    HostOnly,
++}
++
++/// Where the bytes currently live.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum StateImageResidency {
++    Device,
++    Host,
++    Both,
++}
++
++/// Stable image identity inside one engine instance.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
++pub(crate) struct StateImageId(pub(crate) u64);
++
++impl StateImageId {
++    pub(crate) const fn new(raw: u64) -> Self {
++        Self(raw)
++    }
++
++    pub(crate) const fn get(self) -> u64 {
++        self.0
++    }
++}
++
++/// Reuse proof bound to an image.
++///
++/// The fingerprints are deliberately opaque integers: the layouts and token
++/// ledgers that produce them stay in their owning modules. An image is only
++/// restorable when every field matches the target request exactly.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct StateImageStamp {
++    /// Model identity (weights + quantization).
++    pub(crate) model: u64,
++    /// Execution/layout identity (KV tier, RoPE, render configuration).
++    pub(crate) layout: u64,
++    /// Token-ledger identity at the image frontier.
++    pub(crate) tokens: u64,
++    /// Sticky media digest; `None` for text-only continuations.
++    pub(crate) media: Option<u64>,
++    /// Token frontier covered by the image.
++    pub(crate) frontier: u32,
++}
++
++/// Metadata for one retained state image. The payload stays owned by the
++/// state store; this record is what the catalog and metrics can inspect
++/// without touching device or host bytes.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct StateImage {
++    pub(crate) id: StateImageId,
++    pub(crate) kind: StateImageKind,
++    pub(crate) role: StateImageRole,
++    pub(crate) residency: StateImageResidency,
++    pub(crate) stamp: StateImageStamp,
++    /// Host bytes charged for this image (0 when device-only).
++    pub(crate) host_bytes: u64,
++}
++
++impl StateImage {
++    pub(crate) const fn new(
++        id: StateImageId,
++        kind: StateImageKind,
++        role: StateImageRole,
++        residency: StateImageResidency,
++        stamp: StateImageStamp,
++        host_bytes: u64,
++    ) -> Self {
++        Self {
++            id,
++            kind,
++            role,
++            residency,
++            stamp,
++            host_bytes,
++        }
++    }
++
++    /// True when the image is safe to hold without a live slot: immutable and
++    /// backed by a host copy.
++    pub(crate) const fn is_host_checkpoint(self) -> bool {
++        matches!(
++            self.role,
++            StateImageRole::Checkpoint | StateImageRole::HostOnly
++        ) && matches!(
++            self.residency,
++            StateImageResidency::Host | StateImageResidency::Both
++        )
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn stamp() -> StateImageStamp {
++        StateImageStamp {
++            model: 1,
++            layout: 2,
++            tokens: 3,
++            media: None,
++            frontier: 128,
++        }
++    }
++
++    #[test]
++    fn labels_are_stable() {
++        assert_eq!(StateImageKind::Dn.label(), "dn");
++        assert_eq!(StateImageKind::Dflash.label(), "dflash");
++        assert_eq!(StateImageKind::MtpHead.label(), "mtp_head");
++    }
++
++    #[test]
++    fn only_immutable_host_backed_images_are_checkpoints() {
++        let checkpoint = StateImage::new(
++            StateImageId::new(1),
++            StateImageKind::Dn,
++            StateImageRole::Checkpoint,
++            StateImageResidency::Both,
++            stamp(),
++            4096,
++        );
++        assert!(checkpoint.is_host_checkpoint());
++
++        let active = StateImage {
++            role: StateImageRole::Active,
++            ..checkpoint
++        };
++        assert!(!active.is_host_checkpoint());
++
++        let device_only = StateImage {
++            residency: StateImageResidency::Device,
++            ..checkpoint
++        };
++        assert!(!device_only.is_host_checkpoint());
++
++        let host_only = StateImage {
++            role: StateImageRole::HostOnly,
++            residency: StateImageResidency::Host,
++            ..checkpoint
++        };
++        assert!(host_only.is_host_checkpoint());
 +    }
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/step.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/step.rs
@@ -27474,10 +27719,10 @@ index 000000000..ea12a4fca
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/legacy_catalog.rs b/crates/hipfire-arch-qwen35/src/legacy_catalog.rs
 new file mode 100644
-index 000000000..2ed18f4a6
+index 000000000..525e1be5b
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/legacy_catalog.rs
-@@ -0,0 +1,1013 @@
+@@ -0,0 +1,1018 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// hipfire — see LICENSE and NOTICE in the project root.
 +
@@ -27703,6 +27948,11 @@ index 000000000..2ed18f4a6
 +
 +    pub fn get(&self, id: u64) -> Option<&HistoryEntry<T>> {
 +        self.slots.iter().flatten().find(|entry| entry.id == id)
++    }
++
++    /// Every live entry, for accounting that the catalog itself does not own.
++    pub fn values(&self) -> impl Iterator<Item = &T> {
++        self.slots.iter().flatten().map(|entry| &entry.value)
 +    }
 +
 +    /// Publish a complete immutable image supplied by the caller. This call
@@ -32892,8 +33142,44 @@ index 000000000..2e6d23a46
 +        Ok(())
 +    }
 +}
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/weights.rs b/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
+index dd17541e7..cb8e404ee 100644
+--- a/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35/weights.rs
+@@ -3715,6 +3715,31 @@ impl DeltaNetState {
+         Self::new_batched_with_quant(gpu, config, quant, 1)
+     }
+ 
++    /// A parked-slot placeholder with no device allocations.
++    ///
++    /// The slot keeps its `quant` so the state store can reallocate the same
++    /// representation on promotion without consulting the model again. An
++    /// empty state is never a valid forward operand: the serve forward entry
++    /// rejects active slots in this state, and `free_gpu` on it is a no-op.
++    pub fn empty(quant: StateQuant) -> Self {
++        Self {
++            s_matrices: Vec::new(),
++            s_scales: Vec::new(),
++            conv_states: Vec::new(),
++            s_ef_residual: Vec::new(),
++            quant,
++        }
++    }
++
++    /// True when this is the parked placeholder from [`Self::empty`].
++    #[inline]
++    pub fn is_empty(&self) -> bool {
++        self.s_matrices.is_empty()
++            && self.s_scales.is_empty()
++            && self.conv_states.is_empty()
++            && self.s_ef_residual.is_empty()
++    }
++
+     /// Allocate lane-major recurrent state for independent-sequence decode.
+     ///
+     /// The ordinary state has an implicit batch of one.  This variant keeps
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
-index 82fbdd9cd..183fb2121 100644
+index 82fbdd9cd..81c28b93d 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
 @@ -53,6 +53,48 @@ use hipfire_runtime::serve_wait::WaitQueue;
@@ -33015,7 +33301,19 @@ index 82fbdd9cd..183fb2121 100644
      fn close(&self, session: u64) -> Result<(), String> {
          SlotEngine::close(self, session)
      }
-@@ -456,9 +531,10 @@ struct ModelRig {
+@@ -442,6 +517,11 @@ struct ModelRig {
+     config: qwen35::Qwen35Config,
+     scratch: Qwen35Scratch,
+     dn_states: Vec<DeltaNetState>,
++    /// S1 parked-image handles, one per slot. `None` while the live state is
++    /// engine-resident; S2 replaces the live state with `DeltaNetState::empty`
++    /// and stores the published image id here.
++    #[cfg(feature = "kvmem")]
++    dn_images: Vec<Option<crate::kvmem_ctl::StateImageId>>,
+     k_arenas: Vec<GpuTensor>,
+     v_arenas: Vec<GpuTensor>,
+     desc_staging: SlotDescStaging,
+@@ -456,9 +536,10 @@ struct ModelRig {
      /// Per-slot MTP spec state. None for slots that haven't started MTP yet
      /// or when MTP is off. Allocated lazily on first MTP prefill.
      mtp_states: Vec<Option<crate::mtp_spec::MtpSpecState>>,
@@ -33029,7 +33327,7 @@ index 82fbdd9cd..183fb2121 100644
      /// Batched scratch (+ per-row FWHT-rot buffer) for MTP head-KV prefill
      /// from the scheduler's batched prompt chunks. None when MTP is off.
      mtp_prefill_batched: Option<(crate::mtp_head::Qwen35MtpHeadBatchedScratch, GpuTensor)>,
-@@ -476,6 +552,11 @@ struct ModelRig {
+@@ -476,6 +557,11 @@ struct ModelRig {
      /// both exist — the tape stride and graph-shape check use this uniform
      /// width).
      spec_rows: usize,
@@ -33041,7 +33339,7 @@ index 82fbdd9cd..183fb2121 100644
      /// Shared DFlash2 draft state (weights + hidden staging). None when
      /// DFlash is off.
      dflash: Option<crate::dflash_slot::DflashShared>,
-@@ -500,63 +581,34 @@ struct ModelRig {
+@@ -500,63 +586,34 @@ struct ModelRig {
      /// Cross-session recurrent-state checkpoint pool (spec §4.5 C5).
      /// None when `prefix_cache` is off.
      checkpoint_pool: Option<crate::checkpoint::CheckpointPool<DeltaNetSnapshot>>,
@@ -33130,7 +33428,7 @@ index 82fbdd9cd..183fb2121 100644
  }
  
  struct Rig {
-@@ -580,6 +632,21 @@ struct Rig {
+@@ -580,6 +637,21 @@ struct Rig {
      /// the only paged-compatible mode).
      vl_sequential: bool,
      sessions: SessionTable,
@@ -33152,7 +33450,7 @@ index 82fbdd9cd..183fb2121 100644
      adm: AdmissionController,
      swap: SwapManager,
      stamp: SnapshotStamp,
-@@ -613,6 +680,25 @@ struct Rig {
+@@ -613,6 +685,25 @@ struct Rig {
      cache_domain: Option<hipfire_runtime::serve_contract::CacheDomain>,
      /// True when cross-session prefix reuse is enabled.
      prefix_cache: bool,
@@ -33178,7 +33476,7 @@ index 82fbdd9cd..183fb2121 100644
      /// The configured `serve.prefix_cache_max_bytes` ceiling. Retained on
      /// the Rig so the Reset path can re-apply it to the replacement index
      /// (`PrefixIndex::new` starts with no ceiling; losing it on reset
-@@ -747,6 +833,31 @@ fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
+@@ -747,6 +838,31 @@ fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
  }
  
  impl Rig {
@@ -33210,7 +33508,7 @@ index 82fbdd9cd..183fb2121 100644
      /// Resolve the placement the slots path loads with.
      ///
      /// `Full`/`Full` returns the all-device placement with no capacity check — the
-@@ -895,7 +1006,7 @@ impl Rig {
+@@ -895,7 +1011,7 @@ impl Rig {
          use hipfire_runtime::tokenizer::Tokenizer;
          use rdna_compute::kv_slots::preflight_alloc;
  
@@ -33219,7 +33517,7 @@ index 82fbdd9cd..183fb2121 100644
          let mut hfq = HfqFile::open(&cfg.model_path).map_err(|e| format!("open model: {e}"))?;
          let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("config: {e}"))?;
          let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-@@ -966,7 +1077,39 @@ impl Rig {
+@@ -966,7 +1082,39 @@ impl Rig {
          .map_err(|e| format!("kv mode {kv_mode:?}: {e}"))?;
          let per_pos_bytes = kv_plan.k_bytes_per_pos;
          let per_pos_v_bytes = kv_plan.v_bytes_per_pos;
@@ -33259,7 +33557,7 @@ index 82fbdd9cd..183fb2121 100644
          // DFlash2 draft config pre-parse: the runtime block size B sets
          // `spec_rows` (verify rows per spec slot), which `max_batch` and the
          // verify tape are sized by — both allocated before the GPU-side
-@@ -1007,10 +1150,96 @@ impl Rig {
+@@ -1007,10 +1155,96 @@ impl Rig {
          // set_seq_len errors before any kernel writes through the missing
          // page); a larger count over-subscribes physical VRAM and is the
          // operator's call.
@@ -33357,7 +33655,7 @@ index 82fbdd9cd..183fb2121 100644
          let paged_pages = if prefix_cache {
              let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
              // Cache-retained pages share the same physical pool as active slots.
-@@ -1029,6 +1258,11 @@ impl Rig {
+@@ -1029,6 +1263,11 @@ impl Rig {
                      .map(|p| p.max(1))
                      .unwrap_or_else(|| legacy_equivalent.saturating_add(cache_headroom)),
              )
@@ -33369,7 +33667,7 @@ index 82fbdd9cd..183fb2121 100644
          } else {
              match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
                  .ok()
-@@ -1040,10 +1274,7 @@ impl Rig {
+@@ -1040,10 +1279,7 @@ impl Rig {
                      // forced the legacy sequential VL path — that path writes
                      // through a flat contiguous slab view which aliases every
                      // slot onto the arena prefix in paged mode.
@@ -33381,7 +33679,7 @@ index 82fbdd9cd..183fb2121 100644
                          eprintln!(
                              "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
                               requires contiguous KV slots"
-@@ -1635,6 +1866,15 @@ impl Rig {
+@@ -1635,6 +1871,15 @@ impl Rig {
          let pbs = PrefillBatchScratch::new_opt(g.gpu.as_mut().unwrap(), &config, max_batch, false)
              .map_err(|e| format!("pbs: {e}"))?;
          g.pbs = Some(pbs);
@@ -33397,7 +33695,7 @@ index 82fbdd9cd..183fb2121 100644
          let scratch =
              Qwen35Scratch::new_with_kv_max(g.gpu.as_mut().unwrap(), &config, 64, cfg.cap_tokens)
                  .map_err(|e| format!("scratch: {e}"))?;
-@@ -1685,9 +1925,6 @@ impl Rig {
+@@ -1685,9 +1930,6 @@ impl Rig {
          let vl_ext_devs: Vec<Option<GpuTensor>> = (0..cfg.n_slots).map(|_| None).collect();
          let vl_tower_jobs: Vec<Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>> =
              (0..cfg.n_slots).map(|_| None).collect();
@@ -33407,7 +33705,7 @@ index 82fbdd9cd..183fb2121 100644
          if vl_sequential && !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
              return Err(
                  "HIPFIRE_VL_SEQUENTIAL=1 writes KV through the q8-only flat slab \
-@@ -1720,14 +1957,31 @@ impl Rig {
+@@ -1720,14 +1962,31 @@ impl Rig {
              dn_bytes,
          };
  
@@ -33441,7 +33739,7 @@ index 82fbdd9cd..183fb2121 100644
                  pinned_host_bytes,
              },
              vram_total as u64,
-@@ -1769,6 +2023,27 @@ impl Rig {
+@@ -1769,6 +2028,27 @@ impl Rig {
          let scratch = g.scratch.take().unwrap();
          let logits_out = g.logits_out.take().unwrap();
          let out_tokens = g.out_tokens.take().unwrap();
@@ -33469,7 +33767,7 @@ index 82fbdd9cd..183fb2121 100644
          // MTP head-KV prefill scratch, sized for one scheduler prompt chunk.
          // Allocated after the guard commit (transactional ownership is no
          // longer needed past this point: everything above already committed).
-@@ -1817,15 +2092,17 @@ impl Rig {
+@@ -1817,15 +2097,17 @@ impl Rig {
          // ── Prefix cache (spec §4.1–4.6) ──────────────────────────────────
          // Build the CacheDomain ONCE from available identities. When
          // prefix_cache is off, all three are None and the existing path is
@@ -33490,7 +33788,7 @@ index 82fbdd9cd..183fb2121 100644
                  return Err(
                      "serve.prefix_cache requires serve.prefix_cache_max_bytes > 0 \
                       (0 means no retained cache, never unlimited)"
-@@ -1903,24 +2180,47 @@ impl Rig {
+@@ -1903,24 +2185,47 @@ impl Rig {
                      domain_id: "default".to_string(),
                  },
              };
@@ -33556,7 +33854,7 @@ index 82fbdd9cd..183fb2121 100644
          } else {
              (None, None, None)
          };
-@@ -1953,6 +2253,21 @@ impl Rig {
+@@ -1953,6 +2258,21 @@ impl Rig {
          // therefore not a sound deadline base (spec §5.3 S3).
          let wait_queue = WaitQueue::new(cfg.wait_max_count, cfg.wait_max_bytes, u64::MAX)
              .map_err(|e| format!("wait queue: {e}"))?;
@@ -33578,7 +33876,16 @@ index 82fbdd9cd..183fb2121 100644
          Ok(Rig {
              gpu,
              tokenizer,
-@@ -1970,12 +2285,13 @@ impl Rig {
+@@ -1962,6 +2282,8 @@ impl Rig {
+                 config,
+                 scratch,
+                 dn_states,
++                #[cfg(feature = "kvmem")]
++                dn_images: (0..cfg.n_slots).map(|_| None).collect(),
+                 k_arenas,
+                 v_arenas,
+                 desc_staging,
+@@ -1970,12 +2292,13 @@ impl Rig {
                  logits_out,
                  mtp_head,
                  mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
@@ -33593,7 +33900,7 @@ index 82fbdd9cd..183fb2121 100644
                  dflash,
                  dflash_states: (0..cfg.n_slots).map(|_| None).collect(),
                  vision_weights,
-@@ -1983,12 +2299,38 @@ impl Rig {
+@@ -1983,12 +2306,38 @@ impl Rig {
                  vl_ext_devs,
                  vl_tower_jobs,
                  checkpoint_pool,
@@ -33632,7 +33939,7 @@ index 82fbdd9cd..183fb2121 100644
              adm,
              swap,
              stamp,
-@@ -2004,6 +2346,11 @@ impl Rig {
+@@ -2004,6 +2353,11 @@ impl Rig {
              prefix_index,
              cache_domain,
              prefix_cache,
@@ -33644,7 +33951,7 @@ index 82fbdd9cd..183fb2121 100644
              prefix_cache_max_bytes: if prefix_cache {
                  Some(cfg.prefix_cache_max_bytes as usize)
              } else {
-@@ -2140,813 +2487,6 @@ impl Rig {
+@@ -2140,813 +2494,6 @@ impl Rig {
      }
  }
  
@@ -34458,7 +34765,7 @@ index 82fbdd9cd..183fb2121 100644
  /// One slot's in-flight spec draft between the draft phase and the
  /// post-forward accept. `Mtp` carries the head's K-step chain output;
  /// `Dflash` carries the DFlash2 selector block. Both expose the verify-row
-@@ -3062,13 +2602,13 @@ fn clear_work_slot(work: &mut PendingWork) {
+@@ -3062,13 +2609,13 @@ fn clear_work_slot(work: &mut PendingWork) {
      work.vl_prefill = None;
      work.spec = SpecKind::None;
      work.pos3_delta = 0;
@@ -34479,7 +34786,7 @@ index 82fbdd9cd..183fb2121 100644
  }
  
  /// Release a request's prefix-cache pin on every terminal path (spec §4.4
-@@ -3190,28 +2730,15 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
+@@ -3190,28 +2737,15 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
  /// batched forward provisions `set_seq_len(max_pos + 1)` before its KV write
  /// and fails the whole step closed when that exceeds the cap, which rejects
  /// every active slot; MTP must retire before drafting instead.
@@ -34513,7 +34820,7 @@ index 82fbdd9cd..183fb2121 100644
  ///
  /// `repeat_window == 0` does NOT neutralize the penalties: OpenAI-style
  /// presence/frequency penalties are defined over the whole context, so a zero
-@@ -3243,17 +2770,6 @@ fn effective_repeat_window(
+@@ -3243,17 +2777,6 @@ fn effective_repeat_window(
      }
  }
  
@@ -34531,7 +34838,7 @@ index 82fbdd9cd..183fb2121 100644
  /// Install a request's sampling parameters (including token penalties and
  /// min_p) on its slot's sampler state.
  fn install_sample_params(rig: &mut Rig, slot: SlotId, req: &SubmitRequest) {
-@@ -3400,6 +2916,7 @@ fn publish_generated_prefix(
+@@ -3400,6 +2923,7 @@ fn publish_generated_prefix(
                  domain,
                  new_boundary as u64,
                  &tokens,
@@ -34539,7 +34846,7 @@ index 82fbdd9cd..183fb2121 100644
                  &rig.model.dn_states[s],
              ) {
                  Ok(id) if id.is_some() => Some(id),
-@@ -3494,6 +3011,20 @@ fn commit_sampled_token(
+@@ -3494,6 +3018,20 @@ fn commit_sampled_token(
          // instead of a successful done (spec §7.1 G1, A17). ClientGone is
          // never overridden: the receiver is already dropped.
          lock_stats(stats).note_slot_released();
@@ -34560,7 +34867,7 @@ index 82fbdd9cd..183fb2121 100644
          if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
              let _ = send_event(
                  &f.reply,
-@@ -3521,11 +3052,28 @@ fn commit_sampled_token(
+@@ -3521,11 +3059,28 @@ fn commit_sampled_token(
          // the fairness budget (spec §5.3 S3). Idempotent (NotFound ignored).
          let _ = rig.fair_queue.remove(session.0);
          clear_work_slot(&mut work[s]);
@@ -34589,7 +34896,7 @@ index 82fbdd9cd..183fb2121 100644
              rig.sessions.touch(session);
          }
      } else {
-@@ -3537,15 +3085,82 @@ fn commit_sampled_token(
+@@ -3537,15 +3092,82 @@ fn commit_sampled_token(
      }
  }
  
@@ -34680,7 +34987,7 @@ index 82fbdd9cd..183fb2121 100644
  
  /// Swap failures are not fatal (the session re-prefills), but they must not be
  /// silent. Warn once per process and per failure class so a misconfigured
-@@ -3602,6 +3217,17 @@ struct InFlight {
+@@ -3602,6 +3224,17 @@ struct InFlight {
      /// that shared pages from a prefix cache hit are not re-published.
      /// 0 when prefix_cache is off.
      last_published_boundary: usize,
@@ -34698,7 +35005,7 @@ index 82fbdd9cd..183fb2121 100644
      /// Per-request grammar constraint for structured output (spec §7 G1/G2).
      /// `None` for unconstrained requests. When present, a grammar mask is
      /// applied to the slot's logits row BEFORE the GPU sampler's
-@@ -3926,6 +3552,11 @@ fn run_loop(
+@@ -3926,6 +3559,11 @@ fn run_loop(
  ) -> Result<(), String> {
      let n = rig.n_slots;
      let mut slots: Vec<Option<InFlight>> = (0..n).map(|_| None).collect();
@@ -34710,7 +35017,7 @@ index 82fbdd9cd..183fb2121 100644
      let mut work: Vec<PendingWork> = (0..n)
          .map(|s| PendingWork {
              slot: SlotId(s),
-@@ -3934,9 +3565,7 @@ fn run_loop(
+@@ -3934,9 +3572,7 @@ fn run_loop(
              decoding: false,
              vl_prefill: None,
              spec: SpecKind::None,
@@ -34721,7 +35028,7 @@ index 82fbdd9cd..183fb2121 100644
              pos3_delta: 0,
          })
          .collect();
-@@ -3969,6 +3598,13 @@ fn run_loop(
+@@ -3969,6 +3605,13 @@ fn run_loop(
                  rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
                  let _ = rig.fair_queue.remove(sid.0);
                  clear_work_slot(&mut work[s]);
@@ -34735,7 +35042,7 @@ index 82fbdd9cd..183fb2121 100644
                  rig.model.clear_slot_vl_state(&mut rig.gpu, s);
              }
          }
-@@ -3997,9 +3633,16 @@ fn run_loop(
+@@ -3997,9 +3640,16 @@ fn run_loop(
                          .max(std::time::Duration::from_secs(1))
                  }) {
                      Some(wait) => match rx.recv_timeout(wait) {
@@ -34754,7 +35061,7 @@ index 82fbdd9cd..183fb2121 100644
                              let mut st = stats.lock().expect("stats");
                              st.note_swap(&rig.swap);
                              drop(st);
-@@ -4008,14 +3651,28 @@ fn run_loop(
+@@ -4008,14 +3658,28 @@ fn run_loop(
                          Err(RecvTimeoutError::Disconnected) => break 'serve,
                      },
                      None => match rx.recv() {
@@ -34785,7 +35092,7 @@ index 82fbdd9cd..183fb2121 100644
                      Err(TryRecvError::Empty) => break,
                      Err(TryRecvError::Disconnected) => {
                          if slots.iter().all(|s| s.is_none()) {
-@@ -4037,8 +3694,13 @@ fn run_loop(
+@@ -4037,8 +3701,13 @@ fn run_loop(
                  if let Some(pp) = rig.pool.page_pool() {
                      st.note_pool_pages(pp.free_pages(), pp.n_pages());
                  }
@@ -34799,7 +35106,7 @@ index 82fbdd9cd..183fb2121 100644
              // Expire timed-out waiters → typed queue timeout rejection. The
              // deadline is WALL-CLOCK (`serve.queue_timeout_ms` against the
              // enqueue Instant), not a tick count: ticks advance once per serve
-@@ -4094,7 +3756,7 @@ fn run_loop(
+@@ -4094,7 +3763,7 @@ fn run_loop(
                  };
                  let active_before = slots.iter().filter(|s| s.is_some()).count();
                  rig.pending_repark_age = Some(parked.enqueued_at);
@@ -34808,7 +35115,7 @@ index 82fbdd9cd..183fb2121 100644
                  rig.pending_repark_age = None;
                  let active_after = slots.iter().filter(|s| s.is_some()).count();
                  // If admit did not place the request in a slot (it may have
-@@ -4125,12 +3787,39 @@ fn run_loop(
+@@ -4125,12 +3794,39 @@ fn run_loop(
                      .min()
                      .unwrap_or(std::time::Duration::from_millis(50));
                  match rx.recv_timeout(sleep_for) {
@@ -34849,7 +35156,7 @@ index 82fbdd9cd..183fb2121 100644
              // Slot occupancy for this step, after admission. Each terminal
              // below releases its slot in the stats BEFORE posting its event,
              // so the snapshot a `done` reads counts only slots still busy.
-@@ -4296,11 +3985,12 @@ fn run_loop(
+@@ -4296,11 +3992,12 @@ fn run_loop(
                          let seed = work[s].remaining_prompt.last().copied();
                          // Token penalties scope the verify rows against this
                          // request's emitted history (`sess.tokens` past the
@@ -34866,7 +35173,7 @@ index 82fbdd9cd..183fb2121 100644
                                      .as_ref()
                                      .filter(|c| c.sampling.penalized())
                                      .map(|c| c.prompt_len);
-@@ -4318,13 +4008,23 @@ fn run_loop(
+@@ -4318,13 +4015,23 @@ fn run_loop(
                              _ => Vec::new(),
                          };
                          let outcome = match work[s].spec {
@@ -34895,7 +35202,7 @@ index 82fbdd9cd..183fb2121 100644
                                  .map(SpecDraftRows::Dflash),
                              SpecKind::None => {
                                  unreachable!("spec.active() gate above")
-@@ -4332,6 +4032,12 @@ fn run_loop(
+@@ -4332,6 +4039,12 @@ fn run_loop(
                          };
                          match outcome {
                              Ok(draft) => {
@@ -34908,7 +35215,7 @@ index 82fbdd9cd..183fb2121 100644
                                  spec_seeds[s] = seed;
                                  spec_drafts[s] = Some(draft);
                              }
-@@ -4487,11 +4193,30 @@ fn run_loop(
+@@ -4487,11 +4200,30 @@ fn run_loop(
                      eligible[s] = granted_ids.contains(&f.session.0);
                  }
              }
@@ -34940,7 +35247,7 @@ index 82fbdd9cd..183fb2121 100644
              );
  
              // Count prefill + decode rows the scheduler emitted.
-@@ -4602,6 +4327,29 @@ fn run_loop(
+@@ -4602,6 +4334,29 @@ fn run_loop(
              if batch.is_empty() {
                  continue;
              }
@@ -34970,7 +35277,7 @@ index 82fbdd9cd..183fb2121 100644
              // Provision every slot's write frontier before any COW or kernel work.
              // If retained cache-only pages consumed the free list, evict unpinned
              // radix leaves and retry once. `forward_batch_slots` repeats this call
-@@ -4889,11 +4637,55 @@ fn run_loop(
+@@ -4889,11 +4644,55 @@ fn run_loop(
                  work[s].spec == SpecKind::Dflash
                      && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
              });
@@ -35026,7 +35333,7 @@ index 82fbdd9cd..183fb2121 100644
              let fwd = rig.model.forward_step(
                  &mut rig.gpu,
                  &batch,
-@@ -4902,6 +4694,7 @@ fn run_loop(
+@@ -4902,6 +4701,7 @@ fn run_loop(
                  &lm_head_skip,
                  any_verify,
                  any_dflash_rows,
@@ -35034,7 +35341,7 @@ index 82fbdd9cd..183fb2121 100644
              );
              let forward_ns = t_forward.elapsed().as_nanos() as u64;
              // ── Publication (spec §4.6 C6) ──────────────────────────────────
-@@ -5020,6 +4813,7 @@ fn run_loop(
+@@ -5020,6 +4820,7 @@ fn run_loop(
                                      domain,
                                      new_boundary as u64,
                                      &tokens,
@@ -35042,7 +35349,7 @@ index 82fbdd9cd..183fb2121 100644
                                      &rig.model.dn_states[s],
                                  ) {
                                      Ok(id) if id.is_some() => Some(id),
-@@ -5102,6 +4896,28 @@ fn run_loop(
+@@ -5102,6 +4903,28 @@ fn run_loop(
                  poison = Some(reason);
                  break 'serve;
              }
@@ -35071,7 +35378,7 @@ index 82fbdd9cd..183fb2121 100644
              if check_pool_invariants {
                  if let Some(pp) = rig.pool.page_pool() {
                      pp.check_invariants();
-@@ -5115,6 +4931,30 @@ fn run_loop(
+@@ -5115,6 +4938,30 @@ fn run_loop(
              if let Some(pp) = rig.pool.page_pool_mut() {
                  pp.drain_completed();
              }
@@ -35102,7 +35409,7 @@ index 82fbdd9cd..183fb2121 100644
              // Penalty windows: for each slot whose request carries non-neutral
              // token penalties, clamp the requested window to what the session
              // actually holds and upload that tail (most recent last). The kernel
-@@ -5380,6 +5220,17 @@ fn run_loop(
+@@ -5380,6 +5227,17 @@ fn run_loop(
              let t_emit = std::time::Instant::now();
  
              for s in 0..n {
@@ -35120,7 +35427,7 @@ index 82fbdd9cd..183fb2121 100644
                  // Spec verify/accept: process slots that produced draft outputs.
                  if let Some(draft) = spec_drafts[s].take() {
                      if slots[s].is_none() {
-@@ -5432,54 +5283,61 @@ fn run_loop(
+@@ -5432,54 +5290,61 @@ fn run_loop(
                      };
                      match accept_outcome {
                          Ok(tokens) => {
@@ -35223,7 +35530,7 @@ index 82fbdd9cd..183fb2121 100644
                                      }
                                  }
                              }
-@@ -5676,6 +5534,20 @@ fn run_loop(
+@@ -5676,6 +5541,20 @@ fn run_loop(
                      // G1, A17). ClientGone is never overridden: the receiver is
                      // already dropped.
                      lock_stats(&stats).note_slot_released();
@@ -35244,7 +35551,7 @@ index 82fbdd9cd..183fb2121 100644
                      if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
                          let _ = send_event(
                              &f.reply,
-@@ -5704,6 +5576,14 @@ fn run_loop(
+@@ -5704,6 +5583,14 @@ fn run_loop(
                      // publish_generated_prefix never publishes a page whose
                      // rows were not written.
                      publish_generated_prefix(&mut rig, &mut slots, s, work[s].next_pos);
@@ -35259,7 +35566,7 @@ index 82fbdd9cd..183fb2121 100644
                      // Hand the slot back — the session stays resident for
                      // continuation, but slot occupancy must end at terminal
                      // (matching commit_sampled_token). Wave 8's unpin edit
-@@ -5713,6 +5593,17 @@ fn run_loop(
+@@ -5713,6 +5600,17 @@ fn run_loop(
                      slots[s] = None;
                      let _ = rig.fair_queue.remove(session.0);
                      clear_work_slot(&mut work[s]);
@@ -35277,7 +35584,7 @@ index 82fbdd9cd..183fb2121 100644
                      rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                      if matches!(reason, DoneReason::ClientGone) {
                          // Nobody will follow up on a vanished client, so hand the
-@@ -5720,10 +5611,13 @@ fn run_loop(
+@@ -5720,10 +5618,13 @@ fn run_loop(
                          rig.swap.forget(session.0);
                          rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
                      } else {
@@ -35295,7 +35602,7 @@ index 82fbdd9cd..183fb2121 100644
                          rig.sessions.touch(session);
                      }
                  } else {
-@@ -5741,6 +5635,15 @@ fn run_loop(
+@@ -5741,6 +5642,15 @@ fn run_loop(
                      rig.sessions.touch(session);
                  }
              }
@@ -35311,7 +35618,7 @@ index 82fbdd9cd..183fb2121 100644
              let emit_ns = t_emit.elapsed().as_nanos() as u64;
              let total_ns = t_step.elapsed().as_nanos() as u64;
              if hipfire_dispatch::moe_trace_enabled() {
-@@ -5805,6 +5708,7 @@ fn run_loop(
+@@ -5805,6 +5715,7 @@ fn run_loop(
          (None, Err(e)) => Err(e),
      }
  }
@@ -35319,7 +35626,7 @@ index 82fbdd9cd..183fb2121 100644
  fn should_retain_terminal_tok(reason: DoneReason) -> bool {
      matches!(reason, DoneReason::MaxTokens)
  }
-@@ -5824,6 +5728,7 @@ fn handle_command(
+@@ -5824,6 +5735,7 @@ fn handle_command(
      slots: &mut [Option<InFlight>],
      work: &mut [PendingWork],
      stats: &Arc<Mutex<EngineStats>>,
@@ -35327,7 +35634,7 @@ index 82fbdd9cd..183fb2121 100644
      cmd: EngineCommand,
  ) {
      match cmd {
-@@ -5860,7 +5765,7 @@ fn handle_command(
+@@ -5860,7 +5772,7 @@ fn handle_command(
                      }
                  }
              } else {
@@ -35336,7 +35643,7 @@ index 82fbdd9cd..183fb2121 100644
              }
          }
          EngineCommand::CancelWaiting { request_tag } => {
-@@ -5903,6 +5808,11 @@ fn handle_command(
+@@ -5903,6 +5815,11 @@ fn handle_command(
                      drop(inflight.reply);
                  }
                  clear_work_slot(&mut work[idx]);
@@ -35348,7 +35655,7 @@ index 82fbdd9cd..183fb2121 100644
                  rig.model.clear_slot_vl_state(&mut rig.gpu, idx);
                  let _ = rig.fair_queue.remove(session);
              }
-@@ -5910,6 +5820,22 @@ fn handle_command(
+@@ -5910,6 +5827,22 @@ fn handle_command(
              rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
              let _ = reply.send(Ok(()));
          }
@@ -35371,7 +35678,7 @@ index 82fbdd9cd..183fb2121 100644
          EngineCommand::Reset { reply } => {
              if slots.iter().any(|s| s.is_some()) {
                  let _ = reply.send(Err("reset rejected: requests in flight".to_string()));
-@@ -5927,6 +5853,27 @@ fn handle_command(
+@@ -5927,6 +5860,27 @@ fn handle_command(
                  rig.sessions
                      .close(&mut rig.pool, &mut rig.adm, SessionId(id));
              }
@@ -35399,7 +35706,7 @@ index 82fbdd9cd..183fb2121 100644
              // Drop prefix cache state so subsequent lookups miss (spec §4.6).
              // The radix index owns cache leases taken at publication: it
              // MUST release them into the pool before being replaced, or
-@@ -6043,1546 +5990,101 @@ fn sync_fair_needs(
+@@ -6043,1546 +5997,101 @@ fn sync_fair_needs(
      let _ = q.set_uncached_prefill(id, uncached);
  }
  
@@ -37036,7 +37343,7 @@ index 82fbdd9cd..183fb2121 100644
          }
      }
  
-@@ -7669,7 +6171,7 @@ mod tests {
+@@ -7669,7 +6178,7 @@ mod tests {
      /// exact joint acceptance is implemented and validated").
      #[test]
      fn grammar_constrained_requests_select_ar_not_mtp() {
@@ -37045,7 +37352,7 @@ index 82fbdd9cd..183fb2121 100644
          // req.json_schema is Some. This test documents the invariant: a
          // grammar-constrained request must NOT activate MTP.
          let grammar_constrained = true;
-@@ -8324,3 +6826,49 @@ mod mtp_spill_decline_tests {
+@@ -8324,3 +6833,49 @@ mod mtp_spill_decline_tests {
          assert_eq!(slot_mtp_k(MtpMode::On, 0, false), 0);
      }
  }
@@ -38920,10 +39227,10 @@ index 000000000..0d2cbd401
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 new file mode 100644
-index 000000000..ffc831917
+index 000000000..dda54a571
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-@@ -0,0 +1,3846 @@
+@@ -0,0 +1,3926 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -38933,7 +39240,7 @@ index 000000000..ffc831917
 +// scheduling and batch execution stay in `serve_engine.rs`.
 +
 +use super::EngineConfig;
-+use crate::qwen35::LayerType;
++use crate::qwen35::{DeltaNetState, LayerType};
 +use hipfire_runtime::scheduler::{PendingWork, SpecKind};
 +use hipfire_runtime::session_table::SessionId;
 +use hipfire_runtime::slot_batch::SlotBatch;
@@ -39469,7 +39776,7 @@ index 000000000..ffc831917
 +
 +#[cfg(feature = "kvmem")]
 +impl LegacyNativeImage {
-+    fn auxiliary_bytes(&self) -> Result<usize, String> {
++    pub(super) fn auxiliary_bytes(&self) -> Result<usize, String> {
 +        let draft = match &self.draft {
 +            LegacyDraftImage::None => 0,
 +            LegacyDraftImage::Mtp(image) => image.host_bytes(),
@@ -39701,7 +40008,71 @@ index 000000000..ffc831917
 +            eprintln!("[kvmem-legacy] HistoryPark slot={} mtp_freed=1", slot.0);
 +        }
 +    }
++    // S2: the native-history image also owns the recurrent/conv state. The
++    // idle slot keeps only a tombstone so its VRAM can fund another session;
++    // restore or cold admission reallocates the same representation.
++    let dn_bytes = crate::speculative::DeltaNetSnapshot::bytes_for(&rig.model.dn_states[slot.0]);
++    if dn_bytes > 0 {
++        let quant = rig.model.dn_states[slot.0].quant;
++        let live = std::mem::replace(
++            &mut rig.model.dn_states[slot.0],
++            DeltaNetState::empty(quant),
++        );
++        live.free_gpu(&mut rig.gpu);
++        rig.model.dn_images[slot.0] = Some(crate::kvmem_ctl::StateImageId::new(publication.id));
++        if let Some(ctl) = rig.model.kvmem.as_mut() {
++            ctl.note_state_demotion(dn_bytes);
++        }
++        eprintln!(
++            "[kvmem-legacy] HistoryPark slot={} dn_freed=1 bytes={dn_bytes}",
++            slot.0
++        );
++    }
 +    Ok(Some(publication.id))
++}
++
++/// S2: give an active slot its live recurrent state again.
++///
++/// `park_legacy_history` replaces the slot's `DeltaNetState` with a tombstone
++/// after publishing the native image, so a cold admission (or a resumed
++/// session) must allocate the representation the image expects before any
++/// forward or restore runs. The image handle is cleared and the promotion is
++/// charged to the state-image ledger; the caller still owns the install.
++#[cfg(feature = "kvmem")]
++pub(super) fn ensure_dn_live(rig: &mut Rig, slot: usize, reason: &str) -> Result<(), String> {
++    if !rig.model.dn_states[slot].is_empty() {
++        return Ok(());
++    }
++    let quant = rig.model.dn_states[slot].quant;
++    let state = DeltaNetState::new_with_quant(&mut rig.gpu, &rig.model.config, quant)
++        .map_err(|e| format!("kvmem: DN state alloc for slot {slot}: {e}"))?;
++    let bytes = crate::speculative::DeltaNetSnapshot::bytes_for(&state);
++    let image = rig.model.dn_images[slot].take();
++    let restoring = reason == "restore";
++    rig.model.dn_states[slot] = state;
++    if restoring {
++        if let Some(ctl) = rig.model.kvmem.as_mut() {
++            if image.is_some() {
++                ctl.note_state_promotion(bytes);
++            }
++        }
++    }
++    if let Some(id) = image {
++        if restoring {
++            eprintln!(
++                "[kvmem-dn] slot={slot} live state promoted image={} bytes={bytes} reason={reason}",
++                id.get()
++            );
++        } else {
++            // The catalog still owns this image; the slot was reused for a
++            // different request, so only the slot-local handle is stale.
++            eprintln!(
++                "[kvmem-dn] slot={slot} parked image handle dropped image={} bytes={bytes} reason={reason}",
++                id.get()
++            );
++        }
++    }
++    Ok(())
 +}
 +
 +/// Restore target and draft as one execution frontier. The source stays owned
@@ -39720,6 +40091,10 @@ index 000000000..ffc831917
 +            "kvmem: cached source has no complete {kind:?} history"
 +        ));
 +    }
++    // S2: cold admission may reuse a slot whose recurrent state was parked
++    // with the image. Allocate the destination before building the import
++    // scratch so `new_for` sees the real geometry.
++    ensure_dn_live(rig, slot, "restore")?;
 +    rig.gpu
 +        .hip
 +        .device_synchronize()
@@ -39748,6 +40123,9 @@ index 000000000..ffc831917
 +        snapshot
 +            .restore_to(&mut rig.model.dn_states[slot], &mut rig.gpu)
 +            .map_err(|e| format!("kvmem restore DN: {e}"))?;
++        if let Some(ctl) = rig.model.kvmem.as_mut() {
++            ctl.note_state_restore();
++        }
 +        if source.store.frontier == 0 {
 +            if let Some(state) = rig.model.mtp_states[slot].as_mut() {
 +                state
@@ -40263,6 +40641,15 @@ index 000000000..ffc831917
 +    batch: &SlotBatch,
 +    n: usize,
 +) -> Result<(), String> {
++    // S2: a Legacy park leaves a tombstone plus an image handle. Reallocate
++    // before the batch is provisioned so every scheduled slot has real
++    // recurrent buffers (and so the forward guard is a contract, not a trap).
++    #[cfg(feature = "kvmem")]
++    for (slot, flight) in slots.iter().take(n).enumerate() {
++        if flight.is_some() {
++            ensure_dn_live(rig, slot, "active")?;
++        }
++    }
 +    // ── KVMem residency pass (HIPFIRE_KVMEM) ────────────────────────
 +    // Runs BEFORE provisioning: a step's new pages come from the
 +    // pool's free list, so the pages this step sheds must be back in
@@ -42772,10 +43159,10 @@ index 000000000..ffc831917
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 new file mode 100644
-index 000000000..10c9e4b66
+index 000000000..970b29c05
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
-@@ -0,0 +1,793 @@
+@@ -0,0 +1,811 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -43521,7 +43908,12 @@ index 000000000..10c9e4b66
 +                }
 +            }
 +            snapshot.dn_state_bytes = dn_bytes;
-+            snapshot.dn_state_slots = rig.model.dn_states.len() as u32;
++            snapshot.dn_state_slots = rig
++                .model
++                .dn_states
++                .iter()
++                .filter(|state| !state.is_empty())
++                .count() as u32;
 +            // P2: when the host ring owns persistent DN checkpoints, report its
 +            // count/bytes (the GPU pool is a cache, not the ownership tier).
 +            if !kvmem.dn_ring_enabled() {
@@ -43531,6 +43923,19 @@ index 000000000..10c9e4b66
 +                }
 +            }
 +            snapshot.dflash_managed = rig.model.dflash_states.iter().any(|s| s.is_some());
++            // S2: the catalog is the authoritative owner of parked native
++            // images. Count entries and charge their DN/draft payloads from
++            // the images themselves; the slot handles are only locators and
++            // are cleared when a slot is reused for a different request.
++            if let Some(catalog) = rig.legacy_history.as_ref() {
++                snapshot.state_images = catalog.len() as u32;
++                let mut host_bytes = 0u64;
++                for image in catalog.values() {
++                    host_bytes =
++                        host_bytes.saturating_add(image.auxiliary_bytes().unwrap_or(0) as u64);
++                }
++                snapshot.state_host_bytes = host_bytes;
++            }
 +            stats.note_kvmem(snapshot);
 +        }
 +    }
@@ -45487,10 +45892,10 @@ index d6cff7272..69889b0ec 100644
              let body = {
                  let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
 diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
-index 399bcc944..0de488b78 100644
+index 399bcc944..fc11aee3b 100644
 --- a/crates/hipfire-cli/src/serve/metrics.rs
 +++ b/crates/hipfire-cli/src/serve/metrics.rs
-@@ -539,6 +539,334 @@ impl Metrics {
+@@ -539,6 +539,364 @@ impl Metrics {
                  "Prompt tokens reused from the multi-slot cross-session prefix cache.",
                  s.reused_tokens as u64,
              );
@@ -45559,6 +45964,36 @@ index 399bcc944..0de488b78 100644
 +                    "hipfire_kvmem_dn_checkpoint_bytes",
 +                    "Device bytes held by the recurrent checkpoint pool.",
 +                    s.kvmem.dn_checkpoint_bytes as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_state_images",
++                    "Retained DN/DFlash/MTP state images.",
++                    s.kvmem.state_images as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_state_host_bytes",
++                    "Host bytes charged by retained state images.",
++                    s.kvmem.state_host_bytes as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_state_demotions_total",
++                    "Live-to-image state demotions since engine start.",
++                    s.kvmem.state_demotions as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_state_promotions_total",
++                    "Image-to-live state promotions since engine start.",
++                    s.kvmem.state_promotions as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_state_restores_total",
++                    "Successful state-image installs since engine start.",
++                    s.kvmem.state_restores as f64,
 +                );
 +                gauge(
 +                    &mut out,
@@ -45825,7 +46260,7 @@ index 399bcc944..0de488b78 100644
          }
  
          // Multi-slot swap tier, from the last daemon `done` (or the CLI seed
-@@ -943,6 +1271,71 @@ mod tests {
+@@ -943,6 +1301,71 @@ mod tests {
          ] {
              assert!(out.contains(sample), "{sample}: {out}");
          }
@@ -45897,7 +46332,7 @@ index 399bcc944..0de488b78 100644
          // Standard route: no snapshot, no series (not zeros).
          let standard = m.render(&ServeMeta::new("t".to_owned()), 0, 16);
          for name in [
-@@ -950,6 +1343,7 @@ mod tests {
+@@ -950,6 +1373,7 @@ mod tests {
              "hipfire_slots_",
              "hipfire_evictions",
              "hipfire_prefix_",
@@ -45905,7 +46340,7 @@ index 399bcc944..0de488b78 100644
          ] {
              assert!(!standard.contains(name), "{name}: {standard}");
          }
-@@ -966,6 +1360,45 @@ mod tests {
+@@ -966,6 +1390,45 @@ mod tests {
          assert!(!out.contains("hipfire_kv_pages"), "{out}");
      }
  
@@ -63386,7 +63821,7 @@ index d6575b8ad..2d4d8a11b 100644
              },
          ];
 diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
-index 2059215c3..1b829085c 100644
+index 2059215c3..6ed123388 100644
 --- a/crates/hipfire-runtime/src/serve/mod.rs
 +++ b/crates/hipfire-runtime/src/serve/mod.rs
 @@ -49,6 +49,34 @@ pub struct VisualData {
@@ -63439,7 +63874,7 @@ index 2059215c3..1b829085c 100644
      /// Hashes of the conversation's user turns, in order. Identity for
      /// continuation matching — see `Session::convo`.
      pub convo: Vec<u64>,
-@@ -203,6 +239,164 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
+@@ -203,6 +239,172 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
          .map_err(|_| "client receiver dropped".to_string())
  }
  
@@ -63472,6 +63907,14 @@ index 2059215c3..1b829085c 100644
 +    /// Page-aligned recurrent checkpoints currently in the engine pool.
 +    pub dn_checkpoints: u32,
 +    pub dn_checkpoint_bytes: u64,
++    /// S0 state-image ledger: retained DN/DFlash/MTP images, their charged
++    /// host bytes, and cumulative lifecycle transitions. All zero until the
++    /// state store starts retaining images.
++    pub state_images: u32,
++    pub state_host_bytes: u64,
++    pub state_demotions: u64,
++    pub state_promotions: u64,
++    pub state_restores: u64,
 +    /// Media (vision) pages are pinned as indivisible prefix groups. Legacy
 +    /// gained this in P4; Layerwise has always pinned them.
 +    pub media_pins: bool,
@@ -63604,7 +64047,7 @@ index 2059215c3..1b829085c 100644
  /// Serialized as the `engine_stats` object of every multi-slot `done` event;
  /// the serve gateway exports it on `/metrics`.
  #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-@@ -241,6 +435,12 @@ pub struct EngineStats {
+@@ -241,6 +443,12 @@ pub struct EngineStats {
      pub swap_disk_used: u64,
      pub swap_host_budget: u64,
      pub swap_disk_budget: u64,
@@ -63617,7 +64060,7 @@ index 2059215c3..1b829085c 100644
  }
  
  impl EngineStats {
-@@ -275,6 +475,13 @@ impl EngineStats {
+@@ -275,6 +483,13 @@ impl EngineStats {
          self.active_slots = self.active_slots.saturating_sub(1);
      }
  
@@ -63631,7 +64074,7 @@ index 2059215c3..1b829085c 100644
      /// Refresh the swap-tier snapshot from the live manager. Cheap: reads
      /// counters and three integers, no allocation.
      pub fn note_swap(&mut self, swap: &crate::swap::SwapManager) {
-@@ -296,9 +503,9 @@ impl EngineStats {
+@@ -296,9 +511,9 @@ impl EngineStats {
  // single arch-erased surface `handle_generate` drives; the concrete engine
  // (e.g. `hipfire_arch_qwen35::serve_engine::SlotEngine`) implements it.
  //
@@ -63644,7 +64087,7 @@ index 2059215c3..1b829085c 100644
  // `hipfire_arch_qwen35::serve_engine::EngineConfig` field-for-field; keep
  // them in lock-step (the qwen35 carrier maps them 1:1).
  
-@@ -306,9 +513,12 @@ impl EngineStats {
+@@ -306,9 +521,12 @@ impl EngineStats {
  /// the daemon from serve.* config keys + the load request, then handed to
  /// `Carrier::spawn_slot_engine`, which adapts it into the concrete engine's
  /// own config. Field-for-field with the qwen35 `EngineConfig`; a second
@@ -63658,7 +64101,7 @@ index 2059215c3..1b829085c 100644
      pub model_path: PathBuf,
      pub n_slots: usize,
      /// Per-slot generation cap (tokens) used by the paged-KV budget.
-@@ -468,6 +678,14 @@ pub trait SlotEngineHandle: Send + Sync {
+@@ -468,6 +686,14 @@ pub trait SlotEngineHandle: Send + Sync {
      fn submit(&self, req: SubmitRequest) -> Result<(), String>;
      /// Cancel a QUEUED request by submitter tag. Idempotent; tag 0 is a no-op.
      fn cancel_waiting(&self, request_tag: u64);
