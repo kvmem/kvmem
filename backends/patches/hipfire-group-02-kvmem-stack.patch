@@ -3772,10 +3772,10 @@ index 70e956368..8d03fd68c 100644
                          gpu.conv1d_silu_split_qknorm(
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 new file mode 100644
-index 000000000..aa2066b22
+index 000000000..33273cc9e
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
-@@ -0,0 +1,1104 @@
+@@ -0,0 +1,1107 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -4871,6 +4871,9 @@ index 000000000..aa2066b22
 +    draft_images_total: u64,
 +    draft_image_hits_total: u64,
 +    draft_image_misses_total: u64,
++    /// P3: `<pack>.draft` sidecars written and their on-disk bytes.
++    draft_sidecars_total: u64,
++    draft_sidecar_bytes: u64,
 +}
 +
 +/// `SPILLED_PAGE` is re-exported for engine-side diagnostics; keep the import
@@ -6224,10 +6227,10 @@ index 000000000..5f1cc8b61
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
 new file mode 100644
-index 000000000..e006689ec
+index 000000000..e59e4e1c9
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs
-@@ -0,0 +1,562 @@
+@@ -0,0 +1,586 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -6295,6 +6298,7 @@ index 000000000..e006689ec
 +        &self,
 +        source: &LegacyStoreSnapshot,
 +        query: &crate::legacy_query::LegacyQuery,
++        media_pages: &[u32],
 +    ) -> Result<(Vec<u32>, Vec<f64>), String> {
 +        let config = self
 +            .legacy
@@ -6389,7 +6393,7 @@ index 000000000..e006689ec
 +            KV_BLOCK_TOKENS as u32,
 +            self.kv_cfg.sink_blocks,
 +            self.kv_cfg.recent_blocks,
-+            &[],
++            media_pages,
 +        )
 +        .map_err(|e| format!("kvmem Query mandatory: {e}"))?;
 +        if required.len() > self.budget_blocks {
@@ -6460,6 +6464,7 @@ index 000000000..e006689ec
 +        incoming_rows: &[usize],
 +        decoding: &[bool],
 +        replaying: &[bool],
++        media_pages: &[Vec<u32>],
 +        k_arenas: &[GpuTensor],
 +        v_arenas: &[GpuTensor],
 +    ) -> Result<(), String> {
@@ -6515,9 +6520,22 @@ index 000000000..e006689ec
 +                KV_BLOCK_TOKENS as u32,
 +                self.kv_cfg.sink_blocks,
 +                self.kv_cfg.recent_blocks,
-+                &[],
++                media_pages.get(slot).map(Vec::as_slice).unwrap_or(&[]),
 +            )
 +            .map_err(|e| format!("kvmem pressure mandatory: {e}"))?;
++            // Media spans are indivisible prefix groups: every page a live
++            // image touches must remain resident across pressure, exactly as
++            // the Layerwise decoder pins them. A pin that is already spilled
++            // cannot be recovered by the resident-only Legacy pressure pass,
++            // so refuse instead of silently dropping image KV.
++            for &pin in media_pages.get(slot).map(Vec::as_slice).unwrap_or(&[]) {
++                if (pin as usize) < frontier.div_ceil(KV_BLOCK_TOKENS) && !candidates.contains(&pin)
++                {
++                    return Err(format!(
++                        "kvmem: Legacy media pin page {pin} is not resident"
++                    ));
++                }
++            }
 +            // Hipfire has no accepted attention-mass producer on this Legacy
 +            // route. The core's empty-feedback frame has zero mass and uses
 +            // its own deterministic recency tie-break; never recycle Query
@@ -6553,6 +6571,13 @@ index 000000000..e006689ec
 +                    "kvmem: protected Legacy working set leaves insufficient append reserve".into(),
 +                );
 +            }
++            if let Some(pins) = media_pages.get(slot) {
++                if let Some((pin, _)) = spill.iter().find(|(lp, _)| pins.contains(&(*lp as u32))) {
++                    return Err(format!(
++                        "kvmem: Legacy pressure selected media pin page {pin} for spill"
++                    ));
++                }
++            }
 +            let mut elapsed = std::time::Duration::ZERO;
 +            let mut ignored_count = 0;
 +            self.flush_spill_batch(
@@ -6569,9 +6594,11 @@ index 000000000..e006689ec
 +            self.spill_pages_total += spill.len() as u64;
 +            let bytes = spill.len() * self.n_fa_layers * (self.k_page_bytes + self.v_page_bytes);
 +            eprintln!(
-+                "[kvmem-legacy] {} slot={slot} frontier={frontier} incoming={incoming} resident_before={} kept={} window_pages={window_pages} spill_pages={} spill_bytes={bytes} restore_bytes=0",
++                "[kvmem-legacy] {} slot={slot} frontier={frontier} incoming={incoming} resident_before={} kept={} window_pages={window_pages} media_pins={} spill_pages={} spill_bytes={bytes} restore_bytes=0",
 +                if decoding.get(slot).copied().unwrap_or(false) { "DecodePressure" } else { "Pressure" },
-+                candidates.len(), keep.len(), spill.len(),
++                candidates.len(), keep.len(),
++                media_pages.get(slot).map(Vec::len).unwrap_or(0),
++                spill.len(),
 +            );
 +        }
 +        Ok(())
@@ -7110,10 +7137,10 @@ index 000000000..a0637730e
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
 new file mode 100644
-index 000000000..93f27c59f
+index 000000000..e2085b055
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,626 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -7631,6 +7658,8 @@ index 000000000..93f27c59f
 +            draft_images_total: 0,
 +            draft_image_hits_total: 0,
 +            draft_image_misses_total: 0,
++            draft_sidecars_total: 0,
++            draft_sidecar_bytes: 0,
 +        })
 +    }
 +
@@ -7740,10 +7769,10 @@ index 000000000..93f27c59f
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 new file mode 100644
-index 000000000..6b9f7b1be
+index 000000000..3e7f6ecaa
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,646 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -7949,6 +7978,7 @@ index 000000000..6b9f7b1be
 +                            fingerprint,
 +                            bytes,
 +                            sidecar_bytes: 0,
++                            draft_bytes: 0,
 +                            stamp: 0,
 +                        });
 +                    }
@@ -8257,6 +8287,27 @@ index 000000000..6b9f7b1be
 +        demoted
 +    }
 +
++    /// Record the DFlash draft image written beside a pack. The whole cache
++    /// directory (packs + DN + draft sidecars) is re-pruned under the same cap.
++    /// When the pack disappeared meanwhile, drop the orphan draft file.
++    pub fn note_draft_sidecar(&mut self, path: &std::path::Path, bytes: u64) {
++        if !self.cold_packs.set_draft_bytes(path, bytes) {
++            let draft = crate::kvmem_prefix::draft_sidecar_path(path);
++            let _ = std::fs::remove_file(draft);
++            return;
++        }
++        self.draft_sidecars_total += 1;
++        self.draft_sidecar_bytes = self.draft_sidecar_bytes.saturating_add(bytes);
++        let removed = self.cold_packs.prune_to(self.cold_bytes);
++        if !removed.is_empty() && self.diagnostics.trace {
++            eprintln!(
++                "[kvmem-pack] pruned {} pack(s), {} disk bytes retained",
++                removed.len(),
++                self.cold_packs.disk_bytes()
++            );
++        }
++    }
++
 +    /// Live observability snapshot (`/metrics` via `EngineStats.kvmem`).
 +    /// Cheap integer reads from the host stores: no device work, no
 +    /// allocation, and no path reads it back into selection/residency, so it
@@ -8275,6 +8326,15 @@ index 000000000..6b9f7b1be
 +        KvMemStats {
 +            enabled: true,
 +            layerwise: self.strategy.is_layerwise(),
++            trunk_managed: true,
++            mtp_head_managed: self.head_plane_enabled(),
++            dn_state_managed: false,
++            dflash_managed: false,
++            dn_state_bytes: 0,
++            dn_state_slots: 0,
++            dn_checkpoints: 0,
++            dn_checkpoint_bytes: 0,
++            media_pins: true,
 +            host_charged_bytes: self.storage.charged_bytes(),
 +            disk_bytes: self.storage.disk_bytes(),
 +            payload_bytes,
@@ -8307,6 +8367,8 @@ index 000000000..6b9f7b1be
 +            draft_images: self.draft_images_total,
 +            draft_image_hits: self.draft_image_hits_total,
 +            draft_image_misses: self.draft_image_misses_total,
++            draft_sidecars: self.draft_sidecars_total,
++            draft_sidecar_bytes: self.draft_sidecar_bytes,
 +        }
 +    }
 +
@@ -12820,10 +12882,10 @@ index 000000000..c0eb0e6c7
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
 new file mode 100644
-index 000000000..6fc0db750
+index 000000000..151b57241
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
-@@ -0,0 +1,1687 @@
+@@ -0,0 +1,1846 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// hipfire — see LICENSE and NOTICE in the project root.
 +
@@ -12920,6 +12982,106 @@ index 000000000..6fc0db750
 +    pub fn nbytes(&self) -> u64 {
 +        self.blobs.iter().map(|b| b.len() as u64).sum()
 +    }
++
++    /// Persist the draft conditioning image beside the prefix pack. The ring is
++    /// a native full-state serialization: restart reuse can reinstate it
++    /// instead of reseeding the draft (acceptance parity, not correctness).
++    pub fn encode(&self) -> Result<Vec<u8>, String> {
++        const MAGIC: &[u8; 4] = b"HFDR";
++        const VERSION: u32 = 1;
++        let mut out = Vec::with_capacity(48 + self.blobs.iter().map(Vec::len).sum::<usize>());
++        out.extend_from_slice(MAGIC);
++        out.extend_from_slice(&VERSION.to_le_bytes());
++        out.extend_from_slice(&self.geometry.to_le_bytes());
++        out.extend_from_slice(&self.frontier.to_le_bytes());
++        out.extend_from_slice(&self.floor.to_le_bytes());
++        out.extend_from_slice(&(self.window as u32).to_le_bytes());
++        out.extend_from_slice(&(self.feature_width as u32).to_le_bytes());
++        out.extend_from_slice(&(self.kv_dim as u32).to_le_bytes());
++        out.extend_from_slice(&(self.n_layers as u32).to_le_bytes());
++        out.extend_from_slice(&(self.proj_cached_rows as u64).to_le_bytes());
++        out.extend_from_slice(&(self.full_cached_rows as u64).to_le_bytes());
++        out.extend_from_slice(&(self.blobs.len() as u32).to_le_bytes());
++        for blob in &self.blobs {
++            out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
++            out.extend_from_slice(blob);
++        }
++        Ok(out)
++    }
++
++    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
++        const MAGIC: &[u8; 4] = b"HFDR";
++        const VERSION: u32 = 1;
++        const MAX_BLOBS: u32 = 64;
++        const MAX_BLOB_BYTES: u64 = 1 << 30;
++        struct Cursor<'a> {
++            bytes: &'a [u8],
++            at: usize,
++        }
++        impl<'a> Cursor<'a> {
++            fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
++                let end = self
++                    .at
++                    .checked_add(n)
++                    .ok_or("draft image: length overflow")?;
++                if end > self.bytes.len() {
++                    return Err("draft image: truncated".to_string());
++                }
++                let slice = &self.bytes[self.at..end];
++                self.at = end;
++                Ok(slice)
++            }
++            fn u32(&mut self) -> Result<u32, String> {
++                Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
++            }
++            fn u64(&mut self) -> Result<u64, String> {
++                Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
++            }
++        }
++        let mut c = Cursor { bytes, at: 0 };
++        if c.take(4)? != MAGIC {
++            return Err("draft image: bad magic".to_string());
++        }
++        if c.u32()? != VERSION {
++            return Err("draft image: unsupported version".to_string());
++        }
++        let geometry = c.u64()?;
++        let frontier = c.u32()?;
++        let floor = c.u32()?;
++        let window = c.u32()? as usize;
++        let feature_width = c.u32()? as usize;
++        let kv_dim = c.u32()? as usize;
++        let n_layers = c.u32()? as usize;
++        let proj_cached_rows = c.u64()? as usize;
++        let full_cached_rows = c.u64()? as usize;
++        let n_blobs = c.u32()?;
++        if n_blobs > MAX_BLOBS {
++            return Err("draft image: too many blobs".to_string());
++        }
++        let mut blobs = Vec::with_capacity(n_blobs as usize);
++        for _ in 0..n_blobs {
++            let len = c.u64()?;
++            if len > MAX_BLOB_BYTES {
++                return Err("draft image: blob too large".to_string());
++            }
++            blobs.push(c.take(len as usize)?.to_vec());
++        }
++        if c.at != bytes.len() {
++            return Err("draft image: trailing bytes".to_string());
++        }
++        Ok(Self {
++            geometry,
++            frontier,
++            floor,
++            window,
++            feature_width,
++            kv_dim,
++            n_layers,
++            proj_cached_rows,
++            full_cached_rows,
++            blobs,
++        })
++    }
 +}
 +
 +/// 期3 G3 P1.1: adapter metadata of one persistent prefix pack. The pack
@@ -12966,6 +13128,14 @@ index 000000000..6fc0db750
 +    std::path::PathBuf::from(path)
 +}
 +
++/// The DFlash draft conditioning image that co-locates with a pack
++/// (`<pack>.draft`). Optional: a pack without one reseeds the draft.
++pub fn draft_sidecar_path(pack: &std::path::Path) -> std::path::PathBuf {
++    let mut path = pack.as_os_str().to_owned();
++    path.push(".draft");
++    std::path::PathBuf::from(path)
++}
++
 +/// One pack file discovered in the content directory (metadata only; the
 +/// payload is loaded on demand).
 +#[derive(Debug, Clone)]
@@ -12978,6 +13148,9 @@ index 000000000..6fc0db750
 +    /// `<path>.dn` bytes (0 when absent). Charged against the same on-disk
 +    /// content cap as the pack so the cap bounds the whole cache directory.
 +    pub sidecar_bytes: u64,
++    /// `<path>.draft` bytes (0 when absent): the DFlash draft conditioning
++    /// image that rides with the pack. Charged alongside the pack too.
++    pub draft_bytes: u64,
 +    /// Monotonic LRU stamp assigned at scan (file mtime order).
 +    pub stamp: u64,
 +}
@@ -12987,9 +13160,11 @@ index 000000000..6fc0db750
 +        sidecar_path(&self.path)
 +    }
 +
-+    /// Complete on-disk artifact (pack + optional recurrent sidecar).
++    /// Complete on-disk artifact (pack + optional recurrent/draft sidecars).
 +    pub fn disk_bytes(&self) -> u64 {
-+        self.bytes.saturating_add(self.sidecar_bytes)
++        self.bytes
++            .saturating_add(self.sidecar_bytes)
++            .saturating_add(self.draft_bytes)
 +    }
 +}
 +
@@ -13015,6 +13190,10 @@ index 000000000..6fc0db750
 +    /// Recurrent-state sidecars currently on disk (`<pack>.dn`).
 +    pub fn sidecar_bytes(&self) -> u64 {
 +        self.packs.iter().map(|p| p.sidecar_bytes).sum()
++    }
++    /// Draft conditioning images currently on disk (`<pack>.draft`).
++    pub fn draft_bytes(&self) -> u64 {
++        self.packs.iter().map(|p| p.draft_bytes).sum()
 +    }
 +    /// Whole cache-directory footprint the byte cap is applied to.
 +    pub fn disk_bytes(&self) -> u64 {
@@ -13072,6 +13251,9 @@ index 000000000..6fc0db750
 +            let sidecar_bytes = std::fs::metadata(sidecar_path(&path))
 +                .map(|m| m.len())
 +                .unwrap_or(0);
++            let draft_bytes = std::fs::metadata(draft_sidecar_path(&path))
++                .map(|m| m.len())
++                .unwrap_or(0);
 +            raw.push((
 +                modified,
 +                ColdPack {
@@ -13080,6 +13262,7 @@ index 000000000..6fc0db750
 +                    meta,
 +                    bytes: info.file_bytes,
 +                    sidecar_bytes,
++                    draft_bytes,
 +                    stamp: 0,
 +                },
 +            ));
@@ -13216,6 +13399,18 @@ index 000000000..6fc0db750
 +        match self.packs.iter_mut().find(|p| p.path == path) {
 +            Some(p) => {
 +                p.sidecar_bytes = bytes;
++                true
++            }
++            None => false,
++        }
++    }
++
++    /// Update the draft-image charge for a registered pack. Returns false when
++    /// the pack vanished (the caller drops the orphan file).
++    pub fn set_draft_bytes(&mut self, path: &std::path::Path, bytes: u64) -> bool {
++        match self.packs.iter_mut().find(|p| p.path == path) {
++            Some(p) => {
++                p.draft_bytes = bytes;
 +                true
 +            }
 +            None => false,
@@ -13961,6 +14156,31 @@ index 000000000..6fc0db750
 +    }
 +
 +    #[test]
++    fn draft_image_sidecar_roundtrip_and_truncation() {
++        let img = DraftImage {
++            geometry: 0x1234,
++            frontier: 384,
++            floor: 128,
++            window: 256,
++            feature_width: 8,
++            kv_dim: 4,
++            n_layers: 2,
++            proj_cached_rows: 384,
++            full_cached_rows: 128,
++            blobs: vec![vec![1, 2, 3], vec![4; 17]],
++        };
++        let bytes = img.encode().expect("encode");
++        let back = DraftImage::decode(&bytes).expect("decode");
++        assert_eq!(back.geometry, img.geometry);
++        assert_eq!(back.frontier, img.frontier);
++        assert_eq!(back.floor, img.floor);
++        assert_eq!(back.window, img.window);
++        assert_eq!(back.blobs, img.blobs);
++        assert!(DraftImage::decode(&bytes[..bytes.len() - 1]).is_err());
++        assert!(DraftImage::decode(b"HFDR").is_err());
++    }
++
++    #[test]
 +    fn layout_fingerprint_detects_drift() {
 +        let base = layout_fingerprint(&raw_config());
 +        let mut drifted = raw_config();
@@ -14413,6 +14633,7 @@ index 000000000..6fc0db750
 +            meta,
 +            bytes: 1,
 +            sidecar_bytes: 0,
++            draft_bytes: 0,
 +            stamp: 1,
 +        });
 +        assert_eq!(
@@ -38505,10 +38726,10 @@ index 000000000..0d2cbd401
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 new file mode 100644
-index 000000000..add3ddc20
+index 000000000..a7b966404
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-@@ -0,0 +1,3571 @@
+@@ -0,0 +1,3702 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -38560,6 +38781,29 @@ index 000000000..add3ddc20
 +            .map(|s| (s.begin as u32, s.end as u32))
 +            .collect();
 +    (sess.media_digest, spans)
++}
++
++/// Canonical history pages a live image span occupies. Legacy pressure and
++/// Query selection pin exactly these pages, mirroring the Layerwise rule that
++/// media groups are indivisible. Restricted to the sealed prefix `[0, fed)`.
++#[cfg(feature = "kvmem")]
++fn legacy_media_pages(rig: &Rig, fed: u64, session: SessionId) -> Vec<u32> {
++    let (_, spans) = kvmem_session_media(rig, session);
++    if spans.is_empty() {
++        return Vec::new();
++    }
++    let spans: Vec<crate::kvmem_media::MediaSpan> = spans
++        .into_iter()
++        .map(|(begin, end)| crate::kvmem_media::MediaSpan {
++            begin: begin as u64,
++            end: end as u64,
++        })
++        .collect();
++    let block = crate::kvmem_ctl::KV_BLOCK_TOKENS as u64;
++    crate::kvmem_media::pages_from_spans(&spans, block, fed / block)
++        .into_iter()
++        .map(|p| p as u32)
++        .collect()
 +}
 +
 +/// P2.2b2: freeze the canonical host prefix, release displaced GPU refs and PIN
@@ -38655,6 +38899,30 @@ index 000000000..add3ddc20
 +                eprintln!("[kvmem-draft-image] capture skipped at {boundary}: {e}");
 +            }
 +            None => {}
++        }
++        // P3: persist the captured image beside the pack (`.draft`), so a
++        // restart/eviction reuse can reinstate draft conditioning instead of
++        // reseeding. Written after the pack exists; the content cap covers it.
++        if let (Some(pack), Some(img)) = (
++            ctl.prefix_pack_path(id),
++            ctl.prefix_checkpoint(id)
++                .and_then(|c| c.draft_image.as_ref()),
++        ) {
++            match img.encode() {
++                Ok(bytes) => {
++                    let path = crate::kvmem_prefix::draft_sidecar_path(&pack);
++                    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
++                    match std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
++                        Ok(()) => ctl.note_draft_sidecar(&pack, bytes.len() as u64),
++                        Err(e) => eprintln!(
++                            "[kvmem-draft-image] sidecar write skipped at {boundary}: {e}"
++                        ),
++                    }
++                }
++                Err(e) => {
++                    eprintln!("[kvmem-draft-image] sidecar encode skipped at {boundary}: {e}")
++                }
++            }
 +        }
 +    }
 +    // 期3 G3 P1.1 dn-persist: co-locate the recurrent state with the pack.
@@ -39396,6 +39664,7 @@ index 000000000..add3ddc20
 +fn plan_legacy_query_replay(
 +    rig: &Rig,
 +    run: &mut LegacyQueryRun,
++    media_pages: &[u32],
 +) -> Result<LegacyQueryDecision, String> {
 +    let Some(control) = rig.model.kvmem.as_ref() else {
 +        return Ok(LegacyQueryDecision::Skip {
@@ -39417,15 +39686,16 @@ index 000000000..add3ddc20
 +            scores: None,
 +        });
 +    }
-+    let (selected, scores) = match control.select_legacy_query(&source.store, &run.query) {
-+        Ok(result) => result,
-+        Err(e) => {
-+            return Ok(LegacyQueryDecision::Skip {
-+                reason: format!("selection_refused: {e}"),
-+                scores: None,
-+            })
-+        }
-+    };
++    let (selected, scores) =
++        match control.select_legacy_query(&source.store, &run.query, media_pages) {
++            Ok(result) => result,
++            Err(e) => {
++                return Ok(LegacyQueryDecision::Skip {
++                    reason: format!("selection_refused: {e}"),
++                    scores: None,
++                })
++            }
++        };
 +    let prompt_end = run.query.prompt_end() as u64;
 +    let restore_begin = run.query.restore_begin() as u64;
 +    let window_tokens = control.window_capacity_tokens();
@@ -39543,7 +39813,19 @@ index 000000000..add3ddc20
 +            Some(run) => run,
 +            None => continue,
 +        };
-+        let decision = plan_legacy_query_replay(rig, &mut run)?;
++        let media_pages = slots[s]
++            .as_ref()
++            .map(|frame| {
++                let fed = rig
++                    .model
++                    .kvmem
++                    .as_ref()
++                    .and_then(|ctl| ctl.fed_tokens(s))
++                    .unwrap_or(0) as u64;
++                legacy_media_pages(rig, fed, frame.session)
++            })
++            .unwrap_or_default();
++        let decision = plan_legacy_query_replay(rig, &mut run, &media_pages)?;
 +        match decision {
 +            LegacyQueryDecision::Skip { reason, scores } => {
 +                if let Some(scores) = scores {
@@ -39730,6 +40012,23 @@ index 000000000..add3ddc20
 +                        })
 +                })
 +                .collect();
++            // G7: the live image spans are mandatory prefix groups on the
++            // Legacy path too. Compute their canonical pages before the
++            // mutable controller borrow; the pressure pass pins them.
++            let media_pages: Vec<Vec<u32>> = (0..n)
++                .map(|s| {
++                    let Some(frame) = slots[s].as_ref() else {
++                        return Vec::new();
++                    };
++                    let fed = rig
++                        .model
++                        .kvmem
++                        .as_ref()
++                        .and_then(|ctl| ctl.fed_tokens(s))
++                        .unwrap_or(0) as u64;
++                    legacy_media_pages(rig, fed, frame.session)
++                })
++                .collect();
 +            let ctl = rig.model.kvmem.as_mut().unwrap();
 +            ctl.prepare_legacy_step(
 +                &mut rig.gpu,
@@ -39739,6 +40038,7 @@ index 000000000..add3ddc20
 +                &incoming,
 +                &decoding,
 +                &replaying,
++                &media_pages,
 +                &rig.model.k_arenas,
 +                &rig.model.v_arenas,
 +            )
@@ -41102,6 +41402,29 @@ index 000000000..add3ddc20
 +                //    serialization; logical ring + captured watermarks). A
 +                //    missing/unrestorable image reseeds the draft from scratch
 +                //    — acceptance degrades, output stays verify-exact.
++                //    P3: a cold/restart checkpoint has no RAM image; load the
++                //    `.draft` sidecar the freeze wrote beside the pack first.
++                if ctl
++                    .prefix_checkpoint(reuse_id)
++                    .is_some_and(|c| c.draft_image.is_none())
++                {
++                    if let Some(pack) = ctl.prefix_pack_path(reuse_id) {
++                        let path = crate::kvmem_prefix::draft_sidecar_path(&pack);
++                        match std::fs::read(&path) {
++                            Ok(bytes) => match crate::kvmem_prefix::DraftImage::decode(&bytes) {
++                                Ok(img) => {
++                                    if let Some(ckpt) = ctl.prefix_checkpoint_mut(reuse_id) {
++                                        ckpt.draft_image = Some(img);
++                                    }
++                                }
++                                Err(e) => {
++                                    eprintln!("[kvmem-draft-image] sidecar decode skipped: {e}")
++                                }
++                            },
++                            Err(_) => {}
++                        }
++                    }
++                }
 +                if let Some(shared) = rig.model.dflash.as_ref() {
 +                    let restored = {
 +                        match ctl
@@ -41845,6 +42168,20 @@ index 000000000..add3ddc20
 +        }
 +        config
 +    });
++    // P1 ownership contract: the only KVMem path that pages the MTP head KV is
++    // Layerwise (the composite aux plane). Legacy keeps the head full-resident
++    // in its private cache, so admitting MTP there would silently break the
++    // "all KV owned" contract. Refuse instead of pretending.
++    let mtp_spec_active =
++        mtp_head && hipfire_config::mtp_mode_admits(cfg.mtp_mode, crate::MTP_MEASURED_AR_FLOOR);
++    if mtp_spec_active && legacy_config.is_some() {
++        return Err(
++            "kvmem: MTP + KVMem requires the Layerwise recall strategy; Legacy keeps the \
++             MTP head KV outside KVMem. Set HIPFIRE_KVMEM_RECALL_STRATEGY=layerwise or run \
++             with --spec off."
++                .to_string(),
++        );
++    }
 +    if let Some(config) = legacy_config.as_ref() {
 +        eprintln!(
 +            "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
@@ -41880,6 +42217,21 @@ index 000000000..add3ddc20
 +            cfg.cap_tokens,
 +        );
 +    }
++    let ownership_strategy = if legacy_config.is_some() {
++        "legacy"
++    } else {
++        "layerwise"
++    };
++    let head_owner = if legacy_config.is_none() && mtp_head {
++        "aux-plane"
++    } else {
++        "private-resident"
++    };
++    eprintln!(
++        "[kvmem-ownership] strategy={ownership_strategy} trunk=managed \
++         mtp_head={head_owner} dn_state=private-resident \
++         dflash=checkpoint-image media_pins=mandatory vision_kv=none"
++    );
 +    Ok(Some(crate::kvmem_ctl::KvMemCtl::new_with_config(
 +        n_slots,
 +        &plan,
@@ -42082,10 +42434,10 @@ index 000000000..add3ddc20
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
 new file mode 100644
-index 000000000..799c27813
+index 000000000..40664b39d
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem_hooks.rs
-@@ -0,0 +1,773 @@
+@@ -0,0 +1,789 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -42821,7 +43173,23 @@ index 000000000..799c27813
 +    #[cfg(feature = "kvmem")]
 +    {
 +        if let Some(kvmem) = rig.model.kvmem.as_ref() {
-+            stats.note_kvmem(kvmem.stats());
++            let mut snapshot = kvmem.stats();
++            // P0 ownership ledger: the controller cannot see the engine's
++            // recurrent/draft allocations, so the engine fills them here.
++            let mut dn_bytes = 0u64;
++            for dn in &rig.model.dn_states {
++                for t in super::dn_buffers(dn) {
++                    dn_bytes = dn_bytes.saturating_add(t.buf.size() as u64);
++                }
++            }
++            snapshot.dn_state_bytes = dn_bytes;
++            snapshot.dn_state_slots = rig.model.dn_states.len() as u32;
++            if let Some(pool) = rig.model.checkpoint_pool.as_ref() {
++                snapshot.dn_checkpoints = pool.len() as u32;
++                snapshot.dn_checkpoint_bytes = pool.total_bytes();
++            }
++            snapshot.dflash_managed = rig.model.dflash_states.iter().any(|s| s.is_some());
++            stats.note_kvmem(snapshot);
 +        }
 +    }
 +    #[cfg(not(feature = "kvmem"))]
@@ -44777,10 +45145,10 @@ index d6cff7272..69889b0ec 100644
              let body = {
                  let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
 diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
-index 399bcc944..5bf032571 100644
+index 399bcc944..03de93c1f 100644
 --- a/crates/hipfire-cli/src/serve/metrics.rs
 +++ b/crates/hipfire-cli/src/serve/metrics.rs
-@@ -539,6 +539,262 @@ impl Metrics {
+@@ -539,6 +539,328 @@ impl Metrics {
                  "Prompt tokens reused from the multi-slot cross-session prefix cache.",
                  s.reused_tokens as u64,
              );
@@ -44801,6 +45169,60 @@ index 399bcc944..5bf032571 100644
 +                    "hipfire_kvmem_layerwise",
 +                    "1 when the KVMem controller runs the Layerwise per-layer recall strategy.",
 +                    flag(s.kvmem.layerwise),
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_trunk_managed",
++                    "1 when trunk full-attention KV is page-managed by KVMem.",
++                    flag(s.kvmem.trunk_managed),
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_mtp_head_managed",
++                    "1 when the MTP head KV lives on the KVMem auxiliary plane.",
++                    flag(s.kvmem.mtp_head_managed),
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_dn_state_managed",
++                    "1 when the DeltaNet recurrent state is KVMem-tiered.",
++                    flag(s.kvmem.dn_state_managed),
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_dn_state_bytes",
++                    "Live DeltaNet recurrent/conv state bytes held by engine slots.",
++                    s.kvmem.dn_state_bytes as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_dn_state_slots",
++                    "Slots holding a live DeltaNet recurrent state.",
++                    s.kvmem.dn_state_slots as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_dn_checkpoints",
++                    "Page-aligned recurrent checkpoints in the engine pool.",
++                    s.kvmem.dn_checkpoints as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_dn_checkpoint_bytes",
++                    "Device bytes held by the recurrent checkpoint pool.",
++                    s.kvmem.dn_checkpoint_bytes as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_dflash_managed",
++                    "1 when the DFlash draft-context KV is KVMem-managed.",
++                    flag(s.kvmem.dflash_managed),
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_media_pins",
++                    "1 when live image spans are mandatory pinned pages.",
++                    flag(s.kvmem.media_pins),
 +                );
 +                gauge(
 +                    &mut out,
@@ -44942,6 +45364,18 @@ index 399bcc944..5bf032571 100644
 +                );
 +                gauge(
 +                    &mut out,
++                    "hipfire_kvmem_draft_sidecars",
++                    "On-disk DFlash draft images riding with prefix packs.",
++                    s.kvmem.draft_sidecars as f64,
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_draft_sidecar_bytes",
++                    "On-disk DFlash draft image bytes charged to the content cache cap.",
++                    s.kvmem.draft_sidecar_bytes as f64,
++                );
++                gauge(
++                    &mut out,
 +                    "hipfire_kvmem_content_groups",
 +                    "Distinct content groups retained in the prefix directory.",
 +                    s.kvmem.content_groups as f64,
@@ -45043,7 +45477,7 @@ index 399bcc944..5bf032571 100644
          }
  
          // Multi-slot swap tier, from the last daemon `done` (or the CLI seed
-@@ -943,6 +1199,71 @@ mod tests {
+@@ -943,6 +1265,71 @@ mod tests {
          ] {
              assert!(out.contains(sample), "{sample}: {out}");
          }
@@ -45115,7 +45549,7 @@ index 399bcc944..5bf032571 100644
          // Standard route: no snapshot, no series (not zeros).
          let standard = m.render(&ServeMeta::new("t".to_owned()), 0, 16);
          for name in [
-@@ -950,6 +1271,7 @@ mod tests {
+@@ -950,6 +1337,7 @@ mod tests {
              "hipfire_slots_",
              "hipfire_evictions",
              "hipfire_prefix_",
@@ -45123,7 +45557,7 @@ index 399bcc944..5bf032571 100644
          ] {
              assert!(!standard.contains(name), "{name}: {standard}");
          }
-@@ -966,6 +1288,45 @@ mod tests {
+@@ -966,6 +1354,45 @@ mod tests {
          assert!(!out.contains("hipfire_kv_pages"), "{out}");
      }
  
@@ -62604,7 +63038,7 @@ index d6575b8ad..2d4d8a11b 100644
              },
          ];
 diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
-index 2059215c3..f7b8cc943 100644
+index 2059215c3..a6290ff60 100644
 --- a/crates/hipfire-runtime/src/serve/mod.rs
 +++ b/crates/hipfire-runtime/src/serve/mod.rs
 @@ -49,6 +49,34 @@ pub struct VisualData {
@@ -62657,7 +63091,7 @@ index 2059215c3..f7b8cc943 100644
      /// Hashes of the conversation's user turns, in order. Identity for
      /// continuation matching — see `Session::convo`.
      pub convo: Vec<u64>,
-@@ -203,6 +239,138 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
+@@ -203,6 +239,160 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
          .map_err(|_| "client receiver dropped".to_string())
  }
  
@@ -62671,6 +63105,24 @@ index 2059215c3..f7b8cc943 100644
 +    pub enabled: bool,
 +    /// Layerwise recall strategy active (per-layer selection) vs Legacy.
 +    pub layerwise: bool,
++    /// P0 ownership contract: which caches this run actually manages. Trunk
++    /// attention KV is always managed when `enabled`; the remaining flags are
++    /// mode- and feature-dependent and are the authoritative answer to
++    /// "what did KVMem take over?" (they are not inferred from bytes).
++    pub trunk_managed: bool,
++    pub mtp_head_managed: bool,
++    pub dn_state_managed: bool,
++    pub dflash_managed: bool,
++    /// Live per-slot DeltaNet recurrent-state bytes and resident slots. These
++    /// are engine-owned today (reported for the ownership ledger, not paged).
++    pub dn_state_bytes: u64,
++    pub dn_state_slots: u32,
++    /// Page-aligned recurrent checkpoints currently in the engine pool.
++    pub dn_checkpoints: u32,
++    pub dn_checkpoint_bytes: u64,
++    /// Media (vision) pages are pinned as indivisible prefix groups. Legacy
++    /// gained this in P4; Layerwise has always pinned them.
++    pub media_pins: bool,
 +    /// Host KV storage charged bytes (live + sealed payload + metadata).
 +    pub host_charged_bytes: u64,
 +    /// Host KV storage spilled to the disk tier.
@@ -62710,6 +63162,10 @@ index 2059215c3..f7b8cc943 100644
 +    pub draft_images: u64,
 +    pub draft_image_hits: u64,
 +    pub draft_image_misses: u64,
++    /// P3: on-disk `<pack>.draft` images and their bytes (charged to the
++    /// content cache cap alongside packs and DN sidecars).
++    pub draft_sidecars: u64,
++    pub draft_sidecar_bytes: u64,
 +    /// 期3 G3: distinct content groups retained in the prefix directory.
 +    pub content_groups: u64,
 +    /// Entries retired by the group-aware publication plan.
@@ -62796,7 +63252,7 @@ index 2059215c3..f7b8cc943 100644
  /// Serialized as the `engine_stats` object of every multi-slot `done` event;
  /// the serve gateway exports it on `/metrics`.
  #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-@@ -241,6 +409,12 @@ pub struct EngineStats {
+@@ -241,6 +431,12 @@ pub struct EngineStats {
      pub swap_disk_used: u64,
      pub swap_host_budget: u64,
      pub swap_disk_budget: u64,
@@ -62809,7 +63265,7 @@ index 2059215c3..f7b8cc943 100644
  }
  
  impl EngineStats {
-@@ -275,6 +449,13 @@ impl EngineStats {
+@@ -275,6 +471,13 @@ impl EngineStats {
          self.active_slots = self.active_slots.saturating_sub(1);
      }
  
@@ -62823,7 +63279,7 @@ index 2059215c3..f7b8cc943 100644
      /// Refresh the swap-tier snapshot from the live manager. Cheap: reads
      /// counters and three integers, no allocation.
      pub fn note_swap(&mut self, swap: &crate::swap::SwapManager) {
-@@ -296,9 +477,9 @@ impl EngineStats {
+@@ -296,9 +499,9 @@ impl EngineStats {
  // single arch-erased surface `handle_generate` drives; the concrete engine
  // (e.g. `hipfire_arch_qwen35::serve_engine::SlotEngine`) implements it.
  //
@@ -62836,7 +63292,7 @@ index 2059215c3..f7b8cc943 100644
  // `hipfire_arch_qwen35::serve_engine::EngineConfig` field-for-field; keep
  // them in lock-step (the qwen35 carrier maps them 1:1).
  
-@@ -306,9 +487,12 @@ impl EngineStats {
+@@ -306,9 +509,12 @@ impl EngineStats {
  /// the daemon from serve.* config keys + the load request, then handed to
  /// `Carrier::spawn_slot_engine`, which adapts it into the concrete engine's
  /// own config. Field-for-field with the qwen35 `EngineConfig`; a second
@@ -62850,7 +63306,7 @@ index 2059215c3..f7b8cc943 100644
      pub model_path: PathBuf,
      pub n_slots: usize,
      /// Per-slot generation cap (tokens) used by the paged-KV budget.
-@@ -468,6 +652,14 @@ pub trait SlotEngineHandle: Send + Sync {
+@@ -468,6 +674,14 @@ pub trait SlotEngineHandle: Send + Sync {
      fn submit(&self, req: SubmitRequest) -> Result<(), String>;
      /// Cancel a QUEUED request by submitter tag. Idempotent; tag 0 is a no-op.
      fn cancel_waiting(&self, request_tag: u64);
