@@ -97,6 +97,20 @@ if ($Component -eq 'Quantizer') { $readme = 'README-quantizer.md' }
 Copy-Item -LiteralPath (Join-Path $SourceDir ('scripts/windows/' + $readme)) -Destination (Join-Path $OutputDir 'README.md')
 Copy-Item -LiteralPath (Join-Path $SourceDir 'backends/llamacpp/LICENSE') -Destination (Join-Path $OutputDir 'licenses/llama.cpp-MIT.txt')
 Copy-Item -LiteralPath (Join-Path $SourceDir 'README.md') -Destination (Join-Path $OutputDir 'licenses/KVMem-README.md')
+$projectLicense = Join-Path $SourceDir 'LICENSE'
+if (Test-Path -LiteralPath $projectLicense -PathType Leaf) {
+    Copy-Item -LiteralPath $projectLicense -Destination (Join-Path $OutputDir 'licenses/KVMem-Apache-2.0.txt')
+}
+$nariqLicenses = @{
+    'libtrellis-Apache-2.0.txt' = 'backends/llamacpp/ggml/src/ggml-cuda/libtrellis/LICENSE'
+    'ExLlamaV3-MIT.txt' = 'backends/llamacpp/licenses/LICENSE-exllamav3'
+}
+foreach ($license in $nariqLicenses.GetEnumerator()) {
+    $licenseFile = Join-Path $SourceDir $license.Value
+    if (Test-Path -LiteralPath $licenseFile -PathType Leaf) {
+        Copy-Item -LiteralPath $licenseFile -Destination (Join-Path $OutputDir "licenses/$($license.Key)")
+    }
+}
 foreach ($file in Get-ChildItem -LiteralPath (Join-Path $SourceDir 'backends/llamacpp/vendor') -Recurse -File) {
     if ($file.Name -notmatch '^(LICENSE|COPYING|NOTICE)') { continue }
     $relative = $file.FullName.Substring($SourceDir.Length + 1)
