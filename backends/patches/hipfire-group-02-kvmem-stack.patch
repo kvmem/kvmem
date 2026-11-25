@@ -31867,10 +31867,10 @@ index 1485fcb61..29671fe59 100644
          return Ok(());
      }
 diff --git a/crates/hipfire-arch-qwen35/src/mtp_spec.rs b/crates/hipfire-arch-qwen35/src/mtp_spec.rs
-index 14d9a12ed..aa34779b6 100644
+index 14d9a12ed..8bde13f20 100644
 --- a/crates/hipfire-arch-qwen35/src/mtp_spec.rs
 +++ b/crates/hipfire-arch-qwen35/src/mtp_spec.rs
-@@ -33,6 +33,17 @@
+@@ -33,6 +33,25 @@
  use crate::mtp_head::{
      self, Qwen35MtpHead, Qwen35MtpHeadBatchedScratch, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch,
  };
@@ -31880,15 +31880,23 @@ index 14d9a12ed..aa34779b6 100644
 +// zero-sized `PhantomData` stand-in (mirrors `lib.rs::LayerwiseFwd`): callers
 +// pass `None` there, the dispatch's `Some` arm is cfg-gated out, and the
 +// `Option<&mut …>` threading / `is_none()` gates behave identically.
++#[cfg(feature = "kvmem")]
 +use crate::kvmem_ctl::LegacyHeadPlane;
++#[cfg(not(feature = "kvmem"))]
++type LegacyHeadPlane = core::marker::PhantomData<()>;
 +#[cfg(feature = "kvmem")]
 +use crate::layerwise_driver::HeadLayerwise;
 +#[cfg(not(feature = "kvmem"))]
 +type HeadLayerwise<'a> = core::marker::PhantomData<&'a ()>;
++
++#[cfg(feature = "kvmem")]
++const KV_BLOCK_TOKENS: usize = crate::kvmem_ctl::KV_BLOCK_TOKENS;
++#[cfg(not(feature = "kvmem"))]
++const KV_BLOCK_TOKENS: usize = 128;
  use crate::qwen35::prefill::{fp8_verify_open, fp8_verify_target};
  use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
  use crate::qwen35::{LayerType, LayerWeights, PrefillBatchScratch, StateQuant};
-@@ -746,13 +757,25 @@ impl MtpSpecState {
+@@ -746,13 +765,25 @@ impl MtpSpecState {
          head: &Qwen35MtpHead,
          max_n: usize,
          kv_mode: crate::mtp_head::MtpKvMode,
@@ -31915,7 +31923,7 @@ index 14d9a12ed..aa34779b6 100644
      pub fn new_for_components_with_verify_capacity(
          gpu: &mut Gpu,
          config: &Qwen35Config,
-@@ -761,6 +784,7 @@ impl MtpSpecState {
+@@ -761,6 +792,7 @@ impl MtpSpecState {
          max_n: usize,
          verify_capacity: usize,
          kv_mode: crate::mtp_head::MtpKvMode,
@@ -31923,7 +31931,7 @@ index 14d9a12ed..aa34779b6 100644
      ) -> HipResult<Self> {
          assert!(
              max_n >= 1,
-@@ -801,7 +825,14 @@ impl MtpSpecState {
+@@ -801,7 +833,14 @@ impl MtpSpecState {
          let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, config, verify_capacity + 1)?;
          let trunk_gdn_tape = GdnTape::new_for_config(gpu, config, verify_capacity + 1)?;
          let mtp_scratch = Qwen35MtpHeadScratch::new(gpu, &head.config)?;
@@ -31939,7 +31947,7 @@ index 14d9a12ed..aa34779b6 100644
  
          let mtp_t_outs = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
          let mtp_lm_tmp = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
-@@ -1207,6 +1238,28 @@ impl MtpSpecState {
+@@ -1207,6 +1246,28 @@ impl MtpSpecState {
          Ok(())
      }
  
@@ -31968,7 +31976,7 @@ index 14d9a12ed..aa34779b6 100644
      pub fn free_gpu(self, gpu: &mut Gpu) {
          gpu.bind_thread_or_warn();
          // Drain launches and destroy their nodes before releasing captured buffers.
-@@ -1411,6 +1464,7 @@ fn run_mtp_proposal_graph_body_q8(
+@@ -1411,6 +1472,7 @@ fn run_mtp_proposal_graph_body_q8(
                  cur_pos + k,
                  seq_cap,
                  weights,
@@ -31976,7 +31984,7 @@ index 14d9a12ed..aa34779b6 100644
              )?;
          } else {
              let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-@@ -1426,6 +1480,7 @@ fn run_mtp_proposal_graph_body_q8(
+@@ -1426,6 +1488,7 @@ fn run_mtp_proposal_graph_body_q8(
                  cur_pos + k,
                  seq_cap,
                  weights,
@@ -31984,7 +31992,7 @@ index 14d9a12ed..aa34779b6 100644
              )?;
          }
          mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
-@@ -1882,7 +1937,11 @@ fn mtp_assemble_verify_tokens(last_committed: u32, candidates: &[u32]) -> Vec<u3
+@@ -1882,7 +1945,11 @@ fn mtp_assemble_verify_tokens(last_committed: u32, candidates: &[u32]) -> Vec<u3
  /// row 0 pairs `last_committed` with the pre-window hidden, row `i > 0` pairs
  /// `candidates[i - 1]` with verify hidden row `i - 1`. The pending token at
  /// `cur_pos + advance` is written by the next window, as in decode.
@@ -31997,7 +32005,7 @@ index 14d9a12ed..aa34779b6 100644
      assert!(
          advance >= 1 && advance <= candidates.len() + 1,
          "takeover fill: advance {advance} out of 1..={}",
-@@ -2219,9 +2278,14 @@ fn mtp_penalty_apply_row(
+@@ -2219,9 +2286,14 @@ fn mtp_penalty_apply_row(
  /// the window's candidates from `candidates[..n_verify - 1]` (so rejected /
  /// pruned draft-phase pushes never survive), uploads the history once, then
  /// launches one prepass per non-empty row. No-op unless `sampling.penalized()`.
@@ -32014,7 +32022,7 @@ index 14d9a12ed..aa34779b6 100644
      logits_view: &GpuTensor,
      candidates: &[u32],
      n_verify: usize,
-@@ -2231,26 +2295,45 @@ fn mtp_apply_verify_penalties(
+@@ -2231,26 +2303,45 @@ fn mtp_apply_verify_penalties(
      if !sampling.penalized() {
          return Ok(());
      }
@@ -32074,7 +32082,7 @@ index 14d9a12ed..aa34779b6 100644
      if t0.is_some() {
          let uploads = u32::from(!state.penalty.tokens().is_empty());
          let launches = (0..n_verify)
-@@ -2377,7 +2460,7 @@ fn mtp_verify_accept_impl(
+@@ -2377,7 +2468,7 @@ fn mtp_verify_accept_impl(
      if use_sampling {
          hit_eos = mtp_sampled_accept(
              gpu,
@@ -32083,7 +32091,7 @@ index 14d9a12ed..aa34779b6 100644
              &logits_view,
              draft_softmaxes,
              draft_probs,
-@@ -3188,7 +3271,7 @@ pub fn mtp_batched_verify_accept_from_batch(
+@@ -3188,7 +3279,7 @@ pub fn mtp_batched_verify_accept_from_batch(
          let mut accept_count = 0usize;
          let hit_eos = mtp_sampled_accept(
              gpu,
@@ -32092,7 +32100,7 @@ index 14d9a12ed..aa34779b6 100644
              &logits_view,
              &draft.draft_softmaxes,
              &draft.draft_probs,
-@@ -3948,6 +4031,8 @@ where
+@@ -3948,6 +4039,8 @@ where
                          &target.weights,
                          Some(rot),
                          true,
@@ -32101,7 +32109,7 @@ index 14d9a12ed..aa34779b6 100644
                      )?;
                      slice_off = slice_end;
                  }
-@@ -4169,6 +4254,7 @@ pub fn spec_step_mtp(
+@@ -4169,6 +4262,7 @@ pub fn spec_step_mtp(
      // MTP step k writes its own KV slot at position cur_pos + k (same as
      // before — a per-step single-layer transformer cache).
      let dim_bytes = dim * 4;
@@ -32109,7 +32117,7 @@ index 14d9a12ed..aa34779b6 100644
      for k in 0..max_n {
          // Step 0 reads from state.prev_hidden (trunk's last post-norm
          // hidden, snapshot from the previous cycle / prefill) and embeds
-@@ -4176,7 +4262,7 @@ pub fn spec_step_mtp(
+@@ -4176,7 +4270,7 @@ pub fn spec_step_mtp(
          // (k-1) of mtp_t_outs and uses that same row as the embedding
          // override (lossy substitute for embed[predicted_token_{k-1}]).
          if k == 0 {
@@ -32118,7 +32126,7 @@ index 14d9a12ed..aa34779b6 100644
                  gpu,
                  head,
                  &state.mtp_scratch,
-@@ -4185,11 +4271,15 @@ pub fn spec_step_mtp(
+@@ -4185,11 +4279,15 @@ pub fn spec_step_mtp(
                  &state.prev_hidden,
                  None,
                  cur_pos + k,
@@ -32135,7 +32143,7 @@ index 14d9a12ed..aa34779b6 100644
                  gpu,
                  head,
                  &state.mtp_scratch,
-@@ -4198,7 +4288,11 @@ pub fn spec_step_mtp(
+@@ -4198,7 +4296,11 @@ pub fn spec_step_mtp(
                  &prev_row,       // prev_hidden = step k-1's t_mtp_out
                  Some(&prev_row), // embed override = step k-1's t_mtp_out (lossy)
                  cur_pos + k,
@@ -32147,7 +32155,7 @@ index 14d9a12ed..aa34779b6 100644
              )?;
          }
          // Capture this step's t_mtp_out into row k of mtp_t_outs so the
-@@ -4836,9 +4930,9 @@ pub fn spec_step_mtp_compressed(
+@@ -4836,9 +4938,9 @@ pub fn spec_step_mtp_compressed(
  /// empty). RNG draw count/order is identical to the learned-draft path.
  #[allow(clippy::too_many_arguments)]
  #[allow(clippy::too_many_arguments)]
@@ -32159,7 +32167,7 @@ index 14d9a12ed..aa34779b6 100644
      logits_view: &GpuTensor,
      draft_softmaxes: &[Vec<f32>],
      draft_probs: &[f32],
-@@ -4902,7 +4996,7 @@ fn mtp_sampled_accept(
+@@ -4902,7 +5004,7 @@ fn mtp_sampled_accept(
          let target_row_k = target_row_at(k);
          let p_d = draft_probs[k].max(f32::MIN_POSITIVE);
          let p_t = target_row_k[candidates[k] as usize];
@@ -32168,7 +32176,7 @@ index 14d9a12ed..aa34779b6 100644
          if u * p_d <= p_t {
              // Accept.
              committed.push(candidates[k]);
-@@ -4916,7 +5010,7 @@ fn mtp_sampled_accept(
+@@ -4916,7 +5018,7 @@ fn mtp_sampled_accept(
              // across the MISMATCHED per-side nuclei. Both rows are full-vocab
              // length `vocab` (different zero-support), so sample_residual's
              // element-wise subtraction is well-formed.
@@ -32177,7 +32185,7 @@ index 14d9a12ed..aa34779b6 100644
              let bonus = if point_mass {
                  sample_residual_point_mass(&target_row_k, candidates[k], u2)
              } else {
-@@ -4935,7 +5029,7 @@ fn mtp_sampled_accept(
+@@ -4935,7 +5037,7 @@ fn mtp_sampled_accept(
          // All `drafts_generated` accepted (and none was EOS): sample the bonus
          // from the target nucleus at position `*accept_count` (== drafts_generated).
          let row = target_row_at(*accept_count);
@@ -32186,7 +32194,7 @@ index 14d9a12ed..aa34779b6 100644
          let bonus = sample_categorical(&row, u);
          committed.push(bonus);
          if bonus == eos_token_id {
-@@ -5002,6 +5096,139 @@ pub fn spec_step_mtp_compressed_serial(
+@@ -5002,6 +5104,141 @@ pub fn spec_step_mtp_compressed_serial(
  /// calls this then `mtp_shared_verify_accept_rollback_inner`; the slot engine
  /// calls this per-slot, then does a batched `forward_batch_slots_graphed`,
  /// then `mtp_batched_verify_accept_from_batch` per-slot.
@@ -32201,6 +32209,7 @@ index 14d9a12ed..aa34779b6 100644
 +/// `mtp_head_forward_block_only` wrapper byte-for-byte. The head ALGORITHM is
 +/// identical either way; only KV residency differs.
 +#[allow(clippy::too_many_arguments)]
++#[cfg_attr(not(feature = "kvmem"), allow(unused_variables))]
 +fn mtp_head_block_forward_dispatch(
 +    gpu: &mut Gpu,
 +    head: &Qwen35MtpHead,
@@ -32216,6 +32225,7 @@ index 14d9a12ed..aa34779b6 100644
 +    legacy_plane: Option<&mut LegacyHeadPlane>,
 +    head_shift: usize,
 +) -> HipResult<()> {
++    #[cfg(feature = "kvmem")]
 +    if let Some(plane) = legacy_plane {
 +        let paged = plane
 +            .stage_row_with_rope(gpu, row, pos)
@@ -32326,7 +32336,7 @@ index 14d9a12ed..aa34779b6 100644
  #[allow(clippy::too_many_arguments)]
  pub fn mtp_draft_phase_inner(
      gpu: &mut Gpu,
-@@ -5013,6 +5240,9 @@ pub fn mtp_draft_phase_inner(
+@@ -5013,6 +5250,9 @@ pub fn mtp_draft_phase_inner(
      last_committed: u32,
      k: usize,
      skip_proposal_graph: bool,
@@ -32336,7 +32346,7 @@ index 14d9a12ed..aa34779b6 100644
  ) -> HipResult<MtpDraftOutput> {
      // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
      // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
-@@ -5177,7 +5407,13 @@ pub fn mtp_draft_phase_inner(
+@@ -5177,7 +5417,13 @@ pub fn mtp_draft_phase_inner(
          );
      }
      let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
@@ -32350,7 +32360,7 @@ index 14d9a12ed..aa34779b6 100644
          && max_n > 0
          && !state.mtp_proposal_graph_disabled
          && mtp_proposal_graph_eligible_for(
-@@ -5287,32 +5523,34 @@ pub fn mtp_draft_phase_inner(
+@@ -5287,32 +5533,34 @@ pub fn mtp_draft_phase_inner(
              // call. In full-vocab mode we run block_only here and do the
              // rmsnorm + trunk-lm_head GEMV manually below.
              if use_full_vocab {
@@ -32410,7 +32420,7 @@ index 14d9a12ed..aa34779b6 100644
                  // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
                  // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
                  // kernel (gemv_mq4g256_with_rotate / gemv_q8_0 / etc.) on the
-@@ -5330,58 +5568,58 @@ pub fn mtp_draft_phase_inner(
+@@ -5330,58 +5578,58 @@ pub fn mtp_draft_phase_inner(
                      &full_vocab_logits_view,
                  )?;
              } else if use_device_token_chain {
@@ -32517,7 +32527,7 @@ index 14d9a12ed..aa34779b6 100644
              }
  
              // Pick the logits buffer to argmax over (mode-dependent).
-@@ -5718,6 +5956,9 @@ pub fn spec_step_mtp_compressed_serial_inner(
+@@ -5718,6 +5966,9 @@ pub fn spec_step_mtp_compressed_serial_inner(
          last_committed,
          k,
          skip_proposal_graph,
@@ -32527,7 +32537,7 @@ index 14d9a12ed..aa34779b6 100644
      )?;
  
      mtp_shared_verify_accept_rollback_inner(
-@@ -5892,6 +6133,8 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
+@@ -5892,6 +6143,8 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
          &target.weights,
          cur_pos,
          &mtp_takeover_fill_tokens(last_committed, candidates, result.advance),
@@ -32536,11 +32546,12 @@ index 14d9a12ed..aa34779b6 100644
      )?;
  
      // External windows are never truncated; ensure result fields cohere even
-@@ -5909,15 +6152,27 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
+@@ -5909,15 +6162,28 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
  /// KV-only head pass (same gate and kernels as the batched prompt fill) and
  /// falls back to per-row decode forwards otherwise. Rows are independent:
  /// each slot's K/V depends only on its own token and hidden.
 -fn mtp_takeover_fill_head_kv(
++#[cfg_attr(not(feature = "kvmem"), allow(unused_variables))]
 +pub(crate) fn mtp_takeover_fill_head_kv(
      gpu: &mut Gpu,
      head: &Qwen35MtpHead,
@@ -32554,18 +32565,18 @@ index 14d9a12ed..aa34779b6 100644
 +    // P1b: optional bounded Legacy arena. When present the same accepted rows
 +    // are mirrored into it at compact coordinates, so the following draft can
 +    // read them without re-copying the append pages from the archive.
-+    mut paged_plane: Option<&mut crate::kvmem_ctl::LegacyHeadPlane>,
++    mut paged_plane: Option<&mut LegacyHeadPlane>,
  ) -> HipResult<()> {
      let n = tokens.len();
 +    // P1b: a block-quantized Legacy window advanced; slide the contiguous
 +    // cache before this verify span writes at `pos - rope_shift`.
-+    if rope_shift > 0 && rope_shift % crate::kvmem_ctl::KV_BLOCK_TOKENS == 0 {
++    if rope_shift > 0 && rope_shift % KV_BLOCK_TOKENS == 0 {
 +        state.mtp_kv.slide_to_shift(gpu, rope_shift)?;
 +    }
      let dim = head.config.n_embd;
      let dim_bytes = dim * 4;
      if n > 1 {
-@@ -5957,9 +6212,37 @@ fn mtp_takeover_fill_head_kv(
+@@ -5957,9 +6223,41 @@ fn mtp_takeover_fill_head_kv(
              .takeover_fill_batched
              .as_mut()
              .expect("takeover fill scratch allocated above");
@@ -32591,7 +32602,11 @@ index 14d9a12ed..aa34779b6 100644
 +        // arena's own compact coordinates. A stale/mismatched plane (cold
 +        // start, span left the window) falls back to the contiguous write;
 +        // the next draft then restores from the archive as before.
++        #[cfg(feature = "kvmem")]
 +        let mut paged_view = None;
++        #[cfg(not(feature = "kvmem"))]
++        let paged_view = None;
++        #[cfg(feature = "kvmem")]
 +        if let Some(plane) = paged_plane.as_deref_mut() {
 +            if let (Ok(start), Ok(rows)) = (u32::try_from(cur_pos), u32::try_from(n)) {
 +                if let Some(end) = start.checked_add(rows) {
@@ -32605,7 +32620,7 @@ index 14d9a12ed..aa34779b6 100644
              gpu,
              head,
              scratch,
-@@ -5971,8 +6254,27 @@ fn mtp_takeover_fill_head_kv(
+@@ -5971,8 +6269,28 @@ fn mtp_takeover_fill_head_kv(
              trunk_weights,
              Some(rot),
              true,
@@ -32614,6 +32629,7 @@ index 14d9a12ed..aa34779b6 100644
 +            paged_view.as_ref(),
 +        );
 +        drop(paged_view);
++        #[cfg(feature = "kvmem")]
 +        if result.is_ok() {
 +            if let (Some(plane), Ok(end)) = (paged_plane, u32::try_from(cur_pos + n)) {
 +                plane.mark_filled(end);
@@ -34334,7 +34350,7 @@ index dd17541e7..cb8e404ee 100644
      ///
      /// The ordinary state has an implicit batch of one.  This variant keeps
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
-index 82fbdd9cd..a08c0ecbe 100644
+index 82fbdd9cd..708124aee 100644
 --- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
 @@ -53,6 +53,48 @@ use hipfire_runtime::serve_wait::WaitQueue;
@@ -35036,17 +35052,18 @@ index 82fbdd9cd..a08c0ecbe 100644
          Ok(Rig {
              gpu,
              tokenizer,
-@@ -1962,6 +2287,9 @@ impl Rig {
+@@ -1962,6 +2287,10 @@ impl Rig {
                  config,
                  scratch,
                  dn_states,
 +                #[cfg(feature = "kvmem")]
 +                dn_images: (0..cfg.n_slots).map(|_| None).collect(),
++                #[cfg(feature = "kvmem")]
 +                legacy_head_planes: (0..cfg.n_slots).map(|_| None).collect(),
                  k_arenas,
                  v_arenas,
                  desc_staging,
-@@ -1970,12 +2298,13 @@ impl Rig {
+@@ -1970,12 +2299,13 @@ impl Rig {
                  logits_out,
                  mtp_head,
                  mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
@@ -35061,7 +35078,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                  dflash,
                  dflash_states: (0..cfg.n_slots).map(|_| None).collect(),
                  vision_weights,
-@@ -1983,12 +2312,38 @@ impl Rig {
+@@ -1983,12 +2313,38 @@ impl Rig {
                  vl_ext_devs,
                  vl_tower_jobs,
                  checkpoint_pool,
@@ -35100,7 +35117,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              adm,
              swap,
              stamp,
-@@ -2004,6 +2359,11 @@ impl Rig {
+@@ -2004,6 +2360,11 @@ impl Rig {
              prefix_index,
              cache_domain,
              prefix_cache,
@@ -35112,7 +35129,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              prefix_cache_max_bytes: if prefix_cache {
                  Some(cfg.prefix_cache_max_bytes as usize)
              } else {
-@@ -2047,6 +2407,8 @@ impl Rig {
+@@ -2047,6 +2408,8 @@ impl Rig {
                      k_arenas,
                      v_arenas,
                      dn_states,
@@ -35121,7 +35138,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                      desc_staging,
                      pbs,
                      scratch,
-@@ -2084,6 +2446,10 @@ impl Rig {
+@@ -2084,6 +2447,10 @@ impl Rig {
          for dn in dn_states.into_iter().rev() {
              dn.free_gpu(&mut gpu);
          }
@@ -35132,7 +35149,7 @@ index 82fbdd9cd..a08c0ecbe 100644
          // Arenas were allocated per FA layer as k then v; free reverse layers
          // as v then k.
          let mut k_arenas = k_arenas;
-@@ -2140,813 +2506,6 @@ impl Rig {
+@@ -2140,813 +2507,6 @@ impl Rig {
      }
  }
  
@@ -35946,7 +35963,7 @@ index 82fbdd9cd..a08c0ecbe 100644
  /// One slot's in-flight spec draft between the draft phase and the
  /// post-forward accept. `Mtp` carries the head's K-step chain output;
  /// `Dflash` carries the DFlash2 selector block. Both expose the verify-row
-@@ -3062,13 +2621,13 @@ fn clear_work_slot(work: &mut PendingWork) {
+@@ -3062,13 +2622,13 @@ fn clear_work_slot(work: &mut PendingWork) {
      work.vl_prefill = None;
      work.spec = SpecKind::None;
      work.pos3_delta = 0;
@@ -35967,7 +35984,7 @@ index 82fbdd9cd..a08c0ecbe 100644
  }
  
  /// Release a request's prefix-cache pin on every terminal path (spec §4.4
-@@ -3190,28 +2749,15 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
+@@ -3190,28 +2750,15 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
  /// batched forward provisions `set_seq_len(max_pos + 1)` before its KV write
  /// and fails the whole step closed when that exceeds the cap, which rejects
  /// every active slot; MTP must retire before drafting instead.
@@ -36001,7 +36018,7 @@ index 82fbdd9cd..a08c0ecbe 100644
  ///
  /// `repeat_window == 0` does NOT neutralize the penalties: OpenAI-style
  /// presence/frequency penalties are defined over the whole context, so a zero
-@@ -3243,17 +2789,6 @@ fn effective_repeat_window(
+@@ -3243,17 +2790,6 @@ fn effective_repeat_window(
      }
  }
  
@@ -36019,7 +36036,7 @@ index 82fbdd9cd..a08c0ecbe 100644
  /// Install a request's sampling parameters (including token penalties and
  /// min_p) on its slot's sampler state.
  fn install_sample_params(rig: &mut Rig, slot: SlotId, req: &SubmitRequest) {
-@@ -3400,6 +2935,7 @@ fn publish_generated_prefix(
+@@ -3400,6 +2936,7 @@ fn publish_generated_prefix(
                  domain,
                  new_boundary as u64,
                  &tokens,
@@ -36027,7 +36044,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                  &rig.model.dn_states[s],
              ) {
                  Ok(id) if id.is_some() => Some(id),
-@@ -3494,6 +3030,20 @@ fn commit_sampled_token(
+@@ -3494,6 +3031,20 @@ fn commit_sampled_token(
          // instead of a successful done (spec §7.1 G1, A17). ClientGone is
          // never overridden: the receiver is already dropped.
          lock_stats(stats).note_slot_released();
@@ -36048,7 +36065,7 @@ index 82fbdd9cd..a08c0ecbe 100644
          if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
              let _ = send_event(
                  &f.reply,
-@@ -3521,11 +3071,28 @@ fn commit_sampled_token(
+@@ -3521,11 +3072,28 @@ fn commit_sampled_token(
          // the fairness budget (spec §5.3 S3). Idempotent (NotFound ignored).
          let _ = rig.fair_queue.remove(session.0);
          clear_work_slot(&mut work[s]);
@@ -36077,7 +36094,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              rig.sessions.touch(session);
          }
      } else {
-@@ -3537,14 +3104,81 @@ fn commit_sampled_token(
+@@ -3537,14 +3105,81 @@ fn commit_sampled_token(
      }
  }
  
@@ -36166,7 +36183,7 @@ index 82fbdd9cd..a08c0ecbe 100644
  }
  
  /// Swap failures are not fatal (the session re-prefills), but they must not be
-@@ -3602,6 +3236,17 @@ struct InFlight {
+@@ -3602,6 +3237,17 @@ struct InFlight {
      /// that shared pages from a prefix cache hit are not re-published.
      /// 0 when prefix_cache is off.
      last_published_boundary: usize,
@@ -36184,7 +36201,7 @@ index 82fbdd9cd..a08c0ecbe 100644
      /// Per-request grammar constraint for structured output (spec §7 G1/G2).
      /// `None` for unconstrained requests. When present, a grammar mask is
      /// applied to the slot's logits row BEFORE the GPU sampler's
-@@ -3926,6 +3571,11 @@ fn run_loop(
+@@ -3926,6 +3572,11 @@ fn run_loop(
  ) -> Result<(), String> {
      let n = rig.n_slots;
      let mut slots: Vec<Option<InFlight>> = (0..n).map(|_| None).collect();
@@ -36196,7 +36213,7 @@ index 82fbdd9cd..a08c0ecbe 100644
      let mut work: Vec<PendingWork> = (0..n)
          .map(|s| PendingWork {
              slot: SlotId(s),
-@@ -3934,9 +3584,7 @@ fn run_loop(
+@@ -3934,9 +3585,7 @@ fn run_loop(
              decoding: false,
              vl_prefill: None,
              spec: SpecKind::None,
@@ -36207,7 +36224,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              pos3_delta: 0,
          })
          .collect();
-@@ -3969,6 +3617,13 @@ fn run_loop(
+@@ -3969,6 +3618,13 @@ fn run_loop(
                  rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
                  let _ = rig.fair_queue.remove(sid.0);
                  clear_work_slot(&mut work[s]);
@@ -36221,7 +36238,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                  rig.model.clear_slot_vl_state(&mut rig.gpu, s);
              }
          }
-@@ -3997,9 +3652,16 @@ fn run_loop(
+@@ -3997,9 +3653,16 @@ fn run_loop(
                          .max(std::time::Duration::from_secs(1))
                  }) {
                      Some(wait) => match rx.recv_timeout(wait) {
@@ -36240,7 +36257,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                              let mut st = stats.lock().expect("stats");
                              st.note_swap(&rig.swap);
                              drop(st);
-@@ -4008,14 +3670,28 @@ fn run_loop(
+@@ -4008,14 +3671,28 @@ fn run_loop(
                          Err(RecvTimeoutError::Disconnected) => break 'serve,
                      },
                      None => match rx.recv() {
@@ -36271,7 +36288,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                      Err(TryRecvError::Empty) => break,
                      Err(TryRecvError::Disconnected) => {
                          if slots.iter().all(|s| s.is_none()) {
-@@ -4037,8 +3713,13 @@ fn run_loop(
+@@ -4037,8 +3714,13 @@ fn run_loop(
                  if let Some(pp) = rig.pool.page_pool() {
                      st.note_pool_pages(pp.free_pages(), pp.n_pages());
                  }
@@ -36285,7 +36302,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              // Expire timed-out waiters → typed queue timeout rejection. The
              // deadline is WALL-CLOCK (`serve.queue_timeout_ms` against the
              // enqueue Instant), not a tick count: ticks advance once per serve
-@@ -4094,7 +3775,7 @@ fn run_loop(
+@@ -4094,7 +3776,7 @@ fn run_loop(
                  };
                  let active_before = slots.iter().filter(|s| s.is_some()).count();
                  rig.pending_repark_age = Some(parked.enqueued_at);
@@ -36294,7 +36311,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                  rig.pending_repark_age = None;
                  let active_after = slots.iter().filter(|s| s.is_some()).count();
                  // If admit did not place the request in a slot (it may have
-@@ -4125,12 +3806,39 @@ fn run_loop(
+@@ -4125,12 +3807,39 @@ fn run_loop(
                      .min()
                      .unwrap_or(std::time::Duration::from_millis(50));
                  match rx.recv_timeout(sleep_for) {
@@ -36335,7 +36352,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              // Slot occupancy for this step, after admission. Each terminal
              // below releases its slot in the stats BEFORE posting its event,
              // so the snapshot a `done` reads counts only slots still busy.
-@@ -4296,11 +4004,12 @@ fn run_loop(
+@@ -4296,11 +4005,12 @@ fn run_loop(
                          let seed = work[s].remaining_prompt.last().copied();
                          // Token penalties scope the verify rows against this
                          // request's emitted history (`sess.tokens` past the
@@ -36352,7 +36369,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                                      .as_ref()
                                      .filter(|c| c.sampling.penalized())
                                      .map(|c| c.prompt_len);
-@@ -4318,13 +4027,23 @@ fn run_loop(
+@@ -4318,13 +4028,23 @@ fn run_loop(
                              _ => Vec::new(),
                          };
                          let outcome = match work[s].spec {
@@ -36381,7 +36398,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                                  .map(SpecDraftRows::Dflash),
                              SpecKind::None => {
                                  unreachable!("spec.active() gate above")
-@@ -4332,6 +4051,12 @@ fn run_loop(
+@@ -4332,6 +4052,12 @@ fn run_loop(
                          };
                          match outcome {
                              Ok(draft) => {
@@ -36394,7 +36411,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                                  spec_seeds[s] = seed;
                                  spec_drafts[s] = Some(draft);
                              }
-@@ -4487,11 +4212,30 @@ fn run_loop(
+@@ -4487,11 +4213,30 @@ fn run_loop(
                      eligible[s] = granted_ids.contains(&f.session.0);
                  }
              }
@@ -36426,7 +36443,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              );
  
              // Count prefill + decode rows the scheduler emitted.
-@@ -4602,6 +4346,29 @@ fn run_loop(
+@@ -4602,6 +4347,29 @@ fn run_loop(
              if batch.is_empty() {
                  continue;
              }
@@ -36456,7 +36473,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              // Provision every slot's write frontier before any COW or kernel work.
              // If retained cache-only pages consumed the free list, evict unpinned
              // radix leaves and retry once. `forward_batch_slots` repeats this call
-@@ -4889,11 +4656,55 @@ fn run_loop(
+@@ -4889,11 +4657,55 @@ fn run_loop(
                  work[s].spec == SpecKind::Dflash
                      && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
              });
@@ -36512,7 +36529,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              let fwd = rig.model.forward_step(
                  &mut rig.gpu,
                  &batch,
-@@ -4902,6 +4713,7 @@ fn run_loop(
+@@ -4902,6 +4714,7 @@ fn run_loop(
                  &lm_head_skip,
                  any_verify,
                  any_dflash_rows,
@@ -36520,7 +36537,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              );
              let forward_ns = t_forward.elapsed().as_nanos() as u64;
              // ── Publication (spec §4.6 C6) ──────────────────────────────────
-@@ -5020,6 +4832,7 @@ fn run_loop(
+@@ -5020,6 +4833,7 @@ fn run_loop(
                                      domain,
                                      new_boundary as u64,
                                      &tokens,
@@ -36528,7 +36545,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                                      &rig.model.dn_states[s],
                                  ) {
                                      Ok(id) if id.is_some() => Some(id),
-@@ -5102,6 +4915,28 @@ fn run_loop(
+@@ -5102,6 +4916,28 @@ fn run_loop(
                  poison = Some(reason);
                  break 'serve;
              }
@@ -36557,7 +36574,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              if check_pool_invariants {
                  if let Some(pp) = rig.pool.page_pool() {
                      pp.check_invariants();
-@@ -5115,6 +4950,30 @@ fn run_loop(
+@@ -5115,6 +4951,30 @@ fn run_loop(
              if let Some(pp) = rig.pool.page_pool_mut() {
                  pp.drain_completed();
              }
@@ -36588,7 +36605,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              // Penalty windows: for each slot whose request carries non-neutral
              // token penalties, clamp the requested window to what the session
              // actually holds and upload that tail (most recent last). The kernel
-@@ -5380,6 +5239,17 @@ fn run_loop(
+@@ -5380,6 +5240,17 @@ fn run_loop(
              let t_emit = std::time::Instant::now();
  
              for s in 0..n {
@@ -36606,7 +36623,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                  // Spec verify/accept: process slots that produced draft outputs.
                  if let Some(draft) = spec_drafts[s].take() {
                      if slots[s].is_none() {
-@@ -5432,54 +5302,61 @@ fn run_loop(
+@@ -5432,54 +5303,61 @@ fn run_loop(
                      };
                      match accept_outcome {
                          Ok(tokens) => {
@@ -36709,7 +36726,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                                      }
                                  }
                              }
-@@ -5676,6 +5553,20 @@ fn run_loop(
+@@ -5676,6 +5554,20 @@ fn run_loop(
                      // G1, A17). ClientGone is never overridden: the receiver is
                      // already dropped.
                      lock_stats(&stats).note_slot_released();
@@ -36730,7 +36747,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                      if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
                          let _ = send_event(
                              &f.reply,
-@@ -5704,6 +5595,14 @@ fn run_loop(
+@@ -5704,6 +5596,14 @@ fn run_loop(
                      // publish_generated_prefix never publishes a page whose
                      // rows were not written.
                      publish_generated_prefix(&mut rig, &mut slots, s, work[s].next_pos);
@@ -36745,7 +36762,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                      // Hand the slot back — the session stays resident for
                      // continuation, but slot occupancy must end at terminal
                      // (matching commit_sampled_token). Wave 8's unpin edit
-@@ -5713,6 +5612,17 @@ fn run_loop(
+@@ -5713,6 +5613,17 @@ fn run_loop(
                      slots[s] = None;
                      let _ = rig.fair_queue.remove(session.0);
                      clear_work_slot(&mut work[s]);
@@ -36763,7 +36780,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                      rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                      if matches!(reason, DoneReason::ClientGone) {
                          // Nobody will follow up on a vanished client, so hand the
-@@ -5720,10 +5630,13 @@ fn run_loop(
+@@ -5720,10 +5631,13 @@ fn run_loop(
                          rig.swap.forget(session.0);
                          rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
                      } else {
@@ -36781,7 +36798,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                          rig.sessions.touch(session);
                      }
                  } else {
-@@ -5741,6 +5654,15 @@ fn run_loop(
+@@ -5741,6 +5655,15 @@ fn run_loop(
                      rig.sessions.touch(session);
                  }
              }
@@ -36797,7 +36814,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              let emit_ns = t_emit.elapsed().as_nanos() as u64;
              let total_ns = t_step.elapsed().as_nanos() as u64;
              if hipfire_dispatch::moe_trace_enabled() {
-@@ -5805,6 +5727,7 @@ fn run_loop(
+@@ -5805,6 +5728,7 @@ fn run_loop(
          (None, Err(e)) => Err(e),
      }
  }
@@ -36805,7 +36822,7 @@ index 82fbdd9cd..a08c0ecbe 100644
  fn should_retain_terminal_tok(reason: DoneReason) -> bool {
      matches!(reason, DoneReason::MaxTokens)
  }
-@@ -5824,6 +5747,7 @@ fn handle_command(
+@@ -5824,6 +5748,7 @@ fn handle_command(
      slots: &mut [Option<InFlight>],
      work: &mut [PendingWork],
      stats: &Arc<Mutex<EngineStats>>,
@@ -36813,7 +36830,7 @@ index 82fbdd9cd..a08c0ecbe 100644
      cmd: EngineCommand,
  ) {
      match cmd {
-@@ -5860,7 +5784,7 @@ fn handle_command(
+@@ -5860,7 +5785,7 @@ fn handle_command(
                      }
                  }
              } else {
@@ -36822,7 +36839,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              }
          }
          EngineCommand::CancelWaiting { request_tag } => {
-@@ -5903,6 +5827,11 @@ fn handle_command(
+@@ -5903,6 +5828,11 @@ fn handle_command(
                      drop(inflight.reply);
                  }
                  clear_work_slot(&mut work[idx]);
@@ -36834,7 +36851,7 @@ index 82fbdd9cd..a08c0ecbe 100644
                  rig.model.clear_slot_vl_state(&mut rig.gpu, idx);
                  let _ = rig.fair_queue.remove(session);
              }
-@@ -5910,6 +5839,22 @@ fn handle_command(
+@@ -5910,6 +5840,22 @@ fn handle_command(
              rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
              let _ = reply.send(Ok(()));
          }
@@ -36857,7 +36874,7 @@ index 82fbdd9cd..a08c0ecbe 100644
          EngineCommand::Reset { reply } => {
              if slots.iter().any(|s| s.is_some()) {
                  let _ = reply.send(Err("reset rejected: requests in flight".to_string()));
-@@ -5927,6 +5872,27 @@ fn handle_command(
+@@ -5927,6 +5873,27 @@ fn handle_command(
                  rig.sessions
                      .close(&mut rig.pool, &mut rig.adm, SessionId(id));
              }
@@ -36885,7 +36902,7 @@ index 82fbdd9cd..a08c0ecbe 100644
              // Drop prefix cache state so subsequent lookups miss (spec §4.6).
              // The radix index owns cache leases taken at publication: it
              // MUST release them into the pool before being replaced, or
-@@ -6043,1546 +6009,101 @@ fn sync_fair_needs(
+@@ -6043,1546 +6010,101 @@ fn sync_fair_needs(
      let _ = q.set_uncached_prefill(id, uncached);
  }
  
@@ -38522,7 +38539,7 @@ index 82fbdd9cd..a08c0ecbe 100644
          }
      }
  
-@@ -7669,7 +6190,7 @@ mod tests {
+@@ -7669,7 +6191,7 @@ mod tests {
      /// exact joint acceptance is implemented and validated").
      #[test]
      fn grammar_constrained_requests_select_ar_not_mtp() {
@@ -38531,7 +38548,7 @@ index 82fbdd9cd..a08c0ecbe 100644
          // req.json_schema is Some. This test documents the invariant: a
          // grammar-constrained request must NOT activate MTP.
          let grammar_constrained = true;
-@@ -8324,3 +6845,49 @@ mod mtp_spill_decline_tests {
+@@ -8324,3 +6846,49 @@ mod mtp_spill_decline_tests {
          assert_eq!(slot_mtp_k(MtpMode::On, 0, false), 0);
      }
  }
@@ -45299,10 +45316,10 @@ index 000000000..64fa01407
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_model.rs b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
 new file mode 100644
-index 000000000..22380f76e
+index 000000000..c61571570
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
-@@ -0,0 +1,1317 @@
+@@ -0,0 +1,1331 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -45310,6 +45327,16 @@ index 000000000..22380f76e
 +// Model-owned GPU state operations: forward and speculative methods.
 +
 +use super::*;
++
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++use crate::kvmem_ctl::LegacyHeadPlane;
++#[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
++type LegacyHeadPlane = core::marker::PhantomData<()>;
++
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++const KV_BLOCK_TOKENS: usize = crate::kvmem_ctl::KV_BLOCK_TOKENS;
++#[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
++const KV_BLOCK_TOKENS: usize = 128;
 +
 +impl ModelRig {
 +    /// One batched forward step across the N slots (spec §5.2). Wraps
@@ -45885,13 +45912,15 @@ index 000000000..22380f76e
 +            } else {
 +                None
 +            };
++        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
++        let mut legacy_plane: Option<LegacyHeadPlane> = None;
 +        // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
 +        // `gpu`/`weights`/head separately. No closure — it would capture all of
 +        // `rig` and collide with the scratch borrow.
 +        let mtp_outcome = norm_outcome.and_then(|()| {
 +            // P1b: block-quantized Legacy shift — move the live window before
 +            // this chunk stages its compact rows.
-+            if rope_shift > 0 && rope_shift % crate::kvmem_ctl::KV_BLOCK_TOKENS == 0 {
++            if rope_shift > 0 && rope_shift % KV_BLOCK_TOKENS == 0 {
 +                state
 +                    .mtp_kv
 +                    .slide_to_shift(&mut gpu, rope_shift)
@@ -46205,13 +46234,15 @@ index 000000000..22380f76e
 +            } else {
 +                None
 +            };
++        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
++        let mut legacy_plane: Option<LegacyHeadPlane> = None;
 +
 +        // The draft body, factored so the restore helper can run it through the
 +        // head handle (kvmem) or full-resident (fallback / default build). `gpu`
 +        // and the handle are parameters; the rest is captured disjointly.
 +        let mut run_draft = |gpu: &mut Gpu,
 +                             hlw: Option<&mut HeadLw<'_>>,
-+                             _plane: Option<&mut crate::kvmem_ctl::LegacyHeadPlane>|
++                             _plane: Option<&mut LegacyHeadPlane>|
 +         -> Result<crate::mtp_spec::MtpDraftOutput, String> {
 +            if prompt_tokens.is_empty() {
 +                return Err("mtp_draft_step: no seed token".to_string());
