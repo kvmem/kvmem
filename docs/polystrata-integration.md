@@ -27,12 +27,13 @@ qualification builds.
 
 For dSpark on Windows CUDA, select **MTP** and a matching dSpark GGUF in the
 console, or launch the native worker with `--kvmem-mtp --draft-model FILE
---window 4` and the managed launch flags. Use one retained conversation and
-FP16 or FP8 target KV. The default preset keeps ordinary decoding.
+--window 4` and the managed launch flags. Use FP16 or FP8 target KV. The default
+preset keeps ordinary decoding.
 
 The draft's full-attention layer keeps at most `--kvmem-budget` history rows
-and 64 extra rows for temporary writes. `--kvmem-gen-reserve` applies to the
-target model. Startup rejects a prefill batch larger than the full-attention
+and 64 extra rows for temporary writes in each slot. Draft weights and
+temporary compute buffers are shared. Each slot keeps its own draft KV and
+feature ring in VRAM. `--kvmem-gen-reserve` applies to the target model. Startup rejects a prefill batch larger than the full-attention
 draft ring. Position tags keep overwritten draft rows out of attention.
 Drafting resumes after a fresh feature row on checkpoint restore. Acceptance
 and throughput depend on the workload and expert residency.
@@ -40,7 +41,12 @@ and throughput depend on the workload and expert residency.
 ## Inkling 2 Mini
 
 Select **PolyStrata · Inkling 2 Mini** with a Mainline_Support GGUF declaring
-`inkling2_loop`. Run a single text conversation on one Windows CUDA GPU.
+`inkling2_loop`. On one Windows CUDA GPU, text decoding supports up to eight
+active requests and 16 retained conversations, subject to the configured GPU
+and host-memory budgets. Each active slot advances on its own KV and recurrent
+state. Concurrent Inkling skips CUDA Graph replay and advances the slots in turn.
+Workers reporting `inkling2_dspark_batch` can draft and verify independently
+in each active slot. The Monitor reports draft offers and acceptances per request.
 FP16 is the default. FP8 requires an Ampere or newer NVIDIA GPU and Inkling
 Flash Attention. Use the model's own tokenizer and template.
 When the Inkling thinking-token budget expires, the server closes the thinking

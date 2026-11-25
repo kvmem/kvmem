@@ -138,12 +138,15 @@
   const make=(tag,attrs={},text)=>{const el=document.createElement(tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));if(text!==undefined)el.textContent=text;return el;};
   function healthParameters(){
     const parameters={};
-    for(const key of ['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftTokens','DraftModel','KvType','RecallStrategy']){
+    const keys=['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftTokens','DraftModel','KvType','RecallStrategy'];
+    if(root.querySelector('[data-param=Backend]')?.value==='polystrata')keys.push('Concurrency','RetainedSessions');
+    for(const key of keys){
       const el=root.querySelector(`[data-param=${key}]`);
       if(!el||el.disabled)continue;
       if(el.type==='checkbox')parameters[key]=el.checked;
       else if(el.value!=='')parameters[key]=el.dataset.booleanSelect==='true'?el.value==='true':(el.type==='number'||el.dataset.valueType==='number')?Number(el.value):el.value;
     }
+    if(parameters.RetainedSessions!==undefined)parameters.RetainedSessions+=1;
     return parameters;
   }
   function healthBlocks(){return health?.can_start===false;}
@@ -1246,7 +1249,7 @@
     const specModes=info.speculative_capabilities?.[b]||{none:{},...(n?{mtp:{max_draft_tokens:15,adaptive:true,ngram:true,max_concurrency:8,max_devices:8,draft_asset:'embedded'}}:{})};
     const specMode=field(panels[1],p,'SpeculativeMode','草稿方式','Draft method','text',[
       ['none',tr('关闭','Off')],['mtp','MTP'],['dflash2','DFlash2'],...(poly?[['guess','Gemma SharedTarget Guess']]:[])
-    ],poly?['单请求执行可使用 MTP；进入批处理时使用普通生成。','MTP is available in solo execution; batches use ordinary decode.']:['需要模型支持。可用选项取决于后端、并发和显卡数量。','Requires model support. Availability depends on backend, concurrency and GPU count.']);
+    ],poly?['Inkling 2 Mini 可用配套 dSpark GGUF 并发生成，需要支持该功能的 worker。','Inkling 2 Mini can use a matching dSpark GGUF for concurrent requests on a compatible worker.']:['需要模型支持。可用选项取决于后端、并发和显卡数量。','Requires model support. Availability depends on backend, concurrency and GPU count.']);
     for(const option of specMode.options)option.disabled=!specModes[option.value];
     const draftTokens=field(panels[1],p,'DraftTokens','草稿长度 · tokens','Draft length · tokens','number',null,
       ['主模型会验证草稿；分层模式须显式填写当前 worker 支持的长度。Radiance DFlash2 长度须匹配容器训练块。','The target verifies the drafts. Layerwise mode requires an explicit width qualified by the selected worker. Radiance DFlash2 depth must match the trained container block.']);
@@ -1256,7 +1259,7 @@
       ['fixed',tr('固定','Fixed')],['adaptive',tr('自动调整','Adaptive')]
     ],['自动调整仅在后端和所选草稿方式支持时生效。','Adaptive mode applies only when supported by the backend and draft method.']);
     const draftModel=field(panels[1],p,'DraftModel','草稿模型 GGUF','Draft model GGUF','text',null,
-      ['Gemma 4 MTP 和 llama.cpp DFlash2 需要匹配的独立草稿 GGUF；Qwen MTP 和 NInfer 使用内置草稿组件。','Gemma 4 MTP and llama.cpp DFlash2 require a matching draft GGUF; Qwen MTP and NInfer use embedded drafts.'],n||rad);
+      ['Inkling 2 Mini dSpark、Gemma 4 MTP 和 llama.cpp DFlash2 需要配套草稿 GGUF。Qwen MTP 和 NInfer 使用内置草稿。','Inkling 2 Mini dSpark, Gemma 4 MTP and llama.cpp DFlash2 require matching draft GGUFs. Qwen MTP and NInfer use embedded drafts.'],n||rad);
     if(!n&&!rad&&info.native_picker!==false){const row=inputActions(draftModel),choose=make('button',{type:'button',class:'s-button l-secondary'},tr('选择文件','Choose file'));row.append(choose);choose.onclick=async()=>{try{const result=await api('browse-model',{backend:'llamacpp',current_path:draftModel.value});if(result.path){draftModel.value=result.path;draftModel.dispatchEvent(new Event('change',{bubbles:true}));}}catch(e){message(e.message,true);}};}
     if(n)field(panels[1],p,'FastPrefill','启用快速预填充','Enable fast prefill','checkbox',null,['支持 int8、rk8v4、rk4v4、rk4v4-e8、rk2v4-e8；还需模型支持。与 MTP、普通预填充块大小分别设置。','Supports int8, rk8v4, rk4v4, rk4v4-e8 and rk2v4-e8; model support is also required. Independent of MTP and the standard prefill chunk size.'],!n);
     const thinking=field(panels[3],p,'ThinkingMode','默认思考模式','Default thinking mode','text',[[(n||rad)?'default':'on',(n||rad)?tr('跟随模型','Model default'):tr('开启','On')],['off',tr('关闭','Off')]],['需要模型与模板支持。聊天请求中的显式设置优先。','Requires model/template support. Explicit chat settings take priority.']);

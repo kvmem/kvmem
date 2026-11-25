@@ -291,11 +291,18 @@ def main():
         worker_args += ["--kvmem-sessions", str(args.retained_sessions)]
     if args.cache_min_tokens:
         worker_args += ["--kvmem-cache-min-tokens", str(args.cache_min_tokens)]
-    if not args.dry_run and (args.cache_min_tokens or args.kv_type == "fp8"):
+    if not args.dry_run and (args.cache_min_tokens or args.kv_type == "fp8" or args.draft_model):
         from launcher.worker import require_launch_features
-        try: require_launch_features(probe_worker(args.worker, 'polystrata'),
-                                     {**recall_parameters, 'CacheMinTokens': args.cache_min_tokens})
-        except ValueError as error: parser.error(str(error))
+        try:
+            capabilities = probe_worker(args.worker, 'polystrata')
+            require_launch_features(capabilities, {**recall_parameters, 'CacheMinTokens': args.cache_min_tokens})
+            if args.draft_model and capabilities.get('inkling2_dspark') is not True:
+                raise ValueError('This worker does not support KVMem Inkling dSpark')
+            if (args.draft_model and max(args.concurrency, args.retained_sessions) > 1 and
+                    capabilities.get('inkling2_dspark_batch') is not True):
+                raise ValueError('Update the worker to use Inkling dSpark with multiple active or retained sessions')
+        except ValueError as error:
+            parser.error(str(error))
     worker_args += extra
     indices = [0]
     if args.backend == "hip":
@@ -344,6 +351,7 @@ def main():
         if args.vision_device == "gpu":
             config["vision"]["cuda_device"] = indices[0]
     if args.dry_run:
+        config["kvmem_batch_mtp"] = bool(args.draft_model and args.concurrency > 1)
         config["tokenizer_preparation"] = "automatic_from_model_on_start" if automatic_tokenizer else "explicit_export"
         print(json.dumps(config, ensure_ascii=False, indent=2))
         return 0

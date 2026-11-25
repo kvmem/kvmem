@@ -4,7 +4,8 @@
 namespace kvmem {
 // Model-free CLI contract used by the local console before launching a worker.
 inline std::string launch_capabilities(const char* backend, bool inkling2 = false, bool inkling2_fp8 = false,
-                                       bool inkling2_dspark = false) {
+                                       bool inkling2_dspark = false, bool inkling2_multi_session = false,
+                                       bool inkling2_dspark_batch = false) {
     const auto query_limits = std::string(backend) == "ninfer"
         ? "\"legacy_query_replay_revision\":1,\"query_limits\":{\"query_max_tokens\":0,\"query_replay_max_tokens\":0}}"
         : "\"query_limits\":{\"query_max_tokens\":512,\"query_replay_max_tokens\":2048}}";
@@ -19,6 +20,8 @@ inline std::string launch_capabilities(const char* backend, bool inkling2 = fals
                                             : ",\"inkling2_loop\":[\"f16\"]";
         models += "},";
         if (inkling2 && inkling2_dspark) models += "\"inkling2_dspark\":true,";
+        if (inkling2 && inkling2_multi_session) models += "\"inkling2_multi_session\":true,";
+        if (inkling2 && inkling2_dspark_batch) models += "\"inkling2_dspark_batch\":true,";
     }
     return std::string("{\"schema_version\":1,\"backend\":\"") + backend +
         "\"," + blocks + models + "\"cache_admission_revision\":1,\"query_scoring_revision\":2,"
