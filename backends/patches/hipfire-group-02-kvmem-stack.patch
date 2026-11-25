@@ -3772,10 +3772,10 @@ index 70e956368..8d03fd68c 100644
                          gpu.conv1d_silu_split_qknorm(
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 new file mode 100644
-index 000000000..33273cc9e
+index 000000000..63c0001bf
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
-@@ -0,0 +1,1107 @@
+@@ -0,0 +1,1112 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -4428,10 +4428,11 @@ index 000000000..33273cc9e
 +    /// `mtp_head.is_some() && mtp_k > 0` enablement). Under Layerwise this turns
 +    /// the host co-archive into the COMPOSITE `kvmem-main-mtp-pages-v4` record
 +    /// (`n_fa_layers + 1` ordinals, the head aux plane at ordinal `n_fa_layers`)
-+    /// and activates the per-slot head-plane state. Under Legacy it is carried
-+    /// unread (the head keeps the historical full-resident KvCache path), so the
-+    /// default serve stays byte-neutral. The trunk GPU paged arena is UNCHANGED
-+    /// (`n_fa_layers`); only the host record gains the appended aux layer.
++    /// and activates the per-slot head-plane state. Under Legacy the live head
++    /// keeps the full-resident KvCache path, but the parked history image owns
++    /// its full KV and the idle slot's copy is freed; a cold catalog restore
++    /// rebuilds it. The trunk GPU paged arena is UNCHANGED (`n_fa_layers`);
++    /// only the Layerwise host record gains the appended aux layer.
 +    pub mtp_head: bool,
 +}
 +
@@ -4743,6 +4744,10 @@ index 000000000..33273cc9e
 +    interval: usize,
 +    diagnostics: KvMemDiagnostics,
 +    n_fa_layers: usize,
++    /// P1: an independent native MTP head is active. Under Layerwise it is
++    /// paged on the aux plane; under Legacy it is captured in parked history
++    /// images and freed while the slot is idle.
++    mtp_head: bool,
 +    n_heads: usize,
 +    n_kv_heads: usize,
 +    head_dim: usize,
@@ -7137,10 +7142,10 @@ index 000000000..a0637730e
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
 new file mode 100644
-index 000000000..e2085b055
+index 000000000..e61dad5bd
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,627 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -7577,6 +7582,7 @@ index 000000000..e2085b055
 +            interval: plan.interval,
 +            diagnostics: options.diagnostics,
 +            n_fa_layers: geom.n_fa_layers,
++            mtp_head: geom.mtp_head,
 +            n_heads: geom.n_heads,
 +            n_kv_heads: geom.n_kv_heads,
 +            head_dim: geom.head_dim,
@@ -7769,10 +7775,10 @@ index 000000000..e2085b055
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
 new file mode 100644
-index 000000000..3e7f6ecaa
+index 000000000..fa709be9d
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/prefix.rs
-@@ -0,0 +1,646 @@
+@@ -0,0 +1,647 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -8328,6 +8334,7 @@ index 000000000..3e7f6ecaa
 +            layerwise: self.strategy.is_layerwise(),
 +            trunk_managed: true,
 +            mtp_head_managed: self.head_plane_enabled(),
++            mtp_head_history_managed: self.mtp_head,
 +            dn_state_managed: false,
 +            dflash_managed: false,
 +            dn_state_bytes: 0,
@@ -38726,10 +38733,10 @@ index 000000000..0d2cbd401
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 new file mode 100644
-index 000000000..abc38a038
+index 000000000..e309a7b88
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-@@ -0,0 +1,3711 @@
+@@ -0,0 +1,3739 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -39429,6 +39436,15 @@ index 000000000..abc38a038
 +            eprintln!("[kvmem-legacy] HistoryPark slot={} draft_freed=1", slot.0);
 +        }
 +    }
++    // P1: same ownership rule for the MTP head cache. The parked image holds
++    // the full head KV; the idle slot's private copy is redundant. A cold
++    // catalog restore allocates a fresh empty cache and reinstalls the image.
++    if run_kind == SpecKind::Mtp {
++        if let Some(state) = rig.model.mtp_states[slot.0].take() {
++            state.free_gpu(&mut rig.gpu);
++            eprintln!("[kvmem-legacy] HistoryPark slot={} mtp_freed=1", slot.0);
++        }
++    }
 +    Ok(Some(publication.id))
 +}
 +
@@ -39487,13 +39503,37 @@ index 000000000..abc38a038
 +            }
 +        } else {
 +            match (&source.draft, kind) {
-+                (LegacyDraftImage::Mtp(image), SpecKind::Mtp) => image.restore(
-+                    &mut rig.gpu,
-+                    rig.model.mtp_states[slot]
-+                        .as_mut()
-+                        .ok_or("kvmem: missing destination MTP state")?,
-+                    source.store.frontier as usize,
-+                )?,
++                (LegacyDraftImage::Mtp(image), SpecKind::Mtp) => {
++                    // P1: a parked MTP image owns the head KV; the idle slot's
++                    // private cache was freed at park. Allocate the empty
++                    // destination the same way the first prefill chunk would,
++                    // then let the image reinstate it.
++                    if rig.model.mtp_states[slot].is_none() {
++                        let head = rig
++                            .model
++                            .mtp_head
++                            .as_ref()
++                            .ok_or("kvmem: missing destination MTP head")?;
++                        let st = crate::mtp_spec::MtpSpecState::new_for_components(
++                            &mut rig.gpu,
++                            &rig.model.config,
++                            &rig.model.dn_states[slot],
++                            head,
++                            rig.model.mtp_k,
++                            crate::mtp_head::MtpKvMode::Q8,
++                            None,
++                        )
++                        .map_err(|e| format!("kvmem restore MTP state alloc: {e}"))?;
++                        rig.model.mtp_states[slot] = Some(st);
++                    }
++                    image.restore(
++                        &mut rig.gpu,
++                        rig.model.mtp_states[slot]
++                            .as_mut()
++                            .ok_or("kvmem: missing destination MTP state")?,
++                        source.store.frontier as usize,
++                    )?
++                }
 +                (LegacyDraftImage::Dflash(image), SpecKind::Dflash) => {
 +                    // Cold admission frees the previous occupant's draft state;
 +                    // allocate the empty destination the same way the first
@@ -42177,20 +42217,11 @@ index 000000000..abc38a038
 +        }
 +        config
 +    });
-+    // P1 ownership contract: the only KVMem path that pages the MTP head KV is
-+    // Layerwise (the composite aux plane). Legacy keeps the head full-resident
-+    // in its private cache, so admitting MTP there would silently break the
-+    // "all KV owned" contract. Refuse instead of pretending.
-+    let mtp_spec_active =
-+        mtp_head && hipfire_config::mtp_mode_admits(cfg.mtp_mode, crate::MTP_MEASURED_AR_FLOOR);
-+    if mtp_spec_active && legacy_config.is_some() {
-+        return Err(
-+            "kvmem: MTP + KVMem requires the Layerwise recall strategy; Legacy keeps the \
-+             MTP head KV outside KVMem. Set HIPFIRE_KVMEM_RECALL_STRATEGY=layerwise or run \
-+             with --spec off."
-+                .to_string(),
-+        );
-+    }
++    // P1 ownership: Legacy captures the MTP head KV into the parked history
++    // image and frees the live cache at park; a cold catalog restore rebuilds
++    // the private cache. Layerwise additionally pages it through the composite
++    // aux plane while live. Both strategies therefore keep the head history in
++    // KVMem; only the live residency differs.
 +    if let Some(config) = legacy_config.as_ref() {
 +        eprintln!(
 +            "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
@@ -42231,8 +42262,12 @@ index 000000000..abc38a038
 +    } else {
 +        "layerwise"
 +    };
-+    let head_owner = if legacy_config.is_none() && mtp_head {
-+        "aux-plane"
++    let head_owner = if mtp_head {
++        if legacy_config.is_none() {
++            "aux-plane"
++        } else {
++            "park-image"
++        }
 +    } else {
 +        "private-resident"
 +    };
@@ -45154,10 +45189,10 @@ index d6cff7272..69889b0ec 100644
              let body = {
                  let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
 diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
-index 399bcc944..03de93c1f 100644
+index 399bcc944..0de488b78 100644
 --- a/crates/hipfire-cli/src/serve/metrics.rs
 +++ b/crates/hipfire-cli/src/serve/metrics.rs
-@@ -539,6 +539,328 @@ impl Metrics {
+@@ -539,6 +539,334 @@ impl Metrics {
                  "Prompt tokens reused from the multi-slot cross-session prefix cache.",
                  s.reused_tokens as u64,
              );
@@ -45190,6 +45225,12 @@ index 399bcc944..03de93c1f 100644
 +                    "hipfire_kvmem_mtp_head_managed",
 +                    "1 when the MTP head KV lives on the KVMem auxiliary plane.",
 +                    flag(s.kvmem.mtp_head_managed),
++                );
++                gauge(
++                    &mut out,
++                    "hipfire_kvmem_mtp_head_history_managed",
++                    "1 when the MTP head KV is captured in KVMem history images (Legacy park image or Layerwise aux plane).",
++                    flag(s.kvmem.mtp_head_history_managed),
 +                );
 +                gauge(
 +                    &mut out,
@@ -45486,7 +45527,7 @@ index 399bcc944..03de93c1f 100644
          }
  
          // Multi-slot swap tier, from the last daemon `done` (or the CLI seed
-@@ -943,6 +1265,71 @@ mod tests {
+@@ -943,6 +1271,71 @@ mod tests {
          ] {
              assert!(out.contains(sample), "{sample}: {out}");
          }
@@ -45558,7 +45599,7 @@ index 399bcc944..03de93c1f 100644
          // Standard route: no snapshot, no series (not zeros).
          let standard = m.render(&ServeMeta::new("t".to_owned()), 0, 16);
          for name in [
-@@ -950,6 +1337,7 @@ mod tests {
+@@ -950,6 +1343,7 @@ mod tests {
              "hipfire_slots_",
              "hipfire_evictions",
              "hipfire_prefix_",
@@ -45566,7 +45607,7 @@ index 399bcc944..03de93c1f 100644
          ] {
              assert!(!standard.contains(name), "{name}: {standard}");
          }
-@@ -966,6 +1354,45 @@ mod tests {
+@@ -966,6 +1360,45 @@ mod tests {
          assert!(!out.contains("hipfire_kv_pages"), "{out}");
      }
  
@@ -63047,7 +63088,7 @@ index d6575b8ad..2d4d8a11b 100644
              },
          ];
 diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
-index 2059215c3..a6290ff60 100644
+index 2059215c3..1b829085c 100644
 --- a/crates/hipfire-runtime/src/serve/mod.rs
 +++ b/crates/hipfire-runtime/src/serve/mod.rs
 @@ -49,6 +49,34 @@ pub struct VisualData {
@@ -63100,7 +63141,7 @@ index 2059215c3..a6290ff60 100644
      /// Hashes of the conversation's user turns, in order. Identity for
      /// continuation matching — see `Session::convo`.
      pub convo: Vec<u64>,
-@@ -203,6 +239,160 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
+@@ -203,6 +239,164 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
          .map_err(|_| "client receiver dropped".to_string())
  }
  
@@ -63120,6 +63161,10 @@ index 2059215c3..a6290ff60 100644
 +    /// "what did KVMem take over?" (they are not inferred from bytes).
 +    pub trunk_managed: bool,
 +    pub mtp_head_managed: bool,
++    /// P1: the MTP head KV is captured in KVMem history images. Layerwise
++    /// additionally pages it live on the aux plane (`mtp_head_managed`);
++    /// Legacy keeps the live cache private but parks/restores its full image.
++    pub mtp_head_history_managed: bool,
 +    pub dn_state_managed: bool,
 +    pub dflash_managed: bool,
 +    /// Live per-slot DeltaNet recurrent-state bytes and resident slots. These
@@ -63261,7 +63306,7 @@ index 2059215c3..a6290ff60 100644
  /// Serialized as the `engine_stats` object of every multi-slot `done` event;
  /// the serve gateway exports it on `/metrics`.
  #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-@@ -241,6 +431,12 @@ pub struct EngineStats {
+@@ -241,6 +435,12 @@ pub struct EngineStats {
      pub swap_disk_used: u64,
      pub swap_host_budget: u64,
      pub swap_disk_budget: u64,
@@ -63274,7 +63319,7 @@ index 2059215c3..a6290ff60 100644
  }
  
  impl EngineStats {
-@@ -275,6 +471,13 @@ impl EngineStats {
+@@ -275,6 +475,13 @@ impl EngineStats {
          self.active_slots = self.active_slots.saturating_sub(1);
      }
  
@@ -63288,7 +63333,7 @@ index 2059215c3..a6290ff60 100644
      /// Refresh the swap-tier snapshot from the live manager. Cheap: reads
      /// counters and three integers, no allocation.
      pub fn note_swap(&mut self, swap: &crate::swap::SwapManager) {
-@@ -296,9 +499,9 @@ impl EngineStats {
+@@ -296,9 +503,9 @@ impl EngineStats {
  // single arch-erased surface `handle_generate` drives; the concrete engine
  // (e.g. `hipfire_arch_qwen35::serve_engine::SlotEngine`) implements it.
  //
@@ -63301,7 +63346,7 @@ index 2059215c3..a6290ff60 100644
  // `hipfire_arch_qwen35::serve_engine::EngineConfig` field-for-field; keep
  // them in lock-step (the qwen35 carrier maps them 1:1).
  
-@@ -306,9 +509,12 @@ impl EngineStats {
+@@ -306,9 +513,12 @@ impl EngineStats {
  /// the daemon from serve.* config keys + the load request, then handed to
  /// `Carrier::spawn_slot_engine`, which adapts it into the concrete engine's
  /// own config. Field-for-field with the qwen35 `EngineConfig`; a second
@@ -63315,7 +63360,7 @@ index 2059215c3..a6290ff60 100644
      pub model_path: PathBuf,
      pub n_slots: usize,
      /// Per-slot generation cap (tokens) used by the paged-KV budget.
-@@ -468,6 +674,14 @@ pub trait SlotEngineHandle: Send + Sync {
+@@ -468,6 +678,14 @@ pub trait SlotEngineHandle: Send + Sync {
      fn submit(&self, req: SubmitRequest) -> Result<(), String>;
      /// Cancel a QUEUED request by submitter tag. Idempotent; tag 0 is a no-op.
      fn cancel_waiting(&self, request_tag: u64);
