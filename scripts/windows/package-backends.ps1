@@ -188,6 +188,22 @@ docs/ninfer-upstream-63428ac2-integration.md. Models are not downloaded automati
 Copy-Item -LiteralPath (Join-Path $CudaPath 'EULA.txt') -Destination (Join-Path $OutputDir 'licenses/CUDA-EULA.txt')
 Copy-Item -LiteralPath (Join-Path $LlamaSource 'LICENSE') -Destination (Join-Path $OutputDir 'licenses/llama-MIT.txt')
 Copy-Item -LiteralPath (Join-Path $source 'README.md') -Destination (Join-Path $OutputDir 'licenses/KVMem-README.md')
+$projectLicense = Join-Path $source 'LICENSE'
+if (Test-Path -LiteralPath $projectLicense -PathType Leaf) {
+    Copy-Item -LiteralPath $projectLicense -Destination (Join-Path $OutputDir 'licenses/KVMem-Apache-2.0.txt')
+}
+if ($Backend -eq 'all') {
+    $nariqLicenses = @{
+        'libtrellis-Apache-2.0.txt' = 'ggml/src/ggml-cuda/libtrellis/LICENSE'
+        'ExLlamaV3-MIT.txt' = 'licenses/LICENSE-exllamav3'
+    }
+    foreach ($license in $nariqLicenses.GetEnumerator()) {
+        $licenseFile = Join-Path $LlamaSource $license.Value
+        if (Test-Path -LiteralPath $licenseFile -PathType Leaf) {
+            Copy-Item -LiteralPath $licenseFile -Destination (Join-Path $OutputDir "licenses/$($license.Key)")
+        }
+    }
+}
 Copy-Item -LiteralPath (Join-Path $NinferSource 'LICENSE') -Destination (Join-Path $OutputDir 'licenses/ninfer-LICENSE')
 foreach ($tree in @(@('ninfer-third-party', (Join-Path $NinferSource 'third_party')),
                    @('llama-vendor', (Join-Path $LlamaSource 'vendor')))) {
