@@ -247,7 +247,7 @@ index 000000000..242623988
 +    }
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
-index 5f1cc8b61..d293e2baf 100644
+index 5f1cc8b61..ac4699990 100644
 --- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
 @@ -279,6 +279,19 @@ impl KvMemCtl {
@@ -391,7 +391,7 @@ index 5f1cc8b61..d293e2baf 100644
              );
          }
          mtp_auxiliary_capacity(window_tokens, KV_BLOCK_TOKENS)
-@@ -536,10 +616,16 @@ impl KvMemCtl {
+@@ -536,10 +616,19 @@ impl KvMemCtl {
      /// non-page-aligned / zero window fails closed to `None` rather than bounding
      /// to a bad geometry.
      pub fn head_bounded_capacity(&self) -> Option<usize> {
@@ -401,15 +401,18 @@ index 5f1cc8b61..d293e2baf 100644
          }
          let window = self.budget_blocks().checked_mul(KV_BLOCK_TOKENS)?;
 +        if self.head_live {
-+            // Legacy's contiguous cache keeps two trunk windows: the live
-+            // window plus one window of slack for the draft/verify burst that
-+            // may run before the next block-aligned slide.
-+            return window.checked_mul(2);
++            // P1b: the contiguous cache is only the staging source for the
++            // archive, not a second working set. Every HEAD_LIVE write also
++            // lands in the paged arena, and `head_prefill_shift` is computed
++            // from the span end, so compact rows never exceed the window plus
++            // one native block. Bound it exactly like the Layerwise head pool
++            // instead of keeping a second window of slack.
++            return self.head_pool_capacity(window).ok();
 +        }
          self.head_pool_capacity(window).ok()
      }
  
-@@ -552,11 +638,23 @@ impl KvMemCtl {
+@@ -552,11 +641,23 @@ impl KvMemCtl {
      /// per-chunk archive staging under Layerwise (the G4 carrier is the attention
      /// source), so each chunk re-stages independently — no slide.
      pub fn head_prefill_shift(&self, frontier: usize) -> usize {
@@ -435,7 +438,7 @@ index 5f1cc8b61..d293e2baf 100644
      }
  
      /// P4.1② G3c: build the MTP head's bounded composite-slot pool geometry (①
-@@ -569,9 +667,10 @@ impl KvMemCtl {
+@@ -569,9 +670,10 @@ impl KvMemCtl {
      /// replacing the historical full-resident head `KvCache`. Fail-closed off the
      /// Layerwise+MTP path; Legacy / AR-only allocate nothing (byte-neutral).
      pub fn head_pool(&self, window_tokens: usize) -> Result<LayerwisePagePool, String> {
@@ -448,7 +451,7 @@ index 5f1cc8b61..d293e2baf 100644
              );
          }
          mtp_head_pool(
-@@ -800,9 +899,10 @@ impl KvMemCtl {
+@@ -800,9 +902,10 @@ impl KvMemCtl {
      /// head map, or on a map that does not reconstruct `end` — Legacy / AR-only
      /// never publish a head append (byte-neutral).
      pub fn accept_head_append(&mut self, slot: usize, begin: u64, end: u64) -> Result<(), String> {
@@ -8327,10 +8330,10 @@ index 33ae973c0..64fa01407 100644
      #[cfg(not(feature = "kvmem"))]
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_model.rs b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
 new file mode 100644
-index 000000000..c61571570
+index 000000000..12fcca311
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
-@@ -0,0 +1,1331 @@
+@@ -0,0 +1,1336 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -8882,7 +8885,12 @@ index 000000000..c61571570
 +            if self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled()) {
 +                let (kv_mode, window_pages) = {
 +                    let ctl = self.kvmem.as_ref().unwrap();
-+                    let window = ctl.budget_blocks().saturating_mul(2).saturating_add(1);
++                    // P1b: one trunk window plus the sink and one spare page.
++                    // A 1024-row prefill chunk spans at most eight pages, so
++                    // the chunk's start page stays retained while `stage_rows`
++                    // remaps the window to the chunk end; the spare page
++                    // absorbs a draft/verify span that crosses the front.
++                    let window = ctl.budget_blocks().saturating_add(2);
 +                    (
 +                        ctl.kv_mode(),
 +                        u32::try_from(window)
@@ -9197,10 +9205,10 @@ index 000000000..c61571570
 +            if self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled()) {
 +                let (kv_mode, window_pages) = {
 +                    let ctl = self.kvmem.as_ref().unwrap();
-+                    // One spare page absorbs a verify span that crosses the
-+                    // window front, so its first row's destination page is
-+                    // still resident when the fill remaps the frontier.
-+                    let window = ctl.budget_blocks().saturating_mul(2).saturating_add(1);
++                    // One trunk window plus the sink and one spare page; see
++                    // the prefill plane above. The spare absorbs a verify span
++                    // crossing the window front.
++                    let window = ctl.budget_blocks().saturating_add(2);
 +                    (
 +                        ctl.kv_mode(),
 +                        u32::try_from(window)
