@@ -80,6 +80,14 @@
   }
   // NInfer's operational log reports engine throughput for the preceding interval.
   // The request's decode_tps is cumulative and must remain the request mean.
+  function intervalRate(fields, phase) {
+    const field = fields.find((value) => value.startsWith(`${phase} `));
+    if (field === undefined) return 0; // The worker omits phases with no tokens.
+    const match = field.match(/^\w+ ([\d.]+)([kMGT]?) tok\/s \([\d,]+ tok\)$/);
+    if (!match) return null;
+    const rate = Number(match[1]) * 1000 ** ['', 'k', 'M', 'G', 'T'].indexOf(match[2]);
+    return Number.isFinite(rate) ? rate : null;
+  }
   function parseNinferThroughput(log) {
     if (!log?.running || log.backend !== 'ninfer' || typeof log.text !== 'string') return null;
     let sample = null;
@@ -89,21 +97,23 @@
       if (!match) continue;
       const at = new Date(match[1].replace(' ', 'T')).getTime();
       const seconds = Number(match[2]) / (match[3] === 'ms' ? 1000 : 1);
-      const decode = match[4].match(/(?:^| \| )decode ([\d.]+)([kMGT]?) tok\/s \([\d,]+ tok\)(?: \| |$)/);
-      if (!/(?:^| \| )running \d+/.test(match[4])) continue;
-      if (!decode && /(?:^| \| )decode /.test(match[4])) { sample = null; continue; }
-      const rate = decode ? Number(decode[1]) * 1000 ** ['', 'k', 'M', 'G', 'T'].indexOf(decode[2]) : 0;
-      if (Number.isFinite(at) && Number.isFinite(rate) && rate >= 0 && seconds > 0 && at >= log.started_at)
-        sample = {at, seconds, rate};
+      const fields = match[4].split(' | ');
+      if (!fields.some((field) => /^running \d+/.test(field))) continue;
+      if (at >= log.started_at && Number.isFinite(seconds) && seconds > 0) {
+        const prefillRate = intervalRate(fields, 'prefill');
+        const rate = intervalRate(fields, 'decode');
+        sample = prefillRate === null && rate === null ? null : {at, seconds, rate, prefillRate};
+      }
     }
     return sample;
   }
-  function ninferLiveSpeed(snapshot, row, active, sample) {
-    if (!active || row?.status !== 'generating' || !sample) return null;
+  function freshNinferThroughput(snapshot, sample) {
+    if (!sample) return null;
     const age = snapshot.sampled_at_ms - sample.at;
-    // Exclude old sessions/requests and stale reports, including after log failure.
-    return age >= -1000 && age <= sample.seconds * 2000 + 2000 && sample.at >= row.started_at_ms
-      ? sample.rate : null;
+    return age >= -1000 && age <= sample.seconds * 2000 + 2000 ? sample : null;
+  }
+  function ninferLiveSpeed(row, active, sample) {
+    return active && row?.status === 'generating' && sample && sample.at >= row.started_at_ms ? sample.rate : null;
   }
   let throughputLog = null;
   function requestLiveSpeed(snapshot, row, active) {
@@ -946,16 +956,26 @@
         String(Math.min(100, ratio(r.generated_tokens, r.limit))),
       );
     else meter.removeAttribute("aria-valuenow");
-    const nativeThroughput = throughputLog?.sample;
+    const nativeThroughput = freshNinferThroughput(state, throughputLog?.sample);
+    const engineThroughput = $("[data-engine-throughput]");
+    if (engineThroughput) {
+      engineThroughput.hidden = state.backend !== "ninfer";
+      text("engine-throughput-window", nativeThroughput
+        ? t("{0}s 统计窗口", fmt(nativeThroughput.seconds, nativeThroughput.seconds < 1 ? 2 : 1))
+        : t(state.active.length ? "未采集" : "空闲"));
+      text("engine-prefill-speed", fmt(nativeThroughput?.prefillRate, 1));
+      text("engine-decode-speed", fmt(nativeThroughput?.rate, 1));
+    }
     const requestSpeed = requestLiveSpeed(state, r, liveRequest);
+    const engineDecode = state.backend === "ninfer" ? ninferLiveSpeed(r, liveRequest, nativeThroughput) : null;
     const realtimeSpeed = state.backend === "ninfer"
-      ? requestSpeed ?? ninferLiveSpeed(state, r, liveRequest, nativeThroughput)
+      ? requestSpeed ?? engineDecode
       : ["llamacpp","radiance"].includes(state.backend) ? requestLiveSpeed(state, r, liveRequest)
       : liveRequest && state.backend === "polystrata" ? r?.decode_tps : null;
     text("decode", fmt(realtimeSpeed, 1));
     text("decode-label", state.backend === "ninfer" && requestSpeed !== null
       ? t("实时 · {0}s", fmt(r.decode_tps_window_ms / 1000, 0))
-      : state.backend === "ninfer" && nativeThroughput
+      : engineDecode !== null
       ? t("实时 · {0}s", fmt(nativeThroughput.seconds, nativeThroughput.seconds < 1 ? 2 : 0))
       : ["llamacpp","radiance"].includes(state.backend) && number(r?.decode_tps_window_ms)
         ? t("实时 · {0}s", fmt(r.decode_tps_window_ms / 1000, 1)) : t("实时速度"));
