@@ -1436,6 +1436,11 @@
     let timer;
     try{
       const configuration=launchData(),key=JSON.stringify(configuration);
+      const {Prefill:prefill,Reserve:reserve}=configuration.parameters;
+      if(Number.isFinite(prefill)&&Number.isFinite(reserve)&&prefill>reserve)throw Error(tr(
+        `Prefill 不能超过 Gen Reserve。当前 Prefill 为 ${prefill.toLocaleString()}，Gen Reserve 为 ${reserve.toLocaleString()}。请先修改其中一项，自动调整只修改 Budget。`,
+        `Prefill (${prefill.toLocaleString()}) cannot exceed Gen Reserve (${reserve.toLocaleString()}). Adjust either setting first. Auto adjustment changes Budget only.`
+      ));
       busy=true;budgetPending=true;budgetAdjustment={started:Date.now()};applyConfigurationLock();renderMemoryRecovery();renderBudgetAdjustment();
       timer=setInterval(renderBudgetAdjustment,1000);
       const result=await api('adjust-budget',configuration,240000);

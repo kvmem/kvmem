@@ -70,7 +70,8 @@ void PayloadLayout::validate() const {
             fail(MemoryErrorCode::InvalidPlan, "a payload shard has inconsistent head ranges");
         switch (p.kind) {
         case PayloadPlaneKind::Key: case PayloadPlaneKind::Value:
-        case PayloadPlaneKind::KeyScale: case PayloadPlaneKind::ValueScale: break;
+        case PayloadPlaneKind::KeyScale: case PayloadPlaneKind::ValueScale:
+        case PayloadPlaneKind::RawKey: case PayloadPlaneKind::KeyPosition: break;
         case PayloadPlaneKind::PackedKeyValue:
             if (p.token_stride)
                 fail(MemoryErrorCode::InvalidPlan, "packed KV pages require opaque token addressing");

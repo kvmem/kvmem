@@ -1,0 +1,630 @@
+diff --git a/src/models/qwen3_5/frontend/chat_template.cpp b/src/models/qwen3_5/frontend/chat_template.cpp
+index f5db004cf8dc47b3736dad5eafab49fc94c88210..facf867d75d5d70f0d00adc85b002db1b62ffbc9 100644
+--- a/src/models/qwen3_5/frontend/chat_template.cpp
++++ b/src/models/qwen3_5/frontend/chat_template.cpp
+@@ -7,6 +7,7 @@
+ #include "models/qwen3_5/frontend/media_cache.h"
+ #include "models/qwen3_5/frontend/prompt_layout.h"
+ #include "text/unicode.h"
++#include "runtime/generated_history.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -303,6 +304,11 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
+         // Inkling's template has no thinking switch: its effort level 0 is the model's own.
+         context["reasoning_effort"] = "none";
+     }
++    if (history::preparing) {
++        const auto eos = special_tokens_.find("eos_token");
++        history::preparing->template_eos = eos != special_tokens_.end() && eos->is_string()
++            ? std::string_view(eos->get_ref<const std::string&>()) : std::string_view{};
++    }
+     if (continuation) {
+         const auto& final = messages.back();
+         if (final.role != ChatRole::Assistant || final.has_media() ||
+diff --git a/src/models/qwen3_5/frontend/processor.cpp b/src/models/qwen3_5/frontend/processor.cpp
+index a34c9981436246379a5c8445114e4a15b86fe94c..c582c21a2579c59155d30d9e48c2c8bab6dfe6d9 100644
+--- a/src/models/qwen3_5/frontend/processor.cpp
++++ b/src/models/qwen3_5/frontend/processor.cpp
+@@ -3,6 +3,7 @@
+ #include "media/decode/decode.h"
+ #include "models/qwen3_5/frontend/digest.h"
+ #include "models/qwen3_5/frontend/media_cache.h"
++#include "runtime/generated_history.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -13,6 +14,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <iomanip>
+ #include <iterator>
+ #include <limits>
+@@ -1533,6 +1535,84 @@ std::uint32_t gemma_budget_at_most(std::uint64_t bound) {
+     return out;
+ }
+ 
++static std::optional<BoundaryEncodedText> encode_generated_prefix(
++    const Tokenizer& tokenizer, const RenderedChat& rendered, const std::vector<std::size_t>& marks,
++    std::size_t maximum, const kvmem::GeneratedHistory::Prefix& prefix) {
++    const auto& ids = prefix.ids;
++    const std::size_t seam = prefix.text.size();
++    // Frontend preparation supplies context capacity + 1; equality with this
++    // truncation sentinel must fall back so canonical encoding can still fit.
++    if (ids.empty() || ids.size() >= maximum || seam >= rendered.text.size() ||
++        !rendered.text.starts_with(prefix.text)) { return {}; }
++    const auto& stop_ids = tokenizer.default_stop_token_ids();
++    const auto is_stop = [&](int id) {
++        return tokenizer.is_special_token(id) &&
++            (std::find(stop_ids.begin(), stop_ids.end(), id) != stop_ids.end() ||
++             (!history::preparing->template_eos.empty() &&
++              tokenizer.decode_token_bytes(id) == history::preparing->template_eos));
++    };
++    // NInfer commits the sampled stop token. Other completions (e.g. an output
++    // limit) end immediately before the closure inserted by the next template.
++    const bool has_closure = is_stop(ids.back());
++    std::vector<text::ByteSpan> literal;
++    for (auto span : rendered.literal_spans) {
++        if (span.end > seam) {
++            literal.push_back({std::max(seam, span.begin) - seam, span.end - seam});
++        }
++    }
++    const std::string_view suffix = std::string_view(rendered.text).substr(seam);
++    std::vector<std::size_t> suffix_marks;
++    for (auto mark : marks) {
++        if (mark > seam) { suffix_marks.push_back(mark - seam); }
++    }
++    auto tail = tokenizer.encode_with_boundaries(suffix, suffix_marks,
++                                                 {.max_tokens = maximum - ids.size()}, literal);
++    if (tail.input_ids.empty() || tail.input_ids.size() >= maximum - ids.size()) { return {}; }
++    const int closure = has_closure ? ids.back() : tail.input_ids.front();
++    if (std::getenv("KVMEM_TRACE_GENERATED_HISTORY")) {
++        std::fprintf(stderr,"KVMEM_HISTORY seam_bytes=%zu prefix_rows=%zu closure=%d eog=%d\n",
++                     seam, ids.size(), closure, int(is_stop(closure)));
++    }
++    if (!is_stop(closure)) { return {}; }
++    const auto piece = tokenizer.decode_token_bytes(closure);
++    if (piece.empty() || (has_closure && piece.size() > seam)) { return {}; }
++    const auto start = has_closure ? seam - piece.size() : seam;
++    if (text::overlaps(rendered.literal_spans, start, start + piece.size())) { return {}; }
++
++    BoundaryEncodedText out;
++    out.input_ids = ids;
++    out.input_ids.insert(out.input_ids.end(), tail.input_ids.begin(), tail.input_ids.end());
++    // Decode the accepted rows to map every native byte frontier, including
++    // Query, rewrite, message and cache boundaries. No prefix BPE is involved.
++    std::vector<std::size_t> ends{0};
++    ends.reserve(ids.size() + 1);
++    std::size_t offset = 0;
++    for (std::size_t i = 0; i < out.input_ids.size(); ++i) {
++        const auto bytes = tokenizer.decode_token_bytes(out.input_ids[i]);
++        if (bytes.empty() || rendered.text.compare(offset, bytes.size(), bytes) != 0) { return {}; }
++        offset += bytes.size();
++        if (i < ids.size()) { ends.push_back(offset); }
++    }
++    if (ends.back() != seam || offset != rendered.text.size()) { return {}; }
++    std::size_t next_suffix = 0;
++    for (auto mark : marks) {
++        TokenBoundaryResult boundary;
++        if (mark > seam) {
++            boundary = tail.boundaries.at(next_suffix++);
++            if (boundary.exact_frontier) { *boundary.exact_frontier += ids.size(); }
++            boundary.stable_frontier += ids.size();
++        } else {
++            auto pos = std::lower_bound(ends.begin(), ends.end(), mark);
++            if (pos != ends.end() && *pos == mark) { boundary.exact_frontier = pos - ends.begin(); }
++            // Only exact_frontier is consumed by encode_rendered_chat. Previously accepted
++            // rows before or at this marker already have fixed token boundaries.
++            boundary.stable_frontier = std::upper_bound(ends.begin(), ends.end(), mark) - ends.begin() - 1;
++        }
++        out.boundaries.push_back(boundary);
++    }
++    return out;
++}
++
+ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+                                  std::size_t maximum_tokens, MediaPads pads) {
+     if (!rendered.media_placeholders.empty()) {
+@@ -1564,9 +1644,21 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
+         byte_boundaries.push_back(rendered.memory_query->begin);
+         byte_boundaries.push_back(rendered.memory_query->end);
+     }
+-    BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
+-        rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
+-        rendered.literal_spans);
++    std::optional<BoundaryEncodedText> reused;
++    auto* work = history::preparing;
++    if (work && rendered.media_token_runs.empty()) {
++        for (const auto& prefix : work->candidates) {
++            reused = encode_generated_prefix(tokenizer, rendered, byte_boundaries,
++                                             std::min(maximum_tokens, work->capacity_sentinel), *prefix);
++            if (reused) {
++                work->reused = prefix->ids.size();
++                break;
++            }
++        }
++        work->prompt.text = rendered.text;
++    }
++    BoundaryEncodedText tokenized = reused ? std::move(*reused) : tokenizer.encode_with_boundaries(
++        rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens}, rendered.literal_spans);
+     encoded.input_ids = std::move(tokenized.input_ids);
+     if (encoded.input_ids.size() == maximum_tokens) { return encoded; }
+     if (rendered.memory_query) {
+diff --git a/src/runtime/generated_history.h b/src/runtime/generated_history.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..383e455b9822e48e78d776726537ad29fe0c498d
+--- /dev/null
++++ b/src/runtime/generated_history.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include "kvmem/generated_history.hpp"
++#include <string_view>
++
++namespace ninfer::history {
++
++// Engine::prepare calls its frontend synchronously. This narrow scope keeps request
++// evidence out of engine state and restores the caller's scope on exceptions.
++struct Preparation {
++    std::vector<std::shared_ptr<const kvmem::GeneratedHistory::Prefix>> candidates;
++    kvmem::GeneratedHistory::Prefix prompt;
++    std::size_t reused = 0;
++    std::string_view template_eos;
++    std::size_t capacity_sentinel = SIZE_MAX;
++};
++
++inline thread_local Preparation* preparing = nullptr;
++
++class Scope {
++public:
++    explicit Scope(Preparation* current) : prior_(std::exchange(preparing, current)) {}
++    ~Scope() { preparing = prior_; }
++    Scope(const Scope&) = delete;
++    Scope& operator=(const Scope&) = delete;
++private:
++    Preparation* prior_;
++};
++} // namespace ninfer::history
+diff --git a/src/serve/anthropic_messages_request.cpp b/src/serve/anthropic_messages_request.cpp
+index bc8de6c67c27178dfa7118ac1cb1f44019dcb091..99cc724a307f5093db4c842946e4c3385eda2ab6 100644
+--- a/src/serve/anthropic_messages_request.cpp
++++ b/src/serve/anthropic_messages_request.cpp
+@@ -1044,6 +1044,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
+ }
+ 
+ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
++    request.reset_generated_history = optional_bool(body, "cache_reset", false);
+     lower_tools(body, request);
+     parse_system(body, request);
+     parse_messages(body, request);
+diff --git a/src/serve/generation_service.cpp b/src/serve/generation_service.cpp
+index ab344a21de5bb8408694fb013cfb2742e45526c6..087f4003206138a8d5b79b9b6632bc3060199902 100644
+--- a/src/serve/generation_service.cpp
++++ b/src/serve/generation_service.cpp
+@@ -2,6 +2,7 @@
+ #include "serve/openai_chat.h"
+ #include "kvmem/monitor.hpp"
+ #include "kvmem/monitor_rate.hpp"
++#include "runtime/generated_history.h"
+ 
+ #include "product/media_acquire/acquire.h"
+ #include "serve/console_log.h"
+@@ -11,7 +12,10 @@
+ #include <cuda_runtime_api.h>
+ 
+ #include <algorithm>
++#include <bit>
+ #include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstddef>
+ #include <iterator>
+ #include <mutex>
+@@ -19,6 +23,7 @@
+ #include <string>
+ #include <string_view>
+ #include <utility>
++#include <unordered_map>
+ 
+ namespace ninfer::serve {
+ 
+@@ -29,6 +34,7 @@ struct RequestCapacity {
+     std::size_t active = 0;
+     std::size_t peak   = 0;
+     const std::size_t maximum;
++    kvmem::GeneratedHistory history;
+ };
+ 
+ struct RequestLifetime {
+@@ -45,8 +51,117 @@ struct RequestLifetime {
+     std::shared_ptr<RequestCapacity> capacity;
+     std::chrono::steady_clock::time_point started;
+     std::chrono::steady_clock::time_point deadline;
++    std::string history_key;
++    kvmem::GeneratedHistory::Prefix history_prompt;
++    std::uint32_t history_rows = 0;
+ };
+ 
++// Use length-delimited fields so arbitrary bytes or separators in text cannot
++// create a second interpretation. Protocol-generated call IDs are references:
++// identify their targets by declaration order after the wire graph is validated.
++static void history_field(std::string& key, std::string_view value) {
++    key += std::to_string(value.size());
++    key += '#';
++    key.append(value);
++}
++
++using CallNumbers = std::unordered_map<std::string, std::size_t>;
++static void history_turn(std::string& key, const ChatTurn& turn, CallNumbers& calls,
++                         std::size_t& next_call) {
++    history_field(key, std::to_string(static_cast<int>(turn.role)));
++    history_field(key, turn.reasoning_content);
++    const std::size_t count = turn.content.size() == 1 && turn.content.front().text.empty()
++                                  ? 0 : turn.content.size();
++    history_field(key, std::to_string(count));
++    for (std::size_t i = 0; i < count; ++i) { history_field(key, turn.content[i].text); }
++    history_field(key, std::to_string(turn.tool_calls.size()));
++    for (const auto& call : turn.tool_calls) {
++        history_field(key, call.name);
++        history_field(key, call.arguments_json);
++        calls[call.id] = next_call++;
++    }
++    auto target = calls.find(turn.tool_call_id);
++    history_field(key, turn.tool_call_id.empty() ? "" : target == calls.end()
++                          ? "id:" + turn.tool_call_id : "call:" + std::to_string(target->second));
++    history_field(key, turn.tool_result_name.value_or(""));
++    history_field(key, turn.tool_result_is_error ? "1" : "0");
++}
++
++static history::Preparation prepare_history(kvmem::GeneratedHistory& directory, std::string& key,
++                                             const GenerationRequest& request,
++                                             const PromptInput& input) {
++    history::Preparation work;
++    // Responses assigns an internal cache session per stored response. A caller
++    // resending full messages uses the same model and authentication domain.
++    // Keep those native cache handles out of the logical transcript identity.
++    history_field(key, input.options.lora ? "explicit" : "default");
++    if (input.options.lora) {
++        history_field(key, std::to_string(input.options.lora->size()));
++        for (const auto& adapter : *input.options.lora) {
++            history_field(key, std::to_string(adapter.id));
++            history_field(key, std::to_string(std::bit_cast<std::uint32_t>(adapter.scale)));
++        }
++    }
++    history_field(key, input.options.chat_template_kwargs_json);
++    history_field(key, std::to_string(input.options.tool_jsons.size()));
++    for (const auto& tool : input.options.tool_jsons) { history_field(key, tool); }
++    std::vector<std::size_t> ends;
++    CallNumbers calls;
++    std::size_t next_call = 0;
++    for (const auto& turn : request.messages) {
++        history_turn(key, turn, calls, next_call);
++        if (turn.role == ChatRole::Assistant) { ends.push_back(key.size()); }
++    }
++    const auto last_role = request.messages.back().role;
++    if (!request.reset_generated_history &&
++        (last_role == ChatRole::User || last_role == ChatRole::Tool)) {
++        work.candidates = directory.candidates(key, ends);
++    }
++    if (std::getenv("KVMEM_TRACE_GENERATED_HISTORY")) {
++        std::fprintf(stderr,"KVMEM_HISTORY lookup_key_bytes=%zu candidates=%zu\n",key.size(),work.candidates.size());
++    }
++    return work;
++}
++
++static bool uses_history(const GenerationRequest& req, const PromptInput& input) {
++    return req.cache_prompt && !req.raw_prompt && !req.messages.empty() && req.media_item_count() == 0 &&
++           input.options.graft.empty() && req.continuation == PromptContinuationMode::NewAssistantTurn &&
++           !(req.layerwise_query && req.layerwise_query->begin);
++}
++
++static void publish_history(RequestLifetime& lifetime, const GenerationOutcome& outcome, Engine& engine,
++                            bool discarded_calls) {
++    auto prefix = std::move(lifetime.history_prompt);
++    if (prefix.ids.empty() || outcome.tokens.empty() || !outcome.branches.empty() ||
++        outcome.finish_reason == FinishReason::Cancelled || outcome.finish_reason == FinishReason::None) { return; }
++    ChatTurn reply;
++    reply.role = ChatRole::Assistant;
++    reply.reasoning_content = outcome.reasoning;
++    if (!outcome.text.empty()) { reply.content.push_back(ContentPart{.text = outcome.text}); }
++    for (const auto& call : outcome.tool_calls) {
++        reply.tool_calls.push_back({{}, call.name, call.arguments_json});
++    }
++    auto key = std::move(lifetime.history_key);
++    CallNumbers unused;
++    std::size_t index = 0;
++    history_turn(key, reply, unused, index);
++    auto& history = lifetime.capacity->history;
++    if (discarded_calls || outcome.finish_reason == FinishReason::StopString || outcome.matched_stop_string) {
++        history.mark_ambiguous(std::move(key));
++        return;
++    }
++    for (auto token : outcome.tokens) {
++        const auto bytes = engine.token_bytes(token);
++        if (bytes.empty()) { history.mark_ambiguous(std::move(key)); return; }
++        prefix.text += bytes;
++        prefix.ids.push_back(token);
++    }
++    if (std::getenv("KVMEM_TRACE_GENERATED_HISTORY")) {
++        std::fprintf(stderr,"KVMEM_HISTORY publish_key_bytes=%zu prefix_rows=%zu\n",key.size(),prefix.ids.size());
++    }
++    history.publish(std::move(key), std::move(prefix));
++}
++
+ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
+     ApiError error;
+     error.param   = "messages";
+@@ -533,6 +648,9 @@ StagedRequest GenerationService::stage_read(const BranchRead& read,
+                                             const ContextCacheHints& context_cache) const {
+     StagedRequest staged = stage(*read.request, GenerationConsumerMode::Aggregate, observation,
+                                  std::move(is_cancelled), context_cache);
++    // A typed decision publishes a score, and can append raw readout tokens.
++    // Its model output is never a committed assistant message.
++    staged.prepared.lifetime->history_prompt = {};
+     if (!read.continuation.empty()) {
+         try {
+             staged.submission.prompt =
+@@ -738,7 +856,23 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
+                 .deadline     = prepared.lifetime->deadline,
+                 .cancellation = CancellationView(is_cancelled),
+             };
++            std::optional<history::Preparation> history_work;
++            if (options_.kvmem.selected_tokens && cache_participation == CacheParticipation::ReadWrite &&
++                uses_history(request,input)) {
++                history_work = prepare_history(request_capacity_->history,prepared.lifetime->history_key,request,input);
++            }
++            const history::Scope history_scope(history_work ? &*history_work : nullptr);
+             prompt = engine_->prepare(std::move(input), control);
++            if (std::getenv("KVMEM_TRACE_GENERATED_HISTORY")) {
++                std::fprintf(stderr,"KVMEM_HISTORY prepared=%d rendered_bytes=%zu reused=%zu\n",int(bool(history_work)),
++                             history_work ? history_work->prompt.text.size() : 0,history_work ? history_work->reused : 0);
++            }
++            if (history_work && !history_work->prompt.text.empty()) {
++                const auto ids = prompt.token_ids();
++                history_work->prompt.ids.assign(ids.begin(), ids.end());
++                prepared.lifetime->history_prompt = std::move(history_work->prompt);
++                prepared.lifetime->history_rows = static_cast<std::uint32_t>(history_work->reused);
++            }
+         }
+         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+         if (request.layerwise_query) apply_layerwise_query_policy(prompt,*request.layerwise_query);
+@@ -820,6 +954,12 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
+             .deadline     = deadline,
+             .cancellation = CancellationView(is_cancelled),
+         };
++        std::optional<history::Preparation> history_work;
++        if (options_.kvmem.selected_tokens && options_.allow_prefix_reuse && uses_history(request, input)) {
++            history_work = prepare_history(request_capacity_->history,lifetime->history_key,request,input);
++            history_work->capacity_sentinel = static_cast<std::size_t>(options_.max_context) + 1;
++        }
++        const history::Scope history_scope(history_work ? &*history_work : nullptr);
+         const int prompt_tokens =
+             static_cast<int>(engine_->count_tokens(std::move(input), control));
+         check_preparation_control(deadline, is_cancelled);
+@@ -951,6 +1091,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
+     outcome.metrics.engine_timing                = result.engine_timing;
+     outcome.metrics.computed_prefill_tokens      = result.computed_prompt_tokens;
+     outcome.metrics.prefix_cache_hit_tokens      = result.reused_prompt_tokens;
++    outcome.metrics.generated_history_tokens     = prepared.lifetime ? prepared.lifetime->history_rows : 0;
+     outcome.id_slot                              = result.slot;
+     outcome.session_digest                       = result.session_digest;
+     outcome.metrics.prefix_reuse_path            = result.prefix_reuse_path;
+@@ -981,9 +1122,13 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
+     // Decoding is not constrained, so enforce it here: keep the first call and drop the rest. The
+     // model can ask for the next one on the following turn, which is how a sequential executor
+     // consumes them anyway.
+-    if (!prepared.parallel_tool_calls && outcome.tool_calls.size() > 1) {
++    const bool discarded_calls = !prepared.parallel_tool_calls && outcome.tool_calls.size() > 1;
++    if (discarded_calls) {
+         outcome.tool_calls.resize(1);
+     }
++    if (prepared.lifetime && !prepared.lifetime->history_prompt.ids.empty() && !cancellation.requested()) {
++        publish_history(*prepared.lifetime, outcome, *engine_, discarded_calls);
++    }
+     return outcome;
+ }
+ 
+diff --git a/src/serve/generation_service.h b/src/serve/generation_service.h
+index a8f1d6e8b96631cd641dbbf641b320d222eb85d2..61bfce20e01ae54a26dc3803e855cfafd00d80cb 100644
+--- a/src/serve/generation_service.h
++++ b/src/serve/generation_service.h
+@@ -64,6 +64,7 @@ struct GenerationMetrics {
+     // Actual logical prefill progress, including partial progress on cancellation.
+     std::uint32_t computed_prefill_tokens     = 0;
+     std::uint32_t prefix_cache_hit_tokens     = 0;
++    std::uint32_t generated_history_tokens    = 0;
+     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
+     ninfer::MaterializationDiagnostics materialization;
+ };
+diff --git a/src/serve/kvmem_metrics.h b/src/serve/kvmem_metrics.h
+index ab50763e39b2478c92c6a8f89ae935ff36a11b72..501fb26af89517a5d9cac66550ad0e616e2b4b77 100644
+--- a/src/serve/kvmem_metrics.h
++++ b/src/serve/kvmem_metrics.h
+@@ -19,6 +19,7 @@ inline nlohmann::json kvmem_cache_reuse(const GenerationMetrics& metrics) {
+     const auto restore= !actual ? Json(nullptr) : !*actual ? Json("miss") :
+         metrics.prefix_reuse_path==PrefixReusePath::SharedStablePrefix ? Json("snapshot") : Json("continuation");
+     return {{"cache_semantics_revision", 2}, {"restore_path",restore},
++            {"generated_history_tokens", metrics.generated_history_tokens},
+             {"planned_cached_tokens", metrics.prefix_cache_hit_tokens},
+             {"actual_cached_tokens", actual ? Json(*actual) : Json(nullptr)},
+             {"planned_cache_source", kvmem_reuse_source(metrics.prefix_reuse_path, metrics.prefix_cache_hit_tokens)},
+diff --git a/src/serve/openai_chat_request.cpp b/src/serve/openai_chat_request.cpp
+index e978a468ccabf6515be459962eace9b0229f3533..0dcdb719b9a4db68dc87c68abdf56f5beecf822b 100644
+--- a/src/serve/openai_chat_request.cpp
++++ b/src/serve/openai_chat_request.cpp
+@@ -970,6 +970,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
+ 
+     OpenAIChatRequest output;
+     output.generation.layerwise_query=parse_layerwise_query_policy(body);
++    output.generation.reset_generated_history = optional_bool(body, "cache_reset", false);
+     if (body.contains("response_format") && !body.at("response_format").is_null()) {
+         output.generation.structured_output =
+             parse_structured_output(body.at("response_format"), true, "response_format");
+diff --git a/src/serve/openai_responses_request.cpp b/src/serve/openai_responses_request.cpp
+index de7ac9959f12660012d891c3df74f40682efe435..5863abb4be7dc58730e2afa915231af6a5b550c5 100644
+--- a/src/serve/openai_responses_request.cpp
++++ b/src/serve/openai_responses_request.cpp
+@@ -1118,6 +1118,7 @@ void parse_truncation(const Json& body) {
+ 
+ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& limits) {
+     ParsedPromptFields out;
++    out.prompt.generation.reset_generated_history = optional_bool(body, "cache_reset", false);
+     if (!body.contains("model") || !body.at("model").is_string() ||
+         body.at("model").get_ref<const std::string&>().empty()) {
+         bad_request("missing required field: model", "model");
+@@ -1238,6 +1239,7 @@ void reject_unsupported_platform_fields(const Json& body) {
+ 
+ void validate_common_top_level(const Json& body, bool create) {
+     static const std::unordered_set<std::string> create_fields = {"access_programs",
++                                                                  "cache_reset",
+                                                                   "background",
+                                                                   "bad_words",
+                                                                   "chat_template_kwargs",
+@@ -1280,6 +1282,7 @@ void validate_common_top_level(const Json& body, bool create) {
+                                                                   "truncation",
+                                                                   "user"};
+     static const std::unordered_set<std::string> count_fields  = {"chat_template_kwargs",
++                                                                  "cache_reset",
+                                                                   "conversation",
+                                                                   "graft",
+                                                                   "input",
+diff --git a/src/serve/request.h b/src/serve/request.h
+index 13a06278bd7e891b190d196ec243311fdd542ed5..8ba307c8626a7a920a88baa46402581b760d3712 100644
+--- a/src/serve/request.h
++++ b/src/serve/request.h
+@@ -247,6 +247,7 @@ struct GenerationRequest {
+     // llama.cpp's cache_prompt: false keeps the request out of the context cache, neither reusing
+     // a cached prefix nor retaining its own.
+     bool cache_prompt = true;
++    bool reset_generated_history = false;
+     std::vector<ToolDefinition> tools;
+     std::size_t tool_name_max_length = kMaximumToolNameLength;
+     ToolChoice tool_choice;
+diff --git a/tests/models/qwen3_5/test_frontend.cpp b/tests/models/qwen3_5/test_frontend.cpp
+index f17ba9277011d0d80ee15d1a2c0a5d17cae44718..b151f48667fba74afd2c38183128458dbf1689ce 100644
+--- a/tests/models/qwen3_5/test_frontend.cpp
++++ b/tests/models/qwen3_5/test_frontend.cpp
+@@ -12,6 +12,7 @@
+ #include "models/qwen3_5/program/tool_open_mask.h"
+ #include "text/unicode.h"
+ #include "text/structured_output.h"
++#include "runtime/generated_history.h"
+ 
+ #include <nlohmann/json.hpp>
+ 
+@@ -1154,6 +1155,41 @@ int test_assistant_continuation() {
+     return failures;
+ }
+ 
++int test_generated_history_boundaries() {
++    const auto source = resources("");
++    const fi::Tokenizer tokenizer({source.tokenizer_json,source.tokenizer_config_json,source.generation_config_json});
++    auto prefix = std::make_shared<kvmem::GeneratedHistory::Prefix>();
++    prefix->text = "}STOPjunk";
++    prefix->ids = {kStopCutToken};
++    ninfer::history::Preparation work;
++    work.candidates.push_back(prefix);
++    work.template_eos = "<|im_end|>";
++    ninfer::history::Scope scope(&work);
++    fi::RenderedChat rendered;
++    rendered.text = prefix->text + "<|im_end|>x";
++    rendered.message_boundaries = {0, prefix->text.size()};
++    rendered.memory_query = ninfer::text::ByteSpan{rendered.text.size() - 1, rendered.text.size()};
++    auto encoded = fi::encode_rendered_chat(tokenizer, rendered, 4);
++    int failures = check(work.reused == 1 && encoded.input_ids == std::vector<int>({kStopCutToken,248046,0}) &&
++                         encoded.message_boundaries.back() == 1 && encoded.memory_query &&
++                         encoded.memory_query->begin == 2 && encoded.memory_query->count == 1,
++                         "accepted rows or native frontiers changed at exact capacity");
++    work.reused = 0;
++    encoded = fi::encode_rendered_chat(tokenizer, rendered, 3);
++    failures += check(work.reused == 0 && encoded.input_ids.front() != kStopCutToken,
++                      "over-capacity history suppressed canonical fallback");
++    rendered.literal_spans.push_back({prefix->text.size(), rendered.text.size()-1});
++    encoded = fi::encode_rendered_chat(tokenizer, rendered);
++    failures += check(work.reused == 0 && encoded.input_ids.front() != kStopCutToken,
++                      "literal user EOT became a template-owned seam");
++    rendered.literal_spans.clear();
++    work.template_eos = "<unused>";
++    encoded = fi::encode_rendered_chat(tokenizer, rendered);
++    failures += check(work.reused == 0 && encoded.input_ids.front() != kStopCutToken,
++                      "a generic special token became an accepted EOT");
++    return failures;
++}
++
+ int test_rewrite_checkpoint_trace() {
+     const std::string assistant_header = "<|im_start|>assistant\n";
+     fi::ChatMessage first              = chat_message(ninfer::ChatRole::Assistant, "");
+@@ -2890,7 +2926,7 @@ int test_constrained_tool_output() {
+     basic.constraints = ninfer::ToolConstraintMode::Basic;
+     auto session =
+         frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+-                                     {}, {}, basic);
++                                     {}, {}, {}, basic);
+ 
+     const std::string generated =
+         "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
+@@ -2929,7 +2965,7 @@ int test_constrained_tool_output() {
+     std::string compact = generated;
+     const auto empty = compact.find("<parameter=enabled>\n\n");
+     compact.erase(empty + std::string_view("<parameter=enabled>\n").size(), 1);
+-    auto compact_session = frontend.make_output_session(prompt, {}, {}, {}, {}, basic);
++    auto compact_session = frontend.make_output_session(prompt, {}, {}, {}, {}, {}, basic);
+     tokens = fixture_tokenizer().encode(compact);
+     tokens.push_back(6);
+     (void)compact_session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size() + 1U),
+@@ -2943,7 +2979,7 @@ int test_constrained_tool_output() {
+                       "compact empty parameter consumed the next argument or lost diagnostics");
+     ninfer::ToolChoice none = basic;
+     none.mode = ninfer::ToolChoiceMode::None;
+-    auto no_tools = frontend.make_output_session(prompt, {}, {}, {}, {}, none);
++    auto no_tools = frontend.make_output_session(prompt, {}, {}, {}, {}, {}, none);
+     const auto none_grammar = no_tools.grammar_state();
+     failures += check(bool(none_grammar), "explicit basic none lost its prohibition grammar");
+     failures += check(!no_tools.suppressed_tool_open(),
+@@ -2974,7 +3010,7 @@ int test_constrained_tool_output() {
+ 
+     none.constraints = ninfer::ToolConstraintMode::Automatic;
+     auto free_none = frontend.make_output_session(
+-        prompt, {}, ninfer::OutputOptions{.preserve_special_tokens = true}, {}, {}, none);
++        prompt, {}, ninfer::OutputOptions{.preserve_special_tokens = true}, {}, {}, {}, none);
+     failures += check(!free_none.grammar_state(), "default none unexpectedly enabled tool grammar");
+     const auto& open_tokenizer = fixture_tokenizer();
+     const auto expected_open   = ninfer::models::qwen3_5::frontend::unique_exact_token(
+@@ -2995,7 +3031,7 @@ int test_constrained_tool_output() {
+                       "default none decoded calls or discarded the model's plain text");
+ 
+     const ninfer::StructuredOutputOptions json{ninfer::StructuredOutputKind::JsonObject, {}, false};
+-    auto json_none = frontend.make_output_session(prompt, {}, {}, {}, json, none);
++    auto json_none = frontend.make_output_session(prompt, {}, {}, {}, json, {}, none);
+     const auto json_grammar = json_none.grammar_state();
+     failures += check(bool(json_grammar), "default none lost explicit JSON grammar");
+     failures += check(!json_none.suppressed_tool_open(),
+@@ -3357,7 +3393,7 @@ int test_unconstrained_tool_marker_after_quoted_marker() {
+     ninfer::ToolChoice automatic;
+     automatic.constraints = ninfer::ToolConstraintMode::Automatic;
+     auto session = frontend.make_output_session(
+-        prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64}, {}, {}, automatic);
++        prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64}, {}, {}, {}, automatic);
+ 
+     const std::string quoted =
+         "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
+@@ -5089,6 +5125,9 @@ int test_gemma_forced_tool_call() {
+ }
+ 
+ int main(int argc, char** argv) {
++    if (argc == 2 && std::string_view(argv[1]) == "--generated-history-only") {
++        return test_generated_history_boundaries() == 0 ? 0 : 1;
++    }
+     try {
+     const FrontendResources owned = resources();
+     const Frontend frontend       = make_frontend(owned);
+@@ -5130,6 +5169,7 @@ int main(int argc, char** argv) {
+     failures += test_assistant_continuation();
+     failures += test_rewrite_checkpoint_trace();
+     failures += test_open_turn_rewrite_checkpoint();
++    failures += test_generated_history_boundaries();
+     failures += test_adjacent_tool_message_boundary();
+     failures += test_literal_cache_boundary();
+     failures += test_reasoning_effort_substitution();
