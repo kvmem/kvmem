@@ -27,6 +27,20 @@ async function until(fn){for(let i=0;i<100;i++){try{if(await fn())return;}catch{
  assert.deepEqual(await (await fetch(base+'/api/launcher/status')).json(),before);
  const prefillPanel=await page.locator('[data-param=Prefill]').evaluate(el=>el.closest('[role=tabpanel]').id);
  await page.locator(`[aria-controls="${prefillPanel}"]`).click();
+ let planningRequests=0;
+ const countPlanning=request=>{if(request.url().endsWith('/api/launcher/adjust-budget'))planningRequests++;};
+ page.on('request',countPlanning);
+ await page.locator('[data-param=Reserve]').fill('2048');
+ await page.locator('[data-param=Prefill]').fill('4096');
+ await button.click();
+ await until(async()=>(await status.innerText()).includes('Prefill (4,096) cannot exceed Gen Reserve (2,048)'));
+ await page.locator('[data-language-select]').selectOption('zh-CN');
+ await button.click();
+ await until(async()=>(await status.innerText()).includes('Prefill 不能超过 Gen Reserve'));
+ assert.equal(planningRequests,0);
+ assert.equal(await page.locator('[data-param=Budget]').inputValue(),'49152');
+ page.off('request',countPlanning);
+ await page.locator('[data-language-select]').selectOption('en');
  for(const omitted of [['Reserve'],['Prefill'],['Reserve','Prefill']]){
    await page.locator('[data-param=Reserve]').fill('8192');await page.locator('[data-param=Prefill]').fill('256');
    for(const key of omitted)await page.locator(`[data-param=${key}]`).fill('');

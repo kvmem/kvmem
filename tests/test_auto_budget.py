@@ -130,5 +130,18 @@ class AutoBudget(unittest.TestCase):
                     self.c.adjust_budget(self.config)
                 run.assert_not_called()
 
+    def test_prefill_over_effective_reserve_explains_both_values(self):
+        self.p.update(Prefill=4097, Reserve=4097)
+        self.plan['token_settings']['effective'].update(Prefill=4096, Reserve=4096)
+        with patch.object(self.c, 'inspect_model', return_value={'can_start': True}), \
+                patch.object(self.c, 'plan', return_value=self.plan), \
+                patch.object(self.c, '_run_budget_plan') as run:
+            with self.assertRaisesRegex(
+                ValueError, r'Prefill 不能超过 Gen Reserve.*Prefill \(4,097\) cannot exceed the effective Gen Reserve \(4,096\)'
+            ):
+                self.c.adjust_budget(self.config)
+        run.assert_not_called()
+        self.assertFalse(self.c.budget_busy)
+
 
 if __name__=='__main__':unittest.main()
