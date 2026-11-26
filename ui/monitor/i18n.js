@@ -11,6 +11,8 @@
 "是":"Yes",
 "否":"No",
 "引擎统计":"Engine statistics",
+"引擎区间吞吐":"Engine throughput",
+"{0}s 统计窗口":"{0}s reporting window",
 "请求状态":"Request state",
 "等待队列":"Waiting queue",
 "引擎容量":"Engine capacity",
