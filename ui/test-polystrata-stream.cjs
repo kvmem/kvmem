@@ -1,7 +1,7 @@
 // Exercise the shared send/regenerate stream against real SSE fixtures, without a model.
 const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
 const assert = require('node:assert/strict');
-const app = fs.readFileSync(path.join(__dirname, '../backends/polystrata/serve/web/app.js'), 'utf8');
+const app = fs.readFileSync(path.join(__dirname, '../backends/polystrata/terminal/serve/web/kvmem-app.js'), 'utf8');
 const stream = app.slice(app.indexOf('async function streamInto('), app.indexOf('// Regenerates the answer'));
 const frame = value => `data: ${typeof value === 'string' ? value : JSON.stringify(value)}\n\n`;
 function harness(chunks, overrides = {}) {

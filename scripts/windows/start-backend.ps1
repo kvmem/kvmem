@@ -123,7 +123,8 @@ if ($Backend -eq 'ninfer') {
 if ($Backend -eq 'polystrata') {
     $capabilities.block_tokens = @{default=32;supported=@(32,64);startup_fixed=$true}
     $capabilities.supported_combinations=@{
-        text=@{architectures=@('qwen35moe','gemma4');kv=@('f16','q8_0','int8','int8k');max_concurrency=8;max_devices=1}
+        text=@{architectures=@('qwen35moe','gemma4','inkling2_loop');kv=@('f16','q8_0','int8','int8k','fp8');max_concurrency=8;max_devices=1}
+        inkling2=@{platform='windows-cuda';kv=@('f16','fp8');max_concurrency=8;max_retained_sessions=16;max_devices=1;vision=$false;speculative_decoding=$true;batch_mtp=$true}
         mtp=@{drafts=@(0..3);solo=$true;batch=$false;batch_fallback='ordinary_decode'}
         storage=@{scope='process';shared_active_idle_quota=$true;ssd_persistence='process'}
         query=@{scorers=@('page-softmax','meanq-cosine');bounded_replay=$true;tool_continuation='resident_pressure'}

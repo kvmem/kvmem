@@ -1,14 +1,77 @@
 # PolyStrata integration
 
-The opt-in `polystrata` backend pins upstream `v0.1.45-poly.9` at
-`83a7a33272413bf87b8d2742dc557c165e2cb2d2`. It supports qwen35moe GGUF models
-with F16/Q8_0 KV and Gemma 4 26B-A4B with F16/int8/int8k KV on one CUDA GPU.
-This revision also carries the opt-in HIP
-integration, marked experimental and disabled by default. Its compile/link CI
-is a merge gate; AMD inference qualification is required before promoting it
-to validated hardware support, rather than blocking the validated CUDA update.
-The source submodule stays at the upstream commit; `backends/versions.json`
-identifies all twenty-five ordered patches and their resulting trees.
+The integration pins upstream main at
+`36e654b1b7eb4cb462202445be296ba012c75edf`. This follows
+`v0.2.20-poly.4` and includes the Inkling decode-window fix. The ordered patches in
+`backends/versions.json` carry the native KVMem adapter for Qwen35MoE,
+Gemma 4 and Inkling 2 Mini and the corresponding Terminal frontend. Prepare the source with
+`scripts/prepare-backends.py --backend polystrata` and configure
+`backends/polystrata/engine`. Source launches locate the frontend in
+`backends/polystrata/terminal`. The Windows packager supplies the standalone
+frontend layout used by existing packaged launchers.
+
+Qwen35MoE uses F16 or Q8_0 for KVMem. Gemma 4 uses F16, int8 or int8k.
+Inkling 2 Mini supports FP16 and FP8 E4M3 KV for KVMem on Windows CUDA.
+KVMem owns those models' compact cache and state boundaries. Upstream
+`--kv-resident` uses its own host-backed cache.
+HIP support remains experimental.
+
+Windows CUDA qualification for the preceding `v0.2.19-poly.1` pin used an RTX 5050 Laptop and a
+4096-token prefill chunk. Qwen35MoE passed Q8_0 prefix reuse, bounded replay
+with SSD readback, two-slot ordinary decode, and solo embedded MTP. Gemma 4
+passed F16 bounded replay and int8k two-slot ordinary decode, CPU vision
+with a compatible vision worker, and recovery after a client disconnect.
+The inherited KVMem startup check still rejects the external Gemma 4
+assistant on this revision. The MTP results below refer to earlier
+qualification builds.
+
+For dSpark on Windows CUDA, select **MTP** and a matching dSpark GGUF in the
+console, or launch the native worker with `--kvmem-mtp --draft-model FILE
+--window 4` and the managed launch flags. Use FP16 or FP8 target KV. The default
+preset keeps ordinary decoding.
+
+The draft's full-attention layer keeps at most `--kvmem-budget` history rows
+and 64 extra rows for temporary writes in each slot. Draft weights and
+temporary compute buffers are shared. Each slot keeps its own draft KV and
+feature ring in VRAM. `--kvmem-gen-reserve` applies to the target model. Startup rejects a prefill batch larger than the full-attention
+draft ring. Position tags keep overwritten draft rows out of attention.
+Drafting resumes after a fresh feature row on checkpoint restore. Acceptance
+and throughput depend on the workload and expert residency.
+
+## Inkling 2 Mini
+
+Select **PolyStrata · Inkling 2 Mini** with a Mainline_Support GGUF declaring
+`inkling2_loop`. On one Windows CUDA GPU, text decoding supports up to eight
+active requests and 16 retained conversations, subject to the configured GPU
+and host-memory budgets. Each active slot advances on its own KV and recurrent
+state. Concurrent Inkling skips CUDA Graph replay and advances the slots in turn.
+Workers reporting `inkling2_dspark_batch` can draft and verify independently
+in each active slot. The Monitor reports draft offers and acceptances per request.
+FP16 is the default. FP8 requires an Ampere or newer NVIDIA GPU and Inkling
+Flash Attention. Use the model's own tokenizer and template.
+When the Inkling thinking-token budget expires, the server closes the thinking
+block and lets the model continue with an answer. The final answer omits
+the internal block delimiters.
+
+The Mini's 48 execution slots include eight full-attention slots. Each
+full-attention slot has its own KVMem plane, including repeated uses of the
+same physical layer. Physical KV rows address the compact cache. Original
+token positions determine attention bias and query scaling. KVMem saves the
+40 sliding-window rings and convolution state together at a logical token
+boundary. A full FP16 state is about 164 MiB for this model and counts toward
+the RAM quota. Full-attention KV pages can also use the SSD tier.
+
+In the `v0.2.19-poly.1` qualification, a 22K-token retrieval test missed a cold
+record at a 512-token resident budget that native full-context inference found.
+In a separate test at that
+budget, Query restored the page containing the code while leaving the
+preceding page that identified the record outside the working set.
+
+## Previous qualification
+
+The results below were recorded on the specified earlier revisions and
+settings. In particular, `poly.9` used upstream
+`83a7a33272413bf87b8d2742dc557c165e2cb2d2`.
 
 The poly.9 integration sizes each Qwen35 batched attention launch from that
 sequence's compact position, including its decode window. Sequence-buffer lookup
@@ -28,7 +91,7 @@ native acceptance coverage and untested hardware paths.
 
 ## Gemma 4 26B-A4B
 
-Gemma support is carried by the final `gemma4-kvmem` patch. It covers bounded
+The earlier `gemma4-kvmem` patch established the following Gemma 4 contracts. It covers bounded
 Query/replay, resident-only Pressure, native RAM/SSD history, retained sessions,
 concurrent ordinary decode, solo assistant MTP and image input. This source
 change requires a rebuilt worker; older release binaries do not gain these

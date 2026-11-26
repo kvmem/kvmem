@@ -94,7 +94,7 @@ def main():
     parser.add_argument("--graph-alpha", type=float)
     parser.add_argument("--query-max-tokens", type=int, default=512)
     parser.add_argument("--replay-max-tokens", type=int, default=2048)
-    parser.add_argument("--kv-type", choices=("f16","q8_0","int8","int8k"), default="f16")
+    parser.add_argument("--kv-type", choices=("f16","q8_0","int8","int8k","fp8"), default="f16")
     parser.add_argument("--lrfu", action="store_true")
     parser.add_argument("--no-lrfu", action="store_true")
     parser.add_argument("--history-reuse", action=argparse.BooleanOptionalAction, default=True, help="reuse identical managed conversation prefixes")
@@ -187,6 +187,8 @@ def main():
         if getattr(args, name) is None:
             continue
         setattr(args, name, getattr(args, name).resolve())
+    from assets import frontend_root
+    args.source = frontend_root(args.source)
     if not (args.source / "serve/server.py").is_file() or not (args.source / "serve/kvmem.py").is_file():
         parser.error("--source must contain the prepared PolyStrata frontend")
     if not args.worker.is_file() or not args.model.is_file():
@@ -289,11 +291,18 @@ def main():
         worker_args += ["--kvmem-sessions", str(args.retained_sessions)]
     if args.cache_min_tokens:
         worker_args += ["--kvmem-cache-min-tokens", str(args.cache_min_tokens)]
-        if not args.dry_run:
-            from launcher.worker import require_launch_features
-            try: require_launch_features(probe_worker(args.worker, 'polystrata'),
-                                         {**recall_parameters, 'CacheMinTokens': args.cache_min_tokens})
-            except ValueError as error: parser.error(str(error))
+    if not args.dry_run and (args.cache_min_tokens or args.kv_type == "fp8" or args.draft_model):
+        from launcher.worker import require_launch_features
+        try:
+            capabilities = probe_worker(args.worker, 'polystrata')
+            require_launch_features(capabilities, {**recall_parameters, 'CacheMinTokens': args.cache_min_tokens})
+            if args.draft_model and capabilities.get('inkling2_dspark') is not True:
+                raise ValueError('This worker does not support KVMem Inkling dSpark')
+            if (args.draft_model and max(args.concurrency, args.retained_sessions) > 1 and
+                    capabilities.get('inkling2_dspark_batch') is not True):
+                raise ValueError('Update the worker to use Inkling dSpark with multiple active or retained sessions')
+        except ValueError as error:
+            parser.error(str(error))
     worker_args += extra
     indices = [0]
     if args.backend == "hip":
@@ -342,6 +351,7 @@ def main():
         if args.vision_device == "gpu":
             config["vision"]["cuda_device"] = indices[0]
     if args.dry_run:
+        config["kvmem_batch_mtp"] = bool(args.draft_model and args.concurrency > 1)
         config["tokenizer_preparation"] = "automatic_from_model_on_start" if automatic_tokenizer else "explicit_export"
         print(json.dumps(config, ensure_ascii=False, indent=2))
         return 0
@@ -369,7 +379,7 @@ def main():
                 for line in lines:
                     marker = line.split(' ', 1)[0]
                     recall_report = marker == 'INFO' and 'recall_strategy=layerwise' in line
-                    if line.endswith('\n') and (marker in {'KVMEM_SCORING', 'KVMEM_LIMITS', 'KVMEM_BLOCKS'} or recall_report) and marker not in seen:
+                    if line.endswith('\n') and (marker in {'KVMEM_SCORING', 'KVMEM_LIMITS', 'KVMEM_BLOCKS', 'KVMEM_DSPARK_KV'} or recall_report) and marker not in seen:
                         print(line.rstrip(), flush=True)
                         seen.add(marker)
                 required = {'INFO', 'KVMEM_BLOCKS'} if args.recall_strategy == 'layerwise' else {'KVMEM_SCORING', 'KVMEM_LIMITS', 'KVMEM_BLOCKS'}

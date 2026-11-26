@@ -80,12 +80,20 @@ def probe_worker(worker, backend, environment=None):
     return value
 
 
+def supports_inkling_fp8(capabilities):
+    models = capabilities.get('model_kv_formats')
+    formats = models.get('inkling2_loop') if isinstance(models, dict) else None
+    return isinstance(formats, list) and 'fp8' in formats
+
+
 def require_launch_features(capabilities, parameters):
     if (parameters.get('Backend') == 'llamacpp' and '--mcp-servers-config' in parameters.get('WorkerArgs', [])
             and capabilities.get('mcp_stdio') is not True):
         raise ValueError('Update the llama.cpp worker to a version with native stdio MCP support')
     if parameters.get('Lora') and capabilities.get('fixed_lora') is not True:
         raise ValueError('This worker does not support fixed LoRA; update the llama.cpp worker')
+    if parameters.get('Backend') == 'polystrata' and parameters.get('KvType') == 'fp8' and not supports_inkling_fp8(capabilities):
+        raise ValueError('This worker does not support Inkling FP8 KV with KVMem')
     require_recall_features(capabilities, parameters)
     if (parameters.get('Backend') == 'ninfer' and parameters.get('RecallStrategy', 'legacy') == 'legacy'
             and any(parameters.get(key, 0) == 0 for key in ('QueryMaxTokens', 'QueryReplayMaxTokens'))):

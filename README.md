@@ -128,6 +128,8 @@ Include the version, GPU, driver, model, launch settings and error logs when rep
 
 ## Credits and licenses
 
+KVMem's original source code and documentation are licensed under the [Apache License, Version 2.0](LICENSE).
+
 Thanks to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), [Neroued/ninfer](https://github.com/Neroued/ninfer), [iamwavecut/ninfer-all](https://github.com/iamwavecut/ninfer-all) and community contributors, including Ryan-gsq and contributors to 3090/4090 adaptations, adaptive MTP, fast prefill and ngram. LRFU/GQA max references [melis2023/kvmem-actkv](https://github.com/melis2023/kvmem-actkv). Thanks to testers including melis and redsnow23.
 
 Each backend retains its upstream license and third-party notices; see the [backend manifest](backends/versions.json) and package licenses. cuBLAS follows the CUDA EULA. Models are distributed separately under their own terms.

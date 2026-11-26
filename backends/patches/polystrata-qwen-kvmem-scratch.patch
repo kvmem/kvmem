@@ -1,0 +1,61 @@
+diff --git a/engine/src/poly/engine.cpp b/engine/src/poly/engine.cpp
+index 3c3c5581c3878738a4a4e6e22cae7c2bbf9eb6eb..1fd6b8b6f6345fcd1ef204d73540e2807f81ec79 100644
+--- a/engine/src/poly/engine.cpp
++++ b/engine/src/poly/engine.cpp
+@@ -4205,9 +4205,12 @@ void Engine::alloc() {
+ #if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
+         two_scratch_ = false;
+ #else
+-        // The native Inkling decode graphs use the small layout. Keep it available for a single managed sequence.
++        // Use native small decode graphs for single managed sequences. An explicit elastic workspace
++        // keeps its existing layout, and draft verification keeps its batch scratch addresses.
++        const auto& arch = gg_->get("general.architecture")->s;
++        const bool qwen = arch == "qwen35moe" && !elastic_enabled_ && !draft_ && !block_guess_ && !opt_.memory.mtp;
+         two_scratch_ = two_scratch_ && opt_.batch == 0 && opt_.memory.sessions == 1 &&
+-                       gg_->get("general.architecture")->s == "inkling2_loop";
++                       (arch == "inkling2_loop" || qwen);
+ #endif
+     }
+ #endif
+diff --git a/engine/src/poly/qwen35.cpp b/engine/src/poly/qwen35.cpp
+index b6b8b16f8b0468dfc314fa172dbb8d89ec678cab..6597745a87c04c8f007011624f96ca47df473476 100644
+--- a/engine/src/poly/qwen35.cpp
++++ b/engine/src/poly/qwen35.cpp
+@@ -414,7 +414,6 @@ void Qwen35::assign_scratch() {
+         if (!scratch_alias && buf_rows_ >= kStageRows) awork_ = fbuf(heads + heads / 2 + 1 + 3 * n * n_head_);   // a prompt batch's attention
+ #ifdef STRATA_KVMEM
+         if (opt_.memory.budget) {
+-            memory_groups_ = size_t(cache_capacity()) / opt_.memory.block_tokens + 1;
+             // Normalized Q is consumed (including its ordered D2H copy) before
+             // attn_store(), and normalized K before attention uses score_. Reuse
+             // that scratch rather than displacing routed experts from VRAM. Tiny
+@@ -422,11 +421,6 @@ void Qwen35::assign_scratch() {
+             const size_t score_floats=size_t(chunk_)*n_head_*cache_capacity();
+             memory_kpre_ = score_floats>=kv ? score_ : fbuf(kv);
+             memory_qpre_ = score_floats>=heads ? score_ : fbuf(heads);
+-            const size_t key_count = memory_groups_ * n_attn_ * n_kv_ * head_dim_;
+-            memory_stats_stride_=key_count+size_t(n_attn_)*n_head_*head_dim_;
+-            memory_stats_all_ = fbuf(memory_stats_stride_*size_t(opt_.batch+1));
+-            memory_ksums_=memory_stats_all_;
+-            memory_qsums_ = memory_ksums_ ? memory_ksums_ + key_count : nullptr;
+             if (opt_.memory.mtp) {
+                 memory_window_keys_ = fbuf(size_t(opt_.window) * n_attn_ * n_kv_ * head_dim_);
+                 memory_first_draft_ = fbuf(size_t(n_kv_)*head_dim_);
+@@ -511,9 +505,14 @@ void Qwen35::init_memory() {
+         }
+     if(memory_) memory_->rebind(std::move(planes));
+     else memory_ = std::make_shared<KvmemMemory>(*this,std::move(planes),n_head_,n_kv_,head_dim_);
+-    const size_t total = memory_groups_ * n_attn_ * n_kv_ * head_dim_ + size_t(n_attn_) * n_head_ * head_dim_;
+-    if(!h_memory_stats_all_) {
+-        h_memory_stats_all_=static_cast<float*>(hmalloc(total*size_t(opt_.batch+1)*sizeof(float),"KVMem statistics staging"));
++    if (!memory_stats_all_) {
++        memory_groups_ = size_t(cache_capacity()) / opt_.memory.block_tokens + 1;
++        const size_t key_count = memory_groups_ * n_attn_ * n_kv_ * head_dim_;
++        memory_stats_stride_ = key_count + size_t(n_attn_) * n_head_ * head_dim_;
++        const size_t bytes = memory_stats_stride_ * size_t(opt_.batch + 1) * sizeof(float);
++        // Capture clears these before the forward pass can switch scratch layouts.
++        memory_stats_all_ = static_cast<float*>(dmalloc(bytes, "KVMem attention statistics"));
++        h_memory_stats_all_ = static_cast<float*>(hmalloc(bytes, "KVMem statistics staging"));
+         if(opt_.memory.mtp)
+             h_memory_window_keys_=static_cast<float*>(hmalloc(size_t(n_attn_)*opt_.window*n_kv_*head_dim_*sizeof(float),
+                                                              "KVMem accepted window staging"));
