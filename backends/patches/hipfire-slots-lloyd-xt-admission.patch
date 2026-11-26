@@ -1,0 +1,950 @@
+diff --git a/crates/hipfire-arch-qwen35/src/forward_slots.rs b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+index 35ece809f..d70a1d438 100644
+--- a/crates/hipfire-arch-qwen35/src/forward_slots.rs
++++ b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+@@ -114,8 +114,9 @@ use hipfire_dispatch::families::moe::{
+     gated_moe_prefill_admissible, mq6_batched_admit_enabled_from_env,
+ };
+ use hipfire_dispatch::pipeline::batched::{
+-    q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
+-    run_plain_gemm_key, run_residual_gemm_key,
++    mq4v2_lloyd_mmq_graph_admitted, q8_prefill_wmma_enabled, run_fused_gate_up_key,
++    run_fused_qkv_key, run_fused_qkvza_key, run_mq4v2_lloyd_gate_up, run_mq4v2_lloyd_qkv,
++    run_mq4v2_lloyd_qkvza, run_mq4v2_lloyd_residual, run_plain_gemm_key, run_residual_gemm_key,
+ };
+ use hipfire_dispatch::pipeline::batched_attention::{
+     fa_pertoken_min_ctx, q8_multirow_attn_admitted,
+@@ -813,6 +814,12 @@ fn layerwise_fa_slots(
+ /// to the shared `is_batchable_la` (MQ3/MQ3-Lloyd WMMA, MQ*V2 WMMA
+ /// eligibility, etc.) so no duplicate admit table drifts here.
+ fn slots_proj_admissible(dt: DType, arch: &str) -> bool {
++    // qt52 has LUT-batched prefill only on these exact routes. The shared
++    // `is_batchable_la` V2 rule is wider (it also admits gfx1101), where no
++    // Lloyd LUT launcher exists, so the slot gate must stay narrower.
++    if dt == DType::MQ4G256V2Lloyd {
++        return matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
++    }
+     let member = matches!(
+         dt,
+         DType::Q8_0
+@@ -850,14 +857,14 @@ fn slots_is_lowbit(dt: DType) -> bool {
+ 
+ /// Dtypes whose stored weights are offline-FWHT-rotated over G256 groups:
+ /// the activation must be rotated by the matching producer before the
+-/// GEMM. Mirrors the `is_mq` set in `batch_chunk_delta_net_input_projection`
+-/// minus the containers slots refuses (MQ4G256V2Lloyd has no uniform key
+-/// anywhere; MFP4G32 and G128-rotated families stay out of v1).
++/// GEMM. MQ4G256V2Lloyd shares qt44's FWHT-G256 contract; it has dedicated
++/// LUT launchers rather than a uniform fused key.
+ fn slots_weight_rotated(dt: DType) -> bool {
+     matches!(
+         dt,
+         DType::MQ4G256
+             | DType::MQ4G256V2
++            | DType::MQ4G256V2Lloyd
+             | DType::MQ4CG256
+             | DType::MQ6G256
+             | DType::MQ6G256V2
+@@ -871,9 +878,8 @@ fn slots_weight_rotated(dt: DType) -> bool {
+ 
+ /// lm_head dtypes the multi-slot path admits. `Step::Gemv` +
+ /// `weights.output.dispatch_ref()` is dtype-generic, so this is an allow-list
+-/// of formats whose GEMV/rotate path is known-good. Covers every container
+-/// `--tier`/`--fixed-tier` can lift the head to (q8..mq6v2) plus the HFQ
+-/// siblings. Do not silently widen to Lloyd/E8 here.
++/// of formats whose GEMV/rotate path is known-good. MQ3-Lloyd and MQ4-V2-Lloyd
++/// use the existing per-tensor LUT GEMV arms; no batched-head kernel is needed.
+ fn lm_head_slots_admissible(dt: DType) -> bool {
+     matches!(
+         dt,
+@@ -881,6 +887,7 @@ fn lm_head_slots_admissible(dt: DType) -> bool {
+             | DType::MQ4G256
+             | DType::HFQ4G256
+             | DType::MQ4G256V2
++            | DType::MQ4G256V2Lloyd
+             | DType::MQ4CG256
+             | DType::MQ6G256
+             | DType::HFQ6G256
+@@ -888,6 +895,7 @@ fn lm_head_slots_admissible(dt: DType) -> bool {
+             | DType::MQ5G256V2
+             | DType::MQ3G256
+             | DType::MQ3G256V2
++            | DType::MQ3G256Lloyd
+             | DType::MQ2G256V2
+             | DType::HFQ3G256
+             | DType::F16
+@@ -1382,6 +1390,10 @@ fn mq4_residual_proj(
+ ) -> HipResult<()> {
+     rotate_x_mq_batched_for(gpu, w, x, scratch, w.k, n)?;
+     let y_n = y.sub_offset(0, n * w.m);
++    if w.gpu_dtype == DType::MQ4G256V2Lloyd {
++        let wr = w.dispatch_ref();
++        return run_mq4v2_lloyd_residual(gpu, &wr, scratch, &y_n, n);
++    }
+     let key = slots_residual_gemm_key(w.gpu_dtype).ok_or_else(|| {
+         HipError::new(
+             0,
+@@ -1671,23 +1683,32 @@ fn dense_ffn_body_slots(
+             n,
+             q8_wmma_arch,
+         )?,
+-        GroupPlan::Uniform(dt) => run_fused_gate_up_key(
+-            gpu,
+-            fused_gate_up_key_for(dt),
+-            &w_gate.buf,
+-            &w_up.buf,
+-            if slots_weight_rotated(dt) {
++        GroupPlan::Uniform(dt) => {
++            let x = if slots_weight_rotated(dt) {
+                 &pbs.x_rot_batch
+             } else {
+                 &pbs.x_norm_batch
+-            },
+-            &pbs.gate_ffn_batch,
+-            &pbs.up_batch,
+-            w_gate.m,
+-            w_up.m,
+-            w_gate.k,
+-            n,
+-        )?,
++            };
++            if dt == DType::MQ4G256V2Lloyd {
++                let gate = w_gate.dispatch_ref();
++                let up = w_up.dispatch_ref();
++                run_mq4v2_lloyd_gate_up(gpu, &gate, &up, x, &pbs.gate_ffn_batch, &pbs.up_batch, n)?;
++            } else {
++                run_fused_gate_up_key(
++                    gpu,
++                    fused_gate_up_key_for(dt),
++                    &w_gate.buf,
++                    &w_up.buf,
++                    x,
++                    &pbs.gate_ffn_batch,
++                    &pbs.up_batch,
++                    w_gate.m,
++                    w_up.m,
++                    w_gate.k,
++                    n,
++                )?;
++            }
++        }
+         GroupPlan::Mixed { .. } => {
+             let g = pbs.gate_ffn_batch.sub_offset(0, n * w_gate.m);
+             slots_plain_proj(gpu, w_gate, &pbs.x_rot_batch, &pbs.x_norm_batch, &g, n)?;
+@@ -1710,6 +1731,11 @@ fn dense_ffn_body_slots(
+             w_down.k,
+             n,
+         )?;
++        if dt == DType::MQ4G256V2Lloyd {
++            let wr = w_down.dispatch_ref();
++            let y = pbs.x_batch.sub_offset(0, n * w_down.m);
++            return run_mq4v2_lloyd_residual(gpu, &wr, &pbs.ffn_hidden_batch, &y, n);
++        }
+         let key = slots_residual_gemm_key(dt).expect("rotated w_down has a residual key");
+         let y = pbs.x_batch.sub_offset(0, n * w_down.m);
+         run_residual_gemm_key(
+@@ -2062,25 +2088,45 @@ where
+                 } else {
+                     &pbs.x_norm_batch
+                 };
+-                run_fused_qkvza_key(
+-                    gpu,
+-                    fused_qkvza_key_for(dt),
+-                    &layer.wqkv.buf,
+-                    &layer.wz.buf,
+-                    &layer.w_beta.buf,
+-                    &layer.w_alpha.buf,
+-                    x,
+-                    &pbs.dn_qkv_batch,
+-                    &pbs.dn_z_batch,
+-                    &pbs.dn_beta_batch,
+-                    &pbs.dn_alpha_batch,
+-                    layer.wqkv.m,
+-                    layer.wz.m,
+-                    layer.w_beta.m,
+-                    layer.w_alpha.m,
+-                    layer.wqkv.k,
+-                    n,
+-                )?;
++                if dt == DType::MQ4G256V2Lloyd {
++                    let qkv = layer.wqkv.dispatch_ref();
++                    let z = layer.wz.dispatch_ref();
++                    let beta = layer.w_beta.dispatch_ref();
++                    let alpha = layer.w_alpha.dispatch_ref();
++                    run_mq4v2_lloyd_qkvza(
++                        gpu,
++                        &qkv,
++                        &z,
++                        &beta,
++                        &alpha,
++                        x,
++                        &pbs.dn_qkv_batch,
++                        &pbs.dn_z_batch,
++                        &pbs.dn_beta_batch,
++                        &pbs.dn_alpha_batch,
++                        n,
++                    )?;
++                } else {
++                    run_fused_qkvza_key(
++                        gpu,
++                        fused_qkvza_key_for(dt),
++                        &layer.wqkv.buf,
++                        &layer.wz.buf,
++                        &layer.w_beta.buf,
++                        &layer.w_alpha.buf,
++                        x,
++                        &pbs.dn_qkv_batch,
++                        &pbs.dn_z_batch,
++                        &pbs.dn_beta_batch,
++                        &pbs.dn_alpha_batch,
++                        layer.wqkv.m,
++                        layer.wz.m,
++                        layer.w_beta.m,
++                        layer.w_alpha.m,
++                        layer.wqkv.k,
++                        n,
++                    )?;
++                }
+             }
+             GroupPlan::Mixed { .. } => {
+                 for (w, out) in [
+@@ -2427,25 +2473,45 @@ where
+             } else {
+                 &pbs.x_norm_batch
+             };
+-            run_fused_qkvza_key(
+-                gpu,
+-                fused_qkvza_key_for(dt),
+-                &layer.wqkv.buf,
+-                &layer.wz.buf,
+-                &layer.w_beta.buf,
+-                &layer.w_alpha.buf,
+-                x,
+-                &pbs.dn_qkv_batch,
+-                &pbs.dn_z_batch,
+-                &pbs.dn_beta_batch,
+-                &pbs.dn_alpha_batch,
+-                layer.wqkv.m,
+-                layer.wz.m,
+-                layer.w_beta.m,
+-                layer.w_alpha.m,
+-                layer.wqkv.k,
+-                n,
+-            )?;
++            if dt == DType::MQ4G256V2Lloyd {
++                let qkv = layer.wqkv.dispatch_ref();
++                let z = layer.wz.dispatch_ref();
++                let beta = layer.w_beta.dispatch_ref();
++                let alpha = layer.w_alpha.dispatch_ref();
++                run_mq4v2_lloyd_qkvza(
++                    gpu,
++                    &qkv,
++                    &z,
++                    &beta,
++                    &alpha,
++                    x,
++                    &pbs.dn_qkv_batch,
++                    &pbs.dn_z_batch,
++                    &pbs.dn_beta_batch,
++                    &pbs.dn_alpha_batch,
++                    n,
++                )?;
++            } else {
++                run_fused_qkvza_key(
++                    gpu,
++                    fused_qkvza_key_for(dt),
++                    &layer.wqkv.buf,
++                    &layer.wz.buf,
++                    &layer.w_beta.buf,
++                    &layer.w_alpha.buf,
++                    x,
++                    &pbs.dn_qkv_batch,
++                    &pbs.dn_z_batch,
++                    &pbs.dn_beta_batch,
++                    &pbs.dn_alpha_batch,
++                    layer.wqkv.m,
++                    layer.wz.m,
++                    layer.w_beta.m,
++                    layer.w_alpha.m,
++                    layer.wqkv.k,
++                    n,
++                )?;
++            }
+         }
+         GroupPlan::Mixed { .. } => {
+             for (w, out) in [
+@@ -3619,22 +3685,39 @@ fn run_fullattn_layer_slots(
+                 } else {
+                     &pbs.x_norm_batch
+                 };
+-                run_fused_qkv_key(
+-                    gpu,
+-                    fused_qkv_key_for(dt),
+-                    &layer.wq.buf,
+-                    &layer.wk.buf,
+-                    &layer.wv.buf,
+-                    x,
+-                    &pbs.fa_q_full_batch,
+-                    &pbs.fa_k_batch,
+-                    &pbs.fa_v_batch,
+-                    layer.wq.m,
+-                    layer.wk.m,
+-                    layer.wv.m,
+-                    layer.wq.k,
+-                    n,
+-                )?;
++                if dt == DType::MQ4G256V2Lloyd {
++                    let q = layer.wq.dispatch_ref();
++                    let k = layer.wk.dispatch_ref();
++                    let v = layer.wv.dispatch_ref();
++                    run_mq4v2_lloyd_qkv(
++                        gpu,
++                        &q,
++                        &k,
++                        &v,
++                        x,
++                        &pbs.fa_q_full_batch,
++                        &pbs.fa_k_batch,
++                        &pbs.fa_v_batch,
++                        n,
++                    )?;
++                } else {
++                    run_fused_qkv_key(
++                        gpu,
++                        fused_qkv_key_for(dt),
++                        &layer.wq.buf,
++                        &layer.wk.buf,
++                        &layer.wv.buf,
++                        x,
++                        &pbs.fa_q_full_batch,
++                        &pbs.fa_k_batch,
++                        &pbs.fa_v_batch,
++                        layer.wq.m,
++                        layer.wk.m,
++                        layer.wv.m,
++                        layer.wq.k,
++                        n,
++                    )?;
++                }
+             }
+             GroupPlan::Mixed { .. } => {
+                 for (w, out) in [
+@@ -3933,22 +4016,39 @@ fn run_fullattn_moe_layer_slots(
+             } else {
+                 &pbs.x_norm_batch
+             };
+-            run_fused_qkv_key(
+-                gpu,
+-                fused_qkv_key_for(dt),
+-                &layer.wq.buf,
+-                &layer.wk.buf,
+-                &layer.wv.buf,
+-                x,
+-                &pbs.fa_q_full_batch,
+-                &pbs.fa_k_batch,
+-                &pbs.fa_v_batch,
+-                layer.wq.m,
+-                layer.wk.m,
+-                layer.wv.m,
+-                layer.wq.k,
+-                n,
+-            )?;
++            if dt == DType::MQ4G256V2Lloyd {
++                let q = layer.wq.dispatch_ref();
++                let k = layer.wk.dispatch_ref();
++                let v = layer.wv.dispatch_ref();
++                run_mq4v2_lloyd_qkv(
++                    gpu,
++                    &q,
++                    &k,
++                    &v,
++                    x,
++                    &pbs.fa_q_full_batch,
++                    &pbs.fa_k_batch,
++                    &pbs.fa_v_batch,
++                    n,
++                )?;
++            } else {
++                run_fused_qkv_key(
++                    gpu,
++                    fused_qkv_key_for(dt),
++                    &layer.wq.buf,
++                    &layer.wk.buf,
++                    &layer.wv.buf,
++                    x,
++                    &pbs.fa_q_full_batch,
++                    &pbs.fa_k_batch,
++                    &pbs.fa_v_batch,
++                    layer.wq.m,
++                    layer.wk.m,
++                    layer.wv.m,
++                    layer.wq.k,
++                    n,
++                )?;
++            }
+         }
+         GroupPlan::Mixed { .. } => {
+             for (w, out) in [
+@@ -4792,6 +4892,29 @@ pub fn forward_batch_slots_graphed(
+     )
+ }
+ 
++fn layer_uses_mq4v2_lloyd(layer: &LayerWeights) -> bool {
++    let is_lloyd = |w: &WeightTensor| w.gpu_dtype == DType::MQ4G256V2Lloyd;
++    match layer {
++        LayerWeights::DeltaNet(l) => [
++            &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.wo, &l.w_gate, &l.w_up, &l.w_down,
++        ]
++        .iter()
++        .any(|w| is_lloyd(w)),
++        LayerWeights::FullAttn(l) => [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down]
++            .iter()
++            .any(|w| is_lloyd(w)),
++        LayerWeights::DeltaNetMoe(l) => [&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.wo]
++            .iter()
++            .any(|w| is_lloyd(w)),
++        LayerWeights::FullAttnMoe(l) => [&l.wq, &l.wk, &l.wv, &l.wo].iter().any(|w| is_lloyd(w)),
++    }
++}
++
++fn weights_use_mq4v2_lloyd(weights: &Qwen35Weights) -> bool {
++    weights.output.gpu_dtype == DType::MQ4G256V2Lloyd
++        || weights.layers.iter().any(layer_uses_mq4v2_lloyd)
++}
++
+ /// [`forward_batch_slots_graphed`] with MTP-verify awareness.
+ ///
+ /// `mtp_k > 0` additionally admits steps whose per-slot row counts are all in
+@@ -4859,8 +4982,12 @@ pub fn forward_batch_slots_graphed_opts(
+     }
+     // The captured step includes the per-slot lm_head `Step::Gemv`, so a spilled
+     // model routes it to the CPU (a host sync point) and the graph must not be
+-    // used — same rule as the dense AR graph in `qwen35/forward.rs`.
+-    if gpu.owns_host_cpu_weights() {
++    // used — same rule as the dense AR graph in `qwen35/forward.rs`. qt52 on
++    // gfx11 may capture only allocation-free MMQ-LUT row shapes; gfx1201 and
++    // every pad-to-128 shape stay eager.
++    let qt52_graph_admitted = !weights_use_mq4v2_lloyd(weights)
++        || mq4v2_lloyd_mmq_graph_admitted(gpu, batch.total_rows());
++    if gpu.owns_host_cpu_weights() || !qt52_graph_admitted {
+         hipfire_dispatch::log_capture_disabled_once();
+         return forward_batch_slots_opts(
+             gpu,
+@@ -4910,7 +5037,7 @@ pub fn forward_batch_slots_graphed_opts(
+     // buffers are temporaries, and a captured memcpy node bakes its source
+     // pointer. The captured kernels read the device buffers these fill, so
+     // fresh contents reach a replay without re-capturing.
+-    upload_step_inputs(gpu, batch, pool, desc_staging, pbs)?;
++    upload_step_inputs(gpu, batch, pool, desc_staging, pbs, config, kv)?;
+ 
+     if cache.key != Some(key) {
+         cache.release(gpu);
+@@ -4970,13 +5097,25 @@ pub fn forward_batch_slots_graphed_opts(
+             spec_capture,
+             layerwise,
+         );
++        if let Err(error) = captured {
++            if gpu.flags.slot_trace {
++                eprintln!("[slots-graph] capture body failed: {error:?}");
++            }
++            gpu.abort_stream_capture();
++            return Err(error);
++        }
+         let graph = gpu.end_stream_capture()?;
+-        captured?;
+         let exec = gpu.hip.graph_instantiate(&graph)?;
+         cache.graph = Some(graph);
+         cache.exec = Some(exec);
+         cache.key = Some(key);
+         cache.captures += 1;
++        if gpu.flags.slot_trace {
++            eprintln!(
++                "[slots-graph] capture n_slots={} n_rows={} ctx_bucket={} captures={}",
++                key.n_slots, key.n_rows, key.ctx_bucket, cache.captures
++            );
++        }
+         // Capture does not execute, and the warm-up step above already did
+         // this step's work, so nothing is launched here.
+         return Ok(());
+@@ -4990,6 +5129,12 @@ pub fn forward_batch_slots_graphed_opts(
+     cache.exec = Some(exec);
+     launched?;
+     cache.replays += 1;
++    if gpu.flags.slot_trace {
++        eprintln!(
++            "[slots-graph] replay n_slots={} n_rows={} ctx_bucket={} replays={}",
++            key.n_slots, key.n_rows, key.ctx_bucket, cache.replays
++        );
++    }
+     // Host-side bookkeeping the replay cannot do for itself.
+     advance_slot_seq_lens(batch, pool)?;
+     Ok(())
+@@ -5094,6 +5239,8 @@ pub fn upload_step_inputs(
+     pool: &mut SlotPool,
+     desc_staging: &mut SlotDescStaging,
+     pbs: &PrefillBatchScratch,
++    config: &Qwen35Config,
++    kv: &SlotKvTier,
+ ) -> HipResult<()> {
+     let n = batch.total_rows();
+     let tokens_host: Vec<i32> = batch.tokens.iter().map(|&t| t as i32).collect();
+@@ -5167,6 +5314,38 @@ pub fn upload_step_inputs(
+             .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
+         pool.mark_uploaded();
+     }
++    // The multi-slot Q8 WMMA attention path reads three tile tables. They are
++    // shape-derived (not position-derived), but their source vectors are
++    // temporary host allocations, so upload them here outside capture just like
++    // tokens/positions/descriptors. The captured forward only recomputes the
++    // tile count and never issues H2D.
++    let active_slots = batch.m_per_slot.iter().filter(|&&m| m > 0).count();
++    if !pool.is_paged()
++        && kv.is_q8()
++        && active_slots > 1
++        && n > active_slots
++        && q8_flash_prefill_wmma_eligible(gpu, config.head_dim, n)
++    {
++        let (tile_slot, tile_row0, tile_qbase) = build_tiles(&batch.m_per_slot, WMMA_M_TILE);
++        let nt = tile_slot.len();
++        assert!(
++            nt <= desc_staging.max_rows,
++            "forward_batch_slots: n_tiles ({nt}) exceeds desc_staging.max_rows \
++             ({}) capacity — a tile always owns >= 1 row so this should be \
++             unreachable unless max_rows was undersized",
++            desc_staging.max_rows
++        );
++        if nt > 0 {
++            let to_bytes =
++                |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
++            gpu.hip
++                .memcpy_htod(&desc_staging.tile_slot_dev.buf, &to_bytes(&tile_slot))?;
++            gpu.hip
++                .memcpy_htod(&desc_staging.tile_row0_dev.buf, &to_bytes(&tile_row0))?;
++            gpu.hip
++                .memcpy_htod(&desc_staging.tile_qbase_dev.buf, &to_bytes(&tile_qbase))?;
++        }
++    }
+     Ok(())
+ }
+ 
+@@ -5596,7 +5775,7 @@ pub fn forward_batch_slots_opts(
+              unreachable unless max_rows was undersized",
+             desc_staging.max_rows
+         );
+-        if nt > 0 {
++        if nt > 0 && !opts.skip_uploads {
+             let to_bytes =
+                 |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
+             gpu.hip
+@@ -6139,14 +6318,16 @@ mod tests {
+             DType::MQ5G256V2,
+             DType::MQ3G256,
+             DType::MQ3G256V2,
++            DType::MQ3G256Lloyd,
+             DType::MQ2G256V2,
++            DType::MQ4G256V2Lloyd,
+             DType::HFQ3G256,
+             DType::F16,
+         ] {
+             assert!(lm_head_slots_admissible(dt), "lm_head refuses {dt:?}");
+         }
+         // Do not silently widen to codebooks without slot GEMV coverage.
+-        for dt in [DType::MQ4G256V2Lloyd, DType::MQ3G256Lloyd] {
++        for dt in [DType::MQ4G128V2, DType::MFP4G32Lloyd] {
+             assert!(!lm_head_slots_admissible(dt), "lm_head admits {dt:?}");
+         }
+     }
+@@ -6180,6 +6361,30 @@ mod tests {
+             plan_proj_group_dtypes(&[m(DType::MQ4CG256), m(DType::MQ4CG256)], "gfx1201"),
+             Ok(GroupPlan::Uniform(DType::MQ4CG256))
+         );
++        // qt52 is uniform-only and has LUT-batched routes on exactly these
++        // arches. Mixed Lloyd/uniform groups have no plain Lloyd GEMM key.
++        for lloyd_arch in ["gfx1100", "gfx1151", "gfx1201"] {
++            assert_eq!(
++                plan_proj_group_dtypes(
++                    &[m(DType::MQ4G256V2Lloyd), m(DType::MQ4G256V2Lloyd)],
++                    lloyd_arch,
++                ),
++                Ok(GroupPlan::Uniform(DType::MQ4G256V2Lloyd))
++            );
++            assert!(plan_proj_group_dtypes(
++                &[m(DType::MQ4G256V2Lloyd), m(DType::MQ4G256V2)],
++                lloyd_arch,
++            )
++            .unwrap_err()
++            .contains("no per-projection GEMM key"));
++        }
++        for refused_arch in ["gfx1101", "gfx1200", "gfx942"] {
++            assert!(plan_proj_group_dtypes(
++                &[m(DType::MQ4G256V2Lloyd), m(DType::MQ4G256V2Lloyd)],
++                refused_arch,
++            )
++            .is_err());
++        }
+         // qt44 + Q8 mixed group (tier-pro shape): both plain-capable, both
+         // variants needed.
+         assert_eq!(
+@@ -6309,7 +6514,14 @@ mod tests {
+             );
+         }
+         assert!(slots_plain_gemm_key(DType::Q8_0).is_some());
+-        // F16/Lloyd/etc. stay refused at admission regardless of key tables.
++        // qt52 has no uniform plain/residual key: its dedicated LUT wrappers
++        // are selected before the key tables. Admission is arch-narrow.
++        assert!(slots_weight_rotated(DType::MQ4G256V2Lloyd));
++        assert!(slots_plain_gemm_key(DType::MQ4G256V2Lloyd).is_none());
++        assert!(slots_residual_gemm_key(DType::MQ4G256V2Lloyd).is_none());
++        for lloyd_arch in ["gfx1100", "gfx1151", "gfx1201"] {
++            assert!(slots_proj_admissible(DType::MQ4G256V2Lloyd, lloyd_arch));
++        }
+         assert!(!slots_proj_admissible(DType::F16, "gfx1101"));
+         assert!(!slots_proj_admissible(DType::MQ4G256V2Lloyd, "gfx1101"));
+     }
+@@ -6413,6 +6625,26 @@ mod tests {
+         assert!(!spec_verify_graph_shape(&[4, 1], 0));
+     }
+ 
++    #[test]
++    fn qt52_graph_gate_tracks_mtp_and_concurrent_row_shapes() {
++        use hipfire_dispatch::pipeline::batched::mq4v2_lloyd_mmq_graph_shape_admitted;
++        for (m, rows, graphable) in [
++            (vec![1, 1], 4, true),
++            (vec![4, 1, 0, 4], 4, true),
++            (vec![4; 16], 4, false), // 64 rows: eager pad-to-128
++            (vec![4; 32], 4, true),  // 128 rows: direct MMQ
++            (vec![4; 33], 4, false), // 132 rows: eager pad-to-128
++        ] {
++            assert_eq!(spec_verify_graph_shape(&m, rows), true, "m={m:?}");
++            let total = m.iter().sum();
++            assert_eq!(
++                mq4v2_lloyd_mmq_graph_shape_admitted(total),
++                graphable,
++                "m={m:?} total={total}"
++            );
++        }
++    }
++
+     #[test]
+     fn decode_graph_m_hash_separates_patterns() {
+         // Same total rows, different patterns → different graphs.
+diff --git a/crates/hipfire-dispatch/src/pipeline/batched.rs b/crates/hipfire-dispatch/src/pipeline/batched.rs
+index e68d284cf..bff3b9215 100644
+--- a/crates/hipfire-dispatch/src/pipeline/batched.rs
++++ b/crates/hipfire-dispatch/src/pipeline/batched.rs
+@@ -1605,12 +1605,271 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
+             != Some("1")
+ }
+ 
++/// Row shapes whose qt52 gfx11 MMQ-LUT wrapper stays allocation-free during
++/// graph capture. `N < 64` records a fixed per-row GEMV loop; `N % 128 == 0`
++/// takes the direct prequant MMQ path. Other positive shapes use the eager
++/// pad-to-128 wrapper and must not be captured.
++#[inline]
++pub const fn mq4v2_lloyd_mmq_graph_shape_admitted(n: usize) -> bool {
++    n != 0 && (n < 64 || n % 128 == 0)
++}
++
++/// Full qt52 graph capability for the gfx11 MMQ-LUT route. gfx1201 remains
++/// eager-only because its FP8-LUT launchers explicitly reject capture/replay.
++#[inline]
++pub fn mq4v2_lloyd_mmq_graph_admitted(gpu: &Gpu, n: usize) -> bool {
++    lloyd_mmq_lut_route(gpu) && mq4v2_lloyd_mmq_graph_shape_admitted(n)
++}
++
+ /// True when all listed projection dtypes are the Lloyd-V2 dtype.
+ #[inline]
+ pub(crate) fn all_mq4v2_lloyd(dts: &[DType]) -> bool {
+     dts.iter().all(|d| matches!(d, DType::MQ4G256V2Lloyd))
+ }
+ 
++fn require_mq4v2_lloyd(weights: &[&WeightRef<'_>], family: &str) -> HipResult<()> {
++    if weights
++        .iter()
++        .all(|w| matches!(w.dtype, DType::MQ4G256V2Lloyd))
++    {
++        Ok(())
++    } else {
++        Err(HipError::new(
++            0,
++            &format!(
++                "{family}: mixed MQ4G256V2Lloyd/uniform projections are not supported; \
++                 quantize the whole projection group to one dtype"
++            ),
++        ))
++    }
++}
++
++fn mq4v2_lloyd_no_route(gpu: &Gpu, family: &str) -> HipError {
++    HipError::new(
++        0,
++        &format!(
++            "{family}: MQ4G256V2Lloyd has no batched LUT route on {} \
++             (supported: gfx1100/gfx1151 MMQ-LUT, gfx1201 FP8-LUT)",
++            gpu.arch
++        ),
++    )
++}
++
++/// Batched DeltaNet `qkvza` for a uniform MQ4G256V2Lloyd group.
++///
++/// The slot engine owns its norm/rotation producer, so `x` must already be in
++/// the FWHT-G256 basis. This is the thin multi-slot twin of the existing
++/// single-sequence prefill arm: gfx11 uses MMQ-LUT, gfx12 uses FP8-LUT, and
++/// every other architecture / mixed group fails closed.
++#[allow(clippy::too_many_arguments)]
++pub fn run_mq4v2_lloyd_qkvza(
++    gpu: &mut Gpu,
++    wqkv: &WeightRef<'_>,
++    wz: &WeightRef<'_>,
++    w_beta: &WeightRef<'_>,
++    w_alpha: &WeightRef<'_>,
++    x: &GpuTensor,
++    y_qkv: &GpuTensor,
++    y_z: &GpuTensor,
++    y_beta: &GpuTensor,
++    y_alpha: &GpuTensor,
++    n: usize,
++) -> HipResult<()> {
++    const FAMILY: &str = "forward_batch_slots: DeltaNet qkvza";
++    require_mq4v2_lloyd(&[wqkv, wz, w_beta, w_alpha], FAMILY)?;
++    if lloyd_mmq_lut_route(gpu) {
++        gpu.gemm_qkvza_mq4g256v2_mmq_lloyd(
++            &wqkv.buf,
++            &wz.buf,
++            &w_beta.buf,
++            &w_alpha.buf,
++            x,
++            y_qkv,
++            y_z,
++            y_beta,
++            y_alpha,
++            wqkv.m,
++            wz.m,
++            w_beta.m,
++            w_alpha.m,
++            wqkv.k,
++            n,
++            lloyd_c16_or_fail(wqkv, FAMILY)?,
++            lloyd_c16_or_fail(wz, FAMILY)?,
++            lloyd_c16_or_fail(w_beta, FAMILY)?,
++            lloyd_c16_or_fail(w_alpha, FAMILY)?,
++        )
++    } else if gpu.arch.as_str() == "gfx1201" {
++        gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
++            &wqkv.buf,
++            &wz.buf,
++            &w_beta.buf,
++            &w_alpha.buf,
++            x,
++            y_qkv,
++            y_z,
++            y_beta,
++            y_alpha,
++            wqkv.m,
++            wz.m,
++            w_beta.m,
++            w_alpha.m,
++            wqkv.k,
++            n,
++            1,
++            lloyd_e4m3_or_fail(wqkv, FAMILY)?,
++            lloyd_e4m3_or_fail(wz, FAMILY)?,
++            lloyd_e4m3_or_fail(w_beta, FAMILY)?,
++            lloyd_e4m3_or_fail(w_alpha, FAMILY)?,
++        )
++    } else {
++        Err(mq4v2_lloyd_no_route(gpu, FAMILY))
++    }
++}
++
++/// Batched FullAttention `qkv` for a uniform MQ4G256V2Lloyd group.
++#[allow(clippy::too_many_arguments)]
++pub fn run_mq4v2_lloyd_qkv(
++    gpu: &mut Gpu,
++    wq: &WeightRef<'_>,
++    wk: &WeightRef<'_>,
++    wv: &WeightRef<'_>,
++    x: &GpuTensor,
++    y_q: &GpuTensor,
++    y_k: &GpuTensor,
++    y_v: &GpuTensor,
++    n: usize,
++) -> HipResult<()> {
++    const FAMILY: &str = "forward_batch_slots: FullAttn qkv";
++    require_mq4v2_lloyd(&[wq, wk, wv], FAMILY)?;
++    if lloyd_mmq_lut_route(gpu) {
++        gpu.gemm_qkv_mq4g256v2_mmq_lloyd(
++            &wq.buf,
++            &wk.buf,
++            &wv.buf,
++            x,
++            y_q,
++            y_k,
++            y_v,
++            wq.m,
++            wk.m,
++            wv.m,
++            wq.k,
++            n,
++            lloyd_c16_or_fail(wq, FAMILY)?,
++            lloyd_c16_or_fail(wk, FAMILY)?,
++            lloyd_c16_or_fail(wv, FAMILY)?,
++        )
++    } else if gpu.arch.as_str() == "gfx1201" {
++        gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
++            &wq.buf,
++            &wk.buf,
++            &wv.buf,
++            x,
++            y_q,
++            y_k,
++            y_v,
++            wq.m,
++            wk.m,
++            wv.m,
++            wq.k,
++            n,
++            1,
++            lloyd_e4m3_or_fail(wq, FAMILY)?,
++            lloyd_e4m3_or_fail(wk, FAMILY)?,
++            lloyd_e4m3_or_fail(wv, FAMILY)?,
++        )
++    } else {
++        Err(mq4v2_lloyd_no_route(gpu, FAMILY))
++    }
++}
++
++/// Batched dense-FFN `gate_up` for a uniform MQ4G256V2Lloyd group.
++#[allow(clippy::too_many_arguments)]
++pub fn run_mq4v2_lloyd_gate_up(
++    gpu: &mut Gpu,
++    w_gate: &WeightRef<'_>,
++    w_up: &WeightRef<'_>,
++    x: &GpuTensor,
++    y_gate: &GpuTensor,
++    y_up: &GpuTensor,
++    n: usize,
++) -> HipResult<()> {
++    const FAMILY: &str = "forward_batch_slots: dense FFN gate_up";
++    require_mq4v2_lloyd(&[w_gate, w_up], FAMILY)?;
++    if lloyd_mmq_lut_route(gpu) {
++        gpu.gemm_gate_up_mq4g256v2_mmq_lloyd(
++            &w_gate.buf,
++            &w_up.buf,
++            x,
++            y_gate,
++            y_up,
++            w_gate.m,
++            w_up.m,
++            w_gate.k,
++            n,
++            lloyd_c16_or_fail(w_gate, FAMILY)?,
++            lloyd_c16_or_fail(w_up, FAMILY)?,
++        )
++    } else if gpu.arch.as_str() == "gfx1201" {
++        gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
++            &w_gate.buf,
++            &w_up.buf,
++            x,
++            y_gate,
++            y_up,
++            w_gate.m,
++            w_up.m,
++            w_gate.k,
++            n,
++            1,
++            lloyd_e4m3_or_fail(w_gate, FAMILY)?,
++            lloyd_e4m3_or_fail(w_up, FAMILY)?,
++        )
++    } else {
++        Err(mq4v2_lloyd_no_route(gpu, FAMILY))
++    }
++}
++
++/// Batched residual projection for MQ4G256V2Lloyd.
++///
++/// `x` must already be FWHT-G256 rotated when the caller used the fused
++/// SwiGLU+rotate producer. The wrapper preserves residual ADD semantics.
++pub fn run_mq4v2_lloyd_residual(
++    gpu: &mut Gpu,
++    w: &WeightRef<'_>,
++    x: &GpuTensor,
++    y: &GpuTensor,
++    n: usize,
++) -> HipResult<()> {
++    const FAMILY: &str = "forward_batch_slots: Lloyd residual";
++    require_mq4v2_lloyd(&[w], FAMILY)?;
++    if lloyd_mmq_lut_route(gpu) {
++        gpu.gemm_hfq4g256_residual_mmq_lloyd(
++            &w.buf,
++            x,
++            y,
++            w.m,
++            w.k,
++            n,
++            lloyd_c16_or_fail(w, FAMILY)?,
++        )
++    } else if gpu.arch.as_str() == "gfx1201" {
++        gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
++            &w.buf,
++            x,
++            y,
++            w.m,
++            w.k,
++            n,
++            1,
++            lloyd_e4m3_or_fail(w, FAMILY)?,
++        )
++    } else {
++        Err(mq4v2_lloyd_no_route(gpu, FAMILY))
++    }
++}
++
+ /// #397 Ship 5.2 slice 2: route a single BATCHED-prefill FUSED gate+up GEMM
+ /// through [`FusedQkvFamily`] against an explicit `FusedGateUp*` [`KernelKey`].
+ ///
+@@ -2678,6 +2937,16 @@ pub(crate) fn execute_swiglu_ffn_batched(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn mq4v2_lloyd_graph_shape_gate_matches_mmq_wrapper() {
++        for n in [1, 2, 4, 16, 63, 128, 256] {
++            assert!(mq4v2_lloyd_mmq_graph_shape_admitted(n), "N={n}");
++        }
++        for n in [0, 64, 65, 127, 129, 255, 257] {
++            assert!(!mq4v2_lloyd_mmq_graph_shape_admitted(n), "N={n}");
++        }
++    }
++
+     /// ECSQ-5 §6 regression: `HIPFIRE_IU4_PREFILL=0` plus
+     /// `HIPFIRE_GFX12_MQ4V2_FP8_{GATEUP,RESID,QKVZA,QKV}=0` gave WT2 KLD 11.74
+     /// because the FP8-stream producers (gated only on
+diff --git a/crates/rdna-compute/src/dispatch.rs b/crates/rdna-compute/src/dispatch.rs
+index b50fc014b..372437d03 100644
+--- a/crates/rdna-compute/src/dispatch.rs
++++ b/crates/rdna-compute/src/dispatch.rs
+@@ -2553,6 +2553,22 @@ impl Gpu {
+         self.hip.stream_end_capture(stream)
+     }
+ 
++    /// Abort an in-flight stream capture, preserving the original forward error
++    /// instead of letting `hipStreamEndCapture` mask it with error 901.
++    pub fn abort_stream_capture(&mut self) {
++        let stream = self
++            .active_stream
++            .as_ref()
++            .map(|stream| unsafe { stream.alias() });
++        if let Some(stream) = stream {
++            self.graphs
++                .abort_graph_capture(&self.hip, self.device_id, &stream);
++        } else {
++            self.graphs.capture_mode = false;
++            self.graphs.capture_blobs.clear();
++        }
++    }
++
+     /// Launch a previously instantiated graph on this `Gpu`'s stream.
+     pub fn launch_graph(&mut self, exec: &hip_bridge::GraphExec) -> HipResult<()> {
+         self.bind_thread()?;
