@@ -85,19 +85,22 @@ class HealthTests(unittest.TestCase):
         assistant=self.root/'assistant.gguf';gguf(assistant,meta={'general.architecture':'gemma4-assistant'})
         self.assertTrue(self.inspect(model,'polystrata',SpeculativeMode='mtp',DraftModel=str(assistant))['can_start'])
 
-    def test_inkling_accepts_one_fp16_text_conversation(self):
+    def test_inkling_accepts_ordinary_fp16_and_fp8_multi_session(self):
         model = self.root / 'inkling.gguf'
         gguf(model, meta={'general.architecture': 'inkling2_loop'})
         ready = self.inspect(model, 'polystrata', KvType='f16', RetainedSessions=1)
         self.assertTrue(ready['can_start'])
         self.assertNotIn('poly_arch', {check['code'] for check in ready['checks']})
         self.assertEqual(ready['model']['kv_types'], ['f16', 'fp8'])
-        self.assertTrue(self.inspect(model, 'polystrata', KvType='fp8', RetainedSessions=1)['can_start'])
+        for kv_type in ('f16', 'fp8'):
+            for concurrency, retained in ((1, 2), (2, 1), (2, 2)):
+                self.assertTrue(self.inspect(model, 'polystrata', KvType=kv_type, Concurrency=concurrency,
+                                             RetainedSessions=retained)['can_start'])
         rejected = self.inspect(model, 'polystrata', KvType='q8_0', RetainedSessions=2, Vision=True,
                                 SpeculativeMode='mtp')
         self.assertFalse(rejected['can_start'])
         self.assertEqual({check['code'] for check in rejected['checks'] if check['status'] == 'error'},
-                         {'poly_kv', 'inkling_sessions', 'inkling_vision', 'inkling_draft'})
+                         {'poly_kv', 'inkling_vision', 'inkling_draft'})
 
     def test_inkling_dspark_requires_a_matching_external_draft(self):
         model = self.root / 'inkling.gguf'
@@ -109,13 +112,66 @@ class HealthTests(unittest.TestCase):
                                   DraftModel=str(draft), KvType=kv_type)
             self.assertTrue(result['can_start'])
             self.assertEqual(result['features']['mtp'], 'external')
-        result = self.inspect(model, 'polystrata', SpeculativeMode='mtp', DraftTokens=3,
-                              DraftModel=str(draft), RetainedSessions=2)
-        self.assertFalse(result['can_start'])
+        for concurrency, retained in ((1, 2), (2, 1), (2, 2)):
+            result = self.inspect(model, 'polystrata', SpeculativeMode='mtp', DraftTokens=3,
+                                  DraftModel=str(draft), Concurrency=concurrency, RetainedSessions=retained)
+            self.assertTrue(result['can_start'], result)
         gguf(draft, meta={'general.architecture': 'dflash'})
         result = self.inspect(model, 'polystrata', SpeculativeMode='mtp', DraftTokens=3, DraftModel=str(draft))
         self.assertFalse(result['can_start'])
         self.assertIn('inkling_draft_arch', {check['code'] for check in result['checks']})
+
+    def polystrata_console(self):
+        spec = importlib.util.spec_from_file_location('health_console', ROOT / 'scripts/local-console.py')
+        console = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(console)
+        controller = console.Controller(ROOT, self.root / 'state', 18299)
+        # Exercise the worker contract even on hosts that do not ship PolyStrata.
+        controller.backends = ['polystrata']
+        return console, controller
+
+    def test_inkling_multi_session_requires_a_compatible_worker(self):
+        console, controller = self.polystrata_console()
+        model = self.root / 'inkling.gguf'
+        gguf(model, meta={'general.architecture': 'inkling2_loop'})
+        worker = self.root / 'worker.exe'
+        worker.write_bytes(b'fixture')
+        parameters = {'Backend': 'polystrata', 'Model': str(model), 'Worker': str(worker),
+                      'Concurrency': 2, 'RetainedSessions': 2, 'KvType': 'f16'}
+        data = {'schema_version': 1, 'parameters': parameters}
+        for supported in (False, True):
+            report = self.inspect(model, 'polystrata', Concurrency=2, RetainedSessions=2, KvType='f16')
+            with patch.object(console.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps(report))), patch.object(
+                    controller, 'worker_capabilities', return_value={'inkling2_multi_session': supported}):
+                result = controller.inspect_model(data)
+            self.assertEqual(result['can_start'], supported, result)
+            self.assertEqual('inkling_multi_session_worker' in {check['code'] for check in result['checks']},
+                             not supported)
+
+    def test_inkling_dspark_batch_requires_a_compatible_worker(self):
+        console, controller = self.polystrata_console()
+        model, draft, worker = (self.root / name for name in ('inkling.gguf', 'draft.gguf', 'worker.exe'))
+        gguf(model, meta={'general.architecture': 'inkling2_loop'})
+        gguf(draft, meta={'general.architecture': 'dflash'}, tensor='markov_w1.weight')
+        worker.write_bytes(b'fixture')
+        for concurrency, retained in ((1, 1), (1, 4), (2, 1), (2, 4)):
+            options = {'SpeculativeMode': 'mtp', 'DraftTokens': 3, 'DraftModel': str(draft),
+                       'Concurrency': concurrency, 'RetainedSessions': retained, 'KvType': 'f16'}
+            report = self.inspect(model, 'polystrata', **options)
+            parameters = {'Backend': 'polystrata', 'Model': str(model), 'Worker': str(worker), **options}
+            data = {'schema_version': 1, 'parameters': parameters}
+            for supported in (False, True):
+                capabilities = {'inkling2_multi_session': True, 'inkling2_dspark': True,
+                                'inkling2_dspark_batch': supported}
+                with patch.object(console.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                        [], 0, stdout=json.dumps(report))), patch.object(
+                        controller, 'worker_capabilities', return_value=capabilities):
+                    result = controller.inspect_model(data)
+                expected = supported or (concurrency, retained) == (1, 1)
+                self.assertEqual(result['can_start'], expected, result)
+                self.assertEqual('inkling_dspark_batch_worker' in {check['code'] for check in result['checks']},
+                                 not expected)
 
     def test_extension_cannot_disguise_wrong_container(self):
         path=self.root/'fake.gguf'; path.write_bytes(b'not a model'*10)

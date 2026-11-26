@@ -158,6 +158,14 @@ def main():
     copy(ROOT / 'docs/rocm-contributors.md', output / 'rocm-contributors.md')
     copy(args.validation, output / 'VALIDATION.md')
     copy(ROOT / 'backends/llamacpp/LICENSE', output / 'licenses/llama.cpp-MIT.txt')
+    for filename, relative in (
+        ('KVMem-Apache-2.0.txt', 'LICENSE'),
+        ('libtrellis-Apache-2.0.txt', 'backends/llamacpp/ggml/src/ggml-cuda/libtrellis/LICENSE'),
+        ('ExLlamaV3-MIT.txt', 'backends/llamacpp/licenses/LICENSE-exllamav3'),
+    ):
+        license_file = ROOT / relative
+        if license_file.is_file():
+            copy(license_file, output / 'licenses' / filename)
     for tree in ('kvmem', 'backends/llamacpp/vendor'):
         for file in (ROOT / tree).rglob('*'):
             if file.is_file() and re.match(r'^(LICENSE|COPYING|NOTICE)', file.name, re.I):

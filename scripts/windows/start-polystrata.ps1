@@ -24,7 +24,7 @@ if(((Setting 'ThinkingMode' 'default') -eq 'off' -and (Setting 'ReasoningEffort'
 $mode=Setting 'SpeculativeMode' $(if((Setting 'MtpDrafts' 0) -gt 0){'mtp'}else{'none'})
 $count=Setting 'DraftTokens' (Setting 'MtpDrafts' $(if($mode -in @('mtp','guess')){2}else{0}))
 if($Parameters.ContainsKey('MtpDrafts') -and $Parameters.ContainsKey('DraftTokens') -and $Parameters.MtpDrafts -ne $count) { throw 'DraftTokens conflicts with MtpDrafts' }
-if($mode -notin @('none','mtp','guess') -or ($mode -eq 'none' -and $count) -or ($mode -in @('mtp','guess') -and ($count -lt 1 -or $count -gt 3)) -or (Setting 'DraftPolicy' 'adaptive') -notin @('fixed','adaptive')) { throw 'PolyStrata supports native adaptive drafts with a 1..3 ceiling in solo execution; native batch uses ordinary decode' }
+if($mode -notin @('none','mtp','guess') -or ($mode -eq 'none' -and $count) -or ($mode -in @('mtp','guess') -and ($count -lt 1 -or $count -gt 3)) -or (Setting 'DraftPolicy' 'adaptive') -notin @('fixed','adaptive')) { throw 'PolyStrata supports a draft ceiling from 1 to 3' }
 $gpu=Setting 'Gpu' $env:CUDA_VISIBLE_DEVICES
 if($gpu -notmatch '^GPU-[0-9a-fA-F-]{8,64}$') { throw 'PolyStrata requires one GPU UUID' }
 $worker=Setting 'Worker' (Join-Path $Root 'workers/polystrata/strata-poly.exe')
@@ -101,7 +101,7 @@ if(Setting 'Vision' $false) {
 if($WorkerArgs.Count) { $arguments+=@('--')+$WorkerArgs }
 $effective=@{};foreach($key in $Parameters.Keys){if($key -ne 'ApiKey'){$effective[$key]=$Parameters[$key]}}
 $effective.Backend='polystrata';$effective.Model=$model;$effective.Worker=$worker;$effective.Gpu=$gpu
-$effective.SpeculativeMode=$mode;$effective.DraftTokens=$count;$effective.DraftPolicy=if($count){'adaptive'}else{'fixed'}
+$effective.SpeculativeMode=$mode;$effective.DraftTokens=$count;$effective.DraftPolicy=if($count -and !($draft -and (Setting 'Concurrency' 1) -gt 1)){'adaptive'}else{'fixed'}
 $effective.KvType=$kv;$effective.Concurrency=[int](Setting 'Concurrency' 1);$effective.BlockTokens=[int](Setting 'BlockTokens' 32)
 $effective.Reserve=[int](Setting 'Reserve' 1024);$effective.Vision=[bool](Setting 'Vision' $false)
 $effective.CacheMinTokens=[int](Setting 'CacheMinTokens' 0)
@@ -126,7 +126,7 @@ if(Setting 'DryRun' $false) {
         $safeEnv.STRATA_FATTN=$resolved.env.STRATA_FATTN
         $safeEnv.STRATA_FDEC=$resolved.env.STRATA_FDEC
     } finally { $check.Dispose() }
-    @{token_settings=$TokenPlan;effective_parameters=$effective;effective_settings=@{block_tokens=[int](Setting 'BlockTokens' 32);draft_policy=$(if($count){'adaptive'}else{'fixed'});draft_tokens=$count;model_alias=$resolved.model_name;max_tokens=$resolved.kvmem_default_max_tokens;preserve_thinking=$resolved.preserve_thinking;vram_reserve_mib=$resolved.kvmem_vram_reserve_mib};backend='polystrata';native_argv=@($resolved.exe)+@($resolved.args);argv=@($python)+$arguments;environment=$safeEnv;capabilities=@{architectures=@('qwen35moe','gemma4','inkling2_loop');gpu_count=1;batch_mtp=$false;solo_mtp=($count -gt 0);concurrency=(Setting 'Concurrency' 1);kv_type=$kv;storage_quota='process'}} | ConvertTo-Json -Depth 8
+    @{token_settings=$TokenPlan;effective_parameters=$effective;effective_settings=@{block_tokens=[int](Setting 'BlockTokens' 32);draft_policy=$effective.DraftPolicy;draft_tokens=$count;model_alias=$resolved.model_name;max_tokens=$resolved.kvmem_default_max_tokens;preserve_thinking=$resolved.preserve_thinking;vram_reserve_mib=$resolved.kvmem_vram_reserve_mib};backend='polystrata';native_argv=@($resolved.exe)+@($resolved.args);argv=@($python)+$arguments;environment=$safeEnv;capabilities=@{architectures=@('qwen35moe','gemma4','inkling2_loop');gpu_count=1;batch_mtp=[bool]$resolved.kvmem_batch_mtp;solo_mtp=($count -gt 0);concurrency=(Setting 'Concurrency' 1);kv_type=$kv;storage_quota='process'}} | ConvertTo-Json -Depth 8
     return
 }
 Invoke-KVMemRecallWorkerCheck $worker $effective $Root
