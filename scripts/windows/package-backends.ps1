@@ -197,8 +197,11 @@ helper. Packages with the desktop console include Python.
 `start-backend.ps1` 设置 `-CacheMinTokens` 时，需使用系统上的 Python 3.10 或更新版本。
 带桌面控制台的包自带 Python。
 
-TP restrictions and deferred features are recorded in
-docs/ninfer-upstream-63428ac2-integration.md. Models are not downloaded automatically.
+For heads tensor parallelism, select two compatible GPUs and enable
+**Tensor parallelism · heads** in **Multi-GPU**. The PowerShell launcher accepts
+`-TensorParallel` and optional `-TensorSplit` weights in GPU UUID order. See
+[NInfer tensor parallelism](docs/multi-backend.md#ninfer-张量并行) for current launch settings.
+Models are supplied separately.
 '@
 }
 [IO.File]::WriteAllText((Join-Path $OutputDir 'README.md'), $packageReadme, [Text.UTF8Encoding]::new($false))

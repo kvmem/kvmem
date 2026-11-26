@@ -223,14 +223,18 @@ class HealthTests(unittest.TestCase):
             gguf(path, kind=kind, columns=128, payload=b'\0'*(size-1))
             self.assertFalse(self.inspect(path)['can_start'])
 
-    def test_bonsai_native_plane_extents(self):
+    def test_bonsai_native_tensor_extents(self):
         path = self.root/'bonsai.ninfer'
-        # One row: compact base at 0, optional high plane at 256,
-        # FP16 scale at 512 (PTQ1) or 256 (T5); the final two bytes need no tail padding.
-        for format_name, size in [('ptq1_g128_fp16',514),('t5_g128_fp16',258)]:
+        # Native row planes end at scale bytes 514 and 258. WaveCut stores
+        # two rows of two raw 28-byte PTQ1_0 blocks in gguf_blocks_v1.
+        for format_name, layout, shape, size in [
+            ('ptq1_g128_fp16', 'row_split_k128_v1', [1, 128], 514),
+            ('t5_g128_fp16', 'row_split_k128_v1', [1, 128], 258),
+            ('gguf_ptq1_0', 'gguf_blocks_v1', [2, 256], 112),
+        ]:
             directory = dict(components={'text':{'config':{'model_type':'qwen3_5_text'},'resources':{}}},
-                objects=[dict(id='weight',kind='tensor',shape=[1,128],format=format_name,
-                              layout='row_split_k128_v1',offset=0,bytes=size)],
+                objects=[dict(id='weight',kind='tensor',shape=shape,format=format_name,
+                              layout=layout,offset=0,bytes=size)],
                 bindings={'text.weight':{'object':'weight'}},uses=[],files=[dict(path=None,payload_bytes=1024)])
             def write():
                 encoded=json.dumps(directory).encode()
