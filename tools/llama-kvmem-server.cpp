@@ -1446,6 +1446,8 @@ int main(int argc, char ** argv) {
     cparams.n_seq_max = 1;
     cparams.type_k = st.cache_type_k;
     cparams.type_v = st.cache_type_v;
+    // Each server lane requests one logit row per batch without speculation.
+    cparams.n_outputs_max = 1;
     if (st.spec_enabled) {
         const uint32_t n_out = (uint32_t) (1 + std::max(0, st.spec_n_max));
         cparams.n_outputs_max = n_out;
