@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [string]$LlamaWorker,
@@ -131,7 +131,8 @@ foreach ($entry in $workerEntries) {
     $workerInfo[$workerBackend] = @{ sha256=(Get-FileHash -LiteralPath $executable).Hash.ToLowerInvariant();
         path="workers/$workerBackend/$($entry[2])"; clean_path_help_passed=$true; launch_contract=$contract }
 }
-$packageScripts = @('start-backend.ps1', 'start-ninfer.ps1', 'native-process.ps1', 'query-scoring.ps1', 'token-settings.ps1')
+$packageScripts = @('start-backend.ps1', 'start-ninfer.ps1', 'native-process.ps1', 'query-scoring.ps1',
+                    'recall-strategy.ps1', 'token-settings.ps1')
 if ($Backend -eq 'all') { $packageScripts += @('start-dflash2.ps1','start-polystrata.ps1') }
 foreach ($script in $packageScripts) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $script) -Destination (Join-Path $OutputDir 'scripts/windows')
@@ -140,7 +141,19 @@ if ($Backend -eq 'all') {
     New-Item -ItemType Directory -Path (Join-Path $OutputDir 'tools/polystrata') -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $source 'tools/polystrata/server.py') -Destination (Join-Path $OutputDir 'tools/polystrata/server.py')
 }
+# The worker-only launcher uses these modules to validate recall and inspect the selected model.
+$recallFiles = @('scripts/check-recall-worker.py', 'scripts/model_health.py',
+                 'scripts/launcher/__init__.py', 'scripts/launcher/worker.py', 'scripts/launcher/recall.py')
+foreach ($name in '__init__.py', 'reader.py', 'schema.py', 'layouts.py', 'formats.py', 'framing.py', 'file_io.py', 'LICENSE', 'PROVENANCE.json') {
+    $recallFiles += 'scripts/model_health_ninfer/' + $name
+}
+foreach ($relative in $recallFiles) {
+    $destination = Join-Path $OutputDir $relative
+    $null = New-Item -ItemType Directory -Path (Split-Path $destination) -Force
+    Copy-Item -LiteralPath (Join-Path $source $relative) -Destination $destination
+}
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../speculative-capabilities.json') -Destination (Join-Path $OutputDir 'scripts/speculative-capabilities.json')
+& (Join-Path $OutputDir 'scripts/windows/start-ninfer.ps1') -Describe | Out-Null
 Copy-Item -LiteralPath (Join-Path $source 'docs') -Destination (Join-Path $OutputDir 'docs') -Recurse
 Copy-Item -LiteralPath (Join-Path $source 'VERSION') -Destination (Join-Path $OutputDir 'VERSION')
 $packageReadme = @'
@@ -173,12 +186,16 @@ $packageReadme = @'
 This package contains only the NInfer worker and its runtime dependencies.
 Use converted .ninfer Qwen dense model artifacts, supplied separately.
 Install a compatible NVIDIA driver and Microsoft Visual C++ 2015-2022 x64 Runtime.
-The included console exposes only NInfer. See START-HERE.txt for startup and
-provenance/validation.json for the qualified GPU, build and model scope.
+Use `scripts/windows/start-ninfer.ps1` to start the worker. See
+`provenance/validation.json`, when present, for the qualified GPU, build and model scope.
+For layerwise recall, the worker-only package uses Python 3.10+ from `PATH` or
+the `py` launcher. The `start-backend.ps1` option `-CacheMinTokens` uses the same
+helper. Packages with the desktop console include Python.
 
-本包仅包含 NInfer 后端。模型另行提供，使用转换后的 .ninfer Qwen 稠密模型包。
-安装兼容的 NVIDIA 驱动和 Microsoft Visual C++ 2015-2022 x64 运行库后，
-双击 START-HERE-CN.bat。Python、控制台和聊天界面均随包提供。
+本包仅包含 NInfer 后端。安装兼容的 NVIDIA 驱动和 Microsoft Visual C++ 2015-2022 x64 运行库后，
+可通过 `scripts/windows/start-ninfer.ps1` 启动。独立 worker 包启用层级回忆或通过
+`start-backend.ps1` 设置 `-CacheMinTokens` 时，需使用系统上的 Python 3.10 或更新版本。
+带桌面控制台的包自带 Python。
 
 TP restrictions and deferred features are recorded in
 docs/ninfer-upstream-63428ac2-integration.md. Models are not downloaded automatically.
