@@ -1,0 +1,499 @@
+diff --git a/core/kvmem/generated_history.hpp b/core/kvmem/generated_history.hpp
+new file mode 100644
+--- /dev/null
++++ b/core/kvmem/generated_history.hpp
+@@ -0,0 +1,94 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <list>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace kvmem {
++
++// One directory per model/tokenizer instance. The adapter supplies a structured
++// transcript key and validates the rendering seam. This holds no native KV.
++class GeneratedHistory {
++public:
++    struct Prefix {
++        std::string text;
++        std::vector<int32_t> ids;
++    };
++
++    explicit GeneratedHistory(size_t max_entries = 32, size_t max_bytes = 32u << 20)
++        : max_entries_(max_entries), max_bytes_(max_bytes) {}
++
++    std::vector<std::shared_ptr<const Prefix>> candidates(const std::string & transcript,
++            const std::vector<size_t> & assistant_ends) {
++        std::vector<std::shared_ptr<const Prefix>> matches;
++        if (assistant_ends.empty()) return matches;
++        std::lock_guard<std::mutex> guard(mutex_);
++        // A bounded directory scan avoids constructing one copy of the entire
++        // transcript per historical assistant message. Ends refer to complete
++        // serialized messages; text inside a message cannot introduce an end.
++        for (const auto & entry : entries_) {
++            if (entry.prefix && std::binary_search(assistant_ends.begin(), assistant_ends.end(), entry.key.size()) &&
++                    transcript.compare(0, entry.key.size(), entry.key) == 0)
++                matches.push_back(entry.prefix);
++        }
++        std::sort(matches.begin(), matches.end(), [](const auto & a, const auto & b) {
++            return a->text.size() > b->text.size();
++        });
++        return matches;
++    }
++
++    void publish(std::string key, Prefix prefix) {
++        if (prefix.text.empty() || prefix.ids.empty()) return;
++        record(std::move(key), &prefix);
++    }
++
++    // The output parser discarded bytes (e.g. a stop inside a token). A
++    // future echo cannot distinguish this turn from a clean, identical reply.
++    void mark_ambiguous(std::string key) { record(std::move(key), nullptr); }
++
++private:
++    void record(std::string key, Prefix * prefix) {
++        if (key.empty() || !max_entries_) return;
++        std::lock_guard<std::mutex> guard(mutex_);
++        auto it = locate(key);
++        if (it != entries_.end()) {
++            entries_.splice(entries_.begin(), entries_, it);
++            // A retained tombstone prevents a second lookup from picking one
++            // of two indistinguishable branches by recency.
++            if (it->prefix && (!prefix || it->prefix->text != prefix->text || it->prefix->ids != prefix->ids)) {
++                bytes_ -= it->charge - it->key.capacity();
++                it->charge = it->key.capacity();
++                it->prefix.reset();
++            }
++            return;
++        }
++        const size_t charge = key.capacity() + (prefix ? prefix->text.capacity() + prefix->ids.capacity() * sizeof(int32_t) : 0);
++        if (charge > max_bytes_) return;
++        auto immutable = prefix ? std::make_shared<const Prefix>(std::move(*prefix)) : nullptr;
++        entries_.push_front({std::move(key), std::move(immutable), charge});
++        bytes_ += charge;
++        while (entries_.size() > max_entries_ || bytes_ > max_bytes_) {
++            bytes_ -= entries_.back().charge;
++            entries_.pop_back();
++        }
++    }
++
++    struct Entry {
++        std::string key;
++        std::shared_ptr<const Prefix> prefix;
++        size_t charge;
++    };
++    std::list<Entry>::iterator locate(const std::string & key) {
++        return std::find_if(entries_.begin(), entries_.end(), [&](const Entry & e) { return e.key == key; });
++    }
++    const size_t max_entries_, max_bytes_;
++    size_t bytes_ = 0;
++    std::list<Entry> entries_;
++    std::mutex mutex_;
++};
++} // namespace kvmem
+diff --git a/core/server/oai.cpp b/core/server/oai.cpp
+--- a/core/server/oai.cpp
++++ b/core/server/oai.cpp
+@@ -3,6 +3,8 @@
+ #include "json_partial.h"
+ #include "query_span.h"
+ #include "kvmem/cache_owner.hpp"
++#include "kvmem/generated_history.hpp"
++#include "../../vendor/llama/common/chat-origin.h"
+ #include "rad_internal.h"
+ #include "mm/processor.h"
+ #include "server/nemotron35.h"
+@@ -272,6 +274,7 @@
+ };
+ 
+ const char* kAcceptedChat[] = {
++    "cache_reset",
+     "messages", "tools", "tool_choice", "response_format", "top_logprobs",
+     "parallel_tool_calls", "add_generation_prompt", "max_completion_tokens",
+     "chat_template_kwargs", "reasoning_effort", "reasoning", "thinking",
+@@ -1994,11 +1997,55 @@
+     return RAD_OK;
+ }
+ 
++// rad::json preserves insertion order. Object member order is irrelevant to
++// a transcript, including for nested tool call objects.
++static std::string history_json(const json& value) {
++    if (value.is_object()) {
++        std::map<std::string, std::string> fields;
++        for (auto it = value.begin(); it != value.end(); ++it) fields[it.key()] = history_json(*it);
++        std::string result = "{";
++        for (const auto& field : fields) {
++            if (result.size() > 1) result += ",";
++            result += json(field.first).dump() + ":" + field.second;
++        }
++        return result + "}";
++    }
++    if (value.is_array()) {
++        std::string result = "[";
++        for (const auto& item : value) {
++            if (result.size() > 1) result += ",";
++            result += history_json(item);
++        }
++        return result + "]";
++    }
++    return value.dump();
++}
++static std::string history_message(json msg) {
++    if (msg.contains("reasoning") && msg["reasoning"].is_string()) {
++        if (!msg.contains("reasoning_content")) msg["reasoning_content"] = msg.at("reasoning").get<std::string>();
++        if (msg.at("reasoning_content") == msg.at("reasoning")) msg.erase("reasoning");
++    }
++    auto c = msg.find("content");
++    if (c != msg.end() && c->is_array() && c->size() == 1) {
++        const auto& first = (*c)[0];
++        if (first.is_object() && first.size() == 2 && str_or(first,"type") == "text" &&
++                first.contains("text") && first.at("text").is_string()) {
++            const std::string value = first.at("text").get<std::string>();
++            *c = value;
++        }
++    }
++    if (msg.contains("tool_calls") && (!msg.contains("content") || msg.at("content").is_null()))
++        msg["content"] = "";
++    return history_json(msg) + "\n";
++}
++
+ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimits& lim,
+                        OaiRequest* out, ApiError* err) {
+     json b;
+     RAD_TRY(parse_request_object(body, lim, &b, err));
+     RAD_TRY(vet_keys(b, Endpoint::Chat, err));
++    bool reset_history = false;
++    if (!get_bool(b, "cache_reset", &reset_history, err)) return RAD_E_INVAL;
+ 
+     out->endpoint = Endpoint::Chat;
+     out->id = random_id("chatcmpl-");
+@@ -2357,12 +2404,53 @@
+     RAD_TRY(compile_grammar(d, out, out->tools_present ? "tools" : "grammar", err));
+ 
+     const std::string& rendered = render.prompt;
++    std::shared_ptr<const kvmem::GeneratedHistory::Prefix> selected;
+ 
+     PromptInput p;
+     if (media.empty()) {
+         /* add_special is false: the template renders the model's special tokens; BOS is placed
+          * below. */
+-        p.tokens = d.tok->encode(rendered, false, /*parse_special=*/true);
++        const std::string role = messages.empty() ? "" : str_or(messages.back(), "role");
++        if (d.generated_history && opt.add_generation_prompt && (role == "user" || role == "tool") &&
++                !out->legacy_functions && out->model == lim.model_id) {
++            out->generated_history_key = history_json(json::array({out->model, out->cache_owner, out->control_vector})) + "\n";
++            std::vector<size_t> ends;
++            for (const auto& msg : messages) {
++                out->generated_history_key += history_message(msg);
++                if (!reset_history && str_or(msg,"role") == "assistant") ends.push_back(out->generated_history_key.size());
++            }
++            const auto candidates = d.generated_history->candidates(out->generated_history_key, ends);
++            const auto vi = d.tok->vocab_info();
++            for (const auto& candidate : candidates) {
++                const size_t seam = candidate->text.size();
++                if (seam >= rendered.size() || rendered.compare(0, seam, candidate->text) != 0) continue;
++                auto suffix = d.tok->encode(rendered.substr(seam), false, true);
++                const int32_t turn_end = vi.eot >= 0 ? vi.eot : vi.eos;
++                if (suffix.empty() || suffix.front() != turn_end) continue;
++                size_t at = seam;
++                for (auto id : suffix) {
++                    auto piece = d.tok->token_bytes(id);
++                    if (piece.empty() || rendered.compare(at, piece.size(), piece) != 0) break;
++                    at += piece.size();
++                }
++                if (at != rendered.size()) continue;
++                const size_t n = candidate->ids.size() + suffix.size();
++                if (lim.max_ctx > 0 && (n >= size_t(lim.max_ctx) ||
++                        (out->max_tokens > 0 && size_t(out->max_tokens) > size_t(lim.max_ctx)-n))) continue;
++                chat_origin::Probe proof(rendered);
++                ChatRender probe_render; auto probe_opts = opt; probe_opts.quiet = true;
++                if (d.chat->apply(messages, tools, probe_opts, &probe_render, &why) < 0 ||
++                        probe_render.prompt != rendered ||
++                        !proof.owns(seam, seam + d.tok->token_bytes(suffix.front()).size())) continue;
++                selected = candidate;
++                out->generated_history_tokens = candidate->ids.size();
++                p.tokens = candidate->ids;
++                p.tokens.insert(p.tokens.end(), suffix.begin(), suffix.end());
++                RAD_INFO("KVMEM_GENERATED_HISTORY selected=%zu suffix=%zu", candidate->ids.size(), suffix.size());
++                break;
++            }
++        }
++        if (!selected) p.tokens = d.tok->encode(rendered, false, /*parse_special=*/true);
+         p.text = rendered;
+     } else {
+         MediaOpts mo;
+@@ -2385,8 +2473,39 @@
+             }
+         }
+     }
++    // Project historical message boundaries into the saved token sequence.
++    // A boundary inside a saved token cannot define an admissible span.
++    std::vector<size_t> saved_ends;
++    if (selected) {
++        size_t offset = 0;
++        const auto vi = d.tok->vocab_info();
++        for (auto id : selected->ids) {
++            const auto piece = d.tok->token_bytes(id);
++            if (saved_ends.empty() && vi.add_bos && vi.bos == id &&
++                    selected->text.compare(0, piece.size(), piece) != 0) {
++                saved_ends.push_back(0);
++                continue;
++            }
++            if (piece.empty() || selected->text.compare(offset, piece.size(), piece) != 0) {
++                saved_ends.clear(); break;
++            }
++            offset += piece.size(); saved_ends.push_back(offset);
++        }
++        if (offset != selected->text.size()) saved_ends.clear();
++    }
+     const auto encode_prefix = [&](const std::string& text) {
+         const auto encode = [&](const std::string& part) { return d.tok->encode(part, false, true); };
++        if (selected && rendered.compare(0, text.size(), text) == 0) {
++            if (text.size() >= selected->text.size()) {
++                auto ids = selected->ids;
++                const auto suffix = encode(text.substr(selected->text.size()));
++                ids.insert(ids.end(), suffix.begin(), suffix.end());
++                return ids;
++            }
++            const auto end = std::lower_bound(saved_ends.begin(), saved_ends.end(), text.size());
++            if (end == saved_ends.end() || *end != text.size()) return std::vector<int32_t>{};
++            return std::vector<int32_t>(selected->ids.begin(), selected->ids.begin() + (end-saved_ends.begin())+1);
++        }
+         if (!p.media) return encode(text);
+         return encode_media_prefix(text, RAD_MEDIA_MARKER, p.media->items.size(), encode,
+             [&](size_t i) -> const std::vector<int32_t>& { return p.media->items[i].item->expand; });
+@@ -3056,6 +3175,41 @@
+         a.push_back(std::move(c));
+     }
+     return a;
++}
++
++void publish_generated_history(const OaiDeps& d, const OaiRequest& r, const ParsedMessage& msg,
++                               const std::string& raw, const std::vector<int32_t>& gen, Finish finish) {
++    if (!d.generated_history || r.generated_history_key.empty() || r.prompts.size() != 1 ||
++            msg.open_call || (finish != Finish::Stop && finish != Finish::StopString && finish != Finish::Length))
++        return;
++    json assistant{{"role", "assistant"}, {"content", msg.content}};
++    if (!msg.reasoning.empty()) assistant["reasoning_content"] = msg.reasoning;
++    if (!msg.tool_calls.empty()) assistant["tool_calls"] = tool_calls_json(msg.tool_calls);
++    auto key = r.generated_history_key + history_message(std::move(assistant));
++    // The scheduler can deliver its last EOS to the sink even on a length
++    // finish. It has no reply bytes. The renderer must supply this same EOT
++    // at the seam; saving it here as well would replay it twice.
++    auto end = gen.end();
++    const auto vi = d.tok->vocab_info();
++    const int32_t turn_end = vi.eot >= 0 ? vi.eot : vi.eos;
++    if (end != gen.begin() && gen.back() == turn_end && d.tok->reply_bytes(gen.back()).empty()) --end;
++    size_t offset = 0;
++    for (auto it = gen.begin(); it != end; ++it) {
++        const int32_t id = *it;
++        auto piece = d.tok->token_bytes(id);
++        if (piece.empty() || raw.compare(offset, piece.size(), piece) != 0) {
++            d.generated_history->mark_ambiguous(std::move(key)); return;
++        }
++        offset += piece.size();
++    }
++    if (offset != raw.size() || finish == Finish::StopString) {
++        d.generated_history->mark_ambiguous(std::move(key)); return;
++    }
++    if (end == gen.begin()) return;
++    const auto& prompt = r.prompts.front();
++    kvmem::GeneratedHistory::Prefix prefix{prompt.text + raw, prompt.tokens};
++    prefix.ids.insert(prefix.ids.end(), gen.begin(), end);
++    d.generated_history->publish(std::move(key), std::move(prefix));
+ }
+ 
+ static json usage_json(const UsageOut& u) {
+@@ -3118,7 +3272,11 @@
+     if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
+     o["choices"] = std::move(choices);
+     o["usage"] = usage_json(u);
+-    if (t.valid) o["timings"] = timings_json(t);
++    if (t.valid) {
++        o["timings"] = timings_json(t);
++        if (!r.generated_history_key.empty())
++            o["timings"]["cache_reuse"]["generated_history_tokens"] = uint64_t(r.generated_history_tokens);
++    }
+     return o.dump();
+ }
+ 
+diff --git a/core/server/oai.h b/core/server/oai.h
+--- a/core/server/oai.h
++++ b/core/server/oai.h
+@@ -20,6 +20,8 @@
+ #include <string>
+ #include <vector>
+ 
++namespace kvmem { class GeneratedHistory; }
++
+ namespace rad {
+ namespace server {
+ 
+@@ -94,6 +96,8 @@
+      * /sessions. */
+     std::string session_label;
+     std::string cache_owner;
++    std::string generated_history_key;
++    size_t generated_history_tokens = 0;
+     /* The build, as OpenAI's and llama.cpp's `system_fingerprint`. */
+     std::string system_fingerprint;
+ 
+@@ -289,7 +293,12 @@
+     IGrammarCompiler* grammar = nullptr;
+     IMultimodal*      mm = nullptr;
+     IEmbedder*        embed = nullptr;
+-};
++    std::shared_ptr<kvmem::GeneratedHistory> generated_history;
++};
++
++void publish_generated_history(const OaiDeps&, const OaiRequest&, const ParsedMessage&,
++                               const std::string& raw, const std::vector<int32_t>& generated,
++                               Finish finish);
+ 
+ /* The request-key policy (oai.cpp, key vetting) as lists, so a test can cover every key. */
+ struct KeyPolicy {
+diff --git a/core/server/server.cpp b/core/server/server.cpp
+--- a/core/server/server.cpp
++++ b/core/server/server.cpp
+@@ -1,8 +1,10 @@
+ #include "server.h"
+ #include "server_priv.h"
++#include "kvmem/generated_history.hpp"
+ #include "mm/processor.h"
+ 
+ #include <cstdio>
++#include <cstdlib>
+ #include "clef.h"
+ #include "laya.h"
+ #include "mica.h"
+@@ -54,6 +56,7 @@
+     lim_.reasoning_effort_map = opt_.reasoning_effort_map;
+     lim_.reasoning_format = opt_.reasoning_format;
+ 
++    if (opt_.capture_query_span) odeps_.generated_history = std::make_shared<kvmem::GeneratedHistory>();
+     odeps_.tok = deps_.tok;
+     odeps_.chat = deps_.chat;
+     odeps_.grammar = deps_.grammar;
+@@ -576,6 +579,15 @@
+ 
+             Request rq;
+             rq.prompt = r.prompts[p].tokens;
++            if (!r.generated_history_key.empty() && std::getenv("KVMEM_TRACE_GENERATED_HISTORY_IDS")) {
++                uint64_t hash = UINT64_C(14695981039346656037);
++                for (int32_t token : rq.prompt) {
++                    for (int shift = 0; shift < 32; shift += 8)
++                        hash = (hash ^ ((uint32_t(token) >> shift) & 255)) * UINT64_C(1099511628211);
++                }
++                RAD_INFO("KVMEM_EFFECTIVE_IDS request=%s selected=%zu tokens=%zu fnv1a64=%016llx",
++                         r.id.c_str(), r.generated_history_tokens, rq.prompt.size(), (unsigned long long)hash);
++            }
+             rq.query_begin = r.prompts[p].query_begin;
+             rq.history_end = r.prompts[p].history_end;
+             rq.history_reuse_end = r.prompts[p].history_end;
+@@ -781,7 +793,7 @@
+             progress = true;
+             for (size_t i = 0; i < n; ++i) {
+                 g.think.push(r.sp.reasoning, buf[i].token);
+-                if (r.shape == ApiShape::LlamaNative || r.return_tokens)
++                if (r.shape == ApiShape::LlamaNative || r.return_tokens || !r.generated_history_key.empty())
+                     g.tokens.push_back(buf[i].token);
+                 std::string piece = g.detok->push(buf[i].token);
+                 if (!piece.empty()) g.text += piece;
+@@ -1096,6 +1108,8 @@
+         }
+     }
+ 
++    for (size_t i = 0; i < gens.size(); ++i)
++        publish_generated_history(odeps_, r, choices[i].msg, gens[i].text, gens[i].tokens, gens[i].finish);
+     record(r, gens, overall);
+     retire(gens);
+     release(r.n_choices());
+@@ -1451,6 +1465,11 @@
+                         out += g.delta->error_chunk(e, gt, u);
+                     } else {
+                         out += g.delta->final_chunk(g.finish, gt, u);
++                        if (!st->r.generated_history_key.empty()) {
++                            ParsedMessage msg = g.delta->parsed();
++                            if (!st->r.reply_parser) msg.content = g.text;
++                            publish_generated_history(self->odeps_, st->r, msg, g.text, g.tokens, g.finish);
++                        }
+                         overall = outcome(overall, g.delta->adjusted_finish(g.finish));
+                     }
+                 } else if (st->r.shape == ApiShape::LlamaNative) {
+diff --git a/vendor/llama/common/chat-origin.h b/vendor/llama/common/chat-origin.h
+new file mode 100644
+--- /dev/null
++++ b/vendor/llama/common/chat-origin.h
+@@ -0,0 +1,32 @@
++#pragma once
++#include <algorithm>
++#include <cstddef>
++#include <string>
++#include <utility>
++#include <vector>
++
++// Optional per-thread probe of an exact rendering. Only the Jinja runtime knows
++// whether a delimiter came from a message or from the template itself.
++namespace chat_origin {
++struct Probe {
++    explicit Probe(const std::string & text) : expected(text), previous(current) { current = this; }
++    ~Probe() { current = previous; }
++    Probe(const Probe &) = delete;
++    const std::string & expected;
++    Probe * previous;
++    inline static thread_local Probe * current = nullptr;
++    using Ranges = std::vector<std::pair<size_t, size_t>>;
++    Ranges literals;
++    bool seen = false;
++    void observe(Ranges ranges) {
++        if (!seen) literals = std::move(ranges);
++        else if (literals != ranges) literals.clear();
++        seen = true;
++    }
++    bool owns(size_t begin, size_t end) const {
++        return std::any_of(literals.begin(), literals.end(), [&](const auto & r) {
++            return r.first <= begin && end <= r.second;
++        });
++    }
++};
++}
+diff --git a/vendor/llama/common/chat.cpp b/vendor/llama/common/chat.cpp
+--- a/vendor/llama/common/chat.cpp
++++ b/vendor/llama/common/chat.cpp
+@@ -1,4 +1,5 @@
+ #include "chat.h"
++#include "chat-origin.h"
+ 
+ #include "chat-auto-parser-helpers.h"
+ #include "chat-auto-parser.h"
+@@ -925,6 +926,24 @@
+     }
+     if (inputs.add_eos && string_ends_with(result, tmpl.eos_token())) {
+         result = result.substr(0, result.size() - tmpl.eos_token().size());
++    }
++
++    if (auto * probe = chat_origin::Probe::current; probe && inputs.mark_input && result == probe->expected) {
++        const auto parts = jinja::runtime::gather_string_parts(results);
++        const auto original = parts->val_str.str();
++        const size_t skip = inputs.add_bos && string_starts_with(original, tmpl.bos_token())
++            ? tmpl.bos_token().size() : 0;
++        chat_origin::Probe::Ranges literals;
++        if (original.compare(skip, result.size(), result) == 0) {
++            size_t pos = 0;
++            for (const auto & part : parts->val_str.parts) {
++                const size_t end = pos + part.val.size();
++                if (!part.is_input && end > skip && pos < skip + result.size())
++                    literals.emplace_back(std::max(pos, skip)-skip, std::min(end-skip, result.size()));
++                pos = end;
++            }
++        }
++        probe->observe(std::move(literals));
+     }
+     return result;
+ }

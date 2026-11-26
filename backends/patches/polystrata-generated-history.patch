@@ -1,0 +1,549 @@
+diff --git a/terminal/serve/generated_history.py b/terminal/serve/generated_history.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..919b2a726957ff6ba739a5ef70474638f8bb71a6
+--- /dev/null
++++ b/terminal/serve/generated_history.py
+@@ -0,0 +1,144 @@
++"""Bounded, model-local storage for accepted text generation IDs, independent of native KV."""
++from array import array
++from collections import OrderedDict
++from hashlib import sha256
++import json
++import threading
++
++
++def extend(key, message):
++    encoded = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++    return sha256(key + encoded.encode("ascii")).digest()
++
++
++def pieces(tokenizer, ids):
++    return b"".join(tokenizer.token_bytes(i) for i in ids)
++
++
++class Directory:
++    def __init__(self, max_records=32, max_bytes=32 << 20):
++        self.max_records = max_records
++        self.max_bytes = max_bytes
++        self.entries = OrderedDict()
++        self.size = 0
++        self.lock = threading.Lock()
++
++    def begin(self, domain, messages, lookup=True):
++        parent = domain
++        ancestors = []
++        for message in messages:
++            parent = extend(parent, message)
++            if message["role"] == "assistant":
++                ancestors.append(parent)
++        with self.lock:
++            candidates = [self.entries[k] for k in reversed(ancestors) if self.entries.get(k)] if lookup else []
++        return Request(self, parent, candidates)
++
++    @staticmethod
++    def charge(key, record):
++        return len(key) + (sum(map(len, record)) if record else 0)
++
++    def publish(self, key, record):
++        with self.lock:
++            if key in self.entries:
++                old = self.entries.pop(key)
++                self.size -= self.charge(key, old)
++                if old != record:
++                    record = None  # indistinguishable response; keep the tombstone until eviction
++            cost = self.charge(key, record)
++            if cost > self.max_bytes:
++                return
++            self.entries[key] = record
++            self.size += cost
++            while self.size > self.max_bytes or len(self.entries) > self.max_records:
++                old_key, old_record = self.entries.popitem(last=False)
++                self.size -= self.charge(old_key, old_record)
++
++
++class Request:
++    def __init__(self, directory, parent, candidates):
++        self.directory = directory
++        self.parent = parent
++        self.candidates = candidates
++        self.reused = 0
++        self.original = ""
++        self.output = None
++
++    def encoder(self, service, original, tokenize, limit):
++        from .frontend import unmark_think_literals
++        self.original = original
++        original_bytes = original.encode("utf-8")
++        eog = getattr(service.engine, "eos_ids", ())
++        for marked_prefix, packed in self.candidates:
++            if not original_bytes.startswith(marked_prefix):
++                continue
++            seam = len(marked_prefix.decode("utf-8"))
++            suffix = original[seam:]
++            tail = tokenize(suffix)
++            plain_tail, literal = unmark_think_literals(suffix, service.literals)
++            if (not tail or tail[0] not in eog or (literal and literal[0][0] == 0)
++                    or pieces(service.tok, tail) != plain_tail.encode("utf-8")):
++                continue
++            # A worker can accept extra stop IDs. Require an explicitly declared end ID or
++            # a complete ChatML end marker, never an ordinary byte inside a split marker.
++            declared = getattr(service.tok, "special_ids", {}) or {}
++            if (tail[0] not in (declared.get(k) for k in ("eos", "tokenizer.ggml.eos_token_id",
++                    "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"))
++                    and service.tok.token_bytes(tail[0]) not in (b"<|im_end|>", b"<|endoftext|>")):
++                continue
++            saved = array("i")
++            saved.frombytes(packed)
++            if len(saved) + len(tail) > limit:
++                continue
++            ids = saved.tolist()
++            self.reused = len(ids)
++
++            def effective(text):
++                if text == original:
++                    return ids + tail
++                if len(text) >= seam and original.startswith(text):
++                    return ids + tokenize(text[seam:])
++                return tokenize(text)
++            return effective
++        return tokenize
++
++    def observe(self, service, ids, events, cancel):
++        from .frontend import unmark_think_literals
++        text, reasoning, calls = [], [], []
++        for kind, value in events:
++            if kind == "event":
++                if value.kind == "content":
++                    text.append(value.text)
++                elif value.kind == "reasoning":
++                    reasoning.append(value.text)
++                elif value.kind == "tool_call":
++                    call = value.call
++                    calls.append({"id": call.id, "function": {"name": call.name, "arguments": call.arguments}})
++            elif kind == "done" and value["finish"] in ("stop", "length") and not cancel.is_set():
++                assistant = {"role": "assistant", "content": "".join(text)}
++                if reasoning:
++                    assistant["reasoning_content"] = "".join(reasoning)
++                if calls:
++                    assistant["tool_calls"] = calls
++                key = extend(self.parent, assistant)
++                record = None
++                if self.output and not any(k in value for k in ("stop_sequence", "tool_markup_retry",
++                                                                "unread_tool_markup", "rejected_tool_calls")):
++                    raw = self.output
++                    if raw[-1] in getattr(service.engine, "eos_ids", ()):
++                        raw = raw[:-1]
++                    prompt_text, _ = unmark_think_literals(self.original, service.literals)
++                    if raw and pieces(service.tok, ids) == prompt_text.encode("utf-8"):
++                        suffix = pieces(service.tok, raw)
++                        try:
++                            decoded = suffix.decode("utf-8")
++                        except UnicodeDecodeError:
++                            pass
++                        else:
++                            # The frontend uses private-use characters to protect literal control tags.
++                            # An actual model output containing one would change bytes on the next unmark.
++                            _, translated = unmark_think_literals(decoded, service.literals)
++                            if not translated:
++                                record = (self.original.encode("utf-8") + suffix, array("i", list(ids) + raw).tobytes())
++                self.directory.publish(key, record)
++            yield kind, value
+diff --git a/terminal/serve/kvmem.py b/terminal/serve/kvmem.py
+index 7b68e76c0d684cca8da75098958ca7d92a268541..c022885a7f2ad7c2d58046cc1f69a6eff188bbe5 100644
+--- a/terminal/serve/kvmem.py
++++ b/terminal/serve/kvmem.py
+@@ -74,7 +74,7 @@ def _common(a, b):
+     return i
+ 
+ 
+-def canonical_end(service, messages, tools, kwargs, original, ids):
++def canonical_end(service, messages, tools, kwargs, original, ids, tokenize=None):
+     """Prove the complete history rendering, not a user-selected Query span.
+ 
+     Unknown templates/effort-control rewrites and boundary merges opt out.
+@@ -93,18 +93,22 @@ def canonical_end(service, messages, tools, kwargs, original, ids):
+         history = service.template.render(messages, tools=tools, **options)
+         if not history or not original.startswith(history):
+             return -1
+-        text, plain = unmark_think_literals(history, service.literals)
+-        prefix = service.tok.encode(text, parse_special=True, plain=plain)
++        if tokenize is None:
++            text, plain = unmark_think_literals(history, service.literals)
++            prefix = service.tok.encode(text, parse_special=True, plain=plain)
++        else:
++            prefix = tokenize(history)
+         return len(prefix) if prefix and len(prefix) <= len(ids) and list(ids[:len(prefix)]) == prefix else -1
+     except (TemplateError, TypeError, ValueError):
+         return -1
+ 
+ 
+-def _bounds(service, original, first, last, ids):
++def _bounds(service, original, first, last, ids, tokenize=None):
+     from .frontend import unmark_think_literals
+-    def tokenize(text):
+-        plain_text, plain = unmark_think_literals(text, service.literals)
+-        return service.tok.encode(plain_text, parse_special=True, plain=plain)
++    if tokenize is None:
++        def tokenize(text):
++            plain_text, plain = unmark_think_literals(text, service.literals)
++            return service.tok.encode(plain_text, parse_special=True, plain=plain)
+     prefix = tokenize(original[:first])
+     through = tokenize(original[:last])
+     begin, end = _common(ids, prefix), _common(ids, through)
+@@ -168,15 +172,21 @@ def resolve_query(service, messages, tools, kwargs, ids, spec):
+     raise ValueError("the template cannot prove an unchanged explicit KVMem query; do not split literal control tags")
+ 
+ 
+-def encode(service, messages, tools, kwargs):
++def encode(service, messages, tools, kwargs, history=None, limit=0):
+     from .frontend import mark_think_literals, unmark_think_literals
+ 
+     marked, marked_tools, _ = mark_think_literals(messages, tools, service.literals)
++    original = service.render_prompt(marked, marked_tools, kwargs)
++
++    def tokenize(text):
++        plain_text, plain = unmark_think_literals(text, service.literals)
++        return service.tok.encode(plain_text, parse_special=True, plain=plain)
++
++    if history is not None:
++        tokenize = history.encoder(service, original, tokenize, limit)
+     if messages and messages[-1].get("role")!="user":
+-        original=service.render_prompt(marked,marked_tools,kwargs)
+-        text,plain=unmark_think_literals(original,service.literals)
+-        ids = service.tok.encode(text,parse_special=True,plain=plain)
+-        return Prompt(ids,(0,0),canonical_end=canonical_end(service,marked,marked_tools,kwargs,original,ids))
++        ids = tokenize(original)
++        return Prompt(ids,(0,0),canonical_end=canonical_end(service,marked,marked_tools,kwargs,original,ids,tokenize))
+     user = next((i for i in range(len(marked) - 1, -1, -1) if marked[i].get("role") == "user"), None)
+     if user is None:
+         raise ValueError("KVMem retrieval needs a user message")
+@@ -188,7 +198,6 @@ def encode(service, messages, tools, kwargs):
+     elif not isinstance(content, str) or not content.strip():
+         raise ValueError("KVMem query must contain text")
+ 
+-    original = service.render_prompt(marked, marked_tools, kwargs)
+     tag = uuid.uuid4().hex
+     begin_marker, end_marker = f"\x01kvmem-begin-{tag}\x01", f"\x01kvmem-end-{tag}\x01"
+     rendered = None
+@@ -212,11 +221,7 @@ def encode(service, messages, tools, kwargs):
+     if rendered is None:
+         raise ValueError("the chat template cannot prove an unchanged KVMem user-query span")
+ 
+-    def tokenize(text):
+-        plain_text, plain = unmark_think_literals(text, service.literals)
+-        return service.tok.encode(plain_text, parse_special=True, plain=plain)
+-
+     ids = tokenize(original)
+     # BPE can merge text on either side of a character boundary. Include the
+     # boundary token that contains query text rather than changing the prompt.
+-    return Prompt(ids, _bounds(service, original, *rendered, ids), canonical_end=canonical_end(service,marked,marked_tools,kwargs,original,ids))
++    return Prompt(ids, _bounds(service, original, *rendered, ids, tokenize), canonical_end=canonical_end(service,marked,marked_tools,kwargs,original,ids,tokenize))
+diff --git a/terminal/serve/server.py b/terminal/serve/server.py
+index 67d6c8f3d384d73b9dfc15c66d00012feb11f4a4..938b7476e7dd3125fb7e3d0eb4501d67dc4da010 100644
+--- a/terminal/serve/server.py
++++ b/terminal/serve/server.py
+@@ -4508,6 +4508,8 @@ class Service:
+     def _read_tokenizer(self, tokenizer) -> None:
+         """What the model's tokenizer says of the model: the texts that stay text inside a message, the tokens that
+         end a reply, and how it writes a tool call."""
++        from serve.generated_history import Directory
++        self.generated_history = Directory()  # a model switch changes tokenizer, template and native KV identity
+         self.parser_cls = parser_for_template(getattr(self.template, "source", None))   # reads the model's output (reasoning, content, tool calls): by the template's tool-call form
+         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))
+         im_end = tokenizer.encode(IM_END, parse_special=True)
+@@ -6191,7 +6193,24 @@ class Service:
+         fetched = self._note_unreadable_tool_images(messages, cancel)
+         if self.preserve_thinking and not getattr(self, "client_reasoning_history", False) and kwargs.get("preserve_thinking") is not False:
+             messages = self.restore_reasoning(messages)
+-        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
++        history = None
++        options = req or {}
++        domain = getattr(self.embeddings, "history_domain", None) if getattr(self, "api_key", "") else b""
++        if (kvmem.enabled(self.engine) and getattr(self, "generated_history", None) is not None
++                and domain is not None and messages and messages[-1].get("role") in ("user", "tool")
++                and not force and not self.drop_oldest and not images_of(messages)
++                and not options.get("strata_prefix") and not options.get("response_format")
++                and not (isinstance(options.get("text"), dict) and options["text"].get("format"))
++                and hasattr(self.tok, "token_bytes")):
++            lookup = not options.get("cache_reset") and "kvmem_query" not in options
++            history = self.generated_history.begin(domain, messages, lookup)
++            ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
++            reserve = max_new if max_new and max_new > 0 else 1
++            if self.fit_max_tokens:
++                reserve = min(reserve, fit_floor(ctx))
++            ids = encoded_ids = kvmem.encode(self, messages, tools, kwargs, history, ctx - CTX_SLACK - reserve)
++        else:
++            ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+         if self.drop_oldest:
+             messages, ids = self.drop_oldest_turns(messages, tools, kwargs, ids, max_new)
+             encoded_ids = ids
+@@ -6296,6 +6315,7 @@ class Service:
+                 ids = out
+         if kvmem.enabled(self.engine):
+             ids = kvmem.Prompt(ids, getattr(ids, "kvmem_query", (0, 0)), kvmem.cache_owner(req), getattr(ids, "kvmem_canonical_end", -1))
++            ids.generated_history = history
+         ctx = self.engine.max_context
+         if ctx <= 0:
+             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
+@@ -6496,11 +6516,16 @@ class Service:
+         if ka is not None:
+             ka.acquire()
+         try:
++            events = self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
++            history = getattr(ids, "generated_history", None)
++            if history is not None:
++                history.output = None
++                events = history.observe(self, ids, events, cancel)
+             if not self.preserve_thinking or getattr(self, "client_reasoning_history", False):
+-                yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
++                yield from events
+                 return
+             reasoning, text = [], []
+-            for kind, payload in self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred):
++            for kind, payload in events:
+                 if kind == "event" and payload.kind in ("reasoning", "content"):
+                     (reasoning if payload.kind == "reasoning" else text).append(payload.text or "")
+                 yield kind, payload
+@@ -7238,6 +7263,10 @@ class Service:
+         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+                 "timings": timings, "reasoning_tokens": thinking_n,
+                 "reasoning_recoveries": recovery_count}
++        if timings is not None and hasattr(ids, "kvmem_query"):
++            timings["cache_reuse"] = {k: st[k] for k in ("actual_cached_tokens", "planned_cached_tokens",
++                "cache_source", "restore_path", "cache_semantics_revision") if k in st}
++            timings["cache_reuse"]["generated_history_tokens"] = getattr(getattr(ids, "generated_history", None), "reused", 0)
+         if stops is not None and stops.hit is not None:
+             done["stop_sequence"] = stops.hit
+             if finish == "length":
+@@ -7263,6 +7292,10 @@ class Service:
+                 # hears that the call was cut (chars 0: it is not in the text); the server's own retry (finish "stop", no call started)
+                 # never ran for it, and a cut by max tokens would only meet the same cap again.
+                 done["unread_tool_markup"] = {"reason": "cut_off", "chars": 0}
++        history = getattr(ids, "generated_history", None)
++        if history is not None and len(segments) == 1 and segments[0].get("finish") in ("length", "stop") and not (
++                timed_out or nf_retried or recovery_count or looped or repeated or cancel.is_set()):
++            history.output = raw_ids
+         yield "done", done
+ 
+ 
+@@ -7927,6 +7960,7 @@ def make_handler(svc: Service):
+             auth = self.headers.get("Authorization", "")
+             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+             if key_matches(given, svc.api_key):
++                svc.embeddings.history_domain = hashlib.sha256(given.encode("utf-8")).digest()
+                 return True
+             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
+             return False
+diff --git a/terminal/serve/test_generated_history.py b/terminal/serve/test_generated_history.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..72584a1ac22df3ae695734bdc8160142fd6ebd67
+--- /dev/null
++++ b/terminal/serve/test_generated_history.py
+@@ -0,0 +1,177 @@
++"""Exercise accepted IDs at the Service/worker boundary, including cold native KV."""
++from pathlib import Path
++import tempfile
++import threading
++import unittest
++
++from serve.frontend import ChatTemplate, Event, ToolCall
++from serve.generated_history import Directory, extend
++from serve.server import ByteTokenizer, MockEngine, Service
++
++
++class Tokens(ByteTokenizer):
++    SPECIALS = ByteTokenizer.SPECIALS + ["ab"]
++    ALWAYS = ("ab",)
++
++    def token_bytes(self, token):
++        return self.SPECIALS[token - 256].encode() if token >= 256 else bytes([token])
++
++
++class Worker(MockEngine):
++    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
++        try:
++            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
++        finally:
++            self.last = dict(generated=len(self.script), reused=0, prompt_read=len(ids),
++                             prompt_ms=1., decode_ms=1., finish="stop")
++
++
++class GeneratedHistoryTests(unittest.TestCase):
++    def setUp(self):
++        path = tempfile.TemporaryDirectory()
++        self.addCleanup(path.cleanup)
++        template = Path(path.name) / "test.jinja"
++        template.write_text("{% for m in messages %}<|im_start|>{{m.role}}\n"
++                            "{{m.content}}{% if m.tool_calls %}{{m.tool_calls[0].function.name}}{% endif %}"
++                            "<|im_end|>{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
++                            encoding="utf-8")
++        self.tok = Tokens()
++        self.worker = Worker(self.tok, "x", max_context=8192)
++        self.worker.info = {"kvmem": 1}
++        self.worker.last = None
++        self.worker.script = [97, 98] * 4 + [257]
++        self.service = Service(self.worker, self.tok, ChatTemplate(template))
++        self.first = [{"role": "user", "content": "first"}]
++        self.echo = {"role": "assistant", "content": "ab" * 4}
++        self.next = self.first + [self.echo, {"role": "user", "content": "follow up"}]
++
++    def prepare(self, messages, req=None):
++        return self.service.prepare(messages, None, {"enable_thinking": False}, 32, req=req)[0]
++
++    def generate(self, ids):
++        return dict((kind, value) for kind, value in self.service.run(
++            ids, False, None, 32, {}, threading.Event()) if kind == "done")["done"]
++
++    def test_user_and_cold_replay_match_worker_ids_and_query(self):
++        first = self.prepare(self.first)
++        self.generate(first)
++        again = self.prepare(self.next)
++        n = len(first) + 8
++        self.assertEqual(again[:n], list(first) + [97, 98] * 4)
++        self.assertEqual(self.tok.decode(again[slice(*again.kvmem_query)]), "follow up")
++        self.assertEqual(again.kvmem_canonical_end, len(again) - len(first[first.kvmem_canonical_end:]))
++        done = self.generate(again)
++        self.assertEqual(done["timings"]["cache_reuse"]["generated_history_tokens"], n)
++        self.assertEqual(done["reused"], 0)
++        self.assertEqual(self.worker.last_prompt, again)
++        edited = self.first + [dict(self.echo, content="edited"), self.next[-1]]
++        self.assertEqual(self.prepare(edited).generated_history.reused, 0)
++        self.assertEqual(self.prepare(self.next, {"cache_reset": True}).generated_history.reused, 0)
++        self.assertEqual(self.prepare(self.next, {"kvmem_query": {"message": 2, "start": 0, "end": 6}}).generated_history.reused, 0)
++        self.worker.max_context = len(again) + 32  # the split IDs exceed capacity, canonical merges fit
++        self.service.fit_max_tokens = False
++        from serve.server import CTX_SLACK
++        self.worker.max_context += CTX_SLACK - 1
++        self.assertEqual(self.prepare(self.next).generated_history.reused, 0)
++
++    def test_tool_sentinel_and_structured_identity(self):
++        ids = self.prepare(self.first)
++        request = ids.generated_history
++        request.output = self.tok.encode("weather")
++        call = ToolCall("weather", {"city": "X"}, "call-1")
++        done = {"finish": "stop", "timings": {}}
++        list(request.observe(self.service, ids, [("event", Event("tool_call", call=call)), ("done", done)], threading.Event()))
++        assistant = {"role": "assistant", "content": "", "tool_calls": [
++            {"id": call.id, "function": {"name": call.name, "arguments": call.arguments}}]}
++        history = self.first + [assistant, {"role": "tool", "tool_call_id": call.id, "content": "rain"}]
++        resolved = self.prepare(history)
++        self.assertEqual(resolved.kvmem_query, (0, 0))
++        self.assertEqual(resolved.generated_history.reused, len(ids) + len("weather"))
++        assistant["tool_calls"][0]["function"]["arguments"] = {"city": "Y"}
++        self.assertEqual(self.prepare(history).generated_history.reused, 0)
++
++    def test_conflict_clipped_stop_and_authority(self):
++        self.service.api_key = "key"
++        self.assertIsNone(self.prepare(self.first).generated_history)
++        self.service.embeddings.history_domain = b"A"
++        self.generate(self.prepare(self.first))
++        self.service.embeddings.history_domain = b"B"
++        self.assertEqual(self.prepare(self.next).generated_history.reused, 0)
++        self.service.embeddings.history_domain = b"A"
++        self.assertGreater(self.prepare(self.next).generated_history.reused, 0)
++        self.worker.script = self.tok.encode("ab" * 4, parse_special=True) + [257]
++        self.generate(self.prepare(self.first))
++        self.assertEqual(self.prepare(self.next).generated_history.reused, 0)
++        self.service.generated_history = Directory()
++        self.generate(self.prepare(self.first))
++        ids = self.prepare(self.first)
++        history = ids.generated_history
++        history.output = [97, 98] * 6
++        list(history.observe(self.service, ids, [("event", Event("content", "ab" * 4)),
++                             ("done", {"finish": "stop", "stop_sequence": "!"})], threading.Event()))
++        self.assertEqual(self.prepare(self.next).generated_history.reused, 0)
++
++    def test_cancel_and_bounded_immutable_reads(self):
++        cancel = threading.Event()
++        cancel.set()
++        ids = self.prepare(self.first)
++        list(self.service.run(ids, False, None, 32, {}, cancel))
++        self.assertFalse(self.service.generated_history.entries)
++        directory = Directory(max_records=1, max_bytes=48)
++        key = extend(b"", self.echo)
++        directory.publish(key, (b"4", b"1234"))
++        reader = directory.begin(b"", [self.echo])
++        directory.publish(b"x" * 32, (b"3", b"x"))
++        self.assertEqual(directory.begin(b"", [self.echo]).candidates, [])
++        self.assertEqual(reader.candidates, [(b"4", b"1234")])
++        directory.publish(key, (b"x" * 48, b"x"))
++        self.assertLessEqual(directory.size, 48)
++
++    def test_disconnect_after_first_event_never_publishes(self):
++        stream = self.service.run(self.prepare(self.first), False, None, 32, {}, threading.Event())
++        for kind, item in stream:
++            if kind == "event" and item.kind == "content":
++                break
++        stream.close()
++        self.assertFalse(self.service.generated_history.entries)
++
++    def test_generated_private_literal_marker_falls_back_to_plain_bytes(self):
++        marker = self.service.literals["<|im_end|>"]
++        self.worker.script = list(marker.encode("utf-8")) + [257]
++        self.generate(self.prepare(self.first))
++        messages = self.first + [{"role": "assistant", "content": marker}, self.next[-1]]
++        follow = self.prepare(messages)
++        canonical = self.prepare(messages, {"cache_reset": True})
++        self.assertEqual(follow.generated_history.reused, 0)
++        self.assertEqual(follow, canonical)
++        self.assertIn("<|im_end|>", self.tok.decode(follow))
++        self.assertNotIn(marker, self.tok.decode(follow))
++
++    def test_oldest_complete_ancestor_and_independent_end_marker(self):
++        self.generate(self.prepare(self.first))
++        child = self.prepare(self.next)
++        self.generate(child)
++        newest = self.next + [self.echo, {"role": "user", "content": "third"}]
++        self.assertEqual(self.prepare(newest).generated_history.reused, len(child) + 8)
++        edited = self.next + [dict(self.echo, content="different"), newest[-1]]
++        self.assertEqual(self.prepare(edited).generated_history.reused, len(self.prepare(self.first)) + 8)
++        self.worker.eos_ids = frozenset()
++        self.assertEqual(self.prepare(newest).generated_history.reused, 0)
++
++    def test_concurrent_conflicting_publications_are_ambiguous(self):
++        directory = Directory()
++        key = extend(b"D", self.echo)
++        records = [(b"ab", b"split"), (b"ab", b"merged")] * 8
++        barrier = threading.Barrier(len(records))
++
++        def publish(record):
++            barrier.wait()
++            directory.publish(key, record)
++
++        writers = [threading.Thread(target=publish, args=(record,)) for record in records]
++        for writer in writers:
++            writer.start()
++        for writer in writers:
++            writer.join()
++        self.assertIsNone(directory.entries[key])
++        self.assertFalse(directory.begin(b"D", [self.echo]).candidates)
+diff --git a/terminal/serve/test_server.py b/terminal/serve/test_server.py
+index 0dbe122473ec7f41301941404671b8d73a61f633..8e692c482a72f39d0c0f6eeea76c9ecf85079c16 100644
+--- a/terminal/serve/test_server.py
++++ b/terminal/serve/test_server.py
+@@ -2822,6 +2822,7 @@ class DoneLineEngine(MockEngine):
+         self.done_lines = list(done_lines)
+ 
+     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
++        self.cache_reuse = {}  # StrataEngine resets these metrics for each request.
+         try:
+             yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+         finally:
+@@ -3575,7 +3576,7 @@ class CancelledRead(unittest.TestCase):
+     line's 15th field), not the whole prompt; an older engine's line (no such field) keeps the whole prompt."""
+ 
+     def test_parse_done_read_field(self):
+-        e = SimpleNamespace()
++        e = SimpleNamespace(cache_reuse={})
+         StrataEngine._parse_done(e, "DONE 0 98179 17565.0 0.0 cancel 0 0 0 0 0 0 0 0.0 12288")
+         self.assertEqual((e.last["prompt_tokens"], e.last["prompt_read"], e.last["finish"]), (98179, 12288, "cancel"))
+         StrataEngine._parse_done(e, "DONE 0 98179 17565.0 0.0 cancel 0 0 0 0 0 0 0 0.0")
+@@ -3584,7 +3585,7 @@ class CancelledRead(unittest.TestCase):
+     def test_parse_done_chunk_fields(self):
+         """The prompt's first chunk and its streamed expert blobs come as key=value fields after the positional ones,
+         with or without the five --lookup-chain fields; an older line has neither."""
+-        e = SimpleNamespace()
++        e = SimpleNamespace(cache_reuse={})
+         StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 chunk=1536 "
+                                     "experts_streamed=24576")
+         self.assertEqual((e.last["chunk"], e.last["experts_streamed"], e.last["offloaded"]), (1536, 24576, 2))
