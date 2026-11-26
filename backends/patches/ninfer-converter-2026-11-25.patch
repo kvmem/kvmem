@@ -1,0 +1,2008 @@
+diff --git a/tools/artifact/codecs/ptq1.py b/tools/artifact/codecs/ptq1.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4dbd8c703f27edecabe04bf84859ccdca6603bdd
+--- /dev/null
++++ b/tools/artifact/codecs/ptq1.py
+@@ -0,0 +1,31 @@
++"""Native Prism PTQ1_0 base-3 planes over groups of 128 ternary coordinates."""
++from __future__ import annotations
++
++import torch
++
++
++def pack(codes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    if codes.ndim != 2 or codes.shape[1] != 128:
++        raise ValueError("PTQ1 codes must have shape [groups,128]")
++    if bool(((codes < -1) | (codes > 1)).any()):
++        raise ValueError("PTQ1 codes must be in {-1,0,1}")
++    digits = codes.to(torch.int32) + 1
++    planes = []
++    for start, width, stages in ((0, 16, 5), (80, 8, 5), (120, 2, 4)):
++        values = digits[:, start:start + width * stages].reshape(-1, stages, width)
++        powers = torch.tensor([3 ** i for i in reversed(range(stages))],
++                              device=codes.device, dtype=torch.int32).view(1, stages, 1)
++        integer = (values * powers).sum(1)
++        denominator = 3 ** stages
++        planes.append(((integer * 256 + denominator - 1) // denominator).to(torch.uint8))
++    return torch.cat(planes[:2], dim=1), planes[2]
++
++
++def unpack(base: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
++    base = base.reshape(-1, 24).to(torch.int32)
++    high = high.reshape(-1, 2).to(torch.int32)
++    decoded = []
++    for words, stages in ((base[:, :16], 5), (base[:, 16:], 5), (high, 4)):
++        decoded.append(torch.stack([(((words * 3 ** i) & 255) * 3 // 256) - 1
++                                    for i in range(stages)], dim=1).flatten(1))
++    return torch.cat(decoded, dim=1).to(torch.int8)
+diff --git a/tools/artifact/codecs/row_split.py b/tools/artifact/codecs/row_split.py
+index b554ffaa90c86ecfea6dd6ae26e1acf99066cb1c..21ae0d3befe588d7a4330b2b05573e085adac790 100644
+--- a/tools/artifact/codecs/row_split.py
++++ b/tools/artifact/codecs/row_split.py
+@@ -87,6 +87,12 @@ def _unpack_two_bit(packed: torch.Tensor, group_size: int) -> torch.Tensor:
+ def _pack_codes(
+     codes: torch.Tensor, spec: QuantFormat
+ ) -> tuple[torch.Tensor, torch.Tensor]:
++    if spec.name == "t5_g128_fp16":
++        from .t5 import pack
++        return pack(codes), torch.empty((codes.shape[0], 0), dtype=torch.uint8, device=codes.device)
++    if spec.name == "ptq1_g128_fp16":
++        from .ptq1 import pack
++        return pack(codes)
+     if spec.bits == 2:
+         return (
+             _pack_two_bit(codes + spec.code_bias),
+@@ -133,8 +139,8 @@ def encode_row_split(
+         raise ValueError("codes and scales must be on the same device")
+     if spec.code_bias and bool(((codes < spec.qmin) | (codes > spec.qmax)).any()):
+         raise ValueError("Q2 codes must be in [-1, 2]")
+-    if spec.code_bias and not bool(torch.isfinite(scales).all()):
+-        raise ValueError("Q2 scales must be finite binary16 words")
++    if (spec.code_bias or spec.name in ("ptq1_g128_fp16", "t5_g128_fp16")) and not bool(torch.isfinite(scales).all()):
++        raise ValueError("grouped scales must be finite binary16 words")
+     grouped = codes.reshape(-1, spec.group_size)
+     base, high = _pack_codes(grouped, spec)
+     planes = RowPlanes(
+@@ -404,6 +410,13 @@ def _unpack_codes(
+     scales = planes.scale.view(torch.float16).reshape(
+         geometry.n, geometry.groups_per_row
+     )
++    if spec.name == "t5_g128_fp16":
++        from .t5 import unpack
++        return scales, unpack(planes.base).reshape(geometry.n, geometry.groups_per_row, spec.group_size)
++    if spec.name == "ptq1_g128_fp16":
++        from .ptq1 import unpack
++        return scales, unpack(planes.base, planes.high).reshape(
++            geometry.n, geometry.groups_per_row, spec.group_size)
+     if spec.bits == 8:
+         codes = planes.base.view(torch.int8).reshape(
+             geometry.n, geometry.groups_per_row, spec.group_size
+@@ -557,7 +570,7 @@ def dequantize_row_split(
+     geometry = row_split_geometry(spec, shape)
+     target = torch.device(device)
+     planes = _planes_on_device(source, geometry, target)
+-    if dtype == torch.bfloat16:
++    if dtype == torch.bfloat16 and spec.name not in ("ptq1_g128_fp16", "t5_g128_fp16"):
+         byte_indices, shifts = _high_indices(
+             target.type, target.index, spec.bits, spec.group_size
+         )
+diff --git a/tools/artifact/codecs/t5.py b/tools/artifact/codecs/t5.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5612924b7ce77a7e3f593dd744fb537fe1e77eba
+--- /dev/null
++++ b/tools/artifact/codecs/t5.py
+@@ -0,0 +1,41 @@
++"""Exact T5 layout from JGamboa/ninfer-4090-windows (Apache-2.0, see NOTICE).
++
++Two 13-byte units of 64 ternary coordinates per 128-column scale group.
++This codec rearranges represented integers; it never requantizes weights.
++"""
++from __future__ import annotations
++
++import torch
++
++
++def _columns(device):
++    return torch.tensor([[20 * (i // 4) + 4 * m + i % 4 for m in range(5)]
++                         for i in range(12)] + [[60, 61, 62, 63, 64]],
++                        dtype=torch.long, device=device)
++
++
++def pack(codes: torch.Tensor) -> torch.Tensor:
++    if codes.dtype != torch.int8 or codes.ndim != 2 or codes.shape[1] != 128:
++        raise ValueError("T5 codes must be int8 [groups,128]")
++    if bool(((codes < -1) | (codes > 1)).any()):
++        raise ValueError("T5 codes must be in {-1,0,1}")
++    units = codes.reshape(-1, 64).to(torch.int32) + 1
++    units = torch.cat((units, torch.zeros_like(units[:, :1])), dim=1)
++    digits = units[:, _columns(codes.device)]
++    powers = torch.tensor([81, 27, 9, 3, 1], device=codes.device)
++    integers = (digits * powers).sum(-1)
++    return ((256 * integers + 242) // 243).to(torch.uint8).reshape(-1, 26)
++
++
++def unpack(base: torch.Tensor) -> torch.Tensor:
++    if base.dtype != torch.uint8 or base.numel() % 26:
++        raise ValueError("T5 codes require whole 26-byte scale groups")
++    words = base.reshape(-1, 13).to(torch.int32)
++    digits = torch.stack([(((words * 3**i) & 255) * 3) >> 8 for i in range(5)], -1)
++    powers = torch.tensor([81, 27, 9, 3, 1], device=base.device)
++    canonical = (256 * (digits * powers).sum(-1) + 242) // 243
++    if bool((canonical != words).any()) or bool((digits[:, 12, 4] != 0).any()):
++        raise ValueError("T5 requires canonical bytes and a zero padding trit")
++    output = torch.empty((words.shape[0], 65), dtype=torch.int32, device=base.device)
++    output[:, _columns(base.device).flatten()] = digits.flatten(1)
++    return (output[:, :64] - 1).to(torch.int8).reshape(-1, 128)
+diff --git a/tools/artifact/formats.py b/tools/artifact/formats.py
+index 37b74d01b7f28b2a038864d6708849551b453c7a..a938731908f5d22d46646a02d63f71593eb82984 100644
+--- a/tools/artifact/formats.py
++++ b/tools/artifact/formats.py
+@@ -83,6 +83,9 @@ Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
+ # Ternary: two-bit two's-complement codes over {-1, 0, +1} (0b10 is outside the language),
+ # one binary16 multiplier per 128 columns; the native form of ternary checkpoints.
+ T2_G128_FP16 = QuantFormat("t2_g128_fp16", 2, 128, -1, 1)
++# bits describes the logical ternary code domain; PTQ1 uses its own base-3 codec.
++PTQ1_G128_FP16 = QuantFormat("ptq1_g128_fp16", 2, 128, -1, 1)
++T5_G128_FP16 = QuantFormat("t5_g128_fp16", 2, 128, -1, 1)
+ NVFP4 = Nvfp4Format("nvfp4", 16)
+ FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
+ FP8_E4M3FN_ROW_FP16 = Fp8RowFormat("fp8_e4m3fn_row_fp16", "fp16")
+@@ -126,7 +129,7 @@ DIRECT_FORMATS = MappingProxyType(
+ QUANT_FORMATS = MappingProxyType(
+     {
+         item.name: item
+-        for item in (Q2_G64_FP16, Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16, T2_G128_FP16)
++        for item in (Q2_G64_FP16, Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16, T2_G128_FP16, PTQ1_G128_FP16, T5_G128_FP16)
+     }
+ )
+ NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
+diff --git a/tools/artifact/gguf_a4.py b/tools/artifact/gguf_a4.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6d3cf712603e086acc5b39d150746dddf9da0e4
+--- /dev/null
++++ b/tools/artifact/gguf_a4.py
+@@ -0,0 +1,88 @@
++"""Make an explicit GGUF A4-permission artifact without changing physical tensor bytes.
++
++python -m tools.artifact.gguf_a4 source.ninfer output.ninfer --scope mlp-gate-up
++"""
++from __future__ import annotations
++import argparse
++import hashlib
++import json
++import re
++from pathlib import Path
++from .reader import Artifact
++from .schema import ResourceSpec, TensorObject, TensorSpec, binding_parts
++from .writer import ArtifactWriter
++
++def permit_a4(source: Path, output: Path, scope: str, *, verify_payload: bool = True) -> dict:
++    if scope not in {"all-projections", "mlp-gate-up", "mlp-gate-up-middle-half"}:
++        raise ValueError("unknown GGUF A4 scope")
++    if source.resolve() == output.resolve() or output.exists():
++        raise ValueError("output must be a new file distinct from the source")
++    with Artifact(source) as artifact:
++        description = artifact.directory.to_json()
++        layer_pattern=re.compile(r"text/layers/(\d+)/mlp/(gate|up)$")
++        layers=[int(m.group(1)) for name in description["bindings"]
++                if (m:=layer_pattern.fullmatch(name))]
++        count=max(layers)+1 if layers else 0
++        if scope=="mlp-gate-up-middle-half" and count<4:
++            raise ValueError("middle-half scope requires at least four text layers")
++        changed = []
++        for use in description["uses"]:
++            name = use["parameter"]
++            parts = binding_parts(description["bindings"][name], artifact.by_id)
++            gguf = all(isinstance(artifact.by_id[p[0]], TensorObject) and
++                       artifact.by_id[p[0]].format.startswith("gguf_") for p in parts)
++            match=layer_pattern.fullmatch(name)
++            selected = (not name.endswith("/output_head") if scope == "all-projections" else
++                        match is not None and (scope=="mlp-gate-up" or
++                        count//4<=int(match.group(1))<count-count//4))
++            if gguf and selected and use.get("activation_policy") == "AllowA8":
++                use["activation_policy"] = "AllowA4"
++                changed.append({"parameter": name, "input": use["input"]})
++        if not changed:
++            raise ValueError("scope selects no GGUF AllowA8 Uses")
++        specs = [TensorSpec(o.id, o.shape, o.format, o.layout, o.divisors)
++                 if isinstance(o, TensorObject) else ResourceSpec(o.id, o.bytes, o.encoding)
++                 for o in artifact.objects]
++        provenance = {**description["provenance"], "gguf_a4_permission": {
++            "source_artifact_id": artifact.artifact_id.hex(), "scope": scope,
++            "physical_objects": "unchanged", "changed_uses": changed}}
++        hashes = {}
++        with ArtifactWriter(output, specs, components=description["components"],
++                            bindings=description["bindings"], uses=description["uses"],
++                            metadata=description["metadata"], provenance=provenance) as writer:
++            for obj in artifact.objects:
++                digest = hashlib.sha256()
++                def chunks():
++                    for data in artifact.iter_range(obj.offset, obj.bytes):
++                        digest.update(data)
++                        yield data
++                writer.write_object(obj.id, chunks())
++                hashes[obj.id] = digest.hexdigest()
++            writer.finish()
++    with Artifact(output) as artifact:
++        if verify_payload:
++            for obj in artifact.objects:
++                digest = hashlib.sha256()
++                for data in artifact.iter_range(obj.offset, obj.bytes):
++                    digest.update(data)
++                if digest.hexdigest() != hashes[obj.id]:
++                    raise RuntimeError(f"physical object changed: {obj.id}")
++        return {"source": str(source), "output": str(output), "scope": scope,
++                "artifact_id": artifact.artifact_id.hex(), "changed_uses": changed,
++                "object_sha256": hashes, "payload_verified": verify_payload}
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("source", type=Path)
++    parser.add_argument("output", type=Path)
++    parser.add_argument("--scope", choices=("all-projections", "mlp-gate-up", "mlp-gate-up-middle-half"), required=True)
++    parser.add_argument("--report", type=Path)
++    args = parser.parse_args()
++    report = permit_a4(args.source, args.output, args.scope)
++    if args.report:
++        args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
++    print(json.dumps({**{k: v for k, v in report.items() if k not in {"object_sha256","changed_uses"}},
++                      "changed_uses":len(report["changed_uses"])}))
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/artifact/layouts.py b/tools/artifact/layouts.py
+index 006918180ece54f08a834347747956d598c5f825..036d3ed1706176f11264cc0ded42925afd1a49ff 100644
+--- a/tools/artifact/layouts.py
++++ b/tools/artifact/layouts.py
+@@ -103,7 +103,7 @@ CONTIGUOUS_LE_V1 = Layout(
+ ROW_SPLIT_K128_V1 = Layout(
+     "row_split_k128_v1",
+     256,
+-    frozenset(("q2_g64_fp16", "q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16", "t2_g128_fp16")),
++    frozenset(("q2_g64_fp16", "q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16", "t2_g128_fp16", "ptq1_g128_fp16", "t5_g128_fp16")),
+ )
+ BLOCK_SCALE_K16_M128X4_V1 = Layout(
+     "block_scale_k16_m128x4_v1",
+@@ -193,13 +193,18 @@ def row_split_geometry(
+     n, k = _shape(shape, rank=2)
+     k_pad = align_up(k, K_ALIGNMENT)
+     groups_per_row = k_pad // spec.group_size
+-    # 2- and 8-bit codes pack whole; 4/5/6-bit codes keep a 4-bit base plane plus a high plane.
+-    base_bytes_per_group = (
+-        spec.group_size * spec.bits // 8 if spec.bits in (2, 8) else spec.group_size // 2
+-    )
+-    high_bytes_per_group = (
+-        0 if spec.bits in (2, 4, 8) else spec.group_size * (spec.bits - 4) // 8
+-    )
++    if spec.name in ("ptq1_g128_fp16", "t5_g128_fp16"):
++        if k % 128:
++            raise ValueError("PTQ1 requires whole 128-column groups")
++        base_bytes_per_group, high_bytes_per_group = (24, 2) if spec.name == "ptq1_g128_fp16" else (26, 0)
++    else:
++        # 2- and 8-bit codes pack whole; 4/5/6-bit codes keep a 4-bit base plane plus a high plane.
++        base_bytes_per_group = (
++            spec.group_size * spec.bits // 8 if spec.bits in (2, 8) else spec.group_size // 2
++        )
++        high_bytes_per_group = (
++            0 if spec.bits in (2, 4, 8) else spec.group_size * (spec.bits - 4) // 8
++        )
+     base_row_bytes = groups_per_row * base_bytes_per_group
+     high_row_bytes = groups_per_row * high_bytes_per_group
+     scale_row_bytes = groups_per_row * 2
+diff --git a/tools/artifact/tensor_output.py b/tools/artifact/tensor_output.py
+index 6b8cea7554b59637104b0e9443f16a73c09cdc90..03d46fac21c1c024fe8c05b7e749dac9896f7218 100644
+--- a/tools/artifact/tensor_output.py
++++ b/tools/artifact/tensor_output.py
+@@ -92,11 +92,23 @@ class TensorOutput:
+         rows, k = codes.shape[0], obj.shape[1]
+         if rows <= 0 or row_begin + rows > obj.shape[0]:
+             raise ValueError(f"{obj.id}: encoded rows exceed parent")
+-        if packed and self.format.name not in ("q2_g64_fp16", "q8_g32_fp16"):
++        if packed and self.format.name not in ("q2_g64_fp16", "q8_g32_fp16", "ptq1_g128_fp16"):
+             raise ValueError("packed code planes require native Q2 or Q8")
+         self._padding()
+         if isinstance(self.format, QuantFormat):
+             g = row_split_geometry(self.format, obj.shape)
++            if packed and self.format.name == "ptq1_g128_fp16":
++                if (codes.dtype != torch.uint8 or tuple(codes.shape) != (rows, g.groups_per_row * 26)
++                        or scales.dtype != torch.float16 or tuple(scales.shape) != (rows, g.groups_per_row)):
++                    raise ValueError("packed PTQ1 rows require 26 code/tail bytes per group and FP16 scales")
++                records = codes.detach().cpu().contiguous().numpy().reshape(rows, g.groups_per_row, 26)
++                scale_words = scales.detach().cpu().contiguous().numpy()
++                if not np.isfinite(scale_words).all():
++                    raise ValueError("PTQ1 scales must be finite binary16 words")
++                self.write_bytes(g.base_offset + row_begin * g.base_row_bytes, records[:, :, :24].tobytes())
++                self.write_bytes(g.high_offset + row_begin * g.high_row_bytes, records[:, :, 24:].tobytes())
++                self.write_bytes(g.scale_offset + row_begin * g.scale_row_bytes, scale_words.tobytes())
++                return
+             if packed:
+                 if (codes.dtype != torch.uint8 or tuple(codes.shape) != (rows, g.base_row_bytes)
+                         or scales.dtype != torch.float16 or
+diff --git a/tools/convert/__main__.py b/tools/convert/__main__.py
+index 4270857318168e3604a7ed4685fec8ec2a6e8a20..f302c4da47c0f9f8b08e7e42cc6728eb12a12739 100644
+--- a/tools/convert/__main__.py
++++ b/tools/convert/__main__.py
+@@ -72,6 +72,10 @@ def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
+         # The ternary and GGUF block recipes read their block formats themselves, without gguf-py.
+         if name in block_sources:
+             return open_gguf(path)
++        if name == "dflash2":
++            from .dflash2_gguf import DraftSource
++
++            return DraftSource(path)
+         from .sources.gguf_source import GGUFSource
+ 
+         return GGUFSource(path)
+diff --git a/tools/convert/dense_geometry.py b/tools/convert/dense_geometry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c47433ef3112d0836a6f9ad357ae533cd59144b5
+--- /dev/null
++++ b/tools/convert/dense_geometry.py
+@@ -0,0 +1,93 @@
++"""Qwen3.5 dense GGUF geometry and exporter head-order transforms."""
++from dataclasses import dataclass
++import numpy as np
++
++
++@dataclass(frozen=True)
++class DenseGeometry:
++    hidden: int
++    intermediate: int
++    vocabulary: int
++    layers: int
++    attention_heads: int
++    kv_heads: int
++    attention_dim: int
++    key_heads: int
++    value_heads: int
++    head_dim: int
++    taps: int
++    tied: bool
++
++    @classmethod
++    def from_config(cls, config):
++        if "num_experts" in config:
++            raise ValueError("the dense GGUF recipe does not accept MoE weights")
++        result = cls(*(config[k] for k in (
++            "hidden_size", "intermediate_size", "vocab_size", "num_hidden_layers",
++            "num_attention_heads", "num_key_value_heads", "head_dim",
++            "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim",
++            "linear_conv_kernel_dim", "tie_word_embeddings")))
++        if (any(type(v) is not int or v <= 0 for v in tuple(vars(result).values())[:-1])
++                or type(result.tied) is not bool
++                or config["linear_value_head_dim"] != result.head_dim
++                or result.value_heads % result.key_heads
++                or result.attention_heads % result.kv_heads
++                or result.attention_dim != 256 or result.head_dim != 128 or result.taps != 4
++                or (result.attention_heads, result.kv_heads) not in ((8, 2), (16, 4), (24, 4))
++                or result.hidden % 128 or result.key_heads != 16
++                or result.value_heads not in (16, 32, 48)
++                or config["layer_types"] != ["full_attention" if result.full_attention(i)
++                    else "linear_attention" for i in range(result.layers)]):
++            raise ValueError("invalid dense GGUF head geometry or layer layout")
++        return result
++
++    @property
++    def query_rows(self): return self.attention_heads * self.attention_dim
++
++    @property
++    def kv_rows(self): return self.kv_heads * self.attention_dim
++
++    @property
++    def key_dim(self): return self.key_heads * self.head_dim
++
++    @property
++    def value_dim(self): return self.value_heads * self.head_dim
++
++    @property
++    def channels(self): return 2 * self.key_dim + self.value_dim
++
++    @staticmethod
++    def full_attention(layer): return (layer + 1) % 4 == 0
++
++    def expected_header(self):
++        return {"general.architecture": "qwen35", **{"qwen35." + key: value for key, value in {
++            "embedding_length": self.hidden, "feed_forward_length": self.intermediate,
++            "attention.head_count": self.attention_heads, "attention.head_count_kv": self.kv_heads,
++            "attention.key_length": self.attention_dim, "attention.value_length": self.attention_dim,
++            "ssm.conv_kernel": self.taps, "ssm.state_size": self.head_dim,
++            "ssm.group_count": self.key_heads, "ssm.time_step_rank": self.value_heads,
++            "ssm.inner_size": self.value_dim, "full_attention_interval": 4}.items()}}
++
++    def untile(self, array, head_dim):
++        if array.shape[0] != self.value_heads * head_dim:
++            raise ValueError("GDN value-head row count differs from config")
++        per_key = self.value_heads // self.key_heads
++        heads = np.arange(self.value_heads)
++        indices = (heads % per_key) * self.key_heads + heads // per_key
++        return np.ascontiguousarray(array.reshape(self.value_heads, head_dim, *array.shape[1:])
++                                   [indices].reshape(array.shape))
++
++    def untiled_rows(self, base):
++        per_key = self.value_heads // self.key_heads
++        def select(begin, end):
++            r = np.arange(begin, end, dtype=np.int64)
++            heads, lanes = r // self.head_dim, r % self.head_dim
++            return base + ((heads % per_key) * self.key_heads + heads // per_key) * self.head_dim + lanes
++        return select
++
++    def attention_rows(self, gate):
++        def select(begin, end):
++            r = np.arange(begin, end, dtype=np.int64)
++            d = self.attention_dim
++            return (r // d) * 2 * d + (d if gate else 0) + r % d
++        return select
+diff --git a/tools/convert/dflash2_gguf.py b/tools/convert/dflash2_gguf.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e271fc6cc4466cfe0cfb156d1a656b9c5b0e235
+--- /dev/null
++++ b/tools/convert/dflash2_gguf.py
+@@ -0,0 +1,405 @@
++"""A DFlash2 draft adapter kept as its own GGUF.
++
++The release ships the adapter both as a safetensors directory and as one ``-DFlash2`` GGUF
++whose tensors are already exported in the shapes and row order the artifact wants. This module
++reads that GGUF where the official recipes read the directory: the draft geometry is synthesised
++from the file's ``dflash.*`` keys and passed through ``draft_config``, every logical name of the
++adapter maps onto the ``fc``/``blk.*``/``selector_*`` tensor that holds it, and the projections
++whose consumer walks whole ggml blocks -- the feature projection, the merged gate/up MLP parent
++and the selector's hidden projection -- are imported byte for byte. Everything else takes the
++official fallback, because its consumer asks for a specific encoding there: the fused attention
++input projection (``prepare_attn_input_proj_weights``) and the two dynamic-convolution outputs
++(``linear_dynamic_grouped_conv_add``) require Q8, the convolution kernels and the codebooks are
++read as BF16, and the norms are direct tensors.
++
++The file carries no ``qwen3_5`` metadata, so the gguf-py ``GGUFSource`` cannot describe it; a
++small store wrapper presents the tensors under the names the adapter builder reads, which keeps
++the ordinary lazy ``matrix_source``/``tensor_source`` resolution working. A row of a carried
++block tensor is its own bytes, so only ``read_blocks`` and the ``gguf`` package's dequantiser
++are needed, and only values -- never the imported blocks -- pay for the latter.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from math import prod
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
++
++from .sources.gguf import (
++    GGUFFile,
++    TYPE_BF16,
++    TYPE_F16,
++    TYPE_F32,
++    TYPE_NAMES,
++    TensorInfo,
++)
++from .sources.logical import EncodedRows, LogicalSource
++
++_DIRECT_TYPES = (TYPE_F32, TYPE_F16, TYPE_BF16)
++_EMPTY_SCALES = torch.empty(0, dtype=torch.float16)
++
++# GGUF tensor name, the adapter's logical parameter and the checkpoint name the adapter builder
++# reads; ``{i}`` is the layer index. The three names are one-to-one, so one table serves both the
++# builder's store lookups and the recipe's block overrides.
++_TOP_TENSORS = (
++    ("fc.weight", "dflash2/feature_projection", "fc.weight"),
++    ("enc.output_norm.weight", "dflash2/context_norm", "hidden_norm.weight"),
++    ("output_norm.weight", "dflash2/final_norm", "norm.weight"),
++    (
++        "selector_hidden.weight",
++        "dflash2/candidate_selector/hidden_projection",
++        "candidate_selector.hidden_projection.weight",
++    ),
++    (
++        "selector_predecessor.weight",
++        "dflash2/candidate_selector/predecessor_codebook",
++        "candidate_selector.predecessor_codebook",
++    ),
++    (
++        "selector_successor.weight",
++        "dflash2/candidate_selector/successor_codebook",
++        "candidate_selector.successor_codebook",
++    ),
++)
++
++_LAYER_TENSORS = (
++    (
++        "blk.{i}.attn_norm.weight",
++        "dflash2/layers/{i}/input_norm",
++        "layers.{i}.input_layernorm.weight",
++    ),
++    (
++        "blk.{i}.ffn_norm.weight",
++        "dflash2/layers/{i}/post_attention_norm",
++        "layers.{i}.post_attention_layernorm.weight",
++    ),
++    (
++        "blk.{i}.attn_q.weight",
++        "dflash2/layers/{i}/attention/query",
++        "layers.{i}.self_attn.q_proj.weight",
++    ),
++    (
++        "blk.{i}.attn_k.weight",
++        "dflash2/layers/{i}/attention/key",
++        "layers.{i}.self_attn.k_proj.weight",
++    ),
++    (
++        "blk.{i}.attn_v.weight",
++        "dflash2/layers/{i}/attention/value",
++        "layers.{i}.self_attn.v_proj.weight",
++    ),
++    (
++        "blk.{i}.attn_output.weight",
++        "dflash2/layers/{i}/attention/output",
++        "layers.{i}.self_attn.o_proj.weight",
++    ),
++    (
++        "blk.{i}.attn_q_norm.weight",
++        "dflash2/layers/{i}/attention/query_norm",
++        "layers.{i}.self_attn.q_norm.weight",
++    ),
++    (
++        "blk.{i}.attn_k_norm.weight",
++        "dflash2/layers/{i}/attention/key_norm",
++        "layers.{i}.self_attn.k_norm.weight",
++    ),
++    (
++        "blk.{i}.ffn_gate.weight",
++        "dflash2/layers/{i}/mlp/gate",
++        "layers.{i}.mlp.gate_proj.weight",
++    ),
++    ("blk.{i}.ffn_up.weight", "dflash2/layers/{i}/mlp/up", "layers.{i}.mlp.up_proj.weight"),
++    (
++        "blk.{i}.ffn_down.weight",
++        "dflash2/layers/{i}/mlp/down",
++        "layers.{i}.mlp.down_proj.weight",
++    ),
++    (
++        "blk.{i}.attn_conv_base",
++        "dflash2/layers/{i}/attention_conv/base_kernel",
++        "layers.{i}.attention_conv.base_kernel",
++    ),
++    (
++        "blk.{i}.attn_conv_proj.weight",
++        "dflash2/layers/{i}/attention_conv/kernel_projection",
++        "layers.{i}.attention_conv.kernel_projection.weight",
++    ),
++    (
++        "blk.{i}.ffn_conv_base",
++        "dflash2/layers/{i}/mlp_conv/base_kernel",
++        "layers.{i}.mlp_conv.base_kernel",
++    ),
++    (
++        "blk.{i}.ffn_conv_proj.weight",
++        "dflash2/layers/{i}/mlp_conv/kernel_projection",
++        "layers.{i}.mlp_conv.kernel_projection.weight",
++    ),
++)
++
++# Adapter parameters whose consumer is a plain Linear over whole blocks, so a carried ggml type
++# is imported unchanged. The gate/up pair is decided per layer, because only one merged parent of
++# a single block type reaches gguf_swiglu's [gate; up] form.
++_BLOCK_ROLES = ("dflash2/feature_projection", "dflash2/candidate_selector/hidden_projection")
++
++
++def _aliases(layers: int) -> dict[str, str]:
++    """Every name a source lookup may use, mapped to the GGUF tensor that holds it."""
++
++    rows = list(_TOP_TENSORS)
++    for layer in range(layers):
++        rows.extend(tuple(item.format(i=layer) for item in entry) for entry in _LAYER_TENSORS)
++    table: dict[str, str] = {}
++    for tensor, logical, source in rows:
++        for alias in (tensor, logical, source):
++            table[alias] = tensor
++    return table
++
++
++def _integer(kv: dict, key: str, label: str) -> int:
++    value = kv.get(key)
++    if type(value) is not int:
++        raise ValueError(f"{label}: {key} must be an integer, got {value!r}")
++    return value
++
++
++def _real(kv: dict, key: str, label: str) -> float:
++    value = kv.get(key)
++    if type(value) not in (int, float):
++        raise ValueError(f"{label}: {key} must be a real number, got {value!r}")
++    return float(value)
++
++
++def validate(gguf: GGUFFile) -> tuple[dict, dict[str, str]]:
++    """Refuse a GGUF that is not a DFlash2 draft, and return its config and name aliases."""
++
++    label = str(gguf.path)
++    architecture = gguf.kv.get("general.architecture")
++    if architecture != "dflash":
++        raise ValueError(
++            f"{label}: general.architecture = {architecture!r}, expected 'dflash'"
++        )
++    if gguf.kv.get("dflash.attention.causal") is not False:
++        raise ValueError(f"{label}: the draft attention must be noncausal")
++    layers = _integer(gguf.kv, "dflash.block_count", label)
++    if layers <= 0:
++        raise ValueError(f"{label}: dflash.block_count must be positive")
++    tokens = gguf.kv.get("tokenizer.ggml.tokens")
++    if not isinstance(tokens, list) or not tokens:
++        raise ValueError(f"{label}: tokenizer.ggml.tokens is absent")
++    pattern = gguf.kv.get("dflash.attention.sliding_window_pattern")
++    if (
++        not isinstance(pattern, list)
++        or len(pattern) != layers
++        or any(type(value) is not bool for value in pattern)
++    ):
++        raise ValueError(f"{label}: dflash.attention.sliding_window_pattern is invalid")
++    taps = gguf.kv.get("dflash.target_layers")
++    if (
++        not isinstance(taps, list)
++        or not taps
++        or any(type(value) is not int or value <= 0 for value in taps)
++        or len(set(taps)) != len(taps)
++    ):
++        raise ValueError(f"{label}: dflash.target_layers is invalid")
++    head_dim = _integer(gguf.kv, "dflash.attention.key_length", label)
++    if _integer(gguf.kv, "dflash.attention.value_length", label) != head_dim:
++        raise ValueError(f"{label}: the draft key and value widths differ")
++    layer_types = [
++        "sliding_attention" if sliding else "full_attention" for sliding in pattern
++    ]
++    config = {
++        "architectures": ["DFlash2DraftModel"],
++        "model_type": "qwen3",
++        "hidden_act": "silu",
++        "attention_bias": False,
++        "is_causal": False,
++        "hidden_size": _integer(gguf.kv, "dflash.embedding_length", label),
++        "vocab_size": len(tokens),
++        "intermediate_size": _integer(gguf.kv, "dflash.feed_forward_length", label),
++        "num_attention_heads": _integer(gguf.kv, "dflash.attention.head_count", label),
++        "num_key_value_heads": _integer(gguf.kv, "dflash.attention.head_count_kv", label),
++        "head_dim": head_dim,
++        "num_hidden_layers": layers,
++        "max_position_embeddings": _integer(gguf.kv, "dflash.context_length", label),
++        "rms_norm_eps": _real(gguf.kv, "dflash.attention.layer_norm_rms_epsilon", label),
++        "rope_parameters": {
++            "rope_theta": _real(gguf.kv, "dflash.rope.freq_base", label)
++        },
++        "layer_types": layer_types,
++        "dflash_config": {
++            # The GGUF counts the target's layers from one, the checkpoint from zero.
++            "target_layer_ids": [index - 1 for index in taps],
++            "mask_token_id": _integer(gguf.kv, "tokenizer.ggml.mask_token_id", label),
++            "conv_kernel_size": _integer(gguf.kv, "dflash.conv_kernel_size", label),
++            "conv_group_size": _integer(gguf.kv, "dflash.conv_group_size", label),
++            "selector_rank": _integer(gguf.kv, "dflash.selector_rank", label),
++            "selector_top_k": _integer(gguf.kv, "dflash.selector_top_k", label),
++        },
++    }
++    if "sliding_attention" in layer_types:
++        config["sliding_window"] = _integer(
++            gguf.kv, "dflash.attention.sliding_window", label
++        )
++    names = _aliases(layers)
++    expected = set(names.values())
++    if set(gguf.tensors) != expected:
++        missing = sorted(expected - set(gguf.tensors))[:5]
++        extra = sorted(set(gguf.tensors) - expected)[:5]
++        raise ValueError(
++            f"{label}: tensor set mismatch (missing {missing}, extra {extra})"
++        )
++    end = max(info.offset + info.nbytes for info in gguf.tensors.values())
++    if gguf.data_bytes_available < end:
++        raise ValueError(f"{label}: the data section is truncated")
++    return config, names
++
++
++@dataclass(frozen=True, slots=True)
++class TensorSignature:
++    shape: tuple[int, ...]
++    dtype: str
++
++
++class DraftSource:
++    """A DFlash2 draft GGUF presented as a checkpoint directory.
++
++    ``has``/``describe``/``read_flat`` speak the names the adapter builder reads, so the ordinary
++    lazy source resolution works unchanged; ``importable`` returns the same tensor as its own
++    ggml blocks where the recipe is allowed to import it.
++    """
++
++    def __init__(self, path: str | Path) -> None:
++        self.gguf = GGUFFile(path)
++        self.path = self.gguf.path
++        self.config, self.names = validate(self.gguf)
++
++    def __enter__(self) -> "DraftSource":
++        return self
++
++    def __exit__(self, *exc) -> None:
++        self.gguf.__exit__(*exc)
++
++    def _tensor(self, name: str) -> TensorInfo:
++        try:
++            tensor = self.names[name]
++        except KeyError as error:
++            raise ValueError(f"{self.path}: missing source tensor {name!r}") from error
++        return self.gguf.info(tensor)
++
++    def has(self, name: str) -> bool:
++        return name in self.names
++
++    def describe(self, name: str) -> TensorSignature:
++        info = self._tensor(name)
++        return TensorSignature(info.shape, TYPE_NAMES[info.type_id])
++
++    def read_flat(
++        self, name: str, begin: int = 0, end: int | None = None
++    ) -> torch.Tensor:
++        """Float32 values of the named tensor's flat C-order range, as the stores return them."""
++
++        info = self._tensor(name)
++        elements = prod(info.shape)
++        end = elements if end is None else end
++        if not 0 <= begin <= end <= elements:
++            raise ValueError(
++                f"{info.name}: source element range [{begin},{end}) exceeds {info.shape}"
++            )
++        if begin == end:
++            return torch.empty(0, dtype=torch.float32)
++        if info.type_id in _DIRECT_TYPES:
++            flat = self.gguf.read_direct(info.name).reshape(-1)[begin:end]
++            return torch.from_numpy(np.ascontiguousarray(flat))
++        if len(info.shape) != 2:
++            raise ValueError(f"{info.name}: {info.type_name} is not a matrix")
++        columns = info.shape[1]
++        first, last = begin // columns, -(-end // columns)
++        values = self._dequantize(info, first, last).reshape(-1)
++        window = values[begin - first * columns : end - first * columns]
++        return torch.from_numpy(np.ascontiguousarray(window))
++
++    def _dequantize(self, info: TensorInfo, first: int, last: int) -> np.ndarray:
++        if info.type_id in _DIRECT_TYPES:
++            return self.gguf.read_direct(info.name).reshape(last - first, -1)
++        try:
++            from gguf import GGMLQuantizationType
++            from gguf.quants import dequantize
++        except ImportError as error:
++            raise ValueError(
++                "reading the values of a GGUF block matrix needs the `gguf` package; "
++                "importing its blocks does not"
++            ) from error
++        blocks = self.gguf.read_blocks(info.name, first, last)
++        kind = GGMLQuantizationType(info.type_id)
++        values = dequantize(np.ascontiguousarray(blocks), kind)
++        return np.ascontiguousarray(values, dtype=np.float32).reshape(last - first, -1)
++
++    def importable(self, name: str) -> LogicalSource | None:
++        """The tensor as its own ggml blocks, or None when the artifact cannot carry it."""
++
++        info = self._tensor(name)
++        if info.type_id not in GGUF_FORMATS_BY_TYPE:
++            return None
++        return self._block_source(info)
++
++    def pair_importable(
++        self, first: str, second: str
++    ) -> tuple[LogicalSource, LogicalSource] | None:
++        """Two tensors of one merged parent, imported only as a single carried block type."""
++
++        left, right = self._tensor(first), self._tensor(second)
++        if (
++            left.type_id != right.type_id
++            or left.shape != right.shape
++            or left.type_id not in GGUF_FORMATS_BY_TYPE
++        ):
++            return None
++        return self._block_source(left), self._block_source(right)
++
++    def _block_source(self, info: TensorInfo) -> LogicalSource:
++        if len(info.shape) != 2:
++            raise ValueError(f"{info.name}: a carried block tensor must be a matrix")
++        format = GGUF_FORMATS_BY_TYPE[info.type_id].name
++
++        def encoded(begin: int, end: int) -> EncodedRows:
++            blocks = self.gguf.read_blocks(info.name, begin, end)
++            return EncodedRows(
++                format, torch.from_numpy(np.array(blocks, copy=True, order="C")), _EMPTY_SCALES
++            )
++
++        return LogicalSource(
++            info.shape,
++            f"{info.name}[{format}]{list(info.shape)}",
++            lambda begin, end: self.read_flat(info.name, begin, end),
++            encoded,
++        )
++
++
++def draft_blocks(model, source) -> dict[str, LogicalSource]:
++    """The adapter parameters this source can supply as their own ggml blocks."""
++
++    if not isinstance(source, DraftSource):
++        return {}
++    blocks: dict[str, LogicalSource] = {}
++    for name, parameter in model.parameters.items():
++        if not parameter.projection:
++            continue
++        if name in _BLOCK_ROLES:
++            item = source.importable(name)
++            if item is not None:
++                blocks[name] = item
++    layers = model.components["dflash2"]["config"]["num_hidden_layers"]
++    for layer in range(layers):
++        prefix = f"dflash2/layers/{layer}/mlp/"
++        pair = source.pair_importable(prefix + "gate", prefix + "up")
++        if pair is not None:
++            blocks[prefix + "gate"], blocks[prefix + "up"] = pair
++    return blocks
++
++
++__all__ = ["DraftSource", "TensorSignature", "draft_blocks", "validate"]
+diff --git a/tools/convert/gguf_blocks.py b/tools/convert/gguf_blocks.py
+index f5803750fe799ba191500b2a85f580e228530c02..dde85aed3b90f8756e35cbb97647f2b643fc91a5 100644
+--- a/tools/convert/gguf_blocks.py
++++ b/tools/convert/gguf_blocks.py
+@@ -1,11 +1,12 @@
+ """A Qwen3.5/3.8 dense GGUF kept in its own ggml block formats (GSQ-RCO mixed-precision releases).
+ 
+-Every text projection, the token table, the output head and the MTP head of an ``-mtp`` build are
+-stored as the exporter's own blocks, one ggml type per tensor, so no weight is re-quantised: a row
+-of the artifact is byte for byte a row of the GGUF. An untied BF16 output head, which some
+-community builds keep, stays BF16, its words exact. llama.cpp's Qwen3.5 exporter conventions are
++The block-quantized main text projections, token table, output head and MTP head of an ``-mtp``
++build are stored as the exporter's own blocks, without re-quantizing these matrices: a row
++of the artifact is byte for byte a row of the GGUF. An untied BF16 output head stays BF16, its words exact. llama.cpp's Qwen3.5 exporter conventions are
+ undone where they touch rows or small tensors: value heads return to the grouped order,
+ zero-centred norms drop their stored ``1 + w`` and ``ssm_a`` becomes ``A_log`` again.
++The small GDN alpha/beta gates use the runtime's BF16 format; quantized GGUF gates are decoded
++with gguf-py before that cast, while gates already stored in BF16 retain their exact words.
+ 
+ ``ssm_out`` is the exception. Its tiled value heads are its input columns, which a row copy cannot
+ move without re-quantising. Its encoded rows keep the stored order, and their import gives the Use an
+@@ -14,7 +15,7 @@ of the grouped activation. Its values, like every source's, are in the grouped o
+ that re-quantises ``ssm_out`` writes grouped columns and no gather.
+ 
+ The GDN controls ``ssm_alpha`` and ``ssm_beta`` are BF16 operands of the Engine. Exporters store
+-them as BF16 words or as Q8_0 blocks (Underdog-Saluki and similar releases), whose values are
++them as BF16 words, F32/F16 or quantized blocks (for example Q8_0 in Underdog-Saluki releases), whose values are
+ rounded to BF16: the one place a stored value changes.
+ 
+ Vision comes from the release's ``mmproj`` GGUF (``--source vision=mmproj.gguf``) with the official
+@@ -31,6 +32,7 @@ context lookup; DFlash and DFlash2 drafters are trained on the official ids.
+ from __future__ import annotations
+ 
+ import json
++from dataclasses import replace
+ from typing import Callable
+ 
+ import numpy as np
+@@ -38,77 +40,36 @@ import torch
+ 
+ from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
+ 
++from .dflash2_gguf import draft_blocks
+ from .methods import cast_direct, grouped_absmax, import_encoded
+ from .official_recipes import Q4, Q5, Q6, Q8
+-from .sources.gguf import TYPE_BF16, TYPE_PTQ1_0, GGUFFile, decode_ptq1_0
++from .sources.gguf import TYPE_BF16, TYPE_PTQ1_0, GGUFFile, TYPE_NAMES, decode_ptq1_0
+ from .sources.logical import EncodedRows, LogicalSource, array_source
+-from .ternary import (
+-    ATTENTION_HEAD_DIM,
+-    ATTENTION_KV_ROWS,
+-    ATTENTION_QUERY_ROWS,
+-    GDN_CHANNELS,
+-    GDN_HEAD_DIM,
+-    GDN_KEY_DIM,
+-    GDN_KEY_HEADS,
+-    GDN_TAPS,
+-    GDN_VALUE_DIM,
+-    GDN_VALUE_HEADS,
+-    HIDDEN,
+-    INTERMEDIATE,
+-    LAYERS,
+-    VOCABULARY,
+-    RowMap,
+-    _direct,
+-    _flat,
+-    _norm,
+-    attention_rows,
+-    full_attention,
+-    rows,
+-    untile,
+-    untiled_rows,
+-)
+-
+-MTP_BLOCK = LAYERS
+-# The storage the GDN controls may have (gdn_control_source).
+-GDN_CONTROL_TYPES = ("BF16", "Q8_0")
+-# The storage the output head may have: stored blocks, or BF16 words (bf16_source).
++from .ternary import DENSE_GEOMETRY, HIDDEN, VOCABULARY, RowMap, _direct, _flat, _norm, rows
++from .dense_geometry import DenseGeometry
++
++GDN_CONTROL_TYPES = ("F32", "F16", "BF16", *(TYPE_NAMES[t] for t in GGUF_FORMATS_BY_TYPE))
+ HEAD_TYPES = ("blocks", "BF16")
+ 
+-EXPECTED_HEADER = {
+-    "general.architecture": "qwen35",
+-    "qwen35.embedding_length": HIDDEN,
+-    "qwen35.feed_forward_length": INTERMEDIATE,
+-    "qwen35.attention.head_count": 24,
+-    "qwen35.attention.head_count_kv": 4,
+-    "qwen35.attention.key_length": ATTENTION_HEAD_DIM,
+-    "qwen35.attention.value_length": ATTENTION_HEAD_DIM,
+-    "qwen35.ssm.conv_kernel": GDN_TAPS,
+-    "qwen35.ssm.state_size": GDN_HEAD_DIM,
+-    "qwen35.ssm.group_count": GDN_KEY_HEADS,
+-    "qwen35.ssm.time_step_rank": GDN_VALUE_HEADS,
+-    "qwen35.ssm.inner_size": GDN_VALUE_DIM,
+-    "qwen35.full_attention_interval": 4,
+-}
+-
+-
+-def _attention_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
++
++def _attention_tensors(prefix: str, geom: DenseGeometry) -> dict[str, tuple[tuple[int, ...], str]]:
+     return {
+-        prefix + "attn_q.weight": ((2 * ATTENTION_QUERY_ROWS, HIDDEN), "blocks"),
+-        prefix + "attn_k.weight": ((ATTENTION_KV_ROWS, HIDDEN), "blocks"),
+-        prefix + "attn_v.weight": ((ATTENTION_KV_ROWS, HIDDEN), "blocks"),
+-        prefix + "attn_output.weight": ((HIDDEN, ATTENTION_QUERY_ROWS), "blocks"),
+-        prefix + "attn_q_norm.weight": ((ATTENTION_HEAD_DIM,), "F32"),
+-        prefix + "attn_k_norm.weight": ((ATTENTION_HEAD_DIM,), "F32"),
++        prefix + "attn_q.weight": ((2 * geom.query_rows, geom.hidden), "blocks"),
++        prefix + "attn_k.weight": ((geom.kv_rows, geom.hidden), "blocks"),
++        prefix + "attn_v.weight": ((geom.kv_rows, geom.hidden), "blocks"),
++        prefix + "attn_output.weight": ((geom.hidden, geom.query_rows), "blocks"),
++        prefix + "attn_q_norm.weight": ((geom.attention_dim,), "F32"),
++        prefix + "attn_k_norm.weight": ((geom.attention_dim,), "F32"),
+     }
+ 
+ 
+-def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
++def _layer_tensors(prefix: str, geom: DenseGeometry) -> dict[str, tuple[tuple[int, ...], str]]:
+     return {
+-        prefix + "attn_norm.weight": ((HIDDEN,), "F32"),
+-        prefix + "post_attention_norm.weight": ((HIDDEN,), "F32"),
+-        prefix + "ffn_gate.weight": ((INTERMEDIATE, HIDDEN), "blocks"),
+-        prefix + "ffn_up.weight": ((INTERMEDIATE, HIDDEN), "blocks"),
+-        prefix + "ffn_down.weight": ((HIDDEN, INTERMEDIATE), "blocks"),
++        prefix + "attn_norm.weight": ((geom.hidden,), "F32"),
++        prefix + "post_attention_norm.weight": ((geom.hidden,), "F32"),
++        prefix + "ffn_gate.weight": ((geom.intermediate, geom.hidden), "blocks"),
++        prefix + "ffn_up.weight": ((geom.intermediate, geom.hidden), "blocks"),
++        prefix + "ffn_down.weight": ((geom.hidden, geom.intermediate), "blocks"),
+     }
+ 
+ 
+@@ -202,67 +163,67 @@ def check_vocabulary(model, gguf: GGUFFile, vocabulary: int) -> None:
+         )
+ 
+ 
+-def expected_tensors(
+-    mtp: bool, vocabulary: int = VOCABULARY
+-) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
+-    """Row-major shape and kinds of every tensor: "blocks" (any stored ggml block type) and the
++def expected_tensors(mtp: bool, geom: DenseGeometry) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
++    """Row-major shape and kind of every tensor: "blocks" (any stored ggml block type) or the
+     ggml type names it may have."""
+ 
+     out = {
+-        "token_embd.weight": ((vocabulary, HIDDEN), "blocks"),
+-        "output.weight": ((vocabulary, HIDDEN), HEAD_TYPES),
+-        "output_norm.weight": ((HIDDEN,), "F32"),
++        "token_embd.weight": ((geom.vocabulary, geom.hidden), "blocks"),
++        "output.weight": ((geom.vocabulary, geom.hidden), HEAD_TYPES),
++        "output_norm.weight": ((geom.hidden,), "F32"),
+     }
+-    for layer in range(LAYERS):
++    if geom.tied:
++        del out["output.weight"]
++    for layer in range(geom.layers):
+         p = f"blk.{layer}."
+-        out |= _layer_tensors(p)
+-        if full_attention(layer):
+-            out |= _attention_tensors(p)
++        out |= _layer_tensors(p, geom)
++        if geom.full_attention(layer):
++            out |= _attention_tensors(p, geom)
+             continue
+         out |= {
+-            p + "attn_qkv.weight": ((GDN_CHANNELS, HIDDEN), "blocks"),
+-            p + "attn_gate.weight": ((GDN_VALUE_DIM, HIDDEN), "blocks"),
+-            p + "ssm_out.weight": ((HIDDEN, GDN_VALUE_DIM), "blocks"),
+-            p + "ssm_alpha.weight": ((GDN_VALUE_HEADS, HIDDEN), GDN_CONTROL_TYPES),
+-            p + "ssm_beta.weight": ((GDN_VALUE_HEADS, HIDDEN), GDN_CONTROL_TYPES),
+-            p + "ssm_a": ((GDN_VALUE_HEADS,), "F32"),
+-            p + "ssm_dt.bias": ((GDN_VALUE_HEADS,), "F32"),
+-            p + "ssm_conv1d.weight": ((GDN_CHANNELS, GDN_TAPS), "F32"),
+-            p + "ssm_norm.weight": ((GDN_HEAD_DIM,), "F32"),
++            p + "attn_qkv.weight": ((geom.channels, geom.hidden), "blocks"),
++            p + "attn_gate.weight": ((geom.value_dim, geom.hidden), "blocks"),
++            p + "ssm_out.weight": ((geom.hidden, geom.value_dim), "blocks"),
++            p + "ssm_alpha.weight": ((geom.value_heads, geom.hidden), GDN_CONTROL_TYPES),
++            p + "ssm_beta.weight": ((geom.value_heads, geom.hidden), GDN_CONTROL_TYPES),
++            p + "ssm_a": ((geom.value_heads,), "F32"),
++            p + "ssm_dt.bias": ((geom.value_heads,), "F32"),
++            p + "ssm_conv1d.weight": ((geom.channels, geom.taps), "F32"),
++            p + "ssm_norm.weight": ((geom.head_dim,), "F32"),
+         }
+     if mtp:
+-        p = f"blk.{MTP_BLOCK}."
+-        out |= _layer_tensors(p) | _attention_tensors(p)
++        p = f"blk.{geom.layers}."
++        out |= _layer_tensors(p, geom) | _attention_tensors(p, geom)
+         out |= {
+-            p + "nextn.eh_proj.weight": ((HIDDEN, 2 * HIDDEN), "blocks"),
+-            p + "nextn.enorm.weight": ((HIDDEN,), "F32"),
+-            p + "nextn.hnorm.weight": ((HIDDEN,), "F32"),
+-            p + "nextn.shared_head_norm.weight": ((HIDDEN,), "F32"),
++            p + "nextn.eh_proj.weight": ((geom.hidden, 2 * geom.hidden), "blocks"),
++            p + "nextn.enorm.weight": ((geom.hidden,), "F32"),
++            p + "nextn.hnorm.weight": ((geom.hidden,), "F32"),
++            p + "nextn.shared_head_norm.weight": ((geom.hidden,), "F32"),
+         }
+     return out
+ 
+ 
+-def has_mtp(gguf: GGUFFile) -> bool:
+-    return f"blk.{MTP_BLOCK}.nextn.eh_proj.weight" in gguf.tensors
++def has_mtp(gguf: GGUFFile, geom: DenseGeometry) -> bool:
++    return f"blk.{geom.layers}.nextn.eh_proj.weight" in gguf.tensors
+ 
+ 
+-def validate(gguf: GGUFFile) -> None:
+-    """Refuse any GGUF that is not a dense Qwen3.5/3.8-27B text tower of stored block types."""
++def validate(gguf: GGUFFile, geom: DenseGeometry = DENSE_GEOMETRY) -> None:
++    """Reject a GGUF whose dense text tower, MTP head or stored tensor types differ from config."""
+ 
+     if any(key.startswith("prism.hadamard.") for key in gguf.kv):
+         raise ValueError(
+             f"{gguf.path}: a Hadamard-rotated PrismML GGUF converts with bonsai2_27b_ternary"
+         )
+-    for key, expected in EXPECTED_HEADER.items():
++    for key, expected in geom.expected_header().items():
+         if gguf.kv.get(key) != expected:
+             raise ValueError(
+                 f"{gguf.path}: {key} = {gguf.kv.get(key)!r}, expected {expected!r}"
+             )
+-    mtp = has_mtp(gguf)
++    mtp = has_mtp(gguf, geom)
+     blocks = gguf.kv.get("qwen35.block_count")
+-    if blocks != LAYERS + (1 if mtp else 0):
+-        raise ValueError(f"{gguf.path}: {blocks} blocks, expected {LAYERS} (+1 for MTP)")
+-    expected = expected_tensors(mtp, stored_vocabulary(gguf))
++    if blocks != geom.layers + (1 if mtp else 0):
++        raise ValueError(f"{gguf.path}: {blocks} blocks, expected {geom.layers} (+1 for MTP)")
++    expected = expected_tensors(mtp, replace(geom, vocabulary=stored_vocabulary(gguf)))
+     if set(gguf.tensors) != set(expected):
+         missing = sorted(set(expected) - set(gguf.tensors))[:5]
+         extra = sorted(set(gguf.tensors) - set(expected))[:5]
+@@ -575,16 +536,19 @@ def head_source(gguf: GGUFFile) -> tuple[LogicalSource, bool]:
+     return block_source(gguf, "output.weight", padded, rows(), stored_rows=shape[0]), True
+ 
+ 
+-def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
++def gdn_control_source(gguf: GGUFFile, tensor: str, geom: DenseGeometry) -> LogicalSource:
+     """A GDN A/B control as its BF16 operand, its value heads in the grouped order: BF16 words
+-    as stored, Q8_0 values rounded to BF16."""
++    as stored, quantized values rounded to BF16."""
+ 
+-    if gguf.info(tensor).type_id == GGML_Q8_0:
+-        values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
++    if gguf.info(tensor).type_id in GGUF_FORMATS_BY_TYPE:
++        values = geom.untile(_dequantize(gguf, tensor, 0, geom.value_heads).numpy(), 1)
+         return array_source(
+             torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
+         )
+-    words = untile(gguf.read_bf16_words(tensor), 1)
++    if gguf.info(tensor).type_name != "BF16":
++        values = geom.untile(gguf.read_direct(tensor), 1)
++        return array_source(torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor)
++    words = geom.untile(gguf.read_bf16_words(tensor), 1)
+     return array_source(
+         torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(torch.bfloat16),
+         tensor,
+@@ -659,27 +623,27 @@ def q8_native_source(
+                          raw_source.read_values, encoded)
+ 
+ 
+-def tiled_input_columns() -> np.ndarray:
++def tiled_input_columns(geom: DenseGeometry = DENSE_GEOMETRY) -> np.ndarray:
+     """For each stored ``ssm_out`` column (tiled value heads), its grouped activation element."""
+ 
+-    columns = np.arange(GDN_VALUE_DIM, dtype=np.int64)
+-    tiled_head, lane = columns // GDN_HEAD_DIM, columns % GDN_HEAD_DIM
+-    per_key = GDN_VALUE_HEADS // GDN_KEY_HEADS
+-    grouped_head = (tiled_head % GDN_KEY_HEADS) * per_key + tiled_head // GDN_KEY_HEADS
+-    return (grouped_head * GDN_HEAD_DIM + lane).astype(np.int32)
++    columns = np.arange(geom.value_dim, dtype=np.int64)
++    tiled_head, lane = columns // geom.head_dim, columns % geom.head_dim
++    per_key = geom.value_heads // geom.key_heads
++    grouped_head = (tiled_head % geom.key_heads) * per_key + tiled_head // geom.key_heads
++    return (grouped_head * geom.head_dim + lane).astype(np.int32)
+ 
+ 
+ def _attention(
+-    gguf: GGUFFile, g: str, a: str
++    gguf: GGUFFile, g: str, a: str, geom: DenseGeometry
+ ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
+-    q_shape, kv_shape = (ATTENTION_QUERY_ROWS, HIDDEN), (ATTENTION_KV_ROWS, HIDDEN)
++    q_shape, kv_shape = (geom.query_rows, geom.hidden), (geom.kv_rows, geom.hidden)
+     encoded = {
+-        a + "query": block_source(gguf, g + "attn_q.weight", q_shape, attention_rows(False)),
+-        a + "gate": block_source(gguf, g + "attn_q.weight", q_shape, attention_rows(True)),
++        a + "query": block_source(gguf, g + "attn_q.weight", q_shape, geom.attention_rows(False)),
++        a + "gate": block_source(gguf, g + "attn_q.weight", q_shape, geom.attention_rows(True)),
+         a + "key": block_source(gguf, g + "attn_k.weight", kv_shape, rows()),
+         a + "value": block_source(gguf, g + "attn_v.weight", kv_shape, rows()),
+         a + "output": block_source(
+-            gguf, g + "attn_output.weight", (HIDDEN, ATTENTION_QUERY_ROWS), rows()
++            gguf, g + "attn_output.weight", (geom.hidden, geom.query_rows), rows()
+         ),
+     }
+     direct = {
+@@ -690,13 +654,13 @@ def _attention(
+ 
+ 
+ def _layer(
+-    gguf: GGUFFile, g: str, p: str
++    gguf: GGUFFile, g: str, p: str, geom: DenseGeometry
+ ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
+     encoded = {
+-        p + "mlp/gate": block_source(gguf, g + "ffn_gate.weight", (INTERMEDIATE, HIDDEN), rows()),
+-        p + "mlp/up": block_source(gguf, g + "ffn_up.weight", (INTERMEDIATE, HIDDEN), rows()),
++        p + "mlp/gate": block_source(gguf, g + "ffn_gate.weight", (geom.intermediate, geom.hidden), rows()),
++        p + "mlp/up": block_source(gguf, g + "ffn_up.weight", (geom.intermediate, geom.hidden), rows()),
+         p + "mlp/down": block_source(
+-            gguf, g + "ffn_down.weight", (HIDDEN, INTERMEDIATE), rows()
++            gguf, g + "ffn_down.weight", (geom.hidden, geom.intermediate), rows()
+         ),
+     }
+     direct = {
+@@ -707,7 +671,7 @@ def _layer(
+ 
+ 
+ def text_sources(
+-    gguf: GGUFFile, *, mtp: bool, vocabulary: int | None = None
++    gguf: GGUFFile, *, mtp: bool, geom: DenseGeometry, vocabulary: int | None = None
+ ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
+     """Encoded block sources and direct sources of every GGUF-backed text (and MTP) parameter; a
+     BF16 output head is a direct source."""
+@@ -717,78 +681,98 @@ def text_sources(
+         "text/token_embedding": block_source(
+             gguf,
+             "token_embd.weight",
+-            (padded_rows(vocabulary), HIDDEN),
++            (padded_rows(vocabulary), geom.hidden),
+             rows(),
+             stored_rows=vocabulary,
+         ),
+     }
+     direct = {"text/final_norm": _norm(gguf, "output_norm.weight", True)}
+-    head, stored_blocks = head_source(gguf)
+-    (encoded if stored_blocks else direct)["text/output_head"] = head
+-    for layer in range(LAYERS):
++    if geom.tied:
++        encoded["text/output_head"] = encoded["text/token_embedding"]
++    else:
++        head, stored_blocks = head_source(gguf)
++        (encoded if stored_blocks else direct)["text/output_head"] = head
++    for layer in range(geom.layers):
+         g, p = f"blk.{layer}.", f"text/layers/{layer}/"
+-        e, d = _layer(gguf, g, p)
++        e, d = _layer(gguf, g, p, geom)
+         encoded |= e
+         direct |= d
+-        if full_attention(layer):
+-            e, d = _attention(gguf, g, p + "attention/")
++        if geom.full_attention(layer):
++            e, d = _attention(gguf, g, p + "attention/", geom)
+             encoded |= e
+             direct |= d
+             continue
+         n = p + "gdn/"
+         qkv = g + "attn_qkv.weight"
+-        encoded[n + "query"] = block_source(gguf, qkv, (GDN_KEY_DIM, HIDDEN), rows())
+-        encoded[n + "key"] = block_source(gguf, qkv, (GDN_KEY_DIM, HIDDEN), rows(GDN_KEY_DIM))
++        encoded[n + "query"] = block_source(gguf, qkv, (geom.key_dim, geom.hidden), rows())
++        encoded[n + "key"] = block_source(gguf, qkv, (geom.key_dim, geom.hidden), rows(geom.key_dim))
+         encoded[n + "value"] = block_source(
+-            gguf, qkv, (GDN_VALUE_DIM, HIDDEN), untiled_rows(2 * GDN_KEY_DIM)
++            gguf, qkv, (geom.value_dim, geom.hidden), geom.untiled_rows(2 * geom.key_dim)
+         )
+         encoded[n + "z"] = block_source(
+-            gguf, g + "attn_gate.weight", (GDN_VALUE_DIM, HIDDEN), untiled_rows(0)
++            gguf, g + "attn_gate.weight", (geom.value_dim, geom.hidden), geom.untiled_rows(0)
+         )
+         # Tiled input columns: an import keeps them and its Use gathers the grouped activation.
+         encoded[n + "output"] = block_source(
+             gguf,
+             g + "ssm_out.weight",
+-            (HIDDEN, GDN_VALUE_DIM),
++            (geom.hidden, geom.value_dim),
+             rows(),
+-            tiled_input_columns(),
++            tiled_input_columns(geom),
+         )
+         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
+-            direct[n + role] = gdn_control_source(gguf, g + tensor)
+-        ssm_a = untile(gguf.read_direct(g + "ssm_a"), 1).astype(np.float64)
++            direct[n + role] = gdn_control_source(gguf, g + tensor, geom)
++        ssm_a = geom.untile(gguf.read_direct(g + "ssm_a"), 1).astype(np.float64)
+         if not np.all(ssm_a < 0):
+             raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")
+         direct[n + "a_log"] = _direct(
+             np.log(-ssm_a).astype(np.float32), torch.float32, g + "ssm_a"
+         )
+         direct[n + "dt_bias"] = _direct(
+-            untile(gguf.read_direct(g + "ssm_dt.bias"), 1), torch.float32, g + "ssm_dt.bias"
++            geom.untile(gguf.read_direct(g + "ssm_dt.bias"), 1), torch.float32, g + "ssm_dt.bias"
+         )
+         taps = gguf.read_direct(g + "ssm_conv1d.weight")
+         channels = np.concatenate(
+-            [taps[: 2 * GDN_KEY_DIM], untile(taps[2 * GDN_KEY_DIM :], GDN_HEAD_DIM)]
++            [taps[: 2 * geom.key_dim], geom.untile(taps[2 * geom.key_dim :], geom.head_dim)]
+         )
+         direct[n + "convolution"] = _direct(
+             channels.T, torch.bfloat16, g + "ssm_conv1d.weight"
+         )
+         direct[n + "norm"] = _norm(gguf, g + "ssm_norm.weight", False)
+     if mtp:
+-        g, p = f"blk.{MTP_BLOCK}.", "mtp/layers/0/"
+-        e, d = _layer(gguf, g, p)
+-        encoded |= e
+-        direct |= d
+-        e, d = _attention(gguf, g, p + "attention/")
+-        encoded |= e
+-        direct |= d
+-        encoded["mtp/input_projection"] = block_source(
+-            gguf, g + "nextn.eh_proj.weight", (HIDDEN, 2 * HIDDEN), rows()
+-        )
+-        for role, tensor in (
+-            ("embedding_norm", "nextn.enorm.weight"),
+-            ("hidden_norm", "nextn.hnorm.weight"),
+-            ("final_norm", "nextn.shared_head_norm.weight"),
+-        ):
+-            direct["mtp/" + role] = _norm(gguf, g + tensor, True)
++        e, d = mtp_sources(gguf, geom)
++        encoded.update(e)
++        direct.update(d)
++    return encoded, direct
++
++
++def mtp_sources(gguf: GGUFFile, geom: DenseGeometry) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
++    """Dense Qwen3.5 MTP blocks with the exporter's zero-centred (+1 stored) norms.
++
++    This is the same MTP schema used by the dense GGUF recipe. A ternary target
++    may use it independently; its main weights need not be GGUF block formats.
++    """
++    required = {name: value for name, value in expected_tensors(True, geom).items()
++                if name.startswith(f"blk.{geom.layers}.")}
++    for name, (shape, kind) in required.items():
++        info = gguf.info(name)
++        if info.shape != shape:
++            raise ValueError(f"{name}: MTP shape {info.shape} differs from {shape}")
++        if kind == "blocks":
++            block_format(gguf, name)
++        elif info.type_name not in ("F32", "F16", "BF16"):
++            raise ValueError(f"{name}: MTP norm must be a direct format")
++    g, p = f"blk.{geom.layers}.", "mtp/layers/0/"
++    encoded, direct = _layer(gguf, g, p, geom)
++    e, d = _attention(gguf, g, p + "attention/", geom)
++    encoded.update(e)
++    direct.update(d)
++    encoded["mtp/input_projection"] = block_source(
++        gguf, g + "nextn.eh_proj.weight", (geom.hidden, 2 * geom.hidden), rows())
++    for role, tensor in (("embedding_norm", "nextn.enorm.weight"),
++                         ("hidden_norm", "nextn.hnorm.weight"),
++                         ("final_norm", "nextn.shared_head_norm.weight")):
++        direct["mtp/" + role] = _norm(gguf, g + tensor, True)
+     return encoded, direct
+ 
+ 
+@@ -843,8 +827,14 @@ def _companions(model, recipe, sources) -> None:
+ 
+     if "vision" in model.components:
+         assign_vision(model, recipe, sources)
++    blocks = draft_blocks(model, sources["dflash2"]) if "dflash2" in model.components else {}
+     for name, parameter in model.parameters.items():
+         if name.startswith(("dflash/", "dflash2/")) and parameter.projection:
++            if name in blocks:
++                source = blocks[name]
++                recipe.assign(name, format=source.read_encoded(0, 1).format,
++                              method=import_encoded, source=source, activation_policy="AllowA8")
++                continue
+             if name.endswith(
+                 (
+                     "/attention_conv/kernel_projection",
+@@ -869,27 +859,22 @@ def _group_same_format(recipe, names: list[str], formats: dict[str, str]) -> Non
+         recipe.group(names)
+ 
+ 
+-def qwen3_8_27b_gguf(model, recipe, sources):
+-    """A Qwen3.8-27B GGUF in its own block formats from `--source gguf=MODEL.gguf`."""
++def qwen3_5_dense_gguf(model, recipe, sources):
++    """A dense Qwen3.5-family GGUF in its own block formats from `--source gguf=MODEL.gguf`."""
+ 
+-    config = model.config
+-    if (
+-        "num_experts" in config
+-        or config["hidden_size"] != HIDDEN
+-        or config["num_hidden_layers"] != LAYERS
+-    ):
+-        raise ValueError("the GGUF block recipe requires the Qwen3.8-27B Dense geometry")
++    geom = DenseGeometry.from_config(model.config)
+     gguf = sources["gguf"]
+     if not isinstance(gguf, GGUFFile):
+         raise ValueError("--source gguf must name the model's .gguf file")
+-    validate(gguf)
++    validate(gguf, geom)
+     vocabulary = stored_vocabulary(gguf)
+-    check_vocabulary(model, gguf, vocabulary)
++    if geom.hidden == HIDDEN or geom.vocabulary != vocabulary:
++        check_vocabulary(model, gguf, vocabulary)
+     mtp = "mtp" in model.components
+-    if mtp and not has_mtp(gguf):
+-        raise ValueError(f"{gguf.path}: the MTP component needs an -mtp GGUF (blk.64.nextn.*)")
++    if mtp and not has_mtp(gguf, geom):
++        raise ValueError(f"{gguf.path}: the MTP component needs an -mtp GGUF (blk.{geom.layers}.nextn.*)")
+     _companions(model, recipe, sources)
+-    encoded, direct = text_sources(gguf, mtp=mtp, vocabulary=vocabulary)
++    encoded, direct = text_sources(gguf, mtp=mtp, geom=geom, vocabulary=vocabulary)
+     formats = {}
+     for name, source in encoded.items():
+         format = source.read_encoded(0, 1).format
+@@ -904,11 +889,13 @@ def qwen3_8_27b_gguf(model, recipe, sources):
+             method=cast_direct,
+             source=source,
+         )
+-    prefixes = [f"text/layers/{layer}/" for layer in range(LAYERS)]
++    if geom.tied:
++        recipe.share("text/output_head", "text/token_embedding")
++    prefixes = [f"text/layers/{layer}/" for layer in range(geom.layers)]
+     if mtp:
+         prefixes.append("mtp/layers/0/")
+     for p in prefixes:
+-        if p.startswith("text/") and not full_attention(int(p.split("/")[2])):
++        if p.startswith("text/") and not geom.full_attention(int(p.split("/")[2])):
+             n = p + "gdn/"
+             qkv = [n + "query", n + "key", n + "value"]
+             recipe.group(qkv + [n + "z"] if formats[n + "z"] == formats[n + "query"] else qkv)
+@@ -921,10 +908,9 @@ def qwen3_8_27b_gguf(model, recipe, sources):
+         _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
+ 
+ 
+-RECIPES = {"qwen3_8_27b_gguf": qwen3_8_27b_gguf}
++RECIPES = {"qwen3_5_dense_gguf": qwen3_5_dense_gguf}
+ 
+ __all__ = [
+-    "EXPECTED_HEADER",
+     "RECIPES",
+     "assign_vision",
+     "block_format",
+@@ -935,7 +921,7 @@ __all__ = [
+     "gdn_control_source",
+     "has_mtp",
+     "head_source",
+-    "qwen3_8_27b_gguf",
++    "qwen3_5_dense_gguf",
+     "q2_native_source",
+     "padded_rows",
+     "stored_vocabulary",
+diff --git a/tools/convert/methods.py b/tools/convert/methods.py
+index 65cd2fe8179498958d2f7f051b2506ed0d8047c8..5e0db36bf26a2bd531d33156fb4bd66d905068df 100644
+--- a/tools/convert/methods.py
++++ b/tools/convert/methods.py
+@@ -327,7 +327,8 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
+     stored input order."""
+     if (
+         request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "fp8_e4m3fn_row_fp16",
+-                                      "t2_g128_fp16", "q2_g64_fp16", "q8_g32_fp16")
++                                      "t2_g128_fp16", "ptq1_g128_fp16", "t5_g128_fp16",
++                                      "q2_g64_fp16", "q8_g32_fp16")
+         and request.target.format not in GGUF_FORMATS
+     ) or len(request.target.shape) != 2:
+         raise ValueError("import_encoded requires a known encoded matrix target")
+diff --git a/tools/convert/nvfp4.py b/tools/convert/nvfp4.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0549f71fb6e1d8b97b62db111b7cb656637c216b
+--- /dev/null
++++ b/tools/convert/nvfp4.py
+@@ -0,0 +1,52 @@
++"""Bounded weight-only NVFP4 round-to-nearest conversion for optional draft matrices."""
++import struct
++import torch
++
++
++def quantize_rows(values, divisor):
++    """Return packed E2M1 codes and natural E4M3 scale words; ties round to even."""
++    values = values.to(torch.float32) * divisor
++    if not torch.isfinite(values).all():
++        raise ValueError('NVFP4 input must be finite')
++    n, k = values.shape
++    groups = values.reshape(n, k // 16, 16)
++    scales = (groups.abs().amax(-1) / 6).to(torch.float8_e4m3fn)
++    scales32 = scales.float()
++    normalized = groups / torch.where(scales32 == 0, 1., scales32).unsqueeze(-1)
++    magnitude = normalized.abs()
++    midpoints = torch.tensor([.25, .75, 1.25, 1.75, 2.5, 3.5, 5.], device=values.device)
++    codes = torch.bucketize(magnitude.contiguous(), midpoints)
++    codes += ((codes < 7) & (codes.remainder(2) == 1) &
++              (magnitude == midpoints[codes.clamp(max=6)])).long()
++    codes = (codes | (normalized.signbit().long() << 3)).to(torch.uint8).reshape(n, k)
++    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
++    return packed.cpu(), scales.view(torch.uint8).cpu()
++
++
++def nvfp4_maxabs(request):
++    if request.target.format != 'nvfp4' or len(request.target.shape) != 2:
++        raise ValueError('nvfp4_maxabs requires an NVFP4 matrix')
++    n, k = request.target.shape
++    if n % 128 or k % 64:
++        raise ValueError('NVFP4 matrix requires N % 128 == 0 and K % 64 == 0')
++    if any(policy != 'A16Only' for policy in request.policies.values()):
++        raise ValueError('nvfp4_maxabs is weight-only; use A16Only')
++    chunk = max(128, request.rows_per_chunk // 128 * 128)
++    maximum = 0.
++    for begin in range(0, n, chunk):
++        values = request.values(begin*k, min(n, begin+chunk)*k).float()
++        if not torch.isfinite(values).all():
++            raise ValueError('NVFP4 input must be finite')
++        maximum = max(maximum, values.abs().max().item())
++    divisor = struct.unpack('<f', struct.pack('<f', 2688. / maximum if maximum else 1.))[0]
++    if not (0 < divisor < float('inf')):
++        raise ValueError('NVFP4 weight divisor is not representable in FP32')
++    word = struct.pack('<f', divisor)
++
++    def produce(output):
++        for begin in range(0, n, chunk):
++            end = min(n, begin+chunk)
++            values = request.values(begin*k, end*k).reshape(end-begin, k)
++            codes, scales = quantize_rows(values, divisor)
++            output.write_codes(begin, codes, scales, word)
++    return request.job(produce=produce)
+diff --git a/tools/convert/recipes/dflash2_gguf_blocks.py b/tools/convert/recipes/dflash2_gguf_blocks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a08a31693fed1525884c3e8417f079d6ef50d2a5
+--- /dev/null
++++ b/tools/convert/recipes/dflash2_gguf_blocks.py
+@@ -0,0 +1,30 @@
++"""Keep the DFlash2 drafter's GGUF block projections instead of re-quantising them.
++
++Pass ``--source dflash2=<draft.gguf>`` and
++``--override tools/convert/recipes/dflash2_gguf_blocks.py``.
++
++``attention/output`` and ``mlp/down`` stay in the source's own ggml block type
++(``gguf_q3_k`` / ``gguf_q4_k`` / ...), so the artifact carries the exact bytes the
++drafter shipped with and the dynamic grouped conv materialises them through the
++GGUF linear route. QKV, the convolution kernels, the feature projection and the
++selector hidden projection keep the base recipe's formats.
++"""
++from tools.convert.methods import import_encoded
++
++_TARGETS = ('/attention/output', '/mlp/down')
++
++
++def configure(model, recipe, sources):
++    if 'dflash2' not in model.components:
++        raise ValueError('DFlash2 GGUF-block import requires the DFlash2 component')
++    draft = sources['dflash2'] if 'dflash2' in sources else None
++    for name, parameter in model.parameters.items():
++        if not name.startswith('dflash2/') or not parameter.projection:
++            continue
++        if not any(name.endswith(suffix) for suffix in _TARGETS):
++            continue
++        item = draft.importable(name) if draft is not None and draft.has(name) else None
++        if item is None:
++            continue
++        encoded = item.read_encoded(0, 1)
++        recipe.assign(name, format=encoded.format, method=import_encoded, source=item)
+diff --git a/tools/convert/recipes/dflash2_import_nvfp4.py b/tools/convert/recipes/dflash2_import_nvfp4.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a1cf1cdb16a0d8e18f3e39e2c4909b4aad6ac9f
+--- /dev/null
++++ b/tools/convert/recipes/dflash2_import_nvfp4.py
+@@ -0,0 +1,42 @@
++"""Import the DFlash2 module's NVFP4 weights verbatim from a ModelOpt source.
++
++Unlike ``dflash2_nvfp4.py`` (which re-quantises a BF16/FP8 companion), this override
++keeps the source's NVFP4 codes and block scales, and converts its multiplicative
++global scale to the equivalent native divisor. Use it when the
++companion checkpoint is already ModelOpt NVFP4, e.g.
++``maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal``.
++
++The supported large projections use NVFP4: ``attention/output`` and ``mlp/down``
++import the source's codes and block scales verbatim, while ``feature_projection`` and the selector hidden
++projection (BF16 in the checkpoint) are quantised to NVFP4. QKV keeps Q8 because the
++fused attention input projection only admits that format, and the convolution kernel
++projections stay BF16 because their prepare path has no NVFP4 kernel.
++"""
++from tools.convert.methods import import_encoded
++from tools.convert.nvfp4 import nvfp4_maxabs
++
++# The engine's native QKV input projection requires Q8_G32_FP16.
++_KEPT_Q8 = ('/attention/query', '/attention/key', '/attention/value')
++
++# BF16 in the ModelOpt checkpoint; quantise the supported projections to NVFP4.
++_REQUANTISE = (
++    'dflash2/feature_projection',
++    'dflash2/candidate_selector/hidden_projection',
++)
++
++
++def configure(model, recipe, sources):
++    if 'dflash2' not in model.components:
++        raise ValueError('DFlash2 NVFP4 import requires the DFlash2 component')
++    for name, parameter in model.parameters.items():
++        if not name.startswith('dflash2/') or not parameter.projection:
++            continue
++        if 'conv' in name or '/attention/context_' in name:
++            continue
++        if any(name.endswith(suffix) for suffix in _KEPT_Q8):
++            continue
++        if name in _REQUANTISE:
++            recipe.assign(name, format='nvfp4', method=nvfp4_maxabs,
++                          activation_policy='A16Only')
++            continue
++        recipe.assign(name, format='nvfp4', method=import_encoded)
+diff --git a/tools/convert/recipes/dflash2_nvfp4.py b/tools/convert/recipes/dflash2_nvfp4.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f998d725d0a70dd66c700ada8ca26265698ee10
+--- /dev/null
++++ b/tools/convert/recipes/dflash2_nvfp4.py
+@@ -0,0 +1,22 @@
++"""Quantize supported DFlash2 projections to weight-only NVFP4.
++
++QKV keeps its native Q8 fused route; convolution preparation remains BF16.
++"""
++from tools.convert.nvfp4 import nvfp4_maxabs
++
++def configure(model, recipe, sources):
++    if 'dflash2' not in model.components:
++        raise ValueError('DFlash2 NVFP4 override requires the DFlash2 component')
++    for name, parameter in model.parameters.items():
++        if not name.startswith('dflash2/') or not parameter.projection:
++            continue
++        if 'conv' in name or '/attention/context_' in name:
++            continue
++        if name.endswith(('/attention/query', '/attention/key', '/attention/value')):
++            continue
++        recipe.assign(name, format='nvfp4', method=nvfp4_maxabs, activation_policy='A16Only')
++    # Custom methods do not participate in Recipe's automatic packing. SwiGLU needs
++    # gate/up in one complete NVFP4 parent, quantized with one shared divisor.
++    for name in model.parameters:
++        if name.startswith('dflash2/') and name.endswith('/mlp/gate'):
++            recipe.group((name, name.removesuffix('gate') + 'up'))
+diff --git a/tools/convert/repack_t5.py b/tools/convert/repack_t5.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8d4a224c697690afbd10984e992125a4429142c
+--- /dev/null
++++ b/tools/convert/repack_t5.py
+@@ -0,0 +1,125 @@
++"""Repack a native PTQ1 artifact to T5, preserving other objects byte for byte.
++
++Run: python -m tools.convert.repack_t5 INPUT.ninfer OUTPUT.ninfer
++The output is a separate artifact; the input is never modified.
++"""
++from __future__ import annotations
++
++import argparse
++from copy import deepcopy
++import hashlib
++import json
++from pathlib import Path
++
++import torch
++
++from ..artifact.reader import Artifact
++from ..artifact.writer import ArtifactWriter
++from ..artifact.schema import TensorObject, TensorSpec, ResourceSpec
++from ..artifact.layouts import row_split_geometry
++from ..artifact.tensor_output import TensorOutput
++from ..artifact.codecs.ptq1 import unpack as unpack_ptq1
++from ..artifact.codecs.t5 import pack, unpack
++
++
++def repack(source: Path, destination: Path) -> dict:
++    with Artifact(source) as original:
++        targets = {o.id for o in original.objects
++                   if isinstance(o, TensorObject) and o.format == 'ptq1_g128_fp16'}
++        if not targets:
++            raise ValueError('input has no native PTQ1 objects')
++        specs = [TensorSpec(o.id, o.shape, 't5_g128_fp16' if o.id in targets else o.format,
++                            o.layout, o.divisors) if isinstance(o, TensorObject)
++                 else ResourceSpec(o.id, o.bytes, o.encoding) for o in original.objects]
++        directory = original.directory
++        uses = deepcopy(list(directory.uses))
++        for use in uses:
++            binding = directory.bindings[use['parameter']]
++            parts = binding.get('parts', [binding])
++            objects = {part['object'] for part in parts}
++            if objects & targets:
++                if not objects <= targets:
++                    raise ValueError('one parameter mixes PTQ1 and another representation')
++                use['activation_policy'] = 'AllowA8'
++        report = {'source': str(source.resolve()), 'destination': str(destination.resolve()),
++                  'source_artifact_id': original.artifact_id.hex(), 'repacked': [], 'copied': []}
++        provenance = deepcopy(directory.provenance)
++        provenance['t5_repack'] = {'source_artifact_id': original.artifact_id.hex(),
++            'kernel_source': 'JGamboa/ninfer-4090-windows@e905787f067de89ef6ef28c52d65a2ce91d425ca',
++            'weights': 'exact PTQ1 codes and FP16 scale bits; A8 execution permission'}
++        with ArtifactWriter(destination, specs, components=directory.components,
++                            bindings=directory.bindings, uses=uses, metadata=directory.metadata,
++                            provenance=provenance) as writer:
++            for obj in original.objects:
++                if obj.id not in targets:
++                    digest = hashlib.sha256()
++                    def chunks():
++                        for chunk in original.iter_object(obj.id):
++                            digest.update(chunk)
++                            yield chunk
++                    writer.write_object(obj.id, chunks())
++                    report['copied'].append({'id': obj.id, 'bytes': obj.bytes, 'sha256': digest.hexdigest()})
++                    continue
++                n, k = obj.shape
++                geometry = row_split_geometry(obj.format, obj.shape)
++                output = TensorOutput(writer, obj.id)
++                logical_hash = hashlib.sha256()
++                scale_hash = hashlib.sha256()
++                # Bound temporary tensors even for the vocabulary head.
++                rows_per_chunk = max(1, (4 << 20) // k)
++                for begin in range(0, n, rows_per_chunk):
++                    rows = min(rows_per_chunk, n - begin)
++                    def plane(offset, pitch):
++                        return torch.frombuffer(bytearray(original.read_range(
++                            obj.offset + offset + begin * pitch, rows * pitch)), dtype=torch.uint8)
++                    low = plane(geometry.base_offset, geometry.base_row_bytes)
++                    high = plane(geometry.high_offset, geometry.high_row_bytes)
++                    scales = plane(geometry.scale_offset, geometry.scale_row_bytes).view(torch.float16)
++                    codes = unpack_ptq1(low, high)
++                    if not torch.equal(unpack(pack(codes)), codes):
++                        raise ValueError(f'{obj.id}: exact T5 round trip failed')
++                    logical_hash.update(codes.numpy().tobytes())
++                    scale_hash.update(scales.view(torch.uint8).numpy().tobytes())
++                    output.write_codes(begin, codes.reshape(rows, k//128, 128),
++                                       scales.reshape(rows, k//128))
++                report['repacked'].append({'id': obj.id, 'shape': list(obj.shape),
++                    'codes_sha256': logical_hash.hexdigest(), 'scale_sha256': scale_hash.hexdigest()})
++                print(f'T5 {obj.id} {n}x{k}', flush=True)
++        # Re-read the persisted artifact, including unchanged MTP, norms and resources.
++        with Artifact(destination) as converted:
++            for item in report['copied']:
++                digest = hashlib.sha256()
++                for chunk in converted.iter_object(item['id']): digest.update(chunk)
++                if digest.hexdigest() != item['sha256']:
++                    raise ValueError(f"{item['id']}: unchanged object mismatch")
++            for item in report['repacked']:
++                obj = converted.object(item['id'])
++                n,k = obj.shape
++                geometry = row_split_geometry(obj.format, obj.shape)
++                code_hash, scale_hash = hashlib.sha256(), hashlib.sha256()
++                for begin in range(0,n,max(1,(4<<20)//k)):
++                    rows=min(max(1,(4<<20)//k),n-begin)
++                    raw=converted.read_range(obj.offset+begin*geometry.base_row_bytes, rows*geometry.base_row_bytes)
++                    codes=unpack(torch.frombuffer(bytearray(raw),dtype=torch.uint8))
++                    code_hash.update(codes.numpy().tobytes())
++                    scale_hash.update(converted.read_range(obj.offset+geometry.scale_offset+begin*geometry.scale_row_bytes,rows*geometry.scale_row_bytes))
++                if (code_hash.hexdigest()!=item['codes_sha256'] or scale_hash.hexdigest()!=item['scale_sha256']):
++                    raise ValueError(f"{item['id']}: persisted codes/scales mismatch")
++        report['verified'] = True
++        destination.with_suffix(destination.suffix+'.repack.json').write_text(
++            json.dumps(report, indent=2), encoding='utf-8')
++        return report
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('source',type=Path)
++    p.add_argument('destination',type=Path)
++    args=p.parse_args()
++    torch.set_num_threads(4)
++    report=repack(args.source,args.destination)
++    print(f"Verified {len(report['repacked'])} T5 objects and {len(report['copied'])} copied objects")
++
++
++if __name__=='__main__':
++    main()
+diff --git a/tools/convert/resources.py b/tools/convert/resources.py
+index b3aca986de12972367122845f81ced815db64498..8c3c06202b1803ef59d1329d7505685d2241adb3 100644
+--- a/tools/convert/resources.py
++++ b/tools/convert/resources.py
+@@ -14,15 +14,17 @@ TEXT_RESOURCES = (
+ )
+ VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
+ 
+-# Must stay byte-identical to kQwenSplitPattern in
+-# src/models/qwen3_5/frontend/tokenizer.cpp: the runtime tokenizer validates
+-# tokenizer.json's Split pattern for exact equality and rejects any artifact whose
+-# pattern differs.
++# Match the two implemented Split patterns in the Qwen runtime tokenizer.
+ STD_QWEN_SPLIT_PATTERN = (
+     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
+     r"|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+ )
+ 
++QWEN2_SPLIT_PATTERN = (
++    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+"
++    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
++)
++
+ # Qwen3.5 tokenizer_config.json invariants the runtime frontend hard-requires
+ # (src/models/qwen3_5/frontend/frontend.cpp validate_tokenizer_config): a missing
+ # field defaults to the failing value, so each must be present and set to the
+@@ -82,15 +84,7 @@ def _dump_json(value: dict) -> bytes:
+ 
+ 
+ def _normalize_qwen_split(tokenizer: dict) -> bool:
+-    """Normalize a drifted pre-tokenizer split pattern to the standard Qwen one.
+-
+-    The runtime tokenizer pre-tokenizes with its own hardcoded \\p{L}\\p{M} logic
+-    (not the JSON regex) but validates the stored Split pattern for exact equality
+-    against kQwenSplitPattern, so a drifted pattern (some third-party Qwen
+-    checkpoints drop \\p{M}) makes the artifact unloadable without changing
+-    tokenization. Rewriting it to the standard pattern is safe. Returns True if the
+-    pattern changed.
+-    """
++    """Keep both supported Qwen word rules and canonicalize equivalent spellings."""
+     pre = tokenizer.get("pre_tokenizer")
+     if not isinstance(pre, dict) or pre.get("type") != "Sequence":
+         return False
+@@ -103,9 +97,11 @@ def _normalize_qwen_split(tokenizer: dict) -> bool:
+     pattern = split.get("pattern")
+     if not isinstance(pattern, dict):
+         return False
+-    if pattern.get("Regex") == STD_QWEN_SPLIT_PATTERN:
++    expression = pattern.get("Regex")
++    if expression in (STD_QWEN_SPLIT_PATTERN, QWEN2_SPLIT_PATTERN):
+         return False
+-    pattern["Regex"] = STD_QWEN_SPLIT_PATTERN
++    qwen2_class_spelling = QWEN2_SPLIT_PATTERN.replace(r"\p{L}+", r"[\p{L}]+")
++    pattern["Regex"] = QWEN2_SPLIT_PATTERN if expression == qwen2_class_spelling else STD_QWEN_SPLIT_PATTERN
+     split["behavior"] = "Isolated"
+     split["invert"] = False
+     return True
+@@ -213,7 +209,7 @@ def load_resources(
+     if _normalize_qwen_split(tokenizer_json):
+         payloads["resource/text/tokenizer.json"] = _dump_json(tokenizer_json)
+         print(
+-            "normalized tokenizer.json split pattern to the standard Qwen pattern",
++            "normalized tokenizer.json split pattern to a supported Qwen spelling",
+             flush=True,
+         )
+     config_changed = False
+diff --git a/tools/convert/sources/logical.py b/tools/convert/sources/logical.py
+index 1b5f9df58b0530f8bbfcdbe28454848bfbebf9c4..cb8fae71856e34d9426282e7f945d94f5355afff 100644
+--- a/tools/convert/sources/logical.py
++++ b/tools/convert/sources/logical.py
+@@ -16,6 +16,8 @@ class EncodedRows:
+     scales: torch.Tensor
+     weight_divisor: bytes | None = None
+     # Native Q2/Q8 may supply complete packed code rows instead of logical integer codes.
++    # Native PTQ1 packed rows contain 26-byte (24 base + 2 tail) records per 128-group;
++    # the binary16 scales remain in `scales`.
+     packed: bool = False
+     # INT32 little-endian words of rows stored over permuted input columns: stored column c
+     # multiplies logical input element input_columns[c]. None when the stored columns are in the
+diff --git a/tools/convert/ternary.py b/tools/convert/ternary.py
+index a53eb3fcdfd2345b9963d973e719051388545953..37aa9524c7cffad7d4ad8b7c12ceeeee60f2cd50 100644
+--- a/tools/convert/ternary.py
++++ b/tools/convert/ternary.py
+@@ -19,6 +19,7 @@ and `--source dflash2`, which share the geometry.
+ 
+ from __future__ import annotations
+ 
++from functools import partial
+ from typing import Callable
+ 
+ import numpy as np
+@@ -26,12 +27,16 @@ import torch
+ 
+ from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
+ 
++from .dense_geometry import DenseGeometry
+ from .methods import AuxiliaryValue, cast_direct, grouped_absmax, import_encoded
+ from .official_recipes import Q4, _optional
+ from .sources.gguf import TYPE_BF16, TYPE_F32, GGUFFile
+ from .sources.logical import EncodedRows, LogicalSource, array_source
+ 
+ T2 = "t2_g128_fp16"
++PTQ1 = "ptq1_g128_fp16"
++T5 = "t5_g128_fp16"
++GGUF_PTQ1 = "gguf_ptq1_0"
+ 
+ # The DFlash2 adapter projections a ternary artifact encodes as Q4. The fused query/key/value
+ # projection, which the context key/value Uses share, stays Q8 for its Q8-only three-output op.
+@@ -60,9 +65,14 @@ GDN_CHANNELS = 2 * GDN_KEY_DIM + GDN_VALUE_DIM
+ GDN_TAPS = 4
+ HADAMARD_BLOCK = 1024
+ SIGN_WIDTHS = (HIDDEN, ATTENTION_QUERY_ROWS, INTERMEDIATE)
++DENSE_GEOMETRY = DenseGeometry(
++    HIDDEN, INTERMEDIATE, VOCABULARY, LAYERS, ATTENTION_HEADS,
++    ATTENTION_KV_ROWS // ATTENTION_HEAD_DIM, ATTENTION_HEAD_DIM,
++    GDN_KEY_HEADS, GDN_VALUE_HEADS, GDN_HEAD_DIM, GDN_TAPS, False,
++)
+ 
+ # The ternary GGUF types and the artifact format their rows take.
+-TERNARY_FORMATS = {"PQ2_0": T2, "PTQ1_0": "gguf_ptq1_0"}
++TERNARY_FORMATS = {"PQ2_0": T2, "PTQ1_0": GGUF_PTQ1}
+ # The storage the GDN A/B controls may have: BF16 words, or F32 words BF16 holds exactly.
+ CONTROL_TYPES = ("BF16", "F32")
+ MTP_BLOCK = LAYERS
+@@ -309,25 +319,38 @@ def _flat(read_rows, k: int):
+ 
+ 
+ def ternary_source(
+-    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap
++    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap, format: str = T2
+ ) -> LogicalSource:
+-    """Rotated ternary rows as encoded T2 words, and their exact values for any other method."""
++    """Exact rotated ternary rows for native T2, PTQ1 or T5 storage."""
+ 
+     k = shape[1]
+ 
+     def encoded(begin: int, end: int) -> EncodedRows:
+         index = select(begin, end)
+         low, high = int(index.min()), int(index.max()) + 1
++        if format == PTQ1 and gguf.info(tensor).type_name == "PTQ1_0":
++            row_bytes = k // 128 * 28
++            raw = gguf.tensor_bytes(tensor, low * row_bytes, high * row_bytes)
++            selected = np.asarray(raw).reshape(high - low, k // 128, 28)[index - low]
++            codes = np.ascontiguousarray(selected[:, :, :26]).reshape(end - begin, -1)
++            scales = np.ascontiguousarray(selected[:, :, 26:]).view("<f2").reshape(end - begin, k // 128)
++            return EncodedRows(PTQ1, torch.from_numpy(codes), torch.from_numpy(scales), packed=True)
+         blocks = gguf.read_ternary(tensor, low, high)
+         return EncodedRows(
+-            T2,
++            format,
+             torch.from_numpy(np.ascontiguousarray(blocks.values[index - low])),
+             torch.from_numpy(np.ascontiguousarray(blocks.scales[index - low])),
+         )
+ 
+     def values(first: int, last: int) -> torch.Tensor:
+         words = encoded(first, last)
+-        return words.codes.float() * words.scales.float().unsqueeze(-1)
++        if words.packed:
++            from tools.artifact.codecs.ptq1 import unpack
++            records = words.codes.reshape(-1, 26)
++            codes = unpack(records[:, :24], records[:, 24:]).reshape(last - first, k // 128, 128)
++        else:
++            codes = words.codes
++        return codes.float() * words.scales.float().unsqueeze(-1)
+ 
+     return LogicalSource(shape, f"{tensor}{list(shape)}", _flat(values, k), encoded)
+ 
+@@ -376,32 +399,20 @@ def mtp_sources(
+ ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
+     """Block 64's MTP head: its stored (unrotated) blocks as encoded rows and its norms."""
+ 
+-    from .gguf_blocks import _attention, _layer, block_source
++    from .gguf_blocks import mtp_sources as dense_mtp_sources
+ 
+-    g, p = f"blk.{MTP_BLOCK}.", "mtp/layers/0/"
+-    encoded, direct = _layer(gguf, g, p)
+-    e, d = _attention(gguf, g, p + "attention/")
+-    encoded |= e
+-    direct |= d
+-    encoded["mtp/input_projection"] = block_source(
+-        gguf, g + "nextn.eh_proj.weight", (HIDDEN, 2 * HIDDEN), rows()
+-    )
+-    for role, tensor in (
+-        ("embedding_norm", "nextn.enorm.weight"),
+-        ("hidden_norm", "nextn.hnorm.weight"),
+-        ("final_norm", "nextn.shared_head_norm.weight"),
+-    ):
+-        direct["mtp/" + role] = _norm(gguf, g + tensor, True)
+-    return encoded, direct
++    return dense_mtp_sources(gguf, DENSE_GEOMETRY)
+ 
+ 
+ def text_sources(
+-    gguf: GGUFFile,
++    gguf: GGUFFile, format: str | None = None,
+ ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
+     """Encoded sources (T2 words of PQ2_0 rows, the blocks of PTQ1_0 rows) and direct sources of
+     every GGUF-backed text parameter."""
+ 
+-    ternary_rows = ternary_source if ternary_kind(gguf) == "PQ2_0" else ptq1_source
++    if format is None:
++        format = TERNARY_FORMATS[ternary_kind(gguf)]
++    ternary_rows = ptq1_source if format == GGUF_PTQ1 else partial(ternary_source, format=format)
+     encoded = {
+         "text/output_head": ternary_rows(
+             gguf, "output.weight", (VOCABULARY, HIDDEN), rows()
+@@ -517,7 +528,7 @@ def _group_projections(recipe, prefix: str, gdn: bool, pairs: bool) -> None:
+     recipe.group([prefix + "mlp/gate", prefix + "mlp/up"])
+ 
+ 
+-def bonsai2_27b_ternary(model, recipe, sources):
++def bonsai2_27b_ternary(model, recipe, sources, *, format=None, use_embedded_mtp=True):
+     """Ternary Bonsai 2 or 2.5 27B from `--source ternary=<the PQ2_0 or PTQ1_0 GGUF>`; with an
+     `-mtp` GGUF the MTP head from its block 64, with `--source vision=<mmproj GGUF>` the release's
+     Vision tower."""
+@@ -533,8 +544,8 @@ def bonsai2_27b_ternary(model, recipe, sources):
+         )
+     gguf = sources["ternary"]
+     validate(gguf)
+-    kind = ternary_kind(gguf)
+-    format = TERNARY_FORMATS[kind]
++    if format is None:
++        format = TERNARY_FORMATS[ternary_kind(gguf)]
+     signs = sign_vectors(gguf)
+     _optional(model, recipe)
+     if "vision" in model.components and "vision" in sources:
+@@ -548,17 +559,17 @@ def bonsai2_27b_ternary(model, recipe, sources):
+         if name.startswith("dflash2/") and name.endswith(DFLASH2_Q4_PROJECTIONS):
+             recipe.assign(name, format=Q4, method=grouped_absmax)
+     # The GGUF's own MTP head (block 64), unless `--source mtp` names another one.
+-    mtp = "mtp" in model.components and has_mtp(gguf) and "mtp" not in sources
+-    encoded, direct = text_sources(gguf)
++    mtp = use_embedded_mtp and "mtp" in model.components and has_mtp(gguf) and "mtp" not in sources
++    encoded, direct = text_sources(gguf, format)
+     mtp_encoded, mtp_direct = mtp_sources(gguf) if mtp else ({}, {})
+-    blocks = format != T2
++    blocks = format == GGUF_PTQ1
+     for name, source in encoded.items():
+         recipe.assign(
+             name,
+             format=format,
+             method=import_encoded,
+             source=source,
+-            activation_policy="AllowA8" if blocks else None,
++            activation_policy="AllowA8" if blocks or format == T5 else "A16Only",
+         )
+     for name, source in mtp_encoded.items():
+         recipe.assign(
+@@ -594,7 +605,47 @@ def bonsai2_27b_ternary(model, recipe, sources):
+             )
+ 
+ 
+-RECIPES = {"bonsai2_27b_ternary": bonsai2_27b_ternary}
++def bonsai2_27b_ternary_gguf_mtp(model, recipe, sources):
++    """Ternary text plus byte-preserving GGUF MTP from --source gguf=PATH.
++
++    The MTP GGUF uses the dense exporter's +1-stored norms, as the Bonsai r3
++    exports do. The regular companion still supplies the model's MTP geometry.
++    """
++    from .gguf_blocks import mtp_sources, _group_same_format
++
++    if "mtp" not in model.components:
++        raise ValueError("the GGUF MTP recipe requires --components text,mtp")
++    bonsai2_27b_ternary(model, recipe, sources, format=T2, use_embedded_mtp=False)
++    encoded, direct = mtp_sources(sources["gguf"], DenseGeometry.from_config(model.config))
++    formats = {}
++    for name, source in encoded.items():
++        formats[name] = source.read_encoded(0, 1).format
++        recipe.assign(name, format=formats[name], method=import_encoded,
++                      source=source, activation_policy="AllowA8")
++    for name, source in direct.items():
++        recipe.assign(name, format=model.parameters[name].direct_format,
++                      method=cast_direct, source=source)
++    p = "mtp/layers/0/"
++    _group_same_format(recipe, [p + "attention/" + role
++                               for role in ("query", "key", "gate", "value")], formats)
++    _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
++
++
++def bonsai2_27b_ptq1(model, recipe, sources):
++    """Native PTQ1 text weights; retain the companion's optional Vision/MTP components."""
++    bonsai2_27b_ternary(model, recipe, sources, format=PTQ1)
++
++
++def bonsai2_27b_t5(model, recipe, sources):
++    """Exact Bonsai ternary weights in the JGamboa T5 layout with A8 execution."""
++    bonsai2_27b_ternary(model, recipe, sources, format=T5)
++
++
++RECIPES = {"bonsai2_27b_t5": bonsai2_27b_t5,
++           "bonsai2_27b_ptq1": bonsai2_27b_ptq1,
++           "bonsai2_27b_ternary": bonsai2_27b_ternary,
++           "bonsai2_27b_ternary_gguf_mtp": bonsai2_27b_ternary_gguf_mtp}
++
+ 
+ __all__ = [
+     "EXPECTED_HEADER",

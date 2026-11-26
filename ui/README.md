@@ -225,11 +225,15 @@ setting. llama.cpp currently exposes concurrency 1–4 on one GPU, NInfer 1–8.
 Native options keep their original spellings, with a small
 allowlist of numeric thread/GPU-offload options; arbitrary shell text and duplicate common
 options are rejected. Both engines use the same GPU cards. Switching engines preserves the
-selected UUIDs and their order; it never silently chooses another card. Multi-GPU launch is
-currently exposed for NInfer layer splitting. When switching a multi-GPU selection to
-llama.cpp, the cards keep that selection and explain that this launcher currently requires
-one GPU for llama.cpp. Validation blocks preview/start until the user selects one card.
-This is a limit of the current launcher integration, not a claim that llama.cpp lacks multi-GPU support.
+selected UUIDs and their order. In NInfer, select two compatible GPUs under **Inference GPUs**,
+then open **Multi-GPU** and enable **Tensor parallelism · heads**. Leave **TP weights** blank
+for automatic allocation, or enter one positive weight per GPU in the displayed order, such
+as `3,1`. With tensor parallelism off, the launcher uses layer splitting. The launch preview
+checks the selected worker's heads TP capability. After startup, the monitor reports the
+worker's actual execution mode. See the [Windows launcher options](../scripts/windows/README.md#ninfer-tensor-parallelism--ninfer-张量并行).
+
+When switching a multi-GPU selection to llama.cpp, the cards keep that selection. Select
+one GPU to preview or start a llama.cpp service in this launcher.
 
 Common resource, cache and service settings follow the current edits when switching engines,
 including GPU selection, context/B/R/H, prefill/output budgets, port/listen address, concurrency,
@@ -237,8 +241,8 @@ SSD and LRFU settings, model alias and log level. Different supported ranges rem
 to validation; a switch does not clamp a value or reset it to a default. Model/worker paths,
 KV format, chat templates, feature overrides and native arguments keep separate in-page
 drafts per backend, including incomplete native edits. Returning to NInfer reorders saved
-layer counts by GPU UUID if only the order changed, or clears them with a message if the
-selected devices changed. Controls have the same grouping and labels; native formats,
+layer counts or TP weights by GPU UUID if only the order changed, or clears the allocation
+with a message if the selected devices changed. Controls have the same grouping and labels; native formats,
 supported capabilities and explanatory limits can differ.
 
 For llama.cpp, Cache & history has separate **K cache format** and **V cache format**

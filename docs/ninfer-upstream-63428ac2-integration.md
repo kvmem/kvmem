@@ -1,5 +1,7 @@
 # ninfer-all 63428ac2 接入记录
 
+本页记录 2026-10-26 的候选版本。当前控制台和启动器设置见 [NInfer 张量并行](multi-backend.md#ninfer-张量并行)。
+
 日期：2026-10-26。版本：0.19.0。状态：完整构建、最终 fork 的核心功能、独立
 数值检查和三种 KV 的受控性能比较通过。同步 KVMem master `47cee454` 的
 checkpoint-policy 与 monitor-events；发布包仅包含 NVIDIA 50 系 ninfer 后端。
