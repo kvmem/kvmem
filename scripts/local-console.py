@@ -955,6 +955,15 @@ class Controller:
             # Omitted fields use the launcher's defaults. Only explicit values
             # must remain unchanged; report validation uses the effective plan.
             if any(key in p and effective[key] != p[key] for key in ('Reserve', 'Prefill')):
+                prefill = p.get('Prefill')
+                reserve = effective['Reserve']
+                if prefill is not None and prefill > reserve:
+                    raise ValueError(
+                        f'Prefill 不能超过 Gen Reserve。当前 Prefill 为 {prefill:,}，生效的 Gen Reserve 为 {reserve:,}。'
+                        '请先修改其中一项，自动调整只修改 Budget。 / '
+                        f'Prefill ({prefill:,}) cannot exceed the effective Gen Reserve ({reserve:,}). '
+                        'Adjust either setting first. Auto adjustment changes Budget only.'
+                    )
                 raise ValueError('请先通过检查配置对齐 gen reserve 和 prefill；自动调整只修改 budget / Align reserve and prefill first; auto adjustment changes budget only')
             result = validate_budget_plan(self._run_budget_plan(plan), p, plan['token_settings'])
             if self.budget_cancelled:
