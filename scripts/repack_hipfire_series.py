@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Repack the hipfire patch chain into semantic group patches.
 
-The individual patch series is kept for history (``upstream-70.json`` and the
+The individual patch series is kept for history (``upstream-75.json`` and the
 original patch files); ``upstream.json`` points at a small ordered set of group
 patches so a reviewer can see subsystem boundaries without losing the verified
 final tree. Group patches are generated from real tree snapshots: each group is
@@ -22,7 +22,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 HIPFIRE_DIR = ROOT / "backends" / "hipfire"
 DEFAULT_MANIFEST = HIPFIRE_DIR / "upstream.json"
-DEFAULT_ARCHIVE = HIPFIRE_DIR / "upstream-73.json"
+DEFAULT_ARCHIVE = HIPFIRE_DIR / "upstream-75.json"
 
 # Each underlying patch belongs to exactly one group and groups stay in the
 # verified sequential order. Keep this list in sync with the ids in the
@@ -72,11 +72,7 @@ GROUPS = (
             "think-recovery", "legacy-budget-clamp",
             "think-budget-emitter", "think-knobs-answer-room",
             "sequential-loop-recovery",
-            "kvmem-p0-contract", "kvmem-p1a-serve-engine",
-            "kvmem-p1a-batch2-serve-engine",
-            "kvmem-p1c-kvmem-ctl-split", "kvmem-p1d-forward-seam",
-            "kvmem-p2a-options", "kvmem-recovery", "kvmem-c1-hooks",
-            "kvmem-gpu-fixture-fixes", "kvmem-c1-deep-modules",
+            "fork-k2-k13-requeue", "kvmem-full-takeover",
         ),
     },
 )
@@ -243,7 +239,7 @@ def grouped_output(source: dict, entries: list[dict], patched_tree: str,
     output = dict(source)
     output["patches"] = entries
     output["patched_tree"] = patched_tree
-    output["series"] = "grouped-v6"
+    output["series"] = "grouped-v7"
     output["previous_series"] = archive_name
     return output
 

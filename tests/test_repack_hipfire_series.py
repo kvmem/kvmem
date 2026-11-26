@@ -143,7 +143,10 @@ class RealManifestTest(unittest.TestCase):
         archive = manifest_path.parent / manifest["previous_series"]
         self.assertTrue(archive.is_file())
         individual = module.load_manifest(archive)
-        self.assertEqual(len(individual["patches"]), 73)
+        self.assertEqual(
+            len(individual["patches"]),
+            sum(len(group["patches"]) for group in module.GROUPS),
+        )
         self.assertEqual(individual["patched_tree"], manifest["patched_tree"])
         self.assertEqual(
             [item["id"] for item in manifest["patches"]],

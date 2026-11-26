@@ -23,12 +23,13 @@ Read the current values from the metadata; do not copy them into automation:
 The three groups are applied in manifest order. Group 1 is the standalone Escha
 baseline and group 2 is the independently applicable tool/Codex/Bonsai fork
 base. Group 3 is the contiguous KVMem/feature stack: it contains the KVMem
-integration, the five fork patches that depend on that KVMem/legacy state, and
-the P0/P1/P2 hook series. Those changes rewrite each other's lines, so they are
-kept as one tree diff. Apply all of them; only the first two groups are
-independent of KVMem. The manifest's `repository` is the fork used by
-`prepare-backends.py`; the drill merges the canonical upstream by default. The
-ordered 73-change archive is `upstream-73.json`; older archives are
+integration, fork optimizations, full KV takeover (MTP head paging, DFlash/DN
+parking, ownership/metrics) and Swift `-xt` multi-slot Lloyd admission. Those
+changes rewrite each other's lines, so they are kept as one tree diff. Apply all
+of them; only the first two groups are independent of KVMem. The manifest's
+`repository` is the fork used by `prepare-backends.py`; the drill merges the
+canonical upstream by default. The ordered 65-change archive is
+`upstream-75.json`; older archives are `upstream-74.json`, `upstream-73.json`,
 `upstream-72.json`, `upstream-71.json`, `upstream-70.json`, `upstream-69.json`,
 `upstream-68.json`, `upstream-67.json` and `upstream-66.json` beside it. Those
 archives and the individual files under `backends/patches/` are history, not

@@ -224,11 +224,11 @@ optional performance changes are separate layers; see [Bonsai integration](bonsa
 
 hipfire uses a grouped series: `backends/hipfire/upstream.json` contains three
 group patches generated from verified tree snapshots, while
-`upstream-73.json` retains the ordered 73-patch series. The standalone Escha
+`upstream-75.json` retains the ordered 65-patch series. The standalone Escha
 baseline and the independently applicable tool/Codex/Bonsai fork base precede
-the contiguous KVMem/feature stack; the later fork patches stay inside that
-stack after the KVMem/legacy layers they depend on. Older archives
-(`upstream-70.json` through `upstream-66.json`) and the original patch files
+the contiguous KVMem/feature stack; the later fork patches and full KV takeover
+stay inside that stack after the KVMem/legacy layers they depend on. Older archives
+(`upstream-74.json` through `upstream-66.json`) and the original patch files
 under `backends/patches/` remain history, not alternate heads. Regenerate the
 groups with `scripts/repack_hipfire_series.py --write`; validate with `--check`
 or `prepare-backends.py --backend hipfire --check`. Group patches are generated

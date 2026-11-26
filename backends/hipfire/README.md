@@ -10,10 +10,10 @@ restores it.
 
 ## Grouped patch series
 
-`upstream.json` lists three group patches rather than the original 73
+`upstream.json` lists three group patches rather than the original 65
 underlying changes. Each group is a binary diff between two verified tree
 snapshots, so its `after_tree` is still checked by `prepare-backends.py`. The
-individual series remains in `upstream-73.json`; `upstream-72.json` and older
+individual series remains in `upstream-75.json`; `upstream-74.json` and older
 archives are kept for history and bisection. The original
 `../patches/hipfire-*.patch` files remain available as source material.
 
@@ -21,7 +21,7 @@ archives are kept for history and bisection. The original
 |---|---|
 | `escha-baseline` | 1: standalone Escha/fork baseline; no KVMem crate, controller, taps or paged-attention API |
 | `fork-base` | 2-4: tool recovery, Codex Responses and Bonsai render; independently applicable to the Escha baseline |
-| `kvmem-stack` | 5-73: the contiguous KVMem adapter, layerwise/MTP/content/surface layers, fork features and P0/P1/P2 hook series; these changes rewrite each other's lines, so they are reviewed as one tree diff |
+| `kvmem-stack` | 5-65: the contiguous KVMem adapter, layerwise/MTP/content/surface layers, fork optimizations, full KV takeover (MTP head paging, DFlash/DN parking, ownership/metrics) and Swift `-xt` multi-slot Lloyd admission; these changes rewrite each other's lines, so they are reviewed as one tree diff |
 
 `scripts/repack_hipfire_series.py --write` regenerates the group patches from
 the archived individual series and the pinned checkout; `--check` verifies the
@@ -98,7 +98,7 @@ sides of the C ABI. Bump the version for any layout, signature or enum change.
 
 `scripts/prepare-backends.py --backend hipfire` clones the pinned base commit
 into `../hipfire` beside this checkout (override with `--hipfire-dir`) and
-applies the verified 3-group patch series (73 underlying changes); `--backend all` includes hipfire only when
+applies the verified 3-group patch series (65 underlying changes); `--backend all` includes hipfire only when
 `--hipfire-dir` is given or the sibling checkout is already at the pinned base
 with the patched tree. `--all` never clones or patches hipfire implicitly, and
 ROCm detection is not a gate. `cargo build` refreshes `Cargo.lock` in the
@@ -149,7 +149,7 @@ English conflict text) and routes the loop-recovery trace read through
 `hipfire_config::developer_var_os`.
 
 The per-patch qualification notes below describe the underlying changes before
-the grouped repack; their boundaries and hashes remain in `upstream-73.json`.
+the grouped repack; their boundaries and hashes remain in `upstream-75.json`.
 
 The third `rdna3-opt` patch is a gfx1100 (RDNA3) operator pass on top of that
 integration, verified byte-exact (`89e32856d` + the first three patches reproduce
