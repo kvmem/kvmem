@@ -136,8 +136,9 @@ INTEGERS.update(LAYERWISE_RESOURCES)
 MCP_OPTIONS = {'llamacpp': '--mcp-servers-config', 'polystrata': '--mcp-config'}
 NATIVE = {'llamacpp': {'--threads', '--threads-batch', '--n-gpu-layers', MCP_OPTIONS['llamacpp']},
           'radiance': {'--http-threads'}, 'ninfer': {'--threads'},
-          'polystrata': {'--threads', '--elastic-headroom-mib', '--elastic-physical-reserve-mib', MCP_OPTIONS['polystrata']}}
-NATIVE_SWITCHES = {'polystrata': {'--elastic-experts', '--elastic-experts-headroom'}}
+          'polystrata': {'--threads', '--elastic-headroom-mib', '--elastic-physical-reserve-mib',
+                        '--attn-requant', '--expert-swaps', MCP_OPTIONS['polystrata']}}
+NATIVE_SWITCHES = {'polystrata': {'--elastic-experts', '--elastic-experts-headroom', '--loop-bf16'}}
 # Native options whose value is one of a fixed set of words.
 NATIVE_CHOICES = {'ninfer': {'--reasoning-loop': ('off', 'stop', 'conclude')}}
 # Native options that name a file the worker writes; its directory must already exist.
@@ -280,7 +281,8 @@ def normalize(data, backends, *, path_root=None):
             if draft and (Path(draft).suffix.lower() != '.gguf' or not Path(draft).is_file()):
                 raise ValueError('DraftModel must be an existing GGUF file')
     if p['Backend']=='polystrata':
-        if p.get('KvType','f16') not in {'f16','q8_0','int8','int8k'}: raise ValueError('PolyStrata KV: Qwen supports f16/q8_0; Gemma supports f16/int8/int8k')
+        if p.get('KvType','f16') not in {'f16','q8_0','int8','int8k','fp8'}:
+            raise ValueError('PolyStrata KV formats: Qwen f16/q8_0, Gemma f16/int8/int8k, Inkling f16/fp8')
         if ',' in p.get('Gpu',''): raise ValueError('PolyStrata currently supports one GPU')
         if p.get('ReasoningEffort') not in (None,'none','low','medium','high','xhigh'): raise ValueError('PolyStrata reasoning effort must be none, low, medium or high')
         if p.get('ThinkingMode')=='on' and p.get('ReasoningEffort')=='none': raise ValueError('ThinkingMode conflicts with ReasoningEffort none')
@@ -353,8 +355,14 @@ def normalize(data, backends, *, path_root=None):
                 raise ValueError('--reasoning-loop requires thinking; it conflicts with ThinkingMode off')
             index += 1
             continue
-        if (flag not in NATIVE[p['Backend']] or index == len(args)
-                or not re.fullmatch(r'\d{1,6}', args[index])):
+        if flag not in NATIVE[p['Backend']] or index == len(args):
+            raise ValueError(f'Unsupported or incomplete native option: {flag}')
+        if flag == '--attn-requant':
+            if args[index] not in ('q5_0', 'q4_0', 'iq4_nl'):
+                raise ValueError('Attention requantization must use q5_0, q4_0 or iq4_nl')
+            index += 1
+            continue
+        if not re.fullmatch(r'\d{1,6}', args[index]):
             raise ValueError(f'Unsupported or incomplete native option: {flag}')
         if flag == '--elastic-headroom-mib' and not 0 <= int(args[index]) <= 1024:
             raise ValueError('Elastic headroom must be 0..1024 MiB')

@@ -72,6 +72,13 @@ def main():
     shutil.copy2(args.cublas_license, package / 'licenses/NVIDIA-cuBLAS.txt')
     shutil.copy2(args.apache_license, package / 'licenses/Apache-2.0.txt')
     shutil.copy2(source / 'backends/llamacpp/LICENSE', package / 'licenses/llama.cpp-MIT.txt')
+    for filename, relative in (
+        ('libtrellis-Apache-2.0.txt', 'ggml/src/ggml-cuda/libtrellis/LICENSE'),
+        ('ExLlamaV3-MIT.txt', 'licenses/LICENSE-exllamav3'),
+    ):
+        license_file = source / 'backends/llamacpp' / relative
+        if license_file.is_file():
+            shutil.copy2(license_file, package / 'licenses' / filename)
     # Retain vendored dependencies' license texts and embedded notices in the source archive.
     for p in (source / 'backends/llamacpp/vendor').rglob('*'):
         if p.is_file() and p.name.lower().startswith(('license', 'copying', 'notice')):

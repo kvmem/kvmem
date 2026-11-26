@@ -9,6 +9,8 @@ $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $poly=Join-Path $root 'backends/polystrata'
+$terminal=Join-Path $poly 'terminal'
+if (!(Test-Path -LiteralPath (Join-Path $terminal 'serve/server.py'))) {$terminal=$poly}
 $out=[IO.Path]::GetFullPath($OutputDir)
 if((Test-Path -LiteralPath $out) -and !$ComponentOnly) { throw 'OutputDir must be new' }
 if (!$ComponentOnly) {
@@ -27,7 +29,8 @@ if(!$GgmlSource) {
     $cache=Join-Path (Split-Path ([IO.Path]::GetFullPath($Worker))) 'CMakeCache.txt'
     if(Test-Path -LiteralPath $cache) { $line=Select-String -LiteralPath $cache -Pattern '^STRATA_GGML_DIR:PATH=(.+)$';if($line) {$GgmlSource=$line.Matches[0].Groups[1].Value} }
 }
-if(!$GgmlSource -or !(Test-Path -LiteralPath (Join-Path $GgmlSource 'LICENSE') -PathType Leaf)) {throw 'Supply GgmlSource with the pinned llama.cpp license used to build the worker'}
+if($GgmlSource -and !(Test-Path -LiteralPath (Join-Path $GgmlSource 'LICENSE') -PathType Leaf)) {throw 'GgmlSource does not contain a license'}
+if(!$GgmlSource -and $terminal -eq $poly) {throw 'Supply GgmlSource with the pinned llama.cpp license used to build the worker'}
 if($PythonRuntime -and !(Test-Path -LiteralPath (Join-Path $PythonRuntime 'python.exe') -PathType Leaf)) { throw 'PythonRuntime must be a portable Python folder with python.exe and its installed frontend dependencies' }
 foreach($dir in @('workers/polystrata','backends/polystrata','tools/polystrata','scripts/windows','licenses','provenance')) { New-Item -ItemType Directory -Path (Join-Path $out $dir) -Force | Out-Null }
 $workers=@(,@($Worker,'strata-poly.exe'))
@@ -54,23 +57,32 @@ foreach($entry in $workers) {
     }
 }
 # The integration serves chat/monitor in the shared console; retain only the old-origin export helper.
-foreach($file in Get-ChildItem -LiteralPath (Join-Path $poly 'serve') -Recurse -File) {
-    if($file.FullName -match '[\\/]__pycache__[\\/]' -or $file.Extension -eq '.pyc') {continue}
-    if($file.FullName -match '[\\/]serve[\\/]web[\\/]' -and $file.Name -ne 'history-export.html') {continue}
-    $relative=$file.FullName.Substring($poly.Length+1)
-    $dest=Join-Path $out "backends/polystrata/$relative"
-    New-Item -ItemType Directory -Path (Split-Path $dest) -Force | Out-Null
-    Copy-Item -LiteralPath $file.FullName -Destination $dest
+$modules=@('serve')
+if($terminal -ne $poly) {$modules+=@('strata_control','strata_cli')}
+foreach($module in $modules) {
+    foreach($file in Get-ChildItem -LiteralPath (Join-Path $terminal $module) -Recurse -File) {
+        if($file.FullName -match '[\\/]__pycache__[\\/]' -or $file.Extension -eq '.pyc') {continue}
+        if($file.FullName -match '[\\/]serve[\\/]web[\\/]' -and $file.Name -ne 'history-export.html') {continue}
+        $relative=$file.FullName.Substring($terminal.Length+1)
+        $dest=Join-Path $out "backends/polystrata/$relative"
+        New-Item -ItemType Directory -Path (Split-Path $dest) -Force | Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $dest
+    }
 }
 $consoleInspection = @('scripts/model_health.py', 'scripts/console_hardware.py', 'scripts/console_memory.py', 'scripts/requirements-console.txt')
 $consoleInspection += 'scripts/windows_amd_hardware.py', 'scripts/windows_gpu_hardware.py'
+$consoleFiles = @('scripts/console_state.py', 'scripts/console_radiance.py', 'scripts/launcher-capabilities.json',
+                  'scripts/check-recall-worker.py', 'scripts/windows/recall-strategy.ps1')
+foreach ($name in '__init__.py', 'config.py', 'plan.py', 'export.py', 'systemd.py', 'worker.py', 'recall.py') {
+    $consoleFiles += 'scripts/launcher/' + $name
+}
 foreach ($name in '__init__.py', 'reader.py', 'schema.py', 'layouts.py', 'formats.py', 'framing.py', 'file_io.py', 'LICENSE', 'PROVENANCE.json') {
     $consoleInspection += 'scripts/model_health_ninfer/' + $name
 }
 foreach($relative in (@('tools/polystrata/server.py','tools/polystrata/assets.py','scripts/local-console.py','scripts/console_chat.py','scripts/speculative-capabilities.json',
  'scripts/windows/start-backend.ps1','scripts/windows/start-polystrata.ps1','scripts/windows/native-process.ps1',
  'scripts/windows/query-scoring.ps1', 'scripts/windows/token-settings.ps1','scripts/windows/start-ui.ps1','scripts/windows/describe-launch-json.ps1',
- 'scripts/windows/select-model.ps1','START-HERE-CN.bat','START-HERE-EN.bat','backends/versions.json') + $consoleInspection)) {
+ 'scripts/windows/select-model.ps1','START-HERE-CN.bat','START-HERE-EN.bat','backends/versions.json') + $consoleInspection + $consoleFiles)) {
     $dest=Join-Path $out $relative;New-Item -ItemType Directory -Path (Split-Path $dest) -Force | Out-Null
     if((Test-Path -LiteralPath $dest) -and (Get-FileHash -LiteralPath $dest).Hash -ne (Get-FileHash -LiteralPath (Join-Path $root $relative)).Hash) {throw "Conflicting common package file: $relative"}
     Copy-Item -LiteralPath (Join-Path $root $relative) -Destination $dest
@@ -82,11 +94,11 @@ foreach($file in Get-ChildItem -LiteralPath (Join-Path $root 'ui/monitor') -Recu
     Copy-Item -LiteralPath $file.FullName -Destination $dest
 }
 New-Item -ItemType Directory -Path (Join-Path $out 'backends/polystrata/tools') -Force | Out-Null
-foreach($name in @('strata_tokenizer.py','gguf_reader.py')) { Copy-Item -LiteralPath (Join-Path $poly "tools/$name") -Destination (Join-Path $out "backends/polystrata/tools/$name") }
-Copy-Item -LiteralPath (Join-Path $poly 'requirements.txt') -Destination (Join-Path $out 'backends/polystrata/requirements.txt')
+foreach($name in @('strata_tokenizer.py','gguf_reader.py')) { Copy-Item -LiteralPath (Join-Path $terminal "tools/$name") -Destination (Join-Path $out "backends/polystrata/tools/$name") }
+Copy-Item -LiteralPath (Join-Path $terminal 'requirements.txt') -Destination (Join-Path $out 'backends/polystrata/requirements.txt')
 Copy-Item -LiteralPath (Join-Path $poly 'LICENSE') -Destination (Join-Path $out 'licenses/PolyStrata-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $out 'licenses/KVMem-README.md')
-Copy-Item -LiteralPath (Join-Path $GgmlSource 'LICENSE') -Destination (Join-Path $out 'licenses/llama.cpp-MIT.txt')
+if($GgmlSource) { Copy-Item -LiteralPath (Join-Path $GgmlSource 'LICENSE') -Destination (Join-Path $out 'licenses/llama.cpp-MIT.txt') }
 if($CudaPath) { Copy-Item -LiteralPath (Join-Path $CudaPath 'EULA.txt') -Destination (Join-Path $out 'licenses/CUDA-EULA.txt') }
 if($PythonRuntime) {
     New-Item -ItemType Directory -Path (Join-Path $out 'runtime') -Force | Out-Null
@@ -97,9 +109,28 @@ if($PythonRuntime) {
 if($ValidationReport) { Copy-Item -LiteralPath $ValidationReport -Destination (Join-Path $out $(if($ComponentOnly){'provenance/polystrata-validation.json'}else{'provenance/validation.json'})) }
 if($ComponentOnly) { Write-Output "Added PolyStrata component: $out";return }
 Copy-Item -LiteralPath $ChatUiDir -Destination (Join-Path $out 'ui/dist') -Recurse
-$manifest=@{backend='polystrata';architecture='qwen35moe';models_included=$false;offline_python_included=[bool]$PythonRuntime;
+$inklingConcurrency = 1
+$inklingRetained = 1
+$inklingDraft = $false
+$inklingDraftBatch = $false
+try {
+    $workerContract = & (Join-Path $out 'workers/polystrata/strata-poly.exe') --kvmem-capabilities 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $properties = ($workerContract | ConvertFrom-Json).PSObject.Properties
+        if ($properties['inkling2_multi_session'] -and $properties['inkling2_multi_session'].Value -eq $true) {
+            $inklingConcurrency = 8
+            $inklingRetained = 16
+        }
+        $inklingDraft = $properties['inkling2_dspark'] -and $properties['inkling2_dspark'].Value -eq $true
+        $inklingDraftBatch = $properties['inkling2_dspark_batch'] -and $properties['inkling2_dspark_batch'].Value -eq $true
+    }
+} catch {
+    # Older workers may not expose capabilities.
+}
+$manifest=@{backend='polystrata';architecture='qwen35moe';architectures=@('qwen35moe','gemma4','inkling2_loop');models_included=$false;offline_python_included=[bool]$PythonRuntime;
     source=(Get-Content -LiteralPath (Join-Path $root 'backends/versions.json') -Raw|ConvertFrom-Json).polystrata;
-    capability_scope=@{gpu_count=1;kv=@('f16','q8_0');max_concurrency=8;solo_mtp_drafts=@(0..3);batch_mtp=$false};
+    capability_scope=@{gpu_count=1;kv=@('f16','q8_0','int8','int8k','fp8');max_concurrency=8;solo_mtp_drafts=@(0..3);batch_mtp=$false;
+        inkling2=@{platform='windows-cuda';kv=@('f16','fp8');max_concurrency=$inklingConcurrency;max_retained_sessions=$inklingRetained;vision=$false;speculative_decoding=$inklingDraft;batch_mtp=$inklingDraftBatch}};
     validation='provenance/validation.json records configurations actually qualified; packaging alone is not runtime qualification'}
 $manifest|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $out 'BUILD-INFO.json') -Encoding utf8
 $hashes=foreach($file in Get-ChildItem -LiteralPath $out -Recurse -File|Sort-Object FullName) { (Get-FileHash -LiteralPath $file.FullName).Hash.ToLowerInvariant()+'  '+$file.FullName.Substring($out.Length+1).Replace('\','/') }

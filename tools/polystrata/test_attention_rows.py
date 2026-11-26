@@ -24,14 +24,15 @@ def function(text, signature):
 
 
 def generate(source, output):
-    qwen = (source / "src/poly/qwen35.cpp").read_text(encoding="utf-8")
-    engine = (source / "src/poly/engine.cpp").read_text(encoding="utf-8")
+    qwen = (source / "engine/src/poly/qwen35.cpp").read_text(encoding="utf-8")
+    engine = (source / "engine/src/poly/engine.cpp").read_text(encoding="utf-8")
     step = function(engine, "void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* guesses)")
-    key_start = step.index("const int64_t keep = pos_;")
-    key_end = step.index("rows_of_ = rows.data();", key_start)
+    anchor = step.index("key.assign(1, R);")
+    key_start = step.rindex("const int64_t keep = pos_;", 0, anchor)
+    key_end = step.index("rows_of_ = rows.data();", anchor)
     code = Path(__file__).with_name("attention_rows_harness.cpp.in").read_text(encoding="utf-8")
     for marker, value in {
-        "@ATTN_ROWS@": function(qwen, "void Qwen35::attn_rows(Block& B, int n)"),
+        "@ATTN_ROWS@": function(qwen, "void Qwen35::attn_rows(Block& B, int il, int n)"),
         "@HEAD_KEY@": function(qwen, "int Qwen35::head_key(int il, int n) const"),
         "@ROOM_METHODS@": function(engine, "int Engine::room(int n) const") + "\n" +
                           function(engine, "int Engine::room_key(int n) const"),

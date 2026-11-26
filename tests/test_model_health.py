@@ -85,6 +85,94 @@ class HealthTests(unittest.TestCase):
         assistant=self.root/'assistant.gguf';gguf(assistant,meta={'general.architecture':'gemma4-assistant'})
         self.assertTrue(self.inspect(model,'polystrata',SpeculativeMode='mtp',DraftModel=str(assistant))['can_start'])
 
+    def test_inkling_accepts_ordinary_fp16_and_fp8_multi_session(self):
+        model = self.root / 'inkling.gguf'
+        gguf(model, meta={'general.architecture': 'inkling2_loop'})
+        ready = self.inspect(model, 'polystrata', KvType='f16', RetainedSessions=1)
+        self.assertTrue(ready['can_start'])
+        self.assertNotIn('poly_arch', {check['code'] for check in ready['checks']})
+        self.assertEqual(ready['model']['kv_types'], ['f16', 'fp8'])
+        for kv_type in ('f16', 'fp8'):
+            for concurrency, retained in ((1, 2), (2, 1), (2, 2)):
+                self.assertTrue(self.inspect(model, 'polystrata', KvType=kv_type, Concurrency=concurrency,
+                                             RetainedSessions=retained)['can_start'])
+        rejected = self.inspect(model, 'polystrata', KvType='q8_0', RetainedSessions=2, Vision=True,
+                                SpeculativeMode='mtp')
+        self.assertFalse(rejected['can_start'])
+        self.assertEqual({check['code'] for check in rejected['checks'] if check['status'] == 'error'},
+                         {'poly_kv', 'inkling_vision', 'inkling_draft'})
+
+    def test_inkling_dspark_requires_a_matching_external_draft(self):
+        model = self.root / 'inkling.gguf'
+        draft = self.root / 'draft.gguf'
+        gguf(model, meta={'general.architecture': 'inkling2_loop'})
+        gguf(draft, meta={'general.architecture': 'dflash'}, tensor='markov_w1.weight')
+        for kv_type in ('f16', 'fp8'):
+            result = self.inspect(model, 'polystrata', SpeculativeMode='mtp', DraftTokens=3,
+                                  DraftModel=str(draft), KvType=kv_type)
+            self.assertTrue(result['can_start'])
+            self.assertEqual(result['features']['mtp'], 'external')
+        for concurrency, retained in ((1, 2), (2, 1), (2, 2)):
+            result = self.inspect(model, 'polystrata', SpeculativeMode='mtp', DraftTokens=3,
+                                  DraftModel=str(draft), Concurrency=concurrency, RetainedSessions=retained)
+            self.assertTrue(result['can_start'], result)
+        gguf(draft, meta={'general.architecture': 'dflash'})
+        result = self.inspect(model, 'polystrata', SpeculativeMode='mtp', DraftTokens=3, DraftModel=str(draft))
+        self.assertFalse(result['can_start'])
+        self.assertIn('inkling_draft_arch', {check['code'] for check in result['checks']})
+
+    def polystrata_console(self):
+        spec = importlib.util.spec_from_file_location('health_console', ROOT / 'scripts/local-console.py')
+        console = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(console)
+        controller = console.Controller(ROOT, self.root / 'state', 18299)
+        # Exercise the worker contract even on hosts that do not ship PolyStrata.
+        controller.backends = ['polystrata']
+        return console, controller
+
+    def test_inkling_multi_session_requires_a_compatible_worker(self):
+        console, controller = self.polystrata_console()
+        model = self.root / 'inkling.gguf'
+        gguf(model, meta={'general.architecture': 'inkling2_loop'})
+        worker = self.root / 'worker.exe'
+        worker.write_bytes(b'fixture')
+        parameters = {'Backend': 'polystrata', 'Model': str(model), 'Worker': str(worker),
+                      'Concurrency': 2, 'RetainedSessions': 2, 'KvType': 'f16'}
+        data = {'schema_version': 1, 'parameters': parameters}
+        for supported in (False, True):
+            report = self.inspect(model, 'polystrata', Concurrency=2, RetainedSessions=2, KvType='f16')
+            with patch.object(console.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps(report))), patch.object(
+                    controller, 'worker_capabilities', return_value={'inkling2_multi_session': supported}):
+                result = controller.inspect_model(data)
+            self.assertEqual(result['can_start'], supported, result)
+            self.assertEqual('inkling_multi_session_worker' in {check['code'] for check in result['checks']},
+                             not supported)
+
+    def test_inkling_dspark_batch_requires_a_compatible_worker(self):
+        console, controller = self.polystrata_console()
+        model, draft, worker = (self.root / name for name in ('inkling.gguf', 'draft.gguf', 'worker.exe'))
+        gguf(model, meta={'general.architecture': 'inkling2_loop'})
+        gguf(draft, meta={'general.architecture': 'dflash'}, tensor='markov_w1.weight')
+        worker.write_bytes(b'fixture')
+        for concurrency, retained in ((1, 1), (1, 4), (2, 1), (2, 4)):
+            options = {'SpeculativeMode': 'mtp', 'DraftTokens': 3, 'DraftModel': str(draft),
+                       'Concurrency': concurrency, 'RetainedSessions': retained, 'KvType': 'f16'}
+            report = self.inspect(model, 'polystrata', **options)
+            parameters = {'Backend': 'polystrata', 'Model': str(model), 'Worker': str(worker), **options}
+            data = {'schema_version': 1, 'parameters': parameters}
+            for supported in (False, True):
+                capabilities = {'inkling2_multi_session': True, 'inkling2_dspark': True,
+                                'inkling2_dspark_batch': supported}
+                with patch.object(console.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                        [], 0, stdout=json.dumps(report))), patch.object(
+                        controller, 'worker_capabilities', return_value=capabilities):
+                    result = controller.inspect_model(data)
+                expected = supported or (concurrency, retained) == (1, 1)
+                self.assertEqual(result['can_start'], expected, result)
+                self.assertEqual('inkling_dspark_batch_worker' in {check['code'] for check in result['checks']},
+                                 not expected)
+
     def test_extension_cannot_disguise_wrong_container(self):
         path=self.root/'fake.gguf'; path.write_bytes(b'not a model'*10)
         self.assertFalse(self.inspect(path)['can_start'])
@@ -135,14 +223,18 @@ class HealthTests(unittest.TestCase):
             gguf(path, kind=kind, columns=128, payload=b'\0'*(size-1))
             self.assertFalse(self.inspect(path)['can_start'])
 
-    def test_bonsai_native_plane_extents(self):
+    def test_bonsai_native_tensor_extents(self):
         path = self.root/'bonsai.ninfer'
-        # One row: compact base at 0, optional high plane at 256,
-        # FP16 scale at 512 (PTQ1) or 256 (T5); the final two bytes need no tail padding.
-        for format_name, size in [('ptq1_g128_fp16',514),('t5_g128_fp16',258)]:
+        # Native row planes end at scale bytes 514 and 258. WaveCut stores
+        # two rows of two raw 28-byte PTQ1_0 blocks in gguf_blocks_v1.
+        for format_name, layout, shape, size in [
+            ('ptq1_g128_fp16', 'row_split_k128_v1', [1, 128], 514),
+            ('t5_g128_fp16', 'row_split_k128_v1', [1, 128], 258),
+            ('gguf_ptq1_0', 'gguf_blocks_v1', [2, 256], 112),
+        ]:
             directory = dict(components={'text':{'config':{'model_type':'qwen3_5_text'},'resources':{}}},
-                objects=[dict(id='weight',kind='tensor',shape=[1,128],format=format_name,
-                              layout='row_split_k128_v1',offset=0,bytes=size)],
+                objects=[dict(id='weight',kind='tensor',shape=shape,format=format_name,
+                              layout=layout,offset=0,bytes=size)],
                 bindings={'text.weight':{'object':'weight'}},uses=[],files=[dict(path=None,payload_bytes=1024)])
             def write():
                 encoded=json.dumps(directory).encode()

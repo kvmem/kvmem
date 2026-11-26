@@ -7,6 +7,7 @@
 #include "kvmem/retrieval_options.hpp"
 #include "kvmem/launch_contract.hpp"
 #include "kvmem/cache_owner.hpp"
+#include "kvmem/generated_history.hpp"
 #include "kvmem/token_options.hpp"
 #include "kvmem-spec.h"
 #include "kvmem-chat-sampling.h"
@@ -427,6 +428,38 @@ static common_chat_msg parse_assistant_output(
 
 static json message_to_nlohmann(const common_chat_msg & msg) {
     return json::parse(msg.to_json_oaicompat().dump());
+}
+
+static std::string history_message(const common_chat_msg & msg) {
+    // Responses echoes even a single output string as one typed text part.
+    const bool single_text = msg.content_parts.size() == 1 && msg.content_parts.front().type == "text";
+    return json::parse(msg.to_json_oaicompat(single_text).dump()).dump() + "\n";
+}
+
+// End a splice only at a template-owned, indivisible end-of-turn token.
+static bool history_suffix(const llama_vocab * vocab, const common_chat_params & formatted,
+        const std::string & prompt, const std::string & prefix, std::vector<llama_token> & suffix) {
+    const size_t seam = prefix.size();
+    if (seam >= prompt.size() || prompt.compare(0, seam, prefix) != 0) return false;
+    size_t begin = 0;
+    for (const auto & part : formatted.prompt.parts) {
+        const size_t end = begin + part.text.size();
+        if (seam < end) {
+            if (part.is_input) return false;
+            suffix = llama_driver_tokenize(vocab, prompt.substr(seam), false);
+            if (suffix.empty() || !llama_vocab_is_eog(vocab, suffix.front())) return false;
+            size_t offset = seam;
+            for (const auto id : suffix) {
+                const auto piece = common_token_to_piece(vocab, id, true);
+                if (piece.empty() || prompt.compare(offset, piece.size(), piece) != 0) return false;
+                if (offset == seam && piece.size() > end - seam) return false;
+                offset += piece.size();
+            }
+            return offset == prompt.size();
+        }
+        begin = end;
+    }
+    return false;
 }
 
 // OpenAI Responses "output" items for one assistant message. Kept as a free
@@ -1413,6 +1446,8 @@ int main(int argc, char ** argv) {
     cparams.n_seq_max = 1;
     cparams.type_k = st.cache_type_k;
     cparams.type_v = st.cache_type_v;
+    // Each server lane requests one logit row per batch without speculation.
+    cparams.n_outputs_max = 1;
     if (st.spec_enabled) {
         const uint32_t n_out = (uint32_t) (1 + std::max(0, st.spec_n_max));
         cparams.n_outputs_max = n_out;
@@ -1915,6 +1950,7 @@ int main(int argc, char ** argv) {
         std::fflush(stderr);
     };
 
+    kvmem::GeneratedHistory generated_history;
     auto handle_chat = [&](const httplib::Request & req, httplib::Response & res) {
         auto request_metrics = std::make_shared<kvmem_metrics_lease>(native_metrics);
         const auto monitor_id = monitor.begin(req.path);
@@ -2024,9 +2060,41 @@ int main(int argc, char ** argv) {
             return;
         }
         const std::string prompt = formatted.prompt.str();
+        std::string history_key;
+        size_t history_rows = 0;
         std::shared_ptr<kvmem_prompt> parsed_prompt;
         try {
-            parsed_prompt = media_files.empty()
+            if (st.kparams.enabled && media_files.empty() &&
+                    (cr.msgs.back().role == "user" || cr.msgs.back().role == "tool")) {
+                size_t domain = 0;
+                if (!options.api_keys.empty()) {
+                    auto key = req.get_header_value("Authorization");
+                    if (key.empty()) key = req.get_header_value("X-Api-Key");
+                    if (key.compare(0, 7, "Bearer ") == 0) key.erase(0, 7);
+                    domain = std::find(options.api_keys.begin(), options.api_keys.end(), key) - options.api_keys.begin();
+                }
+                history_key = std::to_string(domain) + "\n";
+                std::vector<size_t> assistant_ends;
+                const bool allow_lookup = !body.value("cache_reset", false) && cr.query_begin < 0 && cr.query_end < 0;
+                for (const auto & msg : cr.msgs) {
+                    history_key += history_message(msg);
+                    if (allow_lookup && msg.role == "assistant") assistant_ends.push_back(history_key.size());
+                }
+                for (const auto & prefix : generated_history.candidates(history_key, assistant_ends)) {
+                    std::vector<llama_token> suffix;
+                    int limit = cr.max_tokens;
+                    std::string reason;
+                    if (history_suffix(st.vocab, formatted, prompt, prefix->text, suffix) &&
+                            kvmem_resolve_output_limit(generation_limit, prefix->ids.size() + suffix.size(), limit, reason)) {
+                        auto effective = prefix->ids;
+                        effective.insert(effective.end(), suffix.begin(), suffix.end());
+                        parsed_prompt = std::make_shared<kvmem_prompt>(effective);
+                        history_rows = prefix->ids.size();
+                        break;
+                    }
+                }
+            }
+            if (!parsed_prompt) parsed_prompt = media_files.empty()
                 ? std::make_shared<kvmem_prompt>(llama_driver_tokenize(st.vocab, prompt, true))
                 : st.vision->tokenize(prompt, media_files);
         } catch (const std::exception & e) {
@@ -2035,6 +2103,28 @@ int main(int argc, char ** argv) {
             return;
         }
         auto toks = parsed_prompt->tokens;
+        auto publish_history = [&generated_history, history_key = std::move(history_key), parsed_prompt,
+                vocab = st.vocab](const common_chat_msg & assistant, const std::string & rendered_prompt,
+                const std::string & content, const std::vector<llama_token> & gen) {
+            if (history_key.empty() || gen.empty() || assistant.empty()) return;
+            auto key = history_key + history_message(assistant);
+            size_t offset = 0;
+            for (const auto id : gen) {
+                const auto piece = common_token_to_piece(vocab, id, true);
+                if (piece.empty() || content.compare(offset, piece.size(), piece) != 0) {
+                    generated_history.mark_ambiguous(std::move(key));
+                    return;
+                }
+                offset += piece.size();
+            }
+            if (offset != content.size()) {
+                generated_history.mark_ambiguous(std::move(key));
+                return;
+            }
+            kvmem::GeneratedHistory::Prefix prefix{rendered_prompt + content, parsed_prompt->tokens};
+            prefix.ids.insert(prefix.ids.end(), gen.begin(), gen.end());
+            generated_history.publish(std::move(key), std::move(prefix));
+        };
         if (toks.empty()) {
             res.status = 400;
             res.set_content("{\"error\":\"empty prompt\"}", "application/json");
@@ -2172,7 +2262,12 @@ int main(int argc, char ** argv) {
             if (it->role == "user") break;
             if (it->role == "tool") st.turn_tool_continuation = true;
         }
-        if (qbegin < 0 || qend < 0) {
+        if (history_rows) {
+            // The canonical text tokenizer has different row coordinates.
+            // native_query_span below locates the actual user in effective IDs.
+            qend = int(toks.size());
+            qbegin = std::max(0, qend - st.query_last_fallback);
+        } else if (qbegin < 0 || qend < 0) {
             llama_driver_query_span(st, prompt, cr.last_user, toks, qbegin, qend);
         }
         st.turn_query_exact = cr.query_begin >= 0 && cr.query_end > cr.query_begin && cr.query_end <= (int) toks.size();
@@ -2255,9 +2350,10 @@ int main(int argc, char ** argv) {
         st.log.start();
         LOG_INF("slot   processing task, n_prompt = %d, n_predict = %d\n", (int) toks.size(), cr.max_tokens);
         auto timings = std::make_shared<json>(json::object());
+        kvmem_diag("KVMEM_TRACE generated_history_rows=%zu\n", history_rows);
         // 1:1 upstream timings block (server-context.cpp): prompt/predicted counts, ms, per-token and per-second rates.
         // 中文：对齐上游的 timings 统计块——prompt/predicted 的计数、耗时、每 token 与每秒速率，供 /v1 响应回传
-        auto make_emit_gen_wall = [timings, request_metrics, operation, &lane_conversations, &st, &monitor, monitor_id, n_prompt = (int) toks.size()](
+        auto make_emit_gen_wall = [timings, request_metrics, operation, &lane_conversations, &st, &monitor, monitor_id, history_rows, n_prompt = (int) toks.size()](
                 std::chrono::steady_clock::time_point t_turn0,
                 std::chrono::steady_clock::time_point t_pf1,
                 double prefill_ms, int n_cache_hit) {
@@ -2274,7 +2370,7 @@ int main(int argc, char ** argv) {
                 {"prefill_tps", prefill_ms > 0 ? json(1000.0 * prompt_n / prefill_ms) : json(nullptr)}});
             monitor.update(monitor_id,kvmem_lane_conversations::reuse_observation(*operation,size_t(cache_n)));
             st.log.start_generation();
-            return [timings, request_metrics, operation, &st, &monitor, monitor_id, t_turn0, t_pf1, prefill_ms, n_prompt, prompt_n, cache_n](int n_gen, bool verbose = true, int64_t sampled_us = 0) {
+            return [timings, request_metrics, operation, &st, &monitor, monitor_id, t_turn0, t_pf1, prefill_ms, n_prompt, prompt_n, cache_n, history_rows](int n_gen, bool verbose = true, int64_t sampled_us = 0) {
                 if ((uint64_t)n_gen > request_metrics->stats.native.n_gen)
                     request_metrics->stats.token(n_gen, sampled_us ? sampled_us : ggml_time_us());
                 st.progress.generated(n_gen);
@@ -2285,6 +2381,7 @@ int main(int argc, char ** argv) {
                 const double predicted_per_second = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
                 *timings = request_metrics->stats.timings();
                 (*timings)["cache_reuse"]=kvmem_lane_conversations::reuse_observation(*operation,size_t(cache_n));
+                (*timings)["cache_reuse"]["generated_history_tokens"] = history_rows;
                 const auto & metrics = request_metrics->stats;
                 const bool live = metrics.live_sample_us > 0;
                 monitor.update(monitor_id, {{"generated_tokens", n_gen},
@@ -2328,13 +2425,15 @@ int main(int argc, char ** argv) {
             *timings = stats.timings();
         };
         int n_cache_hit = 0;
-        auto emit_json = [&](const std::string & content, int n_gen, bool hit_limit) {
+        auto emit_json = [&](const std::string & content, const std::vector<llama_token> & gen, bool hit_limit) {
+            const int n_gen = int(gen.size());
             common_chat_msg msg = parse_assistant_output(content, formatted);
             std::vector<std::string> tc_ids;
             int n_id = 0;
             msg.set_tool_call_ids(tc_ids, [&n_id, &request_id]() {
                 return kvmem_chat_tool_id(request_id, ++n_id);
             });
+            publish_history(msg, prompt, content, gen);
             std::string finish = "stop";
             if (!msg.tool_calls.empty()) {
                 finish = "tool_calls";
@@ -2415,7 +2514,7 @@ int main(int argc, char ** argv) {
             res.set_header("X-Accel-Buffering", "no");
             auto monitor_error = std::make_shared<std::atomic<bool>>(false);
             res.set_chunked_content_provider("text/event-stream",
-                [slot, &st, &req, toks, cid, request_id, created, max_tokens, sparams, formatted, stops,
+                [slot, &st, &req, toks, cid, request_id, created, max_tokens, sparams, formatted, stops, publish_history,
                  spec_stream, ctx, vocab, make_emit_gen_wall, timings, request_metrics, set_spec_metrics, timings_per_token, include_usage, is_responses, monitor_error, &monitor, monitor_id](size_t, httplib::DataSink & sink) mutable {
                     kvmem_execution_scope execution(st.execution.get());
                     StreamIo io;
@@ -2629,6 +2728,7 @@ int main(int argc, char ** argv) {
                             }
                             emit_gen_wall((int) gen.size());
                             if (!commit(gen)) return true;
+                            publish_history(responses->prev, formatted.prompt.str(), content, gen);
                             monitor.update(monitor_id, {{"finish_reason", !responses->prev.tool_calls.empty() ? "tool_calls" : (int)gen.size() >= max_tokens ? "length" : "stop"}});
                             for (const std::string & ev : kvmem_responses_stream_done(
                                          responses->state, responses->prev, request_id, st.model_name,
@@ -2657,6 +2757,7 @@ int main(int argc, char ** argv) {
                         llama_kvmem_decode_mean_flush();
                         emit_gen_wall((int) gen.size());
                         if (!commit(gen)) return true;
+                        publish_history(sco.prev, formatted.prompt.str(), content, gen);
                         auto final_chunk = stream_choice_chunk(cid, st.model_name, created, json::object(), finish, include_usage ? nullptr : &*timings);
                         if (!include_usage && !request_metrics->stats.speculative.is_null())
                             final_chunk["kvmem"] = {{"speculative", request_metrics->stats.speculative}};
@@ -2690,6 +2791,7 @@ int main(int argc, char ** argv) {
                         }
                         emit_gen_wall((int) gen.size());
                         if (!commit(gen)) return true;
+                        publish_history(responses->prev, formatted.prompt.str(), content, gen);
                         monitor.update(monitor_id, {{"finish_reason", !responses->prev.tool_calls.empty() ? "tool_calls" : (int)gen.size() >= max_tokens ? "length" : "stop"}});
                         for (const std::string & ev : kvmem_responses_stream_done(
                                      responses->state, responses->prev, request_id, st.model_name,
@@ -2717,6 +2819,7 @@ int main(int argc, char ** argv) {
                             sco.prev.content.size(), sco.prev.reasoning_content.size());
                     emit_gen_wall((int) gen.size());
                     if (!commit(gen)) return true;
+                    publish_history(sco.prev, formatted.prompt.str(), content, gen);
                     auto final_chunk = stream_choice_chunk(cid, st.model_name, created, json::object(), finish, include_usage ? nullptr : &*timings);
                     if (!include_usage && !request_metrics->stats.speculative.is_null())
                         final_chunk["kvmem"] = {{"speculative", request_metrics->stats.speculative}};
@@ -2802,7 +2905,7 @@ int main(int argc, char ** argv) {
             if (io.aborted) return;
             emit_gen_wall((int) gen.size());
             if (!commit(gen)) return;
-            emit_json(content, (int) gen.size(), (int) gen.size() >= cr.max_tokens);
+            emit_json(content, gen, (int) gen.size() >= cr.max_tokens);
             return;
         }
 
@@ -2872,7 +2975,7 @@ int main(int argc, char ** argv) {
         emit_gen_wall((int) gen.size());
         common_sampler_free(smpl);
         if (!commit(gen)) return;
-        emit_json(content, (int) gen.size(), !stopped && (int) gen.size() >= cr.max_tokens);
+        emit_json(content, gen, !stopped && (int) gen.size() >= cr.max_tokens);
     };
 
     svr.Post("/v1/chat/completions", handle_chat);

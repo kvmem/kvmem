@@ -6,6 +6,7 @@
   let info, busy=false, activeTab=0, runtime=null, startPending=false, launchFailure="";
   let budgetPending=false, budgetAdjustment=null;
   let health=null, healthKey='', healthTimer=null, healthAbort=null, healthSequence=0, healthState='idle';
+  let modelKv=null;
   let workerContract=null, workerKey='', workerTimer=null, workerAbort=null, workerSequence=0, workerError='';
   // A running process owns the displayed configuration; browser drafts cannot replace it.
   let configLocked=false, configUncertain=false, runningParameters=null, pendingParameters=null, runningView='';
@@ -110,6 +111,12 @@
     {id:'polystrata-default',title:['PolyStrata · 默认模板','PolyStrata · Default template'],parameters:{...commonPreset,Backend:'polystrata',Budget:36*1024,Reserve:4*1024,ThinkingBudget:0,ThinkingMode:'on',KvType:'q8_0',Prefill:512,DraftTokens:2,DraftPolicy:'adaptive',Vision:false,RetainedSessions:2,VramReserveMiB:256,WorkerArgs:['--elastic-experts-headroom','--elastic-headroom-mib','128','--elastic-physical-reserve-mib','512']},
       note:['256K 上下文 · 36K 驻留 · 4K 生成预留 · 思考不限额','256K context · 36K resident · 4K reserve · no fixed thinking cap']},
     {id:'polystrata-gemma4',title:['PolyStrata · Gemma 4 26B-A4B','PolyStrata · Gemma 4 26B-A4B'],parameters:{...commonPreset,Backend:'polystrata',Budget:32768,Reserve:2048,KvType:'f16',Prefill:512,ThinkingMode:'on',ThinkingBudget:0,SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',ModelAlias:'kvmem-polystrata-gemma4',Vision:false,RetainedSessions:2,VramReserveMiB:512},note:['Gemma 4 26B-A4B；启用 MTP 时选择匹配的 assistant GGUF。','Gemma 4 26B-A4B; select its matching assistant GGUF to enable MTP.']},
+    {id:'polystrata-inkling2',title:['PolyStrata · Inkling 2 Mini','PolyStrata · Inkling 2 Mini'],
+      parameters:{...commonPreset,Backend:'polystrata',Context:16384,Budget:8192,Reserve:4096,HostMiB:2048,
+        KvType:'f16',Prefill:4096,SinkTokens:128,RecentTokens:256,ThinkingMode:'off',ThinkingBudget:0,
+        SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',ModelAlias:'kvmem-polystrata-inkling2',Vision:false,
+        RetainedSessions:1,VramReserveMiB:256,WorkerArgs:['--attn-requant','q5_0','--loop-bf16','--expert-swaps','0']},
+      note:['Windows CUDA · Mainline_Support 权重 · FP16 KV · 单会话文本','Windows CUDA · Mainline_Support weights · FP16 KV · single text session']},
     ...['ninfer','llamacpp','polystrata'].map(backend=>({
       id:backend+'-layerwise',title:[backend+' · 分层召回',backend+' · Layerwise'],
       note:['文本、无草稿起点；仍需当前 worker 确认该组合。','Text without drafts; the selected worker must qualify this combination.'],
@@ -131,12 +138,15 @@
   const make=(tag,attrs={},text)=>{const el=document.createElement(tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));if(text!==undefined)el.textContent=text;return el;};
   function healthParameters(){
     const parameters={};
-    for(const key of ['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftTokens','DraftModel','KvType','RecallStrategy']){
+    const keys=['Backend','Model','Worker','Vision','Mmproj','VisionWorker','Tokenizer','ChatTemplateFile','SpeculativeMode','MtpDrafts','DraftTokens','DraftModel','KvType','RecallStrategy'];
+    if(root.querySelector('[data-param=Backend]')?.value==='polystrata')keys.push('Concurrency','RetainedSessions');
+    for(const key of keys){
       const el=root.querySelector(`[data-param=${key}]`);
       if(!el||el.disabled)continue;
       if(el.type==='checkbox')parameters[key]=el.checked;
       else if(el.value!=='')parameters[key]=el.dataset.booleanSelect==='true'?el.value==='true':(el.type==='number'||el.dataset.valueType==='number')?Number(el.value):el.value;
     }
+    if(parameters.RetainedSessions!==undefined)parameters.RetainedSessions+=1;
     return parameters;
   }
   function healthBlocks(){return health?.can_start===false;}
@@ -237,9 +247,37 @@
       finally{clearTimeout(timeout);if(sequence===workerSequence&&!configurationLocked()){syncDependencies();updateStatus(runtime);}}
     },force?0:250);
   }
+  function kvTypes(backend,current){
+    if(backend==='polystrata'){
+      const types=['f16','q8_0','int8','int8k'];
+      if(current==='fp8')types.push(current);
+      return types;
+    }
+    if(backend==='radiance')return ['fp8','bf16','fp8_v4','k6_v4'];
+    return ['int8','bf16','fp8','nvfp4','k8v4','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'];
+  }
+  function syncKvTypes(backend,modelKey){
+    const select=root.querySelector('[data-param=KvType]');
+    if(!select)return null;
+    const previous=select.value;
+    const checked=modelKv?.key===modelKey;
+    const detected=checked?modelKv.types:null;
+    const types=Array.isArray(detected)&&detected.length?detected:kvTypes(backend,checked?null:previous);
+    if([...select.options].map(option=>option.value).join(',')===types.join(','))return null;
+    select.replaceChildren(...types.map(value=>make('option',{value},value)));
+    select.value=types.includes(previous)?previous:types[0];
+    return select.value!==previous?select.value:null;
+  }
   function scheduleHealth(force=false){
     if(!info||configurationLocked())return;
-    const parameters=healthParameters(),key=JSON.stringify(parameters);
+    const parameters=healthParameters(),modelKey=JSON.stringify([parameters.Backend,parameters.Model,parameters.Worker]);
+    if(modelKv?.key!==modelKey)modelKv=null;
+    const kv=syncKvTypes(parameters.Backend,modelKey);
+    if(kv!==null){
+      parameters.KvType=kv;
+      scheduleSave();
+    }
+    const key=JSON.stringify(parameters);
     if(!force&&key===healthKey)return;
     healthKey=key;health=null;clearTimeout(healthTimer);healthAbort?.abort();
     const sequence=++healthSequence;
@@ -255,6 +293,13 @@
         if(!response.ok||result.schema_version!==1||typeof result.can_start!=='boolean')throw Error('Inspection unavailable');
         if(sequence!==healthSequence)return;
         health=result;healthState=result.status;
+        if(result.model?.architecture){
+          modelKv={key:modelKey,types:result.model.kv_types};
+          if(syncKvTypes(parameters.Backend,modelKey)!==null){
+            scheduleSave();
+            scheduleHealth(true);
+          }
+        }
       }catch(error){if(sequence!==healthSequence)return;healthState='unavailable';}
       finally{clearTimeout(timeout);if(sequence===healthSequence){renderHealth();updateStatus(runtime);}}
     },force?0:400);
@@ -993,7 +1038,7 @@
     const layout=make('div',{class:'l-layout'}),main=make('div',{class:'l-main'}),side=make('aside',{class:'l-side'});layout.append(main,side);root.append(layout);
     const form=make('form',{'aria-label':tr('启动配置','Launch configuration')});form.style.display='contents';main.append(form);form.addEventListener('submit',e=>e.preventDefault());
     const core=make('section',{class:'s-card l-essential'});core.append(make('h2',{class:'s-title'},tr('模型与资源','Model & resources')));const fields=make('div',{class:'l-fields l-core'});core.append(fields);form.append(core);
-    const backend=field(fields,p,'Backend','推理引擎','Backend','text',Object.entries(names).filter(([v])=>info.backends.length!==1||info.backends.includes(v)).map(([v,t])=>[v,t]),['按 KVMem 当前支持范围区分：Dense 为稠密模型，MoE 为混合专家模型。PolyStrata 支持 Qwen3.5 MoE（包括 Tiel）和 Gemma 4 26B-A4B。','Labels describe current KVMem support: Dense for dense models, MoE for mixture-of-experts models. PolyStrata supports Qwen3.5 MoE (including Tiel) and Gemma 4 26B-A4B.']);Array.from(backend.options).forEach(o=>{o.disabled=!info.backends.includes(o.value);if(o.disabled)o.textContent+=' · '+tr('未安装','not installed');});
+    const backend=field(fields,p,'Backend','推理引擎','Backend','text',Object.entries(names).filter(([v])=>info.backends.length!==1||info.backends.includes(v)).map(([v,t])=>[v,t]),['按 KVMem 当前支持范围区分：Dense 为稠密模型，MoE 为混合专家模型。PolyStrata 支持 Qwen3.5 MoE（包括 Tiel）、Gemma 4 26B-A4B 和 Inkling 2 Mini。','Labels describe current KVMem support: Dense for dense models, MoE for mixture-of-experts models. PolyStrata supports Qwen3.5 MoE (including Tiel), Gemma 4 26B-A4B and Inkling 2 Mini.']);Array.from(backend.options).forEach(o=>{o.disabled=!info.backends.includes(o.value);if(o.disabled)o.textContent+=' · '+tr('未安装','not installed');});
     modelPicker(fields,p);
     fields.append(make('section',{class:'l-model-health l-wide','data-model-health':'','aria-label':tr('模型体检','Model inspection')}));
     const gpu=field(fields,p,'Gpu','推理显卡','Inference GPUs','text',info.gpus.map(g=>[g.uuid,g.name+' · '+g.uuid.slice(-8)]),['选择要使用的显卡。勾选至少两张兼容显卡后，在“多卡设置”页签调整执行顺序与分配；切换引擎保留当前选择。','Choose the GPUs to use. Select at least two compatible GPUs, then adjust their order and allocation in Multi-GPU. Switching engines retains your selection.']);
@@ -1117,7 +1162,7 @@
       help(kvTitle,tr('KV 格式','KV format'),tr('K 和 V 可分别选择：q8_0、q5_0、q4_0 可互配；f16、f32 可互配。浮点与量化不能混搭。','Choose K and V independently: q8_0, q5_0 and q4_0 can be combined; f16 and f32 can be combined. Floating-point and quantized types cannot be mixed.'));
       kvField.append(kvTitle,pair,make('p',{class:'l-muted l-error l-kv-status','data-kv-pair-status':'','aria-live':'polite',hidden:''}));panels[0].append(kvField);
     }else{
-      const kv=rad?['fp8','bf16','fp8_v4','k6_v4']:poly?['f16','q8_0','int8','int8k']:['int8','bf16','fp8','nvfp4','k8v4','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'];
+      const kv=kvTypes(b,p.KvType);
       field(panels[0],{...p,KvType:p.KvType||kv[0]},'KvType','KV 格式','KV format','text',kv.map(v=>[v,v]));
     }
     if(b==='llamacpp'){
@@ -1204,7 +1249,7 @@
     const specModes=info.speculative_capabilities?.[b]||{none:{},...(n?{mtp:{max_draft_tokens:15,adaptive:true,ngram:true,max_concurrency:8,max_devices:8,draft_asset:'embedded'}}:{})};
     const specMode=field(panels[1],p,'SpeculativeMode','草稿方式','Draft method','text',[
       ['none',tr('关闭','Off')],['mtp','MTP'],['dflash2','DFlash2'],...(poly?[['guess','Gemma SharedTarget Guess']]:[])
-    ],poly?['单请求执行可使用 MTP；进入批处理时使用普通生成。','MTP is available in solo execution; batches use ordinary decode.']:['需要模型支持。可用选项取决于后端、并发和显卡数量。','Requires model support. Availability depends on backend, concurrency and GPU count.']);
+    ],poly?['Inkling 2 Mini 可用配套 dSpark GGUF 并发生成，需要支持该功能的 worker。','Inkling 2 Mini can use a matching dSpark GGUF for concurrent requests on a compatible worker.']:['需要模型支持。可用选项取决于后端、并发和显卡数量。','Requires model support. Availability depends on backend, concurrency and GPU count.']);
     for(const option of specMode.options)option.disabled=!specModes[option.value];
     const draftTokens=field(panels[1],p,'DraftTokens','草稿长度 · tokens','Draft length · tokens','number',null,
       ['主模型会验证草稿；分层模式须显式填写当前 worker 支持的长度。Radiance DFlash2 长度须匹配容器训练块。','The target verifies the drafts. Layerwise mode requires an explicit width qualified by the selected worker. Radiance DFlash2 depth must match the trained container block.']);
@@ -1214,7 +1259,7 @@
       ['fixed',tr('固定','Fixed')],['adaptive',tr('自动调整','Adaptive')]
     ],['自动调整仅在后端和所选草稿方式支持时生效。','Adaptive mode applies only when supported by the backend and draft method.']);
     const draftModel=field(panels[1],p,'DraftModel','草稿模型 GGUF','Draft model GGUF','text',null,
-      ['Gemma 4 MTP 和 llama.cpp DFlash2 需要匹配的独立草稿 GGUF；Qwen MTP 和 NInfer 使用内置草稿组件。','Gemma 4 MTP and llama.cpp DFlash2 require a matching draft GGUF; Qwen MTP and NInfer use embedded drafts.'],n||rad);
+      ['Inkling 2 Mini dSpark、Gemma 4 MTP 和 llama.cpp DFlash2 需要配套草稿 GGUF。Qwen MTP 和 NInfer 使用内置草稿。','Inkling 2 Mini dSpark, Gemma 4 MTP and llama.cpp DFlash2 require matching draft GGUFs. Qwen MTP and NInfer use embedded drafts.'],n||rad);
     if(!n&&!rad&&info.native_picker!==false){const row=inputActions(draftModel),choose=make('button',{type:'button',class:'s-button l-secondary'},tr('选择文件','Choose file'));row.append(choose);choose.onclick=async()=>{try{const result=await api('browse-model',{backend:'llamacpp',current_path:draftModel.value});if(result.path){draftModel.value=result.path;draftModel.dispatchEvent(new Event('change',{bubbles:true}));}}catch(e){message(e.message,true);}};}
     if(n)field(panels[1],p,'FastPrefill','启用快速预填充','Enable fast prefill','checkbox',null,['支持 int8、rk8v4、rk4v4、rk4v4-e8、rk2v4-e8；还需模型支持。与 MTP、普通预填充块大小分别设置。','Supports int8, rk8v4, rk4v4, rk4v4-e8 and rk2v4-e8; model support is also required. Independent of MTP and the standard prefill chunk size.'],!n);
     const thinking=field(panels[3],p,'ThinkingMode','默认思考模式','Default thinking mode','text',[[(n||rad)?'default':'on',(n||rad)?tr('跟随模型','Model default'):tr('开启','On')],['off',tr('关闭','Off')]],['需要模型与模板支持。聊天请求中的显式设置优先。','Requires model/template support. Explicit chat settings take priority.']);
@@ -1391,6 +1436,11 @@
     let timer;
     try{
       const configuration=launchData(),key=JSON.stringify(configuration);
+      const {Prefill:prefill,Reserve:reserve}=configuration.parameters;
+      if(Number.isFinite(prefill)&&Number.isFinite(reserve)&&prefill>reserve)throw Error(tr(
+        `Prefill 不能超过 Gen Reserve。当前 Prefill 为 ${prefill.toLocaleString()}，Gen Reserve 为 ${reserve.toLocaleString()}。请先修改其中一项，自动调整只修改 Budget。`,
+        `Prefill (${prefill.toLocaleString()}) cannot exceed Gen Reserve (${reserve.toLocaleString()}). Adjust either setting first. Auto adjustment changes Budget only.`
+      ));
       busy=true;budgetPending=true;budgetAdjustment={started:Date.now()};applyConfigurationLock();renderMemoryRecovery();renderBudgetAdjustment();
       timer=setInterval(renderBudgetAdjustment,1000);
       const result=await api('adjust-budget',configuration,240000);

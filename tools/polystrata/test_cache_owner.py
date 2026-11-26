@@ -2,7 +2,7 @@
 from pathlib import Path
 import sys
 import unittest
-sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'backends/polystrata'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'backends/polystrata/terminal'))
 from serve.kvmem import Prompt,cache_owner
 
 class CacheOwnerTest(unittest.TestCase):

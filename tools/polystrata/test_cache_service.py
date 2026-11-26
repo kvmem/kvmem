@@ -6,7 +6,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'backends/polystrata'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'backends/polystrata/terminal'))
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, EngineDied, MockEngine, Service, serve
 from serve.kvmem_monitor import StorageLog, snapshot

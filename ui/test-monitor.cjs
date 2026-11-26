@@ -58,9 +58,10 @@ const server = http.createServer((req, res) => {
     }
     if (req.url.startsWith('/api/launcher/logs')) {
       if (fixture.logFailure) { res.statusCode=503; return res.end('{}'); }
-      const now = new Date(), pad = n => String(n).padStart(2,'0');
+      const now = new Date(Date.now() - (fixture.staleThroughput ? 20000 : 0)), pad = n => String(n).padStart(2,'0');
       const stamp = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.000`;
-      return res.end(JSON.stringify({running:true,backend:'ninfer',session:'test',started_at:Date.now()-10000,revision:String(Date.now()),text:`${stamp}  INFO  throughput | 5.0s | decode 58.4 tok/s (292 tok) | running 1 (decode-ready 1)\n`}));
+      const throughput = fixture.logThroughput ?? 'decode 58.4 tok/s (292 tok)';
+      return res.end(JSON.stringify({running:true,backend:'ninfer',session:'test',started_at:Date.now()-60000,revision:String(Date.now()),text:`${stamp}  INFO  throughput | 5.0s | ${throughput} | running 1 (decode-ready 1)\n`}));
     }
     const payload =
       req.url === "/props"
@@ -284,6 +285,27 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     assert.equal(await queueSection.getAttribute('open'),'');
     assert.match(await page.locator('[data-backend-sections]').textContent(),/启动以来平均吞吐/);
     assert.equal(await page.locator('[data-backend-sections] img').count(),0);
+    // A non-streaming request can stay in processing while the engine reports both rates.
+    fixtureScenario = {backend:'ninfer', active:[{...record(),status:'processing',
+      generated_tokens:0,prefill_tps:null,decode_tps:null}],
+      logThroughput:'prefill 1.25k tok/s (6,250 tok) | decode 17.2 tok/s (86 tok)'};
+    const expectEngineRate = (phase, value) => page.waitForFunction(({phase, value}) =>
+      document.querySelector(`[data-value="engine-${phase}-speed"]`).textContent === value, {phase, value});
+    await expectEngineRate('prefill', '1,250.0');
+    await expectEngineRate('decode', '17.2');
+    assert.equal(await page.locator('[data-engine-throughput]').isVisible(), true);
+    assert.equal(await page.locator('[data-value="engine-throughput-window"]').textContent(), '5.0s 统计窗口');
+    assert.equal(await page.locator('[data-value="decode-mean"]').textContent(), '—');
+    assert.equal(await page.locator('[data-value="prefill"]').textContent(), '—');
+    await page.selectOption('[data-language-select]', 'en');
+    assert.equal(await page.getByRole('region', {name:'Engine throughput'}).isVisible(), true);
+    await page.selectOption('[data-language-select]', 'zh-CN');
+    fixtureScenario.logThroughput = 'prefill 1.25k tok/s (6,250 tok)';
+    await expectEngineRate('decode', '0.0');
+    fixtureScenario.staleThroughput = true;
+    await expectEngineRate('prefill', '—');
+    await expectEngineRate('decode', '—');
+    assert.equal(await page.locator('[data-value="engine-throughput-window"]').textContent(), '未采集');
     fixtureScenario = {backend:'ninfer',nativeRequestMetrics:{
       native_request_id:'chatcmpl-exact',decode_tps_live:21,decode_tps_window_ms:5000,
       decode_tps_sampled_at_ms:Date.now(),prefill_ms:250,ttft_ms:250,decode_ms:1000,
@@ -305,6 +327,7 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     assert.equal(await page.locator('[data-live-speed]').getAttribute('title'),'');
     fixtureScenario = {backend:'ninfer',logFailure:true};
     await page.waitForFunction(() => document.querySelector('[data-value="decode"]').textContent === '—');
+    await expectEngineRate('decode', '—');
     assert.equal(await page.locator('[data-value="decode-mean"]').textContent(),'8.0');
     // Prefill uses completed new work, excluding a large reused prefix. Its
     // native clock updates per chunk; final timing replaces it at decode start.

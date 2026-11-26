@@ -72,7 +72,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path(os.environ.get("POLYSTRATA_SOURCE", ROOT / "backends/polystrata")))
     args = parser.parse_args()
-    body = function((args.source / "src/poly/engine.cpp").read_text(encoding="utf-8"), "void* Engine::seq_buf(int s, const void* p) const")
+    body = function((args.source / "engine/src/poly/engine.cpp").read_text(encoding="utf-8"), "void* Engine::seq_buf(int s, const void* p) const")
     compiler = shutil.which(os.environ.get("CXX", "cl" if os.name == "nt" else "c++"))
     if not compiler:
         parser.error("C++ compiler not found; use a developer shell or set CXX")

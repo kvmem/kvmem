@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [string]$LlamaWorker,
@@ -132,7 +132,8 @@ foreach ($entry in $workerEntries) {
     $workerInfo[$workerBackend] = @{ sha256=(Get-FileHash -LiteralPath $executable).Hash.ToLowerInvariant();
         path="workers/$workerBackend/$($entry[2])"; clean_path_help_passed=$true; launch_contract=$contract }
 }
-$packageScripts = @('start-backend.ps1', 'start-ninfer.ps1', 'native-process.ps1', 'query-scoring.ps1', 'token-settings.ps1')
+$packageScripts = @('start-backend.ps1', 'start-ninfer.ps1', 'native-process.ps1', 'query-scoring.ps1',
+                    'recall-strategy.ps1', 'token-settings.ps1')
 if ($Backend -eq 'all') { $packageScripts += @('start-dflash2.ps1','start-polystrata.ps1') }
 foreach ($script in $packageScripts) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $script) -Destination (Join-Path $OutputDir 'scripts/windows')
@@ -141,7 +142,19 @@ if ($Backend -eq 'all') {
     New-Item -ItemType Directory -Path (Join-Path $OutputDir 'tools/polystrata') -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $source 'tools/polystrata/server.py') -Destination (Join-Path $OutputDir 'tools/polystrata/server.py')
 }
+# The worker-only launcher uses these modules to validate recall and inspect the selected model.
+$recallFiles = @('scripts/check-recall-worker.py', 'scripts/model_health.py',
+                 'scripts/launcher/__init__.py', 'scripts/launcher/worker.py', 'scripts/launcher/recall.py')
+foreach ($name in '__init__.py', 'reader.py', 'schema.py', 'layouts.py', 'formats.py', 'framing.py', 'file_io.py', 'LICENSE', 'PROVENANCE.json') {
+    $recallFiles += 'scripts/model_health_ninfer/' + $name
+}
+foreach ($relative in $recallFiles) {
+    $destination = Join-Path $OutputDir $relative
+    $null = New-Item -ItemType Directory -Path (Split-Path $destination) -Force
+    Copy-Item -LiteralPath (Join-Path $source $relative) -Destination $destination
+}
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../speculative-capabilities.json') -Destination (Join-Path $OutputDir 'scripts/speculative-capabilities.json')
+& (Join-Path $OutputDir 'scripts/windows/start-ninfer.ps1') -Describe | Out-Null
 Copy-Item -LiteralPath (Join-Path $source 'docs') -Destination (Join-Path $OutputDir 'docs') -Recurse
 Copy-Item -LiteralPath (Join-Path $source 'VERSION') -Destination (Join-Path $OutputDir 'VERSION')
 $packageReadme = @'
@@ -174,21 +187,44 @@ $packageReadme = @'
 This package contains only the NInfer worker and its runtime dependencies.
 Use converted .ninfer Qwen dense model artifacts, supplied separately.
 Install a compatible NVIDIA driver and Microsoft Visual C++ 2015-2022 x64 Runtime.
-The included console exposes only NInfer. See START-HERE.txt for startup and
-provenance/validation.json for the qualified GPU, build and model scope.
+Use `scripts/windows/start-ninfer.ps1` to start the worker. See
+`provenance/validation.json`, when present, for the qualified GPU, build and model scope.
+For layerwise recall, the worker-only package uses Python 3.10+ from `PATH` or
+the `py` launcher. The `start-backend.ps1` option `-CacheMinTokens` uses the same
+helper. Packages with the desktop console include Python.
 
-本包仅包含 NInfer 后端。模型另行提供，使用转换后的 .ninfer Qwen 稠密模型包。
-安装兼容的 NVIDIA 驱动和 Microsoft Visual C++ 2015-2022 x64 运行库后，
-双击 START-HERE-CN.bat。Python、控制台和聊天界面均随包提供。
+本包仅包含 NInfer 后端。安装兼容的 NVIDIA 驱动和 Microsoft Visual C++ 2015-2022 x64 运行库后，
+可通过 `scripts/windows/start-ninfer.ps1` 启动。独立 worker 包启用层级回忆或通过
+`start-backend.ps1` 设置 `-CacheMinTokens` 时，需使用系统上的 Python 3.10 或更新版本。
+带桌面控制台的包自带 Python。
 
-TP restrictions and deferred features are recorded in
-docs/ninfer-upstream-63428ac2-integration.md. Models are not downloaded automatically.
+For heads tensor parallelism, select two compatible GPUs and enable
+**Tensor parallelism · heads** in **Multi-GPU**. The PowerShell launcher accepts
+`-TensorParallel` and optional `-TensorSplit` weights in GPU UUID order. See
+[NInfer tensor parallelism](docs/multi-backend.md#ninfer-张量并行) for current launch settings.
+Models are supplied separately.
 '@
 }
 [IO.File]::WriteAllText((Join-Path $OutputDir 'README.md'), $packageReadme, [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $CudaPath 'EULA.txt') -Destination (Join-Path $OutputDir 'licenses/CUDA-EULA.txt')
 Copy-Item -LiteralPath (Join-Path $LlamaSource 'LICENSE') -Destination (Join-Path $OutputDir 'licenses/llama-MIT.txt')
 Copy-Item -LiteralPath (Join-Path $source 'README.md') -Destination (Join-Path $OutputDir 'licenses/KVMem-README.md')
+$projectLicense = Join-Path $source 'LICENSE'
+if (Test-Path -LiteralPath $projectLicense -PathType Leaf) {
+    Copy-Item -LiteralPath $projectLicense -Destination (Join-Path $OutputDir 'licenses/KVMem-Apache-2.0.txt')
+}
+if ($Backend -eq 'all') {
+    $nariqLicenses = @{
+        'libtrellis-Apache-2.0.txt' = 'ggml/src/ggml-cuda/libtrellis/LICENSE'
+        'ExLlamaV3-MIT.txt' = 'licenses/LICENSE-exllamav3'
+    }
+    foreach ($license in $nariqLicenses.GetEnumerator()) {
+        $licenseFile = Join-Path $LlamaSource $license.Value
+        if (Test-Path -LiteralPath $licenseFile -PathType Leaf) {
+            Copy-Item -LiteralPath $licenseFile -Destination (Join-Path $OutputDir "licenses/$($license.Key)")
+        }
+    }
+}
 Copy-Item -LiteralPath (Join-Path $NinferSource 'LICENSE') -Destination (Join-Path $OutputDir 'licenses/ninfer-LICENSE')
 foreach ($tree in @(@('ninfer-third-party', (Join-Path $NinferSource 'third_party')),
                    @('llama-vendor', (Join-Path $LlamaSource 'vendor')))) {
@@ -233,8 +269,8 @@ if ($PolystrataWorker) {
     $polyHelpExit=$process.ExitCode
     if($polyHelpExit -notin @(0,2) -or ($stdout.Result+$stderr.Result) -notmatch 'usage: strata-poly --model' -or ($stdout.Result+$stderr.Result) -notmatch '--kvmem-budget') {throw 'PolyStrata failed with a clean runtime PATH'}
     $process.Dispose()
-    $workerInfo['polystrata']=@{sha256=(Get-FileHash -LiteralPath $polyExe).Hash.ToLowerInvariant();path='workers/polystrata/strata-poly.exe';clean_path_help_passed=$true;help_exit_code=$polyHelpExit;architecture='qwen35moe';batch_mtp=$false}
-    [IO.File]::AppendAllText((Join-Path $OutputDir 'README.md'), "`n## PolyStrata`n`nThis package also contains the single-GPU qwen35moe PolyStrata backend and its portable Python frontend. Start the common console with START-HERE-EN.bat or START-HERE-CN.bat. Select a model GGUF and GPU; an omitted Tokenizer is exported locally from that GGUF on first start. No model download occurs. The model's matching mmproj is required for vision. See provenance/polystrata-validation.json for measured scope and known limitations.`n", [Text.UTF8Encoding]::new($false))
+    $workerInfo['polystrata']=@{sha256=(Get-FileHash -LiteralPath $polyExe).Hash.ToLowerInvariant();path='workers/polystrata/strata-poly.exe';clean_path_help_passed=$true;help_exit_code=$polyHelpExit;architecture='qwen35moe';architectures=@('qwen35moe','gemma4','inkling2_loop');batch_mtp=$false}
+    [IO.File]::AppendAllText((Join-Path $OutputDir 'README.md'), "`n## PolyStrata`n`nThe single-GPU PolyStrata backend serves Qwen3.5 MoE, Gemma 4 and Inkling 2 Mini. Use the Inkling preset for FP16 KV and one text conversation. Start the common console with START-HERE-EN.bat or START-HERE-CN.bat. Select a model GGUF and GPU. When Tokenizer is omitted, it is exported locally from that GGUF on first start. Vision models require their matching mmproj. See provenance/polystrata-validation.json for measured scope and known limitations.`n", [Text.UTF8Encoding]::new($false))
 }
 $manifest = @{ version=(Get-Content -LiteralPath (Join-Path $source 'VERSION') -Raw).Trim();
     workers=$workerInfo; models_included=$false; kv_cross_backend_transfer=$false;
