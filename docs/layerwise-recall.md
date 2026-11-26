@@ -30,6 +30,8 @@ Legacy 的评分器、聚合、graph alpha、LRFU 和 Query/replay 上限保存�
 
 ### RTX 4090 上的 RULER 和 LongMemEval-S 结果
 
+下表记录升级前 NInfer 源码树 `c83c48d` 的实测成绩。
+
 以下 NInfer 实验使用 Qwen3.8-27B NVFP4、FP8 KV、64-token 物理页和原生紧凑 RoPE，页内位置调整上限为 8。每个请求在单张 RTX 4090 上运行。文档预填充使用半衰期为 32,768 token 的 lift，最终 Query 的第 3、7、11、15 层共享全局 Mean-K 选页，其余 12 个注意力层分别选页。各 NInfer 组都开启了 re-RoPE，组间对照衡量页内评分方式。
 
 | RULER 官方分数 | 题数 | NInfer 整页 64 | NInfer 32+32 max | 历史 vLLM 逐层 Mean-K |

@@ -106,6 +106,7 @@ GGUF_Q4_0 = GgufFormat("gguf_q4_0", 2, 32, 18)
 GGUF_Q5_0 = GgufFormat("gguf_q5_0", 6, 32, 22)
 # Two-bit codes over {-1, 0, 1, 2} * d, 64 per block with one binary16 d (GSQ-RCO's Q2_0).
 GGUF_Q2_0 = GgufFormat("gguf_q2_0", 42, 64, 18)
+GGUF_PTQ1_0 = GgufFormat("gguf_ptq1_0", 143, 128, 28)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -141,6 +142,7 @@ GGUF_FORMATS = MappingProxyType(
             GGUF_Q4_0,
             GGUF_Q5_0,
             GGUF_Q2_0,
+            GGUF_PTQ1_0,
         )
     }
 )

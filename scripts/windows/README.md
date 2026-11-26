@@ -57,6 +57,29 @@ on spaces. Named thinking settings must not duplicate the corresponding native o
 ["--default-reasoning-effort", "medium", "--preserve-thinking"]
 ```
 
+## NInfer tensor parallelism / NInfer 张量并行
+
+Select **NInfer**, choose two compatible GPUs, and enable **Tensor parallelism · heads**
+in **Multi-GPU**. For the Windows launcher, pass the GPU UUIDs in order and use
+`-TensorParallel`. `-TensorSplit` is optional. Its weights follow the UUID order, and
+omitting it lets NInfer allocate automatically. With TP enabled, leave `-StageLayers` unset.
+The worker must advertise `heads_tensor_parallel_revision` of at least `1` in
+`--kvmem-capabilities`. Starting with `-DryRun` previews the arguments without launching the worker.
+
+在控制台选择 **NInfer**，勾选两张兼容显卡，然后在 **多卡设置** 启用 **张量并行 · heads**。
+PowerShell 中使用 `-TensorParallel`，以逗号分隔的字符串传入显卡 UUID。`-TensorSplit`
+可选，按 UUID 顺序填写权重，省略时由 NInfer 自动分配。启用 TP 时请留空 `-StageLayers`。
+worker 须在 `--kvmem-capabilities` 中报告 `heads_tensor_parallel_revision` 至少为 `1`。
+
+```powershell
+$gpu1 = 'GPU-00000000-0000-0000-0000-000000000001'
+$gpu2 = 'GPU-00000000-0000-0000-0000-000000000002'
+& .\scripts\windows\start-ninfer.ps1 -Model 'D:\models\model.ninfer' `
+  -Gpu "$gpu1,$gpu2" -TensorParallel -TensorSplit 3,1 -SpeculativeMode none -NoVision -DryRun
+```
+
+Replace the model path and UUIDs. Remove `-DryRun` to start. / 替换模型路径和 UUID，去掉 `-DryRun` 即可启动。
+
 The following sections describe the older rc3 IQ3/IQ4-specific scripts.
 以下章节描述旧 rc3 的 IQ3/IQ4 专用脚本。
 
