@@ -202,7 +202,7 @@ KVMem 新公共配置的默认策略由一份版本化定义提供，模板可�
 | Ngram 草稿 | 无对应项 | `--ngram-draft-tokens`、`--ngram-min-match` | NInfer 可选；开启 spec 后省略宽度会默认 15，明确关闭须传 0 |
 | MTP KV 格式 | `--spec-kv-dtype` | 跟随主 KV 格式 | llama 可单独配置，NInfer 显示跟随主 KV |
 | 视觉启用 | 提供 `--mmproj` | `--vision` | 公共 UI；llama 需要独立 projector，NInfer 需要模型包含视觉资源 |
-| 视觉位置 | `--mmproj-offload` / `--no-mmproj-offload`，可选 `--mmproj-device` | `--vision-residency resident\|overlay\|cpu` | 公共 CPU/GPU 选择按后端映射，overlay 不是普通 GPU 开关，KVMem 下不可用 |
+| 视觉位置 | `--mmproj-offload` / `--no-mmproj-offload`，可选 `--mmproj-device` | `--vision-residency resident\|overlay\|cpu` | NInfer 支持 GPU 常驻、单卡 GPU Overlay 和 CPU；Overlay 需 worker 声明支持 |
 | 图像 token 控制 | `--image-min-tokens`、`--image-max-tokens` | `--vision-max-merged` | 同组展示，保留原生命名和计量含义，不承诺相同数值得到相同图像质量/大小 |
 | 视频采样 | `--video-fps` | 无对应启动项；当前 KVMem 不开放视频 | llama 高级项并按组合校验 |
 
@@ -491,10 +491,10 @@ KVMem 新公共配置的默认策略由一份版本化定义提供，模板可�
 | 原生参数 | 输入和原生行为 |
 |---|---|
 | `--vision` | 启用模型的视觉资源，默认关；原生视频能力不代表 KVMem 视频可用 |
-| `--vision-residency` | resident/overlay/cpu，默认 resident；KVMem 仅 resident/cpu |
+| `--vision-residency` | resident/overlay/cpu，默认 resident；KVMem 的 overlay 需要单张 GPU 和配套 worker |
 | `--vision-cpu` | 同时启用 vision 并选择 CPU |
 | `--cpu-vision-idle-seconds` | Qwen CPU视觉权重按需加载；最后一个编码器释放后空闲超时卸载，默认300秒，0禁用自动卸载 |
-| `--vision-offload` | 必须带 on/off；on 选择 overlay，off 选择 resident，本身不启用 vision；KVMem 下不允许 on |
+| `--vision-offload` | 必须带 on/off；on 选择 overlay，off 选择 resident，本身不启用 vision；统一启动器使用 vision-residency |
 | `--vision-max-merged` | 每媒体项 merged tokens，64–16384；默认 16384，CPU 且未显式指定时为 256 |
 | `--media-cache-mib` | 保留的预处理媒体，默认 1024 MiB；0 关闭 |
 | `--media-live-mib` | 正整数 MiB；活跃预处理媒体总预算，默认 2048 |
@@ -600,7 +600,7 @@ Windows 启动器先按原生参数顺序解析 `WorkerArgs` 中的 Context、Pr
 | NInfer 快速预填充 | 当前 KVMem 仅允许 int8/rk8v4/rk4v4/rk4v4-e8/rk2v4-e8；具体有效 chunk 可能被调整 | 格式切换时重新校验，展示调整结果 |
 | llama 多卡 | 显式选择至少两张同一 CUDA 后端的设备；不允许重复设备；需要 gpu-layers=all 和 layer/tensor；比例列表逐卡对应；row 被服务拒绝 | 切分方式、GPU 层数和设备列表一起校验；不因解析器识别 row 就展示为可用 |
 | GPU 顺序 | NInfer devices 与 device 互斥；stage-layers 依赖多卡；设备要求匹配 compute capability | UUID 持久保存，启动时解析可见索引；不假定索引长期稳定 |
-| NInfer KVMem 模式 | 不支持模型路由、休眠、graft、Flash Next 家族、overlay 视觉、并行 prefill、非 default CUDA memory policy | 参数仍保留在原生清单；当前配置禁用并说明原因 |
+| NInfer KVMem 模式 | 不支持模型路由、休眠、graft、Flash Next 家族、并行 prefill、非 default CUDA memory policy | 参数仍保留在原生清单；当前配置禁用并说明原因 |
 | NInfer 原生缓存 | catalog/hybrid 与 KVMem 历史管理不是同一套；KVMem 明确拒绝多项模式和专属参数，部分其他缓存字段被解析后原生缓存路径关闭 | UI 禁用不适用的原生缓存配置；不要把“参数被接受”标为“对 KVMem 生效”；no-prefix-reuse、derive-session-keys 单独保留 |
 | NInfer no-prefix-reuse | 与 derive-session-keys 和相应原生缓存容量/目录设置冲突 | 关闭复用时检查依赖项，不悄悄保留矛盾设置 |
 | NInfer hybrid | 与 catalog 专属参数、显式 original 模式和多卡 pipeline 互斥；prefix-cache-file 需要 Host 层 | 作为原生模式独立配置，不混入 KVMem SSD |

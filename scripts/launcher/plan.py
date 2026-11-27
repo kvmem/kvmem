@@ -214,7 +214,7 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
             low = 1  # The strategy-specific token check enforces native block alignment.
         if key in p and not low <= p[key] <= high:
             raise ValueError(f'{key} must be in [{low}, {high}]')
-    if p['VisionResidency'] not in ('resident', 'cpu') or p['DeviceProfile'] not in ('off', 'auto'):
+    if p['VisionResidency'] not in ('resident', 'cpu', 'overlay') or p['DeviceProfile'] not in ('off', 'auto'):
         raise ValueError('Unsupported VisionResidency or DeviceProfile')
     gpu_ids = p['Gpu'].split(',') if p['Gpu'] else []
     if not 1 <= len(gpu_ids) <= 8 or len(set(gpu_ids)) != len(gpu_ids):
@@ -257,6 +257,8 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
             raise ValueError('Fast prefill requires INT8 or supported rotated KV')
         if p['VisionResidency'] == 'cpu' and not p['Vision']:
             raise ValueError('CPU Vision requires Vision')
+        if p['VisionResidency'] == 'overlay' and (not p['Vision'] or len(gpu_ids) != 1):
+            raise ValueError('GPU Vision overlay requires Vision and a single GPU')
         if strategy(p) != 'layerwise' and p['Concurrency'] > 1:
             p['NgramDrafts'] = min(p['NgramDrafts'], 15)
         if p['NgramDrafts'] and (not p['MtpDrafts'] or (strategy(p) != 'layerwise' and

@@ -39,7 +39,7 @@ param(
     [ValidateRange(1, 16)][int]$RetainedSessions = 1,
     [switch]$Vision = $true,
     [switch]$NoVision,
-    [ValidateSet('resident', 'cpu')][string]$VisionResidency = 'cpu',
+    [ValidateSet('resident', 'cpu', 'overlay')][string]$VisionResidency = 'cpu',
     [ValidateRange(0, 2147483647)][int]$CpuVisionIdleSeconds = 300,
     [ValidateRange(1, 16384)][int]$VisionTokens = 1024,
     [ValidateSet('off', 'auto')][string]$DeviceProfile = 'off',

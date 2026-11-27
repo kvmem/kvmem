@@ -57,6 +57,30 @@ class PlanTest(unittest.TestCase):
         for flag in ('--thinking', '--no-thinking', '--preserve-thinking', '--no-preserve-thinking'):
             self.assertNotIn(flag, argv)
 
+    def test_ninfer_gpu_vision_overlay(self):
+        plan = self.plan(Vision=True, VisionResidency='overlay', Concurrency=2)
+        argv = plan['argv']
+        self.assertIn('--vision', argv)
+        self.assertEqual(argv[argv.index('--vision-residency') + 1], 'overlay')
+        self.assertNotIn('--cpu-vision-idle-seconds', argv)
+
+        capabilities = {'legacy_query_replay_revision': 1, 'recall_strategies': {
+            'layerwise': {'vision_residency': ['resident', 'cpu']},
+        }}
+        with self.assertRaisesRegex(ValueError, 'does not support NInfer GPU Vision overlay'):
+            require_launch_features(capabilities, plan['effective_parameters'])
+        capabilities['recall_strategies']['layerwise']['vision_residency'].append('overlay')
+        require_launch_features(capabilities, plan['effective_parameters'])
+
+        with self.assertRaisesRegex(ValueError, 'requires Vision and a single GPU'):
+            self.plan(VisionResidency='overlay')
+        config = self.config(Vision=True, VisionResidency='overlay')
+        config['parameters']['Gpu'] = GPU + ',GPU-00000000-0000-0000-0000-000000000002'
+        with self.assertRaisesRegex(ValueError, 'requires Vision and a single GPU'):
+            build_plan(config)
+        with self.assertRaisesRegex(ValueError, 'only supported by NInfer'):
+            self.plan('llamacpp', Vision=True, VisionResidency='overlay')
+
     def test_full_query_limits_require_new_worker_without_changing_requested_values(self):
         cases = ({}, {'QueryMaxTokens': 512}, {'QueryReplayMaxTokens': 2048},
                  {'QueryMaxTokens': 0, 'QueryReplayMaxTokens': 2048},

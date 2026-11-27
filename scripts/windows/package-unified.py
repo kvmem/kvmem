@@ -18,7 +18,8 @@ METADATA = {'BUILD-INFO.json', 'console-build.json', 'SHA256SUMS',
 OVERLAYS = ('scripts/local-console.py', 'scripts/windows/native-process.ps1',
             'scripts/windows/start-ui.ps1', 'START-HERE-CN.bat', 'START-HERE-EN.bat',
             'scripts/console_chat.py', 'scripts/console_radiance.py', 'scripts/launcher/config.py', 'scripts/launcher/plan.py',
-            'scripts/launcher/radiance.py', 'scripts/launcher/worker.py', 'scripts/windows/start-backend.ps1',
+            'scripts/launcher/radiance.py', 'scripts/launcher/worker.py', 'scripts/launcher-capabilities.json',
+            'scripts/windows/start-backend.ps1', 'scripts/windows/start-ninfer.ps1',
             'ui/monitor/launcher.js',
             'ui/monitor/monitor.js', 'ui/monitor/i18n.js')
 

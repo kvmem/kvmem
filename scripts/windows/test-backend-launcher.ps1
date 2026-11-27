@@ -261,6 +261,17 @@ try {
     $cpu = & $launcher @common -Backend ninfer -Model (Join-Path $testDir 'model with spaces.ninfer') `
         -KvType rk8v4 -Vision -VisionResidency cpu -MtpDrafts 15 -AdaptiveMtp | ConvertFrom-Json
     if ($cpu.argv[[array]::IndexOf($cpu.argv, '--vision-residency') + 1] -ne 'cpu') { throw 'CPU Vision mapping failed' }
+    $overlayModel = Join-Path $testDir 'model with spaces.ninfer'
+    $overlay = & $launcher @common -Backend ninfer -Model $overlayModel -Vision -VisionResidency overlay -Concurrency 2 | ConvertFrom-Json
+    if ($overlay.argv[[array]::IndexOf($overlay.argv, '--vision-residency') + 1] -ne 'overlay' -or
+        $overlay.argv -contains '--cpu-vision-idle-seconds' -or
+        $overlay.capabilities.supported_combinations.images.residency -notcontains 'overlay') {
+        throw 'GPU Vision overlay mapping failed'
+    }
+    $overlayError = $null
+    try { $null = & $launcher @common -Backend ninfer -Model $overlayModel -VisionResidency overlay }
+    catch { $overlayError = $_.Exception.Message }
+    if ($overlayError -notmatch 'requires -Vision and a single GPU') { throw 'Overlay must require Vision' }
     foreach ($residency in 'resident', 'cpu') {
         foreach ($lanes in 1..8) {
             $imageLanes = & $launcher @common -Backend ninfer -Model (Join-Path $testDir 'model with spaces.ninfer') `

@@ -731,6 +731,13 @@
     dependency('DraftModel',enabled&&['llamacpp','polystrata'].includes(backend),tr('NInfer 使用模型内置草稿组件；llama.cpp 需先选择草稿方式。','NInfer uses an embedded draft component. Select a draft method for llama.cpp first.'));
     if(get('DraftModel'))get('DraftModel').required=enabled&&cap.draft_asset==='required_gguf';
     const selectedGpu=get('Gpu'),selectedCount=selectedGpu?.multiple?selectedGpu.selectedOptions.length:(selectedGpu?.value||'').split(',').filter(Boolean).length;
+    const placement=get('VisionResidency'),overlay=placement?.querySelector('option[value=overlay]');
+    if(overlay){
+      const reason=selectedCount>1?tr('GPU Overlay 仅支持单卡。','GPU Overlay requires a single GPU.'):
+        workerContract?.worker?.vision_overlay===false?tr('所选 NInfer 后端不支持 GPU Overlay。','The selected NInfer worker does not support GPU Overlay.'):'';
+      overlay.disabled=!!reason;
+      placement.setCustomValidity(vision&&placement.value==='overlay'?reason:'');
+    }
     const specReason=(layerwise&&(workerBlocks()||cap.available!==true))?(workerError||tr('正在读取所选 worker 的实际能力…','Reading the selected worker capabilities…')):enabled&&(!profiles[mode]||Number(get('Concurrency')?.value||1)>(cap.max_concurrency||profile?.max_concurrency||1)||selectedCount>(cap.max_devices||profile?.max_devices||1))?
       tr('当前草稿方式不支持所选并发或显卡数量。','The selected draft method does not support this concurrency or GPU count.'):'';
     get('SpeculativeMode')?.setCustomValidity(specReason);
@@ -1301,7 +1308,12 @@
     field(panels[3],p,'PreserveThinking','保留历史思考','Preserve previous reasoning','checkbox',null,poly?['保留客户端回传的已结束轮次思考；内置聊天页自动回传。不会按回答文本猜测或补回缺失思考。','Retain reasoning supplied by the client. Built-in chat sends it automatically; missing reasoning is never guessed from answer text.']:['在后续提示中保留已结束轮次的 assistant 思考内容。','Retain closed-turn assistant reasoning in later prompts.']);
     }
     field(panels[4],p,'Vision','启用图像输入','Enable vision','checkbox',null,['需要模型及配套资源支持','Requires compatible model and resources']);
-    field(panels[4],p,'VisionTokens','图像 token 上限（可选）','Image token limit (optional)','number',null,['开启图像输入时生效。','Applies when vision input is enabled.']);field(panels[4],{VisionResidency:'resident',...p},'VisionResidency','图像编码器存放位置','Vision encoder placement','text',[['resident','GPU'],['cpu','CPU']],['开启图像输入时生效；关闭后保留原选择。','Applies when vision input is enabled; the selection is retained when off.']);
+    field(panels[4],p,'VisionTokens','图像 token 上限（可选）','Image token limit (optional)','number',null,['开启图像输入时生效。','Applies when vision input is enabled.']);
+    const placements=[['resident',n?tr('GPU 常驻','GPU resident'):'GPU'],['cpu','CPU']];
+    if(n)placements.splice(1,0,['overlay','GPU Overlay']);
+    field(panels[4],{VisionResidency:'resident',...p},'VisionResidency','图像编码器存放位置','Vision encoder placement','text',placements,
+      n?['GPU Overlay 在处理图片时临时借用模型显存，需要支持该模式的 NInfer 和单张 GPU。','GPU Overlay temporarily borrows model VRAM for image encoding. Requires a compatible NInfer worker and one GPU.']:
+      ['开启图像输入时生效；关闭后保留原选择。','Applies when vision input is enabled; the selection is retained when off.']);
     templateFileField(panels[4],p);
     field(panels[5],{ListenHost:'127.0.0.1',...p},'ListenHost','监听地址','Listen address','text',[['127.0.0.1',tr('127.0.0.1 · 仅本机','127.0.0.1 · This computer')],['0.0.0.0',tr('0.0.0.0 · 所有网卡','0.0.0.0 · All interfaces')]],['选择所有网卡后，其他设备可通过本机 IP 和端口访问推理服务','All interfaces allows other devices to access inference through this computer’s IP and port']);field(panels[5],p,'Port','服务端口','Service port','number');
     const concurrency=field(panels[5],p,'Concurrency','同时处理的请求数（可选）','Simultaneous requests (optional)','number',null,(n||rad)?['范围 1–8；留空为 1。并发增加会提高 KV 和显存需求。','Range 1–8; empty uses 1. More concurrent requests require more KV and VRAM.']:['范围 1–8；留空为 1。当前控制台使用单卡；并发增加会提高 KV 和显存需求。','Range 1–8; empty uses 1. This console uses one GPU; more concurrent requests require more KV and VRAM.']);concurrency.min='1';concurrency.max='8';
