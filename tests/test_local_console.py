@@ -181,11 +181,13 @@ class ConsoleTests(unittest.TestCase):
         worker = Path(self.tmp.name) / f'worker{EXE}'; worker.write_bytes(b'fixture')
         contract = dict(schema_version=1, backend='ninfer', query_scoring_revision=2,
                         independent_graph_lrfu=True, signed_lrfu_hits=True)
-        with patch.object(console.subprocess, 'run', return_value=SimpleNamespace(
-                returncode=0, stdout=json.dumps(contract))) as run:
+        with patch.object(console.subprocess, 'run', side_effect=[
+                SimpleNamespace(returncode=0, stdout=json.dumps(contract)),
+                SimpleNamespace(returncode=1, stderr='ninfer-serve: artifact path is required')]) as run:
             first = console.Controller.worker_capabilities(self.controller, worker, 'ninfer')
             second = console.Controller.worker_capabilities(self.controller, worker, 'ninfer')
-            self.assertEqual(first, second); self.assertEqual(run.call_count, 1)
+            self.assertEqual(first, second); self.assertEqual(run.call_count, 2)
+            self.assertTrue(first['explicit_thinking_switches'])
             self.assertEqual(len(first['executable_sha256']), 64)
             self.assertEqual(run.call_args.kwargs['env']['CUDA_VISIBLE_DEVICES'], '-1')
         for value in ([], dict(contract, backend='llamacpp'), dict(contract, query_scoring_revision=1)):
@@ -449,7 +451,7 @@ class ConsoleTests(unittest.TestCase):
 
     def test_new_fields_validate_native_capabilities_and_single_key(self):
         for key, value in [('ApiKey', 'key,second'), ('ApiKey', 'key with space'), ('ApiKey', 'key\nheader'),
-                           ('LogLevel', 'verbose'), ('ThinkingMode', 'on'), ('Concurrency', 9),
+                           ('LogLevel', 'verbose'), ('ThinkingMode', 'invalid'), ('Concurrency', 9),
                            ('ChatTemplateFile', str(Path(self.tmp.name) / 'missing.jinja'))]:
             bad = json.loads(json.dumps(self.config)); bad['parameters'][key] = value
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
@@ -466,11 +468,12 @@ class ConsoleTests(unittest.TestCase):
         model = Path(self.tmp.name) / 'model with spaces.ninfer'; model.touch()
         self.config['parameters'].update(Model=str(model), Worker=str(worker),
             Gpu='GPU-00000000-0000-0000-0000-000000000001', ThinkingBudget=256,
-            ReasoningEffort='medium', PreserveThinking=True, WorkerArgs=['--threads', '2'])
+            ReasoningEffort='medium', ThinkingMode='on', PreserveThinking=True, WorkerArgs=['--threads', '2'])
         argv = self.controller.plan(self.config)['argv']
         self.assertEqual(argv[-2:], ['--threads', '2'])
         self.assertEqual(argv[argv.index('--default-reasoning-effort') + 1], 'medium')
         self.assertEqual(argv[argv.index('--default-thinking-budget') + 1], '256')
+        self.assertIn('--thinking', argv)
         self.assertIn('--preserve-thinking', argv)
         self.assertEqual(list(Path(self.tmp.name).glob('*.json')), [])
         for overrides in ({'ReasoningEffort': 'bad'}, {'ThinkingMode': 'off'},

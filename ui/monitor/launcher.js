@@ -98,9 +98,9 @@
     SinkTokens:12288,RecentTokens:1024,Concurrency:1,RetainedSessions:1,ThinkingBudget:16384,
     ReasoningEffort:'xhigh',PreserveThinking:true,SpeculativeMode:'mtp',VisionResidency:'cpu',VisionTokens:1024,
     QueryScorer:'page-softmax',GraphAlpha:0.2,Lrfu:false,ScoreAggregation:'mean',QueryMaxTokens:512,QueryReplayMaxTokens:2048};
-  const ninferDefaultPreset={...commonPreset,Backend:'ninfer',QueryMaxTokens:0,QueryReplayMaxTokens:0,ThinkingMode:'default',ThinkingBudget:0,KvType:'int8',Prefill:256,DraftTokens:4,DraftPolicy:'adaptive',NgramDrafts:31,NgramMinMatch:12,FastPrefill:true,DeviceProfile:'auto',Vision:true};
+  const ninferDefaultPreset={...commonPreset,Backend:'ninfer',QueryMaxTokens:0,QueryReplayMaxTokens:0,ThinkingMode:'on',ThinkingBudget:0,KvType:'int8',Prefill:256,DraftTokens:4,DraftPolicy:'adaptive',NgramDrafts:31,NgramMinMatch:12,FastPrefill:true,DeviceProfile:'auto',Vision:true};
   const presets = [
-    {id:'radiance',title:['RX 9000 系列 16GB · 极速档','RX 9000 Series 16GB · Speed'],note:['256K 上下文 · 36K KV · CPU 视觉','256K context · 36K KV · CPU vision'],parameters:{...commonPreset,"Backend":"radiance","Budget":36864,"Reserve":4096,"KvType":"fp8","StateCacheType":"f32","Prefill":256,"SpeculativeMode":"dflash2","DraftTokens":7,"DraftPolicy":"fixed","Vision":true,"ThinkingMode":"default","ThinkingBudget":0,"VramReserveMiB":256,"EmbeddingPlacement":"ram","CpuThreads":8,"VisionCacheMiB":64,"VisionTokens":256,"NgramDrafts":0,"NgramMinMatch":12}},
+    {id:'radiance',title:['RX 9000 系列 16GB · 极速档','RX 9000 Series 16GB · Speed'],note:['256K 上下文 · 36K KV · CPU 视觉','256K context · 36K KV · CPU vision'],parameters:{...commonPreset,"Backend":"radiance","Budget":36864,"Reserve":4096,"KvType":"fp8","StateCacheType":"f32","Prefill":256,"SpeculativeMode":"dflash2","DraftTokens":7,"DraftPolicy":"fixed","Vision":true,"ThinkingMode":"on","ThinkingBudget":0,"VramReserveMiB":256,"EmbeddingPlacement":"ram","CpuThreads":8,"VisionCacheMiB":64,"VisionTokens":256,"NgramDrafts":0,"NgramMinMatch":12}},
     {id:'ninfer-speed',title:['NInfer · 极速档','NInfer · Speed'],
       parameters:{...ninferDefaultPreset,SpeculativeMode:'dflash2',DraftTokens:5,DraftPolicy:'fixed',Budget:36*1024,Reserve:4*1024,NgramDrafts:0},
       note:['启用 DFlash2，历史 KV 预算较少，侧重响应速度。','Uses DFlash2 with a smaller history KV budget, prioritizing response speed.']},
@@ -122,7 +122,7 @@
       note:['文本、无草稿起点；仍需当前 worker 确认该组合。','Text without drafts; the selected worker must qualify this combination.'],
       parameters:{Backend:backend,RecallStrategy:'layerwise',Context:262144,Budget:32768,Reserve:1024,HostMiB:16384,
         Prefill:backend==='polystrata'?512:256,MaxTokens:1024,Concurrency:1,RetainedSessions:1,
-        SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',Vision:false,ThinkingMode:'default',
+        SpeculativeMode:'none',DraftTokens:0,DraftPolicy:'fixed',Vision:false,ThinkingMode:backend==='llamacpp'?'off':'on',
         SinkTokens:'',RecentTokens:'',KvType:backend==='llamacpp'?'q8_0':backend==='polystrata'?'f16':'bf16',
         ...(backend==='llamacpp'?{KvTypeK:'q8_0',KvTypeV:'q8_0'}:{}),...(explicitLayerwiseRecipeResources[backend]||{})}
     })),
@@ -201,7 +201,7 @@
         if(input.value===input.dataset.workerDefault)input.value='';
         delete input.dataset.workerDefault;delete input.dataset.defaultWorker;delete input.dataset.uiOnly;
       }
-      input.placeholder=tr('使用后端默认值','Use backend default');
+      input.placeholder=tr('未报告','Not reported');
       if(input.value===''&&Object.hasOwn(values,name)){
         input.value=String(values[name]);input.dataset.workerDefault=input.value;input.dataset.defaultWorker=key;input.dataset.uiOnly='true';
       }else if(input.dataset.workerDefault!==undefined&&input.value===input.dataset.workerDefault&&Object.hasOwn(values,name)){
@@ -492,6 +492,7 @@
   }
   function launchData(){
     const data=collect(),p=data.parameters;
+    if(!['on','off'].includes(p.ThinkingMode))throw Error(tr('请为思考选择开启或关闭。','Choose On or Off for Thinking.'));
     if(p.RecallStrategy==='layerwise'&&info.recall_strategy_version!==1)throw Error(tr('请更新完整控制台以使用分层召回。','Update the complete console to use layerwise recall.'));
     if(info.query_scoring_version!==2)throw Error(tr('启动配置已更新，请完整更新并重启控制台，再刷新页面。','Launch settings changed. Update and restart the complete console, then refresh.'));
     if(p.Backend==='llamacpp'&&info.kv_cache_version!==1)throw Error(tr('K/V 独立格式设置已更新，请先关闭原启动窗口并重新启动控制台，然后刷新页面。','Independent K/V settings have been updated. Close the original startup window, restart the console, then refresh this page.'));
@@ -532,7 +533,7 @@
         row(tr('实际 KV 块大小','Effective KV block size'),`${plan.block_tokens} tokens`,p.Backend==='polystrata'?'BlockTokens':null);
         for(const [key,label] of Object.entries(labels)){const before=plan.requested[key],after=plan.effective[key];row(label,`${before===after?after:`${before} → ${after}`} tokens`+(before===after?'':tr(' · 已自动调整',' · Adjusted automatically')),key);}
       }
-      row(tr('对外模型名','Served model name'),result.effective_settings?.model_alias||p.ModelAlias||tr('沿用模型名称','Use model name'),'ModelAlias');
+      row(tr('对外模型名','Served model name'),result.effective_settings?.model_alias||p.ModelAlias||tr('未设置别名','No alias configured'),'ModelAlias');
       row(tr('API 访问密钥','API access key'),p.ApiKey?tr('已设置 · 预览隐藏密钥','Configured · Hidden in preview'):tr('未设置','Not configured'),'ApiKey');
       const reserveAt=result.argv.indexOf(p.Backend==='polystrata'?'--reserve':'--kvmem-gen-reserve'),outputAt=result.argv.indexOf(p.Backend==='polystrata'?'--max-tokens':p.Backend==='ninfer'?'--default-max-tokens':'-n');
       if(reserveAt>=0&&outputAt>=0){const reserve=Number(result.argv[reserveAt+1]),requested=Number(result.argv[outputAt+1]);row(tr('默认输出预算 / 追加空间','Default output budget / append workspace'),`${requested} / ${reserve} tokens · `+tr('追加空间可循环复用，输出预算可超过 R','Append workspace is reusable; output budget may exceed R'),'Reserve');}
@@ -665,9 +666,22 @@
     dependency('DiskMiB',disk,tr('先开启 canonical SSD 缓存。','Enable canonical SSD cache first.'));
     if(get('DiskPath'))get('DiskPath').required=disk||activationDisk;
     for(const key of ['VisionTokens','VisionResidency'])dependency(key,vision,tr('先开启图像输入。','Enable vision input first.'));
-    dependency('ThinkingBudget',get('ThinkingMode')?.value!=='off',tr('默认思考模式已关闭；重新开启或选择默认后可设置预算。','Default thinking is off. Select on or default to set a budget.'));
-    for(const option of get('ReasoningEffort')?.options||[])if(option.value==='none'&&get('Backend').value==='polystrata')option.disabled=get('ThinkingMode')?.value!=='off';
-    dependency('ReasoningEffort',get('ThinkingMode')?.value!=='off',tr('默认思考模式已关闭；选择默认后可设置思考强度。','Default thinking is off. Select default to set reasoning effort.'));
+    const thinking=get('ThinkingMode')?.value==='on';
+    for(const key of ['ThinkingBudget','ReasoningEffort'])dependency(key,thinking,tr('先开启思考。','Enable thinking first.'));
+    const thinkingWarning=root.querySelector('[data-thinking-worker-warning]');
+    if(thinkingWarning){
+      const oldWorker=workerContract?.worker?.explicit_thinking_switches===false;
+      const blocked=oldWorker&&(thinking||get('PreserveThinking')?.value==='false');
+      const reason=tr('当前 NInfer 后端不支持在启动时显式开启思考或关闭历史思考保留。请更新后端，或改选可用设置。','This NInfer worker cannot explicitly enable thinking or disable reasoning history at startup. Update the worker or choose supported settings.');
+      thinkingWarning.hidden=!blocked;
+      thinkingWarning.textContent=blocked?reason:'';
+      for(const [key,value] of [['ThinkingMode','on'],['PreserveThinking','false']]){
+        const input=get(key);
+        const option=Array.from(input.options).find(item=>item.value===value);
+        if(option)option.disabled=oldWorker;
+        input.setCustomValidity(oldWorker&&input.value===value?reason:'');
+      }
+    }
     const history=!!get('Lrfu')?.checked;
     for(const key of ['LrfuLambda','LrfuTopFraction'])dependency(key,history,tr('先开启历史累计。','Enable LRFU history first.'));
     const fraction=get('LrfuTopFraction');if(fraction)fraction.setCustomValidity(fraction.value!==''&&Number(fraction.value)<=0?tr('候选比例必须大于 0。','The reward fraction must be greater than 0.'): '');
@@ -722,6 +736,12 @@
     get('SpeculativeMode')?.setCustomValidity(specReason);
     for(const option of get('SpeculativeMode')?.options||[]){const c=profiles[option.value];option.disabled=!c||layerwise&&c.available!==true||(option.value==='guess'&&!layerwise)||(option.value!=='none'&&(Number(get('Concurrency')?.value||1)>(c.max_concurrency||profile?.max_concurrency||1)||selectedCount>(c.max_devices||profile?.max_devices||1)));}
     const historyChoice=get('LayerwiseMtpHistory');
+    if(historyChoice){
+      const defaultOption=Array.from(historyChoice.options).find(option=>option.value===baseCap.default_history_policy);
+      historyChoice.options[0].textContent=defaultOption
+        ? tr('自动 · '+defaultOption.textContent,'Auto · '+defaultOption.textContent)
+        : tr('请选择历史来源','Choose a history source');
+    }
     historyChoice?.setCustomValidity(layerwise&&mode==='mtp'&&historyChoice.value&&!baseCap.history_policies?.includes(historyChoice.value)?tr('此 worker 未验证所选 MTP 历史策略；当前选择已保留。','This worker does not qualify the selected MTP history policy; your selection is retained.'):'');
     for(const option of historyChoice?.options||[])option.disabled=layerwise&&mode==='mtp'&&!!option.value&&!baseCap.history_policies?.includes(option.value);
     syncRecallOptions();
@@ -774,8 +794,9 @@
 
   function templateFileField(parent,p){
     const advanced=make('details',{class:'l-advanced l-wide'});advanced.append(make('summary',{},tr('高级 · 自定义聊天模板','Advanced · Custom chat template')));const grid=make('div',{class:'l-fields l-template-fields'});advanced.append(grid);parent.append(advanced);
-    const input=field(grid,p,'ChatTemplateFile','模板文件（可选）','Template file (optional)','text',null,['留空使用模型与引擎默认模板。只选择模板文件，不在页面中编辑模板。','Leave empty to use the model and engine default. Choose a template file; template editing is not provided here.']);input.closest('label').classList.add('l-wide');
-    const row=inputActions(input),browse=make('button',{type:'button',class:'s-button','data-browse-template':''},tr('选择…','Choose…')),reset=make('button',{type:'button',class:'s-button','data-reset-template':''},tr('恢复默认','Use default'));
+    const input=field(grid,p,'ChatTemplateFile','模板文件（可选）','Template file (optional)','text',null,['可选择 Jinja 文件覆盖内置聊天模板。','Select a Jinja file to override the built-in chat template.']);input.closest('label').classList.add('l-wide');
+    input.placeholder=tr('使用内置聊天模板','Use built-in chat template');
+    const row=inputActions(input),browse=make('button',{type:'button',class:'s-button','data-browse-template':''},tr('选择…','Choose…')),reset=make('button',{type:'button',class:'s-button','data-reset-template':''},tr('使用内置模板','Use built-in template'));
     browse.onclick=async()=>{if(pickingModel)return;pickingModel=true;browse.disabled=true;try{const result=await api('browse-template',{backend:p.Backend,current_path:input.value||p.Model||''},315000);if(result.path&&input.isConnected){input.value=result.path;input.dispatchEvent(new Event('input',{bubbles:true}));}}catch(error){showError(error);}finally{pickingModel=false;browse.disabled=false;}};
     reset.onclick=()=>{input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));};row.append(browse,reset);
     if(info.native_picker===false)browse.hidden=true;
@@ -1025,7 +1046,9 @@
       DeviceProfile:'off',LogLevel:'info',QueryMaxTokens:n?0:512,ReplayMaxTokens:2048};
     for(const [key,value] of Object.entries(concreteDefaults))if(p[key]===undefined||p[key]===null||p[key]==='')p[key]=value;
     if(p.RetainedSessions===undefined||p.RetainedSessions===null||p.RetainedSessions==='')p.RetainedSessions=poly?Math.max(4,Number(p.Concurrency)+1):4;
-    if(!p.ThinkingMode||p.ThinkingMode==='default')p.ThinkingMode=(n||rad)?'default':poly?(p.ReasoningEffort==='none'?'off':'on'):'off';
+    if(p.ReasoningEffort==='none'||(rad&&p.ReasoningEffort==='minimal')){
+      p.ThinkingMode='off';delete p.ReasoningEffort;
+    }else if(!p.ThinkingMode||(p.ThinkingMode==='default'&&(l||poly)))p.ThinkingMode=l?'off':'on';
     if(poly&&!p.ReasoningEffort)p.ReasoningEffort='medium';
     if(poly&&p.ReasoningEffort==='high')p.ReasoningEffort='xhigh';
     if(poly&&['mtp','guess'].includes(p.SpeculativeMode))p.DraftPolicy='adaptive';
@@ -1116,7 +1139,7 @@
     field(fields,p,'Context','最大上下文 · tokens','Context limit · tokens','number');
     const outputLimit=field(fields,p,'MaxTokens','默认最大输出 · tokens','Default output limit · tokens','number',null,['聊天请求可以覆盖默认输出预算。温度、top-p 等采样参数由聊天请求设置。','Chat requests can override the default output budget. Temperature, top-p and other sampling controls are set by chat requests.']);
     const outputMode=make('select',{'data-output-mode':'','aria-label':tr('输出上限模式','Output limit mode')});
-    for(const [value,label] of [['unlimited',tr('不限制','Unlimited')],['limited',tr('指定上限','Token limit')]])outputMode.append(make('option',{value},label));
+    for(const [value,label] of [['unlimited',tr('不单设输出上限','No separate output cap')],['limited',tr('指定上限','Token limit')]])outputMode.append(make('option',{value},label));
     outputMode.value=p.MaxTokens!==''&&Number(p.MaxTokens)===0?'unlimited':'limited';
     outputLimit.before(outputMode);outputLimit.hidden=outputMode.value==='unlimited';
     outputLimit.addEventListener('input',()=>{outputMode.value=outputLimit.value!==''&&Number(outputLimit.value)===0?'unlimited':'limited';outputLimit.hidden=outputMode.value==='unlimited';});
@@ -1215,8 +1238,8 @@
     layerwise.append(layerwiseAdvanced.parentElement);
     const drafts=make('div',{class:'l-recall-drafts l-wide','data-layerwise-drafts':''});layerwise.append(drafts);
     field(drafts,p,'LayerwiseMtpHistory','MTP 历史来源','MTP history','text',[
-      ['',tr('请选择，无默认值','Choose; no default')],['upstream-global',tr('上游全局 · 私有探测','Upstream global · private probe')],['first-layer',tr('首个目标层 · fresh Q','First target layer · fresh Q')]
-    ],['两者的主模型均使用 fresh-Q 分层召回，此选项只决定草稿 OWN KV 的历史 ID。NInfer 默认 first-layer；留空使用所选 worker 的默认，显式值保持不变。','Both target paths use fresh-Q layerwise recall. This choice controls history IDs in draft-owned KV; NInfer defaults to first-layer. Leave blank for the selected worker default; explicit choices are preserved.']);
+      ['',tr('请选择历史来源','Choose a history source')],['upstream-global',tr('上游全局 · 私有探测','Upstream global · private probe')],['first-layer',tr('首个目标层 · fresh Q','First target layer · fresh Q')]
+    ],['两种选项都使用 fresh-Q 分层召回。此设置决定草稿 OWN KV 从哪里读取历史 ID。有可用的自动选项时，下拉列表会显示实际来源。','Both choices use fresh-Q layerwise recall. This sets where draft-owned KV reads history IDs. When automatic selection is available, the list names the source.']);
     drafts.append(make('p',{class:'l-recall-description','data-layerwise-draft-note':''}));
     const retention=recallSection('历史保留','History retention',
       '设置始终保护的开头、最近内容及空闲会话数量。会话保留仍受共享内存预算限制。',
@@ -1262,14 +1285,18 @@
       ['Inkling 2 Mini dSpark、Gemma 4 MTP 和 llama.cpp DFlash2 需要配套草稿 GGUF。Qwen MTP 和 NInfer 使用内置草稿。','Inkling 2 Mini dSpark, Gemma 4 MTP and llama.cpp DFlash2 require matching draft GGUFs. Qwen MTP and NInfer use embedded drafts.'],n||rad);
     if(!n&&!rad&&info.native_picker!==false){const row=inputActions(draftModel),choose=make('button',{type:'button',class:'s-button l-secondary'},tr('选择文件','Choose file'));row.append(choose);choose.onclick=async()=>{try{const result=await api('browse-model',{backend:'llamacpp',current_path:draftModel.value});if(result.path){draftModel.value=result.path;draftModel.dispatchEvent(new Event('change',{bubbles:true}));}}catch(e){message(e.message,true);}};}
     if(n)field(panels[1],p,'FastPrefill','启用快速预填充','Enable fast prefill','checkbox',null,['支持 int8、rk8v4、rk4v4、rk4v4-e8、rk2v4-e8；还需模型支持。与 MTP、普通预填充块大小分别设置。','Supports int8, rk8v4, rk4v4, rk4v4-e8 and rk2v4-e8; model support is also required. Independent of MTP and the standard prefill chunk size.'],!n);
-    const thinking=field(panels[3],p,'ThinkingMode','默认思考模式','Default thinking mode','text',[[(n||rad)?'default':'on',(n||rad)?tr('跟随模型','Model default'):tr('开启','On')],['off',tr('关闭','Off')]],['需要模型与模板支持。聊天请求中的显式设置优先。','Requires model/template support. Explicit chat settings take priority.']);
+    const thinkingOptions=[['on',tr('开启','On')],['off',tr('关闭','Off')]];
+    if(p.ThinkingMode==='default')thinkingOptions.unshift(['default',tr('请选择开启或关闭','Choose On or Off')]);
+    const thinking=field(panels[3],p,'ThinkingMode','思考','Thinking','text',thinkingOptions,['这是服务的启动设置。聊天请求可单独覆盖。开启思考需要当前模型和聊天模板支持。','This is the startup setting. A chat request can override it. Thinking requires a compatible model and chat template.']);
+    if(p.ThinkingMode==='default')thinking.options[0].disabled=true;
     const thinkingBudget=field(panels[3],p,'ThinkingBudget','默认思考预算 · tokens','Default thinking budget · tokens','number',null,poly?['0：根据输出上限自动给答案留空间；正数：思考 token 上限，也受总输出预算约束。','0: automatically reserve answer space within the output limit. Positive values cap reasoning tokens, subject to the total output budget.']:['0：不设置单独的思考限额，仍受总输出预算约束。正数：思考 token 上限。','0: no separate reasoning cap; the total output budget still applies. Positive values cap reasoning tokens.']);
     thinkingBudget.required=true;
     field(panels[3],p,'ReasoningEffort','默认思考强度（可选）','Default reasoning effort (optional)','text',[
-      ...(!poly?[['',tr('不附加强度指令','No additional effort instruction')]]:[]),...(poly?['none','low','medium','xhigh']:['none','minimal','low','medium','high','xhigh','max']).map(x=>[x,x])
+      ...(!poly?[['',tr('不设置强度','No effort override')]]:[]),...(poly?['low','medium','xhigh']:rad?['low','medium','high','xhigh','max']:['minimal','low','medium','high','xhigh','max']).map(x=>[x,x])
     ],['默认思考强度，具体支持取决于模型；与思考 token 预算分别设置。','Default reasoning effort; supported levels depend on the model. Separate from the thinking-token budget.']);
     if(n){
-      const preserve=field(panels[3],{PreserveThinking:p.PreserveThinking===true?'true':'false'},'PreserveThinking','历史思考','Previous reasoning','text',[['true',tr('开启','On')],['false',tr('跟随模型','Model default')]],['当前 NInfer 启动接口只提供强制保留开关；跟随模型不等于关闭。聊天请求仍可单独覆盖。','NInfer only provides a force-preserve startup switch. Model default does not mean off. Chat requests can override it.']);preserve.dataset.booleanSelect='true';
+      const preserve=field(panels[3],{PreserveThinking:p.PreserveThinking===true?'true':'false'},'PreserveThinking','保留历史思考','Preserve previous reasoning','text',[['true',tr('开启','On')],['false',tr('关闭','Off')]],['控制后续提示是否保留已结束轮次的思考内容。聊天请求可单独覆盖。','Control whether later prompts retain reasoning from finished turns. A chat request can override it.']);preserve.dataset.booleanSelect='true';
+      panels[3].append(make('p',{class:'l-error l-wide','data-thinking-worker-warning':'',role:'status',hidden:''}));
     }else{
     field(panels[3],p,'PreserveThinking','保留历史思考','Preserve previous reasoning','checkbox',null,poly?['保留客户端回传的已结束轮次思考；内置聊天页自动回传。不会按回答文本猜测或补回缺失思考。','Retain reasoning supplied by the client. Built-in chat sends it automatically; missing reasoning is never guessed from answer text.']:['在后续提示中保留已结束轮次的 assistant 思考内容。','Retain closed-turn assistant reasoning in later prompts.']);
     }
@@ -1280,12 +1307,13 @@
     const concurrency=field(panels[5],p,'Concurrency','同时处理的请求数（可选）','Simultaneous requests (optional)','number',null,(n||rad)?['范围 1–8；留空为 1。并发增加会提高 KV 和显存需求。','Range 1–8; empty uses 1. More concurrent requests require more KV and VRAM.']:['范围 1–8；留空为 1。当前控制台使用单卡；并发增加会提高 KV 和显存需求。','Range 1–8; empty uses 1. This console uses one GPU; more concurrent requests require more KV and VRAM.']);concurrency.min='1';concurrency.max='8';
     credentialField(panels[5],p);
     const serviceAdvanced=make('details',{class:'l-advanced l-wide'});serviceAdvanced.append(make('summary',{},tr('高级 · 服务标识与日志','Advanced · Service identity & logs')));const serviceFields=make('div',{class:'l-fields l-service-fields'});serviceAdvanced.append(serviceFields);panels[5].append(serviceAdvanced);
-    field(serviceFields,p,'ModelAlias','对外模型名（可选）','Served model name (optional)','text',null,poly?['供 API 客户端使用；留空使用 kvmem-polystrata-qwen35。','API model name; empty uses kvmem-polystrata-qwen35.']:['供 API 客户端使用的稳定名称；留空沿用模型名称。','A stable name for API clients; leave empty to inherit the model name.']);
+    const alias=field(serviceFields,p,'ModelAlias','API 模型别名（可选）','API model alias (optional)','text',null,['填写客户端要使用的固定名称。留空时，启动后在监控里查看服务名称。','Enter a stable name for API clients. When blank, see the served name in the monitor after startup.']);
+    alias.placeholder=tr('未设置别名','No alias configured');
     field(serviceFields,p,'LogLevel','日志级别','Log level','text',[['info','Info'],['debug','Debug'],['trace','Trace'],['warning','Warning'],['error','Error'],['off',tr('关闭日志','Off')]],['通常使用 Info；排查问题时可临时选择 Debug。','Use Info normally; select Debug temporarily for troubleshooting.']);
     if(n){
       const ngram=field(panels[1],p,'NgramDrafts','N-gram 推测 token 数','N-gram draft tokens','number',null,['依赖支持 N-gram 的草稿方式；0 或留空关闭。Layerwise 的宽度及并发上限来自当前 worker，超限保留原值并拒绝启动。','Requires a draft method supporting N-gram. 0 or empty disables it. Layerwise width and concurrency limits come from the selected worker; an excessive value is retained and blocks launch.']);ngram.max='63';
       const minMatch=field(panels[1],p,'NgramMinMatch','N-gram 最短匹配','N-gram minimum match','number',null,['启用 N-gram 时生效，范围 4–64。','Applies when N-gram is enabled; range 4–64.']);minMatch.min='4';minMatch.max='64';
-      field(panels[1],p,'DeviceProfile','设备性能配置','Device profile','text',[['off',tr('关闭','Off')],['auto',tr('自动','Auto')]]);
+      field(panels[1],p,'DeviceProfile','设备性能配置','Device profile','text',[['off',tr('关闭','Off')],['auto',tr('按显卡自动选择','Select by GPU')]]);
 
     }
     if(poly||l){

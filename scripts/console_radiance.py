@@ -10,7 +10,9 @@ def effective_settings(info, template_effort=None):
     for key in ('enable_thinking','preserve_thinking','reasoning_effort'):
         if key in native.get('chat_template_kwargs',{}):effective[key]=native['chat_template_kwargs'][key]
     effort = effective.get('reasoning_effort')
-    if not effort and template_effort and template_effort in (info.get('capabilities', {}).get('reasoning_efforts') or []):
+    thinking = effective.get('enable_thinking')
+    effort_matches = thinking is None or thinking == (template_effort not in ('none', 'minimal'))
+    if not effort and effort_matches and template_effort in (info.get('capabilities', {}).get('reasoning_efforts') or []):
         effort = effective['reasoning_effort'] = template_effort
     if effort in ('none', 'minimal'):
         effective['enable_thinking'] = False

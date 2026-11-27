@@ -13,6 +13,7 @@ from console_chat import context_payload
 
 @unittest.skipUnless(sys.platform == 'win32' and SHELLS, 'Windows PowerShell launchers')
 class EngineSettingsTests(unittest.TestCase):
+    setUpClass = classmethod(WorkerArgsTests.setUpClass.__func__)
     setUp = WorkerArgsTests.setUp
     tearDown = WorkerArgsTests.tearDown
     run_launcher = WorkerArgsTests.run_launcher
@@ -77,9 +78,16 @@ class ChatDefaultsTests(unittest.TestCase):
         self.assertTrue(result['capabilities']['preserve'])
         self.assertIn('xhigh',result['capabilities']['efforts'])
 
-    def test_ninfer_inherit_is_not_reported_as_off(self):
-        result=context_payload(self.state('ninfer',PreserveThinking=False),{})
+    def test_ninfer_reasoning_uses_native_or_confirmed_launch_values(self):
+        state = self.state('ninfer', Model='Qwen-unknown.ninfer', PreserveThinking=False)
+        result = context_payload(state, {})
         self.assertNotIn('preserve_thinking',result['effective'])
+        self.assertNotIn('enable_thinking',result['effective'])
+        state['worker'] = {'explicit_thinking_switches': True}
+        state['active_config']['parameters']['ThinkingMode'] = 'on'
+        result = context_payload(state, {})
+        self.assertFalse(result['effective']['preserve_thinking'])
+        self.assertTrue(result['effective']['enable_thinking'])
 
     def test_poly_effort_alias_and_sampling_match(self):
         result=context_payload(self.state('polystrata'),{}, {'effective':{'reasoning_effort':'high'},

@@ -17,7 +17,9 @@ METADATA = {'BUILD-INFO.json', 'console-build.json', 'SHA256SUMS',
             'README.md', 'RELEASE-NOTES.md', 'START-HERE.txt', 'VERSION'}
 OVERLAYS = ('scripts/local-console.py', 'scripts/windows/native-process.ps1',
             'scripts/windows/start-ui.ps1', 'START-HERE-CN.bat', 'START-HERE-EN.bat',
-            'scripts/launcher/config.py', 'ui/monitor/launcher.js',
+            'scripts/console_chat.py', 'scripts/console_radiance.py', 'scripts/launcher/config.py', 'scripts/launcher/plan.py',
+            'scripts/launcher/radiance.py', 'scripts/launcher/worker.py', 'scripts/windows/start-backend.ps1',
+            'ui/monitor/launcher.js',
             'ui/monitor/monitor.js', 'ui/monitor/i18n.js')
 
 
@@ -126,8 +128,10 @@ def prepare(args):
         # Keep the monitor embedded in Chat in sync with the console monitor.
         for name in ('launcher.js', 'monitor.js', 'i18n.js'):
             shutil.copyfile(out / 'ui/monitor' / name, out / 'ui/dist/monitor' / name)
-        if "Backend:'ninfer',ThinkingMode:'default',ThinkingBudget:0" not in (out / 'ui/monitor/launcher.js').read_text(encoding='utf-8-sig'):
-            raise ValueError('NInfer thinking-unlimited presets are missing')
+        launcher_text = (out / 'ui/monitor/launcher.js').read_text(encoding='utf-8-sig')
+        preset = re.search(r'const ninferDefaultPreset=\{([^}]+)\}', launcher_text)
+        if not preset or "ThinkingMode:'on'" not in preset[1] or 'ThinkingBudget:0' not in preset[1]:
+            raise ValueError('NInfer presets must explicitly enable thinking with no separate cap')
         (out / 'VERSION').write_text(args.version + '\n', encoding='utf-8')
         worker_paths = {'ninfer': 'workers/ninfer/ninfer-kvmem-server.exe',
                         'polystrata': 'workers/polystrata/strata-poly.exe'}

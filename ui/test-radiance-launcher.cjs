@@ -46,7 +46,7 @@ module.exports=async({browser,base,info})=>{
  await page.locator('[data-param=DiskEnabled]').check();
  for(const key of ['DiskPath','DiskMiB'])assert.equal(await page.locator(`[data-param=${key}]`).isDisabled(),false,key);
  assert.equal(await page.locator('[data-param=Concurrency]').inputValue(),'2');
- assert.equal(await page.locator('[data-param=ThinkingMode]').inputValue(),'default');
+ assert.equal(await page.locator('[data-param=ThinkingMode] option:checked').textContent(),'Choose On or Off');
  assert.equal(await page.locator('[data-param=VramReserveMiB]').inputValue(),'1024');
  assert.equal(await page.locator('[data-param=RadianceHome]').inputValue(),'C:/radiance/home');
  assert.equal(await page.locator('[data-param=RocmPath]').inputValue(),'C:/ROCm');
@@ -77,6 +77,7 @@ module.exports=async({browser,base,info})=>{
  assert.equal(await gpu(uuid).evaluate(x=>x.checkValidity()),true);
  await page.locator('[data-preset=radiance]').click();
  assert.equal(await page.locator('[data-param=Prefill]').inputValue(),'256','Radiance template uses the new default');
+ assert.equal(await page.locator('[data-param=ThinkingMode]').inputValue(),'on');
  await page.locator('[data-preset-undo]').click();
  assert.equal(await page.locator('[data-param=Prefill]').inputValue(),'512','undo restores the explicit saved chunk');
  assert.deepEqual(errors,[]);

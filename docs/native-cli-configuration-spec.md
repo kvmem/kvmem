@@ -182,7 +182,7 @@ KVMem 新公共配置的默认策略由一份版本化定义提供，模板可�
 | 频率惩罚 | -2–2 | `--frequency-penalty` | 同名 | 直接沿用 |
 | 重复惩罚 | 正数 | `--repeat-penalty` / `--repetition-penalty` | 无对应项 | 保留 llama 原名；不映射到存在/频率惩罚 |
 | 随机种子 | 无符号整数或继承 | `--seed` / `-s`，uint32 | `--seed`，uint64 | 名称沿用，范围按后端；相同 seed 不承诺跨后端相同输出 |
-| 默认思考 | 继承/开/关 | `--enable-thinking` / `--no-think` | `--no-thinking`；普通聊天默认思考 | 公共 UI 正向显示；生成原生开关；不把所有模型默认推断为同一值 |
+| 思考 | 开启／关闭 | `--enable-thinking` / `--no-think` | `--thinking` / `--no-thinking` | 启动配置发出所选的原生开关 |
 | 思考预算 | 继承或 tokens | `--reasoning-budget`：-1 不限、0 立即结束、正整数 | `--default-thinking-budget`：仅正整数，省略未设置 | 公共 UI 的可移植输入为继承/正整数；llama 0 独立保留，不转换成 NInfer 关闭思考 |
 | 思考预算提示 | 文本 | `--reasoning-budget-message` | `--thinking-budget-message` | 公共 UI；保留原生名及结束控制语义 |
 | 思考强度 | 模型相关枚举 | `--reasoning-effort` | `--default-reasoning-effort` | 公共 UI；按模型和后端校验，不仅按名称翻译 |
@@ -681,17 +681,16 @@ UI 只提供常用设置，不复制完整原生命令行。以下名称属于 U
 | `ModelAlias` | 服务与并发 → 高级 | `--alias NAME` | `--model-id NAME` |
 | `LogLevel` | 服务与并发 → 高级 | `--verbosity`：off=0、error=1、warning=2、info=3、trace=4、debug=5 | `--log-level` 对应文字值 |
 | `ChatTemplateFile` | 模板与图像 → 高级 | `--chat-template-file PATH` | `--chat-template PATH`（此处原生含义就是文件） |
-| `ThinkingMode` | 生成与思考 | default 不传覆盖，on=`--enable-thinking`，off=`--no-think` | default 不传覆盖，off=`--no-thinking`；缺少原生启动 on 选项，UI 禁用 on，不模拟成其他参数 |
+| `ThinkingMode` | 生成与思考 | on=`--enable-thinking`，off=`--no-think` | on=`--thinking`，off=`--no-thinking` |
 | `Concurrency` | 服务与并发 | `--parallel N`，1–8；当前控制台单卡，允许公共 SSD，H 需容纳所有并发工作集 | `--max-concurrency N`，1–8 |
 
-模型名、日志和模板文件留空时不产生覆盖参数；思考模式继承各自原生默认，不能把 llama 的默认关闭和 NInfer 的模型默认描述为相同的运行状态。思考预算仍仅对 NInfer 开放，UI 关闭思考时不发送预算。温度、top-p 等继续交给聊天请求。
+模型名、日志和模板文件留空时省略对应的覆盖参数。启动配置提供开启和关闭两种思考选项。旧版配置中的 `default` 仍可由脚本与 API 读取。需要选择的旧草稿会在启动前提示用户。关闭思考时，界面省略思考预算与强度。温度、top-p 等在聊天请求中设置。
 
 密钥支持随机生成与显示/隐藏，只在页面内存和正在运行的控制器/worker 中保留。浏览器草稿、个人模板和控制器保存的草稿都排除密钥；刷新后重启服务需要重新输入。预览/复制命令使用 `<redacted>`，手动执行前要替换占位符。控制器不把密钥写入启动计划临时 JSON；状态只报告是否配置，日志接口屏蔽已用密钥。当前控制器对自己管理的服务自动携带密钥读取健康状态和固定监控路由；外部聊天客户端仍须提供密钥。
 
 启动器的同一设置不能同时从命名字段和 `WorkerArgs` 覆盖。未使用相应命名字段时，直接脚本仍可保留原有原生高级参数；UI 的原生参数数组继续使用小范围白名单，不开放任意参数传递。
 
-NInfer 启动器和 UI 另提供 `ReasoningEffort` 与 `PreserveThinking`，分别映射到
-`--default-reasoning-effort` 与 `--preserve-thinking`；当前两个控件只对 NInfer 开放。
+NInfer 的 `ReasoningEffort` 映射到 `--default-reasoning-effort`，`PreserveThinking` 映射到 `--preserve-thinking` 或 `--no-preserve-thinking`。旧版 NInfer 支持的开关以启动预检为准。
 思考模式为 off 时不得设置思考强度；保留历史思考独立控制。`ThinkingBudget` 保持原有映射。
 UI 继续通过 JSON 参数数组调用内部脚本。直接脚本增加 `WorkerArgsFile`，读取 UTF-8 JSON
 字符串数组，和 `WorkerArgs` 互斥，读取后走同一套冲突校验及原生参数编码。

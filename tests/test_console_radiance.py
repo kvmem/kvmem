@@ -58,6 +58,14 @@ class Contract(unittest.TestCase):
         self.assertEqual(context_payload(self.state,self.props,self.info)['capabilities']['efforts'], [])
         self.assertNotIn('kvmem', speculative_event({'timings':{'draft_n':0,'draft_n_accepted':0}}))
 
+    def test_reported_thinking_switch_beats_inferred_template_effort(self):
+        self.info['capabilities']['reasoning_efforts'].append('minimal')
+        self.assertTrue(effective_settings(self.info, 'minimal')['enable_thinking'])
+        self.info['request_defaults']['chat_template_kwargs']['enable_thinking'] = False
+        effective = effective_settings(self.info, 'xhigh')
+        self.assertFalse(effective['enable_thinking'])
+        self.assertNotIn('reasoning_effort', effective)
+
     def test_binding_requires_complete_native_rank_identity(self):
         device = dict(rank=0,device=2,name='AMD test GPU',arch='gfx1201',uuid='GPU-test',vram_bytes=16*1024**3,free_vram_bytes=123)
         engine = dict(tensor_parallel=1,devices=[device])

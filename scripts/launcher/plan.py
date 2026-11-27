@@ -296,8 +296,8 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
             pair('--default-thinking-budget', p['ThinkingBudget'])
         if p.get('ReasoningEffort'):
             pair('--default-reasoning-effort', p['ReasoningEffort'])
-        if p.get('PreserveThinking'):
-            argv.append('--preserve-thinking')
+        if 'PreserveThinking' in supplied:
+            argv.append('--preserve-thinking' if p['PreserveThinking'] else '--no-preserve-thinking')
     else:
         forbidden = {'StageLayers', 'FastPrefill', 'NgramDrafts', 'NgramMinMatch', 'DeviceProfile', 'CpuVisionIdleSeconds'} & supplied.keys()
         if forbidden:
@@ -363,7 +363,7 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
     if p['ThinkingMode'] == 'off':
         argv.append('--no-thinking' if backend == 'ninfer' else '--no-think')
     if p['ThinkingMode'] == 'on':
-        argv.append('--enable-thinking')
+        argv.append('--thinking' if backend == 'ninfer' else '--enable-thinking')
     argv.append('--kvmem')
     if p['CacheMinTokens']:
         pair('--kvmem-cache-min-tokens', p['CacheMinTokens'])

@@ -210,14 +210,14 @@ foreach ($setting in @(
     @('ModelAlias', '^(-a|--alias|--model-id)(=|$)'),
     @('LogLevel', '^(-lv|--verbosity|--log-verbosity|--log-level)(=|$)'),
     @('ChatTemplateFile', '^--chat-template(-file)?(=|$)'),
-    @('ThinkingMode', '^--(enable-thinking|no-think(ing)?)(=|$)'),
+    @('ThinkingMode', '^--(thinking|enable-thinking|no-think(ing)?)(=|$)'),
     @('ReasoningEffort', '^--(default-reasoning-effort|reasoning-effort)(=|$)'),
     @('ThinkingBudget', '^--(default-thinking-budget|reasoning-budget)(=|$)'),
     @('MaxTokens', '^(-n|--n-predict|--predict|--default-max-tokens)(=|$)'),
     @('Vision', '^--(mmproj|mmproj-offload|no-mmproj-offload|mmproj-device|image-max-tokens)(=|$)'),
     @('Mmproj', '^--mmproj(=|$)'),
     @('Lora', '^--lora(-scale)?(=|$)'),
-    @('PreserveThinking', '^--(preserve-thinking|chat-template-kwargs)(=|$)'),
+    @('PreserveThinking', '^--((no-)?preserve-thinking|chat-template-kwargs)(=|$)'),
     @('CpuVisionIdleSeconds', '^--cpu-vision-idle-seconds(=|$)'),
     @('Concurrency', '^(-np|--parallel|--max-concurrency)(=|$)')
 )) {
@@ -236,8 +236,8 @@ if ($ChatTemplateFile) {
     if (!(Test-Path -LiteralPath $ChatTemplateFile -PathType Leaf)) { throw 'ChatTemplateFile must be an existing template file' }
     $ChatTemplateFile = (Resolve-Path -LiteralPath $ChatTemplateFile).Path
 }
-if ($Backend -eq 'ninfer' -and $ThinkingMode -eq 'on') {
-    throw 'NInfer has no native thinking-on startup override; use default or off (requests can select thinking)'
+if ($ThinkingMode -eq 'on' -and $ReasoningEffort -eq 'none') {
+    throw 'ThinkingMode on requires a reasoning effort that enables thinking'
 }
 if ($Backend -eq 'ninfer' -and $ThinkingMode -eq 'off' -and
     ($ReasoningEffort -or @($WorkerArgs | Where-Object { $_ -match '^--default-reasoning-effort(=|$)' }).Count)) {
@@ -348,7 +348,9 @@ if ($Backend -eq 'ninfer') {
     if ($Vision -and $VisionResidency -eq 'cpu') { $nativeArgs += @('--cpu-vision-idle-seconds', "$CpuVisionIdleSeconds") }
     if ($ThinkingBudget -gt 0) { $nativeArgs += @('--default-thinking-budget', "$ThinkingBudget") }
     if ($ReasoningEffort) { $nativeArgs += @('--default-reasoning-effort', $ReasoningEffort) }
-    if ($PreserveThinking) { $nativeArgs += '--preserve-thinking' } # false/unset inherits the model template
+    if ($PSBoundParameters.ContainsKey('PreserveThinking')) {
+        $nativeArgs += $(if ($PreserveThinking) { '--preserve-thinking' } else { '--no-preserve-thinking' })
+    }
 } else {
     # Legacy KvType still sets both sides. Explicit K/V values override that base;
     # emit separate native flags when either independent value was requested.
@@ -413,7 +415,7 @@ if ($LogLevel) {
     else { $nativeArgs += @('--verbosity', "$(@{off=0; error=1; warning=2; info=3; trace=4; debug=5}[$LogLevel])") }
 }
 if ($ThinkingMode -eq 'off') { $nativeArgs += $(if ($Backend -eq 'ninfer') { '--no-thinking' } else { '--no-think' }) }
-if ($ThinkingMode -eq 'on') { $nativeArgs += '--enable-thinking' }
+if ($ThinkingMode -eq 'on') { $nativeArgs += $(if ($Backend -eq 'ninfer') { '--thinking' } else { '--enable-thinking' }) }
 $nativeArgs += '--kvmem'
 if ($CacheMinTokens -gt 0) { $nativeArgs += @('--kvmem-cache-min-tokens', "$CacheMinTokens") }
 if ($Backend -eq 'llamacpp') { $nativeArgs += @('--kvmem-block-tokens', "$resolvedBlock") }

@@ -32,6 +32,9 @@ if '--kvmem-capabilities' in sys.argv:
     print(json.dumps(dict(schema_version=1, backend='ninfer', query_scoring_revision=2,
                          independent_graph_lrfu=True, signed_lrfu_hits=True, legacy_query_replay_revision=1)))
     raise SystemExit(0)
+if sys.argv[1:] == ['--thinking', '--no-preserve-thinking']:
+    print('ninfer-serve: artifact path is required', file=sys.stderr)
+    raise SystemExit(1)
 print('KVMEM_SCORING scorer=page-softmax agg=mean lrfu=0 lambda=0.5 top_frac=0.9 graph_alpha=0.2', flush=True)
 def limit(flag):
     return sys.argv[sys.argv.index(flag)+1] if flag in sys.argv else '0'

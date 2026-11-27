@@ -54,7 +54,7 @@ try {
             try { $null = & $launcher @common -Backend $backend -Model $model @conflict } catch { $rejected = $true }
             if (!$rejected) { throw 'Accepted an incompatible scoring combination' }
         }
-        if (@($defaults.argv | Where-Object { $_ -match '^--(enable-thinking|no-think(ing)?)$' }).Count) { throw 'Default thinking must inherit the native default' }
+        if (@($defaults.argv | Where-Object { $_ -match '^--(thinking|enable-thinking|no-think(ing)?)$' }).Count) { throw 'Legacy default thinking must omit native overrides' }
         $limits = & $launcher @common -Backend $backend -Model $model -QueryMaxTokens 160 -QueryReplayMaxTokens 320 | ConvertFrom-Json
         foreach ($pair in @(@('--kvmem-query-max-tokens','160'), @('--kvmem-query-replay-max-tokens','320'))) {
             if ($limits.argv[[array]::IndexOf($limits.argv,$pair[0])+1] -ne $pair[1]) { throw 'Query/replay limit lost in launch plan' }
@@ -79,6 +79,11 @@ try {
         if (!$rejected) { throw 'Invalid checkpoint recompute setting accepted' }
     }
     if ($thinkingOn.argv -notcontains '--enable-thinking') { throw 'llama thinking-on mapping failed' }
+    $ninferThinking = & $launcher @common -Backend ninfer -Model (Join-Path $testDir 'model with spaces.ninfer') `
+        -ThinkingMode on -PreserveThinking:$false | ConvertFrom-Json
+    if ($ninferThinking.argv -notcontains '--thinking' -or $ninferThinking.argv -notcontains '--no-preserve-thinking') {
+        throw 'Explicit NInfer thinking and history settings must produce native switches'
+    }
     $splitKv = & $launcher @common -Backend llamacpp -Model (Join-Path $testDir 'model.gguf') -KvTypeK q8_0 -KvTypeV q4_0 | ConvertFrom-Json
     if ($splitKv.argv -contains '--kv-dtype' -or
         $splitKv.argv[[array]::IndexOf($splitKv.argv, '--cache-type-k') + 1] -ne 'q8_0' -or
@@ -86,7 +91,7 @@ try {
         throw 'Independent K/V settings lost their separate native flags'
     }
     foreach ($case in @(
-        @{Backend='ninfer'; Model=(Join-Path $testDir 'model with spaces.ninfer'); ThinkingMode='on'},
+        @{Backend='ninfer'; Model=(Join-Path $testDir 'model with spaces.ninfer'); ThinkingMode='on'; ReasoningEffort='none'},
         @{Backend='ninfer'; Model=(Join-Path $testDir 'model with spaces.ninfer'); KvTypeK='q8_0'},
         @{Backend='llamacpp'; Model=(Join-Path $testDir 'model.gguf'); KvTypeK='q8_0'; KvTypeV='f16'},
         @{Backend='llamacpp'; Model=(Join-Path $testDir 'model.gguf'); KvTypeK='q8_0'; WorkerArgs=@('--cache-type-v', 'q5_0')},

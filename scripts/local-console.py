@@ -261,9 +261,12 @@ class Controller:
         parameters = self.prefer_packaged_worker(parameters)
         worker = parameters.get('Worker') or self.worker_defaults()[backend]['path']
         value = self.worker_capabilities(worker, backend)
+        identity = dict(path=value['path'], executable_sha256=value['executable_sha256'])
+        if 'explicit_thinking_switches' in value:
+            identity['explicit_thinking_switches'] = value['explicit_thinking_switches']
         return dict(schema_version=1, backend=backend, strategy=selected,
                     requested_worker=requested_worker,
-                    worker=dict(path=value['path'], executable_sha256=value['executable_sha256']),
+                    worker=identity,
                     profile=strategy_profile(value, selected))
 
     @staticmethod
