@@ -17,6 +17,8 @@ NON_CUDA_PATHS = {
     'scripts/windows/test-launcher.ps1',
 }
 CONSOLE_PATHS = {
+    'scripts/windows/token-settings.ps1', 'scripts/windows/start-ninfer.ps1', 'scripts/windows/test-backend-launcher.ps1',
+    'tests/test_auto_budget.py',
     '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py',
     'tests/test_radiance_launcher.py',
     'tests/test_layerwise_launcher.py', 'tests/test_layerwise_product.py',

@@ -15,11 +15,11 @@ and other settings, loads weights once, computes the maximum budget with headroo
 and fills only Budget. It does not start a server. Unlike OOM recovery, it does not
 cap reserve at 4K or limit the result to the old budget. A zero/oversized current
 budget is replaced only in the planning request by the legal sink/recent minimum.
-The returned maximum remains bounded by Context minus Reserve. Unaligned reserve
-or prefill must be corrected through Check settings first; they are not changed
-silently. Leaving either field blank uses the normal launcher's effective default
-(currently Reserve 1024 and Prefill 128); planning leaves those fields blank and
-still fills only Budget. The UI shows elapsed time, rejects a result if settings changed while
+The returned maximum remains bounded by Context minus the effective Reserve.
+Planning uses the same effective Reserve and Prefill as Check settings and displays
+any alignment or capping with the result. Blank fields use the normal launcher's
+defaults (currently Reserve 1024 and Prefill 128). The action fills only Budget.
+The UI shows elapsed time, rejects a result if settings changed while
 waiting, and displays errors beside Budget. Running services and concurrent
 planning block the action. Currently supported: ordinary single-GPU NInfer
 Qwen3.5-family KVMem with device-resident weights.
@@ -106,8 +106,8 @@ layer-pipeline changes. It preserves the generated Linux launch flow and package
   unchanged explicit reserve/KV, failure display, languages and mobile layout.
 - A real Windows launcher plan resolves omitted Reserve to 1024 and omitted Prefill
   to 128. A simulated GPU quote verifies successful budget-only responses for each
-  omitted field and both together. Explicit values that would be aligned or clamped
-  are still rejected before loading weights. CI runs these controller regressions.
+  omitted field and both together. Controller and browser tests also verify that
+  explicit values are normalized for planning and that the form retains those inputs.
 - The complete NInfer patch chain passes the project's verifier. The changed
   runtime, static planning entry point, serve main and host test compile and link
   against the existing same-toolchain libraries. The host test verifies the largest

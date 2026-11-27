@@ -67,6 +67,23 @@ function Resolve-KVMemTokenOverrides([string]$Backend, [string[]]$Arguments,
     return $values
 }
 
+function Resolve-KVMemPrefill([long]$Prefill, [long]$Reserve, [int]$Alignment) {
+    $effective = [long][Math]::Floor([Math]::Min($Prefill,$Reserve)/$Alignment)*$Alignment
+    if ($effective -lt $Alignment) { throw "Prefill and Reserve must allow at least $Alignment prefill tokens" }
+    return $effective
+}
+
+function New-KVMemTokenPlan($Requested, $Effective, [int]$Block) {
+    $adjustments = [Collections.Generic.List[object]]::new()
+    foreach ($key in $Effective.Keys) {
+        if ($Requested[$key] -ne $Effective[$key]) {
+            $reason=if ($key -eq 'Prefill') { 'prefill alignment and Reserve limit' } else { "alignment to $Block tokens" }
+            $adjustments.Add(@{parameter=$key; requested=$Requested[$key]; effective=$Effective[$key]; reason=$reason})
+        }
+    }
+    return @{requested=$Requested; effective=$Effective; block_tokens=$Block; adjustments=@($adjustments.ToArray())}
+}
+
 # Resolve the public launch plan before either preview or process creation.
 function Resolve-KVMemTokenSettings([string]$Backend, [int]$BlockTokens,
     [long]$Budget, [long]$Reserve, [long]$Prefill, [long]$SinkTokens, [long]$RecentTokens, [long]$Context,
@@ -74,16 +91,38 @@ function Resolve-KVMemTokenSettings([string]$Backend, [int]$BlockTokens,
     $block = if ($Backend -eq 'ninfer') { 64 } else { $BlockTokens }
     $values = [ordered]@{Budget=$Budget; Reserve=$Reserve; SinkTokens=$SinkTokens; RecentTokens=$RecentTokens; Prefill=$Prefill; Context=$Context}
     $requested = [ordered]@{}; foreach ($key in $values.Keys) { $requested[$key]=$values[$key] }
-    $adjustments = [Collections.Generic.List[object]]::new()
     if($RecallStrategy -eq 'layerwise') {
-        if($Budget -le 0 -or $Budget % $block -or $Reserve -lt $block -or $Reserve % $block) {throw 'Layerwise Budget/Reserve require block alignment and Reserve >= one block'}
-        foreach($key in @('SinkTokens','RecentTokens')) {
-            if(!$ExplicitParameters.ContainsKey($key)) {$requested[$key]=$null;$values[$key]=$null}
-            elseif($values[$key] -lt 0 -or $values[$key] % $block) {throw "Layerwise $key requires block alignment; explicit zero is preserved"}
+        if ($Backend -eq 'ninfer') {
+            $values.Budget = [long][Math]::Floor($Budget/$block)*$block
+            $values.Reserve = [long][Math]::Floor($Reserve/$block)*$block
+            if ($values.Budget -lt $block -or $values.Reserve -lt $block) {
+                throw "Layerwise Budget and Reserve must each allow at least $block tokens after alignment"
+            }
+        } elseif ($Budget -le 0 -or $Budget % $block -or $Reserve -lt $block -or $Reserve % $block) {
+            throw 'Layerwise Budget/Reserve require block alignment and Reserve >= one block'
         }
-        if($null -ne $values.SinkTokens -and $null -ne $values.RecentTokens -and $values.SinkTokens+$values.RecentTokens -gt $Budget) {throw 'SinkTokens + RecentTokens must fit layerwise startup Budget'}
-        if($Budget+$Reserve -gt $Context -or $Prefill -le 0) {throw 'Layerwise Budget + Reserve must fit Context and Prefill must be positive'}
-        return @{requested=$requested;effective=$values;block_tokens=$block;adjustments=@()}
+        foreach($key in @('SinkTokens','RecentTokens')) {
+            if (!$ExplicitParameters.ContainsKey($key)) {
+                $requested[$key]=$null; $values[$key]=$null
+            } elseif ($values[$key] -lt 0 -or ($Backend -ne 'ninfer' -and $values[$key] % $block)) {
+                throw "Layerwise $key must be nonnegative and aligned to $block tokens"
+            } elseif ($Backend -eq 'ninfer') {
+                $values[$key] = [long][Math]::Ceiling($values[$key]/$block)*$block
+            }
+        }
+        if ($Backend -eq 'ninfer') {
+            $kept = [long]$values.SinkTokens + [long]$values.RecentTokens
+            if ($kept -gt $values.Budget) {
+                throw "Layerwise SinkTokens + RecentTokens need $kept tokens after alignment; effective Budget is $($values.Budget)"
+            }
+            $requestedPrefill = if ($Prefill -eq 0) { 1024 } else { $Prefill }
+            $values.Prefill = Resolve-KVMemPrefill $requestedPrefill $values.Reserve $block
+        } elseif ($null -ne $values.SinkTokens -and $null -ne $values.RecentTokens -and $values.SinkTokens+$values.RecentTokens -gt $Budget) {
+            throw 'SinkTokens + RecentTokens must fit layerwise startup Budget'
+        }
+        if ($values.Budget+$values.Reserve -gt $Context) { throw 'Budget + Reserve must fit Context' }
+        if ($Prefill -le 0 -and $Backend -ne 'ninfer') { throw 'Layerwise Prefill must be positive' }
+        return New-KVMemTokenPlan $requested $values $block
     }
     foreach ($key in @('Budget','Reserve','SinkTokens','RecentTokens')) {
         $minimum = switch ($key) {
@@ -102,16 +141,9 @@ function Resolve-KVMemTokenSettings([string]$Backend, [int]$BlockTokens,
         # Native ninfer's zero sentinel selects 1024 before applying the KVMem R limit.
         if ($Backend -eq 'ninfer' -and $Prefill -eq 0) { $Prefill=1024 }
         $alignment=if ($Backend -eq 'ninfer') { 128 } else { 1 }
-        $values.Prefill=[long][Math]::Floor([Math]::Min($Prefill,$values.Reserve)/$alignment)*$alignment
-        if ($values.Prefill -lt $alignment) { throw "Prefill and Reserve must allow at least $alignment prefill tokens" }
+        $values.Prefill = Resolve-KVMemPrefill $Prefill $values.Reserve $alignment
     }
     if ($values.SinkTokens + $values.RecentTokens -gt $values.Budget) { throw 'SinkTokens + RecentTokens must fit Budget after alignment' }
     if ($values.Budget + $values.Reserve -gt $Context) { throw 'Budget + Reserve must fit Context after alignment' }
-    foreach ($key in $values.Keys) {
-        if ($requested[$key] -ne $values[$key]) {
-            $reason=if ($key -eq 'Prefill') { 'prefill alignment and Reserve limit' } else { "alignment to $block tokens" }
-            $adjustments.Add(@{parameter=$key; requested=$requested[$key]; effective=$values[$key]; reason=$reason})
-        }
-    }
-    return @{requested=$requested; effective=$values; block_tokens=$block; adjustments=@($adjustments.ToArray())}
+    return New-KVMemTokenPlan $requested $values $block
 }

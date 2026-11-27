@@ -27,19 +27,19 @@ async function until(fn){for(let i=0;i<100;i++){try{if(await fn())return;}catch{
  assert.deepEqual(await (await fetch(base+'/api/launcher/status')).json(),before);
  const prefillPanel=await page.locator('[data-param=Prefill]').evaluate(el=>el.closest('[role=tabpanel]').id);
  await page.locator(`[aria-controls="${prefillPanel}"]`).click();
- let planningRequests=0;
- const countPlanning=request=>{if(request.url().endsWith('/api/launcher/adjust-budget'))planningRequests++;};
- page.on('request',countPlanning);
- await page.locator('[data-param=Reserve]').fill('2048');
+ await page.locator('[data-param=Budget]').fill('16384');
+ await page.locator('[data-param=Reserve]').fill('2049');
  await page.locator('[data-param=Prefill]').fill('4096');
+ const normalizedResponse=page.waitForResponse(r=>r.url().endsWith('/api/launcher/adjust-budget'));
  await button.click();
- await until(async()=>(await status.innerText()).includes('Prefill (4,096) cannot exceed Gen Reserve (2,048)'));
- await page.locator('[data-language-select]').selectOption('zh-CN');
- await button.click();
- await until(async()=>(await status.innerText()).includes('Prefill 不能超过 Gen Reserve'));
- assert.equal(planningRequests,0);
+ const normalized=await (await normalizedResponse).json();
+ assert.deepEqual([normalized.reserve,normalized.prefill],[2048,2048]);
+ await until(async()=>(await status.innerText()).includes('Gen reserve 2,049 → 2,048 · Prefill 4,096 → 2,048'));
  assert.equal(await page.locator('[data-param=Budget]').inputValue(),'49152');
- page.off('request',countPlanning);
+ assert.equal(await page.locator('[data-param=Reserve]').inputValue(),'2049');
+ assert.equal(await page.locator('[data-param=Prefill]').inputValue(),'4096');
+ await page.locator('[data-language-select]').selectOption('zh-CN');
+ await until(async()=>(await status.innerText()).includes('生成预留 2,049 → 2,048 · 预填充 4,096 → 2,048'));
  await page.locator('[data-language-select]').selectOption('en');
  for(const omitted of [['Reserve'],['Prefill'],['Reserve','Prefill']]){
    await page.locator('[data-param=Reserve]').fill('8192');await page.locator('[data-param=Prefill]').fill('256');
@@ -81,5 +81,5 @@ async function until(fn){for(let i=0;i<100;i++){try{if(await fn())return;}catch{
  assert.ok(await button.isDisabled());
  await page.locator('[data-action=stop]').click();await until(()=>button.isEnabled());
  assert.deepEqual(errors,[]);
- console.log('PASS: budget-only growth, omitted reserve/prefill defaults, fixed 8K reserve and KV, no automatic start, stale edits rejected, inline failure, busy/running lock, hover help, Chinese/English, desktop/mobile');
+ console.log('PASS: budget-only growth, normalized and omitted reserve/prefill, fixed 8K reserve and KV, no automatic start, stale edits rejected, inline failure, busy/running lock, hover help, Chinese/English, desktop/mobile');
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(async()=>{if(browser)await browser.close();child.kill();});

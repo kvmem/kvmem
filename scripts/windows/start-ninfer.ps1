@@ -23,7 +23,7 @@ param(
     [ValidateRange(1, 2147483647)][int]$Budget = 36864,
     [ValidateRange(64, 2147483647)][int]$Reserve = 16384,
     [ValidateRange(1, 1048576)][int]$HostMiB = 12288,
-    [ValidateRange(128, 2147483647)][int]$Prefill = 256,
+    [ValidateRange(0, 2147483647)][int]$Prefill = 256,
     [ValidateRange(1, 2147483647)][int]$MaxTokens = 16384,
     [string]$KvType = 'int8',
     [ValidateRange(0, 15)][int]$MtpDrafts = 4,

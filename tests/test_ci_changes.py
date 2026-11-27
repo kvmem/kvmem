@@ -32,6 +32,8 @@ class DocumentationChangesTest(unittest.TestCase):
         paths = ['scripts/launcher/worker.py', 'scripts/windows/start-backend.ps1',
                  'tests/test_layerwise_launcher.py', 'tests/test_layerwise_product.py',
                  'tests/test_windows_worker_args.py', 'tests/test_launcher_export.py',
+                 'scripts/windows/token-settings.ps1', 'scripts/windows/test-backend-launcher.ps1',
+                 'tests/test_auto_budget.py',
                  '.github/scripts/classify_changes.py', 'tests/test_ci_changes.py']
         self.assertTrue(changes.requires_ci(paths))
         self.assertFalse(changes.requires_native(paths))
@@ -255,6 +257,7 @@ class DocumentationChangesTest(unittest.TestCase):
     def test_launchers_do_not_recompile_unchanged_cuda(self):
         paths = ['scripts/windows/start-ninfer.ps1', 'scripts/windows/test-backend-launcher.ps1', 'README.md']
         self.assertTrue(changes.requires_ci(paths))
+        self.assertFalse(changes.requires_native(paths))
         self.assertFalse(changes.requires_cuda(paths, 'a', 'b'))
         for path in ('src/adapter/llama-memory-kvmem.cpp', 'backends/ninfer', 'CMakeLists.txt',
                      'scripts/windows/build-backends.ps1', 'backends/patches/ninfer-kvmem.patch',

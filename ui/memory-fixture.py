@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tests'))
 from test_console_memory import console, evidence
 from test_auto_budget import budget_evidence
+from launcher.plan import token_settings
 console.AUTO_BUDGET_SUPPORTED = True
 
 control = console.Controller(console.ROOT, sys.argv[2], int(sys.argv[1]))
@@ -42,7 +43,9 @@ control.status, control.start, control.stop = status, start, stop
 control.inspect_model = lambda *a,**kw: {'schema_version':1,'status':'pass','can_start':True,'model':{},'features':{},'checks':[]}
 def budget_launch(data):
     p=console.normalize(data,control.backends)['parameters']
-    tokens,report=budget_evidence(dict(console.DEFAULTS,**p))
+    values=dict(console.DEFAULTS,**p)
+    tokens=token_settings('ninfer',values)
+    _,report=budget_evidence(values | tokens['effective'])
     return {'argv':['fixture-worker'],'worker':{'budget_planning_version':1},'token_settings':tokens,'report':report}
 def budget_worker(plan):
     time.sleep(.3)

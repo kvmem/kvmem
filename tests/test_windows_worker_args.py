@@ -80,6 +80,16 @@ class Worker {
                                 ['-DraftModel', str(draft), '-Concurrency', '9']):
                     self.assertNotEqual(llama(invalid).returncode, 0)
 
+    def test_layerwise_prefill_reaches_shared_launcher_through_ninfer_shortcut(self):
+        for shell in SHELLS:
+            for requested, effective in ((0, 1024), (64, 64)):
+                with self.subTest(shell=shell, prefill=requested):
+                    plan = self.plan(self.run_launcher(shell, 'start-ninfer.ps1', [
+                        '-RecallStrategy', 'layerwise', '-Prefill', str(requested)]))
+                    self.assertEqual(plan['token_settings']['requested']['Prefill'], requested)
+                    argv = plan['argv']
+                    self.assertEqual(argv[argv.index('--prefill-chunk') + 1], str(effective))
+
     def test_cpu_vision_idle_timeout_reaches_worker(self):
         for shell in SHELLS:
             for seconds in ('0', '2', '300'):
