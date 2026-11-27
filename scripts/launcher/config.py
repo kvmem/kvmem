@@ -118,15 +118,26 @@ RADIANCE_LAUNCH_DEFAULTS = dict(Backend='radiance', Context=65536, Budget=4096, 
     VisionTokens=1024, VisionResidency='resident', EmbeddingPlacement='vram', CpuThreads=2, VisionCacheMiB=256,
     WeightPlacement='all_vram', WeightHostMiB=0)
 ENGINE_DEFAULTS['radiance'] = {'Backend': 'radiance', 'Context': 262144, 'Budget': 36864, 'Reserve': 4096, 'HostMiB': 12288, 'SinkTokens': 12288, 'RecentTokens': 1024, 'Concurrency': 1, 'RetainedSessions': 1, 'QueryScorer': 'page-softmax', 'ScoreAggregation': 'mean', 'GraphAlpha': 0.2, 'Lrfu': False, 'QueryMaxTokens': 512, 'QueryReplayMaxTokens': 2048, 'KvType': 'fp8', 'StateCacheType': 'f32', 'Prefill': 256, 'SpeculativeMode': 'dflash2', 'DraftTokens': 7, 'DraftPolicy': 'fixed', 'Vision': True, 'MaxTokens': 0, 'ThinkingMode': 'default', 'ThinkingBudget': 0, 'VramReserveMiB': 256, 'EmbeddingPlacement': 'ram', 'CpuThreads': 8, 'VisionResidency': 'cpu', 'VisionTokens': 256, 'VisionCacheMiB': 64, 'ReasoningEffort': 'xhigh', 'PreserveThinking': True, 'NgramDrafts': 0, 'NgramMinMatch': 12}
+ENGINE_DEFAULTS['hipfire'] = {'Backend': 'hipfire', 'Context': 65536, 'Budget': 4096,
+    'Reserve': 1024, 'HostMiB': 16384, 'SinkTokens': 128, 'RecentTokens': 128,
+    'Concurrency': 1, 'RetainedSessions': 1, 'QueryScorer': 'page-softmax',
+    'ScoreAggregation': 'mean', 'GraphAlpha': 0, 'Lrfu': False,
+    'QueryMaxTokens': 512, 'QueryReplayMaxTokens': 2048, 'KvType': 'q8',
+    'Prefill': 512, 'SpeculativeMode': 'mtp', 'DraftPolicy': 'fixed',
+    'Vision': False, 'VisionResidency': 'cpu', 'MaxTokens': 1024,
+    'ThinkingMode': 'default', 'ThinkingBudget': 0, 'ReasoningEffort': 'xhigh',
+    'PreserveThinking': True, 'NgramDrafts': 0, 'NgramMinMatch': 12,
+    'CacheMinTokens': 0, 'DiskMiB': 0, 'IdleTimeout': 0}
 
 STRINGS = {'StateCacheType', 'EmbeddingPlacement', 'WeightPlacement', 'RadianceHome', 'RocmPath', 'Tokenizer','PolystrataSource','Python','VisionWorker','Mmproj','Lora','QueryScorer','Backend', 'Model', 'Worker', 'Gpu', 'ListenHost', 'KvType', 'KvTypeK', 'KvTypeV', 'DiskPath',
            'VisionResidency',
            'DeviceProfile', 'ScoreAggregation', 'QueryScorer', 'ApiKey', 'ModelAlias', 'LogLevel',
-           'ChatTemplateFile', 'ThinkingMode', 'ReasoningEffort', 'SpeculativeMode', 'DraftPolicy', 'DraftModel'}
+           'ChatTemplateFile', 'ThinkingMode', 'ReasoningEffort', 'SpeculativeMode', 'DraftPolicy', 'DraftModel',
+           'VisionSidecar', 'ApiKeyFile'}
 INTEGERS = {'CpuThreads', 'VisionCacheMiB', 'WeightHostMiB', 'BlockTokens', 'VramReserveMiB', 'Context', 'Budget', 'Reserve', 'HostMiB', 'Prefill', 'MaxTokens', 'Port',
             'MtpDrafts', 'NgramDrafts', 'NgramMinMatch', 'Concurrency', 'RetainedSessions',
             'VisionTokens', 'ThinkingBudget', 'SinkTokens', 'RecentTokens', 'DiskMiB', 'DraftTokens',
-            'QueryMaxTokens', 'QueryReplayMaxTokens', 'ReplayMaxTokens', 'CheckpointExtraRecomputeTokens', 'CacheMinTokens'}
+            'QueryMaxTokens', 'QueryReplayMaxTokens', 'ReplayMaxTokens', 'CheckpointExtraRecomputeTokens', 'CacheMinTokens', 'IdleTimeout'}
 BOOLEANS = {'AdaptiveMtp', 'FastPrefill', 'Vision', 'NoLrfu', 'Lrfu', 'PreserveThinking', 'TensorParallel'}
 DECIMALS = {'LrfuLambda', 'LrfuTopFraction', 'GraphAlpha'}
 STRINGS.update(('RecallStrategy', 'LayerwiseMtpHistory'))
@@ -137,7 +148,8 @@ MCP_OPTIONS = {'llamacpp': '--mcp-servers-config', 'polystrata': '--mcp-config'}
 NATIVE = {'llamacpp': {'--threads', '--threads-batch', '--n-gpu-layers', MCP_OPTIONS['llamacpp']},
           'radiance': {'--http-threads'}, 'ninfer': {'--threads'},
           'polystrata': {'--threads', '--elastic-headroom-mib', '--elastic-physical-reserve-mib',
-                        '--attn-requant', '--expert-swaps', MCP_OPTIONS['polystrata']}}
+                        '--attn-requant', '--expert-swaps', MCP_OPTIONS['polystrata']},
+          'hipfire': set()}
 NATIVE_SWITCHES = {'polystrata': {'--elastic-experts', '--elastic-experts-headroom', '--loop-bf16'}}
 
 
@@ -201,9 +213,10 @@ def normalize(data, backends, *, path_root=None):
     if p.get('ScoreAggregation', 'mean') not in {'mean', 'max'}:
         raise ValueError('Unsupported ScoreAggregation')
     for key in ('QueryMaxTokens', 'QueryReplayMaxTokens'):
-        minimum = 0 if p['Backend'] == 'ninfer' else 1
+        minimum = 0 if (p['Backend'] == 'ninfer' or
+                       p['Backend'] == 'hipfire' and p.get('RecallStrategy') == 'layerwise') else 1
         if key in p and p[key] < minimum:
-            raise ValueError(f'{key} must be >= {minimum}; zero means unlimited for NInfer')
+            raise ValueError(f'{key} must be >= {minimum} for this backend/strategy')
     if p['Backend'] != 'radiance' and {'CpuThreads','VisionCacheMiB','WeightPlacement','WeightHostMiB'} & p.keys():
         raise ValueError('CPU threads, image cache and weight placement configure Radiance only')
     if 'CheckpointExtraRecomputeTokens' in p and p['Backend'] != 'ninfer':
@@ -235,7 +248,7 @@ def normalize(data, backends, *, path_root=None):
         raise ValueError('Concurrency must be 1..8')
     if p.get('ChatTemplateFile') and not Path(p['ChatTemplateFile']).is_file():
         raise ValueError('ChatTemplateFile must be an existing template file')
-    if 'SpeculativeMode' in p or 'DraftTokens' in p or 'DraftPolicy' in p or 'DraftModel' in p:
+    if p['Backend'] != 'hipfire' and ('SpeculativeMode' in p or 'DraftTokens' in p or 'DraftPolicy' in p or 'DraftModel' in p):
         mode = p.get('SpeculativeMode', 'mtp' if p.get('MtpDrafts', 0) else 'none')
         profile = SPECULATIVE_PROFILES[p['Backend']].get(mode)
         if profile is None:
@@ -276,6 +289,21 @@ def normalize(data, backends, *, path_root=None):
                 raise ValueError(f'{mode} requires DraftModel with a compatible GGUF')
             if draft and (Path(draft).suffix.lower() != '.gguf' or not Path(draft).is_file()):
                 raise ValueError('DraftModel must be an existing GGUF file')
+    if p['Backend'] == 'hipfire':
+        if p.get('IdleTimeout', 0) > 86400:
+            raise ValueError('hipfire IdleTimeout must be between 0 and 86400 seconds')
+        mode = p.get('SpeculativeMode', 'none')
+        if mode not in ('none', 'mtp', 'dflash2'):
+            raise ValueError('hipfire SpeculativeMode must be none, mtp or dflash2')
+        if p.get('DraftTokens') or p.get('MtpDrafts'):
+            raise ValueError('hipfire draft width is model-owned and cannot be edited')
+        if p.get('NgramDrafts') or p.get('AdaptiveMtp') or p.get('DraftPolicy', 'fixed') != 'fixed':
+            raise ValueError('hipfire exposes fixed, model-owned MTP/DFlash width only')
+        if mode == 'none' and p.get('DraftModel'):
+            raise ValueError('Disabled speculative decoding cannot have a draft model')
+        p['DraftPolicy'] = 'fixed'
+        p['NgramDrafts'] = 0
+        p['AdaptiveMtp'] = False
     if p['Backend']=='polystrata':
         if p.get('KvType','f16') not in {'f16','q8_0','int8','int8k','fp8'}:
             raise ValueError('PolyStrata KV formats: Qwen f16/q8_0, Gemma f16/int8/int8k, Inkling f16/fp8')

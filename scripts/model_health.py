@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import stat
 import struct
+import subprocess
 import sys
 import time
 
@@ -19,7 +20,7 @@ MAX_TENSORS = 200000
 MAX_PARTS = 128
 FIELDS = {'Backend', 'Model', 'Worker', 'Vision', 'Mmproj', 'VisionWorker',
           'Tokenizer', 'ChatTemplateFile', 'SpeculativeMode', 'MtpDrafts', 'DraftTokens', 'DraftModel', 'KvType',
-          'RecallStrategy', 'Concurrency', 'RetainedSessions'}
+          'RecallStrategy', 'Concurrency', 'RetainedSessions', 'VisionSidecar'}
 
 
 class Incomplete(Exception):
@@ -34,7 +35,7 @@ def request_parameters(data):
     if not isinstance(data, dict) or data.get('schema_version') != 1 or not isinstance(data.get('parameters'), dict):
         raise ValueError('Expected configuration schema 1')
     p = {k: v for k, v in data['parameters'].items() if k in FIELDS}
-    if p.get('Backend') not in {'llamacpp', 'ninfer', 'polystrata', 'radiance'}:
+    if p.get('Backend') not in {'llamacpp', 'ninfer', 'polystrata', 'radiance', 'hipfire'}:
         raise ValueError('Unsupported inspection backend')
     for k, v in p.items():
         if k == 'Vision':
@@ -517,6 +518,107 @@ class Inspection:
         self.check('rad_directory','pass','RAD 目录与文件范围检查通过','RAD directory and file ranges checked',
                    str(info['entries'])+' entries; not a weight checksum or runtime compatibility check')
 
+    def hipfire_report(self, path):
+        worker = self.p.get('Worker')
+        if not worker:
+            raise Incomplete('hipfire Worker is required for model inspection')
+        environment = dict(os.environ, HIP_VISIBLE_DEVICES='-1', ROCR_VISIBLE_DEVICES='-1')
+        try:
+            run = subprocess.run([worker, 'inspect', '--json', str(path)], capture_output=True,
+                text=True, encoding='utf-8', errors='replace', timeout=8, cwd=self.base,
+                env=environment, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise Incomplete('hipfire inspect failed: ' + str(error)) from error
+        if run.returncode:
+            raise Invalid((run.stderr or run.stdout or 'hipfire inspect failed').strip()[-600:])
+        try:
+            report = json.loads(run.stdout)
+        except (ValueError, TypeError) as error:
+            raise Incomplete('hipfire inspect returned invalid JSON') from error
+        if (not isinstance(report, dict) or report.get('schema_version') != 1
+                or type(report.get('arch_id')) is not int
+                or type(report.get('can_serve')) is not bool):
+            raise Incomplete('hipfire inspect returned an unsupported report')
+        if report.get('source') != 'hfq':
+            raise Invalid('KVMem hipfire integration accepts HFQ model files only')
+        return report
+
+    def inspect_hipfire(self, path):
+        report = self.hipfire_report(path)
+        source = report['source']
+        architecture = report.get('architecture', 'unknown')
+        self.report['model'] = {
+            'format': 'HFQ',
+            'architecture': architecture,
+            'arch_id': report['arch_id'],
+            'tensors': report.get('tensor_count'),
+            'kv_types': report.get('kv_types') or ['q8'],
+            'source': source,
+        }
+        self.report['features']['mtp'] = 'supported' if report.get('speculative', {}).get('mtp', {}).get('supported') else 'unsupported'
+        self.report['features']['dflash2'] = 'supported' if report.get('speculative', {}).get('dflash2', {}).get('supported') else 'unsupported'
+        self.check('hipfire_container', 'pass', 'hipfire 模型容器检查通过',
+                   'hipfire model container checked', f"{source} / arch_id={report['arch_id']}")
+        if not report['can_serve']:
+            self.check('hipfire_architecture', 'error', '此文件不是可服务的 Qwen3.5 主模型',
+                       'This is not a serveable Qwen3.5 trunk', architecture, fix='choose_model')
+            return
+        if self.p.get('KvType', 'q8') != 'q8':
+            self.check('hipfire_kv', 'error', 'hipfire KVMem 当前只支持 q8',
+                       'hipfire KVMem currently requires q8', fix='set_kv_q8')
+        mode = self.p.get('SpeculativeMode') or ('mtp' if self.p.get('MtpDrafts') else 'none')
+        if mode not in ('none', 'mtp', 'dflash2'):
+            self.check('hipfire_spec_mode', 'error', 'hipfire 仅支持 none/mtp/dflash2',
+                       'hipfire supports none/mtp/dflash2 only', mode, fix='disable_speculative')
+        elif mode == 'mtp' and not report.get('speculative', {}).get('mtp', {}).get('supported'):
+            self.check('hipfire_mtp', 'error', '此模型来源不支持 MTP',
+                       'This model source does not support MTP', fix='disable_speculative')
+        elif mode == 'dflash2':
+            draft = self.p.get('DraftModel')
+            if not report.get('speculative', {}).get('dflash2', {}).get('supported'):
+                self.check('hipfire_dflash', 'error', '此模型来源不支持 DFlash2',
+                           'This model source does not support DFlash2', fix='disable_speculative')
+            elif not draft:
+                self.check('hipfire_draft_missing', 'error', 'DFlash2 需要 HFQ 草稿文件',
+                           'DFlash2 requires an HFQ draft file', fix='choose_draft')
+            else:
+                draft_report = self.hipfire_report(self.path(draft))
+                if draft_report.get('architecture') != 'dflash-draft' and draft_report.get('arch_id') != 20:
+                    self.check('hipfire_draft_arch', 'error', 'DFlash 草稿 arch_id 不正确',
+                               'DFlash draft has the wrong arch_id', str(draft_report.get('arch_id')), fix='choose_draft')
+                else:
+                    self.report['features']['dflash2'] = 'external'
+                    self.check('hipfire_draft', 'pass', 'DFlash2 HFQ 草稿检查通过',
+                               'DFlash2 HFQ draft checked', draft)
+        vision = report.get('vision', {})
+        if self.p.get('Vision'):
+            sidecar = self.p.get('VisionSidecar')
+            if not vision.get('sidecar_supported'):
+                self.check('hipfire_vision_source', 'error', '此模型不支持视觉 sidecar',
+                           'This model does not support a vision sidecar', fix='disable_vision')
+            elif vision.get('present'):
+                self.report['features']['vision'] = 'present'
+                self.check('hipfire_vision', 'pass', '模型已包含视觉塔',
+                           'The model contains a vision tower')
+            elif not sidecar:
+                self.check('hipfire_vision_missing', 'error', '需要选择视觉 sidecar',
+                           'Choose a vision sidecar', fix='choose_vision_sidecar')
+            else:
+                sidecar_report = self.hipfire_report(self.path(sidecar))
+                if (sidecar_report.get('arch_id') not in (5, 6)
+                        or not sidecar_report.get('vision', {}).get('present')):
+                    self.check('hipfire_vision_sidecar', 'error', '视觉 sidecar 与模型不匹配',
+                               'Vision sidecar does not match the model', fix='choose_vision_sidecar')
+                else:
+                    self.report['features']['vision'] = 'sidecar'
+                    self.check('hipfire_vision', 'pass', '视觉 sidecar 检查通过',
+                               'Vision sidecar checked', sidecar)
+        elif self.p.get('VisionSidecar'):
+            self.check('hipfire_vision_disabled', 'error', '选择视觉 sidecar 前请先启用视觉',
+                       'Enable vision before selecting a sidecar', fix='enable_vision')
+        else:
+            self.report['features']['vision'] = 'present' if vision.get('present') else 'absent'
+
     def run(self):
         try:
             if not self.p.get('Model', '').strip():
@@ -526,6 +628,8 @@ class Inspection:
                 self.inspect_ninfer(path)
             elif self.p['Backend']=='radiance':
                 self.inspect_radiance(path)
+            elif self.p['Backend'] == 'hipfire':
+                self.inspect_hipfire(path)
             else:
                 self.inspect_gguf(path)
             if self.p.get('ChatTemplateFile'):

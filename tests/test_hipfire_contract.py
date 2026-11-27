@@ -152,7 +152,7 @@ def check(hipfire_dir: Path | None, require_rust: bool = False) -> list[str]:
     for key in ("repository", "base_commit", "patched_tree"):
         if not isinstance(upstream.get(key), str) or not upstream[key]:
             errors.append(f"upstream.json has no {key}")
-    if upstream.get("series") in {"grouped-v1", "grouped-v2", "grouped-v3", "grouped-v4", "grouped-v5", "grouped-v6", "grouped-v7"}:
+    if upstream.get("series") in {"grouped-v1", "grouped-v2", "grouped-v3", "grouped-v4", "grouped-v5", "grouped-v6", "grouped-v7", "grouped-v8"}:
         archive_name = upstream.get("previous_series")
         if not isinstance(archive_name, str) or not archive_name:
             errors.append("grouped manifest has no previous_series")
@@ -162,8 +162,8 @@ def check(hipfire_dir: Path | None, require_rust: bool = False) -> list[str]:
                 errors.append(f"individual patch archive is missing: {archive_name}")
             else:
                 archived = json.loads(archive.read_text(encoding="utf-8"))
-                if len(archived.get("patches", [])) != 65:
-                    errors.append("individual patch archive does not contain 65 patches")
+                if len(archived.get("patches", [])) != 67:
+                    errors.append("individual patch archive does not contain 67 patches")
                 if archived.get("patched_tree") != upstream.get("patched_tree"):
                     errors.append("individual patch archive final tree differs from upstream.json")
     patches = upstream.get("patches")

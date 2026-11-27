@@ -26,6 +26,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  await require('./test-radiance-launcher.cjs')({browser,base,info});
  if(info.platform==='linux'){
   await require('./test-launcher-linux.cjs')({browser,base,info,state});
+  await require('./test-hipfire-launcher.cjs')({browser,base,info});
   return;
  }
  // Either initialization order must preserve the stopped-service config page.

@@ -1,0 +1,333 @@
+diff --git a/crates/hipfire-arch-qwen35/src/forward_slots.rs b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+index d70a1d438..f887690d9 100644
+--- a/crates/hipfire-arch-qwen35/src/forward_slots.rs
++++ b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+@@ -4949,7 +4949,7 @@ pub fn forward_batch_slots_graphed_opts(
+     verify_rows: usize,
+     lm_head_skip: &[bool],
+     mut spec_capture: Option<&mut SpecVerifyCapture>,
+-    mut layerwise: crate::LayerwiseFwd<'_, '_>,
++    mut layerwise: crate::LayerwiseCarrierFwd<'_, '_>,
+ ) -> HipResult<()> {
+     let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
+     // An MTP verify step is graphable when every slot's row count is a decode
+@@ -5426,7 +5426,7 @@ pub fn forward_batch_slots_opts(
+     opts: SlotStepOpts,
+     lm_head_skip: &[bool],
+     mut spec_capture: Option<&mut SpecVerifyCapture>,
+-    mut layerwise: crate::LayerwiseFwd<'_, '_>,
++    mut layerwise: crate::LayerwiseCarrierFwd<'_, '_>,
+ ) -> HipResult<()> {
+     if batch.is_empty() {
+         return Ok(());
+@@ -5822,7 +5822,14 @@ pub fn forward_batch_slots_opts(
+     // below (an early `return` here would skip them, as the legacy reference
+     // path also falls through).
+     #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+-    let layerwise_handled = if let Some(lq) = layerwise.as_deref_mut() {
++    let layerwise_handled = if layerwise
++        .as_deref()
++        .is_some_and(|carrier| !carrier.is_query())
++    {
++        // NInfer no-refresh: the existing full-resident native maps remain the
++        // attention domain; no scorer, restore, tape or layer-table work.
++        false
++    } else if let Some(lq) = layerwise.as_deref_mut().and_then(|carrier| carrier.query_mut()) {
+         // P4.1② G1: two admissible Layerwise shapes, both single-slot q8 paged.
+         // (a) AR single-row decode (D4b-3): n == 1, unspec, the paged GQA decode
+         // tile engaged. G7 Stage D admits the uniform past-prompt M-RoPE form
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index a18d76f46..1853a17a3 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -63,6 +63,24 @@ pub fn layerwise_floor_tokens(sink_blocks: usize, recent_blocks: usize) -> u64 {
+     (sink_blocks + recent_blocks).max(1) as u64 * LAYERWISE_BLOCK_TOKENS as u64
+ }
+ 
++/// NInfer's below-budget no-refresh gate (`query_refresh_required` is
++/// `history >= selection_budget`). A partial tail remains on the no-refresh
++/// path until the next sealed-page boundary; force-query, media and an existing
++/// compressed keep-set always retain the full Layerwise transaction.
++pub(crate) fn layerwise_no_refresh_admitted(
++    fed: u64,
++    budget_blocks: usize,
++    force_query: bool,
++    has_media: bool,
++    has_prior_selection: bool,
++) -> bool {
++    budget_blocks > 0
++        && !force_query
++        && !has_media
++        && !has_prior_selection
++        && fed / (LAYERWISE_BLOCK_TOKENS as u64) < budget_blocks as u64
++}
++
+ /// Map a core `NativeQueryScalar` ordinal (`native_layer_query.hpp`) to the
+ /// launcher's `PageQueryScalar`. The ordinals are identical (F32=0, F16=1,
+ /// BF16=2); an unknown ordinal fails closed rather than guessing a width.
+@@ -794,6 +812,102 @@ pub struct LayerwiseQuery<'a> {
+     pub mass: Option<MassCapture>,
+ }
+ 
++/// One Layerwise step. `NoRefresh` is the NInfer-equivalent below-budget path:
++/// it keeps the request on the existing full-resident native maps and performs
++/// no source freeze, current-Q scoring, projection tape, canonical stripe
++/// restore, composite-arena allocation or per-layer table upload. The archive
++/// write-through and accepted-token lifecycle remain owned by the Layerwise
++/// controller. `Query` is the existing full per-layer transaction.
++pub enum LayerwiseCarrier<'a> {
++    Query(LayerwiseQuery<'a>),
++    NoRefresh,
++}
++
++impl<'a> LayerwiseCarrier<'a> {
++    pub fn is_query(&self) -> bool {
++        matches!(self, Self::Query(_))
++    }
++
++    pub fn query(&self) -> Option<&LayerwiseQuery<'a>> {
++        match self {
++            Self::Query(query) => Some(query),
++            Self::NoRefresh => None,
++        }
++    }
++
++    pub fn query_mut(&mut self) -> Option<&mut LayerwiseQuery<'a>> {
++        match self {
++            Self::Query(query) => Some(query),
++            Self::NoRefresh => None,
++        }
++    }
++
++    pub fn is_pressure(&self) -> bool {
++        self.query().is_some_and(LayerwiseQuery::is_pressure)
++    }
++
++    pub fn activation(&self) -> Option<&LayerwiseActivation> {
++        self.query().and_then(LayerwiseQuery::activation)
++    }
++
++    pub fn activation_mut(&mut self) -> Option<&mut LayerwiseActivation> {
++        self.query_mut().and_then(LayerwiseQuery::activation_mut)
++    }
++
++    pub fn restored_keep_set(&self) -> Result<Vec<Vec<u64>>, String> {
++        match self {
++            Self::Query(query) => query.restored_keep_set(),
++            Self::NoRefresh => Ok(Vec::new()),
++        }
++    }
++
++    pub fn accept_output_pressure(
++        &mut self,
++        pressure: &mut OutputPressure,
++        request: u64,
++        begin: u64,
++        accepted: u32,
++    ) -> Result<u64, String> {
++        match self {
++            Self::Query(query) => query.accept_output_pressure(pressure, request, begin, accepted),
++            Self::NoRefresh => Ok(0),
++        }
++    }
++
++    pub fn extract_output_acceptance(
++        &self,
++        request: u64,
++        begin: u64,
++    ) -> Result<Option<OutputAcceptanceSnapshot>, String> {
++        match self {
++            Self::Query(query) => query.extract_output_acceptance(request, begin),
++            Self::NoRefresh => Ok(None),
++        }
++    }
++
++    pub fn capture_feed_rows(
++        &self,
++        gpu: &Gpu,
++        pos0: usize,
++        rows: usize,
++    ) -> Result<Option<crate::kvmem_ctl::LayerwiseFeedRows>, String> {
++        match self {
++            Self::Query(query) => query.capture_feed_rows(gpu, pos0, rows).map(Some),
++            // No-refresh attended the legacy arenas. The normal accepted-row
++            // feed reads those same arenas after sampling; no composite pending
++            // image exists and none may be fabricated.
++            Self::NoRefresh => Ok(None),
++        }
++    }
++
++    pub fn free(self, gpu: &mut Gpu) -> Result<(), String> {
++        match self {
++            Self::Query(query) => query.free(gpu),
++            Self::NoRefresh => Ok(()),
++        }
++    }
++}
++
+ /// One ordinal's restored compact page geometry for the pressure mass packet
+ /// (design §3.10a). Filled by [`LayerwiseQuery::restore_layer`] in Pressure mode.
+ struct PressurePages {
+@@ -2577,7 +2691,7 @@ pub fn engine_carrier_rows<'a>(
+     // (byte-neutral). The caller already filtered them to sealed pages and
+     // verified they fit the resident budget.
+     media_pages: &[u32],
+-) -> Result<Option<LayerwiseQuery<'a>>, String> {
++) -> Result<Option<LayerwiseCarrier<'a>>, String> {
+     if !ctl.strategy().is_layerwise() || width == 0 {
+         return Ok(None);
+     }
+@@ -2596,6 +2710,21 @@ pub fn engine_carrier_rows<'a>(
+     }
+     let (keys, _slot_policy) = stores;
+     let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
++    let has_prior_selection = ctl
++        .layerwise_keep_set(slot)
++        .map(|sets| sets.iter().any(|ids| !ids.is_empty()))
++        .unwrap_or(false);
++    if layerwise_no_refresh_admitted(
++        fed as u64,
++        ctl.budget_blocks(),
++        force_query,
++        !media_pages.is_empty(),
++        has_prior_selection,
++    ) {
++        return Ok(Some(LayerwiseCarrier::NoRefresh));
++    }
++    let (keys, _slot_policy) = stores;
++    let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
+     let q8 =
+         LayerwiseQ8Layout::resolve(ctl.kv_mode(), n_fa_layers, n_kv_heads, head_dim, &fa_layers)
+             .map_err(|e| format!("layerwise engine rows: q8 layout: {e}"))?;
+@@ -2805,7 +2934,7 @@ pub fn engine_carrier_rows<'a>(
+             return Err(e);
+         }
+     }
+-    Ok(Some(carrier))
++    Ok(Some(LayerwiseCarrier::Query(carrier)))
+ }
+ 
+ /// P4.1② G4 (f2): the head-only restore carrier for the MTP draft phase under
+@@ -4612,6 +4741,61 @@ mod tests {
+         assert!((256u64) >= floor);
+     }
+ 
++    #[test]
++    fn layerwise_no_refresh_gate_matches_ninfer_budget_cadence() {
++        let budget = 187usize;
++        let block = 128u64;
++        assert!(layerwise_no_refresh_admitted(
++            0, budget, false, false, false
++        ));
++        assert!(layerwise_no_refresh_admitted(
++            (budget as u64 - 1) * block + 127,
++            budget,
++            false,
++            false,
++            false
++        ));
++        assert!(!layerwise_no_refresh_admitted(
++            budget as u64 * block,
++            budget,
++            false,
++            false,
++            false
++        ));
++        assert!(!layerwise_no_refresh_admitted(
++            budget as u64 * block + 1,
++            budget,
++            false,
++            false,
++            false
++        ));
++        assert!(!layerwise_no_refresh_admitted(
++            128, budget, true, false, false
++        ));
++        assert!(!layerwise_no_refresh_admitted(
++            128, budget, false, true, false
++        ));
++        assert!(!layerwise_no_refresh_admitted(
++            128, budget, false, false, true
++        ));
++    }
++
++    #[test]
++    fn no_refresh_carrier_owns_no_query_or_feedback_work() {
++        let carrier = LayerwiseCarrier::NoRefresh;
++        assert!(!carrier.is_query());
++        assert!(!carrier.is_pressure());
++        assert!(carrier.activation().is_none());
++        assert!(carrier
++            .restored_keep_set()
++            .expect("empty keep-set")
++            .is_empty());
++        assert!(carrier
++            .extract_output_acceptance(1, 0)
++            .expect("no output snapshot")
++            .is_none());
++    }
++
+     /// Q8-ish geometry: 2 KV heads × head_dim 64 → kw = 128; 4 query heads →
+     /// GQA group 2, qw = 256.
+     const KV_HEADS: u32 = 2;
+@@ -10153,6 +10337,9 @@ mod tests {
+         )
+         .expect("engine_carrier_rows")
+         .expect("admitted carrier");
++        let LayerwiseCarrier::Query(mut carrier) = carrier else {
++            panic!("width-4 verify fixture requires a full Query carrier");
++        };
+         assert_eq!(
+             carrier.staging.width(),
+             width as usize,
+diff --git a/crates/hipfire-arch-qwen35/src/lib.rs b/crates/hipfire-arch-qwen35/src/lib.rs
+index ea6f9674c..eefff3da9 100644
+--- a/crates/hipfire-arch-qwen35/src/lib.rs
++++ b/crates/hipfire-arch-qwen35/src/lib.rs
+@@ -185,6 +185,11 @@ pub mod legacy_query;
+ pub(crate) type LayerwiseFwd<'a, 'b> = Option<&'a mut layerwise_driver::LayerwiseQuery<'b>>;
+ #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+ pub(crate) type LayerwiseFwd<'a, 'b> = Option<&'a mut core::marker::PhantomData<&'b ()>>;
++#[cfg(all(feature = "deltanet", feature = "kvmem"))]
++pub(crate) type LayerwiseCarrierFwd<'a, 'b> =
++    Option<&'a mut layerwise_driver::LayerwiseCarrier<'b>>;
++#[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
++pub(crate) type LayerwiseCarrierFwd<'a, 'b> = LayerwiseFwd<'a, 'b>;
+ #[cfg(feature = "deltanet")]
+ pub(crate) mod layer_driver;
+ #[cfg(feature = "deltanet")]
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+index a3990df49..9a91b3965 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+@@ -2313,7 +2313,7 @@ pub(super) fn layerwise_forward(
+                             if let Some(s) = aux_sel {
+                                 k.set_aux_selection(slot, s);
+                             }
+-                            if let Ok(feed) = feed_res {
++                            if let Ok(Some(feed)) = feed_res {
+                                 k.set_layerwise_pending_feed(slot, feed);
+                             }
+                         }
+@@ -2600,7 +2600,7 @@ pub(super) fn layerwise_forward(
+                                 if let Some(s) = aux_sel {
+                                     k.set_aux_selection(slot, s);
+                                 }
+-                                if let Ok(feed) = feed_res {
++                                if let Ok(Some(feed)) = feed_res {
+                                     k.set_layerwise_pending_feed(slot, feed);
+                                 }
+                             }
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_model.rs b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
+index 0a75f8c4e..48adb4982 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine_model.rs
+@@ -35,7 +35,7 @@ impl ModelRig {
+         lm_head_skip: &[bool],
+         any_verify: bool,
+         any_dflash_rows: bool,
+-        layerwise: crate::LayerwiseFwd<'_, '_>,
++        layerwise: crate::LayerwiseCarrierFwd<'_, '_>,
+     ) -> rdna_compute::HipResult<()> {
+         let mut capture = (any_verify || any_dflash_rows).then(|| {
+             let tape = self

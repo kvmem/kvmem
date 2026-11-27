@@ -61,6 +61,13 @@ class PackageTests(unittest.TestCase):
         (self.chat/'ui-build.json').write_text('{"console_chat_protocol":0}')
         with self.assertRaisesRegex(ValueError,'chat'): self.build()
 
+    def test_hipfire_console_package_advertises_backend(self):
+        result = package.package(ROOT, self.directory / 'hipfire', self.chat,
+                                 self.wheel, self.sha, 'hipfire')
+        info = json.loads((Path(result['directory']) / 'console-build.json').read_text())
+        self.assertEqual(info['supported_backends'], ['hipfire'])
+        self.assertIn('scripts/launcher/hipfire.py', info['controller_files'])
+
     def test_radiance_package_contains_worker_plan_and_bounded_model_inspector(self):
         result=package.package(ROOT,self.directory/'radiance',self.chat,self.wheel,self.sha,'radiance')
         directory=Path(result['directory'])

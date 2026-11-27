@@ -73,6 +73,7 @@ GROUPS = (
             "think-budget-emitter", "think-knobs-answer-room",
             "sequential-loop-recovery",
             "fork-k2-k13-requeue", "kvmem-full-takeover",
+            "ui-capability-inspect", "layerwise-feed-capture",
         ),
     },
 )
@@ -239,7 +240,7 @@ def grouped_output(source: dict, entries: list[dict], patched_tree: str,
     output = dict(source)
     output["patches"] = entries
     output["patched_tree"] = patched_tree
-    output["series"] = "grouped-v7"
+    output["series"] = "grouped-v8"
     output["previous_series"] = archive_name
     return output
 

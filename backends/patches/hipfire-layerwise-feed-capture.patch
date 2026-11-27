@@ -1,0 +1,354 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index b87ee3cb8..b7c04de16 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -818,6 +818,16 @@ pub struct KvMemGeometry {
+     pub mtp_head: bool,
+ }
+ 
++/// Packed Q8 feed rows captured from the Layerwise composite arena before the
++/// per-step carrier is freed. The scheduler consumes only the committed prefix
++/// after sampling, so rejected draft rows never enter the host archive.
++pub(crate) struct LayerwiseFeedRows {
++    pub pos0: u32,
++    pub rows: u32,
++    pub k: Vec<u8>,
++    pub v: Vec<u8>,
++}
++
+ struct SlotState {
+     raw: RawStore,
+     kv: KvStore,
+@@ -925,6 +935,10 @@ struct SlotState {
+     /// snapshot is owned, so it survives the scoped controller take that the
+     /// carrier's `&KvMemCtl` borrow requires.
+     lw_pending_output: Option<OutputAcceptanceSnapshot>,
++    /// Packed composite-arena feed rows captured before the Layerwise carrier is
++    /// freed. `feed_rows` takes this after sampling and seals only the committed
++    /// prefix; prefill has no carrier and keeps the direct arena gather path.
++    lw_pending_feed: Option<LayerwiseFeedRows>,
+     /// P4.1② G3: the MTP head's independent aux-plane resident map (design §A.8).
+     /// Constructed lazily on the first admitted Layerwise MTP verify
+     /// ([`KvMemCtl::ensure_head_plane`]); `None` under Legacy / AR-only (never
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
+index b42ee6b9e..92177507b 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
+@@ -271,6 +271,21 @@ impl KvMemCtl {
+             .and_then(|st| st.lw_pending_output.take())
+     }
+ 
++    /// Store packed feed rows captured from the Layerwise composite arena before
++    /// the carrier is freed. The scheduler seals only the committed prefix.
++    pub fn set_layerwise_pending_feed(&mut self, slot: usize, feed: LayerwiseFeedRows) {
++        if let Some(st) = self.slots.get_mut(slot) {
++            st.lw_pending_feed = Some(feed);
++        }
++    }
++
++    /// Take the pending composite-arena feed rows for `slot`, if any.
++    pub fn take_layerwise_pending_feed(&mut self, slot: usize) -> Option<LayerwiseFeedRows> {
++        self.slots
++            .get_mut(slot)
++            .and_then(|st| st.lw_pending_feed.take())
++    }
++
+     /// P4.1② G3: whether the composite head aux plane is active (Layerwise AND
+     /// native MTP). The orchestration gates every head-plane path on this; under
+     /// Legacy / AR-only it is false and the head keeps the historical
+@@ -1062,7 +1077,12 @@ impl KvMemCtl {
+         // drop-evict + COW restore (D4). Legacy skips this entirely — the arena
+         // params are unused on the default path, keeping it byte-neutral.
+         if self.strategy.is_layerwise() {
+-            self.write_through_archive(gpu, pool, k_arenas, v_arenas, slot, pos0, n_rows)?;
++            let pending_feed = st.lw_pending_feed.take();
++            if let Some(feed) = pending_feed {
++                self.write_through_archive_rows(slot, pos0, n_rows, &feed)?;
++            } else {
++                self.write_through_archive(gpu, pool, k_arenas, v_arenas, slot, pos0, n_rows)?;
++            }
+         }
+         if trace {
+             eprintln!(
+@@ -1082,6 +1102,63 @@ impl KvMemCtl {
+         Ok(())
+     }
+ 
++    /// Seal a committed prefix of feed rows captured from the Layerwise
++    /// composite arena. The carrier is already freed when this runs, so the
++    /// packed Q8 payload must be supplied by the scoped forward orchestration.
++    pub(super) fn write_through_archive_rows(
++        &mut self,
++        slot: usize,
++        pos0: usize,
++        n_rows: usize,
++        feed: &LayerwiseFeedRows,
++    ) -> Result<(), String> {
++        if slot >= self.slots.len() {
++            return Err(format!("kvmem write-through: slot {slot} out of range"));
++        }
++        if feed.pos0 != pos0 as u32 || n_rows > feed.rows as usize {
++            return Err(format!(
++                "kvmem write-through: captured rows {}..{} do not cover committed {}..{}",
++                feed.pos0,
++                feed.pos0 + feed.rows,
++                pos0,
++                pos0 + n_rows
++            ));
++        }
++        let krow = self.k_page_bytes / KV_BLOCK_TOKENS;
++        let vrow = self.v_page_bytes / KV_BLOCK_TOKENS;
++        let captured = feed.rows as usize;
++        if feed.k.len() != self.n_fa_layers * captured * krow
++            || feed.v.len() != self.n_fa_layers * captured * vrow
++        {
++            return Err("kvmem write-through: captured K/V buffer geometry mismatch".to_string());
++        }
++        let committed_k = n_rows * krow;
++        let committed_v = n_rows * vrow;
++        for il in 0..self.n_fa_layers {
++            let k0 = il * captured * krow;
++            let v0 = il * captured * vrow;
++            self.slots[slot]
++                .raw
++                .write_layer_k_gpu(
++                    pos0 as u32,
++                    n_rows as u32,
++                    il as u32,
++                    &feed.k[k0..k0 + committed_k],
++                )
++                .map_err(|e| format!("kvmem write-through K seal (layer {il}): {e}"))?;
++            self.slots[slot]
++                .raw
++                .write_layer_v_gpu(
++                    pos0 as u32,
++                    n_rows as u32,
++                    il as u32,
++                    &feed.v[v0..v0 + committed_v],
++                )
++                .map_err(|e| format!("kvmem write-through V seal (layer {il}): {e}"))?;
++        }
++        Ok(())
++    }
++
+     /// Layerwise write-through (design §3.7). Gather this feed's packed Q8 K/V
+     /// rows out of the GPU arenas into the contiguous staging buffers and seal
+     /// them into the slot's host archive (`write_layer_k_gpu`/`v_gpu`), so EVERY
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
+index e85cb8403..527843837 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
+@@ -441,6 +441,7 @@ impl KvMemCtl {
+                 last_freeze_id: None,
+                 lw_import_blocks: Cell::new(None),
+                 lw_pending_output: None,
++                lw_pending_feed: None,
+                 lw_head: None,
+                 lw_aux_selection: None,
+             });
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/slot.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/slot.rs
+index 8f730122b..17f01a128 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl/slot.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/slot.rs
+@@ -121,6 +121,7 @@ impl KvMemCtl {
+             last_freeze_id: None,
+             lw_import_blocks: Cell::new(None),
+             lw_pending_output: None,
++            lw_pending_feed: None,
+             // P4.1② G3: a fresh session drops the head resident map and its
+             // per-Query binding, mirroring the trunk pressure owners. The next
+             // admitted MTP verify lazily reconstructs the map under the bumped
+@@ -246,6 +247,8 @@ impl KvMemCtl {
+             .ok_or_else(|| format!("kvmem: begin_request slot {slot} out of range"))?;
+         st.turn_start = st.fed;
+         st.first_decode_done = false;
++        // A cancelled verify may leave captured rows that were never committed.
++        st.lw_pending_feed = None;
+         // A new turn's question must not inherit the previous turn's Q span.
+         st.q_ring_len = 0;
+         st.q_ring_cursor = 0;
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index c163e30ea..a18d76f46 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -1617,6 +1617,116 @@ impl<'a> LayerwiseQuery<'a> {
+         Ok(extent)
+     }
+ 
++    /// Capture the freshly written evaluation rows from the composite suffix
++    /// stripe before the carrier is freed. The host archive later consumes only
++    /// the scheduler-confirmed prefix, so rejected MTP draft rows are dropped.
++    pub fn capture_feed_rows(
++        &self,
++        gpu: &Gpu,
++        pos0: usize,
++        rows: usize,
++    ) -> Result<crate::kvmem_ctl::LayerwiseFeedRows, String> {
++        if rows == 0 || rows != self.staging.width() {
++            return Err(format!(
++                "layerwise feed capture: rows {rows} != staging width {}",
++                self.staging.width()
++            ));
++        }
++        let suffix = self
++            .suffix_slot
++            .ok_or_else(|| "layerwise feed capture: no suffix page mapped".to_string())?;
++        let bt = self.driver.block_tokens() as usize;
++        if bt == 0 || self.partial_tokens as usize + rows > bt * 2 {
++            return Err("layerwise feed capture: evaluation span exceeds suffix pages".to_string());
++        }
++        let layout = self.driver.arena().layout();
++        let k_plane = layout.k_plane_bytes();
++        let v_plane = layout.v_plane_bytes();
++        if k_plane % bt != 0 || v_plane % bt != 0 {
++            return Err(
++                "layerwise feed capture: packed row geometry is not page-aligned".to_string(),
++            );
++        }
++        let krow = k_plane / bt;
++        let vrow = v_plane / bt;
++        let n_layers = self.driver.fa_layers().len();
++        let k_bytes = n_layers * rows * krow;
++        let v_bytes = n_layers * rows * vrow;
++        let mut k_rows = vec![0u8; k_bytes];
++        let mut v_rows = vec![0u8; v_bytes];
++        let stream = gpu.steady_copy_stream();
++        let arena = self.driver.arena().arena();
++        let result = (|| -> Result<(), String> {
++            for ordinal in 0..n_layers {
++                for row in 0..rows {
++                    let compact = self.partial_tokens as usize + row;
++                    let (source_slot, intra) = if compact < bt {
++                        (suffix, compact)
++                    } else {
++                        (
++                            self.suffix_slot_overflow.ok_or_else(|| {
++                                "layerwise feed capture: suffix overflow page is not mapped"
++                                    .to_string()
++                            })?,
++                            compact - bt,
++                        )
++                    };
++                    let src_k = layout
++                        .layer_k_offset(source_slot as usize, ordinal)
++                        .map_err(|e| format!("layerwise feed capture: K offset {ordinal}: {e}"))?
++                        + intra * krow;
++                    let src_v = layout
++                        .layer_v_offset(source_slot as usize, ordinal)
++                        .map_err(|e| format!("layerwise feed capture: V offset {ordinal}: {e}"))?
++                        + intra * vrow;
++                    let dst_k = (ordinal * rows + row) * krow;
++                    let dst_v = (ordinal * rows + row) * vrow;
++                    gpu.hip
++                        .memcpy_dtoh_async_at(
++                            &mut k_rows[dst_k..dst_k + krow],
++                            &arena.buf,
++                            src_k,
++                            stream,
++                        )
++                        .map_err(|e| {
++                            format!("layerwise feed capture: K D2H {ordinal}/{row}: {e:?}")
++                        })?;
++                    gpu.hip
++                        .memcpy_dtoh_async_at(
++                            &mut v_rows[dst_v..dst_v + vrow],
++                            &arena.buf,
++                            src_v,
++                            stream,
++                        )
++                        .map_err(|e| {
++                            format!("layerwise feed capture: V D2H {ordinal}/{row}: {e:?}")
++                        })?;
++                }
++            }
++            Ok(())
++        })();
++        if let Err(error) = result {
++            let _ = match stream {
++                Some(stream) => gpu.hip.stream_synchronize(stream),
++                None => gpu.hip.stream_synchronize_default(),
++            };
++            return Err(error);
++        }
++        match stream {
++            Some(stream) => gpu.hip.stream_synchronize(stream),
++            None => gpu.hip.stream_synchronize_default(),
++        }
++        .map_err(|e| format!("layerwise feed capture: sync: {e:?}"))?;
++        let pos0 = u32::try_from(pos0)
++            .map_err(|_| "layerwise feed capture: position exceeds u32".to_string())?;
++        Ok(crate::kvmem_ctl::LayerwiseFeedRows {
++            pos0,
++            rows: rows as u32,
++            k: k_rows,
++            v: v_rows,
++        })
++    }
++
+     /// Report ordinal `ordinal`'s attended evaluation span to the state machine
+     /// and close its attending phase. Reads the span from the active query's
+     /// identity (the same `rows` [`Self::restore_layer`] added to the compacted
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+index 2fa07b1b0..a3990df49 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
+@@ -2248,6 +2248,11 @@ pub(super) fn layerwise_forward(
+                                 .map(|_| false),
+                             None => Ok(false),
+                         };
++                        // Capture the packed composite-arena feed row before
++                        // freeing the carrier; the scheduler seals it after the
++                        // single AR row is accepted.
++                        let feed_res = carrier.capture_feed_rows(&rig.gpu, begin as usize, 1);
++                        let feed_err = feed_res.as_ref().err().cloned();
+                         // Release the carrier exactly once (its GPU
+                         // buffers have no Drop). `free` consumes it,
+                         // ending its borrow of `kvmem`/`lw_policy` before
+@@ -2284,7 +2289,7 @@ pub(super) fn layerwise_forward(
+                                 k.restore_layerwise_output_pressure(slot, p);
+                             }
+                         }
+-                        if let Some(e) = accept_res.err().or_else(|| free_res.err()) {
++                        if let Some(e) = accept_res.err().or_else(|| free_res.err()).or(feed_err) {
+                             rig.model.kvmem = kvmem;
+                             return Err(e);
+                         }
+@@ -2308,6 +2313,9 @@ pub(super) fn layerwise_forward(
+                             if let Some(s) = aux_sel {
+                                 k.set_aux_selection(slot, s);
+                             }
++                            if let Ok(feed) = feed_res {
++                                k.set_layerwise_pending_feed(slot, feed);
++                            }
+                         }
+                         rig.model.kvmem = kvmem;
+                         fwd
+@@ -2523,6 +2531,9 @@ pub(super) fn layerwise_forward(
+                             // so the publish runs in `mtp_verify_accept_step`
+                             // (after `feed_rows`), outside this scoped take.
+                             let snap_res = carrier.extract_output_acceptance(request, begin);
++                            let feed_res =
++                                carrier.capture_feed_rows(&rig.gpu, begin as usize, width as usize);
++                            let feed_err = feed_res.as_ref().err().cloned();
+                             let free_res = carrier.free(&mut rig.gpu);
+                             // G5: FirstLayer head aux binding (pure-host, after the
+                             // carrier borrow ends). `head_plane` ⇒ Layerwise + MTP ⇒
+@@ -2555,7 +2566,7 @@ pub(super) fn layerwise_forward(
+                                     k.restore_layerwise_output_pressure(slot, p);
+                                 }
+                             }
+-                            if let Some(e) = free_res.err() {
++                            if let Some(e) = free_res.err().or(feed_err) {
+                                 rig.model.kvmem = kvmem;
+                                 return Err(e);
+                             }
+@@ -2589,6 +2600,9 @@ pub(super) fn layerwise_forward(
+                                 if let Some(s) = aux_sel {
+                                     k.set_aux_selection(slot, s);
+                                 }
++                                if let Ok(feed) = feed_res {
++                                    k.set_layerwise_pending_feed(slot, feed);
++                                }
+                             }
+                             rig.model.kvmem = kvmem;
+                             fwd

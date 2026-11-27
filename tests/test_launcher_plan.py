@@ -425,5 +425,183 @@ class PlanTest(unittest.TestCase):
                 self.assertEqual(new['environment'], old['environment'])
 
 
+class HipfirePlanTest(unittest.TestCase):
+    def test_static_capability_is_hfq_only_single_gpu(self):
+        caps = capabilities(ROOT)['backends']['hipfire']
+        self.assertEqual(caps['model_sources'], ['hfq'])
+        self.assertEqual(caps['supported_combinations']['text']['max_devices'], 1)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name).resolve()
+        self.worker = self.directory / 'hipfire'
+        self.worker.write_text('#!/bin/sh\nexit 0\n')
+        self.worker.chmod(0o755)
+        self.model = self.directory / 'qwen3.8-27b.mq4-xts'
+        self.model.write_bytes(b'HFQM' + bytes(28))
+
+    def config(self, **values):
+        parameters = dict(Backend='hipfire', Model=str(self.model), Worker=str(self.worker),
+            Gpu=GPU, Context=8192, Budget=4096, Reserve=1024, HostMiB=4096,
+            Prefill=512, MaxTokens=128, Port=18200, ListenHost='127.0.0.1',
+            SinkTokens=128, RecentTokens=128, Concurrency=1, RetainedSessions=1,
+            KvType='q8', SpeculativeMode='mtp', DraftPolicy='fixed', Vision=False,
+            ThinkingMode='default', ThinkingBudget=0, ReasoningEffort='xhigh',
+            PreserveThinking=True, QueryScorer='page-softmax', ScoreAggregation='mean',
+            GraphAlpha=0, Lrfu=False, QueryMaxTokens=512, QueryReplayMaxTokens=2048,
+            CacheMinTokens=0, DiskMiB=0)
+        parameters.update(values)
+        return {'schema_version': 1, 'parameters': parameters}
+
+    def test_legacy_plan_uses_public_cli_and_hip_environment(self):
+        plan = build_plan(self.config())
+        argv = plan['argv']
+        self.assertEqual(argv[:3], [str(self.worker), 'serve', str(self.model)])
+        for flag, value in [('--max-seq', '8192'), ('--kv-mode', 'q8'), ('--spec', 'mtp'),
+                            ('--kvmem-budget', '4096'), ('--kvmem-gen-reserve', '1024'),
+                            ('--kvmem-host-mib', '4096'), ('--kvmem-block-tokens', '128'),
+                            ('--kvmem-query-max-tokens', '512'),
+                            ('--kvmem-query-replay-max-tokens', '2048')]:
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+        environment = plan['environment']
+        self.assertEqual(environment['HIP_VISIBLE_DEVICES'], GPU)
+        self.assertEqual(environment['ROCR_VISIBLE_DEVICES'], GPU)
+        self.assertNotIn('CUDA_VISIBLE_DEVICES', environment)
+        self.assertEqual(environment['HIPFIRE_SERVE_MULTI_SLOT'], '1')
+        self.assertEqual(environment['HIPFIRE_SERVE_MULTI_SLOT_SLOTS'], '1')
+        self.assertEqual(environment['HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK'], '512')
+        self.assertEqual(environment['HIPFIRE_SLOTS_PAGED_PAGES'], '45')
+        self.assertNotIn('HIPFIRE_KVMEM_GPU_HIGH_WATERMARK', environment)
+        self.assertNotIn('HIPFIRE_KVMEM_GPU_LOW_WATERMARK', environment)
+        self.assertNotIn('HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY', environment)
+        self.assertNotIn('HIPFIRE_KVMEM_CONTENT_GROUPS', environment)
+        self.assertNotIn('HIPFIRE_KVMEM_CACHE_DIR', environment)
+        self.assertEqual(plan['token_settings']['block_tokens'], 128)
+
+    def test_worker_probe_accepts_the_real_hipfire_contract(self):
+        capability = dict(schema_version=1, backend='hipfire', query_scoring_revision=2,
+            compiled_with_kvmem=True, kvmem_contract_version=1,
+            independent_graph_lrfu=False, block_tokens=[128])
+        completed = subprocess.CompletedProcess([str(self.worker), '--kvmem-capabilities'], 0,
+            stdout=json.dumps(capability), stderr='')
+        with patch('launcher.worker.subprocess.run', return_value=completed):
+            value = probe_worker(self.worker, 'hipfire')
+        self.assertEqual(value['backend'], 'hipfire')
+        self.assertTrue(value['compiled_with_kvmem'])
+        self.assertEqual(len(value['executable_sha256']), 64)
+        capability['compiled_with_kvmem'] = False
+        completed.stdout = json.dumps(capability)
+        with patch('launcher.worker.subprocess.run', return_value=completed):
+            with self.assertRaisesRegex(ValueError, 'compiled_with_kvmem'):
+                probe_worker(self.worker, 'hipfire')
+
+    def test_layerwise_plan_uses_environment_without_public_cli(self):
+        data = self.config(RecallStrategy='layerwise', QueryMaxTokens=0,
+            QueryReplayMaxTokens=0, LayerwiseActivationRamMiB=256, LayerwiseActivationDiskMiB=0,
+            LayerwiseStagingMiB=16, LayerwiseMetadataMiB=256,
+            LayerwiseActivationMetadataMiB=128,
+            LayerwiseMtpHistory='upstream-global')
+        for key in ('QueryScorer', 'ScoreAggregation', 'GraphAlpha', 'Lrfu',
+                    'SinkTokens', 'RecentTokens'):
+            data['parameters'].pop(key, None)
+        plan = build_plan(data)
+        argv = plan['argv']
+        self.assertFalse(any(arg.startswith('--kvmem') for arg in argv))
+        environment = plan['environment']
+        self.assertEqual(environment['HIPFIRE_KVMEM'], '1')
+        self.assertEqual(environment['HIPFIRE_KVMEM_RECALL_STRATEGY'], 'layerwise')
+        self.assertEqual(environment['HIPFIRE_KVMEM_BUDGET_TOKENS'], '4096')
+        self.assertEqual(environment['HIPFIRE_KVMEM_GEN_RESERVE'], '1024')
+        self.assertEqual(environment['HIPFIRE_KVMEM_HOST_BYTES'], str(4096 << 20))
+        self.assertEqual(environment['HIPFIRE_KVMEM_SINK_BLOCKS'], '1')
+        self.assertEqual(environment['HIPFIRE_KVMEM_RECENT_BLOCKS'], '1')
+        self.assertEqual(environment['HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB'], '256')
+        self.assertEqual(environment['HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB'], '0')
+        self.assertEqual(environment['HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB'], '16')
+        self.assertEqual(environment['HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB'], '256')
+        self.assertEqual(environment['HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB'], '128')
+        self.assertEqual(environment['HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY'], 'upstream-global')
+        self.assertEqual(environment['HIPFIRE_SLOTS_PAGED_PAGES'], '45')
+        self.assertEqual(plan['resolved_scoring']['strategy'], 'layerwise')
+
+    def test_layerwise_worker_profile_accepts_model_owned_draft_width(self):
+        profile = {
+            'available': True, 'current_layer_q': True, 'query_replay': False,
+            'position_policy': 'original', 'model_architectures': ['qwen35'],
+            'max_devices': 1, 'max_concurrency': 8,
+            'minimum_reserve_blocks': 1, 'parallel_modes': ['single'],
+            'kv_formats': ['q8'], 'vision_residency': ['resident', 'cpu'],
+            'speculative': {'mtp': {
+                'available': True, 'draft_width_model_owned': True,
+                'history_policies': ['first-layer'], 'default_history_policy': 'first-layer',
+                'state_modes': ['native'],
+            }},
+        }
+        capability = {'recall_strategy_revision': 1,
+                      'recall_strategies': {'layerwise': profile}}
+        parameters = dict(Backend='hipfire', RecallStrategy='layerwise', Budget=4096,
+            Reserve=1024, Gpu=GPU, Concurrency=1, KvType='q8', Vision=False,
+            SpeculativeMode='mtp', DraftPolicy='fixed', NgramDrafts=0,
+            LayerwiseMtpHistory='first-layer')
+        with patch('model_health.Inspection') as inspection:
+            inspection.return_value.run.return_value = {'can_start': True,
+                'model': {'format': 'HFQ', 'architecture': 'qwen35', 'arch_id': 5}}
+            require_launch_features(capability, parameters)
+
+    def test_vision_and_key_file_are_first_class(self):
+        sidecar = self.directory / 'qwen3.8-27b-vision.hfq'
+        key_file = self.directory / 'hipfire.key'
+        sidecar.write_bytes(b'HFQM' + bytes(28))
+        key_file.write_text('test-secret-value\n', encoding='utf-8')
+        key_file.chmod(0o600)
+        plan = build_plan(self.config(Vision=True, VisionSidecar=str(sidecar),
+            VisionResidency='cpu', SpeculativeMode='none',
+            ApiKeyFile=str(key_file), ListenHost='0.0.0.0'))
+        argv = plan['argv']
+        self.assertEqual(argv[argv.index('--vision') + 1], str(sidecar))
+        self.assertEqual(argv[argv.index('--spec') + 1], 'off')
+        self.assertEqual(argv[argv.index('--api-key-file') + 1], str(key_file))
+        self.assertEqual(plan['environment']['HIPFIRE_VISION_MODE'], 'auto')
+        self.assertTrue(plan['api_key_configured'])
+        self.assertNotIn('test-secret-value', json.dumps(plan))
+        with self.assertRaisesRegex(ValueError, 'vision.*speculative'):
+            build_plan(self.config(Vision=True, VisionSidecar=str(sidecar), SpeculativeMode='mtp'))
+
+    def test_dflash_uses_hfq_draft(self):
+        draft = self.directory / 'qwen38-27b-dflash-mq4.hfq'
+        draft.write_bytes(b'HFQM' + bytes(28))
+        plan = build_plan(self.config(SpeculativeMode='dflash2', DraftModel=str(draft)))
+        argv = plan['argv']
+        self.assertEqual(argv[argv.index('--spec') + 1], 'dflash')
+        self.assertEqual(plan['environment']['HIPFIRE_DFLASH_DRAFT'], str(draft))
+
+    def test_idle_timeout_zero_prevents_model_unload(self):
+        for seconds in (0, 300, 86400):
+            with self.subTest(seconds=seconds):
+                argv = build_plan(self.config(IdleTimeout=seconds))['argv']
+                self.assertEqual(argv[argv.index('--idle-timeout') + 1], str(seconds))
+        argv = build_plan(self.config())['argv']
+        self.assertEqual(argv[argv.index('--idle-timeout') + 1], '0')
+        for seconds in (-1, 86401):
+            with self.subTest(seconds=seconds), self.assertRaises(ValueError):
+                build_plan(self.config(IdleTimeout=seconds))
+
+    def test_hfq_only_and_invalid_combinations(self):
+        model_dir = self.directory / 'qwen3.5-safetensors'
+        model_dir.mkdir()
+        (model_dir / 'config.json').write_text('{"model_type":"qwen3.5"}', encoding='utf-8')
+        (model_dir / 'model.safetensors').write_bytes(bytes(16))
+        with self.assertRaisesRegex(ValueError, 'Missing Model file'):
+            build_plan(self.config(Model=str(model_dir), SpeculativeMode='none'))
+        for values in (
+            dict(Gpu=GPU + ',GPU-00000000-0000-0000-0000-000000000002'),
+            dict(GraphAlpha=.2),
+            dict(QueryMaxTokens=0),
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                build_plan(self.config(**values))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,4 +1,12 @@
 const assert = require('node:assert/strict');
+globalThis.FileReader = class {
+  readAsDataURL(file) {
+    file.arrayBuffer().then((data) => {
+      this.result = `data:${file.type};base64,${Buffer.from(data).toString('base64')}`;
+      this.onloadend?.();
+    });
+  }
+};
 (async () => {
   const { readAttachment, attachmentContent, supportedAttachment } = await import('./lightweight/attachments.ts');
   const source = '你好\nconst value = "<script>";\n';
@@ -15,6 +23,10 @@ const assert = require('node:assert/strict');
   await assert.rejects(() => readAttachment(new File(['x'.repeat(1024 * 1024 + 1)], 'big.txt'), false), /1 MiB/);
   await assert.rejects(() => readAttachment(new File(['x'], 'photo.png'), false), /不支持图片/);
   await assert.rejects(() => readAttachment(new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'photo.png'), true), /10 MiB/);
+  await assert.rejects(() => readAttachment(new File(['x'], 'photo.webp', {type:'image/webp'}), true,
+    {image_types:['image/png','image/jpeg']}), /PNG|JPEG/);
+  assert.equal((await readAttachment(new File(['x'], 'photo.jpg', {type:'image/jpeg'}), true,
+    {image_types:['image/png','image/jpeg']})).type, 'image');
   assert.equal(typeof attachmentContent('', [file]), 'string', 'text-only model receives ordinary text');
   assert.ok(attachmentContent('Question', [file]).includes(source), 'content is not truncated or executed');
   const image = { type: 'image', name: 'a.png', size: 1, base64Url: 'data:image/png;base64,AA==' };

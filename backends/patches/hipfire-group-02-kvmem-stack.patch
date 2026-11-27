@@ -4392,10 +4392,10 @@ index 70e956368..8d03fd68c 100644
                          gpu.conv1d_silu_split_qknorm(
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
 new file mode 100644
-index 000000000..b87ee3cb8
+index 000000000..b7c04de16
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
-@@ -0,0 +1,1302 @@
+@@ -0,0 +1,1316 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -5216,6 +5216,16 @@ index 000000000..b87ee3cb8
 +    pub mtp_head: bool,
 +}
 +
++/// Packed Q8 feed rows captured from the Layerwise composite arena before the
++/// per-step carrier is freed. The scheduler consumes only the committed prefix
++/// after sampling, so rejected draft rows never enter the host archive.
++pub(crate) struct LayerwiseFeedRows {
++    pub pos0: u32,
++    pub rows: u32,
++    pub k: Vec<u8>,
++    pub v: Vec<u8>,
++}
++
 +struct SlotState {
 +    raw: RawStore,
 +    kv: KvStore,
@@ -5323,6 +5333,10 @@ index 000000000..b87ee3cb8
 +    /// snapshot is owned, so it survives the scoped controller take that the
 +    /// carrier's `&KvMemCtl` borrow requires.
 +    lw_pending_output: Option<OutputAcceptanceSnapshot>,
++    /// Packed composite-arena feed rows captured before the Layerwise carrier is
++    /// freed. `feed_rows` takes this after sampling and seals only the committed
++    /// prefix; prefill has no carrier and keeps the direct arena gather path.
++    lw_pending_feed: Option<LayerwiseFeedRows>,
 +    /// P4.1② G3: the MTP head's independent aux-plane resident map (design §A.8).
 +    /// Constructed lazily on the first admitted Layerwise MTP verify
 +    /// ([`KvMemCtl::ensure_head_plane`]); `None` under Legacy / AR-only (never
@@ -6289,10 +6303,10 @@ index 000000000..228c3a4fd
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
 new file mode 100644
-index 000000000..b42ee6b9e
+index 000000000..92177507b
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/layerwise.rs
-@@ -0,0 +1,1396 @@
+@@ -0,0 +1,1473 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -6564,6 +6578,21 @@ index 000000000..b42ee6b9e
 +        self.slots
 +            .get_mut(slot)
 +            .and_then(|st| st.lw_pending_output.take())
++    }
++
++    /// Store packed feed rows captured from the Layerwise composite arena before
++    /// the carrier is freed. The scheduler seals only the committed prefix.
++    pub fn set_layerwise_pending_feed(&mut self, slot: usize, feed: LayerwiseFeedRows) {
++        if let Some(st) = self.slots.get_mut(slot) {
++            st.lw_pending_feed = Some(feed);
++        }
++    }
++
++    /// Take the pending composite-arena feed rows for `slot`, if any.
++    pub fn take_layerwise_pending_feed(&mut self, slot: usize) -> Option<LayerwiseFeedRows> {
++        self.slots
++            .get_mut(slot)
++            .and_then(|st| st.lw_pending_feed.take())
 +    }
 +
 +    /// P4.1② G3: whether the composite head aux plane is active (Layerwise AND
@@ -7357,7 +7386,12 @@ index 000000000..b42ee6b9e
 +        // drop-evict + COW restore (D4). Legacy skips this entirely — the arena
 +        // params are unused on the default path, keeping it byte-neutral.
 +        if self.strategy.is_layerwise() {
-+            self.write_through_archive(gpu, pool, k_arenas, v_arenas, slot, pos0, n_rows)?;
++            let pending_feed = st.lw_pending_feed.take();
++            if let Some(feed) = pending_feed {
++                self.write_through_archive_rows(slot, pos0, n_rows, &feed)?;
++            } else {
++                self.write_through_archive(gpu, pool, k_arenas, v_arenas, slot, pos0, n_rows)?;
++            }
 +        }
 +        if trace {
 +            eprintln!(
@@ -7373,6 +7407,63 @@ index 000000000..b42ee6b9e
 +                t_read.as_secs_f64() * 1e3,
 +                t_write.as_secs_f64() * 1e3,
 +            );
++        }
++        Ok(())
++    }
++
++    /// Seal a committed prefix of feed rows captured from the Layerwise
++    /// composite arena. The carrier is already freed when this runs, so the
++    /// packed Q8 payload must be supplied by the scoped forward orchestration.
++    pub(super) fn write_through_archive_rows(
++        &mut self,
++        slot: usize,
++        pos0: usize,
++        n_rows: usize,
++        feed: &LayerwiseFeedRows,
++    ) -> Result<(), String> {
++        if slot >= self.slots.len() {
++            return Err(format!("kvmem write-through: slot {slot} out of range"));
++        }
++        if feed.pos0 != pos0 as u32 || n_rows > feed.rows as usize {
++            return Err(format!(
++                "kvmem write-through: captured rows {}..{} do not cover committed {}..{}",
++                feed.pos0,
++                feed.pos0 + feed.rows,
++                pos0,
++                pos0 + n_rows
++            ));
++        }
++        let krow = self.k_page_bytes / KV_BLOCK_TOKENS;
++        let vrow = self.v_page_bytes / KV_BLOCK_TOKENS;
++        let captured = feed.rows as usize;
++        if feed.k.len() != self.n_fa_layers * captured * krow
++            || feed.v.len() != self.n_fa_layers * captured * vrow
++        {
++            return Err("kvmem write-through: captured K/V buffer geometry mismatch".to_string());
++        }
++        let committed_k = n_rows * krow;
++        let committed_v = n_rows * vrow;
++        for il in 0..self.n_fa_layers {
++            let k0 = il * captured * krow;
++            let v0 = il * captured * vrow;
++            self.slots[slot]
++                .raw
++                .write_layer_k_gpu(
++                    pos0 as u32,
++                    n_rows as u32,
++                    il as u32,
++                    &feed.k[k0..k0 + committed_k],
++                )
++                .map_err(|e| format!("kvmem write-through K seal (layer {il}): {e}"))?;
++            self.slots[slot]
++                .raw
++                .write_layer_v_gpu(
++                    pos0 as u32,
++                    n_rows as u32,
++                    il as u32,
++                    &feed.v[v0..v0 + committed_v],
++                )
++                .map_err(|e| format!("kvmem write-through V seal (layer {il}): {e}"))?;
 +        }
 +        Ok(())
 +    }
@@ -9640,10 +9731,10 @@ index 000000000..84c341c6d
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
 new file mode 100644
-index 000000000..e85cb8403
+index 000000000..527843837
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs
-@@ -0,0 +1,720 @@
+@@ -0,0 +1,721 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -10087,6 +10178,7 @@ index 000000000..e85cb8403
 +                last_freeze_id: None,
 +                lw_import_blocks: Cell::new(None),
 +                lw_pending_output: None,
++                lw_pending_feed: None,
 +                lw_head: None,
 +                lw_aux_selection: None,
 +            });
@@ -11097,10 +11189,10 @@ index 000000000..ade164172
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl/slot.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl/slot.rs
 new file mode 100644
-index 000000000..8f730122b
+index 000000000..17f01a128
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl/slot.rs
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,367 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -11224,6 +11316,7 @@ index 000000000..8f730122b
 +            last_freeze_id: None,
 +            lw_import_blocks: Cell::new(None),
 +            lw_pending_output: None,
++            lw_pending_feed: None,
 +            // P4.1② G3: a fresh session drops the head resident map and its
 +            // per-Query binding, mirroring the trunk pressure owners. The next
 +            // admitted MTP verify lazily reconstructs the map under the bumped
@@ -11349,6 +11442,8 @@ index 000000000..8f730122b
 +            .ok_or_else(|| format!("kvmem: begin_request slot {slot} out of range"))?;
 +        st.turn_start = st.fed;
 +        st.first_decode_done = false;
++        // A cancelled verify may leave captured rows that were never committed.
++        st.lw_pending_feed = None;
 +        // A new turn's question must not inherit the previous turn's Q span.
 +        st.q_ring_len = 0;
 +        st.q_ring_cursor = 0;
@@ -18536,10 +18631,10 @@ index 0dbffb184..a7c7b8171 100644
      DeltaNetLayerWeights, DeltaNetMoeLayerWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
 diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
 new file mode 100644
-index 000000000..c163e30ea
+index 000000000..a18d76f46
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
-@@ -0,0 +1,10181 @@
+@@ -0,0 +1,10291 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Kaden Schutt
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -20157,6 +20252,116 @@ index 000000000..c163e30ea
 +            seq_len,
 +        )?;
 +        Ok(extent)
++    }
++
++    /// Capture the freshly written evaluation rows from the composite suffix
++    /// stripe before the carrier is freed. The host archive later consumes only
++    /// the scheduler-confirmed prefix, so rejected MTP draft rows are dropped.
++    pub fn capture_feed_rows(
++        &self,
++        gpu: &Gpu,
++        pos0: usize,
++        rows: usize,
++    ) -> Result<crate::kvmem_ctl::LayerwiseFeedRows, String> {
++        if rows == 0 || rows != self.staging.width() {
++            return Err(format!(
++                "layerwise feed capture: rows {rows} != staging width {}",
++                self.staging.width()
++            ));
++        }
++        let suffix = self
++            .suffix_slot
++            .ok_or_else(|| "layerwise feed capture: no suffix page mapped".to_string())?;
++        let bt = self.driver.block_tokens() as usize;
++        if bt == 0 || self.partial_tokens as usize + rows > bt * 2 {
++            return Err("layerwise feed capture: evaluation span exceeds suffix pages".to_string());
++        }
++        let layout = self.driver.arena().layout();
++        let k_plane = layout.k_plane_bytes();
++        let v_plane = layout.v_plane_bytes();
++        if k_plane % bt != 0 || v_plane % bt != 0 {
++            return Err(
++                "layerwise feed capture: packed row geometry is not page-aligned".to_string(),
++            );
++        }
++        let krow = k_plane / bt;
++        let vrow = v_plane / bt;
++        let n_layers = self.driver.fa_layers().len();
++        let k_bytes = n_layers * rows * krow;
++        let v_bytes = n_layers * rows * vrow;
++        let mut k_rows = vec![0u8; k_bytes];
++        let mut v_rows = vec![0u8; v_bytes];
++        let stream = gpu.steady_copy_stream();
++        let arena = self.driver.arena().arena();
++        let result = (|| -> Result<(), String> {
++            for ordinal in 0..n_layers {
++                for row in 0..rows {
++                    let compact = self.partial_tokens as usize + row;
++                    let (source_slot, intra) = if compact < bt {
++                        (suffix, compact)
++                    } else {
++                        (
++                            self.suffix_slot_overflow.ok_or_else(|| {
++                                "layerwise feed capture: suffix overflow page is not mapped"
++                                    .to_string()
++                            })?,
++                            compact - bt,
++                        )
++                    };
++                    let src_k = layout
++                        .layer_k_offset(source_slot as usize, ordinal)
++                        .map_err(|e| format!("layerwise feed capture: K offset {ordinal}: {e}"))?
++                        + intra * krow;
++                    let src_v = layout
++                        .layer_v_offset(source_slot as usize, ordinal)
++                        .map_err(|e| format!("layerwise feed capture: V offset {ordinal}: {e}"))?
++                        + intra * vrow;
++                    let dst_k = (ordinal * rows + row) * krow;
++                    let dst_v = (ordinal * rows + row) * vrow;
++                    gpu.hip
++                        .memcpy_dtoh_async_at(
++                            &mut k_rows[dst_k..dst_k + krow],
++                            &arena.buf,
++                            src_k,
++                            stream,
++                        )
++                        .map_err(|e| {
++                            format!("layerwise feed capture: K D2H {ordinal}/{row}: {e:?}")
++                        })?;
++                    gpu.hip
++                        .memcpy_dtoh_async_at(
++                            &mut v_rows[dst_v..dst_v + vrow],
++                            &arena.buf,
++                            src_v,
++                            stream,
++                        )
++                        .map_err(|e| {
++                            format!("layerwise feed capture: V D2H {ordinal}/{row}: {e:?}")
++                        })?;
++                }
++            }
++            Ok(())
++        })();
++        if let Err(error) = result {
++            let _ = match stream {
++                Some(stream) => gpu.hip.stream_synchronize(stream),
++                None => gpu.hip.stream_synchronize_default(),
++            };
++            return Err(error);
++        }
++        match stream {
++            Some(stream) => gpu.hip.stream_synchronize(stream),
++            None => gpu.hip.stream_synchronize_default(),
++        }
++        .map_err(|e| format!("layerwise feed capture: sync: {e:?}"))?;
++        let pos0 = u32::try_from(pos0)
++            .map_err(|_| "layerwise feed capture: position exceeds u32".to_string())?;
++        Ok(crate::kvmem_ctl::LayerwiseFeedRows {
++            pos0,
++            rows: rows as u32,
++            k: k_rows,
++            v: v_rows,
++        })
 +    }
 +
 +    /// Report ordinal `ordinal`'s attended evaluation span to the state machine
@@ -42707,10 +42912,10 @@ index 000000000..4d49ffe90
 +}
 diff --git a/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
 new file mode 100644
-index 000000000..2fa07b1b0
+index 000000000..a3990df49
 --- /dev/null
 +++ b/crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs
-@@ -0,0 +1,4397 @@
+@@ -0,0 +1,4411 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright (c) 2026 Nick Woolmer
 +// hipfire — see LICENSE and NOTICE in the project root.
@@ -44961,6 +45166,11 @@ index 000000000..2fa07b1b0
 +                                .map(|_| false),
 +                            None => Ok(false),
 +                        };
++                        // Capture the packed composite-arena feed row before
++                        // freeing the carrier; the scheduler seals it after the
++                        // single AR row is accepted.
++                        let feed_res = carrier.capture_feed_rows(&rig.gpu, begin as usize, 1);
++                        let feed_err = feed_res.as_ref().err().cloned();
 +                        // Release the carrier exactly once (its GPU
 +                        // buffers have no Drop). `free` consumes it,
 +                        // ending its borrow of `kvmem`/`lw_policy` before
@@ -44997,7 +45207,7 @@ index 000000000..2fa07b1b0
 +                                k.restore_layerwise_output_pressure(slot, p);
 +                            }
 +                        }
-+                        if let Some(e) = accept_res.err().or_else(|| free_res.err()) {
++                        if let Some(e) = accept_res.err().or_else(|| free_res.err()).or(feed_err) {
 +                            rig.model.kvmem = kvmem;
 +                            return Err(e);
 +                        }
@@ -45020,6 +45230,9 @@ index 000000000..2fa07b1b0
 +                            k.set_layerwise_keep_set(slot, new_keep);
 +                            if let Some(s) = aux_sel {
 +                                k.set_aux_selection(slot, s);
++                            }
++                            if let Ok(feed) = feed_res {
++                                k.set_layerwise_pending_feed(slot, feed);
 +                            }
 +                        }
 +                        rig.model.kvmem = kvmem;
@@ -45236,6 +45449,9 @@ index 000000000..2fa07b1b0
 +                            // so the publish runs in `mtp_verify_accept_step`
 +                            // (after `feed_rows`), outside this scoped take.
 +                            let snap_res = carrier.extract_output_acceptance(request, begin);
++                            let feed_res =
++                                carrier.capture_feed_rows(&rig.gpu, begin as usize, width as usize);
++                            let feed_err = feed_res.as_ref().err().cloned();
 +                            let free_res = carrier.free(&mut rig.gpu);
 +                            // G5: FirstLayer head aux binding (pure-host, after the
 +                            // carrier borrow ends). `head_plane` ⇒ Layerwise + MTP ⇒
@@ -45268,7 +45484,7 @@ index 000000000..2fa07b1b0
 +                                    k.restore_layerwise_output_pressure(slot, p);
 +                                }
 +                            }
-+                            if let Some(e) = free_res.err() {
++                            if let Some(e) = free_res.err().or(feed_err) {
 +                                rig.model.kvmem = kvmem;
 +                                return Err(e);
 +                            }
@@ -45301,6 +45517,9 @@ index 000000000..2fa07b1b0
 +                                }
 +                                if let Some(s) = aux_sel {
 +                                    k.set_aux_selection(slot, s);
++                                }
++                                if let Ok(feed) = feed_res {
++                                    k.set_layerwise_pending_feed(slot, feed);
 +                                }
 +                            }
 +                            rig.model.kvmem = kvmem;
@@ -50053,6 +50272,166 @@ index 31be486bb..187bbb0fb 100644
  
  [dependencies]
  anyhow.workspace = true
+diff --git a/crates/hipfire-cli/src/capabilities.rs b/crates/hipfire-cli/src/capabilities.rs
+new file mode 100644
+index 000000000..51c534837
+--- /dev/null
++++ b/crates/hipfire-cli/src/capabilities.rs
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Read-only KVMem launch capability advertisement.
++//!
++//! This is deliberately independent of model loading, GPU discovery and the
++//! daemon. KVMem uses it to qualify a worker before a model is selected.
++
++use serde_json::{json, Value};
++
++const MIB: u64 = 1 << 20;
++
++pub(crate) fn report() -> Value {
++    let kvmem = cfg!(feature = "kvmem");
++    let layerwise = kvmem.then(|| {
++        json!({
++            "available": true,
++            "config_source": "environment",
++            "current_layer_q": true,
++            "query_replay": false,
++            "position_policy": "original",
++            "model_architectures": ["qwen35"],
++            "model_sources": ["hfq"],
++            "max_devices": 1,
++            "max_concurrency": 8,
++            "minimum_window_tokens": 384,
++            "minimum_reserve_blocks": 1,
++            "parallel_modes": ["single"],
++            "kv_formats": ["q8"],
++            "vision_residency": ["resident", "cpu"],
++            "default_resources": {
++                "activation_ram_bytes": 64 * MIB,
++                "activation_disk_bytes": 32 * MIB,
++                "staging_bytes": 8 * MIB,
++                "metadata_bytes": 1024 * MIB,
++                "activation_metadata_bytes": 96 * MIB,
++            },
++            "speculative": {
++                "none": {"available": true},
++                "mtp": {
++                    "available": true,
++                    "draft_width_model_owned": true,
++                    "adaptive": false,
++                    "ngram": false,
++                    "max_concurrency": 8,
++                    "max_devices": 1,
++                    "draft_asset": "embedded",
++                    "history_policies": ["first-layer", "upstream-global"],
++                    "default_history_policy": "first-layer",
++                    "state_modes": ["native"],
++                },
++                "dflash2": {
++                    "available": true,
++                    "draft_width_model_owned": true,
++                    "adaptive": false,
++                    "ngram": false,
++                    "max_concurrency": 8,
++                    "max_devices": 1,
++                    "draft_asset": "paired_hfq",
++                    "model_sources": ["hfq"],
++                    "history": "independent-native-window",
++                },
++            },
++        })
++    });
++
++    json!({
++        "schema_version": 1,
++        "backend": "hipfire",
++        "query_scoring_revision": 2,
++        "recall_strategy_revision": if kvmem { json!(1) } else { Value::Null },
++        "compiled_with_kvmem": kvmem,
++        "kvmem_contract_version": if kvmem { json!(1) } else { Value::Null },
++        "block_tokens": [128],
++        "kv_formats": if kvmem { json!(["q8"]) } else { json!([]) },
++        "model_sources": ["hfq"],
++        "model_architectures": ["qwen35"],
++        "max_devices": 1,
++        "max_concurrency": 8,
++        "graph_alpha_supported": false,
++        "independent_graph_lrfu": false,
++        "streaming": true,
++        "concurrent_requests": true,
++        "multimodal": true,
++        "recall_strategies": {
++            "legacy": {
++                "available": kvmem,
++                "config_source": "cli",
++            },
++            "layerwise": layerwise.unwrap_or(Value::Null),
++        },
++        "speculative": {
++            "none": {"available": true},
++            "mtp": {
++                "available": true,
++                "draft_width_model_owned": true,
++                "draft_asset": "embedded",
++            },
++            "dflash2": {
++                "available": true,
++                "draft_width_model_owned": true,
++                "draft_asset": "paired_hfq",
++                "model_sources": ["hfq"],
++            },
++        },
++        "vision": {
++            "available": true,
++            "model_sources": ["hfq"],
++            "sidecar_arch_ids": [5, 6],
++            "residency": ["resident", "cpu"],
++            "image_types": ["image/png", "image/jpeg"],
++            "max_images_per_request": 1,
++            "remote_urls": false,
++        },
++        "auth": {
++            "api_key_file": true,
++            "raw_api_key_arg": false,
++        },
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::report;
++    use clap::Parser;
++
++    #[test]
++    fn cli_accepts_the_read_only_capability_flag() {
++        let cli = crate::Cli::try_parse_from(["hipfire", "--kvmem-capabilities"]).unwrap();
++        assert!(cli.kvmem_capabilities);
++    }
++
++    #[test]
++    fn report_declares_the_kvmem_ui_contract() {
++        let report = report();
++        assert_eq!(report["schema_version"], 1);
++        assert_eq!(report["backend"], "hipfire");
++        assert_eq!(report["block_tokens"], serde_json::json!([128]));
++        assert_eq!(report["model_sources"], serde_json::json!(["hfq"]));
++        assert_eq!(report["recall_strategies"]["legacy"]["available"], true);
++        assert_eq!(
++            report["recall_strategies"]["layerwise"]["available"],
++            cfg!(feature = "kvmem")
++        );
++        assert_eq!(report["vision"]["max_images_per_request"], 1);
++        assert_eq!(report["auth"]["api_key_file"], true);
++        if cfg!(feature = "kvmem") {
++            assert_eq!(report["recall_strategy_revision"], 1);
++        } else {
++            assert!(report["recall_strategy_revision"].is_null());
++        }
++    }
++}
 diff --git a/crates/hipfire-cli/src/emu.rs b/crates/hipfire-cli/src/emu.rs
 index 384bd858d..2f31402ef 100644
 --- a/crates/hipfire-cli/src/emu.rs
@@ -50188,11 +50567,273 @@ index 51c2e94b3..e4cc2a8c6 100644
      #[test]
      fn unchecked_context_is_undetermined_and_advisory() {
          let p = projection();
+diff --git a/crates/hipfire-cli/src/inspect.rs b/crates/hipfire-cli/src/inspect.rs
+index 92d3bbb45..9fdce0aab 100644
+--- a/crates/hipfire-cli/src/inspect.rs
++++ b/crates/hipfire-cli/src/inspect.rs
+@@ -2,26 +2,33 @@
+ // Copyright (c) 2026 Kaden Schutt
+ // hipfire — see LICENSE and NOTICE in the project root.
+ 
+-//! `hipfire inspect <file.gguf>`: read a GGUF header and report what hipfire
+-//! would do with it: architecture, tensor count, per-type histogram, model
+-//! bits per weight, and the per-tensor admission verdict. Read-only (no GPU,
+-//! no daemon, no model load), so it works on a header-only download too.
++//! `hipfire inspect`: read a GGUF, HFQ, or safetensors-directory header and
++//! report what hipfire would do with it. Read-only: no GPU, daemon, model load,
++//! or tensor payload read.
+ 
+-use anyhow::{bail, Context, Result};
++use anyhow::{Context, Result, bail};
+ use clap::Args;
+ use std::io::Read;
+ use std::path::PathBuf;
+ 
+ #[derive(Args, Debug)]
+ pub(crate) struct InspectArgs {
+-    /// A `.gguf` model file.
++    /// A GGUF/HFQ model file or a safetensors model directory.
+     pub path: PathBuf,
++    /// Emit the KVMem HFQ/safetensors health report as JSON.
++    #[arg(long)]
++    pub json: bool,
+ }
+ 
+ /// The four GGUF magic bytes.
+ const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+ 
+ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
++    if args.json {
++        let report = inspect_json(&args.path)?;
++        println!("{}", serde_json::to_string_pretty(&report)?);
++        return Ok(());
++    }
+     let mut magic = [0u8; 4];
+     std::fs::File::open(&args.path)
+         .with_context(|| format!("could not open {}", args.path.display()))?
+@@ -42,18 +49,191 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Header/index-only model report for KVMem's CPU-side health check.
++pub(crate) fn inspect_json(path: &std::path::Path) -> Result<serde_json::Value> {
++    use hipfire_runtime::loader_api::ModelSource;
++    use hipfire_runtime::model_source::ModelSource as SourceTrait;
++    use serde_json::{Value, json};
++
++    let path_text = path.to_string_lossy();
++    let source = ModelSource::from_path(&path_text)
++        .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
++    let (kind, arch_id, tensor_count, format_version, names, metadata) = match &source {
++        ModelSource::Hfq(hfq) => (
++            "hfq",
++            hfq.arch_id,
++            hfq.tensors().len(),
++            Some(hfq.format_version),
++            hfq.tensors()
++                .iter()
++                .map(|tensor| tensor.name.as_str())
++                .collect::<Vec<_>>(),
++            serde_json::from_str::<Value>(&hfq.metadata_json).unwrap_or_else(|_| json!({})),
++        ),
++        ModelSource::Dir(dir) => (
++            "safetensors-dir",
++            dir.arch_id(),
++            dir.tensor_names().len(),
++            None,
++            dir.tensor_names(),
++            serde_json::from_str::<Value>(SourceTrait::metadata_json(dir))
++                .unwrap_or_else(|_| json!({})),
++        ),
++    };
++    let is_dir = kind == "safetensors-dir";
++    let qwen35 = matches!(arch_id, 5 | 6);
++    let has_trunk = names.iter().any(|name| {
++        name.ends_with("lm_head.weight")
++            || name.ends_with("model.embed_tokens.weight")
++            || name.ends_with("model.layers.0.self_attn.q_proj.weight")
++    });
++    let vision_present = names
++        .iter()
++        .any(|name| name.ends_with("model.visual.patch_embed.proj.weight"));
++    let architecture = match arch_id {
++        5 => "qwen35",
++        6 => "qwen35-moe",
++        20 => "dflash-draft",
++        21 => "mtp-head",
++        22 | 23 => "draft-sidecar",
++        _ => "unknown",
++    };
++    let selected_metadata = json!({
++        "model_type": metadata.get("model_type"),
++        "architectures": metadata.get("architectures"),
++        "num_experts": metadata.get("num_experts"),
++        "quant_method": metadata.get("quant_method"),
++        "torch_dtype": metadata.get("torch_dtype"),
++    });
++    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
++    Ok(json!({
++        "schema_version": 1,
++        "source": kind,
++        "path": canonical,
++        "arch_id": arch_id,
++        "architecture": architecture,
++        "format_version": format_version,
++        "tensor_count": tensor_count,
++        "can_serve": qwen35 && has_trunk,
++        "kv_types": ["q8"],
++        "metadata": selected_metadata,
++        "vision": {
++            "present": vision_present,
++            "sidecar_supported": qwen35 && !is_dir,
++        },
++        "speculative": {
++            "mtp": {"supported": qwen35 && has_trunk && !is_dir},
++            "dflash2": {"supported": qwen35 && has_trunk && !is_dir, "draft_asset": "paired_hfq"},
++        },
++        "limitations": if is_dir {
++            json!(["vision-sidecar-unsupported", "dflash-unsupported"])
++        } else {
++            json!([])
++        },
++    }))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use clap::Parser;
++    use serde_json::json;
+ 
+-    #[test]
+-    fn a_non_gguf_file_is_named_and_refused() {
+-        let dir = std::env::temp_dir().join(format!("hipfire-inspect-{}", std::process::id()));
++    fn scratch(label: &str) -> std::path::PathBuf {
++        let dir =
++            std::env::temp_dir().join(format!("hipfire-inspect-{label}-{}", std::process::id()));
+         std::fs::create_dir_all(&dir).unwrap();
+-        let path = dir.join("not-gguf.bin");
+-        std::fs::write(&path, b"HFQM....").unwrap();
+-        let err = inspect_command(InspectArgs { path: path.clone() }).unwrap_err();
+-        assert!(err.to_string().contains("not a GGUF file"), "{err}");
+-        let _ = std::fs::remove_dir_all(&dir);
++        dir
++    }
++
++    fn write_hfq(path: &std::path::Path, arch_id: u32, tensors: &[&str]) {
++        let metadata = b"{}";
++        let mut index = Vec::new();
++        index.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
++        for tensor in tensors {
++            index.extend_from_slice(&(tensor.len() as u16).to_le_bytes());
++            index.extend_from_slice(tensor.as_bytes());
++            index.push(1); // quant type
++            index.push(1); // dimensions
++            index.extend_from_slice(&1u32.to_le_bytes());
++            index.extend_from_slice(&0u32.to_le_bytes());
++            index.extend_from_slice(&0u64.to_le_bytes());
++        }
++        let data_offset = 32 + metadata.len() + index.len();
++        let mut bytes = Vec::new();
++        bytes.extend_from_slice(b"HFQM");
++        bytes.extend_from_slice(&1u32.to_le_bytes());
++        bytes.extend_from_slice(&arch_id.to_le_bytes());
++        bytes.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
++        bytes.extend_from_slice(&32u64.to_le_bytes());
++        bytes.extend_from_slice(&(data_offset as u64).to_le_bytes());
++        bytes.extend_from_slice(metadata);
++        bytes.extend_from_slice(&index);
++        std::fs::write(path, bytes).unwrap();
++    }
++
++    fn write_safetensors(dir: &std::path::Path) {
++        std::fs::write(
++            dir.join("config.json"),
++            json!({"model_type":"qwen3.5"}).to_string(),
++        )
++        .unwrap();
++        let header = json!({"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}).to_string();
++        let mut bytes = Vec::new();
++        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
++        bytes.extend_from_slice(header.as_bytes());
++        bytes.extend_from_slice(&0f32.to_le_bytes());
++        std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
++    }
++
++    #[test]
++    fn cli_accepts_json_output() {
++        let cli =
++            crate::Cli::try_parse_from(["hipfire", "inspect", "model.hfq", "--json"]).unwrap();
++        match cli.command {
++            Some(crate::Commands::Inspect(args)) => assert!(args.json),
++            _ => panic!("expected inspect command"),
++        }
++    }
++
++    #[test]
++    fn hfq_json_reports_architecture_and_embedded_vision() {
++        let dir = scratch("hfq");
++        let path = dir.join("qwen3.8-27b.mq4-xts");
++        write_hfq(
++            &path,
++            5,
++            &["model.visual.patch_embed.proj.weight", "lm_head.weight"],
++        );
++        let report = inspect_json(&path).unwrap();
++        assert_eq!(report["source"], "hfq");
++        assert_eq!(report["arch_id"], 5);
++        assert_eq!(report["architecture"], "qwen35");
++        assert_eq!(report["tensor_count"], 2);
++        assert_eq!(report["vision"]["present"], true);
++        assert_eq!(report["speculative"]["dflash2"]["supported"], true);
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
++    #[test]
++    fn safetensors_json_reports_directory_limits() {
++        let dir = scratch("safetensors");
++        write_safetensors(&dir);
++        let report = inspect_json(&dir).unwrap();
++        assert_eq!(report["source"], "safetensors-dir");
++        assert_eq!(report["arch_id"], 5);
++        assert_eq!(report["vision"]["present"], false);
++        assert_eq!(report["speculative"]["dflash2"]["supported"], false);
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
++    #[test]
++    fn a_non_model_file_is_named_and_refused() {
++        let dir = scratch("invalid");
++        let path = dir.join("not-a-model.bin");
++        std::fs::write(&path, b"not a model").unwrap();
++        let err = inspect_json(&path).unwrap_err();
++        assert!(err.to_string().contains("not-a-model.bin"), "{err}");
++        let _ = std::fs::remove_dir_all(dir);
+     }
+ }
 diff --git a/crates/hipfire-cli/src/main.rs b/crates/hipfire-cli/src/main.rs
-index c3da2cc31..f0882d646 100644
+index c3da2cc31..c81ae29fd 100644
 --- a/crates/hipfire-cli/src/main.rs
 +++ b/crates/hipfire-cli/src/main.rs
-@@ -958,8 +958,163 @@ struct SidecarArgs {
+@@ -51,6 +51,7 @@ use std::{
+ 
+ mod bench_concurrency;
+ mod bench_power;
++mod capabilities;
+ mod calibrate;
+ mod config_tuning;
+ mod config_view;
+@@ -90,6 +91,9 @@ const BUILD_TARGET: &str = env!("HIPFIRE_BUILD_TARGET");
+     long_about = "Native Rust control plane for hipfire. Configuration, registry, model lifecycle, serving, chat, and diagnostics are implemented without a JavaScript runtime."
+ )]
+ pub(crate) struct Cli {
++    /// Print the read-only KVMem launch capability contract as JSON.
++    #[arg(long)]
++    kvmem_capabilities: bool,
+     #[command(subcommand)]
+     command: Option<Commands>,
+ }
+@@ -958,8 +962,163 @@ struct SidecarArgs {
      skip_validation: bool,
  }
  
@@ -50356,7 +50997,7 @@ index c3da2cc31..f0882d646 100644
      /// Optional model, host, host:port, and/or port in legacy-compatible order.
      #[arg(value_name = "MODEL_HOST_OR_PORT", num_args = 0..=3)]
      positionals: Vec<String>,
-@@ -1093,13 +1248,24 @@ fn finish_command(result: Result<()>) {
+@@ -1093,13 +1252,28 @@ fn finish_command(result: Result<()>) {
      }
  }
  fn run() -> Result<()> {
@@ -50376,6 +51017,10 @@ index c3da2cc31..f0882d646 100644
 +        .collect();
 +    validate_kvmem_storage_args(&arguments)?;
 +    let cli = Cli::parse_from(arguments);
++    if cli.kvmem_capabilities {
++        println!("{}", serde_json::to_string_pretty(&capabilities::report())?);
++        return Ok(());
++    }
 +    // Must precede Paths::discover, registry/model lookup, restart/stop, detach
 +    // and every daemon/GPU side effect. Only global config files are read.
 +    if let Some(Commands::Serve(args) | Commands::Restart(args)) = &cli.command {
@@ -50387,7 +51032,7 @@ index c3da2cc31..f0882d646 100644
      // Print-only commands die quietly on a closed stdout (`hipfire list -r |
      // head -1`) like any Unix filter instead of panicking in `println!`.
      // Commands that drive a daemon, server or child over pipes keep Rust's
-@@ -1157,6 +1323,17 @@ fn run() -> Result<()> {
+@@ -1157,6 +1331,17 @@ fn run() -> Result<()> {
          Some(Commands::Serve(args)) => crate::serve::serve_command(&paths, args),
          Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
          Some(Commands::Restart(args)) => {
@@ -50405,7 +51050,7 @@ index c3da2cc31..f0882d646 100644
              let port = args.positionals.iter().find_map(|value| {
                  value.parse::<u16>().ok().or_else(|| {
                      crate::serve::parse_host_port(value)
-@@ -4102,6 +4279,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
+@@ -4102,6 +4287,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
  
      if !service_ready(&endpoint, Duration::from_millis(150)) {
          let serve_args = ServeArgs {
@@ -50413,7 +51058,7 @@ index c3da2cc31..f0882d646 100644
              positionals: vec![host.clone(), port.to_string()],
              model: None,
              detach: true,
-@@ -6559,6 +6737,17 @@ pub(crate) fn config_value<'a>(
+@@ -6559,6 +6745,17 @@ pub(crate) fn config_value<'a>(
          .ok_or_else(|| anyhow!("missing resolved configuration key {key}"))
  }
  

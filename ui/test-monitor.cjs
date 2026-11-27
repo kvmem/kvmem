@@ -45,7 +45,7 @@ const server = http.createServer((req, res) => {
     }
     res.setHeader("Content-Type", "application/json");
     res.setHeader("Cache-Control", "no-store");
-    if (req.url === '/slots' && fixture.backend === 'radiance') { res.statusCode=404; return res.end('{}'); }
+    if (req.url === '/slots' && ['radiance','hipfire'].includes(fixture.backend)) { res.statusCode=404; return res.end('{}'); }
     if (req.url === '/stats') return res.end(JSON.stringify(fixture.nativeStats || {queue:{depth:2}}));
     if (req.url === '/api/launcher/hardware') {
       if (!fixture.sharedDisk || fixture.diskFailure) {
@@ -195,6 +195,22 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     assert.match(await page.locator('[data-detail-body]').textContent(),/Image cache hits \/ misses: 1 \/ 0/);
     await page.locator('[data-language-select]').selectOption('zh-CN');
     await page.locator('[data-close]').click();
+
+    fixtureScenario={backend:'hipfire',monitorCache:{enabled:1,layerwise:1,
+      host_payload_bytes:1048576,host_payload_budget_bytes:8388608,
+      host_bytes:8589934592,spill_pages_total:7,restore_pages_total:5,
+      prefix_hits_total:2,draft_images_total:1},nativeStats:{queue_depth:0,requests_served:2,recent_tok_s:42.5}};
+    await page.waitForFunction(()=>document.querySelector('[data-backend-metrics]')?.textContent.includes('hipfire · KVMem'));
+    assert.match(await page.locator('[data-backend-metrics]').textContent(),/spill.*7/);
+    assert.match(await page.locator('[data-value="model"]').textContent(),/hipfire/);
+    fixtureScenario.nativeRequestMetrics = {
+      generated_tokens:null,phase:'thinking',stream_deltas:50,stream_chars:500,
+      decode_tps_live:50,decode_tps_mean:50,decode_tps_window_ms:1000,
+      decode_tps_sampled_at_ms:Date.now(),
+    };
+    await page.waitForFunction(()=>document.querySelector('[data-value="decode"]').textContent==='50.0');
+    assert.match(await page.locator('[data-value="output"]').textContent(),/已接收 50 段 · 500 字符/);
+    assert.match(await page.locator('[data-value="decode-label"]').textContent(),/Δ\/s/);
 
     assert.equal(await page.locator('[data-bar="host"]').evaluate(e=>e.style.width),'12.5%');
     assert.notEqual(await page.locator('.s-state').getAttribute('data-stale'),'true');

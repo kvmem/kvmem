@@ -21,6 +21,125 @@ EXE = '.exe' if os.name == 'nt' else ''
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_linux_controller_discovers_hipfire_worker(self):
+        package = Path(self.tmp.name) / 'hipfire-package'
+        (package / 'scripts').mkdir(parents=True)
+        (package / 'workers/hipfire').mkdir(parents=True)
+        for name in ('launcher-capabilities.json', 'speculative-capabilities.json'):
+            (package / 'scripts' / name).write_bytes((console.ROOT / 'scripts' / name).read_bytes())
+        worker = package / 'workers/hipfire/hipfire'
+        worker.write_text('#!/bin/sh\nexit 0\n')
+        worker.chmod(0o755)
+        controller = console.Controller(package, package / 'state', 18196)
+        self.assertIn('hipfire', controller.backends)
+        self.assertEqual(controller.worker_defaults()['hipfire']['path'], str(worker.resolve()))
+
+    def test_hipfire_plan_preserves_layerwise_scoring_metadata(self):
+        worker = Path(self.tmp.name) / 'hipfire'
+        worker.write_text('#!/bin/sh\nexit 0\n')
+        worker.chmod(0o755)
+        model = Path(self.tmp.name) / 'model.mq4-xts'
+        model.write_bytes(b'HFQM' + bytes(28))
+        profile = {'available': True, 'current_layer_q': True, 'query_replay': False,
+            'position_policy': 'original', 'model_architectures': ['qwen35'],
+            'max_devices': 1, 'max_concurrency': 8, 'minimum_reserve_blocks': 1,
+            'parallel_modes': ['single'], 'kv_formats': ['q8'],
+            'vision_residency': ['resident', 'cpu'], 'speculative': {'mtp': {
+                'available': True, 'draft_width_model_owned': True,
+                'history_policies': ['first-layer'], 'default_history_policy': 'first-layer',
+                'state_modes': ['native']}}}
+        capability = {'recall_strategy_revision': 1,
+                      'recall_strategies': {'layerwise': profile}}
+        parameters = dict(Backend='hipfire', Model=str(model), Worker=str(worker),
+            Gpu='GPU-00000000-0000-0000-0000-000000000001', Context=8192, Budget=4096, Reserve=1024, HostMiB=4096,
+            Prefill=512, MaxTokens=128, Port=18210, ListenHost='127.0.0.1',
+            SinkTokens=128, RecentTokens=128, Concurrency=1, RetainedSessions=1,
+            KvType='q8', SpeculativeMode='mtp', Vision=False, ThinkingMode='off',
+            PreserveThinking=True, CacheMinTokens=0, DiskMiB=0, RecallStrategy='layerwise')
+        with patch.object(self.controller, 'worker_capabilities', return_value=capability), \
+             patch('model_health.Inspection') as inspection:
+            inspection.return_value.run.return_value = {'can_start': True,
+                'model': {'format': 'HFQ', 'architecture': 'qwen35', 'arch_id': 5}}
+            result = self.controller.plan({'schema_version': 1, 'parameters': parameters})
+        self.assertEqual(result['resolved_scoring']['strategy'], 'layerwise')
+        self.assertEqual(result['resolved_scoring']['graph_alpha'], 0)
+        self.assertEqual(result['resolved_scoring']['current_layer_q'], True)
+
+    def test_hipfire_ready_requires_a_loaded_model(self):
+        key_file = Path(self.tmp.name) / 'hipfire.key'
+        key_file.write_text('secret\n')
+        key_file.chmod(0o600)
+        self.controller.active = {'parameters': {'Backend': 'hipfire', 'Port': 18200,
+                                                  'ApiKeyFile': str(key_file)}}
+        self.controller.process = MagicMock(pid=123)
+        self.controller.process.poll.return_value = None
+        def status_with(model):
+            response = MagicMock(status=200)
+            response.read.return_value = json.dumps({'model': model, 'n_ctx': 65536}).encode()
+            response.__enter__.return_value = response
+            with patch.object(console.urllib.request, 'urlopen', return_value=response) as opened:
+                result = self.controller.status()
+            self.assertEqual(opened.call_args.args[0].get_header('Authorization'), 'Bearer secret')
+            return result
+        loading = status_with(None)
+        self.assertEqual(loading['state'], 'starting')
+        self.assertTrue(loading['api_key_configured'])
+        ready = status_with('qwen3.8-27b.mq4-xts')
+        self.assertEqual(ready['state'], 'ready')
+
+    def test_hipfire_monitor_snapshot_uses_bounded_records_and_native_metrics(self):
+        state={'state':'ready','instance':'hipfire-one','url':'http://127.0.0.1:18200',
+               'active_config':{'parameters':{'Backend':'hipfire','Gpu':'GPU-test'}}}
+        records={
+            'active':{'id':'active','native_id':'chat-1','instance':'hipfire-one','state':'answering',
+                      'started_at_ms':1000,'has_media':True,
+                      'usage':{'prompt_tokens':100,'completion_tokens':5,
+                               'prompt_tokens_details':{'cached_tokens':80}}},
+            'done':{'id':'done','native_id':'chat-2','instance':'hipfire-one','state':'completed',
+                    'started_at_ms':500,'finished_at_ms':1500,'finish_reason':'stop',
+                    'timings':{'prefill_ms':200,'decode_tok_s':10}},
+        }
+        snapshot=console.hipfire_monitor_snapshot(state,records,
+            {'model':'qwen3.8-27b.mq4-xts','n_ctx':65536},
+            {'queue_depth':0,'requests_served':2},
+            'hipfire_kvmem_enabled 1\nhipfire_kvmem_layerwise 1\nhipfire_kvmem_spill_pages_total 7\n',
+            {'schema_version':1,'scope':'system','sampled_at_ms':2000})
+        self.assertEqual(snapshot['backend'],'hipfire')
+        self.assertEqual(snapshot['server_instance'],'hipfire-one')
+        self.assertEqual([row['id'] for row in snapshot['active']],['active'])
+        self.assertEqual([row['id'] for row in snapshot['recent']],['done'])
+        self.assertTrue(snapshot['active'][0]['has_media'])
+        self.assertEqual(snapshot['kvmem']['layerwise'],1)
+        self.assertEqual(snapshot['kvmem']['spill_pages_total'],7)
+        self.assertEqual(snapshot['recent'][0]['decode_tps_mean'],10)
+
+    def test_hipfire_monitor_reads_key_file_without_exposing_it(self):
+        key_file = Path(self.tmp.name) / 'hipfire.key'
+        key_file.write_text('monitor-secret\n', encoding='utf-8')
+        key_file.chmod(0o600)
+        self.controller.active = {'parameters': {'Backend': 'hipfire', 'ApiKeyFile': str(key_file)}}
+        self.assertEqual(self.controller.monitor_authorization(), 'Bearer monitor-secret')
+        self.assertIn('monitor-secret', self.controller.redactions)
+        self.assertNotIn('monitor-secret', json.dumps(self.controller.status()))
+
+    def test_hipfire_scan_finds_hfq_models_only(self):
+        scan = Path(self.tmp.name) / 'models'
+        scan.mkdir()
+        def hfq(name, arch):
+            data = bytearray(b'HFQM' + bytes(28))
+            data[8:12] = arch.to_bytes(4, 'little')
+            (scan / name).write_bytes(data)
+        hfq('qwen3.8-27b.mq4-xts', 5)
+        hfq('qwen3.8-27b-vision.hfq', 5)
+        hfq('qwen38-27b-dflash-mq4.hfq', 20)
+        directory = scan / 'qwen3.5-safetensors'
+        directory.mkdir()
+        (directory / 'config.json').write_text('{"model_type":"qwen3.5"}')
+        (directory / 'model.safetensors').write_bytes(bytes(16))
+        result = self.controller.scan_models({'backend': 'hipfire', 'directory': str(scan)})
+        self.assertEqual({item['name'] for item in result['models']}, {'qwen3.8-27b.mq4-xts'})
+        self.assertEqual({item['format'] for item in result['models']}, {'HFQ'})
+
     def test_ninfer_only_package_filters_backends_and_rejects_old_backend_drafts(self):
         package = Path(self.tmp.name) / 'ninfer-package'
         launcher = package / 'scripts/windows/start-backend.ps1'

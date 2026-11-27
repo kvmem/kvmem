@@ -463,7 +463,7 @@
       ? list.reduce((n, x) => n + x[field], 0)
       : null;
   function cacheData() {
-    if (state.backend === "polystrata" || state.backend === "radiance" ||
+    if (state.backend === "polystrata" || state.backend === "radiance" || state.backend === "hipfire" ||
         (state.backend === "llamacpp" && Object.hasOwn(state.kvmem || {}, "physical_payload_bytes"))) return state.kvmem || {};
     if (state.backend === "ninfer")
       return stats?.kvmem || props.kvmem?.usage || {};
@@ -620,6 +620,14 @@
     if (state.backend === 'llamacpp') slots.forEach((slot,index) => {
       if (slot.kvmem?.conversations) groups.push({id:'lane-'+index,label:t('执行槽 {0} · 会话',fmt(slot.id ?? index)),value:slot.kvmem.conversations});
     });
+    if (state.backend === 'hipfire') {
+      if (stats) groups.push({id:'scheduler',label:'hipfire · 服务',value:{
+        requests_served:stats.requests_served,queue_depth:stats.queue_depth,
+        recent_tok_s:stats.recent_tok_s,swap:stats.swap,
+        draft_positions:stats.draft_positions,spec_cycles:stats.spec_cycles,
+        spec_committed_tokens:stats.spec_committed_tokens}});
+      if (state.kvmem) groups.push({id:'kvmem',label:'hipfire · KVMem',value:state.kvmem});
+    }
     const keep = new Set();
     for (const group of groups) {
       const id = state.backend + '/' + group.id;
@@ -926,7 +934,7 @@
     const model = props.model_name || props.model_alias || t("本地模型");
     text(
       "model",
-      `${model} · ${{ninfer: "NInfer", polystrata: "PolyStrata", llamacpp: "llama.cpp"}[state.backend] || state.backend}`,
+      `${model} · ${{ninfer: "NInfer", polystrata: "PolyStrata", llamacpp: "llama.cpp", hipfire: "hipfire"}[state.backend] || state.backend}`,
     );
     const activeStates = new Set(state.active.map(displayState));
     const serviceStatus = !state.active.length ? "idle" :
@@ -942,10 +950,15 @@
     const requestScope = !r ? t("暂无请求") : liveRequest ? t("当前请求") : followLatest ? t("上次请求") : t("历史请求");
     text("request-scope", r ? `${requestScope} #${r.id} · ${requestStatus(r)}` : requestScope);
     $$("[data-request-scope]").forEach((e) => e.textContent = requestScope);
+    const outputBudget = number(r?.limit) && r.limit > 0 ? fmt(r.limit) : t("未设上限");
     text(
       "output",
       r
-        ? t("已生成 {0} tokens · 输出预算 {1}", fmt(r.generated_tokens), number(r.limit) && r.limit > 0 ? fmt(r.limit) : t("未设上限"))
+        ? number(r.generated_tokens)
+          ? t("已生成 {0} tokens · 输出预算 {1}", fmt(r.generated_tokens), outputBudget)
+          : liveRequest && state.backend === "hipfire"
+            ? t("已接收 {0} 段 · {1} 字符 · 输出预算 {2}", fmt(r.stream_deltas), fmt(r.stream_chars), outputBudget)
+            : t("已生成 {0} tokens · 输出预算 {1}", fmt(r.generated_tokens), outputBudget)
         : t("等待请求"),
     );
     bar("output", ratio(r?.generated_tokens, r?.limit));
@@ -970,17 +983,19 @@
     const engineDecode = state.backend === "ninfer" ? ninferLiveSpeed(r, liveRequest, nativeThroughput) : null;
     const realtimeSpeed = state.backend === "ninfer"
       ? requestSpeed ?? engineDecode
-      : ["llamacpp","radiance"].includes(state.backend) ? requestLiveSpeed(state, r, liveRequest)
+      : ["llamacpp","radiance","hipfire"].includes(state.backend) ? requestLiveSpeed(state, r, liveRequest)
       : liveRequest && state.backend === "polystrata" ? r?.decode_tps : null;
     text("decode", fmt(realtimeSpeed, 1));
     text("decode-label", state.backend === "ninfer" && requestSpeed !== null
       ? t("实时 · {0}s", fmt(r.decode_tps_window_ms / 1000, 0))
       : engineDecode !== null
       ? t("实时 · {0}s", fmt(nativeThroughput.seconds, nativeThroughput.seconds < 1 ? 2 : 0))
-      : ["llamacpp","radiance"].includes(state.backend) && number(r?.decode_tps_window_ms)
-        ? t("实时 · {0}s", fmt(r.decode_tps_window_ms / 1000, 1)) : t("实时速度"));
+      : ["llamacpp","radiance","hipfire"].includes(state.backend) && number(r?.decode_tps_window_ms)
+        ? state.backend === "hipfire" ? t("实时 · Δ/s") : t("实时 · {0}s", fmt(r.decode_tps_window_ms / 1000, 1)) : t("实时速度"));
     $("[data-live-speed]").title = state.backend === "ninfer" && requestSpeed === null
-      ? t("引擎区间吞吐，包含同期所有请求；本轮平均仅统计所选请求。") : "";
+      ? t("引擎区间吞吐，包含同期所有请求；本轮平均仅统计所选请求。")
+      : state.backend === "hipfire" && requestSpeed !== null
+        ? t("与 hipfire 原生 UI 同口径：SSE delta 事件/秒；事后均值才是 token/s。") : "";
     $("[data-live-speed]").hidden = !liveRequest;
     text("decode-mean", fmt(meanSpeed(r), 1));
     const prefill = prefillMetrics(state, r, liveRequest);
@@ -1150,11 +1165,11 @@
         snapshot.schema_version !== 1 ||
         !Array.isArray(snapshot.active) ||
         !Array.isArray(snapshot.recent) ||
-        !(Array.isArray(lanes) || (snapshot.backend==="radiance" && lanes===null))
+        !(Array.isArray(lanes) || (["radiance","hipfire"].includes(snapshot.backend) && lanes===null))
       )
         throw new Error(t("不兼容的监控数据"));
       const runtime =
-        ["ninfer","radiance"].includes(snapshot.backend)
+        ["ninfer","radiance","hipfire"].includes(snapshot.backend)
           ? await get("../stats", controller.signal)
           : null;
       if (snapshot.backend === "ninfer") {
