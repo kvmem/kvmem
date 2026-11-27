@@ -62,8 +62,8 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  console.log('PASS: English launch, saved-language override, picker/reload retention and URL preservation');
  const page=await browser.newPage({viewport:{width:1920,height:1080}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.goto(base+'/monitor/#config');await page.locator('[data-param=Backend]').waitFor();
- assert.deepEqual(info.backends,['llamacpp','ninfer','polystrata','radiance']);
- assert.deepEqual(await page.locator('[data-param=Backend] option').evaluateAll(items=>items.map(x=>x.value)),['llamacpp','ninfer','polystrata','radiance']);
+ assert.deepEqual(info.backends,['llamacpp','ninfer','polystrata','radiance','hipfire']);
+ assert.deepEqual(await page.locator('[data-param=Backend] option').evaluateAll(items=>items.map(x=>x.value)),['llamacpp','ninfer','polystrata','radiance','hipfire']);
  assert.equal(await page.locator('[data-view=config]').isVisible(),true);
  await page.locator('#launch-tab-6').click();
  const cacheMinimum=page.locator('[data-param=CacheMinTokens]');
