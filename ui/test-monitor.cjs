@@ -169,6 +169,36 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
       await noScripts.goto(url);
       assert.equal(await noScripts.locator('[data-ui-pending]').isVisible(), true);
     } finally { await noScripts.close(); }
+    const delayedConfig = await browser.newPage();
+    let releaseDetails;
+    const detailsReady = new Promise(resolve => { releaseDetails = resolve; });
+    const detailCalls = [];
+    const snapshots = [];
+    try {
+      fixtureScenario = {model:'Delayed configuration', liveLlama:true};
+      await delayedConfig.route(/\/(props|slots)$/, async route => {
+        detailCalls.push(new URL(route.request().url()).pathname);
+        await detailsReady;
+        await route.continue();
+      });
+      delayedConfig.on('response', response => {
+        if (new URL(response.url()).pathname === '/api/monitor/snapshot') snapshots.push(response);
+      });
+      await delayedConfig.goto(url);
+      const speed = delayedConfig.locator('[data-value="decode"]');
+      await delayedConfig.waitForFunction(() => document.querySelector('[data-value="decode"]')?.textContent === '23.5');
+      await delayedConfig.waitForResponse(response => new URL(response.url()).pathname === '/api/monitor/snapshot');
+      assert.equal(await speed.textContent(), '23.5');
+      assert.ok(snapshots.length >= 2);
+      assert.deepEqual(detailCalls.sort(), ['/props', '/slots']);
+      releaseDetails();
+      await delayedConfig.waitForFunction(() => document.querySelector('[data-value="model"]')?.textContent.includes('Delayed configuration'));
+      assert.equal(await speed.textContent(), '23.5');
+    } finally {
+      releaseDetails();
+      await delayedConfig.close();
+      fixtureScenario = {};
+    }
     const page = await browser.newPage({
         viewport: { width: 1440, height: 1100 },
       }),
@@ -542,6 +572,7 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     await page.setViewportSize({width:1440,height:1100});
     await runtime(null);fixtureScenario = {};
     await page.waitForFunction(()=>document.querySelector('[data-runtime-key="SpeculativeMode"] .s-runtime-value')?.textContent==='—');
+    await page.waitForFunction(() => document.querySelectorAll('[data-gpus] article').length === 1);
     assert.equal(await page.locator("[data-gpus] article").count(), 1);
     assert.equal(await page.locator("[data-service-state]").textContent(), "生成中");
     fixtureScenario = {dual: true, idle: true, missing: true};
@@ -574,7 +605,7 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     assert.equal(await page.locator('[data-gpu="status"]').textContent(),'本服务');
     assert.equal(await page.locator('[data-gpu="power"]').getAttribute('title'),'');
     fixtureScenario = {};
-    await page.waitForFunction(() => document.querySelectorAll("[data-gpus] article").length === 1);
+    await page.waitForFunction(() => document.querySelector('[data-gpu="load"]')?.textContent === '42');
     assert.equal(await page.evaluate(() => window.injected), undefined);
     await page.locator("[data-requests] button").click();
     assert.equal(await page.locator("[data-detail]").isVisible(), true);

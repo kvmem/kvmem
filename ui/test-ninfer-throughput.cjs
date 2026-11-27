@@ -1,7 +1,9 @@
 const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
 const code = fs.readFileSync(path.join(__dirname, 'monitor/monitor.js'), 'utf8');
-const helpers = code.slice(code.indexOf('  function parseNinferThroughput'), code.indexOf('  let throughputLog'));
-const {parseNinferThroughput: parse, ninferLiveSpeed: speed} = vm.runInNewContext(helpers + ';({parseNinferThroughput,ninferLiveSpeed})');
+const helpers = code.slice(code.indexOf('  function intervalRate'), code.indexOf('  let throughputLog'));
+const {parseNinferThroughput: parse, freshNinferThroughput, ninferLiveSpeed} = vm.runInNewContext(
+  helpers + ';({parseNinferThroughput,freshNinferThroughput,ninferLiveSpeed})');
+const speed = (snapshot, row, active, sample) => ninferLiveSpeed(row, active, freshNinferThroughput(snapshot, sample));
 const at = new Date('2026-10-25T15:00:00.000').getTime();
 const line = (body, interval='5.0s') => `2026-10-25 15:00:00.000  INFO  throughput | ${interval} | ${body} | running 1 (decode-ready 1) | batch 1.00\n`;
 const log = text => ({running:true,backend:'ninfer',started_at:at-60000,text});
@@ -24,5 +26,5 @@ assert.equal(parse(log('\x1b[32m'+native+'\x1b[0m')).rate,58.4);
 assert.equal(parse(log(line('prefill 1.20k tok/s (6,000 tok)'))).rate,0,'no decode in interval is zero');
 assert.equal(parse(log(line('decode 1.20k tok/s (6,000 tok)'))).rate,1200);
 assert.equal(parse(log(line('decode 40.0 tok/s (20 tok)','500 ms'))).seconds,0.5);
-assert.equal(parse(log(native+line('decode n/a tok/s (292 tok)'))),null,'malformed latest rate does not keep an old rate');
+assert.equal(parse(log(native+line('decode n/a tok/s (292 tok)'))).rate,null,'malformed latest rate does not keep an old rate');
 console.log('PASS: native interval rate, cumulative mean separation, stale/request/session boundaries, log formats.');

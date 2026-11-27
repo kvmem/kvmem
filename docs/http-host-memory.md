@@ -1,10 +1,11 @@
 # HTTP workers and host memory
 
 The llama.cpp KVMem server runs inference on HTTP workers. Its automatic pool
-is fixed at two workers per inference lane (`--parallel`), independent of the
-host CPU count. Both omitted and nonpositive `--threads-http` values select
-this default. A positive value selects that fixed number of workers; the pool
-does not expand when requests queue. `/props` startup configuration reports
+is fixed at four workers for a single inference lane and two workers per lane
+for multiple lanes (`--parallel`), independent of the host CPU count. Both
+omitted and nonpositive `--threads-http` values select this default. A positive
+value selects that fixed number of workers. The pool does not expand when
+requests queue. With `--kvmem-trace`, the `KVMEM_STARTUP ready` log reports
 `http.threads` and `http.max_threads`.
 
 This bounds the number of allocator arenas used by successive host-KV
@@ -16,11 +17,12 @@ after releasing a conversation, or that all allocator fragmentation disappears.
 The pool policy is portable; the demonstrated arena mechanism is specific to
 glibc and is not evidence of identical Windows or musl behavior.
 
-Two workers per lane leave capacity for a health/control request during one
-active generation per lane. A fully occupied HTTP pool queues further requests,
-including health requests. Increase `--threads-http` explicitly if the expected
-concurrent HTTP load requires it, accounting for the extra memory high-water
-marks. An explicit single worker can delay control requests during generation.
+The single-lane minimum leaves capacity for monitoring while a non-streaming
+request and a keep-alive connection occupy workers. A fully occupied HTTP pool
+queues further requests, including health requests. Increase `--threads-http`
+explicitly if the expected concurrent HTTP load requires it, accounting for the
+extra memory high-water marks. An explicit single worker can delay control
+requests during generation.
 
 The fix does not change process-wide allocator settings, trim memory after
 every request, restart the model, or change KV ownership or inference policy.

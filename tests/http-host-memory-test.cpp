@@ -36,7 +36,8 @@ int main(int argc, char ** argv) {
     std::unique_ptr<kvmem::RawKvStore> current;
     std::mutex store_mutex;
     httplib::Server server;
-    if (!legacy) assert(kvmem_configure_http_pool(server, 1) == 2);
+    constexpr int worker_count = 4;
+    if (!legacy) assert(kvmem_configure_http_pool(server, 1) == worker_count);
     std::set<std::thread::id> workers;
     server.Post("/document", [&](const httplib::Request &, httplib::Response & response) {
         std::lock_guard<std::mutex> lock(store_mutex);
@@ -96,7 +97,7 @@ int main(int argc, char ** argv) {
               << " last=" << last << " freed=" << freed << " trimmed=" << trimmed
               << " live=" << heap.uordblks << " free=" << heap.fordblks
               << " charged_final=" << storage->charged_bytes() << " plateau=" << plateau << '\n';
-    if (!legacy) assert(workers.size() <= 2);
+    if (!legacy) assert(workers.size() <= worker_count);
     return plateau ? 0 : 1;
 }
 #else
