@@ -1,0 +1,299 @@
+diff --git a/apps/serve/main.cpp b/apps/serve/main.cpp
+index 2f1ab2363080c9c417ef9aa54bd546991365aacd..6f33ae730d62fb26f1506750b5cc698a87068dd0 100644
+--- a/apps/serve/main.cpp
++++ b/apps/serve/main.cpp
+@@ -236,7 +236,8 @@ int main(int argc, char** argv) {
+                 {"query_replay", false}, {"position_policy", "original"},
+                 {"minimum_reserve_blocks", 1}, {"minimum_window_tokens", 256}, {"max_devices", 2},
+                 {"parallel_modes", {"single", "pipeline", "tensor"}}, {"max_concurrency", 8},
+-                {"kv_formats", {"bf16", "int8", "fp8", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8", "nvfp4", "k8v4"}}, {"vision_residency", {"resident", "cpu"}},
++                {"kv_formats", {"bf16", "int8", "fp8", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8", "nvfp4", "k8v4"}},
++                {"vision_residency", {"resident", "overlay", "cpu"}},
+                 {"model_architectures", {"Qwen3_5ForCausalLM"}},
+                 {"retained_metadata_scope", "program"},
+                 {"checkpoint_retention", {{"default_target", ninfer::kDefaultLayerwiseCheckpointTarget},
+diff --git a/docs/maintainer/paged-kv-cache.md b/docs/maintainer/paged-kv-cache.md
+index e34dc2a091d117163705b8ee14b18800413ba80a..55446862ef61c521fbe811a45b5d20282eddd1de 100644
+--- a/docs/maintainer/paged-kv-cache.md
++++ b/docs/maintainer/paged-kv-cache.md
+@@ -960,13 +960,14 @@ Representative image/copy/concurrency qualification is linked from the parent
+ ngram63 cold/restored newline difference remains unresolved; admission does not claim that
+ observation is fixed.
+ 
+-Resident or CPU vision supports 1..8 active requests. CPU image encoding remains serialized. Complete image pages are mandatory alongside
++Image requests support 1..8 active lanes with resident, CPU, or single-GPU overlay Vision.
++CPU image encoding remains serialized. Overlay Vision uses an exclusive weight window for
++each image encode and restores the weights before inference resumes. Complete image pages are mandatory alongside
+ the sink and append tail; admission rejects images that cannot fit B. Prefix identity includes
+ media content, token types and all MRoPE axes. Query replay rewinds use of the retained encoded
+ payload (CPU replay joins an outstanding encoder and re-encodes retained media), and MTP
+ boundary rebuilding consumes the same multimodal bridge. Host staging includes the shifted
+-MTP column even when Main has zero visual columns. Video and overlay vision remain outside
+-the supported KVMem combinations.
++MTP column even when Main has zero visual columns. KVMem vision covers static images.
+ 
+ Paired Engine `disk_path`/`disk_bytes` (or serving `--kvmem-disk-path`/`--kvmem-disk-mib`)
+ enable the common ephemeral SSD tier. H bounds native RAM records, D bounds native cold
+diff --git a/docs/serving.md b/docs/serving.md
+index b2648f2d795116cbb2d6d47132d8d4b69c8116cc..b16a81b0dc1f90ab310febbe35210edf716e0cd1 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -54,8 +54,7 @@ ledger.
+ Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
+ selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
+ artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`. With
+-KVMem, DFlash2 is currently restricted to one sequence on one GPU, with resident or CPU Vision
+-and 1 to 15 drafts. DFlash2
++KVMem, DFlash2 supports 1 to 15 drafts. On one GPU it can use resident, CPU or overlay Vision. DFlash2
+ accepts draft counts 1..15 and supports the same sampling, concurrency, prefix reuse, and
+ image/video request surfaces. It may remain combined with
+ `--vision`.
+@@ -203,6 +202,10 @@ item's merged tokens (media above it is downscaled at preprocessing) and sizes t
+ request log line reports `overlay=<windows>x<conc|excl|mixed> <ms> (evict <MiB> <ms>, restore <ms>,
+ staged <MiB>)` and the JSON record carries `vision_overlay`, including `exclusive_windows`.
+ 
++In KVMem mode, single-GPU image requests use the exclusive weight window for every overlay
++encode. Other requests can stay active and resume GPU execution after the weights are restored.
++The KV page budget stays available to KVMem throughout the encode.
++
+ `--vision-residency cpu` (or `--vision-cpu`, which also sets `--vision`) keeps no Vision memory on
+ the device at all: on the Qwen3.5 family (including Qwen3.6/3.8), the first uncached image encode
+ loads and decodes the tower to FP32 host memory (about 1.7 GiB), and each image is encoded on CPU
+diff --git a/src/models/qwen3_5/execution/vision.cpp b/src/models/qwen3_5/execution/vision.cpp
+index b18b79cfef58ab1c85c0d3a65225d3ea17619d95..fc5dac5229bd6ef094e3daa4d1558d7d0094599f 100644
+--- a/src/models/qwen3_5/execution/vision.cpp
++++ b/src/models/qwen3_5/execution/vision.cpp
+@@ -675,13 +675,13 @@ VisionOverlayWindowStats VisionPrefillSession::overlay_stats() const noexcept {
+ }
+ 
+ void VisionPrefillSession::rewind(std::uint32_t begin) {
+-    if (overlay_ || begin >= prompt_.token_ids.size()) {
+-        throw std::logic_error("Vision replay requires resident or CPU Vision and a valid prefill frontier");
++    if (begin >= prompt_.token_ids.size()) {
++        throw std::logic_error("Vision replay requires a valid prefill frontier");
+     }
+-    // A prefetched CPU result belongs to the old forward cursor. Join its worker
++    // A prefetched result belongs to the old forward cursor. Wait for its encoder
+     // before discarding that association and re-encoding retained query payloads.
+-    if (cpu_ && submitted_item_) {
+-        (void)cpu_->complete_item();
++    if (submitted_item_) {
++        (void)(overlay_ ? overlay_->complete_item() : cpu_->complete_item());
+         submitted_item_.reset();
+     }
+     next_use_ = 0;
+diff --git a/src/models/qwen3_5/execution/vision.h b/src/models/qwen3_5/execution/vision.h
+index 5d8e9d8320bc0ced0835e1d9aa7897ef553ef078..cc45390a2126b626974ceb5c0c4a9d8eadd156ef 100644
+--- a/src/models/qwen3_5/execution/vision.h
++++ b/src/models/qwen3_5/execution/vision.h
+@@ -113,7 +113,7 @@ public:
+     [[nodiscard]] bool vision_pending() const;
+     [[nodiscard]] VisionOverlayWindowStats overlay_stats() const noexcept;
+     void release_encoded_media_payloads() noexcept;
+-    // Resident/CPU KVMem query replay retains source payloads until this rewind.
++    // KVMem query replay retains source payloads until this rewind.
+     void rewind(std::uint32_t begin);
+     void retire_handoff() noexcept;
+     [[nodiscard]] double elapsed_seconds() const;
+diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
+index 68bd9f4b403df3cd043124fd71c29e098f80e6be..90be87574a4f33d6836f10eda9f021aca462fc05 100644
+--- a/src/models/qwen3_5/program/program_impl.cpp
++++ b/src/models/qwen3_5/program/program_impl.cpp
+@@ -65,7 +65,8 @@ std::unique_ptr<EvictableKVPool> make_kv_arena(DeviceContext& device,
+     if (granularity == 0 || plan.persistent.lendable_kv_end_bytes == 0) { return nullptr; }
+     const std::size_t lendable = plan.persistent.lendable_kv_end_bytes / granularity * granularity;
+     std::size_t window = 0;
+-    if (plan.features.overlay_vision()) {
++    // KVMem owns the page budget. Its Vision window borrows weights only.
++    if (plan.features.overlay_vision() && plan.kvmem_window_tokens == 0) {
+         const EvictableWeightPool* const pool = parameters.model.weight_pool();
+         if (pool == nullptr || !pool->mirror_captured()) {
+             throw std::logic_error("overlay Vision weight pool has no captured window");
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index 9a561a28b4789969ae792b88e061c833a70bcbd8..cecb0f2a342f8780ae8e56aa60a7f00a15eba687 100644
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -495,7 +495,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+         if (options.purpose != EnginePurpose::Generation || options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency ||
+             options.concurrent_prefill ||
+             (options.enable_vision && options.vision_residency != VisionResidency::Resident &&
+-                options.vision_residency != VisionResidency::Cpu) ||
++                options.vision_residency != VisionResidency::Cpu &&
++                options.vision_residency != VisionResidency::Overlay) ||
+             !memory_spec_supported ||
+             options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault ||
+             options.kv_capacity.mode != KvCapacityMode::Explicit ||
+@@ -522,7 +523,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+              options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
+              options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
+             throw std::invalid_argument("KVMem requires explicit B+R page-aligned "
+-                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-GPU/layer-pipeline/heads-TP DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
++                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or Vision lanes (overlay on one GPU), ordinary/fixed/adaptive MTP1..15 or single-GPU/layer-pipeline/heads-TP DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
+                 "and disabled prefix cache");
+         }
+     }
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index eb712a333ce6fd66d545a42d166459812d0f005a..3d5b34b14561c01158f569366f9b292bcc7a4b8d 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -258,9 +258,9 @@ std::string serve_usage_text(const char* argv0) {
+            "                                KVMem uses B+R device tokens and its own\n"
+            "                                verified history reuse; BF16/INT8/FP8/NVFP4/K8V4,\n"
+            "                                RK8V4/RK4V4/RK4V4-E8/RK2V4-E8,\n"
+-           "                                1..8 text or resident/CPU-vision lanes,\n"
+-           "                                ordinary/fixed/adaptive MTP1..15; DFlash2 1..15\n"
+-           "                                on one sequence/GPU; ngram1..63,\n"
++           "                                1..8 text or Vision lanes (overlay on one GPU),\n"
++           "                                ordinary/fixed/adaptive MTP1..15 or DFlash2 1..15;\n"
++           "                                ngram1..63,\n"
+            "                                C2..8 automatically cap ngram at 15;\n"
+            "                                ngram text/images use all nine KV formats,\n"
+            "                                SSD: process-local active/idle tiering; fast prefill supports\n"
+@@ -2350,8 +2350,6 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
+         if (legacy_cache_flag || hybrid_option_flag || original_cache_selected ||
+             options.context_cache.mode != ContextCacheMode::Legacy ||
+             options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency ||
+-            (options.enable_vision && options.vision_residency != VisionResidency::Resident &&
+-                options.vision_residency != VisionResidency::Cpu) ||
+             !memory_spec_supported || options.concurrent_prefill ||
+             (options.fast_prefill_kernel &&
+                 (options.kv_cache != KvCacheStorage::Int8Group64 &&
+@@ -2367,7 +2365,7 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
+              options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value &&
+              options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
+              options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
+-            throw std::invalid_argument("KVMem requires ordinary/fixed/adaptive MTP1..15 or single-GPU/layer-pipeline/heads-TP DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), single-GPU, layer-pipeline or heads-TP BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 generation, 1..8 text or resident/CPU-vision lanes, INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
++            throw std::invalid_argument("KVMem requires ordinary/fixed/adaptive MTP1..15 or single-GPU/layer-pipeline/heads-TP DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), single-GPU, layer-pipeline or heads-TP BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 generation, 1..8 text or Vision lanes (overlay on one GPU), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
+                 "and exclusive ownership of history caching");
+         }
+         if (options.kvmem.recall_strategy==kvmem::RecallStrategy::Layerwise)
+diff --git a/tests/experimental/p1_options.cpp b/tests/experimental/p1_options.cpp
+index 25866c76dd2f7593049015116cbd6df3d866158b..2414e89bfe05553871d19318170c6324bc0a5011 100644
+--- a/tests/experimental/p1_options.cpp
++++ b/tests/experimental/p1_options.cpp
+@@ -389,6 +389,21 @@ int main() {
+                 }
+             }
+         }
++        for (const auto lanes : {1U, 2U, 8U}) {
++            auto overlay = base;
++            overlay.enable_vision = true;
++            overlay.vision_residency = ninfer::VisionResidency::Overlay;
++            overlay.max_concurrency = lanes;
++            overlay.max_context = 8192;
++            overlay.prefill_chunk = 4096;
++            overlay.kvmem.reserve_tokens = 4096;
++            overlay.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(
++                overlay.kvmem.device_tokens() * lanes);
++            const auto normalized = ninfer::runtime::normalize_engine_options(overlay);
++            if (normalized.vision_residency != ninfer::VisionResidency::Overlay ||
++                normalized.max_concurrency != lanes)
++                throw std::runtime_error("Engine did not preserve concurrent KVMem Vision overlay");
++        }
+         const std::vector<std::function<void(ninfer::EngineOptions&)>> invalid{
+             [](auto& o) { o.max_concurrency = 2; },
+             [](auto& o) { o.max_concurrency = 9;
+@@ -396,7 +411,6 @@ int main() {
+             [](auto& o) { o.context_cache.enabled = true; },
+             [](auto& o) { o.kvmem.disk_path = "missing-quota"; },
+             [](auto& o) { o.kvmem.disk_bytes = 1ULL << 30; },
+-            [](auto& o) { o.enable_vision = true; o.vision_residency = ninfer::VisionResidency::Overlay; },
+             [](auto& o) { o.enable_vision = true; o.max_concurrency = 8;
+                          o.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(256); },
+             [](auto& o) { o.concurrent_prefill = true; },
+diff --git a/tests/models/qwen3_5/test_vision_overlay_real.cpp b/tests/models/qwen3_5/test_vision_overlay_real.cpp
+index 7717e6f2e3785d9ee04811e21377c8c708330fb3..476e38bab4f86119a9e65c1105218c4021261225 100644
+--- a/tests/models/qwen3_5/test_vision_overlay_real.cpp
++++ b/tests/models/qwen3_5/test_vision_overlay_real.cpp
+@@ -13,7 +13,8 @@
+ // Vision window, and one lane's item submitted ahead of its prefill unit can hold it when the other
+ // lane encodes its own item synchronously: that encode finishes the submitted item first. Both
+ // requests must complete, each reading its own image -- the first answer token (the color's name)
+-// of each concurrent request agrees with the one its image gives alone -- under both context caches.
++// of each concurrent request agrees with the one its image gives alone. KVMem must use the
++// exclusive weight window even when there is room in the KV pool.
+ namespace {
+ 
+ // A disc or a square of one color on a gray ground: something a model can name.
+@@ -95,21 +96,27 @@ bool agrees(const ninfer::GenerationResult& alone, const ninfer::GenerationResul
+     return shared >= 6 && margin <= 0.25F;
+ }
+ 
+-int run_with(const char* artifact, ninfer::ContextCacheMode mode) {
++int run_with(const char* artifact, ninfer::ContextCacheMode mode, bool kvmem = false) {
+     ninfer::EngineOptions options;
+     options.artifact_path            = artifact;
+     // Free KV beyond the two requests funds the window an item submitted ahead takes; the legacy
+     // cache accepts at most max_context tokens per lane.
+     options.max_context              = 8192;
+     options.kv_capacity              = ninfer::KvCapacityPolicy::explicit_capacity(16384);
+-    options.prefill_chunk            = 512;
++    options.prefill_chunk            = 4096;
+     options.enable_vision            = true;
+     options.vision_residency         = ninfer::VisionResidency::Overlay;
+     options.vision_max_merged_tokens = 256;
+     options.max_concurrency          = 2;
+     options.max_pending_requests     = 2;
+-    options.concurrent_prefill       = true;
++    options.concurrent_prefill       = !kvmem;
+     options.context_cache.mode       = mode;
++    if (kvmem) {
++        options.max_context = 16384;
++        options.context_cache.enabled = false;
++        options.kvmem = {.selected_tokens = 4096, .reserve_tokens = 4096,
++                         .host_bytes = 512ULL << 20};
++    }
+     ninfer::Engine engine(std::move(options));
+ 
+     const std::vector<std::vector<std::uint8_t>> images = {test_image(true, 230, 30, 30),
+@@ -126,7 +133,7 @@ int run_with(const char* artifact, ninfer::ContextCacheMode mode) {
+     std::vector<ninfer::GenerationResult> together;
+     for (auto& handle : handles) { together.push_back(handle.wait()); }
+ 
+-    const char* name = mode == ninfer::ContextCacheMode::Hybrid ? "hybrid" : "legacy";
++    const char* name = kvmem ? "kvmem" : mode == ninfer::ContextCacheMode::Hybrid ? "hybrid" : "legacy";
+     int failures     = 0;
+     if (alone[0].content_logprobs.empty() || alone[1].content_logprobs.empty() ||
+         alone[0].content_logprobs.front().id == alone[1].content_logprobs.front().id) {
+@@ -141,6 +148,14 @@ int run_with(const char* artifact, ninfer::ContextCacheMode mode) {
+                       << ": the concurrent request did not read its own image\n";
+             ++failures;
+         }
++        if (kvmem) {
++            const auto& timing = together[i].timings;
++            if (timing.overlay_windows == 0 || timing.overlay_windows != timing.overlay_exclusive_windows ||
++                timing.overlay_evicted_bytes == 0) {
++                std::cerr << "kvmem image " << i << ": expected an exclusive weight window\n";
++                ++failures;
++            }
++        }
+     }
+     return failures;
+ }
+@@ -152,6 +167,7 @@ int run() {
+     for (const auto mode : {ninfer::ContextCacheMode::Hybrid, ninfer::ContextCacheMode::Legacy}) {
+         failures += run_with(artifact, mode);
+     }
++    failures += run_with(artifact, ninfer::ContextCacheMode::Legacy, true);
+     return failures == 0 ? 0 : 1;
+ }
+ 
+diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
+index e3a6d84e47474d93c28c45f310423cd4a6641909..3e30e306d341ff067ce52ce746943c9c7d12d9a6 100644
+--- a/tests/test_serve_options.cpp
++++ b/tests/test_serve_options.cpp
+@@ -2616,6 +2616,14 @@ int run_serve_option_tests() {
+                           "--vision-residency overlay did not select overlay residency");
+         failures += check(overlay.vision_max_merged_tokens == 12288U,
+                           "--vision-max-merged did not set the merged-token budget");
++        const ServeOptions kvmem_overlay =
++            parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-residency", "overlay",
++                   "--kvmem-budget", "4096", "--kvmem-gen-reserve", "4096", "--kvmem-host-mib", "512",
++                   "--prefill-chunk", "4096", "--max-context", "16384", "--max-concurrency", "2",
++                   "--kv-capacity", "16384"});
++        failures += check(kvmem_overlay.vision_residency == ninfer::VisionResidency::Overlay &&
++                              kvmem_overlay.max_concurrency == 2 && kvmem_overlay.prefill_chunk == 4096,
++                          "serving dropped the concurrent KVMem Vision overlay configuration");
+         const ServeOptions resident = parse({"ninfer-serve", "model.ninfer", "--vision"});
+         failures += check(resident.vision_residency == ninfer::VisionResidency::Resident,
+                           "vision residency does not default to resident");

@@ -41,6 +41,12 @@ available from the adjacent information buttons in readable popovers; runtime
 settings and cache details expand on demand. Device-assignment warnings remain
 visible when assignments are unknown or no GPU is used.
 
+The monitor refreshes request snapshots independently of service configuration
+and slots. The configuration and slots refresh every five seconds in the
+foreground or every fifteen seconds in a background tab. The console forwards
+read-only monitoring requests directly to the owned worker, with readiness
+probes handled by launcher status.
+
 Context and default output limits share the resource row. Recall policy has a
 dedicated tab for scoring, graph propagation, LRFU and retention budgets; scoring,
 graph propagation and LRFU remain independently selectable. PolyStrata alone has

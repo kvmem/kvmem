@@ -786,7 +786,7 @@ class Controller:
                 'limited': limited, 'limit_reasons': sorted(reasons), 'skipped': skipped,
                 'other_formats': {key[1:]: len(value) for key, value in other.items()}}
 
-    def status(self):
+    def status(self, *, probe_health=True):
         with self.lock:
             service = None
             service_error = None
@@ -847,32 +847,33 @@ class Controller:
             if running and self.active and (not service or service['worker_matches']):
                 port = self.active['parameters'].get('Port', 18200)
                 result['url'] = f'http://127.0.0.1:{port}'
-                try:
-                    headers = {}
+                if probe_health:
                     try:
-                        authorization = self.monitor_authorization()
-                        if authorization:
-                            headers['Authorization'] = authorization
-                    except (OSError, ValueError):
+                        headers = {}
+                        try:
+                            authorization = self.monitor_authorization()
+                            if authorization:
+                                headers['Authorization'] = authorization
+                        except (OSError, ValueError):
+                            pass
+                        target = result['url'] + '/health'
+                        if headers:
+                            target = urllib.request.Request(target, headers=headers)
+                        with urllib.request.urlopen(target, timeout=0.5) as response:
+                            ready = response.status == 200
+                            if ready and self.active['parameters'].get('Backend') == 'hipfire':
+                                try:
+                                    health = json.loads(response.read(1024 * 1024))
+                                    ready = bool(health.get('model') and health.get('n_ctx'))
+                                except (ValueError, TypeError, OSError):
+                                    ready = False
+                            if ready:
+                                result['state'] = 'ready'
+                                self.launch_was_ready = True
+                    except urllib.error.HTTPError as error:
+                        error.close()
+                    except (OSError, urllib.error.URLError):
                         pass
-                    target = result['url'] + '/health'
-                    if headers:
-                        target = urllib.request.Request(target, headers=headers)
-                    with urllib.request.urlopen(target, timeout=0.5) as response:
-                        ready = response.status == 200
-                        if ready and self.active['parameters'].get('Backend') == 'hipfire':
-                            try:
-                                health = json.loads(response.read(1024 * 1024))
-                                ready = bool(health.get('model') and health.get('n_ctx'))
-                            except (ValueError, TypeError, OSError):
-                                ready = False
-                        if ready:
-                            result['state'] = 'ready'
-                            self.launch_was_ready = True
-                except urllib.error.HTTPError as error:
-                    error.close()
-                except (OSError, urllib.error.URLError):
-                    pass
             if self.memory_trial:
                 result['memory_trial'] = {**self.memory_trial, 'startup_verified': result['state'] == 'ready'}
             return result
@@ -1553,7 +1554,7 @@ class Handler(BaseHTTPRequestHandler):
                 revision = parse_qs(urlsplit(self.path).query).get('revision', [''])[0]
                 self.reply(200, self.control.log_snapshot(revision))
             elif path in ('/api/monitor/snapshot', '/props', '/slots', '/stats', '/server_info'):
-                state = self.control.status()
+                state = self.control.status(probe_health=False)
                 if not state['url']:
                     self.reply(503, {'error': 'No managed service is running'}); return
                 if path == '/api/monitor/snapshot' and state.get('active_config',{}).get('parameters',{}).get('Backend') == 'hipfire':
@@ -1563,7 +1564,7 @@ class Handler(BaseHTTPRequestHandler):
                         metrics=self.control.chat.get_text(state,'/metrics')
                         with self.control.chat.lock:
                             records=copy.deepcopy(self.control.chat.records)
-                        if state.get('instance') != self.control.status().get('instance'):
+                        if state.get('instance') != self.control.status(probe_health=False).get('instance'):
                             raise ValueError('Service changed while reading monitor data')
                         snapshot=hipfire_monitor_snapshot(state,records,health,stats,metrics,
                             self.server.hardware.snapshot())
@@ -1593,11 +1594,11 @@ class Handler(BaseHTTPRequestHandler):
                         elif path=='/props' and state.get('active_config',{}).get('parameters',{}).get('Backend')=='radiance':
                             info=self.control.chat.get_json(state,'/server_info')
                             snapshot=self.control.chat.get_json(state,'/api/monitor/snapshot')
-                            if state.get('instance')!=self.control.status().get('instance'):
+                            if state.get('instance')!=self.control.status(probe_health=False).get('instance'):
                                 raise ValueError('Service changed while reading runtime data')
                             body=enrich_props(json.loads(body),info,snapshot,state.get('radiance_template_effort'),state.get('monitor_devices'))
                         elif path == '/api/monitor/snapshot' and state.get('active_config',{}).get('parameters',{}).get('Backend') == 'radiance':
-                            if state.get('instance') != self.control.status().get('instance'):
+                            if state.get('instance') != self.control.status(probe_health=False).get('instance'):
                                 raise ValueError('Service changed while reading runtime data')
                             body = enrich_hardware(json.loads(body), self.server.hardware.snapshot())
                         self.reply(response.status, body)
