@@ -162,8 +162,8 @@ def check(hipfire_dir: Path | None, require_rust: bool = False) -> list[str]:
                 errors.append(f"individual patch archive is missing: {archive_name}")
             else:
                 archived = json.loads(archive.read_text(encoding="utf-8"))
-                if len(archived.get("patches", [])) != 67:
-                    errors.append("individual patch archive does not contain 67 patches")
+                if len(archived.get("patches", [])) != 68:
+                    errors.append("individual patch archive does not contain 68 patches")
                 if archived.get("patched_tree") != upstream.get("patched_tree"):
                     errors.append("individual patch archive final tree differs from upstream.json")
     patches = upstream.get("patches")
