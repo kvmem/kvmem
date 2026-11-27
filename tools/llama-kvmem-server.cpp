@@ -97,7 +97,7 @@ static void print_usage(const char * argv0) {
             "  --no-kvmem-trace           disable diagnostics, overriding the environment\n"
             "  --host HOST                bind address (default 127.0.0.1)\n"
             "  --port N                   port (default 8080)\n"
-            "  --threads-http N           fixed HTTP workers (auto: 2 per inference lane)\n"
+            "  --threads-http N           fixed HTTP workers (auto: at least 4, or 2 per lane)\n"
             "  --ui-dir PATH              serve static chat UI from PATH\n"
             "  --no-ui                    disable bundled chat UI\n"
             "  -c, --ctx-size N           context size (default 2048)\n"

@@ -935,10 +935,32 @@ class ConsoleTests(unittest.TestCase):
         response.__enter__.return_value.status = 200
         try:
             with patch.object(console.urllib.request, 'urlopen', return_value=response) as request:
+                route = self.controller.status(probe_health=False)
+                self.assertEqual(route['url'], 'http://127.0.0.1:18200')
+                request.assert_not_called()
                 result = self.controller.status()
             self.assertEqual(result['state'], 'ready')
             self.assertEqual(result['url'], 'http://127.0.0.1:18200')
             request.assert_called_once_with('http://127.0.0.1:18200/health', timeout=0.5)
+        finally:
+            self.controller.process = None
+
+    def test_monitor_routes_forward_without_rechecking_health(self):
+        self.controller.active = self.config
+        self.controller.process = SimpleNamespace(poll=lambda: None, pid=123)
+        paths = ('/api/monitor/snapshot', '/props', '/slots')
+        response = MagicMock()
+        response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = b'{}'
+        try:
+            with patch.object(console.urllib.request, 'urlopen', return_value=response) as send:
+                for path in paths:
+                    handler = MagicMock(path=path, control=self.controller, headers={})
+                    handler.trusted.return_value = True
+                    console.Handler.do_GET(handler)
+                    handler.reply.assert_called_once_with(200, b'{}')
+            self.assertEqual([args[0].full_url for args, _ in send.call_args_list],
+                             ['http://127.0.0.1:18200' + path for path in paths])
         finally:
             self.controller.process = None
 

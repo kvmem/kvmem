@@ -130,7 +130,7 @@
     detail = "",
     all = false,
     state = null,
-    props = null,
+    props = {},
     slots = [],
     stats = null;
   let timer,
@@ -141,6 +141,7 @@
     lastGood = 0,
     stopped = false;
   let lastError = null, restartNotice = false, consoleRuntime = null, runtimePropsInstance = null;
+  let detailsController = null, nextConfigPoll = 0, systemHardware = null;
   let series = {},
     previousDisk = null,
     speedRequest = null,
@@ -901,7 +902,7 @@
     }
   }
   function render(append) {
-    if (!state || !props) return;
+    if (!state) return;
     const r = currentRequest(),
       allRecords = records();
     if (speedRequest !== r?.id) {
@@ -1122,12 +1123,76 @@
     clearTimeout(timer);
     if (!stopped && !authNeeded) timer = setTimeout(poll, delay);
   }
+  function resetDetails() {
+    detailsController?.abort();
+    detailsController = null;
+    nextConfigPoll = 0;
+    runtimePropsInstance = null;
+    props = {};
+    slots = [];
+    stats = null;
+    throughputLog = null;
+    systemHardware = null;
+  }
+  function refreshDetails(snapshot, launchInstance) {
+    if (detailsController) return;
+    const request = new AbortController();
+    detailsController = request;
+    const timeout = setTimeout(() => request.abort(), 8000);
+    const instance = snapshot.server_instance;
+    const load = (path, apply, fallback) => get(path, request.signal).catch(error => {
+      if (fallback) return fallback(error);
+      throw error;
+    }).then(value => {
+      if (request.signal.aborted || currentInstance !== instance ||
+          consoleRuntime?.instance !== launchInstance || !state) return;
+      apply(value);
+      render(false);
+    });
+    const pending = [load("../api/launcher/hardware", value => {
+      systemHardware = value?.schema_version === 1 && value.scope === "system"
+        ? value : value === null ? null : {sampled_at_ms:null};
+      state.system_hardware = systemHardware;
+    }, error => error.status === 404 ? null : {sampled_at_ms:null})];
+    const now = Date.now();
+    if (now >= nextConfigPoll) {
+      nextConfigPoll = now + (document.hidden ? 15000 : 5000);
+      pending.push(load("../props", value => {
+        props = value;
+        runtimePropsInstance = launchInstance;
+      }), load("../slots", value => {
+        if (Array.isArray(value)) slots = value;
+      }, error => {
+        if (error.status === 404 && snapshot.backend === "radiance") return [];
+        throw error;
+      }));
+    }
+    if (["ninfer", "radiance"].includes(snapshot.backend)) {
+      pending.push(load("../stats", value => { stats = value; }));
+    }
+    if (snapshot.backend === "ninfer") {
+      // Read complete native log lines from this worker's current log session.
+      const previous = throughputLog;
+      pending.push(load("../api/launcher/logs?revision=" + encodeURIComponent(previous?.revision || ""), log => {
+        const sample = log?.running && log.backend === "ninfer"
+          ? log.text === null && log.session === previous?.session ? previous?.sample : parseNinferThroughput(log)
+          : null;
+        throughputLog = log ? {session: log.session, revision: log.revision, sample} : null;
+      }, () => null));
+    }
+    void Promise.allSettled(pending).finally(() => {
+      clearTimeout(timeout);
+      if (detailsController === request) detailsController = null;
+    });
+  }
   window.addEventListener("kvmem-runtime-status", (event) => {
-    const old = consoleRuntime?.state;
+    const old = consoleRuntime;
     consoleRuntime = event.detail;
+    if (old?.instance !== consoleRuntime?.instance) resetDetails();
     renderRuntimeConfiguration();
     renderConnection();
-    if (old !== consoleRuntime?.state && consoleRuntime?.state === "ready" && !busy) schedule(0);
+    if ((old?.state !== consoleRuntime?.state || old?.instance !== consoleRuntime?.instance) &&
+        consoleRuntime?.state === "ready" && !busy) schedule(0);
   });
   async function poll() {
     if (busy || stopped) return;
@@ -1136,43 +1201,18 @@
     const launchInstance = consoleRuntime?.instance;
     const abort = setTimeout(() => controller.abort(), 8000);
     try {
-      const [snapshot, configuration, lanes, systemHardware] = await Promise.all([
-        get("../api/monitor/snapshot", controller.signal),
-        get("../props", controller.signal),
-        get("../slots", controller.signal).catch(error => {
-          if (error.status===404) return null;
-          throw error;
-        }),
-        get("../api/launcher/hardware", controller.signal).catch(error =>
-          error.status === 404 ? null : {sampled_at_ms:null}),
-      ]);
+      const snapshot = await get("../api/monitor/snapshot", controller.signal);
       if (
         snapshot.schema_version !== 1 ||
         !Array.isArray(snapshot.active) ||
-        !Array.isArray(snapshot.recent) ||
-        !(Array.isArray(lanes) || (snapshot.backend==="radiance" && lanes===null))
+        !Array.isArray(snapshot.recent)
       )
         throw new Error(t("不兼容的监控数据"));
-      const runtime =
-        ["ninfer","radiance"].includes(snapshot.backend)
-          ? await get("../stats", controller.signal)
-          : null;
-      if (snapshot.backend === "ninfer") {
-        if (throughputLog?.instance !== snapshot.server_instance) throughputLog = null;
-        // Read the same redacted, complete native log lines as the console tab.
-        // A missing log endpoint must not take down other monitor metrics.
-        const log = await get("../api/launcher/logs?revision=" + encodeURIComponent(throughputLog?.revision || ""), controller.signal).catch(() => null);
-        const sample = log?.running && log.backend === "ninfer"
-          ? log.text === null && log.session === throughputLog?.session
-            ? throughputLog.sample : parseNinferThroughput(log)
-          : null;
-        throughputLog = log ? {instance:snapshot.server_instance, session:log.session, revision:log.revision, sample} : null;
-      } else throughputLog = null;
       if (consoleRuntime?.instance !== launchInstance) return;
-      runtimePropsInstance = launchInstance;
       const restarted =
         currentInstance !== null &&
         currentInstance !== snapshot.server_instance;
+      if (restarted || (state && state.backend !== snapshot.backend)) resetDetails();
       if (restarted) {
         series = {};
         previousDisk = null;
@@ -1181,16 +1221,12 @@
         detail = "";
       }
       currentInstance = snapshot.server_instance;
-      snapshot.system_hardware = systemHardware?.schema_version === 1 && systemHardware.scope === "system"
-        ? systemHardware : systemHardware === null ? null : {sampled_at_ms:null};
+      snapshot.system_hardware = systemHardware;
       for (const row of [...snapshot.active, ...snapshot.recent]) {
         if (number(row.actual_cached_tokens)) row.cached_tokens = row.actual_cached_tokens;
         else if (String(row.reuse_accounting_scope || '').startsWith('admission_quote')) row.cached_tokens = null;
       }
       state = snapshot;
-      props = configuration;
-      slots = lanes || [];
-      stats = runtime;
       failures = 0;
       lastGood = Date.now();
       authNeeded = false;
@@ -1200,10 +1236,12 @@
       restartNotice = restarted;
       renderConnection();
       render(true);
+      refreshDetails(snapshot, launchInstance);
     } catch (error) {
       controller.abort();
       failures++;
       authNeeded = error.status === 401 || error.status === 403;
+      if (authNeeded) resetDetails();
       $("[data-auth]").hidden = !authNeeded;
       if (authNeeded && !document.querySelector('[data-view="config"]:not([hidden]), [data-view="logs"]:not([hidden])')) page("monitor");
       lastError = error;
@@ -1245,7 +1283,7 @@
     key = "";
     storage(sessionStorage, "kvmem-monitor-key", null);
     state = null;
-    props = null;
+    resetDetails();
     selected = "";
     series = {};
     previousDisk = null;
@@ -1260,6 +1298,7 @@
     stopped = true;
     clearTimeout(timer);
     controller?.abort();
+    detailsController?.abort();
   });
   window.addEventListener("pageshow", () => {
     if (stopped) {

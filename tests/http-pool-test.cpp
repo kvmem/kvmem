@@ -18,9 +18,10 @@ using namespace std::chrono_literals;
 int main() {
     for (int lanes : {1, 2, 4, 8}) {
         httplib::Server server;
-        assert(kvmem_configure_http_pool(server, lanes) == 2 * lanes);
-        assert(kvmem_configure_http_pool(server, lanes, 0) == 2 * lanes);
-        assert(kvmem_configure_http_pool(server, lanes, -3) == 2 * lanes);
+        const int expected = lanes == 1 ? 4 : 2 * lanes;
+        assert(kvmem_configure_http_pool(server, lanes) == expected);
+        assert(kvmem_configure_http_pool(server, lanes, 0) == expected);
+        assert(kvmem_configure_http_pool(server, lanes, -3) == expected);
         assert(kvmem_configure_http_pool(server, lanes, 19) == 19);
     }
     for (int lanes : {0, 9}) {
@@ -35,7 +36,8 @@ int main() {
     }
 
     httplib::Server server;
-    assert(kvmem_configure_http_pool(server, 1) == 2);
+    constexpr int worker_count = 4;
+    assert(kvmem_configure_http_pool(server, 1) == worker_count);
     std::mutex mutex;
     std::condition_variable changed;
     std::set<std::thread::id> threads;
@@ -77,20 +79,25 @@ int main() {
         std::unique_lock<std::mutex> lock(mutex);
         assert(changed.wait_for(lock, 3s, [&] { return entered == 1; }));
     }
-    // A long generation must leave another worker for health/control traffic.
-    auto health = std::async(std::launch::async, [&] { return get("/health"); });
-    assert(health.wait_for(3s) == std::future_status::ready && health.get() == "OK");
     auto second = std::async(std::launch::async, [&] { return get("/hold"); });
     {
         std::unique_lock<std::mutex> lock(mutex);
         assert(changed.wait_for(lock, 3s, [&] { return entered == 2; }));
     }
+    // Generation and a second occupied HTTP connection must leave room for monitoring.
+    auto health = std::async(std::launch::async, [&] { return get("/health"); });
+    assert(health.wait_for(3s) == std::future_status::ready && health.get() == "OK");
     std::vector<std::future<std::string>> queued;
+    for (int i = 2; i < worker_count; ++i) queued.push_back(std::async(std::launch::async, [&] { return get("/hold"); }));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(changed.wait_for(lock, 3s, [&] { return entered == worker_count; }));
+    }
     for (int i = 0; i < 8; ++i) queued.push_back(std::async(std::launch::async, [&] { return get("/hold"); }));
     {
         std::unique_lock<std::mutex> lock(mutex);
         // Overflow requests stay queued rather than creating new allocator arenas.
-        assert(!changed.wait_for(lock, 200ms, [&] { return entered > 2; }));
+        assert(!changed.wait_for(lock, 200ms, [&] { return entered > worker_count; }));
         release = true;
     }
     changed.notify_all();
@@ -99,6 +106,6 @@ int main() {
     for (int i = 0; i < 24; ++i) assert(get("/health") == "OK");
     assert(get("/stream") == "data: done\n\n");
     server.stop(); serving.join();
-    assert(entered == 10 && threads.size() <= 2);
+    assert(entered == worker_count + 8 && threads.size() <= worker_count);
     std::cout << "HTTP pool: fixed worker bound, queued overflow, health and streaming passed\n";
 }
