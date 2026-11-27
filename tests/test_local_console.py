@@ -21,6 +21,7 @@ EXE = '.exe' if os.name == 'nt' else ''
 
 
 class ConsoleTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'hipfire KVMem integration is Linux-only')
     def test_linux_controller_discovers_hipfire_worker(self):
         package = Path(self.tmp.name) / 'hipfire-package'
         (package / 'scripts').mkdir(parents=True)
@@ -34,6 +35,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('hipfire', controller.backends)
         self.assertEqual(controller.worker_defaults()['hipfire']['path'], str(worker.resolve()))
 
+    @unittest.skipIf(os.name == 'nt', 'hipfire KVMem integration is Linux-only')
     def test_hipfire_plan_preserves_layerwise_scoring_metadata(self):
         worker = Path(self.tmp.name) / 'hipfire'
         worker.write_text('#!/bin/sh\nexit 0\n')
@@ -122,6 +124,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('monitor-secret', self.controller.redactions)
         self.assertNotIn('monitor-secret', json.dumps(self.controller.status()))
 
+    @unittest.skipIf(os.name == 'nt', 'hipfire KVMem integration is Linux-only')
     def test_hipfire_scan_finds_hfq_models_only(self):
         scan = Path(self.tmp.name) / 'models'
         scan.mkdir()

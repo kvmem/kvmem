@@ -76,6 +76,11 @@ GROUPS = (
             "ui-capability-inspect", "layerwise-feed-capture",
         ),
     },
+    {
+        "id": "layerwise-no-refresh",
+        "file": "hipfire-layerwise-no-refresh.patch",
+        "patches": ("layerwise-no-refresh",),
+    },
 )
 
 

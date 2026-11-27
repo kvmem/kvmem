@@ -198,7 +198,8 @@ class HipfireIndexTest(unittest.TestCase):
                 encoding='utf-8'))
             entry = prepare.backend_entry(versions, 'hipfire')
             self.assertEqual(entry['layout'], 'external-checkout-with-patches')
-            self.assertEqual(len(entry['patches']), 3)
+            self.assertEqual(len(entry['patches']), 4)
+            self.assertEqual(entry['patches'][-1]['id'], 'layerwise-no-refresh')
             self.assertEqual(entry['patches'][-1]['after_tree'], entry['patched_tree'])
         finally:
             prepare.ROOT = previous
