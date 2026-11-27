@@ -66,7 +66,7 @@ async function api(action,data){const response=await fetch(base+'/api/launcher/'
  assert.deepEqual(info.backends.filter(name=>name!=='hipfire'),requiredBackends);
  assert.equal(new Set(info.backends).size,info.backends.length);
  assert.ok(info.backends.every(name=>[...requiredBackends,'hipfire'].includes(name)));
- assert.deepEqual(await page.locator('[data-param=Backend] option').evaluateAll(items=>items.map(x=>x.value)),info.backends);
+ assert.deepEqual(await page.locator('[data-param=Backend] option').evaluateAll(items=>items.filter(x=>!x.disabled).map(x=>x.value)),info.backends);
  assert.equal(await page.locator('[data-view=config]').isVisible(),true);
  await page.locator('#launch-tab-6').click();
  const cacheMinimum=page.locator('[data-param=CacheMinTokens]');
