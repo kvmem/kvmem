@@ -150,7 +150,7 @@ class RealManifestTest(unittest.TestCase):
         self.assertEqual(individual["patched_tree"], manifest["patched_tree"])
         self.assertEqual(
             [item["id"] for item in manifest["patches"]],
-            ["escha-baseline", "fork-base", "kvmem-stack"],
+            ["escha-baseline", "fork-base", "kvmem-stack", "layerwise-no-refresh"],
         )
         by_group = {item["id"]: item for item in manifest["patches"]}
         baseline = (manifest_path.parent / by_group["escha-baseline"]["path"]).read_bytes()
