@@ -165,7 +165,12 @@ class LayerwiseProductTest(unittest.TestCase):
                 '-File',str(ROOT/'scripts/windows/describe-launch-json.ps1'),'-BackendRoot',str(ROOT),
                 '-ConfigFile',str(config)],capture_output=True,timeout=20)
             self.assertEqual(run.returncode,0,run.stderr.decode('utf-8','replace'))
-            self.assertEqual(json.loads(run.stdout.decode('utf-8-sig'))['argv'],build_plan(data)['argv'])
+            result = json.loads(run.stdout.decode('utf-8-sig'))
+            portable = build_plan(data)
+            self.assertEqual(result['argv'], portable['argv'])
+            self.assertEqual(result['token_settings'], portable['token_settings'])
+            if backend == 'ninfer':
+                self.assertIn('KVMEM_CONFIG Prefill: 128 -> 64 tokens', result['warnings'])
 
     @unittest.skipUnless(os.name == 'nt', 'Windows activation-only SSD preview')
     def test_windows_activation_only_ssd_uses_shared_directory_with_zero_canonical_quota(self):

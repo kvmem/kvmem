@@ -8,12 +8,14 @@ foreach ($property in $inputConfig.PSObject.Properties) {
     $parameters[$property.Name] = $property.Value
 }
 $parameters.DryRun = $true
-$output = & (Join-Path $BackendRoot 'scripts/windows/start-backend.ps1') @parameters
-$text = $output -join "`n"
+$output = @(& (Join-Path $BackendRoot 'scripts/windows/start-backend.ps1') @parameters 3>&1)
+$warnings = @($output | Where-Object { $_ -is [System.Management.Automation.WarningRecord] } | ForEach-Object Message)
+$text = ($output | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] }) -join "`n"
 $jsonStart = $text.IndexOf('{')
 if ($jsonStart -lt 0) { throw 'Launcher did not return a launch plan' }
-if ($jsonStart -gt 0) { Write-Output $text.Substring(0, $jsonStart) }
+if ($jsonStart -gt 0) { $warnings += $text.Substring(0, $jsonStart).Trim() }
 $plan = $text.Substring($jsonStart) | ConvertFrom-Json
+if ($warnings.Count) { $plan | Add-Member -NotePropertyName warnings -NotePropertyValue ($warnings -join "`n") }
 $port = if ($parameters.ContainsKey('Port')) { [int]$parameters.Port } else { 18200 }
 $listenHost = if ($parameters.ContainsKey('ListenHost')) { [string]$parameters.ListenHost } else { '127.0.0.1' }
 $probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse($listenHost), $port)

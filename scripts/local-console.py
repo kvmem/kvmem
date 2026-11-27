@@ -459,7 +459,8 @@ class Controller:
                     result.setdefault('environment',{})['STRATA_API_KEY']=api_key if reveal_secrets else '<redacted>'
                 else:
                     argv.extend(['--api-key', api_key if reveal_secrets else '<redacted>'])
-            result['warnings'] = self.redact(run.stdout[:start].strip())
+            warnings = (run.stdout[:start].strip(), result.get('warnings', ''))
+            result['warnings'] = self.redact('\n'.join(filter(None, warnings)))
             native_argv = result.get('native_argv', argv)
             result['worker'] = self.worker_capabilities(native_argv[0], params['Backend'])
             require_launch_features(result['worker'], result.get('effective_parameters', params))
