@@ -41,6 +41,17 @@ class RadiancePlanTest(unittest.TestCase):
                 args=plan['argv']
                 self.assertEqual(args[args.index('--max-num-batched-tokens')+1],str(expected))
 
+    def test_explicit_thinking_has_one_native_setting(self):
+        args = self.plan(ThinkingMode='on', ReasoningEffort='low', PreserveThinking=False)['argv']
+        self.assertEqual(args[args.index('--reasoning-effort') + 1], 'low')
+        kwargs = json.loads(args[args.index('--chat-template-kwargs') + 1])
+        self.assertEqual(kwargs, {'preserve_thinking': False})
+
+        args = self.plan(ThinkingMode='on', PreserveThinking=False)['argv']
+        self.assertNotIn('--reasoning-effort', args)
+        kwargs = json.loads(args[args.index('--chat-template-kwargs') + 1])
+        self.assertEqual(kwargs, {'enable_thinking': True, 'preserve_thinking': False})
+
     def test_cache_minimum(self):
         self.assertEqual(self.plan()['argv'],self.plan(CacheMinTokens=0)['argv'])
         for value in (4095,4096,4097,2147483647):

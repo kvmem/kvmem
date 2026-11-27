@@ -61,11 +61,12 @@ def worker_digest(path):
 def probe_worker(worker, backend, environment=None):
     path = Path(worker).resolve()
     identity = _identity(path)
+    probe = dict(capture_output=True, encoding='utf-8', errors='replace', timeout=10, cwd=path.parent,
+                 env={**os.environ, **(environment or {}), 'CUDA_VISIBLE_DEVICES': '-1',
+                      'HIP_VISIBLE_DEVICES': '-1', 'ROCR_VISIBLE_DEVICES': '-1'},
+                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     try:
-        run = subprocess.run([str(path), '--kvmem-capabilities'], capture_output=True,
-            encoding='utf-8', errors='replace', timeout=10, cwd=path.parent,
-            env={**os.environ, **(environment or {}), 'CUDA_VISIBLE_DEVICES': '-1', 'HIP_VISIBLE_DEVICES':'-1', 'ROCR_VISIBLE_DEVICES':'-1'},
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        run = subprocess.run([str(path), '--kvmem-capabilities'], **probe)
         value = json.loads(run.stdout)
         if (run.returncode or not isinstance(value, dict) or value.get('schema_version') != 1
                 or value.get('backend') != backend or value.get('query_scoring_revision', 0) < 2
@@ -73,6 +74,17 @@ def probe_worker(worker, backend, environment=None):
             raise ValueError('incompatible worker contract')
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         raise ValueError('Worker does not support this launch contract; update the complete package. ' + str(path)) from error
+    if backend == 'ninfer':
+        if _identity(path) != identity:
+            raise ValueError('Worker changed during capability probing; retry after the update completes')
+        # The native capability document predates these switches. With no
+        # artifact argument, successful parsing terminates before loading a model.
+        try:
+            switches = subprocess.run([str(path), '--thinking', '--no-preserve-thinking'], **probe)
+            value['explicit_thinking_switches'] = bool(
+                switches.returncode and 'artifact path is required' in switches.stderr)
+        except (OSError, subprocess.TimeoutExpired):
+            value['explicit_thinking_switches'] = False
     digest = worker_digest(path)
     if _identity(path) != identity:
         raise ValueError('Worker changed during capability probing; retry after the update completes')
@@ -87,6 +99,10 @@ def supports_inkling_fp8(capabilities):
 
 
 def require_launch_features(capabilities, parameters):
+    if (parameters.get('Backend') == 'ninfer' and capabilities.get('explicit_thinking_switches') is False
+            and (parameters.get('ThinkingMode') == 'on' or parameters.get('PreserveThinking') is False)):
+        raise ValueError('当前 NInfer 无法在启动时显式开启思考或关闭历史思考保留，请更新后端。 / '
+                         'Update the NInfer worker to explicitly enable thinking or disable reasoning history.')
     if (parameters.get('Backend') == 'llamacpp' and '--mcp-servers-config' in parameters.get('WorkerArgs', [])
             and capabilities.get('mcp_stdio') is not True):
         raise ValueError('Update the llama.cpp worker to a version with native stdio MCP support')

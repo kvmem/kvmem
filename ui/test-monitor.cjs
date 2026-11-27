@@ -58,10 +58,15 @@ const server = http.createServer((req, res) => {
     }
     if (req.url.startsWith('/api/launcher/logs')) {
       if (fixture.logFailure) { res.statusCode=503; return res.end('{}'); }
-      const now = new Date(Date.now() - (fixture.staleThroughput ? 20000 : 0)), pad = n => String(n).padStart(2,'0');
-      const stamp = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.000`;
+      const updated = Date.now() - (fixture.staleThroughput ? 20000 : 0);
+      const now = new Date(updated), pad = n => String(n).padStart(2,'0');
+      const stamp = fixture.logZoneMinutes === undefined
+        ? `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}.000`
+        : new Date(updated + fixture.logZoneMinutes * 60000).toISOString().slice(0,-1).replace('T',' ');
       const throughput = fixture.logThroughput ?? 'decode 58.4 tok/s (292 tok)';
-      return res.end(JSON.stringify({running:true,backend:'ninfer',session:'test',started_at:Date.now()-60000,revision:String(Date.now()),text:`${stamp}  INFO  throughput | 5.0s | ${throughput} | running 1 (decode-ready 1)\n`}));
+      return res.end(JSON.stringify({running:true,backend:'ninfer',session:'test',started_at:Date.now()-60000,
+        updated_at:fixture.logZoneMinutes === undefined ? undefined : updated,revision:String(Date.now()),
+        text:`${stamp}  INFO  throughput | 5.0s | ${throughput} | running 1 (decode-ready 1)\r\n`}));
     }
     const payload =
       req.url === "/props"
@@ -298,7 +303,7 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     fixtureScenario = {backend:'ninfer'};
     await page.waitForFunction(() => document.querySelector('[data-value="decode"]').textContent === '58.4');
     assert.equal(await page.locator('[data-value="decode-mean"]').textContent(),'8.0');
-    assert.equal(await page.locator('[data-value="decode-label"]').textContent(),'实时 · 5s');
+    assert.equal(await page.locator('[data-value="decode-label"]').textContent(),'引擎生成 · 5s');
     assert.equal(await page.locator('[data-value="queue"]').textContent(),'活动 1 · 排队 2');
     fixtureScenario={backend:'ninfer',nativeStats:{queue:{depth:2,entries:[{request_id:'<img onerror=bad()>',prompt:'must-not-render'}]},
       kvmem:{history_misses:3,disk_errors:2,disk_written_bytes:2097152,statistics_bytes:1048576},
@@ -318,18 +323,26 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     // A non-streaming request can stay in processing while the engine reports both rates.
     fixtureScenario = {backend:'ninfer', active:[{...record(),status:'processing',
       generated_tokens:0,prefill_tps:null,decode_tps:null}],
-      logThroughput:'prefill 1.25k tok/s (6,250 tok) | decode 17.2 tok/s (86 tok)'};
+      logZoneMinutes:480, logThroughput:'prefill 1.25k tok/s (6,250 tok) | decode 17.2 tok/s (86 tok)'};
     const expectEngineRate = (phase, value) => page.waitForFunction(({phase, value}) =>
       document.querySelector(`[data-value="engine-${phase}-speed"]`).textContent === value, {phase, value});
     await expectEngineRate('prefill', '1,250.0');
     await expectEngineRate('decode', '17.2');
     assert.equal(await page.locator('[data-engine-throughput]').isVisible(), true);
     assert.equal(await page.locator('[data-value="engine-throughput-window"]').textContent(), '5.0s 统计窗口');
+    assert.equal(await page.locator('[data-value="decode"]').textContent(), '17.2');
+    assert.equal(await page.locator('[data-value="decode-label"]').textContent(), '引擎生成 · 5s');
     assert.equal(await page.locator('[data-value="decode-mean"]').textContent(), '—');
     assert.equal(await page.locator('[data-value="prefill"]').textContent(), '—');
     await page.selectOption('[data-language-select]', 'en');
     assert.equal(await page.getByRole('region', {name:'Engine throughput'}).isVisible(), true);
     await page.selectOption('[data-language-select]', 'zh-CN');
+    const utc = await browser.newPage({timezoneId:'UTC'});
+    try {
+      await utc.goto(url);
+      await utc.waitForFunction(() => document.querySelector('[data-value="decode"]').textContent === '17.2');
+      assert.equal(await utc.locator('[data-value="engine-decode-speed"]').textContent(), '17.2');
+    } finally { await utc.close(); }
     fixtureScenario.logThroughput = 'prefill 1.25k tok/s (6,250 tok)';
     await expectEngineRate('decode', '0.0');
     fixtureScenario.staleThroughput = true;
@@ -504,15 +517,17 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
       host_payload_budget_bytes:4*1024**3,capabilities:{disk_budget_bytes:8*1024**3,ssd_enabled:true,max_active_requests:2,ngram_min_match:12}},
       speculative:{algorithm:'dflash2',draft_tokens:5,adaptive:false,ngram_draft_tokens:16},
       execution:{monitor_devices:[],stage_layers:[20,20]},total_slots:2}};
-    await runtime({state:'ready',instance:'config-ninfer',active_config:{parameters:{Backend:'ninfer',Budget:16384,Reserve:1024,
+    await runtime({state:'ready',instance:'config-ninfer',worker:{explicit_thinking_switches:true},active_config:{parameters:{Backend:'ninfer',Budget:16384,Reserve:1024,
       Prefill:512,Context:32768,KvType:'int8',SpeculativeMode:'dflash2',DraftTokens:5,NgramDrafts:16,FastPrefill:false,
-      Concurrency:2,MaxTokens:4096,ThinkingMode:'default',ThinkingBudget:0,PreserveThinking:false,
+      Concurrency:2,MaxTokens:4096,ThinkingMode:'on',ThinkingBudget:0,PreserveThinking:false,
       DiskEnabled:true,DiskPath:'C:/cache/<img src=x onerror=bad()>',ListenHost:'127.0.0.1',Port:18200}},
       token_settings:{block_tokens:64,effective:{Prefill:512}},effective_scoring:{scorer:'page-softmax',agg:'mean',graph_alpha:0.1,lrfu:true,query_max_tokens:512,query_replay_max_tokens:2048}});
     await page.waitForFunction(()=>document.querySelector('[data-runtime-key="NgramDrafts"] .s-runtime-value')?.textContent==='16 tokens');
     assert.equal(await value('Budget'),'16,384');
     assert.equal(await value('Reserve'),'1,024');
     assert.equal(await value('FastPrefill'),'关闭');
+    assert.equal(await value('ThinkingMode'),'开启');
+    assert.equal(await value('PreserveThinking'),'关闭');
     assert.equal(await setting('FastPrefill').getAttribute('data-source'),'launch');
     assert.equal(await value('StageLayers'),'20 / 20');
     assert.equal(await page.locator('[data-runtime-config] img').count(),0);

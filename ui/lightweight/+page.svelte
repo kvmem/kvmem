@@ -1454,7 +1454,7 @@
               disabled={value("enable_thinking") === false}
               value={value("reasoning_effort") || ""}
               onchange={(e) => edit("reasoning_effort", e.currentTarget.value)}
-              ><option value="" disabled>{t(ctx?.uses_template_effort ? "跟随模型" : "未报告")}</option
+              ><option value="" disabled>{t("未报告")}</option
               >{#if value("reasoning_effort") === "none"}<option value="none"
                   >none</option
                 >{/if}{#each ctx.capabilities.efforts as effort}<option
@@ -1470,7 +1470,7 @@
               max={ctx?.limit}
               step="1"
               value={f.key === "max_tokens" && value(f.key) != null && value(f.key) <= 0 ? "" : (value(f.key) ?? "")}
-              placeholder={t(f.key === "max_tokens" && value(f.key) != null && value(f.key) <= 0 ? "不限制（跟随服务）" : "未报告")}
+              placeholder={t(f.key === "max_tokens" && value(f.key) != null && value(f.key) <= 0 ? "未设独立输出上限" : "未报告")}
               onchange={(e) => editNumber(f.key, e.currentTarget)}
             /></label
           >{/each}<small

@@ -32,7 +32,7 @@ ENGINE_DEFAULTS = {'ninfer': {'Context': 262144,
             'QueryReplayMaxTokens': 0,
             'CheckpointExtraRecomputeTokens': 0,
             'CacheMinTokens': 0,
-            'ThinkingMode': 'default',
+            'ThinkingMode': 'on',
             'KvType': 'int8',
             'Prefill': 256,
             'DraftTokens': 4,
@@ -117,7 +117,7 @@ RADIANCE_LAUNCH_DEFAULTS = dict(Backend='radiance', Context=65536, Budget=4096, 
     ThinkingMode='default', ThinkingBudget=0, VramReserveMiB=1024,
     VisionTokens=1024, VisionResidency='resident', EmbeddingPlacement='vram', CpuThreads=2, VisionCacheMiB=256,
     WeightPlacement='all_vram', WeightHostMiB=0)
-ENGINE_DEFAULTS['radiance'] = {'Backend': 'radiance', 'Context': 262144, 'Budget': 36864, 'Reserve': 4096, 'HostMiB': 12288, 'SinkTokens': 12288, 'RecentTokens': 1024, 'Concurrency': 1, 'RetainedSessions': 1, 'QueryScorer': 'page-softmax', 'ScoreAggregation': 'mean', 'GraphAlpha': 0.2, 'Lrfu': False, 'QueryMaxTokens': 512, 'QueryReplayMaxTokens': 2048, 'KvType': 'fp8', 'StateCacheType': 'f32', 'Prefill': 256, 'SpeculativeMode': 'dflash2', 'DraftTokens': 7, 'DraftPolicy': 'fixed', 'Vision': True, 'MaxTokens': 0, 'ThinkingMode': 'default', 'ThinkingBudget': 0, 'VramReserveMiB': 256, 'EmbeddingPlacement': 'ram', 'CpuThreads': 8, 'VisionResidency': 'cpu', 'VisionTokens': 256, 'VisionCacheMiB': 64, 'ReasoningEffort': 'xhigh', 'PreserveThinking': True, 'NgramDrafts': 0, 'NgramMinMatch': 12}
+ENGINE_DEFAULTS['radiance'] = {'Backend': 'radiance', 'Context': 262144, 'Budget': 36864, 'Reserve': 4096, 'HostMiB': 12288, 'SinkTokens': 12288, 'RecentTokens': 1024, 'Concurrency': 1, 'RetainedSessions': 1, 'QueryScorer': 'page-softmax', 'ScoreAggregation': 'mean', 'GraphAlpha': 0.2, 'Lrfu': False, 'QueryMaxTokens': 512, 'QueryReplayMaxTokens': 2048, 'KvType': 'fp8', 'StateCacheType': 'f32', 'Prefill': 256, 'SpeculativeMode': 'dflash2', 'DraftTokens': 7, 'DraftPolicy': 'fixed', 'Vision': True, 'MaxTokens': 0, 'ThinkingMode': 'on', 'ThinkingBudget': 0, 'VramReserveMiB': 256, 'EmbeddingPlacement': 'ram', 'CpuThreads': 8, 'VisionResidency': 'cpu', 'VisionTokens': 256, 'VisionCacheMiB': 64, 'ReasoningEffort': 'xhigh', 'PreserveThinking': True, 'NgramDrafts': 0, 'NgramMinMatch': 12}
 
 STRINGS = {'StateCacheType', 'EmbeddingPlacement', 'WeightPlacement', 'RadianceHome', 'RocmPath', 'Tokenizer','PolystrataSource','Python','VisionWorker','Mmproj','Lora','QueryScorer','Backend', 'Model', 'Worker', 'Gpu', 'ListenHost', 'KvType', 'KvTypeK', 'KvTypeV', 'DiskPath',
            'VisionResidency',
@@ -223,12 +223,13 @@ def normalize(data, backends, *, path_root=None):
         raise ValueError('Unsupported LogLevel')
     if p.get('ThinkingMode', 'default') not in {'default', 'on', 'off'}:
         raise ValueError('ThinkingMode must be default, on or off')
-    if p['Backend'] == 'ninfer' and p.get('ThinkingMode') == 'on':
-        raise ValueError('NInfer supports default/off at startup; thinking-on is selected by requests')
     if p.get('ReasoningEffort') not in (None, 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
         raise ValueError('Unsupported ReasoningEffort')
     if p.get('ThinkingMode') == 'off' and p.get('ReasoningEffort'):
         raise ValueError('ReasoningEffort conflicts with ThinkingMode off')
+    if p.get('ThinkingMode') == 'on' and (p.get('ReasoningEffort') == 'none' or
+            (p['Backend'] == 'radiance' and p.get('ReasoningEffort') == 'minimal')):
+        raise ValueError('ThinkingMode on requires a reasoning effort that enables thinking')
     if p['Backend'] != 'llamacpp' and {'KvTypeK', 'KvTypeV'} & p.keys():
         raise ValueError('K/V 独立格式仅适用于 llama.cpp；NInfer 请使用 KV 格式选项。')
     if p.get('Concurrency') is not None and not 1 <= p['Concurrency'] <= 8:
@@ -281,7 +282,6 @@ def normalize(data, backends, *, path_root=None):
             raise ValueError('PolyStrata KV formats: Qwen f16/q8_0, Gemma f16/int8/int8k, Inkling f16/fp8')
         if ',' in p.get('Gpu',''): raise ValueError('PolyStrata currently supports one GPU')
         if p.get('ReasoningEffort') not in (None,'none','low','medium','high','xhigh'): raise ValueError('PolyStrata reasoning effort must be none, low, medium or high')
-        if p.get('ThinkingMode')=='on' and p.get('ReasoningEffort')=='none': raise ValueError('ThinkingMode conflicts with ReasoningEffort none')
     gpu = p.get('Gpu', '')
     if gpu and not all(re.fullmatch(r'GPU-[0-9a-fA-F-]{8,64}', x) for x in gpu.split(',')):
         raise ValueError('Select GPUs by UUID, separated by commas')

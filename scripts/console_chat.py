@@ -74,8 +74,8 @@ def context_payload(state, props, settings=None):
     put('max_tokens', params.get('max_tokens', params.get('n_predict')))
     for key in ('enable_thinking', 'reasoning_budget_tokens', 'preserve_thinking'):
         put(key, defaults.get(key))
-    put('reasoning_effort', defaults.get('chat_template_kwargs', {}).get('reasoning_effort'))
-    put('preserve_thinking', defaults.get('chat_template_kwargs', {}).get('preserve_thinking'))
+    for key in ('reasoning_effort', 'preserve_thinking'):
+        put(key, defaults.get('chat_template_kwargs', {}).get(key))
     # These are explicit parameters of the running process, never the editable draft.
     for key, field in [('MaxTokens','max_tokens'), ('ThinkingBudget','reasoning_budget_tokens'),
                        ('ReasoningEffort','reasoning_effort'), ('PreserveThinking','preserve_thinking')]:
@@ -85,21 +85,17 @@ def context_payload(state, props, settings=None):
             # the native request protocol uses -1 for no bound and 0 to close
             # reasoning immediately. Report the actual startup meaning.
             if backend == 'radiance' and key == 'ThinkingBudget' and value == 0: value = -1
-            if backend == 'ninfer' and key == 'PreserveThinking' and value is False: value = None
+            if (backend == 'ninfer' and key == 'PreserveThinking' and value is False
+                    and (state.get('worker') or {}).get('explicit_thinking_switches') is not True):
+                value = None
             put(field, value, 'launch')
     if backend == 'radiance' and settings:
         for key,value in effective_settings(settings,state.get('radiance_template_effort')).items(): put(key,value)
     mode = launch.get('ThinkingMode')
     if 'enable_thinking' not in effective and mode in ('on','off'):
         put('enable_thinking', mode == 'on', 'launch')
-    if backend == 'ninfer':
-        # NInfer's ordinary Qwen templates default to thinking; Gemma4 defaults
-        # to final-only. An arbitrary custom template must report its own policy.
-        model = str(props.get('model_alias', '')) + str(launch.get('Model', ''))
-        if not launch.get('ChatTemplateFile') and 'enable_thinking' not in effective:
-            if 'qwen' in model.lower(): put('enable_thinking', True, 'backend-template')
-            elif 'gemma4' in model.lower(): put('enable_thinking', False, 'backend-template')
-        if effective.get('reasoning_effort') == 'none': put('enable_thinking', False, 'launch')
+    if backend == 'ninfer' and effective.get('reasoning_effort') == 'none':
+        put('enable_thinking', False, 'launch')
     if settings and settings.get('effective'):
         # This integration starts the pinned strata-poly sampler without CLI
         # sampling overrides. src/poly/main.cpp::Sampling owns these defaults;

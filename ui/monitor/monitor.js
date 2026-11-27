@@ -91,11 +91,20 @@
   function parseNinferThroughput(log) {
     if (!log?.running || log.backend !== 'ninfer' || typeof log.text !== 'string') return null;
     let sample = null;
-    const clean = log.text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
-    for (const line of clean.split('\n')) {
+    const lines = log.text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').trimEnd().split(/\r?\n/);
+    // Native timestamps are in the worker's wall time. Use the last complete
+    // line and the controller's epoch file timestamp to recover its UTC offset.
+    const last = lines.at(-1).match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s/);
+    const zoneStep = 15 * 60 * 1000;
+    const delta = last && number(log.updated_at) && !log.pending
+      ? log.updated_at - Date.parse(last[1].replace(' ', 'T') + 'Z') : NaN;
+    const offset = Math.round(delta / zoneStep) * zoneStep;
+    const workerTime = Math.abs(offset) <= 14 * 60 * 60 * 1000 && Math.abs(delta - offset) <= 5000;
+    for (const line of lines) {
       const match = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+INFO\s+throughput \| ([\d.]+)\s*(ms|s) \| (.*)$/);
       if (!match) continue;
-      const at = new Date(match[1].replace(' ', 'T')).getTime();
+      const stamp = match[1].replace(' ', 'T');
+      const at = workerTime ? Date.parse(stamp + 'Z') + offset : Date.parse(stamp);
       const seconds = Number(match[2]) / (match[3] === 'ms' ? 1000 : 1);
       const fields = match[4].split(' | ');
       if (!fields.some((field) => /^running \d+/.test(field))) continue;
@@ -113,7 +122,9 @@
     return age >= -1000 && age <= sample.seconds * 2000 + 2000 ? sample : null;
   }
   function ninferLiveSpeed(row, active, sample) {
-    return active && row?.status === 'generating' && sample && sample.at >= row.started_at_ms ? sample.rate : null;
+    if (!active || !sample) return null;
+    if (row.status === 'processing') return sample.rate;
+    return row.status === 'generating' && sample.at >= row.started_at_ms ? sample.rate : null;
   }
   let throughputLog = null;
   function requestLiveSpeed(snapshot, row, active) {
@@ -828,9 +839,10 @@
     row('engine','Port',['服务端口','Service port'],undefined,config.Port,{optional:true,format:String});
     row('engine','Worker',['后端程序','Backend executable'],undefined,config.Worker,{optional:true});
 
-    const thinkingMode = first(boolean(k.defaults?.enable_thinking),present(defaults.reasoning_effort)?defaults.reasoning_effort!=='none':undefined);
+    const thinkingMode = first(boolean(defaults.enable_thinking),boolean(k.defaults?.enable_thinking),
+      present(defaults.reasoning_effort)?!(defaults.reasoning_effort==='none'||(backend==='radiance'&&defaults.reasoning_effort==='minimal')):undefined);
     row('generation','ThinkingMode',['默认思考模式','Default thinking mode'],thinkingMode,
-      config.ThinkingMode==='on'?true:config.ThinkingMode==='off'?false:backend==='radiance'&&typeof thinkingMode==='boolean'?undefined:config.ThinkingMode,{format:value=>value==='default'?tr('跟随模型','Model default'):format(value)});
+      config.ThinkingMode==='on'?true:config.ThinkingMode==='off'?false:undefined);
     row('generation','ReasoningEffort',['默认思考强度','Default reasoning effort'],defaults.reasoning_effort,config.ReasoningEffort,{optional:true});
     // Launcher 0 means no separate cap (llama.cpp translates it to -1); PolyStrata uses automatic answer reserve.
     const thinkingBudget = value => value < 0 || (value===0 && backend!=='polystrata') ? -1 : value;
@@ -838,9 +850,10 @@
       first(defaults.reasoning_budget_tokens,k.defaults?.reasoning_budget_tokens),
       number(config.ThinkingBudget)?thinkingBudget(config.ThinkingBudget):undefined,
       {format:value=>value<0?tr('不单设上限','No separate cap'):value===0?backend==='polystrata'?tr('自动预留答案空间','Automatic answer reserve'):tr('立即结束思考','End reasoning immediately'):tokens(value)});
-    row('generation','PreserveThinking',['保留历史思考','Preserve previous reasoning'],boolean(defaults.preserve_thinking),
-      backend==='ninfer'&&config.PreserveThinking===false?'default':boolean(config.PreserveThinking),
-      {optional:true,format:value=>value==='default'?tr('跟随模型','Model default'):format(value)});
+    const preserve = backend==='ninfer'&&config.PreserveThinking===false&&consoleRuntime?.worker?.explicit_thinking_switches!==true
+      ? undefined : boolean(config.PreserveThinking);
+    row('generation','PreserveThinking',['保留历史思考','Preserve previous reasoning'],
+      first(boolean(defaults.preserve_thinking),boolean(k.defaults?.preserve_thinking)),preserve,{optional:true});
     for (const [key,labels] of [['temperature',['温度','Temperature']],['top_p',['Top-p','Top-p']],['top_k',['Top-k','Top-k']],['min_p',['Min-p','Min-p']]])
       row('generation',key,labels,first(defaults[key],generation.params?.[key]),undefined,{optional:true});
 
@@ -977,10 +990,10 @@
     text("decode-label", state.backend === "ninfer" && requestSpeed !== null
       ? t("实时 · {0}s", fmt(r.decode_tps_window_ms / 1000, 0))
       : engineDecode !== null
-      ? t("实时 · {0}s", fmt(nativeThroughput.seconds, nativeThroughput.seconds < 1 ? 2 : 0))
+      ? t("引擎生成 · {0}s", fmt(nativeThroughput.seconds, nativeThroughput.seconds < 1 ? 2 : 0))
       : ["llamacpp","radiance"].includes(state.backend) && number(r?.decode_tps_window_ms)
         ? t("实时 · {0}s", fmt(r.decode_tps_window_ms / 1000, 1)) : t("实时速度"));
-    $("[data-live-speed]").title = state.backend === "ninfer" && requestSpeed === null
+    $("[data-live-speed]").title = engineDecode !== null && requestSpeed === null
       ? t("引擎区间吞吐，包含同期所有请求；本轮平均仅统计所选请求。") : "";
     $("[data-live-speed]").hidden = !liveRequest;
     text("decode-mean", fmt(meanSpeed(r), 1));

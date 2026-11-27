@@ -76,10 +76,10 @@ function settings(backend){
     assert.equal(await dialog.getByLabel('temperature',{exact:true}).inputValue(),backend==='llamacpp'?'0.7':'0.2');
     assert.equal(await thinking.inputValue(),backend==='ninfer'?'unknown':'false');
     const output=dialog.getByLabel('总输出上限 · tokens',{exact:true});
-    assert.equal(await output.inputValue(),'');assert.equal(await output.getAttribute('placeholder'),'不限制（跟随服务）');
+    assert.equal(await output.inputValue(),'');assert.equal(await output.getAttribute('placeholder'),'未设独立输出上限');
     assert.equal(await output.evaluate(el=>el.checkValidity()),true);
     await output.fill('64');await output.press('Tab');await output.fill('');await output.press('Tab');
-    assert.equal(await output.inputValue(),'');assert.equal(await output.getAttribute('placeholder'),'不限制（跟随服务）');
+    assert.equal(await output.inputValue(),'');assert.equal(await output.getAttribute('placeholder'),'未设独立输出上限');
     await output.fill('16');await output.press('Tab');
     await output.fill('8193');await output.press('Tab');
     await dialog.getByRole('alert').filter({hasText:'max_tokens'}).waitFor();

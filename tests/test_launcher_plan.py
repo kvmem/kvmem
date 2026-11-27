@@ -41,6 +41,22 @@ class PlanTest(unittest.TestCase):
     def plan(self, backend='ninfer', **values):
         return build_plan(self.config(backend, **values))
 
+    def test_explicit_ninfer_thinking_flags_and_worker_requirement(self):
+        for mode, preserve in (('on', False), ('off', True)):
+            with self.subTest(mode=mode, preserve=preserve):
+                plan = self.plan(ThinkingMode=mode, PreserveThinking=preserve)
+                self.assertIn('--thinking' if mode == 'on' else '--no-thinking', plan['argv'])
+                self.assertIn('--preserve-thinking' if preserve else '--no-preserve-thinking', plan['argv'])
+                caps = {'explicit_thinking_switches': mode == 'off', 'legacy_query_replay_revision': 1}
+                if mode == 'on':
+                    with self.assertRaisesRegex(ValueError, 'Update the NInfer worker'):
+                        require_launch_features(caps, plan['effective_parameters'])
+                caps['explicit_thinking_switches'] = mode == 'on'
+                require_launch_features(caps, plan['effective_parameters'])
+        argv = self.plan()['argv']
+        for flag in ('--thinking', '--no-thinking', '--preserve-thinking', '--no-preserve-thinking'):
+            self.assertNotIn(flag, argv)
+
     def test_full_query_limits_require_new_worker_without_changing_requested_values(self):
         cases = ({}, {'QueryMaxTokens': 512}, {'QueryReplayMaxTokens': 2048},
                  {'QueryMaxTokens': 0, 'QueryReplayMaxTokens': 2048},
