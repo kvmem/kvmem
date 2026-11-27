@@ -1,0 +1,862 @@
+diff --git a/crates/hipfire-arch-qwen35/src/dflash_slot.rs b/crates/hipfire-arch-qwen35/src/dflash_slot.rs
+index 490b1739bf48952fdfc74624fc80393262148389..f72aee9affecea40f6a2b96dfeaea08caa74b959 100644
+--- a/crates/hipfire-arch-qwen35/src/dflash_slot.rs
++++ b/crates/hipfire-arch-qwen35/src/dflash_slot.rs
+@@ -436,6 +436,143 @@ pub fn reset_dflash_slot(st: &mut DflashSlotState, session: u64) {
+     st.draft = None;
+ }
+ 
++/// 期4 (KVMem/nInfer DFlash2 integration): stable identity of the draft
++/// geometry a state image was captured from. A restore refuses a mismatch
++/// instead of seeding garbage into the rings.
++pub fn dflash_geometry_id(shared: &DflashShared) -> u64 {
++    use std::hash::{Hash, Hasher};
++    let d = &shared.draft_config;
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    d.n_layers.hash(&mut h);
++    d.hidden.hash(&mut h);
++    d.feature_width().hash(&mut h);
++    d.kv_dim().hash(&mut h);
++    d.head_dim.hash(&mut h);
++    d.target_layer_ids.hash(&mut h);
++    d.all_layers_sliding.hash(&mut h);
++    shared.block_size.hash(&mut h);
++    shared.window.hash(&mut h);
++    h.finish()
++}
++
++/// 期4: capture the DFlash2 draft's conditioning state at a checkpoint whose
++/// frontier equals the draft's LIVE seeded frontier (nInfer native full-state
++/// serialization). Earlier frontiers cannot be reconstructed from the cached
++/// ring — those checkpoints simply carry no image and reseed on reuse.
++pub fn dflash_capture_image(
++    gpu: &Gpu,
++    shared: &DflashShared,
++    st: &DflashSlotState,
++    frontier: usize,
++    floor: usize,
++) -> Result<crate::kvmem_prefix::DraftImage, String> {
++    let d = &shared.draft_config;
++    let w = shared
++        .window
++        .ok_or_else(|| "draft image: not a windowed draft".to_string())?;
++    if !d.all_layers_sliding {
++        return Err("draft image: split/legacy draft shape".to_string());
++    }
++    if st.seeded_through != frontier {
++        return Err(format!(
++            "draft image: draft frontier {} != checkpoint frontier {frontier}",
++            st.seeded_through
++        ));
++    }
++    if frontier > st.scratch.max_ctx_len {
++        return Err(format!(
++            "draft image: frontier {frontier} exceeds draft ctx {}",
++            st.scratch.max_ctx_len
++        ));
++    }
++    let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(1 + 2 * d.n_layers);
++    let mut grab = |t: &GpuTensor| -> Result<(), String> {
++        let mut bytes = vec![0u8; t.buf.size()];
++        gpu.hip
++            .memcpy_dtoh(&mut bytes, &t.buf)
++            .map_err(|e| format!("draft image dtoh: {e:?}"))?;
++        blobs.push(bytes);
++        Ok(())
++    };
++    grab(&st.scratch.target_hidden)?;
++    for l in 0..d.n_layers {
++        grab(&st.scratch.k_ctx_cached[l])?;
++        grab(&st.scratch.v_ctx_cached[l])?;
++    }
++    Ok(crate::kvmem_prefix::DraftImage {
++        geometry: dflash_geometry_id(shared),
++        frontier: frontier as u32,
++        floor: floor as u32,
++        window: w,
++        feature_width: d.feature_width(),
++        kv_dim: d.kv_dim(),
++        n_layers: d.n_layers,
++        proj_cached_rows: st.scratch.thlog.proj_cached_rows(),
++        full_cached_rows: st.scratch.thlog.full_cached_rows(),
++        blobs,
++    })
++}
++
++/// 期4: install a captured draft image into the slot (fresh or reused state)
++/// and publish the restored conditioning frontier + suffix bound. The next
++/// draft cycle conditions on exactly the rows the target verify sees; the
++/// suffix floor is recomputed per draft step from the live Layerwise policy.
++pub fn dflash_restore_image(
++    gpu: &mut Gpu,
++    shared: &DflashShared,
++    st: &mut DflashSlotState,
++    img: &crate::kvmem_prefix::DraftImage,
++    session: u64,
++    frontier: usize,
++) -> Result<(), String> {
++    let d = &shared.draft_config;
++    let w = shared
++        .window
++        .ok_or_else(|| "draft image: not a windowed draft".to_string())?;
++    if img.geometry != dflash_geometry_id(shared) {
++        return Err("draft image: geometry mismatch".to_string());
++    }
++    if img.frontier as usize != frontier || img.window != w || img.n_layers != d.n_layers {
++        return Err(format!(
++            "draft image: frontier/window/layers mismatch ({} vs {frontier}, {} vs {w}, {} vs {})",
++            img.frontier, img.window, img.n_layers, d.n_layers
++        ));
++    }
++    if img.blobs.len() != 1 + 2 * d.n_layers {
++        return Err(format!(
++            "draft image: {} blobs, expected {}",
++            img.blobs.len(),
++            1 + 2 * d.n_layers
++        ));
++    }
++    let mut put = |t: &GpuTensor, b: &[u8]| -> Result<(), String> {
++        if b.len() != t.buf.size() {
++            return Err(format!(
++                "draft image h2d: blob {} bytes != tensor {} bytes",
++                b.len(),
++                t.buf.size()
++            ));
++        }
++        gpu.hip
++            .memcpy_htod(&t.buf, b)
++            .map_err(|e| format!("draft image h2d: {e:?}"))
++    };
++    put(&st.scratch.target_hidden, &img.blobs[0])?;
++    for l in 0..d.n_layers {
++        put(&st.scratch.k_ctx_cached[l], &img.blobs[1 + 2 * l])?;
++        put(&st.scratch.v_ctx_cached[l], &img.blobs[2 + 2 * l])?;
++    }
++    st.scratch.reset_upload_tracking();
++    let abs: Vec<i32> = (0..frontier as i32).collect();
++    st.scratch
++        .thlog
++        .restore_state(abs, img.proj_cached_rows, img.full_cached_rows);
++    st.session = Some(session);
++    st.seeded_through = frontier;
++    st.draft = None;
++    Ok(())
++}
++
+ /// `target_hidden` is interleaved `[pos % modulus][layer][h]` — one
+ /// `scatter_hidden_block_to_interleaved`-style copy per extract layer.
+ pub fn scatter_staging_rows_to_interleaved(
+@@ -523,6 +660,7 @@ pub fn dflash_slot_draft_step(
+     st: &mut DflashSlotState,
+     seed: u32,
+     position: usize,
++    ctx_floor: usize,
+ ) -> Result<DflashSlotDraft, String> {
+     let b = shared.block_size;
+     let h = shared.draft_config.hidden;
+@@ -590,11 +728,16 @@ pub fn dflash_slot_draft_step(
+         .len()
+         .min(position)
+         .min(st.scratch.max_ctx_len);
++    let ctx_rows_len = st.scratch.thlog.abs_positions().len();
++    let start_idx = ctx_rows_len.saturating_sub(effective_ctx_len);
++    // 期4: absolute retained-suffix floor → row index of the context buffer
++    // (slot positions are contiguous, `abs_positions()[i] == i`). This is the
++    // draft's local-attention lower bound; 0 keeps the historical span.
++    st.scratch.ctx_floor = ctx_floor.saturating_sub(start_idx).min(effective_ctx_len);
+     let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
+     let mut positions_k: Vec<i32> = Vec::with_capacity(effective_ctx_len + b);
+     {
+         let th_abs = st.scratch.thlog.abs_positions();
+-        let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
+         positions_k.extend_from_slice(&th_abs[start_idx..]);
+         for p in 0..b {
+             positions_k.push(position as i32 + p as i32);
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 7270a75dc0244985f363b0bed8cb6e4bbf7b6dca..83791baeee05acabb19673dbdbf1383ff47bff84 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -904,6 +904,11 @@ pub struct KvMemCtl {
+     prefix_hits_total: u64,
+     prefix_misses_total: u64,
+     prefix_evictions_total: u64,
++    /// 期4: DFlash2 draft conditioning images captured with prefix
++    /// checkpoints, restored on reuse, and missing/unrestorable (reseed).
++    draft_images_total: u64,
++    draft_image_hits_total: u64,
++    draft_image_misses_total: u64,
+ }
+ 
+ impl KvMemCtl {
+@@ -1231,6 +1236,9 @@ impl KvMemCtl {
+             prefix_hits_total: 0,
+             prefix_misses_total: 0,
+             prefix_evictions_total: 0,
++            draft_images_total: 0,
++            draft_image_hits_total: 0,
++            draft_image_misses_total: 0,
+         })
+     }
+ 
+@@ -1288,6 +1296,26 @@ impl KvMemCtl {
+         Ok(policy)
+     }
+ 
++    /// 期4 (KVMem/nInfer DFlash2 integration): the draft's local-attention
++    /// lower bound in logical token positions — the start of the continuous
++    /// recent suffix the Layerwise selection retains
++    /// (nInfer `dflash_context_floor = main_frontier − recent_blocks·page_tokens`).
++    /// The draft ring, proposal positions and cyclic slot addressing stay
++    /// logical; only the target verify uses compact positions. 0 under Legacy,
++    /// where the whole context stays resident and the draft span is unchanged.
++    pub fn draft_conditioning_floor(&self, slot: usize, position: usize) -> usize {
++        if !self.strategy.is_layerwise() {
++            return 0;
++        }
++        let fed = self
++            .fed_tokens(slot)
++            .map(|f| f as usize)
++            .unwrap_or(position)
++            .min(position);
++        let recent = self.kv_cfg.recent_blocks as usize * KV_BLOCK_TOKENS;
++        fed.saturating_sub(recent)
++    }
++
+     /// Per-slot resident page budget (full pages + partial tail).
+     pub fn budget_blocks(&self) -> usize {
+         self.budget_blocks
+@@ -1544,6 +1572,18 @@ impl KvMemCtl {
+         self.prefix_catalog.get(id)
+     }
+ 
++    /// 期4: DFlash2 draft image instrumentation (captures / restore hits /
++    /// misses). Pure bookkeeping — never read back into selection/residency.
++    pub fn note_draft_image_capture(&mut self) {
++        self.draft_images_total += 1;
++    }
++    pub fn note_draft_image_hit(&mut self) {
++        self.draft_image_hits_total += 1;
++    }
++    pub fn note_draft_image_miss(&mut self) {
++        self.draft_image_misses_total += 1;
++    }
++
+     /// Mutable access (engine attaches `gpu_pages` after sealing + cache refs).
+     pub fn prefix_checkpoint_mut(&mut self, id: u64) -> Option<&mut PrefixCheckpoint> {
+         self.prefix_catalog.get_mut(id)
+@@ -1597,6 +1637,9 @@ impl KvMemCtl {
+             prefix_hits: self.prefix_hits_total,
+             prefix_misses: self.prefix_misses_total,
+             prefix_evictions: self.prefix_evictions_total,
++            draft_images: self.draft_images_total,
++            draft_image_hits: self.draft_image_hits_total,
++            draft_image_misses: self.draft_image_misses_total,
+         }
+     }
+ 
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index de1d282beb8b301e2b1bcb6581824651c2428a6b..b877f995f493e264e65fc4cadf0e5d00b7477af7 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -57,6 +57,43 @@ pub fn layout_fingerprint(cfg: &RawStoreConfig) -> u64 {
+     h
+ }
+ 
++/// 期4 (KVMem/nInfer DFlash2 integration): the DFlash2 draft's conditioning
++/// state at a prefix checkpoint — the backend-owned "native full sequence
++/// state serialization" that rides with the target checkpoint. Captured only
++/// when the draft's live seeded frontier equals the checkpoint frontier (the
++/// cached ring cannot reconstruct an earlier frontier); restored with the
++/// target prefix so the next draft cycle conditions on the same rows the
++/// target verify sees. Native F32 layout in ring-slot order (`row % window`):
++/// `[target_hidden w×feature_width][k_l w×kv_dim][v_l w×kv_dim]...`.
++#[derive(Debug, Clone, Default)]
++pub struct DraftImage {
++    /// Draft geometry identity (layers, hidden, feature width, kv dim, window,
++    /// block) — a mismatch refuses the restore instead of seeding garbage.
++    pub geometry: u64,
++    /// Logical frontier (committed rows) at capture.
++    pub frontier: u32,
++    /// Retained-suffix floor (logical tokens) at capture
++    /// (nInfer `dflash_context_floor`).
++    pub floor: u32,
++    /// Ring window `w` (row modulus) at capture.
++    pub window: usize,
++    pub feature_width: usize,
++    pub kv_dim: usize,
++    pub n_layers: usize,
++    /// Captured thlog watermarks (rows whose projection was cached).
++    pub proj_cached_rows: usize,
++    pub full_cached_rows: usize,
++    /// Raw blobs in the order above, each the full ring (`window × dim × 4`).
++    pub blobs: Vec<Vec<u8>>,
++}
++
++impl DraftImage {
++    /// Host bytes charged to the prefix catalog (blob payload).
++    pub fn nbytes(&self) -> u64 {
++        self.blobs.iter().map(|b| b.len() as u64).sum()
++    }
++}
++
+ /// One frozen reusable prefix: the immutable canonical archive plus the
+ /// provenance a reuse must satisfy. Created by [`crate::kvmem_ctl::KvMemCtl::freeze_prefix`];
+ /// the engine attaches the pinned GPU pages (`gpu_pages`) after sealing them.
+@@ -86,6 +123,10 @@ pub struct PrefixCheckpoint {
+     /// records are sealed shared sources; mean-K is private to this archive
+     /// and re-forked private into every branch. Never fed after freeze.
+     canonical: RawStore,
++    /// 期4: DFlash2 draft conditioning image captured with this checkpoint
++    /// (`None` for AR/MTP sessions, non-windowed drafts, or a frontier that
++    /// did not equal the draft's live seeded frontier — those reseed).
++    pub draft_image: Option<DraftImage>,
+     /// LRU clock stamp (catalog-internal).
+     last_used: u64,
+ }
+@@ -115,10 +156,18 @@ impl PrefixCheckpoint {
+             layout_id,
+             gpu_pages: Vec::new(),
+             canonical,
++            draft_image: None,
+             last_used: 0,
+         }
+     }
+ 
++    /// Host bytes charged for retention (canonical packed archive + the
++    /// optional draft image).
++    pub fn host_bytes(&self) -> u64 {
++        self.canonical.payload_bytes()
++            + self.draft_image.as_ref().map_or(0, |img| img.nbytes())
++    }
++
+     /// The canonical archive (read-only use: fork / inspect).
+     pub fn canonical(&self) -> &RawStore {
+         &self.canonical
+@@ -345,7 +394,7 @@ impl PrefixCatalog {
+             .iter()
+             .map(|e| CoverageInfo {
+                 frontier: e.frontier as u64,
+-                bytes: e.canonical.payload_bytes(),
++                bytes: e.host_bytes(),
+                 used: e.last_used,
+                 identity: e.id,
+                 purpose: CoveragePurpose::Periodic as u32,
+@@ -481,6 +530,7 @@ mod tests {
+             layout_id: layout_fingerprint(&raw_config()),
+             gpu_pages: Vec::new(),
+             canonical,
++            draft_image: None,
+             last_used: 0,
+         }
+     }
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 6d205ea2a626839bef8257aa4a24886b1099e421..a6460469501fd80ce4f61b68fcb480d310dae817 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -95,6 +95,35 @@ fn kvmem_enabled(rig: &Rig) -> bool {
+     }
+ }
+ 
++/// 期4: KVMem × DFlash2 load-time validation matrix (KVMem/nInfer integration
++/// pattern). `None` = the combination is legal. Unsupported combinations are
++/// refused at load, never silently degraded:
++/// * the native MTP head and a DFlash2 draft are mutually exclusive (the main
++///   model does not load its MTP head for DFlash2);
++/// * the KVMem DFlash lane is single-sequence.
++fn kvmem_dflash_validation_error(
++    kvmem_on: bool,
++    dflash_draft: bool,
++    mtp_k: usize,
++    n_slots: usize,
++) -> Option<String> {
++    if !kvmem_on || !dflash_draft {
++        return None;
++    }
++    if mtp_k > 0 {
++        return Some(format!(
++            "KVMem + DFlash2: MTP head (mtp_k={mtp_k}) and a DFlash2 draft are mutually \
++             exclusive; serve with --spec dflash (or set speculation.mtp off)"
++        ));
++    }
++    if n_slots != 1 {
++        return Some(format!(
++            "KVMem + DFlash2: single-slot serve only (SLOTS=1), got n_slots={n_slots}"
++        ));
++    }
++    None
++}
++
+ /// Internal control plane for the engine thread. Public methods map onto these
+ /// messages; the GPU rig stays exclusively on that thread.
+ ///
+@@ -668,19 +697,24 @@ fn layerwise_admissible(
+     Some((slot, frame.session.0))
+ }
+ 
+-/// Layerwise MTP-verify admission (P4.1②, design §A.6 / §B D1.4②). The multi-row
+-/// sibling of [`layerwise_admissible`]: admits a single-slot MTP verify span under
+-/// Layerwise so the trunk's accepted-only write-through + drop-evict +
+-/// restore-before-attend runs over the whole `width`-row verifier batch (Path B
+-/// `run_layers_slots`, already width-aware). Returns `(slot, session_id, width)`
+-/// where `width` is the slot's verify-row count (`m_per_slot`, == the drafted span
+-/// from `inject_spec_verify_tokens`). Everything else threads `None` (Legacy
+-/// byte-neutral): non-Layerwise, non-paged / non-q8, GQA-decode disabled, DFlash
+-/// rows, multi-slot batches, prefill, image / M-RoPE steps. The accepted PREFIX is
+-/// published post-sampling through the OUTPUT-scope owner
++/// Layerwise spec-verify admission (P4.1② design §A.6 / §B D1.4②; 期4 DFlash2).
++/// The multi-row sibling of [`layerwise_admissible`]: admits a single-slot MTP or
++/// DFlash2 verify span under Layerwise so the trunk's accepted-only write-through
++/// + drop-evict + restore-before-attend runs over the whole `width`-row verifier
++/// batch (Path B `run_layers_slots`, already width-aware). Returns
++/// `(slot, session_id, width)` where `width` is the slot's verify-row count
++/// (`m_per_slot`, == the drafted span from `inject_spec_verify_tokens`).
++/// Everything else threads `None` (Legacy byte-neutral): non-Layerwise,
++/// non-paged / non-q8, GQA-decode disabled, non-spec rows, multi-slot batches,
++/// prefill, image / M-RoPE steps, and DFlash2 shapes whose draft context is not
++/// the all-sliding windowed ring (split/legacy drafts keep the Legacy capped
++/// path — the KVMem/nInfer DFlash2 integration admits the windowed chain only).
++/// The accepted PREFIX is published post-sampling through the OUTPUT-scope owner
+ /// (`accept_output_pressure`), not the all-or-nothing prefill owner the single-row
+ /// AR path uses. Automatic: no dedicated on/off env (design §B D1.5) — gated solely
+-/// on the Layerwise strategy + native MTP being active this step.
++/// on the Layerwise strategy + native spec being active this step. DFlash2 never
++/// carries the MTP head plane (load validation keeps `mtp_k == 0`), so the
++/// composite head co-archive below is MTP-only by construction.
+ #[cfg(feature = "kvmem")]
+ fn layerwise_mtp_verify_admissible(
+     rig: &Rig,
+@@ -694,8 +728,12 @@ fn layerwise_mtp_verify_admissible(
+     if !ctl.strategy().is_layerwise() {
+         return None;
+     }
+-    // MTP only this sub-patch (②): DFlash verify is a separate spec mechanism.
+-    if !any_verify || any_dflash_rows || !rig.pool.is_paged() || !rig.model.kv_tier.is_q8() {
++    // MTP and DFlash2 verify spans share this Path B (期4): both are multi-row
++    // accepted-prefix mechanics. DFlash2 is admitted only in the all-sliding
++    // windowed draft shape — the KVMem/nInfer integration semantics (logical
++    // ring + compact target positions + suffix bound); split/legacy drafts stay
++    // Legacy capped.
++    if !any_verify || !rig.pool.is_paged() || !rig.model.kv_tier.is_q8() {
+         return None;
+     }
+     // Same paged GQA decode tile gate as AR: an operator who disabled it falls
+@@ -719,7 +757,30 @@ fn layerwise_mtp_verify_admissible(
+         return None;
+     }
+     let width = batch.m_per_slot[slot] as u64;
+-    if work[slot].spec != SpecKind::Mtp || !work[slot].decoding {
++    if !work[slot].decoding {
++        return None;
++    }
++    if work[slot].spec != SpecKind::Mtp && work[slot].spec != SpecKind::Dflash {
++        return None;
++    }
++    // The batch-wide DFlash flag and the admitted slot's kind must agree.
++    if work[slot].spec == SpecKind::Dflash && !any_dflash_rows {
++        return None;
++    }
++    if work[slot].spec == SpecKind::Mtp && any_dflash_rows {
++        return None;
++    }
++    if work[slot].spec == SpecKind::Dflash {
++        let draft = rig.model.dflash.as_ref()?;
++        if draft.window.is_none() || !draft.draft_config.all_layers_sliding {
++            return None;
++        }
++    }
++    // 期4: never clip the speculative extent. If the full verify width cannot
++    // fit the Layerwise window capacity this step stays Legacy (the nInfer
++    // "prepare the complete verification width before binding the target
++    // window" rule; a narrow round is not a legal fallback).
++    if width > ctl.window_capacity_tokens() {
+         return None;
+     }
+     // Text-only this step (same throat as AR): no vision-tower embedding rows, no
+@@ -1228,6 +1289,22 @@ impl Rig {
+         // flat slab view that paged mode cannot honour, and its single-token
+         // forwards bypass the step batch the statistics taps follow).
+         let kvmem_on = kvmem_requested()?;
++        // 期4: KVMem + DFlash2 validation matrix (KVMem/nInfer integration
++        // pattern). Unsupported combinations are rejected at load — never a
++        // silent degrade — mirroring the backend's parse/normalize checks.
++        // The native MTP head and a DFlash2 draft are mutually exclusive
++        // (nInfer: "The main model does not load its MTP head for DFlash2");
++        // the KVMem DFlash lane is single-sequence. Split/legacy draft shapes
++        // stay legal under KVMem but only run the Legacy capped path; the
++        // Layerwise admission checks the all-sliding windowed shape per step.
++        if let Some(err) = kvmem_dflash_validation_error(
++            kvmem_on,
++            cfg.dflash_draft.is_some(),
++            cfg.mtp_k,
++            cfg.n_slots,
++        ) {
++            return Err(err);
++        }
+         let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
+             .ok()
+             .is_some_and(|v| v == "1" || v == "on" || v == "true");
+@@ -3739,6 +3816,22 @@ impl ModelRig {
+             st.trunk_snap
+                 .save_from(&mut self.dn_states[slot.0], &mut gpu)
+                 .map_err(|e| format!("dflash dn snapshot: {e}"))?;
++            // 期4 (KVMem/nInfer DFlash2 integration): the draft's local
++            // attention lower bound is the retained continuous recent suffix
++            // of the target's Layerwise selection (nInfer `dflash_context_floor`
++            // = main_frontier − recent_blocks·page_tokens). Logical positions:
++            // the draft ring, proposal positions and cyclic slot addressing
++            // stay logical; only the target verify uses compact positions.
++            // Zero under Legacy / no reselection ⇒ the span is unchanged
++            // (byte-neutral).
++            #[cfg(feature = "kvmem")]
++            let ctx_floor = self
++                .kvmem
++                .as_ref()
++                .map(|k| k.draft_conditioning_floor(slot.0, pos))
++                .unwrap_or(0);
++            #[cfg(not(feature = "kvmem"))]
++            let ctx_floor = 0usize;
+             crate::dflash_slot::dflash_slot_draft_step(
+                 &mut gpu,
+                 shared,
+@@ -3747,6 +3840,7 @@ impl ModelRig {
+                 &mut st,
+                 seed,
+                 pos,
++                ctx_floor,
+             )
+         })();
+ 
+@@ -3840,6 +3934,28 @@ impl ModelRig {
+                     &self.v_arenas,
+                 )
+                 .map_err(|e| format!("kvmem statistics feed: {e}"))?;
++                // 期4 (KVMem/nInfer DFlash2 integration): publish the Layerwise
++                // verify's captured output mass at the scheduler-confirmed
++                // accepted PREFIX — the same `committed.len()` rows just fed to
++                // the host store, so the output owner's `accepted_end` and the
++                // store frontier stay in lockstep (MTP's `result.advance`
++                // sibling). The snapshot was extracted from the verify carrier
++                // pre-free. No-op under Legacy / AR-only / when no verify is
++                // pending (byte-neutral).
++                if ctl.strategy().is_layerwise() {
++                    if let Some(snap) = ctl.take_layerwise_pending_output(slot.0) {
++                        let mut owner = ctl.take_layerwise_output_pressure(slot.0).ok_or_else(
++                            || "kvmem: layerwise verify pending without output owner".to_string(),
++                        )?;
++                        let pub_res = crate::layerwise_driver::publish_output_acceptance(
++                            &mut owner,
++                            snap,
++                            committed.len() as u32,
++                        );
++                        ctl.restore_layerwise_output_pressure(slot.0, owner);
++                        pub_res.map_err(|e| format!("kvmem: layerwise output publish: {e}"))?;
++                    }
++                }
+             }
+             Ok(committed)
+         })();
+@@ -7692,6 +7808,45 @@ fn kvmem_catalog_and_pin(
+             ckpt.gpu_pages = page_indices.to_vec();
+         }
+     }
++    // 期4: co-archive the DFlash2 draft conditioning image (KVMem/nInfer
++    // "native full sequence-state serialization"). Only when the draft's live
++    // seeded frontier equals this checkpoint's frontier — the cached ring
++    // cannot reconstruct an earlier frontier, so those checkpoints carry no
++    // image and reseed on reuse. Capture failure never drops the KV
++    // checkpoint (the target prefix stays reusable; only the draft reseeds).
++    // Layerwise only: Legacy keeps the historical AR-on-reuse path and stays
++    // byte/time-neutral (no image copies).
++    if !deduped && ctl.strategy().is_layerwise() {
++        let boundary_usize = boundary as usize;
++        let capture = match (
++            rig.model.dflash.as_ref(),
++            rig.model.dflash_states[s].as_ref(),
++        ) {
++            (Some(shared), Some(st)) if st.seeded_through == boundary_usize => {
++                let floor = ctl.draft_conditioning_floor(s, boundary_usize);
++                Some(crate::dflash_slot::dflash_capture_image(
++                    &rig.gpu,
++                    shared,
++                    st,
++                    boundary_usize,
++                    floor,
++                ))
++            }
++            _ => None,
++        };
++        match capture {
++            Some(Ok(img)) => {
++                if let Some(ckpt) = ctl.prefix_checkpoint_mut(id) {
++                    ckpt.draft_image = Some(img);
++                }
++                ctl.note_draft_image_capture();
++            }
++            Some(Err(e)) => {
++                eprintln!("[kvmem-draft-image] capture skipped at {boundary}: {e}");
++            }
++            None => {}
++        }
++    }
+     Ok(())
+ }
+ 
+@@ -9159,6 +9314,63 @@ fn admit(
+                     let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                     return Err("kvmem reuse: GPU page share failed".to_string());
+                 }
++                // 4. 期4: restore the DFlash2 draft conditioning image that
++                //    rides with this checkpoint (nInfer native full-state
++                //    serialization; logical ring + captured watermarks). A
++                //    missing/unrestorable image reseeds the draft from scratch
++                //    — acceptance degrades, output stays verify-exact.
++                if let Some(shared) = rig.model.dflash.as_ref() {
++                    let restored = {
++                        match ctl
++                            .prefix_checkpoint(reuse_id)
++                            .and_then(|c| c.draft_image.as_ref())
++                        {
++                            Some(img) => {
++                                if rig.model.dflash_states[slot.0].is_none() {
++                                    match crate::dflash_slot::new_dflash_slot_state(
++                                        &mut rig.gpu,
++                                        shared,
++                                        &rig.model.config,
++                                        &rig.model.dn_states[slot.0],
++                                    ) {
++                                        Ok(st) => rig.model.dflash_states[slot.0] = Some(st),
++                                        Err(e) => eprintln!(
++                                            "[kvmem-draft-image] state alloc failed: {e}"
++                                        ),
++                                    }
++                                }
++                                match rig.model.dflash_states[slot.0].as_mut() {
++                                    Some(st) => match crate::dflash_slot::dflash_restore_image(
++                                        &mut rig.gpu,
++                                        shared,
++                                        st,
++                                        img,
++                                        id.0,
++                                        frontier as usize,
++                                    ) {
++                                        Ok(()) => true,
++                                        Err(e) => {
++                                            eprintln!(
++                                                "[kvmem-draft-image] restore skipped: {e}"
++                                            );
++                                            false
++                                        }
++                                    },
++                                    None => false,
++                                }
++                            }
++                            None => false,
++                        }
++                    };
++                    if restored {
++                        ctl.note_draft_image_hit();
++                    } else {
++                        ctl.note_draft_image_miss();
++                        if let Some(st) = rig.model.dflash_states[slot.0].as_mut() {
++                            crate::dflash_slot::reset_dflash_slot(st, id.0);
++                        }
++                    }
++                }
+                 Ok(frontier as usize)
+             })();
+             match reuse {
+@@ -9665,10 +9877,21 @@ fn admit(
+                     .saturating_add(d.block_size)
+                     <= d.ctx_capacity
+         });
++        // 期4: a Layerwise canonical reuse may keep DFlash2 when the
++        // checkpoint carried the draft conditioning image and it was restored
++        // at exactly the reused frontier (nInfer native full-state
++        // serialization). Without an image the ring has no rows for
++        // 0..reused, so the request runs AR (the historical rule). Legacy
++        // reuse keeps AR unconditionally (byte/time-neutral fail-closed path).
++        let dflash_reused_ready = kvmem_lw_reuse
++            && reused > 0
++            && rig.model.dflash_states[slot.0]
++                .as_ref()
++                .is_some_and(|st| st.seeded_through == reused);
+         let dflash_ok = rig.model.dflash.is_some()
+             && !grammar_constrained
+             && dflash_ctx_fits
+-            && reused == 0;
++            && (reused == 0 || dflash_reused_ready);
+         work[slot.0].spec = if mtp_ok {
+             SpecKind::Mtp
+         } else if dflash_ok {
+@@ -10784,3 +11007,34 @@ mod mtp_spill_decline_tests {
+         assert_eq!(slot_mtp_k(MtpMode::On, 0, false), 0);
+     }
+ }
++
++#[cfg(test)]
++mod kvmem_dflash_validation_tests {
++    use super::kvmem_dflash_validation_error;
++
++    /// 期4 rejection matrix (KVMem/nInfer integration pattern): unsupported
++    /// combinations are refused at load; everything outside the KVMem+DFlash
++    /// intersection is untouched.
++    #[test]
++    fn accepts_legal_combinations() {
++        // No KVMem: DFlash behaviour is unchanged (Legacy/Layerwise untouched).
++        assert!(kvmem_dflash_validation_error(false, true, 4, 2).is_none());
++        // No DFlash: MTP / AR loads unchanged.
++        assert!(kvmem_dflash_validation_error(true, false, 4, 2).is_none());
++        // KVMem + DFlash2 single slot, no MTP head.
++        assert!(kvmem_dflash_validation_error(true, true, 0, 1).is_none());
++        assert!(kvmem_dflash_validation_error(false, false, 0, 1).is_none());
++    }
++
++    #[test]
++    fn rejects_mtp_head_with_dflash() {
++        let e = kvmem_dflash_validation_error(true, true, 4, 1).expect("must reject");
++        assert!(e.contains("mutually exclusive"), "{e}");
++    }
++
++    #[test]
++    fn rejects_multi_slot_kvmem_dflash() {
++        let e = kvmem_dflash_validation_error(true, true, 0, 2).expect("must reject");
++        assert!(e.contains("single-slot"), "{e}");
++    }
++}
+diff --git a/crates/hipfire-cli/src/serve/metrics.rs b/crates/hipfire-cli/src/serve/metrics.rs
+index 88f25e195f8f5c7d03ccb6ffcc356efecef15809..c8524f6f43d3e2cd3fea2a6eefccfb504d3f0f64 100644
+--- a/crates/hipfire-cli/src/serve/metrics.rs
++++ b/crates/hipfire-cli/src/serve/metrics.rs
+@@ -647,6 +647,24 @@ impl Metrics {
+                     "Frozen prefix checkpoints displaced by the LRU bound or admission reclaim.",
+                     s.kvmem.prefix_evictions,
+                 );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_draft_images_total",
++                    "DFlash2 draft conditioning images captured with prefix checkpoints.",
++                    s.kvmem.draft_images,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_draft_image_hits_total",
++                    "Prefix reuses that restored the DFlash2 draft conditioning image.",
++                    s.kvmem.draft_image_hits,
++                );
++                counter(
++                    &mut out,
++                    "hipfire_kvmem_draft_image_misses_total",
++                    "Prefix reuses with no restorable DFlash2 draft image (draft reseeds).",
++                    s.kvmem.draft_image_misses,
++                );
+             }
+         }
+ 
+@@ -1066,6 +1084,7 @@ mod tests {
+                 "prefix_entries": 2, "prefix_pinned_pages": 16,
+                 "prefix_freezes": 5, "prefix_hits": 4,
+                 "prefix_misses": 6, "prefix_evictions": 1,
++                "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
+             },
+         });
+         let kvmeta = ServeMeta {
+@@ -1091,6 +1110,9 @@ mod tests {
+             "hipfire_kvmem_prefix_hits_total 4\n",
+             "hipfire_kvmem_prefix_misses_total 6\n",
+             "hipfire_kvmem_prefix_evictions_total 1\n",
++            "hipfire_kvmem_draft_images_total 2\n",
++            "hipfire_kvmem_draft_image_hits_total 1\n",
++            "hipfire_kvmem_draft_image_misses_total 1\n",
+         ] {
+             assert!(out.contains(sample), "{sample}: {out}");
+         }
+diff --git a/crates/hipfire-runtime/src/dflash.rs b/crates/hipfire-runtime/src/dflash.rs
+index 2e28df3c60f670f3a3ca2adb0c1071b5ab3e77a9..e20ffaab4f6c2e7489a40bbdb5ee054804c06c89 100644
+--- a/crates/hipfire-runtime/src/dflash.rs
++++ b/crates/hipfire-runtime/src/dflash.rs
+@@ -1561,6 +1561,22 @@ mod target_hidden_log {
+         pub fn mark_full_cached(&mut self, l: usize) {
+             self.full_cached_rows = l;
+         }
++
++        /// 期4 checkpoint restore (KVMem/nInfer DFlash2 integration): install
++        /// the captured row layout and watermarks in one shot. The caller has
++        /// already uploaded the ring bytes; `abs_positions` is the prefix's
++        /// contiguous `0..frontier` list.
++        pub fn restore_state(
++            &mut self,
++            abs_positions: Vec<i32>,
++            proj_cached_rows: usize,
++            full_cached_rows: usize,
++        ) {
++            self.uploaded_rows = abs_positions.len();
++            self.abs_positions = abs_positions;
++            self.proj_cached_rows = proj_cached_rows.min(self.uploaded_rows);
++            self.full_cached_rows = full_cached_rows.min(self.uploaded_rows);
++        }
+     }
+ }
+ pub use target_hidden_log::{TargetHiddenLog, TargetHiddenLogMark};
+@@ -1692,6 +1708,12 @@ impl DraftLaneWorkspace {
+ pub struct DflashScratch {
+     pub max_block_size: usize,
+     pub max_ctx_len: usize,
++    /// Draft local-attention lower bound (KVMem/nInfer DFlash2 integration):
++    /// the retained continuous recent suffix of the target's reselection,
++    /// expressed as a row index in the context buffer ([0, ctx_len]). Rows
++    /// below it are masked. 0 = no bound (Legacy / no reselection ⇒ the span
++    /// is the historical `[l−w, l)` and every offset stays byte-identical).
++    pub ctx_floor: usize,
+ 
+     // Block-sized activations (B rows).
+     pub x: GpuTensor,        // [B, hidden] — hidden state rolled across layers
+@@ -2197,6 +2219,7 @@ impl DflashScratch {
+         let scratch = DflashScratch {
+             max_block_size: b,
+             max_ctx_len: l,
++            ctx_floor: 0,
+ 
+             x: take!(i_x),
+             x_norm: take!(i_x_norm),
+@@ -4238,7 +4261,15 @@ fn draft_forward_based_inner(
+         } else {
+             (&scratch.k_cat, &scratch.v_cat)
+         };
+-        let span_start = l.saturating_sub(layer_w);
++        // 期4 (KVMem/nInfer DFlash2 integration): the target's reselection
++        // retains a continuous recent suffix; every draft row carries that
++        // suffix's lower bound into its LOCAL attention and older ring entries
++        // are masked. Applied to the attention span only — the projection fill
++        // keeps the historical span so every reachable ring row stays
++        // projected (a lower floor restored from a checkpoint image must never
++        // read unprojected rows). `ctx_floor == 0` ⇒ byte-identical offsets.
++        let span_start_ring = l.saturating_sub(layer_w);
++        let span_start = span_start_ring.max(scratch.ctx_floor.min(l));
+         let span = l - span_start;
+         let wm = if is_full_layer {
+             scratch.thlog.full_cached_rows()
+@@ -4247,7 +4278,7 @@ fn draft_forward_based_inner(
+         };
+         // Rows older than the proj ring's live window cannot be (re)filled
+         // here — the post-seed backfill owns that band for the last layer.
+-        let fill_start = wm.max(span_start).max(l.saturating_sub(swa_w));
++        let fill_start = wm.max(span_start_ring).max(l.saturating_sub(swa_w));
+         // For all-sliding, there is no out-of-window full backfill band to skip;
+         // the fill_start already equals span_start.
+         if fill_start < l {
+diff --git a/crates/hipfire-runtime/src/serve/mod.rs b/crates/hipfire-runtime/src/serve/mod.rs
+index 57664d4c51dce2e284b3bf365da17ba2c0c8dec1..9c211e97e9a80d8a943cd8febda5275d121c5734 100644
+--- a/crates/hipfire-runtime/src/serve/mod.rs
++++ b/crates/hipfire-runtime/src/serve/mod.rs
+@@ -235,6 +235,11 @@ pub struct KvMemStats {
+     pub prefix_hits: u64,
+     pub prefix_misses: u64,
+     pub prefix_evictions: u64,
++    /// 期4: DFlash2 draft conditioning images captured with prefix
++    /// checkpoints, restored on reuse, and missing/unrestorable (reseed).
++    pub draft_images: u64,
++    pub draft_image_hits: u64,
++    pub draft_image_misses: u64,
+ }
+ 
+ /// Serialized as the `engine_stats` object of every multi-slot `done` event;

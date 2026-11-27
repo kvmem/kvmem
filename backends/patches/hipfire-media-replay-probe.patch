@@ -1,0 +1,361 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 61d7f3869c3b6de4b2a54594001c8673fc53f231..09e173be2a946ea5b2cb8ee2dc5ef993d693ce5e 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -1856,6 +1856,31 @@ impl KvMemCtl {
+                 }
+             }
+         }
++        // G7 Stage E probe: distinguish a media-identity refusal from a token
++        // proof miss. The candidate below proves by FULL token equality; only
++        // the image identity gate refused it. Trace-only, read-only.
++        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++            .ok()
++            .is_some_and(|v| v == "1" || v == "on" || v == "true")
++        {
++            let layout = layout_fingerprint(&self.raw_cfg);
++            let rejected = self
++                .prefix_catalog
++                .probe_media_reject(prompt, layout, media)
++                .or_else(|| self.cold_packs.probe_media_reject(prompt, layout, media));
++            if let Some((frontier, digest)) = rejected {
++                let fmt = |d: Option<u64>| {
++                    d.map(|x| format!("{x:016x}"))
++                        .unwrap_or_else(|| "none".to_string())
++                };
++                eprintln!(
++                    "[kvmem-media] lookup miss: token candidate frontier={frontier} \
++                     digest={} request digest={} -> media identity gate",
++                    fmt(digest),
++                    fmt(media)
++                );
++            }
++        }
+         self.prefix_misses_total += 1;
+         None
+     }
+@@ -1945,16 +1970,35 @@ impl KvMemCtl {
+         max_frontier: u32,
+         media: Option<u64>,
+     ) -> Option<u64> {
+-        let hit = self.prefix_catalog.lookup_at_most_media(
+-            prompt,
+-            layout_fingerprint(&self.raw_cfg),
+-            max_frontier,
+-            media,
+-        );
++        let layout = layout_fingerprint(&self.raw_cfg);
++        let hit = self
++            .prefix_catalog
++            .lookup_at_most_media(prompt, layout, max_frontier, media);
+         if hit.is_some() {
+             self.prefix_catalog_hits_total += 1;
+             self.prefix_hits_total += 1;
+         } else {
++            // G7 Stage E probe: a capped lookup narrowed to `max_frontier` can
++            // miss on the media identity alone; name the refused candidate.
++            if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++                .ok()
++                .is_some_and(|v| v == "1" || v == "on" || v == "true")
++            {
++                if let Some((frontier, digest)) =
++                    self.prefix_catalog.probe_media_reject(prompt, layout, media)
++                {
++                    let fmt = |d: Option<u64>| {
++                        d.map(|x| format!("{x:016x}"))
++                            .unwrap_or_else(|| "none".to_string())
++                    };
++                    eprintln!(
++                        "[kvmem-media] capped lookup miss: token candidate frontier={frontier} \
++                         digest={} request digest={} cap={max_frontier} -> media identity gate",
++                        fmt(digest),
++                        fmt(media)
++                    );
++                }
++            }
+             self.prefix_misses_total += 1;
+         }
+         hit
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index 09ce420354b9c00264f16aff89efe13d1ad49cac..1760bb1c0be68225bb05699f21d2b3fa8d7a9113 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -276,6 +276,45 @@ impl ColdPackIndex {
+         best
+     }
+ 
++    /// G7 Stage E probe: the longest token-proven pack the media identity
++    /// gate rejected (`None` when the token-best pack is eligible or nothing
++    /// proves). Read-only — no LRU touch, no counters; trace evidence only.
++    pub fn probe_media_reject(
++        &self,
++        prompt: &[u32],
++        layout_id: u64,
++        media: Option<u64>,
++    ) -> Option<(u32, Option<u64>)> {
++        let mut best: Option<&ColdPack> = None;
++        for p in &self.packs {
++            if p.meta.layout_id != layout_id || p.meta.frontier as usize > prompt.len() {
++                continue;
++            }
++            if meta_media_eligible(
++                p.meta.frontier,
++                &p.meta.media_spans,
++                p.meta.media_digest,
++                media,
++            ) {
++                continue;
++            }
++            let f = p.meta.frontier as usize;
++            if prefix_fingerprint(&prompt[..f]) != p.fingerprint {
++                continue;
++            }
++            if prompt[..f] != p.meta.tokens[..] {
++                continue;
++            }
++            if best
++                .map(|b| p.meta.frontier > b.meta.frontier)
++                .unwrap_or(true)
++            {
++                best = Some(p);
++            }
++        }
++        best.map(|p| (p.meta.frontier, p.meta.media_digest))
++    }
++
+     /// Delete the oldest packs until the index fits `max_bytes`. Returns the
+     /// removed files so callers can log/metrics them.
+     pub fn prune_to(&mut self, max_bytes: u64) -> Vec<std::path::PathBuf> {
+@@ -775,6 +814,37 @@ impl PrefixCatalog {
+         self.entries.iter().find(|e| e.id == id)
+     }
+ 
++    /// G7 Stage E probe: the longest token-proven checkpoint the media
++    /// identity gate rejected. Read-only — no LRU touch, no counters; trace
++    /// evidence for the cross-image miss gate.
++    pub fn probe_media_reject(
++        &self,
++        prompt: &[u32],
++        dst_layout: u64,
++        media: Option<u64>,
++    ) -> Option<(u32, Option<u64>)> {
++        let mut best: Option<&PrefixCheckpoint> = None;
++        for e in &self.entries {
++            if e.layout_id != dst_layout || e.frontier as usize > prompt.len() {
++                continue;
++            }
++            if e.media_eligible(media) {
++                continue;
++            }
++            let f = e.frontier as usize;
++            if prefix_fingerprint(&prompt[..f]) != e.fingerprint {
++                continue;
++            }
++            if prompt[..f] != e.prefix_tokens[..] {
++                continue;
++            }
++            if best.map(|b| e.frontier > b.frontier).unwrap_or(true) {
++                best = Some(e);
++            }
++        }
++        best.map(|e| (e.frontier, e.media_digest))
++    }
++
+     /// Catalog-wide host-byte accounting. `gross` sums every entry's
+     /// [`PrefixCheckpoint::host_bytes`]; `unique` charges a `SealedKvBlock`
+     /// origin once across entries that share it (a session's successive
+@@ -1373,6 +1443,73 @@ mod tests {
+         assert!(!t.media_eligible(None));
+     }
+ 
++    /// G7 Stage E: the trace probe names the token-proven candidate that the
++    /// media identity gate refused, so a cross-image miss is attributable in
++    /// live logs (and is provably NOT a token-proof miss).
++    #[test]
++    fn media_probe_reports_identity_rejected_candidates() {
++        let st = storage();
++        let toks = tokens(256);
++        let layout = layout_fingerprint(&raw_config());
++        let mut cat = PrefixCatalog::new(4);
++        let mut a = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
++        a.media_digest = Some(0xA);
++        a.media_spans = vec![(64, 128)];
++        let (ida, _) = cat.insert_displacing(a).expect("insert a");
++        assert!(ida.is_some());
++        // Different image: the token proof matches, the media gate refuses.
++        assert_eq!(
++            cat.probe_media_reject(&toks[..128], layout, Some(0xB)),
++            Some((128, Some(0xA)))
++        );
++        // Text continuation (no media identity) is refused the same way.
++        assert_eq!(
++            cat.probe_media_reject(&toks[..128], layout, None),
++            Some((128, Some(0xA)))
++        );
++        // Same image (or an eligible text checkpoint) is not a rejection.
++        assert_eq!(cat.probe_media_reject(&toks[..128], layout, Some(0xA)), None);
++        // A broken token proof is a token miss, not a media rejection.
++        let mut bad = toks[..128].to_vec();
++        bad[7] ^= 1;
++        assert_eq!(cat.probe_media_reject(&bad, layout, Some(0xB)), None);
++    }
++
++    /// G7 Stage E: the cold-index probe mirrors the hot one (packs can carry
++    /// the media identity too, so a restart miss is attributable as well).
++    #[test]
++    fn media_probe_reports_cold_identity_rejects() {
++        let toks = tokens(128);
++        let layout = 0x5151_5151_5151_5151;
++        let meta = ContentPackMeta {
++            version: ContentPackMeta::VERSION,
++            layout_id: layout,
++            frontier: 128,
++            tokens: toks.clone(),
++            mean_tail: None,
++            group: 0,
++            original_query: None,
++            n_record_layers: LAYERS,
++            media_digest: Some(0xA),
++            media_spans: vec![(64, 128)],
++        };
++        let mut idx = ColdPackIndex::default();
++        idx.clock = 1;
++        idx.packs.push(ColdPack {
++            path: std::path::PathBuf::from("probe.hkpack"),
++            fingerprint: prefix_fingerprint(&toks),
++            meta,
++            bytes: 1,
++            stamp: 1,
++        });
++        assert_eq!(
++            idx.probe_media_reject(&toks, layout, Some(0xB)),
++            Some((128, Some(0xA)))
++        );
++        assert_eq!(idx.probe_media_reject(&toks, layout, Some(0xA)), None);
++        assert_eq!(idx.probe_media_reject(&toks, layout ^ 1, Some(0xB)), None);
++    }
++
+     /// 期3 G3 P1.1: the cold index scans pack files, proves by full token
+     /// equality (never fingerprint alone), and prunes by byte cap.
+     #[test]
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 531663da749f662129c2229d04e7471cd8b5105b..ee2a438a4bf21d3fcf2ef434e2fac432149ef0f9 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -7785,6 +7785,22 @@ fn run_loop(
+                                  splits a media span"
+                             );
+                         }
++                        // G7 Stage E probe: the media replay anchor refuses
++                        // this freeze boundary (name the span it would split).
++                        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++                            .ok()
++                            .is_some_and(|v| v == "1" || v == "on" || v == "true")
++                        {
++                            if let Some(&(b, e)) = all_spans
++                                .iter()
++                                .find(|&&(b, e)| (b as usize) < boundary && boundary < e as usize)
++                            {
++                                eprintln!(
++                                    "[kvmem-media] freeze skip boundary={boundary} \
++                                     splits span=[{b},{e})"
++                                );
++                            }
++                        }
+                         continue;
+                     }
+                     let media_spans: Vec<(u32, u32)> = all_spans
+@@ -7792,6 +7808,24 @@ fn run_loop(
+                         .copied()
+                         .filter(|&(_, e)| (e as usize) <= boundary)
+                         .collect();
++                    // G7 Stage E probe: the frozen boundary is media-aligned
++                    // (never inside a span) and carries the identity.
++                    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++                        .ok()
++                        .is_some_and(|v| v == "1" || v == "on" || v == "true")
++                    {
++                        let fmt = |d: Option<u64>| {
++                            d.map(|x| format!("{x:016x}"))
++                                .unwrap_or_else(|| "none".to_string())
++                        };
++                        eprintln!(
++                            "[kvmem-media] freeze boundary={boundary} digest={} \
++                             spans={} inside={}",
++                            fmt(media_digest),
++                            all_spans.len(),
++                            media_spans.len()
++                        );
++                    }
+                     // PIN requires residency: every prefix page must still be
+                     // bound (a spilled page has no physical handle to pin).
+                     let n_pages = boundary / PAGE_TOKENS;
+@@ -8269,7 +8303,20 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
+     // G7: the endpoint frontier must not split an image span; carry the
+     // session's media identity into the checkpoint.
+     let (media_digest, all_spans) = kvmem_session_media(rig, session);
+-    if all_spans.iter().any(|&(b, e)| b < boundary && boundary < e) {
++    if let Some(&(b, e)) = all_spans
++        .iter()
++        .find(|&&(b, e)| b < boundary && boundary < e)
++    {
++        // G7 Stage E probe: the endpoint replay anchor refuses this frontier.
++        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++            .ok()
++            .is_some_and(|v| v == "1" || v == "on" || v == "true")
++        {
++            eprintln!(
++                "[kvmem-media] endpoint freeze skip boundary={boundary} \
++                 splits span=[{b},{e})"
++            );
++        }
+         return;
+     }
+     let media_spans: Vec<(u32, u32)> = all_spans
+@@ -8277,6 +8324,22 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
+         .copied()
+         .filter(|&(_, e)| e <= boundary)
+         .collect();
++    // G7 Stage E probe: endpoint frontier carries a media-aligned identity.
++    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++        .ok()
++        .is_some_and(|v| v == "1" || v == "on" || v == "true")
++    {
++        let fmt = |d: Option<u64>| {
++            d.map(|x| format!("{x:016x}"))
++                .unwrap_or_else(|| "none".to_string())
++        };
++        eprintln!(
++            "[kvmem-media] endpoint freeze boundary={boundary} digest={} spans={} inside={}",
++            fmt(media_digest),
++            all_spans.len(),
++            media_spans.len()
++        );
++    }
+     let Some(domain) = rig.cache_domain.as_ref() else {
+         return;
+     };
+@@ -9577,6 +9640,23 @@ fn admit(
+                 "kvmem reuse: media anchor moves frontier {frontier} -> {aligned}"
+             ));
+         }
++        // G7 Stage E probe: the live media replay anchor accepted this
++        // frontier (block-aligned and not splitting any image span).
++        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
++            .ok()
++            .is_some_and(|v| v == "1" || v == "on" || v == "true")
++        {
++            let fmt = |d: Option<u64>| {
++                d.map(|x| format!("{x:016x}"))
++                    .unwrap_or_else(|| "none".to_string())
++            };
++            eprintln!(
++                "[kvmem-media] reuse anchor accept digest={} spans={} candidate={frontier} \
++                 aligned={aligned}",
++                fmt(req_media),
++                req_media_spans.len()
++            );
++        }
+         Ok(frontier)
+     };
+     #[cfg(feature = "kvmem")]

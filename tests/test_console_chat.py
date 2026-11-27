@@ -34,8 +34,8 @@ class Upstream(BaseHTTPRequestHandler):
 
 class Control:
     def __init__(self,port):
-        self.lock=threading.RLock();self.instance='one';self.port=port;self.backend='polystrata'
-    def status(self):return {'state':'ready','instance':self.instance,'url':f'http://127.0.0.1:{self.port}', 'active_config':{'parameters':{'Backend':self.backend}}}
+        self.lock=threading.RLock();self.instance='one';self.port=port;self.backend='polystrata';self.parameters={}
+    def status(self):return {'state':'ready','instance':self.instance,'url':f'http://127.0.0.1:{self.port}', 'active_config':{'parameters':{'Backend':self.backend,**self.parameters}}}
     def monitor_authorization(self):return 'Bearer managed-test-key'
 
 class Downstream(BaseHTTPRequestHandler):
@@ -99,6 +99,41 @@ class TransportTests(unittest.TestCase):
         payload=self.up.received[0][1];self.assertEqual(payload['thinking_budget'],16);self.assertNotIn('reasoning_budget_tokens',payload)
         c,r=self.request(id='invalid',reasoning_budget_tokens=0);self.assertEqual(r.status,400);r.read();c.close()
 
+    def test_hipfire_budget_and_preservation_map_to_native_fields(self):
+        self.control.backend='hipfire'
+        c,r=self.request(reasoning_budget_tokens=16,preserve_thinking=True,
+                         enable_thinking=False,reasoning_effort='xhigh');r.read();c.close()
+        payload=self.up.received[0][1]
+        self.assertEqual(payload['max_think_tokens'],16)
+        self.assertEqual(payload['chat_template_kwargs']['preserve_thinking'],True)
+        self.assertNotIn('reasoning_budget_tokens',payload)
+        self.assertNotIn('preserve_thinking',payload)
+        self.assertEqual(payload['enable_thinking'],False)
+        self.assertEqual(payload['reasoning_effort'],'xhigh')
+        self.assertEqual(payload['stream_options'],{'include_usage':True})
+
+    def test_hipfire_launch_output_limit_is_sent_when_request_omits_it(self):
+        self.control.backend='hipfire'
+        self.control.parameters={'MaxTokens':65536,'Context':262144}
+        c,r=self.request(id='launch-limit');r.read();c.close()
+        payload=self.up.received[0][1]
+        self.assertEqual(payload['max_tokens'],65536)
+        self.assertEqual(self.bridge.records['launch-limit']['limit'],65536)
+
+    def test_hipfire_request_output_limit_overrides_launch(self):
+        self.control.backend='hipfire'
+        self.control.parameters={'MaxTokens':65536,'Context':262144}
+        c,r=self.request(id='request-limit',max_tokens=128);r.read();c.close()
+        self.assertEqual(self.up.received[0][1]['max_tokens'],128)
+        self.assertEqual(self.bridge.records['request-limit']['limit'],128)
+
+    def test_hipfire_zero_launch_limit_uses_context_ceiling(self):
+        self.control.backend='hipfire'
+        self.control.parameters={'MaxTokens':0,'Context':262144}
+        c,r=self.request(id='context-limit');r.read();c.close()
+        self.assertEqual(self.up.received[0][1]['max_tokens'],262144)
+        self.assertEqual(self.bridge.records['context-limit']['limit'],262144)
+
 class ContextTests(unittest.TestCase):
     def test_exact_native_id_join_and_ambiguous_rows(self):
         control=Control(1);control.backend='llamacpp';bridge=ChatBridge(control)
@@ -132,6 +167,73 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(value['prefill_ms'],200)
         self.assertEqual(value['drafts_accepted'],10)
         self.assertEqual(value['finish_reason'],'length')
+
+    def test_hipfire_native_timings_and_usage_are_normalized(self):
+        record={'state':'completed','finish_reason':'stop','started_at_ms':1000,'finished_at_ms':2500,
+            'endpoint':'/v1/chat/completions','limit':64,
+            'usage':{'prompt_tokens':100,'completion_tokens':20,
+                     'prompt_tokens_details':{'cached_tokens':80}},
+            'timings':{'prefill_ms':200,'prefill_tok_s':50,'decode_tok_s':10,
+                       'ttft_ms':12,'mtp_drafts':8,'mtp_accepted':4}}
+        value=request_metrics(record,{},None,'hipfire')
+        self.assertEqual(value['prompt_tokens'],100)
+        self.assertEqual(value['elapsed_ms'],1500)
+        self.assertEqual(value['limit'],64)
+        self.assertEqual(value['endpoint'],'/v1/chat/completions')
+        self.assertEqual(value['prefill_ms'],200)
+        self.assertEqual(value['prefill_tps'],50)
+        self.assertEqual(value['prompt_new_tokens'],20)
+        self.assertEqual(value['cached_tokens'],80)
+        self.assertEqual(value['generated_tokens'],20)
+        self.assertEqual(value['decode_tps_mean'],10)
+        self.assertEqual(value['drafts_offered'],8)
+        self.assertEqual(value['drafts_accepted'],4)
+        self.assertIsNone(value['decode_tps'])
+
+    def test_hipfire_stream_timing_fallback_uses_observed_token_span(self):
+        record={'state':'completed','started_at_ms':1000,'first_token_at_ms':1300,'finished_at_ms':2300,
+            'usage':{'prompt_tokens':100,'completion_tokens':20,
+                     'prompt_tokens_details':{'cached_tokens':80}}}
+        value=request_metrics(record,{},None,'hipfire')
+        self.assertEqual(value['ttft_ms'],300)
+        self.assertEqual(value['prefill_ms'],300)
+        self.assertEqual(value['prefill_tps'],20/(300/1000))
+        self.assertEqual(value['decode_tps_mean'],20)
+
+    def test_hipfire_live_thinking_metrics_follow_delta_stream(self):
+        record={'state':'thinking','phase':'thinking','started_at_ms':1000,
+            'first_token_at_ms':1100,'last_token_at_ms':2100,
+            'stream_deltas':50,'stream_chars':500}
+        value=request_metrics(record,{},None,'hipfire')
+        self.assertEqual(value['phase'],'thinking')
+        self.assertEqual(value['stream_deltas'],50)
+        self.assertEqual(value['stream_chars'],500)
+        self.assertEqual(value['decode_tps_live'],50)
+        self.assertEqual(value['decode_tps_mean'],50)
+        self.assertEqual(value['decode_tps_window_ms'],1000)
+        self.assertEqual(value['decode_tps_sampled_at_ms'],2100)
+
+    def test_hipfire_context_uses_health_and_launch_vision(self):
+        control=Control(1);control.backend='hipfire'
+        state={'state':'ready','instance':'one','url':'http://localhost:99',
+               'active_config':{'parameters':{'Backend':'hipfire','Context':65536,
+                   'MaxTokens':1024,'Vision':True,'VisionSidecar':'/models/vision.hfq'}}}
+        control.status=lambda:state
+        bridge=ChatBridge(control)
+        def get_json(_state,path):
+            return {'speculative':{'enabled':True}} if path=='/props' else {
+                'model':'qwen3.8-27b.mq4-xts','n_ctx':65536,
+                'reasoning_efforts':['low','medium','xhigh']}
+        bridge.get_json=get_json
+        result=bridge.context()
+        self.assertEqual(result['model'],'qwen3.8-27b.mq4-xts')
+        self.assertEqual(result['context'],65536)
+        self.assertEqual(result['capabilities']['efforts'],['low','medium','xhigh'])
+        self.assertTrue(result['capabilities']['vision'])
+        self.assertEqual(result['capabilities']['image_types'],['image/png','image/jpeg'])
+        self.assertEqual(result['capabilities']['max_images'],1)
+        self.assertEqual(result['budget_min'],0)
+        self.assertIsNone(result['history_export_url'])
 
     def test_native_props_fallbacks_and_unknown_thinking(self):
         for backend in ('ninfer', 'llamacpp'):

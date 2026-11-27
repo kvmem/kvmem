@@ -69,10 +69,11 @@ def render_script(plan, lock_path, secret_ref=None):
             raise ValueError('Invalid worker SHA-256')
         lines += ['kvmem_worker_hash=$(/usr/bin/sha256sum < ' + worker + ') || fail "Cannot verify worker."',
                   '[[ ${kvmem_worker_hash:0:64} == ' + digest + ' ]] || fail "Worker changed; regenerate this version."']
-    for key in ('Model', 'DraftModel', 'ChatTemplateFile', 'Mmproj', 'Lora'):
+    for key in ('Model', 'DraftModel', 'ChatTemplateFile', 'Mmproj', 'Lora', 'VisionSidecar', 'ApiKeyFile'):
         value = plan['effective_parameters'].get(key)
         if value:
-            lines.append('[[ -f ' + shlex.quote(value) + ' && -r ' + shlex.quote(value)
+            exists = '-e' if key == 'Model' and plan['backend'] == 'hipfire' else '-f'
+            lines.append('[[ ' + exists + ' ' + shlex.quote(value) + ' && -r ' + shlex.quote(value)
                          + ' ]] || fail ' + shlex.quote(key + ' is missing or unreadable.'))
     if secret_index is not None:
         if secret_ref['kind'] == 'file':
@@ -124,7 +125,7 @@ def export_profile(data, backend_root, profiles_root, profile_id, *,
     revision = uuid.uuid4().hex
     target = revisions / revision
     secret_ref = None
-    if plan['api_key_configured']:
+    if plan.get('credential_mode') != 'api-key-file' and plan['api_key_configured']:
         secret_ref = dict(kind='file', path=str(secret_file)) if secret_file else dict(kind='environment', name='KVMEM_API_KEY')
     if persist_secret and secret_file:
         raise ValueError('Choose a supplied key file or a stored key, not both')

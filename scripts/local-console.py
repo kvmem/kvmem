@@ -29,7 +29,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from console_chat import ChatBridge, MAX_BODY
+from console_chat import ChatBridge, MAX_BODY, request_metrics
 from console_hardware import SystemHardwareSampler
 from console_radiance import enrich_props, enrich_status, enrich_hardware
 from console_memory import diagnose as diagnose_memory, validate_budget_plan
@@ -55,6 +55,40 @@ CONTENT_TYPES = {
 
 def media_type(name):
     return CONTENT_TYPES.get(Path(name).suffix.lower(), 'application/octet-stream')
+
+
+def hipfire_monitor_snapshot(state, records, health, stats, metrics_text, hardware):
+    """Project hipfire's native HTTP surfaces into the shared monitor schema."""
+    metrics = {}
+    for line in (metrics_text or '').splitlines():
+        match = re.match(r'^(hipfire_kvmem_[A-Za-z0-9_]+)\s+([^\s]+)', line.strip())
+        if not match:
+            continue
+        key, raw = match.groups()
+        try:
+            value = float(raw)
+            if value.is_integer():
+                value = int(value)
+        except ValueError:
+            continue
+        metrics[key.removeprefix('hipfire_kvmem_')] = value
+    active, recent = [], []
+    for record in sorted(records.values(), key=lambda item: item.get('started_at_ms', 0)):
+        metrics_row = request_metrics(record, {}, None, 'hipfire')
+        status = {'waiting':'queued', 'thinking':'generating', 'answering':'generating',
+                  'completed':'completed', 'cancelled':'completed', 'error':'error'}.get(record.get('state'), 'queued')
+        row = dict(metrics_row)
+        row.update(id=record.get('id'), native_request_id=record.get('native_id'),
+                   status=status, started_at_ms=record.get('started_at_ms'),
+                   finished_at_ms=record.get('finished_at_ms'), has_media=bool(record.get('has_media')))
+        if record.get('finish_reason'):
+            row['finish_reason'] = record['finish_reason']
+        (active if status in ('queued', 'generating') else recent).append(row)
+    return dict(schema_version=1, backend='hipfire', server_instance=state.get('instance'),
+                sampled_at_ms=int(time.time() * 1000), model=(health or {}).get('model'),
+                n_ctx=(health or {}).get('n_ctx'), active=active[-512:], recent=recent[-100:],
+                queued_count=sum(row['status'] == 'queued' for row in active), kvmem=metrics,
+                native_stats=stats or {}, hardware=hardware or {})
 
 
 from launcher.config import (SPECULATIVE_PROFILES, DEFAULTS, ENGINE_DEFAULTS,
@@ -172,7 +206,7 @@ class Controller:
             self.launcher_query_contract = all(name in source for name in ('QueryScorer', 'GraphAlpha', 'QueryMaxTokens', 'QueryReplayMaxTokens'))
         else:
             manifest = launcher_capabilities(self.backend_root)
-            self.backends = [name for name in manifest['backends'] if name in ('ninfer', 'llamacpp', 'radiance')]
+            self.backends = [name for name in manifest['backends'] if name in ('ninfer', 'llamacpp', 'radiance', 'hipfire')]
             self.launcher_query_contract = True
         build_info=self.backend_root/'BUILD-INFO.json'
         if build_info.is_file():
@@ -330,7 +364,7 @@ class Controller:
             raise ValueError('Invalid worker-paths.json: map backend names to absolute executable paths')
         names = {'ninfer': ('ninfer-kvmem-server.exe', 'ninfer-serve.exe'),
                  'llamacpp': ('llama-kvmem-server.exe',), 'polystrata':('strata-poly.exe',),
-                 'radiance':('radiance-kvmem-server.exe',)}
+                 'radiance':('radiance-kvmem-server.exe',), 'hipfire': ('hipfire',)}
         if os.name != 'nt':
             names = {backend: tuple(name.removesuffix('.exe') for name in entries) for backend, entries in names.items()}
         result = {}
@@ -413,7 +447,8 @@ class Controller:
             if params['Backend']=='radiance' and params.get('Vision') and not result['worker'].get('multimodal'):
                 raise ValueError('该 Radiance worker 未编入图片解码支持，请使用带 FFmpeg 的视觉构建。 This Radiance worker has no image decoder; use a vision build with FFmpeg.')
             require_launch_features(result['worker'], result['effective_parameters'])
-            result['resolved_scoring'] = self.scoring_from_argv(result['argv'])
+            if params['Backend'] != 'hipfire':
+                result['resolved_scoring'] = self.scoring_from_argv(result['argv'])
             with socket.socket() as probe:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
@@ -600,6 +635,21 @@ class Controller:
                 raise ValueError('无法保存模型目录，请检查控制台状态目录的写入权限。') from None
         return self.model_directories()
 
+    @staticmethod
+    def _hipfire_model_file(path):
+        try:
+            if path.name.lower().startswith('.') or any(token in path.name.lower()
+                    for token in ('vision', 'dflash', 'draft', '.mtp', '.vl')):
+                return False
+            with path.open('rb') as stream:
+                header = stream.read(32)
+            if len(header) != 32 or header[:4] != b'HFQM':
+                return False
+            arch = int.from_bytes(header[8:12], 'little')
+            return arch in (5, 6)
+        except OSError:
+            return False
+
     def scan_models(self, data):
         if not isinstance(data, dict) or set(data) - {'backend', 'current_path', 'directory', 'worker_path'}:
             raise ValueError('Invalid model scan request')
@@ -648,7 +698,7 @@ class Controller:
             roots[folder] = roots.get(folder, False) or recursive
         locations = [{'path': str(folder), 'recursive': recursive, 'status': 'pending'}
                      for folder, recursive in roots.items()]
-        suffix = '.rad' if backend=='radiance' else '.ninfer' if backend == 'ninfer' else '.gguf'
+        suffix = '.rad' if backend=='radiance' else '.ninfer' if backend == 'ninfer' else 'HFQ' if backend == 'hipfire' else '.gguf'
         found, visited, candidates = {}, {}, 0
         other = {'.ninfer': set(), '.gguf': set(), '.rad':set()}
         reasons = set()
@@ -681,6 +731,15 @@ class Controller:
                             stat = entry.stat(follow_symlinks=False)
                             # Junctions and links can lead outside the chosen folder or into loops.
                             if entry.is_symlink() or getattr(stat, 'st_file_attributes', 0) & 0x400:
+                                continue
+                            if backend == 'hipfire' and entry.is_file(follow_symlinks=False):
+                                path = Path(entry.path)
+                                if self._hipfire_model_file(path):
+                                    key = ((stat.st_dev, stat.st_ino) if stat.st_ino
+                                           else os.path.normcase(entry.path))
+                                    found.setdefault(key, dict(path=entry.path, name=entry.name,
+                                        bytes=stat.st_size, format='HFQ',
+                                        warnings=['empty'] if stat.st_size == 0 else []))
                                 continue
                             if entry.is_dir(follow_symlinks=False):
                                 if entry.name.startswith('.') or entry.name.lower() in ('node_modules', '__pycache__'):
@@ -752,7 +811,8 @@ class Controller:
             result = {'state': 'starting' if running else ('exited' if self.exit_code is not None else 'stopped'),
                       'pid': self.process.pid if running and self.process else None, 'exit_code': self.exit_code, 'instance':self.instance,
                       'active_config': without_secrets(self.active) if self.active else None,
-                      'api_key_configured': bool(self.active and self.active['parameters'].get('ApiKey')), 'url': None}
+                      'api_key_configured': bool(self.active and (self.active['parameters'].get('ApiKey')
+                          or self.active['parameters'].get('ApiKeyFile'))), 'url': None}
             result['owner'] = 'temporary' if self.active else None
             observation = self.radiance_template_observation
             if running and observation and observation[0] == self.instance and (self.active or {}).get('parameters', {}).get('Backend') == 'radiance':
@@ -789,12 +849,25 @@ class Controller:
                 result['url'] = f'http://127.0.0.1:{port}'
                 if probe_health:
                     try:
+                        headers = {}
+                        try:
+                            authorization = self.monitor_authorization()
+                            if authorization:
+                                headers['Authorization'] = authorization
+                        except (OSError, ValueError):
+                            pass
                         target = result['url'] + '/health'
-                        api_key = self.active['parameters'].get('ApiKey')
-                        if api_key:
-                            target = urllib.request.Request(target, headers={'Authorization': 'Bearer ' + api_key})
+                        if headers:
+                            target = urllib.request.Request(target, headers=headers)
                         with urllib.request.urlopen(target, timeout=0.5) as response:
-                            if response.status == 200:
+                            ready = response.status == 200
+                            if ready and self.active['parameters'].get('Backend') == 'hipfire':
+                                try:
+                                    health = json.loads(response.read(1024 * 1024))
+                                    ready = bool(health.get('model') and health.get('n_ctx'))
+                                except (ValueError, TypeError, OSError):
+                                    ready = False
+                            if ready:
                                 result['state'] = 'ready'
                                 self.launch_was_ready = True
                     except urllib.error.HTTPError as error:
@@ -1327,8 +1400,24 @@ class Controller:
 
     def monitor_authorization(self):
         with self.lock:
-            key = self.active['parameters'].get('ApiKey') if self.active else None
-            return 'Bearer ' + key if key else None
+            parameters = self.active['parameters'] if self.active else {}
+            key = parameters.get('ApiKey')
+            if parameters.get('Backend') == 'hipfire' and parameters.get('ApiKeyFile'):
+                path = Path(parameters['ApiKeyFile'])
+                metadata = path.stat()
+                if os.name != 'nt' and stat.S_IMODE(metadata.st_mode) & 0o077:
+                    raise ValueError('ApiKeyFile must not be accessible by group or other users')
+                with path.open('rb') as stream:
+                    raw = stream.read(513)
+                if len(raw) > 512 or not raw:
+                    raise ValueError('ApiKeyFile must contain one token of at most 512 bytes')
+                key = raw.strip().decode('ascii')
+                if not re.fullmatch(r'[A-Za-z0-9._~+/-]+=*', key):
+                    raise ValueError('ApiKeyFile contains an invalid bearer token')
+            if key:
+                self.redactions.add(key)
+                return 'Bearer ' + key
+            return None
 
 
 def gpu_inventory():
@@ -1468,6 +1557,21 @@ class Handler(BaseHTTPRequestHandler):
                 state = self.control.status(probe_health=False)
                 if not state['url']:
                     self.reply(503, {'error': 'No managed service is running'}); return
+                if path == '/api/monitor/snapshot' and state.get('active_config',{}).get('parameters',{}).get('Backend') == 'hipfire':
+                    try:
+                        health=self.control.chat.get_json(state,'/health')
+                        stats=self.control.chat.get_json(state,'/stats')
+                        metrics=self.control.chat.get_text(state,'/metrics')
+                        with self.control.chat.lock:
+                            records=copy.deepcopy(self.control.chat.records)
+                        if state.get('instance') != self.control.status(probe_health=False).get('instance'):
+                            raise ValueError('Service changed while reading monitor data')
+                        snapshot=hipfire_monitor_snapshot(state,records,health,stats,metrics,
+                            self.server.hardware.snapshot())
+                        self.reply(200,json.dumps(snapshot,ensure_ascii=False).encode('utf-8'))
+                    except (OSError,ValueError,http.client.HTTPException) as error:
+                        self.reply(503, {'error':'hipfire monitor unavailable: '+str(error)})
+                    return
                 # Fixed read-only routes to the owned service, never an arbitrary URL.
                 request = urllib.request.Request(state['url'] + path)
                 authorization = self.control.monitor_authorization() or self.headers.get('Authorization')
@@ -1478,7 +1582,16 @@ class Handler(BaseHTTPRequestHandler):
                         body = response.read(4 * 1024 * 1024 + 1)
                         if len(body) > 4 * 1024 * 1024:
                             raise ValueError('Monitor response too large')
-                        if path=='/props' and state.get('active_config',{}).get('parameters',{}).get('Backend')=='radiance':
+                        if path=='/props' and state.get('active_config',{}).get('parameters',{}).get('Backend')=='hipfire':
+                            health=self.control.chat.get_json(state,'/health')
+                            props=json.loads(body)
+                            props['model_name']=health.get('model')
+                            props['default_generation_settings']={'n_ctx':health.get('n_ctx')}
+                            gpu=state.get('active_config',{}).get('parameters',{}).get('Gpu','')
+                            device=next((item for item in self.server.gpus if item.get('uuid')==gpu),None)
+                            props['execution']={'mode':'single','monitor_devices':[device] if device else []}
+                            body=json.dumps(props,ensure_ascii=False).encode('utf-8')
+                        elif path=='/props' and state.get('active_config',{}).get('parameters',{}).get('Backend')=='radiance':
                             info=self.control.chat.get_json(state,'/server_info')
                             snapshot=self.control.chat.get_json(state,'/api/monitor/snapshot')
                             if state.get('instance')!=self.control.status(probe_health=False).get('instance'):

@@ -369,9 +369,14 @@ std::vector<double> page_softmax_scores(const RawKvStore& keys, PageQueryView q,
             double maximum = -std::numeric_limits<double>::infinity();
             const auto head = h/(q.query_heads/q.kv_heads);
             for (size_t j = 0; j < enabled.size(); ++j) {
-                double dot = 0;
-                for (uint32_t d = 0; d < q.head_dim; ++d) dot += double(query[d])*means[j*kw+head*q.head_dim+d];
-                maximum = std::max(maximum, logits[j] = dot*scale);
+                // FP16-rounded operands make each product exact in float32; a
+                // float SIMD reduction (omp simd) replaces the serial double
+                // dependency chain that dominated page-softmax selection cost.
+                float dot = 0;
+                const float* mv = means.data() + j*kw + size_t(head)*q.head_dim;
+                #pragma omp simd reduction(+:dot)
+                for (uint32_t d = 0; d < q.head_dim; ++d) dot += query[d]*mv[d];
+                maximum = std::max(maximum, logits[j] = double(dot)*scale);
             }
             double denominator = 0;
             for (auto& value : logits) denominator += value = std::exp(value-maximum);

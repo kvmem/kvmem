@@ -11,11 +11,20 @@ export const fileAccept = [
   ...Object.values(imageTypes), "text/*", ...textExtensions.map((ext) => "." + ext),
 ].join(",");
 
-export async function readAttachment(file: File, vision: boolean): Promise<ChatAttachment> {
+export async function readAttachment(
+  file: File,
+  vision: boolean,
+  capabilities?: { image_types?: string[] },
+): Promise<ChatAttachment> {
   const extension = file.name.split(".").pop()!.toLowerCase();
   const imageType = imageTypes[extension] || (Object.values(imageTypes).includes(file.type) ? file.type : "");
   if (imageType) {
     if (!vision) throw Error("当前模型不支持图片");
+    const allowed = capabilities?.image_types;
+    if (allowed?.length && !allowed.includes(imageType)) {
+      const labels = allowed.map((type) => type.split("/")[1]?.toUpperCase()).join(" / ");
+      throw Error(`当前后端仅支持 ${labels} 图片`);
+    }
     if (file.size > 10 * 1024 * 1024) throw Error("图片每张不超过 10 MiB");
     const base64Url = await new Promise<string>((resolve, reject) => {
       const reader = new FileReader();

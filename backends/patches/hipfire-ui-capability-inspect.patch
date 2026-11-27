@@ -1,0 +1,437 @@
+diff --git a/crates/hipfire-cli/src/capabilities.rs b/crates/hipfire-cli/src/capabilities.rs
+new file mode 100644
+index 000000000..51c534837
+--- /dev/null
++++ b/crates/hipfire-cli/src/capabilities.rs
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Kaden Schutt
++// hipfire — see LICENSE and NOTICE in the project root.
++
++//! Read-only KVMem launch capability advertisement.
++//!
++//! This is deliberately independent of model loading, GPU discovery and the
++//! daemon. KVMem uses it to qualify a worker before a model is selected.
++
++use serde_json::{json, Value};
++
++const MIB: u64 = 1 << 20;
++
++pub(crate) fn report() -> Value {
++    let kvmem = cfg!(feature = "kvmem");
++    let layerwise = kvmem.then(|| {
++        json!({
++            "available": true,
++            "config_source": "environment",
++            "current_layer_q": true,
++            "query_replay": false,
++            "position_policy": "original",
++            "model_architectures": ["qwen35"],
++            "model_sources": ["hfq"],
++            "max_devices": 1,
++            "max_concurrency": 8,
++            "minimum_window_tokens": 384,
++            "minimum_reserve_blocks": 1,
++            "parallel_modes": ["single"],
++            "kv_formats": ["q8"],
++            "vision_residency": ["resident", "cpu"],
++            "default_resources": {
++                "activation_ram_bytes": 64 * MIB,
++                "activation_disk_bytes": 32 * MIB,
++                "staging_bytes": 8 * MIB,
++                "metadata_bytes": 1024 * MIB,
++                "activation_metadata_bytes": 96 * MIB,
++            },
++            "speculative": {
++                "none": {"available": true},
++                "mtp": {
++                    "available": true,
++                    "draft_width_model_owned": true,
++                    "adaptive": false,
++                    "ngram": false,
++                    "max_concurrency": 8,
++                    "max_devices": 1,
++                    "draft_asset": "embedded",
++                    "history_policies": ["first-layer", "upstream-global"],
++                    "default_history_policy": "first-layer",
++                    "state_modes": ["native"],
++                },
++                "dflash2": {
++                    "available": true,
++                    "draft_width_model_owned": true,
++                    "adaptive": false,
++                    "ngram": false,
++                    "max_concurrency": 8,
++                    "max_devices": 1,
++                    "draft_asset": "paired_hfq",
++                    "model_sources": ["hfq"],
++                    "history": "independent-native-window",
++                },
++            },
++        })
++    });
++
++    json!({
++        "schema_version": 1,
++        "backend": "hipfire",
++        "query_scoring_revision": 2,
++        "recall_strategy_revision": if kvmem { json!(1) } else { Value::Null },
++        "compiled_with_kvmem": kvmem,
++        "kvmem_contract_version": if kvmem { json!(1) } else { Value::Null },
++        "block_tokens": [128],
++        "kv_formats": if kvmem { json!(["q8"]) } else { json!([]) },
++        "model_sources": ["hfq"],
++        "model_architectures": ["qwen35"],
++        "max_devices": 1,
++        "max_concurrency": 8,
++        "graph_alpha_supported": false,
++        "independent_graph_lrfu": false,
++        "streaming": true,
++        "concurrent_requests": true,
++        "multimodal": true,
++        "recall_strategies": {
++            "legacy": {
++                "available": kvmem,
++                "config_source": "cli",
++            },
++            "layerwise": layerwise.unwrap_or(Value::Null),
++        },
++        "speculative": {
++            "none": {"available": true},
++            "mtp": {
++                "available": true,
++                "draft_width_model_owned": true,
++                "draft_asset": "embedded",
++            },
++            "dflash2": {
++                "available": true,
++                "draft_width_model_owned": true,
++                "draft_asset": "paired_hfq",
++                "model_sources": ["hfq"],
++            },
++        },
++        "vision": {
++            "available": true,
++            "model_sources": ["hfq"],
++            "sidecar_arch_ids": [5, 6],
++            "residency": ["resident", "cpu"],
++            "image_types": ["image/png", "image/jpeg"],
++            "max_images_per_request": 1,
++            "remote_urls": false,
++        },
++        "auth": {
++            "api_key_file": true,
++            "raw_api_key_arg": false,
++        },
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::report;
++    use clap::Parser;
++
++    #[test]
++    fn cli_accepts_the_read_only_capability_flag() {
++        let cli = crate::Cli::try_parse_from(["hipfire", "--kvmem-capabilities"]).unwrap();
++        assert!(cli.kvmem_capabilities);
++    }
++
++    #[test]
++    fn report_declares_the_kvmem_ui_contract() {
++        let report = report();
++        assert_eq!(report["schema_version"], 1);
++        assert_eq!(report["backend"], "hipfire");
++        assert_eq!(report["block_tokens"], serde_json::json!([128]));
++        assert_eq!(report["model_sources"], serde_json::json!(["hfq"]));
++        assert_eq!(report["recall_strategies"]["legacy"]["available"], true);
++        assert_eq!(
++            report["recall_strategies"]["layerwise"]["available"],
++            cfg!(feature = "kvmem")
++        );
++        assert_eq!(report["vision"]["max_images_per_request"], 1);
++        assert_eq!(report["auth"]["api_key_file"], true);
++        if cfg!(feature = "kvmem") {
++            assert_eq!(report["recall_strategy_revision"], 1);
++        } else {
++            assert!(report["recall_strategy_revision"].is_null());
++        }
++    }
++}
+diff --git a/crates/hipfire-cli/src/inspect.rs b/crates/hipfire-cli/src/inspect.rs
+index 92d3bbb45..9fdce0aab 100644
+--- a/crates/hipfire-cli/src/inspect.rs
++++ b/crates/hipfire-cli/src/inspect.rs
+@@ -2,26 +2,33 @@
+ // Copyright (c) 2026 Kaden Schutt
+ // hipfire — see LICENSE and NOTICE in the project root.
+ 
+-//! `hipfire inspect <file.gguf>`: read a GGUF header and report what hipfire
+-//! would do with it: architecture, tensor count, per-type histogram, model
+-//! bits per weight, and the per-tensor admission verdict. Read-only (no GPU,
+-//! no daemon, no model load), so it works on a header-only download too.
++//! `hipfire inspect`: read a GGUF, HFQ, or safetensors-directory header and
++//! report what hipfire would do with it. Read-only: no GPU, daemon, model load,
++//! or tensor payload read.
+ 
+-use anyhow::{bail, Context, Result};
++use anyhow::{Context, Result, bail};
+ use clap::Args;
+ use std::io::Read;
+ use std::path::PathBuf;
+ 
+ #[derive(Args, Debug)]
+ pub(crate) struct InspectArgs {
+-    /// A `.gguf` model file.
++    /// A GGUF/HFQ model file or a safetensors model directory.
+     pub path: PathBuf,
++    /// Emit the KVMem HFQ/safetensors health report as JSON.
++    #[arg(long)]
++    pub json: bool,
+ }
+ 
+ /// The four GGUF magic bytes.
+ const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+ 
+ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
++    if args.json {
++        let report = inspect_json(&args.path)?;
++        println!("{}", serde_json::to_string_pretty(&report)?);
++        return Ok(());
++    }
+     let mut magic = [0u8; 4];
+     std::fs::File::open(&args.path)
+         .with_context(|| format!("could not open {}", args.path.display()))?
+@@ -42,18 +49,191 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Header/index-only model report for KVMem's CPU-side health check.
++pub(crate) fn inspect_json(path: &std::path::Path) -> Result<serde_json::Value> {
++    use hipfire_runtime::loader_api::ModelSource;
++    use hipfire_runtime::model_source::ModelSource as SourceTrait;
++    use serde_json::{Value, json};
++
++    let path_text = path.to_string_lossy();
++    let source = ModelSource::from_path(&path_text)
++        .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
++    let (kind, arch_id, tensor_count, format_version, names, metadata) = match &source {
++        ModelSource::Hfq(hfq) => (
++            "hfq",
++            hfq.arch_id,
++            hfq.tensors().len(),
++            Some(hfq.format_version),
++            hfq.tensors()
++                .iter()
++                .map(|tensor| tensor.name.as_str())
++                .collect::<Vec<_>>(),
++            serde_json::from_str::<Value>(&hfq.metadata_json).unwrap_or_else(|_| json!({})),
++        ),
++        ModelSource::Dir(dir) => (
++            "safetensors-dir",
++            dir.arch_id(),
++            dir.tensor_names().len(),
++            None,
++            dir.tensor_names(),
++            serde_json::from_str::<Value>(SourceTrait::metadata_json(dir))
++                .unwrap_or_else(|_| json!({})),
++        ),
++    };
++    let is_dir = kind == "safetensors-dir";
++    let qwen35 = matches!(arch_id, 5 | 6);
++    let has_trunk = names.iter().any(|name| {
++        name.ends_with("lm_head.weight")
++            || name.ends_with("model.embed_tokens.weight")
++            || name.ends_with("model.layers.0.self_attn.q_proj.weight")
++    });
++    let vision_present = names
++        .iter()
++        .any(|name| name.ends_with("model.visual.patch_embed.proj.weight"));
++    let architecture = match arch_id {
++        5 => "qwen35",
++        6 => "qwen35-moe",
++        20 => "dflash-draft",
++        21 => "mtp-head",
++        22 | 23 => "draft-sidecar",
++        _ => "unknown",
++    };
++    let selected_metadata = json!({
++        "model_type": metadata.get("model_type"),
++        "architectures": metadata.get("architectures"),
++        "num_experts": metadata.get("num_experts"),
++        "quant_method": metadata.get("quant_method"),
++        "torch_dtype": metadata.get("torch_dtype"),
++    });
++    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
++    Ok(json!({
++        "schema_version": 1,
++        "source": kind,
++        "path": canonical,
++        "arch_id": arch_id,
++        "architecture": architecture,
++        "format_version": format_version,
++        "tensor_count": tensor_count,
++        "can_serve": qwen35 && has_trunk,
++        "kv_types": ["q8"],
++        "metadata": selected_metadata,
++        "vision": {
++            "present": vision_present,
++            "sidecar_supported": qwen35 && !is_dir,
++        },
++        "speculative": {
++            "mtp": {"supported": qwen35 && has_trunk && !is_dir},
++            "dflash2": {"supported": qwen35 && has_trunk && !is_dir, "draft_asset": "paired_hfq"},
++        },
++        "limitations": if is_dir {
++            json!(["vision-sidecar-unsupported", "dflash-unsupported"])
++        } else {
++            json!([])
++        },
++    }))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use clap::Parser;
++    use serde_json::json;
+ 
+-    #[test]
+-    fn a_non_gguf_file_is_named_and_refused() {
+-        let dir = std::env::temp_dir().join(format!("hipfire-inspect-{}", std::process::id()));
++    fn scratch(label: &str) -> std::path::PathBuf {
++        let dir =
++            std::env::temp_dir().join(format!("hipfire-inspect-{label}-{}", std::process::id()));
+         std::fs::create_dir_all(&dir).unwrap();
+-        let path = dir.join("not-gguf.bin");
+-        std::fs::write(&path, b"HFQM....").unwrap();
+-        let err = inspect_command(InspectArgs { path: path.clone() }).unwrap_err();
+-        assert!(err.to_string().contains("not a GGUF file"), "{err}");
+-        let _ = std::fs::remove_dir_all(&dir);
++        dir
++    }
++
++    fn write_hfq(path: &std::path::Path, arch_id: u32, tensors: &[&str]) {
++        let metadata = b"{}";
++        let mut index = Vec::new();
++        index.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
++        for tensor in tensors {
++            index.extend_from_slice(&(tensor.len() as u16).to_le_bytes());
++            index.extend_from_slice(tensor.as_bytes());
++            index.push(1); // quant type
++            index.push(1); // dimensions
++            index.extend_from_slice(&1u32.to_le_bytes());
++            index.extend_from_slice(&0u32.to_le_bytes());
++            index.extend_from_slice(&0u64.to_le_bytes());
++        }
++        let data_offset = 32 + metadata.len() + index.len();
++        let mut bytes = Vec::new();
++        bytes.extend_from_slice(b"HFQM");
++        bytes.extend_from_slice(&1u32.to_le_bytes());
++        bytes.extend_from_slice(&arch_id.to_le_bytes());
++        bytes.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
++        bytes.extend_from_slice(&32u64.to_le_bytes());
++        bytes.extend_from_slice(&(data_offset as u64).to_le_bytes());
++        bytes.extend_from_slice(metadata);
++        bytes.extend_from_slice(&index);
++        std::fs::write(path, bytes).unwrap();
++    }
++
++    fn write_safetensors(dir: &std::path::Path) {
++        std::fs::write(
++            dir.join("config.json"),
++            json!({"model_type":"qwen3.5"}).to_string(),
++        )
++        .unwrap();
++        let header = json!({"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}).to_string();
++        let mut bytes = Vec::new();
++        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
++        bytes.extend_from_slice(header.as_bytes());
++        bytes.extend_from_slice(&0f32.to_le_bytes());
++        std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
++    }
++
++    #[test]
++    fn cli_accepts_json_output() {
++        let cli =
++            crate::Cli::try_parse_from(["hipfire", "inspect", "model.hfq", "--json"]).unwrap();
++        match cli.command {
++            Some(crate::Commands::Inspect(args)) => assert!(args.json),
++            _ => panic!("expected inspect command"),
++        }
++    }
++
++    #[test]
++    fn hfq_json_reports_architecture_and_embedded_vision() {
++        let dir = scratch("hfq");
++        let path = dir.join("qwen3.8-27b.mq4-xts");
++        write_hfq(
++            &path,
++            5,
++            &["model.visual.patch_embed.proj.weight", "lm_head.weight"],
++        );
++        let report = inspect_json(&path).unwrap();
++        assert_eq!(report["source"], "hfq");
++        assert_eq!(report["arch_id"], 5);
++        assert_eq!(report["architecture"], "qwen35");
++        assert_eq!(report["tensor_count"], 2);
++        assert_eq!(report["vision"]["present"], true);
++        assert_eq!(report["speculative"]["dflash2"]["supported"], true);
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
++    #[test]
++    fn safetensors_json_reports_directory_limits() {
++        let dir = scratch("safetensors");
++        write_safetensors(&dir);
++        let report = inspect_json(&dir).unwrap();
++        assert_eq!(report["source"], "safetensors-dir");
++        assert_eq!(report["arch_id"], 5);
++        assert_eq!(report["vision"]["present"], false);
++        assert_eq!(report["speculative"]["dflash2"]["supported"], false);
++        let _ = std::fs::remove_dir_all(dir);
++    }
++
++    #[test]
++    fn a_non_model_file_is_named_and_refused() {
++        let dir = scratch("invalid");
++        let path = dir.join("not-a-model.bin");
++        std::fs::write(&path, b"not a model").unwrap();
++        let err = inspect_json(&path).unwrap_err();
++        assert!(err.to_string().contains("not-a-model.bin"), "{err}");
++        let _ = std::fs::remove_dir_all(dir);
+     }
+ }
+diff --git a/crates/hipfire-cli/src/main.rs b/crates/hipfire-cli/src/main.rs
+index f0882d646..c81ae29fd 100644
+--- a/crates/hipfire-cli/src/main.rs
++++ b/crates/hipfire-cli/src/main.rs
+@@ -51,6 +51,7 @@ use std::{
+ 
+ mod bench_concurrency;
+ mod bench_power;
++mod capabilities;
+ mod calibrate;
+ mod config_tuning;
+ mod config_view;
+@@ -90,6 +91,9 @@ const BUILD_TARGET: &str = env!("HIPFIRE_BUILD_TARGET");
+     long_about = "Native Rust control plane for hipfire. Configuration, registry, model lifecycle, serving, chat, and diagnostics are implemented without a JavaScript runtime."
+ )]
+ pub(crate) struct Cli {
++    /// Print the read-only KVMem launch capability contract as JSON.
++    #[arg(long)]
++    kvmem_capabilities: bool,
+     #[command(subcommand)]
+     command: Option<Commands>,
+ }
+@@ -1259,6 +1263,10 @@ fn run() -> Result<()> {
+         .collect();
+     validate_kvmem_storage_args(&arguments)?;
+     let cli = Cli::parse_from(arguments);
++    if cli.kvmem_capabilities {
++        println!("{}", serde_json::to_string_pretty(&capabilities::report())?);
++        return Ok(());
++    }
+     // Must precede Paths::discover, registry/model lookup, restart/stop, detach
+     // and every daemon/GPU side effect. Only global config files are read.
+     if let Some(Commands::Serve(args) | Commands::Restart(args)) = &cli.command {

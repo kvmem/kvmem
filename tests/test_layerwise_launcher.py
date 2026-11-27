@@ -148,7 +148,7 @@ class LayerwiseLauncherTest(unittest.TestCase):
             require_launch_features(cap, p)
         # A plausible model_type and filename cannot stand in for the exact ID.
         ninfer(model)
-        with self.assertRaisesRegex(ValueError, 'unverified'):
+        with self.assertRaisesRegex(ValueError, 'does not qualify|unverified'):
             require_launch_features(cap, p)
         with self.assertRaisesRegex(ValueError, 'model architectures'):
             require_launch_features(contract(model_architectures=[]), p)

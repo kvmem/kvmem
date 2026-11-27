@@ -114,6 +114,10 @@ public:
 
     // Normalize the stored sum by mean_tokens; absent statistics return zeros.
     void mean_k(uint32_t block_id, uint32_t il, float * out) const;
+    // Exact pre-normalization Mean-K sum of one block (n_embd_k floats). False
+    // when the block carries no Mean-K sum. Used by cross-account copies that
+    // must reproduce the retrieval index byte-for-byte.
+    bool mean_sum(uint32_t block_id, uint32_t il, float * out) const;
 
     size_t bytes_k() const;
     size_t bytes_v() const;

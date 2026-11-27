@@ -104,7 +104,7 @@
           .replace(/\.gguf$/i, "")
       : "";
   const backendLabel = (name: string) =>
-    ({ llamacpp: "llama.cpp", ninfer: "NInfer", polystrata: "PolyStrata" })[
+    ({ llamacpp: "llama.cpp", ninfer: "NInfer", polystrata: "PolyStrata", hipfire: "hipfire" })[
       name
     ] ||
     name ||
@@ -471,8 +471,10 @@
     if (busy || loading || !files.length) return;
     const editing = !!editingId;
     const existing = editing ? editedImages : images;
-    if (existing.length + files.length > 4) {
-      error = t("每条消息最多添加 4 个文件");
+    const maxFiles = ctx?.capabilities?.max_files ?? 4;
+    const maxImages = ctx?.capabilities?.max_images ?? 4;
+    if (existing.length + files.length > maxFiles) {
+      error = t(`每条消息最多添加 ${maxFiles} 个文件`);
       return;
     }
     loading = true;
@@ -480,8 +482,12 @@
     try {
       const added = [];
       for (const file of files) {
-        try { added.push(await readAttachment(file, !!ctx?.capabilities?.vision)); }
+        try { added.push(await readAttachment(file, !!ctx?.capabilities?.vision, ctx?.capabilities)); }
         catch (e) { throw Error(file.name + ": " + t(e instanceof Error ? e.message : String(e))); }
+      }
+      const imageCount = [...existing, ...added].filter((item) => item.type === "image").length;
+      if (imageCount > maxImages) {
+        throw Error(t(`每条消息最多添加 ${maxImages} 张图片`));
       }
       if (editing) editedImages = [...existing, ...added];
       else images = [...existing, ...added];

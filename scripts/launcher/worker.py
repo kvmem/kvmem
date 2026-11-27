@@ -68,11 +68,19 @@ def probe_worker(worker, backend, environment=None):
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         value = json.loads(run.stdout)
         if (run.returncode or not isinstance(value, dict) or value.get('schema_version') != 1
-                or value.get('backend') != backend or value.get('query_scoring_revision', 0) < 2
-                or not value.get('independent_graph_lrfu') or not value.get('signed_lrfu_hits')):
+                or value.get('backend') != backend or value.get('query_scoring_revision', 0) < 2):
+            raise ValueError('incompatible worker contract')
+        if backend == 'hipfire':
+            if (value.get('compiled_with_kvmem') is not True
+                    or type(value.get('kvmem_contract_version')) is not int
+                    or value['kvmem_contract_version'] < 1
+                    or value.get('block_tokens') != [128]):
+                raise ValueError('incompatible hipfire worker contract: compiled_with_kvmem and 128-token blocks are required')
+        elif not value.get('independent_graph_lrfu') or not value.get('signed_lrfu_hits'):
             raise ValueError('incompatible worker contract')
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-        raise ValueError('Worker does not support this launch contract; update the complete package. ' + str(path)) from error
+        raise ValueError('Worker does not support this launch contract; update the complete package. '
+                         + str(path) + ': ' + str(error)) from error
     digest = worker_digest(path)
     if _identity(path) != identity:
         raise ValueError('Worker changed during capability probing; retry after the update completes')

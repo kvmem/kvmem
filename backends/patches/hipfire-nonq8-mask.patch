@@ -1,0 +1,1050 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index 5a7a92b0ff98b684aa00d9de6b6a0da29018df39..01f17a0520650c3721ba1f92b67ead946a8904c7 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -54,6 +54,7 @@ use rdna_compute::layerwise_pool::{mtp_auxiliary_capacity, mtp_head_pool, Layerw
+ use rdna_compute::page_pool::SPILLED_PAGE;
+ use rdna_compute::slot_pool::{SlotId, SlotPool};
+ use rdna_compute::{Gpu, GpuTensor};
++use saddle_core::kv::KvMode;
+ 
+ use crate::kvmem_taps::KvMemTaps;
+ use crate::kvmem_prefix::{layout_fingerprint, PrefixCatalog, PrefixCheckpoint, PREFIX_PAGE_TOKENS};
+@@ -513,6 +514,10 @@ pub struct KvMemGeometry {
+     pub n_heads: usize,
+     pub n_kv_heads: usize,
+     pub head_dim: usize,
++    /// P4.4: the KV tier this controller's geometry resolves to. The layerwise
++    /// layout adapter registers a per-tier format identity from it (format
++    /// isolation); Legacy carries it for the same admission/identity purpose.
++    pub kv_mode: KvMode,
+     /// K arena bytes per position (packed Q8 row of one KV head set).
+     pub per_pos_bytes: usize,
+     /// V arena bytes per position.
+@@ -794,6 +799,8 @@ pub struct KvMemCtl {
+     n_heads: usize,
+     n_kv_heads: usize,
+     head_dim: usize,
++    /// P4.4: KV tier (per-tier layerwise format identity + admission).
++    kv_mode: KvMode,
+     q_width: usize,
+     k_page_bytes: usize,
+     v_page_bytes: usize,
+@@ -1137,6 +1144,7 @@ impl KvMemCtl {
+             n_heads: geom.n_heads,
+             n_kv_heads: geom.n_kv_heads,
+             head_dim: geom.head_dim,
++            kv_mode: geom.kv_mode,
+             q_width,
+             k_page_bytes: KV_BLOCK_TOKENS * geom.per_pos_bytes,
+             v_page_bytes: KV_BLOCK_TOKENS * geom.per_pos_v_bytes,
+@@ -1176,6 +1184,12 @@ impl KvMemCtl {
+         })
+     }
+ 
++    /// P4.4: the KV tier this controller resolves to (per-tier layerwise format
++    /// identity + admission). The layout adapter and backend identity read it.
++    pub fn kv_mode(&self) -> KvMode {
++        self.kv_mode
++    }
++
+     /// Resolved recall execution model (`HIPFIRE_KVMEM_RECALL_STRATEGY`).
+     /// The engine gates the Layerwise subsystem (write-through archive,
+     /// per-layer driver, packed residency) on this; Legacy is the default.
+@@ -2166,14 +2180,14 @@ impl KvMemCtl {
+         }
+         let frontier = full_pages * bt;
+         // Composite Main+aux descriptor; the head plans ONLY the aux ordinal.
+-        let mtp = LayerwiseMtpQ8Layout::resolve(self.n_fa_layers, self.n_kv_heads, self.head_dim)
++        let mtp = LayerwiseMtpQ8Layout::resolve(self.kv_mode, self.n_fa_layers, self.n_kv_heads, self.head_dim)
+             .map_err(|e| format!("kvmem head plan: mtp layout: {e}"))?;
+         let layout = mtp
+             .payload_layout()
+             .map_err(|e| format!("kvmem head plan: manifest: {e}"))?;
+         let record_bytes = layout.record_bytes();
+         let descriptor = MemoryDescriptor::new(
+-            &layerwise_backend(model),
++            &layerwise_backend(model, self.kv_mode),
+             &layout,
+             &layerwise_capabilities(max_position),
+         )
+@@ -3398,6 +3412,7 @@ mod tests {
+             n_heads: 4,
+             n_kv_heads: 2,
+             head_dim: 64,
++            kv_mode: KvMode::Q8,
+             per_pos_bytes: 136,
+             per_pos_v_bytes: 136,
+             max_rows: 512,
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index 191ccab31860f500b1884ffd72bef5a06cd49fe9..0c394958562403aad0f545a430060e55a3f4c264 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -43,6 +43,7 @@ use hipfire_kvmem::{
+ use rdna_compute::kvmem_page_mass::PageMassQuery;
+ use rdna_compute::kvmem_page_score::{PageQueryScalar, PageScoreQuery};
+ use rdna_compute::kv_slots::KvSlotDesc;
++use saddle_core::kv::KvMode;
+ use rdna_compute::layerwise_pool::{LayerwisePagePool, PackedArenaLayout};
+ use rdna_compute::{DType, Gpu, GpuTensor};
+ use std::collections::HashMap;
+@@ -2178,12 +2179,14 @@ pub fn bootstrap_layerwise_rows(
+     })
+ }
+ 
+-/// Production backend identity for the hipfire Q8 packed layerwise archive
++/// Production backend identity for the hipfire packed layerwise archive
+ /// (design §3.9g). Tags the sealed records' provenance; the core treats it as an
+ /// opaque admission key (must match across a transaction's export/restore).
+-pub fn layerwise_backend(model: &str) -> BackendIdentity {
++/// P4.4: the tag is per-KV-tier ([`packed_format_tag`]) so records sealed under
++/// one tier can never seed another (ninfer format-isolation pattern).
++pub fn layerwise_backend(model: &str, kv_mode: KvMode) -> BackendIdentity {
+     BackendIdentity {
+-        backend: Q8_PACKED_FORMAT.to_string(),
++        backend: crate::layerwise_layout::packed_format_tag(kv_mode).to_string(),
+         revision: env!("CARGO_PKG_VERSION").to_string(),
+         model: model.to_string(),
+         state_schema: "state-v1".to_string(),
+@@ -2267,7 +2270,7 @@ pub fn engine_carrier_rows<'a>(
+     }
+     let (keys, _slot_policy) = stores;
+     let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
+-    let q8 = LayerwiseQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim, &fa_layers)
++    let q8 = LayerwiseQ8Layout::resolve(ctl.kv_mode(), n_fa_layers, n_kv_heads, head_dim, &fa_layers)
+         .map_err(|e| format!("layerwise engine rows: q8 layout: {e}"))?;
+     // P4.1② G4 (f1): under Layerwise + MTP the canonical archive is the COMPOSITE
+     // Main+aux manifest (n_fa + 1 layers) so every sealed trunk record co-archives
+@@ -2276,7 +2279,7 @@ pub fn engine_carrier_rows<'a>(
+     // Legacy / AR-only keep the standalone trunk manifest (byte-neutral).
+     let mtp = if ctl.head_plane_enabled() {
+         Some(
+-            LayerwiseMtpQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim)
++            LayerwiseMtpQ8Layout::resolve(ctl.kv_mode(), n_fa_layers, n_kv_heads, head_dim)
+                 .map_err(|e| format!("layerwise engine rows: mtp layout: {e}"))?,
+         )
+     } else {
+@@ -2391,7 +2394,7 @@ pub fn engine_carrier_rows<'a>(
+                 .payload_layout()
+                 .map_err(|e| format!("layerwise engine rows: manifest: {e}"))?;
+             let descriptor = MemoryDescriptor::new(
+-                &layerwise_backend(model),
++                &layerwise_backend(model, ctl.kv_mode()),
+                 &layout,
+                 &layerwise_capabilities(max_position),
+             )
+@@ -2441,7 +2444,7 @@ pub fn engine_carrier_rows<'a>(
+         keys,
+         policy,
+         &q8,
+-        layerwise_backend(model),
++        layerwise_backend(model, ctl.kv_mode()),
+         layerwise_capabilities(max_position),
+         bootstrap,
+         n_slots,
+@@ -2508,9 +2511,9 @@ pub fn engine_carrier_head<'a>(
+     }
+     let (keys, _slot_policy) = stores;
+     let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
+-    let q8 = LayerwiseQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim, &fa_layers)
++    let q8 = LayerwiseQ8Layout::resolve(ctl.kv_mode(), n_fa_layers, n_kv_heads, head_dim, &fa_layers)
+         .map_err(|e| format!("layerwise head carrier: q8 layout: {e}"))?;
+-    let mtp = LayerwiseMtpQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim)
++    let mtp = LayerwiseMtpQ8Layout::resolve(ctl.kv_mode(), n_fa_layers, n_kv_heads, head_dim)
+         .map_err(|e| format!("layerwise head carrier: mtp layout: {e}"))?;
+     let record_bytes = mtp
+         .payload_layout()
+@@ -2556,7 +2559,7 @@ pub fn engine_carrier_head<'a>(
+         keys,
+         policy,
+         &q8,
+-        layerwise_backend(model),
++        layerwise_backend(model, ctl.kv_mode()),
+         layerwise_capabilities(max_position),
+         bootstrap,
+         n_slots,
+@@ -3819,7 +3822,7 @@ impl<'a> LayerwiseDriver<'a> {
+         // head draft carrier needs for `restore_head_plane`.
+         self.set_composite_export(mtp, max_position)?;
+         // The head's bounded single-layer arena (the aux plane, ordinal 0).
+-        let head_q8 = LayerwiseQ8Layout::resolve(1, n_kv_heads, head_dim, &[0])
++        let head_q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, 1, n_kv_heads, head_dim, &[0])
+             .map_err(|e| format!("layerwise head: head q8 layout: {e}"))?;
+         let mut arena = LayerwiseArena::new(gpu, &head_q8, head_n_slots)?;
+         // Reserve the draft-scratch suffix slot up front (the `+1` block in the
+@@ -4370,7 +4373,7 @@ mod tests {
+         let mut gpu = Gpu::init().expect("gpu");
+         // 2 fa layers, 4 KV heads × head_dim 256 → Q8 stride 1088 (the layout
+         // adapter's host fixture). 3 composite slots ≈ 1.6 MiB arena.
+-        let q8 = LayerwiseQ8Layout::resolve(2, 4, 256, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[0, 1]).expect("q8 layout");
+         let n_slots = 3usize;
+         let mut arena = LayerwiseArena::new(&mut gpu, &q8, n_slots).expect("arena");
+         let layout = *arena.layout();
+@@ -4489,7 +4492,7 @@ mod tests {
+         }
+     }
+     fn fx_layout() -> LayerwiseQ8Layout {
+-        LayerwiseQ8Layout::resolve(FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM, &[0, 1]).unwrap()
++        LayerwiseQ8Layout::resolve(KvMode::Q8, FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM, &[0, 1]).unwrap()
+     }
+     fn fx_backend() -> BackendIdentity {
+         BackendIdentity {
+@@ -4728,7 +4731,7 @@ mod tests {
+         use crate::layerwise_layout::LayerwiseMtpQ8Layout;
+         let mut gpu = Gpu::init().expect("gpu");
+         // Composite Main+aux: FX_LAYERS trunk planes + ONE head aux plane (ordinal n_fa).
+-        let mtp = LayerwiseMtpQ8Layout::resolve(FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
++        let mtp = LayerwiseMtpQ8Layout::resolve(KvMode::Q8, FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
+             .expect("mtp layout");
+         let aux = mtp.head_layer();
+         assert_eq!(aux, FX_LAYERS);
+@@ -4791,7 +4794,7 @@ mod tests {
+ 
+         // Bounded head arena: ONE layer (the aux plane), separate from the trunk arena.
+         let head_q8 =
+-            LayerwiseQ8Layout::resolve(1, FX_KV_HEADS, FX_HEAD_DIM, &[0]).expect("head q8");
++            LayerwiseQ8Layout::resolve(KvMode::Q8, 1, FX_KV_HEADS, FX_HEAD_DIM, &[0]).expect("head q8");
+         let archive = Storage::new_ram(16 << 20).expect("archive storage");
+         let mut records: HashMap<u64, HostRecord> = HashMap::new();
+         let mut slab = gpu.hip.transfer_buffer(FX_LAYER_BYTES as usize).expect("slab");
+@@ -4860,7 +4863,7 @@ mod tests {
+     #[ignore]
+     fn driver_head_plane_attach_restore_integration() {
+         let mut gpu = Gpu::init().expect("gpu");
+-        let mtp = LayerwiseMtpQ8Layout::resolve(FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
++        let mtp = LayerwiseMtpQ8Layout::resolve(KvMode::Q8, FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
+             .expect("mtp layout");
+         let aux = mtp.head_layer();
+         let composite_record = mtp.payload_layout().expect("composite manifest").record_bytes();
+@@ -5749,7 +5752,7 @@ mod tests {
+         const SEQ: i32 = (NP * BT) as i32; // 384
+         const MAXTILES: usize = (SEQ as usize + BT - 1) / BT; // 3
+ 
+-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
+         assert_eq!(q8.k_stride(), SEG);
+         assert_eq!(q8.v_stride(), SEG);
+ 
+@@ -5972,7 +5975,7 @@ mod tests {
+         const NL: usize = 2;
+         const NSLOTS: usize = 4;
+         const MAXP: usize = 4;
+-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
+         let arena = LayerwiseArena::new(&mut gpu, &q8, NSLOTS).expect("arena");
+         let staging = LayerwiseDescStaging::new(&mut gpu, NL, MAXP).expect("staging");
+         assert_eq!(staging.n_layers(), NL);
+@@ -6481,7 +6484,7 @@ mod tests {
+         }
+ 
+         // ── statistics + packed store: both canonical pages, both layers ──
+-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
+         assert_eq!(q8.k_stride(), SEG);
+         assert_eq!(q8.v_stride(), SEG);
+         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+@@ -6784,7 +6787,7 @@ mod tests {
+         }
+ 
+         // ── statistics + packed store: both canonical pages, both layers ──
+-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
+         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+         let budget = || MemoryBudget {
+             selected_tokens: BT as u64,
+@@ -7107,7 +7110,7 @@ mod tests {
+         }
+ 
+         // ── statistics + packed store: both canonical pages, both layers ──
+-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
+         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+         let budget = || MemoryBudget {
+             selected_tokens: BT as u64,
+@@ -7484,7 +7487,7 @@ mod tests {
+ 
+         // Production geometry: 2 FA layers, DENSE ordinals [0, 1] (the engine's
+         // `fa_layers`, matching KvMemCtl's `raw_cfg.n_layer == n_fa_layers`).
+-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
+         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+ 
+         // Micro dense model shared by both cases (real HFQ4 projections + FFN).
+@@ -7615,7 +7618,7 @@ mod tests {
+                 &keys,
+                 &policy,
+                 &q8,
+-                layerwise_backend("qwen35"),
++                layerwise_backend("qwen35", KvMode::Q8),
+                 layerwise_capabilities(CTX as u32),
+                 bootstrap,
+                 n_slots,
+@@ -7830,7 +7833,7 @@ mod tests {
+             return;
+         }
+ 
+-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
+         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+         let full_pages = 3u32;
+         let budget_blocks = 1u32; // one-page resident budget ⇒ history overflows
+@@ -7937,7 +7940,7 @@ mod tests {
+         assert_eq!(mass_rows1, vec![0u32], "first sample admits the single decode row");
+         let mass1 = MassCapture::new(NL, frontier, local_begin1, 1, mass_rows1);
+         let mut carrier1 = LayerwiseQuery::build_with_pressure(
+-            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
++            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35", KvMode::Q8),
+             layerwise_capabilities(CTX as u32), bootstrap1, n_slots, archive_bytes,
+             None, Some(mass1), None,
+         )
+@@ -8019,7 +8022,7 @@ mod tests {
+ 
+         // Resident-only selection over a catalog whose resident == the keep-set.
+         let descriptor2 = MemoryDescriptor::new(
+-            &layerwise_backend("qwen35"), &q8.payload_layout().expect("manifest2"),
++            &layerwise_backend("qwen35", KvMode::Q8), &q8.payload_layout().expect("manifest2"),
+             &layerwise_capabilities(CTX as u32),
+         )
+         .expect("descriptor2");
+@@ -8050,7 +8053,7 @@ mod tests {
+         let budgets2: Vec<MemoryBudget> = bootstrap2.specs.iter().map(|s| s.budget).collect();
+         let step2 = PressureStep::new(selected2.clone(), budgets2).expect("pressure step");
+         let mut carrier2 = LayerwiseQuery::build_with_pressure(
+-            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
++            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35", KvMode::Q8),
+             layerwise_capabilities(CTX as u32), bootstrap2, n_slots, archive_bytes,
+             Some(step2), Some(mass2), None,
+         )
+@@ -8121,7 +8124,7 @@ mod tests {
+             return;
+         }
+ 
+-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
+         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+         let full_pages = 3u32;
+         let budget_blocks = 1u32; // one-page resident budget
+@@ -8232,7 +8235,7 @@ mod tests {
+         let n_slots = 1 + 2; // selected_pages(1) + suffix + headroom
+         let archive_bytes = (full_pages as u64 + 2) * record_bytes;
+         let mut carrier = LayerwiseQuery::build_with_pressure(
+-            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
++            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35", KvMode::Q8),
+             layerwise_capabilities(CTX as u32), bootstrap, n_slots, archive_bytes,
+             None, Some(mass), None,
+         )
+@@ -8324,6 +8327,7 @@ mod tests {
+             n_heads: NH,
+             n_kv_heads: KVH,
+             head_dim: HD,
++            kv_mode: KvMode::Q8,
+             per_pos_bytes: SEG,
+             per_pos_v_bytes: SEG,
+             max_rows: 512,
+@@ -8335,7 +8339,7 @@ mod tests {
+ 
+         // Populate the slot's statistics store directly (the &self core writes),
+         // mirroring the ① fixture: 3 sealed pages, mean-K sign trick selects one.
+-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
+         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+         {
+             let (keys, _kv) = ctl.layerwise_stores(0).expect("slot stores");
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_layout.rs b/crates/hipfire-arch-qwen35/src/layerwise_layout.rs
+index 57c1a3de5d7c14ed6d532a8adba8900f59796346..77b5be617dde30dfed0aff13f59dc8ea5661c837 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_layout.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_layout.rs
+@@ -36,6 +36,43 @@ pub const Q8_MAIN_MTP_FORMAT: &str = "hipfire-q8-main-mtp-v1";
+ /// `PAGE_TOKENS`). Kept as a literal here so the adapter has no legacy import.
+ pub const LAYERWISE_BLOCK_TOKENS: u32 = 128;
+ 
++/// P4.4: per-tier packed-page format identity (ninfer `layout_name` pattern,
++/// ninfer-kvmem.patch:8597-8609). The core treats the tag as an opaque
++/// provenance/admission key, so each KV tier registers its own identity and a
++/// record sealed under one tier can never seed another (format isolation).
++/// Q8 keeps the sealed-chain tag byte-for-byte (`hipfire-q8-packed-v1`).
++pub fn packed_format_tag(mode: KvMode) -> &'static str {
++    match mode {
++        KvMode::Q8 => Q8_PACKED_FORMAT,
++        KvMode::Bf16 => "hipfire-bf16-page-v1",
++        KvMode::F16 => "hipfire-f16-page-v1",
++        KvMode::Asym2 => "hipfire-asym2-page-v1",
++        KvMode::Asym3 => "hipfire-asym3-page-v1",
++        KvMode::Asym4 => "hipfire-asym4-page-v1",
++        KvMode::Fwht2 => "hipfire-fwht2-page-v1",
++        KvMode::Fwht3 => "hipfire-fwht3-page-v1",
++        KvMode::Fwht4 => "hipfire-fwht4-page-v1",
++        KvMode::Fp8 => "hipfire-fp8-page-v1",
++    }
++}
++
++/// P4.4: per-tier Main+aux MTP composite format identity (the head shares the
++/// trunk's KV tier geometry). Q8 keeps the sealed-chain tag (`hipfire-q8-main-mtp-v1`).
++pub fn composite_format_tag(mode: KvMode) -> &'static str {
++    match mode {
++        KvMode::Q8 => Q8_MAIN_MTP_FORMAT,
++        KvMode::Bf16 => "hipfire-bf16-main-mtp-v1",
++        KvMode::F16 => "hipfire-f16-main-mtp-v1",
++        KvMode::Asym2 => "hipfire-asym2-main-mtp-v1",
++        KvMode::Asym3 => "hipfire-asym3-main-mtp-v1",
++        KvMode::Asym4 => "hipfire-asym4-main-mtp-v1",
++        KvMode::Fwht2 => "hipfire-fwht2-main-mtp-v1",
++        KvMode::Fwht3 => "hipfire-fwht3-main-mtp-v1",
++        KvMode::Fwht4 => "hipfire-fwht4-main-mtp-v1",
++        KvMode::Fp8 => "hipfire-fp8-main-mtp-v1",
++    }
++}
++
+ /// Resolved Q8 packed-page geometry: the core [`RawStoreConfig`] bridge inputs,
+ /// the per-position K/V strides, and the fa-layer manifest list.
+ ///
+@@ -49,15 +86,21 @@ pub struct LayerwiseQ8Layout {
+     k_stride: usize,
+     v_stride: usize,
+     fa_layers: Vec<u32>,
++    /// P4.4: per-tier packed format identity ([`packed_format_tag`]). The struct
++    /// name is historical (Q8); the adapter is now multi-format — the strides
++    /// come from the tier plan and the tag isolates each tier's records.
++    packed_format: &'static str,
+ }
+ 
+ impl LayerwiseQ8Layout {
+     /// Resolve from model geometry. `n_layer_total` is the core store's layer
+     /// count (`cfg.n_layer`); `fa_layers` the attention-layer IDs to manifest
+     /// (non-empty, unique, each `< n_layer_total`). K/V strides come from the
+-    /// engine's Q8 tier plan (`n_kv_heads * (head_dim / 32) * 34`, scales inline).
+-    /// Fails closed on bad geometry — never silently defaults.
++    /// engine's tier plan for `kv_mode` (P4.4: Q8 scales inline; flat F16/BF16
++    /// 2B/elem; rotated asym/fwht K with static Q8 V). Fails closed on bad
++    /// geometry — never silently defaults.
+     pub fn resolve(
++        kv_mode: KvMode,
+         n_layer_total: usize,
+         n_kv_heads: usize,
+         head_dim: usize,
+@@ -82,8 +125,8 @@ impl LayerwiseQ8Layout {
+                 return Err(format!("layerwise Q8 layout: duplicate fa layer {layer}"));
+             }
+         }
+-        // The engine's own Q8 stride authority (validates head_dim % 32, etc.).
+-        let plan = SlotKvTierPlan::resolve(KvMode::Q8, n_kv_heads, head_dim)
++        // The engine's own tier stride authority (validates head_dim, etc.).
++        let plan = SlotKvTierPlan::resolve(kv_mode, n_kv_heads, head_dim)
+             .map_err(|e| format!("layerwise Q8 layout: {e}"))?;
+         let k_stride = plan.k_bytes_per_pos;
+         let v_stride = plan.v_bytes_per_pos;
+@@ -105,6 +148,7 @@ impl LayerwiseQ8Layout {
+             k_stride,
+             v_stride,
+             fa_layers: fa_layers.to_vec(),
++            packed_format: packed_format_tag(kv_mode),
+         })
+     }
+ 
+@@ -112,6 +156,10 @@ impl LayerwiseQ8Layout {
+     pub fn raw_config(&self) -> &RawStoreConfig {
+         &self.raw_cfg
+     }
++    /// P4.4: the per-tier packed format identity this layout registers.
++    pub fn packed_format(&self) -> &'static str {
++        self.packed_format
++    }
+     pub fn k_stride(&self) -> usize {
+         self.k_stride
+     }
+@@ -125,7 +173,7 @@ impl LayerwiseQ8Layout {
+     /// Build the core generic `PayloadLayout` manifest (layer-major {Key, Value}
+     /// per fa layer). One record == one canonical page == one composite slot.
+     pub fn payload_layout(&self) -> Result<PayloadLayout, String> {
+-        self.payload_layout_with_format(Q8_PACKED_FORMAT)
++        self.payload_layout_with_format(self.packed_format)
+     }
+ 
+     /// Build the core generic `PayloadLayout` manifest under an explicit backend
+@@ -172,14 +220,17 @@ pub struct LayerwiseMtpQ8Layout {
+     /// The head's auxiliary-plane layer ordinal (== `n_fa_layers`).
+     head_layer: u32,
+     n_fa_layers: usize,
++    /// P4.4: per-tier composite format identity ([`composite_format_tag`]).
++    composite_format: &'static str,
+ }
+ 
+ impl LayerwiseMtpQ8Layout {
+     /// Resolve from model geometry. `n_fa_layers` is the trunk FA-layer count
+     /// (>= 1); the head adds ONE auxiliary plane at ordinal `n_fa_layers`. K/V
+-    /// strides come from the engine's Q8 tier plan (shared by trunk and head).
+-    /// Fails closed on bad geometry — never silently defaults.
++    /// strides come from the engine's tier plan for `kv_mode` (shared by trunk
++    /// and head). Fails closed on bad geometry — never silently defaults.
+     pub fn resolve(
++        kv_mode: KvMode,
+         n_fa_layers: usize,
+         n_kv_heads: usize,
+         head_dim: usize,
+@@ -188,19 +239,20 @@ impl LayerwiseMtpQ8Layout {
+             return Err("layerwise MTP Q8 layout: n_fa_layers == 0".to_string());
+         }
+         let main_ordinals: Vec<u32> = (0..n_fa_layers as u32).collect();
+-        let main = LayerwiseQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim, &main_ordinals)
++        let main = LayerwiseQ8Layout::resolve(kv_mode, n_fa_layers, n_kv_heads, head_dim, &main_ordinals)
+             .map_err(|e| format!("layerwise MTP Q8 layout (main): {e}"))?;
+         let head_layer = n_fa_layers as u32;
+         let mut composite_ordinals = main_ordinals;
+         composite_ordinals.push(head_layer);
+         let composite = LayerwiseQ8Layout::resolve(
++            kv_mode,
+             n_fa_layers + 1,
+             n_kv_heads,
+             head_dim,
+             &composite_ordinals,
+         )
+         .map_err(|e| format!("layerwise MTP Q8 layout (composite): {e}"))?;
+-        Ok(Self { main, composite, head_layer, n_fa_layers })
++        Ok(Self { main, composite, head_layer, n_fa_layers, composite_format: composite_format_tag(kv_mode) })
+     }
+ 
+     /// The trunk Main-plane adapter (ordinals `0..n_fa`, standalone Q8 format).
+@@ -223,6 +275,10 @@ impl LayerwiseMtpQ8Layout {
+     pub fn k_stride(&self) -> usize {
+         self.composite.k_stride()
+     }
++    /// P4.4: the per-tier composite format identity this layout registers.
++    pub fn composite_format(&self) -> &'static str {
++        self.composite_format
++    }
+     /// Per-position V row bytes (shared trunk/head Q8 geometry).
+     pub fn v_stride(&self) -> usize {
+         self.composite.v_stride()
+@@ -232,7 +288,7 @@ impl LayerwiseMtpQ8Layout {
+     /// layer-major {Key, Value} for every trunk FA layer THEN the head's aux
+     /// plane. One record == one canonical page == one composite slot.
+     pub fn payload_layout(&self) -> Result<PayloadLayout, String> {
+-        self.composite.payload_layout_with_format(Q8_MAIN_MTP_FORMAT)
++        self.composite.payload_layout_with_format(self.composite_format)
+     }
+ 
+     /// The crate-agnostic packed arena geometry for `n_slots` composite slots
+@@ -259,7 +315,7 @@ mod tests {
+ 
+     /// Q8 geometry: 4 KV heads × head_dim 256 → 4 * 8 * 34 = 1088 bytes/pos.
+     fn resolved() -> LayerwiseQ8Layout {
+-        LayerwiseQ8Layout::resolve(2, 4, 256, &[0, 1]).unwrap()
++        LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[0, 1]).unwrap()
+     }
+ 
+     #[test]
+@@ -281,15 +337,15 @@ mod tests {
+     #[test]
+     fn rejects_bad_geometry() {
+         // head_dim not divisible by 32 (engine Q8 gate).
+-        assert!(LayerwiseQ8Layout::resolve(2, 4, 100, &[0, 1]).is_err());
++        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 100, &[0, 1]).is_err());
+         // zero KV heads.
+-        assert!(LayerwiseQ8Layout::resolve(2, 0, 256, &[0, 1]).is_err());
++        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 0, 256, &[0, 1]).is_err());
+         // empty / out-of-range / duplicate fa-layer list.
+-        assert!(LayerwiseQ8Layout::resolve(2, 4, 256, &[]).is_err());
+-        assert!(LayerwiseQ8Layout::resolve(2, 4, 256, &[0, 2]).is_err());
+-        assert!(LayerwiseQ8Layout::resolve(2, 4, 256, &[1, 1]).is_err());
++        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[]).is_err());
++        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[0, 2]).is_err());
++        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[1, 1]).is_err());
+         // zero layer count.
+-        assert!(LayerwiseQ8Layout::resolve(0, 4, 256, &[0]).is_err());
++        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 0, 4, 256, &[0]).is_err());
+     }
+ 
+     #[test]
+@@ -340,7 +396,7 @@ mod tests {
+     // ── P4.1① Main+aux MTP composite ──────────────────────────────────────
+     /// MTP composite fixture: 2 trunk FA layers + 1 head aux layer, Q8 geometry.
+     fn mtp_resolved() -> LayerwiseMtpQ8Layout {
+-        LayerwiseMtpQ8Layout::resolve(2, 4, 256).unwrap()
++        LayerwiseMtpQ8Layout::resolve(KvMode::Q8, 2, 4, 256).unwrap()
+     }
+ 
+     #[test]
+@@ -424,8 +480,59 @@ mod tests {
+ 
+     #[test]
+     fn mtp_rejects_bad_geometry() {
+-        assert!(LayerwiseMtpQ8Layout::resolve(0, 4, 256).is_err()); // no trunk
+-        assert!(LayerwiseMtpQ8Layout::resolve(2, 4, 100).is_err()); // head_dim % 32
+-        assert!(LayerwiseMtpQ8Layout::resolve(2, 0, 256).is_err()); // zero KV heads
++        assert!(LayerwiseMtpQ8Layout::resolve(KvMode::Q8, 0, 4, 256).is_err()); // no trunk
++        assert!(LayerwiseMtpQ8Layout::resolve(KvMode::Q8, 2, 4, 100).is_err()); // head_dim % 32
++        assert!(LayerwiseMtpQ8Layout::resolve(KvMode::Q8, 2, 0, 256).is_err()); // zero KV heads
++    }
++
++    // ── P4.4 multi-format adapter (ninfer layout-identity pattern) ──────────
++
++    #[test]
++    fn per_mode_format_tags_isolate_tiers() {
++        // Q8 keeps the sealed-chain tags byte-for-byte.
++        assert_eq!(packed_format_tag(KvMode::Q8), "hipfire-q8-packed-v1");
++        assert_eq!(composite_format_tag(KvMode::Q8), "hipfire-q8-main-mtp-v1");
++        // Every tier registers a distinct packed + composite identity.
++        let modes = [
++            KvMode::Q8, KvMode::Bf16, KvMode::F16, KvMode::Asym2, KvMode::Asym3,
++            KvMode::Asym4, KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4, KvMode::Fp8,
++        ];
++        let mut packed = std::collections::HashSet::new();
++        let mut composite = std::collections::HashSet::new();
++        for m in modes {
++            assert!(packed.insert(packed_format_tag(m)), "dup packed tag {m:?}");
++            assert!(composite.insert(composite_format_tag(m)), "dup composite tag {m:?}");
++        }
++        assert_eq!(packed.len(), modes.len());
++    }
++
++    #[test]
++    fn per_mode_resolve_strides_and_manifest() {
++        // head_dim 256, 4 KV heads — valid for q8/f16/bf16/asym3/fwht4.
++        let fa = [0u32, 1];
++        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &fa).expect("q8");
++        let f16 = LayerwiseQ8Layout::resolve(KvMode::F16, 2, 4, 256, &fa).expect("f16");
++        let bf16 = LayerwiseQ8Layout::resolve(KvMode::Bf16, 2, 4, 256, &fa).expect("bf16");
++        let asym3 = LayerwiseQ8Layout::resolve(KvMode::Asym3, 2, 4, 256, &fa).expect("asym3");
++        let fwht4 = LayerwiseQ8Layout::resolve(KvMode::Fwht4, 2, 4, 256, &fa).expect("fwht4");
++        // Q8: 4 * (256/32) * 34 = 1088 B/pos. Flat F16/BF16: 4 * 256 * 2 = 2048.
++        assert_eq!(q8.k_stride(), 1088);
++        assert_eq!(f16.k_stride(), 2048);
++        assert_eq!(bf16.k_stride(), 2048);
++        assert_eq!(f16.k_stride(), f16.v_stride(), "flat tier V == K");
++        // Rotated tiers: V is static Q8 (1088), K differs from Q8.
++        assert_eq!(asym3.v_stride(), 1088);
++        assert_eq!(fwht4.v_stride(), 1088);
++        assert_ne!(asym3.k_stride(), q8.k_stride());
++        assert_ne!(fwht4.k_stride(), q8.k_stride());
++        // Manifests carry the per-tier tag and resolve cleanly.
++        for (layout, mode) in [(&q8, KvMode::Q8), (&f16, KvMode::F16), (&asym3, KvMode::Asym3), (&fwht4, KvMode::Fwht4)] {
++            let _manifest = layout.payload_layout().expect("manifest");
++            assert_eq!(layout.packed_format(), packed_format_tag(mode));
++        }
++        // Composite per-tier manifest.
++        let mtp_f16 = LayerwiseMtpQ8Layout::resolve(KvMode::F16, 2, 4, 256).expect("mtp f16");
++        let _composite = mtp_f16.payload_layout().expect("composite");
++        assert_eq!(mtp_f16.composite_format(), composite_format_tag(KvMode::F16));
+     }
+ }
+\ No newline at end of file
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 51bf64e03a30611eae21dcf7abaa9b28c4e34c2f..ac4a2dab706b21e18266142de2c9757010cfcb03 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -1222,12 +1222,24 @@ impl Rig {
+             .ok()
+             .is_some_and(|v| v == "1" || v == "on" || v == "true");
+         if kvmem_on {
+-            if !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
+-                return Err(format!(
+-                    "HIPFIRE_KVMEM requires q8 KV (resolved {kv_mode:?}); the \
+-                     spill/restore path moves packed Q8 rows and the paged \
+-                     attention kernels are Q8-only"
+-                ));
++            // P4.4: KVMem admits every KV tier whose paged batched attention
++            // kernel carries the kv_page_present residency mask (ninfer
++            // multi-format admission pattern). Q8 + the 8 non-Q8 tiers are
++            // masked (flat f16/bf16, rotated asym/fwht, fp8 as a q8 TU variant);
++            // spill/restore is byte-opaque and mean-K is F32 pre-RoPE, so the
++            // host path is tier-generic. Per-tier head_dim / hardware constraints
++            // fail closed downstream in SlotKvTierPlan::resolve / kernel admission.
++            match kv_mode {
++                hipfire_runtime::kv_mode::KvMode::Q8
++                | hipfire_runtime::kv_mode::KvMode::Bf16
++                | hipfire_runtime::kv_mode::KvMode::F16
++                | hipfire_runtime::kv_mode::KvMode::Asym2
++                | hipfire_runtime::kv_mode::KvMode::Asym3
++                | hipfire_runtime::kv_mode::KvMode::Asym4
++                | hipfire_runtime::kv_mode::KvMode::Fwht2
++                | hipfire_runtime::kv_mode::KvMode::Fwht3
++                | hipfire_runtime::kv_mode::KvMode::Fwht4
++                | hipfire_runtime::kv_mode::KvMode::Fp8 => {}
+             }
+             if cfg.is_vl && vl_sequential {
+                 return Err(
+@@ -2084,6 +2096,7 @@ impl Rig {
+                     n_heads: config.n_heads,
+                     n_kv_heads: config.n_kv_heads,
+                     head_dim: config.head_dim,
++                    kv_mode,
+                     per_pos_bytes,
+                     per_pos_v_bytes,
+                     max_rows: max_batch,
+diff --git a/crates/rdna-compute/src/verify_twins.rs b/crates/rdna-compute/src/verify_twins.rs
+index 394493c1356285b94239f00dcfb2ad0478eeccdd..9b871f56d554b0739f4946e02662f774aa91a05c 100644
+--- a/crates/rdna-compute/src/verify_twins.rs
++++ b/crates/rdna-compute/src/verify_twins.rs
+@@ -98,6 +98,10 @@ const ATTN_FP8_LOAD_EDITS: &[(&str, &str)] = &[
+     ),
+     (
+         "        for (int t = 0; t < eff_seq_len; t++) {
++            // KVMem residency (P4.4): spilled page weight is zero; skip the read.
++            if (!kv_page_present(desc, t)) {
++                continue;
++            }
+             const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+             const float vs = (float)*((const _Float16*)(vrow + scale_off));
+             val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
+@@ -107,17 +111,30 @@ const ATTN_FP8_LOAD_EDITS: &[(&str, &str)] = &[
+         for (; t + 8 <= eff_seq_len; t += 8) {
+             float vsu[8];
+             unsigned char vbu[8];
++            bool vpr[8];
+             #pragma unroll
+             for (int u = 0; u < 8; u++) {
++                // KVMem residency (P4.4): spilled page weight is zero; skip the read.
++                vpr[u] = kv_page_present(desc, t + u);
++                if (!vpr[u]) {
++                    vsu[u] = 0.0f;
++                    vbu[u] = 0;
++                    continue;
++                }
+                 const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t + u, per_pos_bytes);
+                 vsu[u] = (float)*((const _Float16*)(vrow + scale_off));
+                 vbu[u] = vrow[k_head_off + d];
+             }
+             #pragma unroll
+             for (int u = 0; u < 8; u++)
+-                val += scores[t + u] * (vsu[u] * hipfire_fp8_e4m3_to_f32_batched(vbu[u]));
++                if (vpr[u])
++                    val += scores[t + u] * (vsu[u] * hipfire_fp8_e4m3_to_f32_batched(vbu[u]));
+         }
+         for (; t < eff_seq_len; t++) {
++            // KVMem residency (P4.4): spilled page weight is zero; skip the read.
++            if (!kv_page_present(desc, t)) {
++                continue;
++            }
+             const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+             const float vs = (float)*((const _Float16*)(vrow + scale_off));
+             val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
+diff --git a/kernels/src/attention_flash_asym2_tile_batched.hip b/kernels/src/attention_flash_asym2_tile_batched.hip
+index b5c2e31788dea753fa2a4b79f65a9a915bd5fb3f..d4c9fa8a5254fa291d2b874323ecf39d3c325ea0 100644
+--- a/kernels/src/attention_flash_asym2_tile_batched.hip
++++ b/kernels/src/attention_flash_asym2_tile_batched.hip
+@@ -112,6 +112,12 @@ __global__ void attention_flash_asym2_tile_batched(
+     // Phase A: Q·K (2-bit K)
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         int t = tile_start + t_local;
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
++        // score; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+         const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
+ #else
+@@ -160,6 +166,7 @@ __global__ void attention_flash_asym2_tile_batched(
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         float w = scores[t_local];
+         int t = tile_start + t_local;
++        if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+         const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
+ #else
+diff --git a/kernels/src/attention_flash_asym3_tile_batched.hip b/kernels/src/attention_flash_asym3_tile_batched.hip
+index 19614e48e29dd1f2c1be4c2d9eb54f9539288e42..4431e3a57457d1d8bfa40c137ec1b8c909d0b102 100644
+--- a/kernels/src/attention_flash_asym3_tile_batched.hip
++++ b/kernels/src/attention_flash_asym3_tile_batched.hip
+@@ -170,6 +170,12 @@ __global__ void attention_flash_asym3_tile_batched(
+     // Phase A: Q·K
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         int t = tile_start + t_local;
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
++        // score; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+         const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
+         float cnorm = *(const float*)kb;
+         const unsigned char* base = kb + 4 + tid * 3;
+@@ -224,6 +230,7 @@ __global__ void attention_flash_asym3_tile_batched(
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         float w = scores[t_local];
+         int t = tile_start + t_local;
++        if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+         const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
+         #pragma unroll
+         for (int i = 0; i < 8; i++) {
+diff --git a/kernels/src/attention_flash_asym3_tile_hd512_batched.hip b/kernels/src/attention_flash_asym3_tile_hd512_batched.hip
+index a555d8012666f57f85d6569decf88d84eaeec3e5..39936691c11184975ed7a99e139a8a78277032a2 100644
+--- a/kernels/src/attention_flash_asym3_tile_hd512_batched.hip
++++ b/kernels/src/attention_flash_asym3_tile_hd512_batched.hip
+@@ -176,6 +176,12 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
+     // Phase A: Q·K — both chunks accumulated into a single scalar partial.
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         int t = tile_start + t_local;
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
++        // score; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+         const bool out_of_window = sliding && (t < t_lo);
+         float partial = 0.0f;
+         if (!out_of_window) {
+@@ -246,6 +252,7 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         float w = scores[t_local];
+         int t = tile_start + t_local;
++        if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+         const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
+         #pragma unroll
+         for (int i = 0; i < 8; i++) {
+diff --git a/kernels/src/attention_flash_asym4_tile_batched.hip b/kernels/src/attention_flash_asym4_tile_batched.hip
+index ee0691ad4c33c885536595fcb0de53c10bb31fda..ab67fe822534e7ccff25841228dfc76a0e4aece0 100644
+--- a/kernels/src/attention_flash_asym4_tile_batched.hip
++++ b/kernels/src/attention_flash_asym4_tile_batched.hip
+@@ -121,6 +121,12 @@ __global__ void attention_flash_asym4_tile_batched(
+     // Phase A: Q·K (4-bit K)
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         int t = tile_start + t_local;
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
++        // score; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+         const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
+ #else
+@@ -170,6 +176,7 @@ __global__ void attention_flash_asym4_tile_batched(
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         float w = scores[t_local];
+         int t = tile_start + t_local;
++        if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+         const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
+ #else
+diff --git a/kernels/src/attention_flash_bf16_tile_batched.hip b/kernels/src/attention_flash_bf16_tile_batched.hip
+index b72edcb61d9126c2892ad3e7d8917d0253b0ca4b..6811a08122a621cf2afc0f361636df4fcb33a350 100644
+--- a/kernels/src/attention_flash_bf16_tile_batched.hip
++++ b/kernels/src/attention_flash_bf16_tile_batched.hip
+@@ -136,6 +136,12 @@ __global__ void attention_flash_bf16_tile_batched(
+             if (tid == 0) scores[t_local] = -INFINITY;
+             continue;                      // t is wave-uniform; all lanes skip together
+         }
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask like the
++        // window case; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+         const unsigned short* kb = (const unsigned short*)
+             (k_cache + kv_offset_for_k(desc, t, per_pos_bytes)) + head_base + d0;
+         float partial = 0.0f;
+@@ -178,6 +184,8 @@ __global__ void attention_flash_bf16_tile_batched(
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         const float w = scores[t_local];
+         const int t = tile_start + t_local;
++        // KVMem residency (P4.4): skip the V load for spilled pages.
++        if (!kv_page_present(desc, t)) continue;
+         const unsigned short* vb = (const unsigned short*)
+             (v_cache + kv_offset_for_v(desc, t, per_pos_bytes)) + head_base + d0;
+         for (int i = 0; i < dpt; i++) {
+diff --git a/kernels/src/attention_flash_f16_tile_batched.hip b/kernels/src/attention_flash_f16_tile_batched.hip
+index c61104900e25c31a5d96f1454110892f1b6ce114..58c256d45ec5abdd7ff8fe9f85da00732886ac55 100644
+--- a/kernels/src/attention_flash_f16_tile_batched.hip
++++ b/kernels/src/attention_flash_f16_tile_batched.hip
+@@ -139,6 +139,12 @@ __global__ void attention_flash_f16_tile_batched(
+             if (tid == 0) scores[t_local] = -INFINITY;
+             continue;                      // t is wave-uniform; all lanes skip together
+         }
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask like the
++        // window case; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+         const unsigned short* kb = (const unsigned short*)
+             (k_cache + kv_offset_for_k(desc, t, per_pos_bytes)) + head_base + d0;
+         float partial = 0.0f;
+@@ -181,6 +187,9 @@ __global__ void attention_flash_f16_tile_batched(
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         const float w = scores[t_local];
+         const int t = tile_start + t_local;
++        // KVMem residency (P4.4): skip the V load for spilled pages (weight is 0
++        // anyway, but the freed arena bytes may be reused — never read them).
++        if (!kv_page_present(desc, t)) continue;
+         const unsigned short* vb = (const unsigned short*)
+             (v_cache + kv_offset_for_v(desc, t, per_pos_bytes)) + head_base + d0;
+         for (int i = 0; i < dpt; i++) {
+diff --git a/kernels/src/attention_flash_fwht2_tile_batched.hip b/kernels/src/attention_flash_fwht2_tile_batched.hip
+index ce6a293a10428fa908d0c4b95d671f16d2dd0232..aba2c9cedfe7bf27f3063238a5647abec8c2a117 100644
+--- a/kernels/src/attention_flash_fwht2_tile_batched.hip
++++ b/kernels/src/attention_flash_fwht2_tile_batched.hip
+@@ -110,6 +110,12 @@ __global__ void attention_flash_fwht2_tile_batched(
+ 
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         int t = tile_start + t_local;
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
++        // score; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+         const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
+ #else
+@@ -167,6 +173,7 @@ __global__ void attention_flash_fwht2_tile_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             float w = scores[t_local];
+             int t = tile_start + t_local;
++            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+             const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
+ #else
+@@ -203,6 +210,7 @@ __global__ void attention_flash_fwht2_tile_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             float w = scores[t_local];
+             int t = tile_start + t_local;
++            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+             const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_bytes_per_pos) + v_head_off;
+ #else
+diff --git a/kernels/src/attention_flash_fwht3_tile_batched.hip b/kernels/src/attention_flash_fwht3_tile_batched.hip
+index 3ce7b3f2bbb693c610be64ba1a611803e1119b10..21f846f448c9a990540394f547a9fee6cd713731 100644
+--- a/kernels/src/attention_flash_fwht3_tile_batched.hip
++++ b/kernels/src/attention_flash_fwht3_tile_batched.hip
+@@ -102,6 +102,12 @@ __global__ void attention_flash_fwht3_tile_batched(
+ 
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         int t = tile_start + t_local;
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
++        // score; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+         const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
+ #else
+@@ -160,6 +166,7 @@ __global__ void attention_flash_fwht3_tile_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             float w = scores[t_local];
+             int t = tile_start + t_local;
++            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+             const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
+ #else
+@@ -185,6 +192,7 @@ __global__ void attention_flash_fwht3_tile_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             float w = scores[t_local];
+             int t = tile_start + t_local;
++            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+             const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_bytes_per_pos) + v_head_off;
+ #else
+diff --git a/kernels/src/attention_flash_fwht3_tile_hd512_batched.hip b/kernels/src/attention_flash_fwht3_tile_hd512_batched.hip
+index 78cb1397cb910b71d230eb579d9cff755ce141f2..239aa96f030aa0a843f1d0b9f8f557674497dd7d 100644
+--- a/kernels/src/attention_flash_fwht3_tile_hd512_batched.hip
++++ b/kernels/src/attention_flash_fwht3_tile_hd512_batched.hip
+@@ -116,6 +116,12 @@ __global__ void attention_flash_fwht3_tile_hd512_batched(
+     // Phase A: Q·K (3-bit K, two 24-bit packed words per lane).
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         int t = tile_start + t_local;
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
++        // score; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+         const bool out_of_window = sliding && (t < t_lo);
+         float partial = 0.0f;
+         if (!out_of_window) {
+@@ -190,6 +196,7 @@ __global__ void attention_flash_fwht3_tile_hd512_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             float w = scores[t_local];
+             int t = tile_start + t_local;
++            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+             const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+             const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
+             #pragma unroll
+diff --git a/kernels/src/attention_flash_fwht4_tile_batched.hip b/kernels/src/attention_flash_fwht4_tile_batched.hip
+index c7edc2ca0201fa819a1099948feb32d4e35cdb90..8caaaa9202d0b87e83b883013ff70e947d0b24d5 100644
+--- a/kernels/src/attention_flash_fwht4_tile_batched.hip
++++ b/kernels/src/attention_flash_fwht4_tile_batched.hip
+@@ -121,6 +121,12 @@ __global__ void attention_flash_fwht4_tile_batched(
+     // Phase A: Q·K (4-bit K)
+     for (int t_local = 0; t_local < tile_len; t_local++) {
+         int t = tile_start + t_local;
++        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
++        // score; Phase D skips the V load for the same pages. Wave-uniform.
++        if (!kv_page_present(desc, t)) {
++            if (tid == 0) scores[t_local] = -INFINITY;
++            continue;
++        }
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+         const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
+ #else
+@@ -179,6 +185,7 @@ __global__ void attention_flash_fwht4_tile_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             float w = scores[t_local];
+             int t = tile_start + t_local;
++            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+             const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
+ #else
+@@ -215,6 +222,7 @@ __global__ void attention_flash_fwht4_tile_batched(
+         for (int t_local = 0; t_local < tile_len; t_local++) {
+             float w = scores[t_local];
+             int t = tile_start + t_local;
++            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
+ #ifdef HIPFIRE_KV_SLOT_PAGED
+             const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_bytes_per_pos) + v_head_off;
+ #else
+diff --git a/kernels/src/attention_q8_0_kv_batched.hip b/kernels/src/attention_q8_0_kv_batched.hip
+index 316ef422430e2d8610068f8d0541f2a62bad85ee..50afd953866fea6577ad2408ebf7c16b5dcb90c9 100644
+--- a/kernels/src/attention_q8_0_kv_batched.hip
++++ b/kernels/src/attention_q8_0_kv_batched.hip
+@@ -452,6 +452,11 @@ extern "C" __global__ void attention_fp8_e4m3_kv_batched(
+     // Phase 1: Q @ K^T with fp8 decode.
+     float local_max = -1e30f;
+     for (int t = tid; t < eff_seq_len; t += nthreads) {
++        // KVMem residency (P4.4): spilled page holds no K bytes; mask sentinel.
++        if (!kv_page_present(desc, t)) {
++            scores[t] = -1e30f;
++            continue;
++        }
+         const unsigned char* krow = k_cache + kv_offset_for_k(desc, t, per_pos_bytes);
+         const float ks = (float)*((const _Float16*)(krow + scale_off));
+         const unsigned char* kc = krow + k_head_off;
+@@ -500,6 +505,10 @@ extern "C" __global__ void attention_fp8_e4m3_kv_batched(
+     for (int d = tid; d < head_dim; d += nthreads) {
+         float val = 0.0f;
+         for (int t = 0; t < eff_seq_len; t++) {
++            // KVMem residency (P4.4): spilled page weight is zero; skip the read.
++            if (!kv_page_present(desc, t)) {
++                continue;
++            }
+             const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+             const float vs = (float)*((const _Float16*)(vrow + scale_off));
+             val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
+@@ -574,6 +583,12 @@ extern "C" __global__ void attention_bf16_kv_batched(
+     // Phase 1: Q @ K^T with bf16 widening.
+     float local_max = -1e30f;
+     for (int t = tid; t < eff_seq_len; t += nthreads) {
++        // KVMem residency (P4.4): a spilled page holds no K bytes; mask with the
++        // -1e30 sentinel (expf collapses to zero weight). Whole-block skip.
++        if (!kv_page_present(desc, t)) {
++            scores[t] = -1e30f;
++            continue;
++        }
+         const unsigned short* kc =
+             (const unsigned short*)(k_cache + kv_offset_for_k(desc, t, per_pos_bytes)) + k_head_off;
+         float dot = 0.0f;
+@@ -621,6 +636,11 @@ extern "C" __global__ void attention_bf16_kv_batched(
+     for (int d = tid; d < head_dim; d += nthreads) {
+         float val = 0.0f;
+         for (int t = 0; t < eff_seq_len; t++) {
++            // KVMem residency (P4.4): spilled page weight is zero; skip the read
++            // (its address would resolve through the -1 sentinel).
++            if (!kv_page_present(desc, t)) {
++                continue;
++            }
+             const unsigned short* vc =
+                 (const unsigned short*)(v_cache + kv_offset_for_v(desc, t, per_pos_bytes)) + k_head_off;
+             val += scores[t] * hipfire_bf16_to_f32_batched(vc[d]);

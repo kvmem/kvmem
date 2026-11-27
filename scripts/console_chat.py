@@ -51,6 +51,58 @@ def request_metrics(record, snapshot, row, backend):
     }.items():
         if finite(timings.get(source)):
             metrics[target] = timings[source]
+    if backend == 'hipfire':
+        for key in ('phase', 'stream_deltas', 'stream_chars'):
+            if record.get(key) is not None:
+                metrics[key] = record[key]
+        if record.get('state') in ('thinking', 'answering'):
+            first = record.get('first_token_at_ms')
+            last = record.get('last_token_at_ms')
+            deltas = record.get('stream_deltas')
+            if finite(first) and finite(last) and finite(deltas) and last > first:
+                window = last - first
+                rate = deltas / (window / 1000)
+                metrics.update(decode_tps_live=rate, decode_tps_mean=rate,
+                               decode_tps_window_ms=window,
+                               decode_tps_sampled_at_ms=last)
+        usage = record.get('usage') or {}
+        prompt = usage.get('prompt_tokens')
+        cached = (usage.get('prompt_tokens_details') or {}).get('cached_tokens')
+        completion = usage.get('completion_tokens')
+        if finite(prompt):
+            metrics['prompt_tokens'] = prompt
+        if finite(prompt) and finite(cached):
+            metrics['prompt_new_tokens'] = max(0, prompt - cached)
+        if finite(cached):
+            metrics['cached_tokens'] = cached
+        if finite(completion):
+            metrics['generated_tokens'] = completion
+        for source, target in {'prefill_ms':'prefill_ms', 'prefill_tok_s':'prefill_tps',
+                               'decode_tok_s':'decode_tps_mean', 'ttft_ms':'ttft_ms',
+                               'mtp_drafts':'drafts_offered', 'mtp_accepted':'drafts_accepted'}.items():
+            if finite(timings.get(source)):
+                metrics[target] = timings[source]
+        started, finished = record.get('started_at_ms'), record.get('finished_at_ms')
+        if finite(started) and finite(finished):
+            metrics['elapsed_ms'] = max(0, finished - started)
+        # The slots route may omit native prefill/decode timings. Derive them from
+        # this request's observed first-token and completion boundaries instead of
+        # mislabeling hipfire's wall-inclusive tok_s as decode throughput.
+        first = record.get('first_token_at_ms')
+        if finite(started) and finite(first) and finite(finished) and first >= started and finished > first:
+            observed_ttft = first - started
+            if not finite(metrics.get('ttft_ms')):
+                metrics['ttft_ms'] = observed_ttft
+            if not finite(metrics.get('prefill_ms')):
+                metrics['prefill_ms'] = observed_ttft
+            prompt_new, generated = metrics.get('prompt_new_tokens'), metrics.get('generated_tokens')
+            if finite(prompt_new) and prompt_new > 0 and observed_ttft > 0 and not finite(metrics.get('prefill_tps')):
+                metrics['prefill_tps'] = prompt_new / (observed_ttft / 1000)
+            if finite(generated) and generated > 0 and not finite(metrics.get('decode_tps_mean')):
+                metrics['decode_tps_mean'] = generated / ((finished - first) / 1000)
+        for key in ('endpoint', 'limit'):
+            if record.get(key) is not None:
+                metrics[key] = record[key]
     if record.get('finish_reason'):
         metrics['finish_reason'] = record['finish_reason']
     if record.get('state') in ('completed','cancelled','error'):
@@ -58,9 +110,25 @@ def request_metrics(record, snapshot, row, backend):
     return metrics
 
 
-def context_payload(state, props, settings=None):
+def hipfire_output_limit(launch):
+    """Resolve the launcher output cap that hipfire's serve CLI cannot pass."""
+    value = launch.get('MaxTokens')
+    if type(value) is not int or value < 0:
+        return None
+    if value == 0:
+        context = launch.get('Context')
+        if type(context) is not int or context <= 0:
+            return None
+        return min(context, 393216)
+    if value > 393216:
+        raise ValueError('hipfire MaxTokens must be between 0 and 393216')
+    return value
+
+
+def context_payload(state, props, settings=None, health=None):
     launch = (state.get('active_config') or {}).get('parameters', {})
     backend = launch.get('Backend')
+    health = health or {}
     native = props.get('kvmem', {})
     generation = props.get('default_generation_settings', {})
     params = generation.get('params', {})
@@ -114,27 +182,32 @@ def context_payload(state, props, settings=None):
     if backend == 'polystrata' and effective.get('reasoning_effort') == 'high':
         effective['reasoning_effort'] = 'xhigh'
     capabilities = {'thinking': True, 'budget': True,
-                    'preserve': backend in ('ninfer','polystrata','llamacpp'),
+                    'preserve': backend in ('ninfer','polystrata','llamacpp','hipfire'),
                     'efforts': ['low','medium','xhigh'] if backend == 'polystrata' else
                                ['minimal','low','medium','high','xhigh','max'],
                     'vision': bool(props.get('modalities', {}).get('vision', native.get('vision', False))),
                     'tools': False}
+    if backend == 'hipfire':
+        capabilities.update(thinking=bool(health.get('reasoning_contract', True)),
+                            efforts=health.get('reasoning_efforts') or capabilities['efforts'],
+                            vision=bool(launch.get('Vision')),
+                            image_types=['image/png','image/jpeg'], max_images=1)
     if backend == 'radiance' and settings:
         caps=settings.get('capabilities',{})
         capabilities.update(thinking=bool(caps.get('reasoning')),budget=bool(caps.get('reasoning')),
             preserve=bool(props.get('chat_template_caps',{}).get('supports_preserve_reasoning')),
             efforts=caps.get('reasoning_efforts') or [],vision=bool(caps.get('image')))
     return {'schema_version':1, 'state':state['state'], 'instance':state.get('instance'),
-            'backend':backend, 'model':props.get('model_name') or props.get('model_alias') or props.get('model'),
-            'context':generation.get('n_ctx', launch.get('Context')),
-            'limit':native.get('generation_limit') or generation.get('n_ctx') or launch.get('Context'),
+            'backend':backend, 'model':health.get('model') or props.get('model_name') or props.get('model_alias') or props.get('model'),
+            'context':health.get('n_ctx') or generation.get('n_ctx') or launch.get('Context'),
+            'limit':native.get('generation_limit') or health.get('n_ctx') or generation.get('n_ctx') or launch.get('Context'),
             'effective':effective, 'sources':sources, 'capabilities':capabilities,
             'uses_template_effort': backend == 'radiance' and bool(settings) and 'reasoning_effort' in settings.get('request_defaults', {}) and settings['request_defaults']['reasoning_effort'] is None and 'reasoning_effort' not in settings['request_defaults'].get('chat_template_kwargs', {}),
             'budget_min':1 if backend=='ninfer' else -1 if backend=='radiance' else 0,
             'sampling_by_mode':native.get('sampling', {}),
             'sampling_by_effort':{('xhigh' if backend == 'polystrata' and k == 'high' else k): v
                                   for k, v in (settings or {}).get('sampling_by_effort', {}).items()},
-            'history_export_url':None if backend=='radiance' else state.get('url','') + ('/kvmem-history-export' if backend=='polystrata' else '/history-export.html')}
+            'history_export_url':None if backend in ('radiance','hipfire') else state.get('url','') + ('/kvmem-history-export' if backend=='polystrata' else '/history-export.html')}
 
 
 class ChatBridge:
@@ -167,6 +240,22 @@ class ChatBridge:
             return json.loads(body)
         finally: conn.close()
 
+    def get_text(self, state, path):
+        parsed = urlsplit(state['url'])
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        try:
+            headers = {}
+            auth = self.control.monitor_authorization()
+            if auth: headers['Authorization'] = auth
+            conn.request('GET', path, headers=headers)
+            response = conn.getresponse()
+            body = response.read(4 * 1024 * 1024 + 1)
+            if response.status != 200: raise ValueError('Engine text endpoint unavailable')
+            if len(body) > 4 * 1024 * 1024: raise ValueError('Engine text endpoint too large')
+            return body.decode('utf-8', errors='replace')
+        finally:
+            conn.close()
+
     def context(self):
         state = self.control.status()
         if state['state'] != 'ready':
@@ -175,9 +264,10 @@ class ChatBridge:
         props = self.get_json(state, '/props')
         backend=state['active_config']['parameters']['Backend']
         settings = self.get_json(state, '/settings' if backend=='polystrata' else '/server_info') if backend in ('polystrata','radiance') else None
+        health = self.get_json(state, '/health') if backend == 'hipfire' else None
         if state.get('instance') != self.control.status().get('instance'):
             raise ValueError('Service changed while reading settings')
-        return context_payload(state, props, settings)
+        return context_payload(state, props, settings, health)
 
     def cancel(self, request_id):
         with self.lock:
@@ -241,6 +331,34 @@ class ChatBridge:
                     raise ValueError('Conflicting thinking budgets')
                 payload['thinking_budget'] = budget
                 raw = json.dumps(payload, ensure_ascii=False).encode()
+            elif state.get('active_config', {}).get('parameters', {}).get('Backend') == 'hipfire':
+                launch = state['active_config']['parameters']
+                if payload.get('max_tokens') is None:
+                    default_limit = hipfire_output_limit(launch)
+                    if default_limit is not None:
+                        payload['max_tokens'] = default_limit
+                if 'reasoning_budget_tokens' in payload:
+                    budget = payload.pop('reasoning_budget_tokens')
+                    if type(budget) is not int or budget < 0:
+                        raise ValueError('hipfire thinking budget must be a nonnegative integer')
+                    if 'max_think_tokens' in payload and payload['max_think_tokens'] != budget:
+                        raise ValueError('Conflicting thinking budgets')
+                    payload['max_think_tokens'] = budget
+                if 'preserve_thinking' in payload:
+                    preserve = payload.pop('preserve_thinking')
+                    if type(preserve) is not bool:
+                        raise ValueError('preserve_thinking must be boolean')
+                    kwargs = payload.get('chat_template_kwargs') or {}
+                    if not isinstance(kwargs, dict):
+                        raise ValueError('chat_template_kwargs must be an object')
+                    if 'preserve_thinking' in kwargs and kwargs['preserve_thinking'] != preserve:
+                        raise ValueError('Conflicting preserve_thinking values')
+                    payload['chat_template_kwargs'] = dict(kwargs, preserve_thinking=preserve)
+                options = payload.get('stream_options') or {}
+                if not isinstance(options, dict):
+                    raise ValueError('stream_options must be an object')
+                payload['stream_options'] = dict(options, include_usage=True)
+                raw = json.dumps(payload, ensure_ascii=False).encode()
             if state.get('active_config', {}).get('parameters', {}).get('Backend') == 'radiance':
                 payload['stream_options']=dict(payload.get('stream_options') or {},include_usage=True)
                 raw=json.dumps(payload,ensure_ascii=False).encode()
@@ -249,7 +367,13 @@ class ChatBridge:
             cancel = threading.Event()
             record = {'id':request_id,'instance':state.get('instance'),'state':'waiting',
                       'backend':state.get('active_config', {}).get('parameters', {}).get('Backend'),
-                      'started_at_ms':int(time.time()*1000),'finish_reason':None,'timings':None}
+                      'started_at_ms':int(time.time()*1000),'finish_reason':None,'timings':None,
+                      'endpoint':'/v1/chat/completions',
+                      'limit':payload.get('max_tokens') if type(payload.get('max_tokens')) is int and payload.get('max_tokens') >= 0 else None,
+                      'has_media':any(isinstance(message.get('content'), list) and
+                                      any(isinstance(part, dict) and part.get('type') == 'image_url'
+                                          for part in message['content'])
+                                      for message in payload.get('messages', []) if isinstance(message, dict))}
             with self.lock:
                 if request_id in self.records: raise ValueError('Duplicate request identity')
                 self.active[request_id]=(conn,cancel)
@@ -324,9 +448,18 @@ class ChatBridge:
                             record['native_id']=event.get('id',record.get('native_id'))
                             for choice in event.get('choices',[]):
                                 delta=choice.get('delta',{})
-                                if delta.get('reasoning_content') or delta.get('content'):
-                                    record.setdefault('first_token_at_ms',int(time.time()*1000))
-                                    record['state']='thinking' if delta.get('reasoning_content') else 'answering'
+                                pieces=[piece for piece in (delta.get('reasoning_content'),delta.get('content')) if piece]
+                                if pieces:
+                                    now_ms=int(time.time()*1000)
+                                    record.setdefault('first_token_at_ms',now_ms)
+                                    if record['backend']=='hipfire':
+                                        record['last_token_at_ms']=now_ms
+                                        record['stream_deltas']=record.get('stream_deltas',0)+len(pieces)
+                                        record['stream_chars']=record.get('stream_chars',0)+sum(len(piece) for piece in pieces)
+                                        record['phase']='answering' if delta.get('content') else 'thinking'
+                                        record['state']=record['phase']
+                                    else:
+                                        record['state']='thinking' if delta.get('reasoning_content') else 'answering'
                                 if choice.get('finish_reason'): record['finish_reason']=choice['finish_reason']
                             if event.get('timings'): record['timings']=event['timings']
                             if event.get('usage'): record['usage']=event['usage']

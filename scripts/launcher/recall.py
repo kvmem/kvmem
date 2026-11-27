@@ -157,8 +157,8 @@ def require_recall_features(capabilities, parameters):
         from pathlib import Path
         inspected = Inspection(parameters, Path.cwd()).run()
         model = inspected.get('model', {})
-        architecture = model.get('architecture_id', model.get('architecture')
-                                 if model.get('format') == 'GGUF' else None)
+        architecture = (model.get('architecture') if model.get('format') == 'GGUF'
+                        else model.get('architecture_id', model.get('architecture')))
         if not inspected.get('can_start') or architecture not in architectures:
             raise ValueError('This worker does not qualify the selected layerwise model architecture '
                              + str(architecture or '(unverified)') + '; qualified architectures: '
@@ -169,7 +169,9 @@ def require_recall_features(capabilities, parameters):
         if type(limit) is not int or limit < 1 or value > limit:
             raise ValueError(f'This worker does not qualify layerwise {name}')
     floor = profile.get('minimum_reserve_blocks')
-    block = 64 if parameters.get('Backend') == 'ninfer' else 128 if parameters.get('Backend') == 'radiance' else parameters.get('BlockTokens', 32)
+    block = (64 if parameters.get('Backend') == 'ninfer' else
+             128 if parameters.get('Backend') in ('radiance', 'hipfire') else
+             parameters.get('BlockTokens', 32))
     reserve = parameters.get('Reserve', 1024)
     if type(floor) is not int or floor < 1 or type(block) is not int or block < 1:
         raise ValueError('This worker requires an explicit qualified layerwise reserve floor')
@@ -186,7 +188,8 @@ def require_recall_features(capabilities, parameters):
     aliases = {'fp16': 'f16', 'fp32': 'f32', 'q8': 'q8_0', 'q5': 'q5_0', 'q4': 'q4_0'}
     for key in ('KvTypeK', 'KvTypeV') if parameters.get('Backend') == 'llamacpp' else ('KvType',):
         value = parameters.get(key) or parameters.get('KvType') or ('q8_0' if parameters.get('Backend') == 'llamacpp' else 'int8')
-        if aliases.get(value, value) not in formats:
+        qualified = value if parameters.get('Backend') == 'hipfire' else aliases.get(value, value)
+        if qualified not in formats:
             raise ValueError(f'This worker does not qualify layerwise {key}={value}; qualified formats: {", ".join(formats)}')
     vision = profile.get('vision_residency', [])
     if not isinstance(vision, list) or any(not isinstance(item, str) for item in vision):
@@ -203,7 +206,11 @@ def require_recall_features(capabilities, parameters):
     require_ngram_limit(profile, spec, parameters)
     count = parameters.get('DraftTokens', parameters.get('MtpDrafts', 0))
     maximum = spec.get('max_draft_tokens')
-    if type(count) is not int or type(maximum) is not int or maximum < 1 or not 1 <= count <= maximum:
+    model_owned = spec.get('draft_width_model_owned') is True
+    if model_owned:
+        if count not in (0, None):
+            raise ValueError('This worker owns the layerwise draft width; DraftTokens must be omitted')
+    elif type(count) is not int or type(maximum) is not int or maximum < 1 or not 1 <= count <= maximum:
         raise ValueError(f'This worker does not qualify layerwise draft width {count}; qualified maximum: {maximum}')
     if (parameters.get('DraftPolicy') == 'adaptive' or parameters.get('AdaptiveMtp')) and spec.get('adaptive') is not True:
         raise ValueError('This worker does not qualify layerwise adaptive drafts')
@@ -234,7 +241,8 @@ def require_recall_features(capabilities, parameters):
             require_ngram_limit(profile, policy_spec, parameters)
             if policy_spec.get('available') is not True:
                 raise ValueError('This worker does not qualify the selected MTP history policy')
-            if type(policy_spec.get('max_draft_tokens')) is not int or count > policy_spec['max_draft_tokens']:
+            if (not model_owned and
+                    (type(policy_spec.get('max_draft_tokens')) is not int or count > policy_spec['max_draft_tokens'])):
                 raise ValueError('This worker does not qualify this MTP policy draft width')
             if (parameters.get('DraftPolicy') == 'adaptive' or parameters.get('AdaptiveMtp')) and policy_spec.get('adaptive') is not True:
                 raise ValueError('This worker does not qualify this MTP policy adaptive drafts')

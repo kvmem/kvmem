@@ -6,7 +6,10 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const root=path.resolve(__dirname,'..'),state=fs.mkdtempSync(path.join(os.tmpdir(),'kvmem-health-test-'));
 const python=process.env.PYTHON||'python',port=Number(process.env.CONSOLE_TEST_PORT||18437),base=`http://127.0.0.1:${port}`;
 const model=path.join(state,'text.ninfer'),broken=path.join(state,'broken.ninfer'),worker=path.join(state,'worker.exe'),rad=path.join(state,'ordinary.rad');
+const hipfireWorker=path.join(state,'hipfire-worker');
 fs.writeFileSync(worker,'not executed');fs.writeFileSync(broken,'broken');
+fs.writeFileSync(hipfireWorker,`#!/usr/bin/env python3\nimport json\nprint(json.dumps({'schema_version':1,'source':'hfq','arch_id':5,'can_serve':False,'speculative':{'mtp':{'supported':True},'dflash2':{'supported':True}},'vision':{'present':False,'sidecar_supported':True}}))\n`);
+fs.chmodSync(hipfireWorker,0o755);
 const prepare=spawnSync(python,['-c',"import sys;from pathlib import Path;sys.path.insert(0,'tests');from test_model_health import ninfer;ninfer(Path(sys.argv[1]));sys.path.insert(0,'backends/radiance/tests');from draft_control_test import container;container(Path(sys.argv[2]),['dflash.fc.weight'],[('draft.architectures','DFlash2Model'),('draft.dflash_config.block_size','8'),('mtp_num_hidden_layers',1)])",model,rad],{cwd:root,encoding:'utf8',windowsHide:true});
 assert.equal(prepare.status,0,prepare.stderr);
 const ggufModels={
@@ -22,7 +25,7 @@ const prepareGguf=spawnSync(python,['-c',[
   "for arch, path in zip(sys.argv[1::2], sys.argv[2::2]): gguf(Path(path), meta={'general.architecture':arch})"
 ].join('\n'),...Object.entries(ggufModels).flat()],{cwd:root,encoding:'utf8',windowsHide:true});
 assert.equal(prepareGguf.status,0,prepareGguf.stderr);
-fs.writeFileSync(path.join(state,'worker-paths.json'),JSON.stringify({llamacpp:worker,ninfer:worker,polystrata:worker,radiance:worker}));
+fs.writeFileSync(path.join(state,'worker-paths.json'),JSON.stringify({llamacpp:worker,ninfer:worker,polystrata:worker,radiance:worker,hipfire:hipfireWorker}));
 const child=spawn(python,['-B',path.join(root,'scripts/local-console.py'),'--port',String(port),'--state-dir',state],{cwd:root,windowsHide:true});
 let stderr='',browser;child.stderr.on('data',data=>stderr+=data);
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));

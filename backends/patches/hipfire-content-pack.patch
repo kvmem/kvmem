@@ -1,0 +1,454 @@
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+index c0139f5fb10d35d73320319d67d86339142f914e..a886fe6434b0952d62aa7bc78d71dbd6266e2fc6 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_prefix.rs
+@@ -96,6 +96,188 @@ impl DraftImage {
+     }
+ }
+ 
++/// 期3 G3 P1.1: adapter metadata of one persistent prefix pack. The pack
++/// header (geometry + per-block tokens) lives in the shim; this JSON blob is
++/// opaque to it and carries the reuse proof and identity.
++#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
++pub struct ContentPackMeta {
++    pub version: u32,
++    pub layout_id: u64,
++    pub frontier: u32,
++    pub tokens: Vec<u32>,
++    pub mean_tail: Option<Vec<f32>>,
++    pub group: u64,
++    pub original_query: Option<(u64, u64)>,
++    pub n_record_layers: u32,
++}
++
++impl ContentPackMeta {
++    pub const VERSION: u32 = 1;
++    pub fn encode(&self) -> Result<Vec<u8>, String> {
++        serde_json::to_vec(self).map_err(|e| format!("content pack meta: {e}"))
++    }
++    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
++        serde_json::from_slice(bytes).map_err(|e| format!("content pack meta: {e}"))
++    }
++}
++
++/// One pack file discovered in the content directory (metadata only; the
++/// payload is loaded on demand).
++#[derive(Debug, Clone)]
++pub struct ColdPack {
++    pub path: std::path::PathBuf,
++    pub meta: ContentPackMeta,
++    pub fingerprint: u64,
++    pub bytes: u64,
++    /// Monotonic LRU stamp assigned at scan (file mtime order).
++    pub stamp: u64,
++}
++
++/// Cold content index: persistent pack files in `HIPFIRE_KVMEM_CACHE_DIR`.
++/// A hit loads the payload into a fresh store and publishes a normal catalog
++/// entry (the engine then reuses it through the usual proof path).
++#[derive(Debug, Default)]
++pub struct ColdPackIndex {
++    packs: Vec<ColdPack>,
++    clock: u64,
++}
++
++impl ColdPackIndex {
++    pub fn len(&self) -> usize {
++        self.packs.len()
++    }
++    pub fn is_empty(&self) -> bool {
++        self.packs.is_empty()
++    }
++    pub fn total_bytes(&self) -> u64 {
++        self.packs.iter().map(|p| p.bytes).sum()
++    }
++    pub fn packs(&self) -> &[ColdPack] {
++        &self.packs
++    }
++
++    /// Scan `dir` for `*.hkpack` files, keeping only packs whose geometry and
++    /// layout match this engine and whose metadata is well-formed. Files are
++    /// ordered by mtime (oldest first) for byte-cap pruning.
++    pub fn scan(
++        dir: &std::path::Path,
++        layout_id: u64,
++        n_record_layers: u32,
++        block_tokens: u32,
++        max_meta_bytes: u64,
++    ) -> Self {
++        let mut index = Self::default();
++        let Ok(entries) = std::fs::read_dir(dir) else {
++            return index;
++        };
++        let mut raw: Vec<(std::time::SystemTime, ColdPack)> = Vec::new();
++        for entry in entries.flatten() {
++            let path = entry.path();
++            if path.extension().and_then(|e| e.to_str()) != Some("hkpack") {
++                continue;
++            }
++            let Ok(info) = RawStore::prefix_pack_info(&path) else {
++                continue;
++            };
++            if info.meta_bytes == 0 || info.meta_bytes > max_meta_bytes {
++                continue;
++            }
++            let Ok(meta_bytes) = RawStore::prefix_pack_meta(&path) else {
++                continue;
++            };
++            let Ok(meta) = ContentPackMeta::decode(&meta_bytes) else {
++                continue;
++            };
++            if meta.version != ContentPackMeta::VERSION
++                || meta.layout_id != layout_id
++                || meta.n_record_layers != n_record_layers
++                || meta.frontier == 0
++                || meta.frontier % block_tokens != 0
++                || meta.tokens.len() != meta.frontier as usize
++            {
++                continue;
++            }
++            let modified = entry
++                .metadata()
++                .and_then(|m| m.modified())
++                .unwrap_or(std::time::UNIX_EPOCH);
++            raw.push((
++                modified,
++                ColdPack {
++                    fingerprint: prefix_fingerprint(&meta.tokens),
++                    path,
++                    meta,
++                    bytes: info.file_bytes,
++                    stamp: 0,
++                },
++            ));
++        }
++        raw.sort_by_key(|(m, _)| *m);
++        index.clock = raw.len() as u64;
++        index.packs = raw
++            .into_iter()
++            .enumerate()
++            .map(|(i, (_, mut p))| {
++                p.stamp = i as u64;
++                p
++            })
++            .collect();
++        index
++    }
++
++    /// Longest pack whose FULL token proof matches `prompt` (same rule as the
++    /// hot catalog; a fingerprint alone is never the admission proof).
++    pub fn lookup(&self, prompt: &[u32], layout_id: u64) -> Option<usize> {
++        let mut best: Option<usize> = None;
++        for (i, p) in self.packs.iter().enumerate() {
++            if p.meta.layout_id != layout_id || p.meta.frontier as usize > prompt.len() {
++                continue;
++            }
++            let f = p.meta.frontier as usize;
++            if prefix_fingerprint(&prompt[..f]) != p.fingerprint {
++                continue;
++            }
++            if prompt[..f] != p.meta.tokens[..] {
++                continue;
++            }
++            if best
++                .map(|b| p.meta.frontier > self.packs[b].meta.frontier)
++                .unwrap_or(true)
++            {
++                best = Some(i);
++            }
++        }
++        best
++    }
++
++    /// Delete the oldest packs until the index fits `max_bytes`. Returns the
++    /// removed files so callers can log/metrics them.
++    pub fn prune_to(&mut self, max_bytes: u64) -> Vec<std::path::PathBuf> {
++        let mut removed = Vec::new();
++        while self.total_bytes() > max_bytes && !self.packs.is_empty() {
++            let victim = self
++                .packs
++                .iter()
++                .enumerate()
++                .min_by_key(|(_, p)| p.stamp)
++                .map(|(i, _)| i)
++                .expect("nonempty");
++            let p = self.packs.remove(victim);
++            let _ = std::fs::remove_file(&p.path);
++            removed.push(p.path);
++        }
++        removed
++    }
++
++    pub fn remove(&mut self, index: usize) -> Option<ColdPack> {
++        if index < self.packs.len() {
++            Some(self.packs.remove(index))
++        } else {
++            None
++        }
++    }
++}
++
+ /// One frozen reusable prefix: the immutable canonical archive plus the
+ /// provenance a reuse must satisfy. Created by [`crate::kvmem_ctl::KvMemCtl::freeze_prefix`];
+ /// the engine attaches the pinned GPU pages (`gpu_pages`) after sealing them.
+@@ -856,4 +1038,52 @@ mod tests {
+         let (id, none, deduped) = cat.insert_group_aware(dup, 2).expect("dedup");
+         assert!(id.is_none() && none.is_empty() && deduped);
+     }
+-}
+\ No newline at end of file
++
++    /// 期3 G3 P1.1: the cold index scans pack files, proves by full token
++    /// equality (never fingerprint alone), and prunes by byte cap.
++    #[test]
++    fn cold_pack_index_scans_proves_and_prunes() {
++        let st = storage();
++        let src = RawStore::new(raw_config(), Some(&st)).expect("src");
++        fill(&src, 4);
++        let dir = std::env::temp_dir().join(format!("kvmem-packidx-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).expect("dir");
++        let layout = layout_fingerprint(&raw_config());
++        let mut write = |frontier: u32, seed: u32, name: &str| {
++            let canonical = src.fork_prefix(frontier).expect("fork");
++            let toks: Vec<u32> = (0..frontier)
++                .map(|i| i.wrapping_mul(31).wrapping_add(seed))
++                .collect();
++            let meta = ContentPackMeta {
++                version: ContentPackMeta::VERSION,
++                layout_id: layout,
++                frontier,
++                tokens: toks.clone(),
++                mean_tail: None,
++                group: 7,
++                original_query: Some((0, 10)),
++                n_record_layers: LAYERS,
++            };
++            let path = dir.join(name);
++            canonical
++                .write_prefix_pack(frontier / BLOCK, &path, &meta.encode().expect("meta"))
++                .expect("write pack");
++            (path, toks)
++        };
++        let (p1, t1) = write(128, 0, "a.hkpack");
++        let (p2, t2) = write(256, 1, "b.hkpack");
++        let mut idx = ColdPackIndex::scan(&dir, layout, LAYERS, BLOCK, 1 << 20);
++        assert_eq!(idx.len(), 2, "two well-formed packs");
++        assert_eq!(idx.lookup(&t1, layout).map(|i| idx.packs()[i].path.clone()), Some(p1.clone()));
++        assert_eq!(idx.lookup(&t2, layout).map(|i| idx.packs()[i].path.clone()), Some(p2.clone()));
++        let mut foreign = t1.clone();
++        foreign[0] ^= 0xffff;
++        assert!(idx.lookup(&foreign, layout).is_none(), "fingerprint alone is no proof");
++        assert!(idx.lookup(&t1, layout ^ 1).is_none(), "layout must match");
++        let removed = idx.prune_to(0);
++        assert_eq!(removed.len(), 2);
++        assert!(!p1.exists() && !p2.exists());
++        std::fs::remove_dir_all(&dir).ok();
++    }
++}
++
+diff --git a/crates/hipfire-kvmem/src/lib.rs b/crates/hipfire-kvmem/src/lib.rs
+index ad4f7b18110cc7485a0f45888ef331370c36dde1..753a445da32dd235239de1f1b4e4bee58cbd5371 100644
+--- a/crates/hipfire-kvmem/src/lib.rs
++++ b/crates/hipfire-kvmem/src/lib.rs
+@@ -138,6 +138,21 @@ struct HkKvSnapshot {
+     _private: [u8; 0],
+ }
+ 
++/// Header of one persistent prefix pack (期3 G3 P1.1).
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct PrefixPackInfo {
++    pub n_layer: u32,
++    pub block_tokens: u32,
++    pub n_embd_k: u32,
++    pub n_embd_v: u32,
++    pub blocks: u32,
++    pub k_row_bytes: u64,
++    pub v_row_bytes: u64,
++    pub meta_bytes: u64,
++    pub file_bytes: u64,
++}
++
+ #[repr(C)]
+ struct HkKvStore {
+     _private: [u8; 0],
+@@ -1114,6 +1129,32 @@ mod ffi {
+             src: *const HkRawStore,
+             blocks: u32,
+         ) -> c_int;
++
++        // 期3 G3 P1.1: persistent prefix packs.
++        pub fn hk_raw_store_write_prefix_pack(
++            st: *const HkRawStore,
++            blocks: u32,
++            path: *const c_char,
++            meta: *const u8,
++            meta_len: usize,
++        ) -> c_int;
++        pub fn hk_prefix_pack_info_read(
++            path: *const c_char,
++            out: *mut PrefixPackInfo,
++        ) -> c_int;
++        pub fn hk_prefix_pack_meta_read(
++            path: *const c_char,
++            meta_out: *mut u8,
++            meta_cap: usize,
++            meta_len: *mut usize,
++        ) -> c_int;
++        pub fn hk_raw_store_read_prefix_pack(
++            st: *mut HkRawStore,
++            path: *const c_char,
++            meta_out: *mut u8,
++            meta_cap: usize,
++            meta_len: *mut usize,
++        ) -> c_int;
+         pub fn hk_raw_store_capture_snapshot(
+             st: *const HkRawStore,
+             blocks: u32,
+@@ -2283,6 +2324,95 @@ impl RawStore {
+         })
+     }
+ 
++    /// 期3 G3 P1.1: write this store's `blocks`-block packed prefix (K/V +
++    /// Mean-K sums) and the opaque adapter metadata into an atomic pack file.
++    pub fn write_prefix_pack(&self, blocks: u32, path: &Path, meta: &[u8]) -> Result<()> {
++        let c = CString::new(path.to_string_lossy().as_bytes())
++            .map_err(|e| KvMemError(format!("pack path: {e}")))?;
++        let p = self.ptr.as_ptr();
++        checked(|| unsafe {
++            let _ = ffi::hk_raw_store_write_prefix_pack(
++                p,
++                blocks,
++                c.as_ptr(),
++                if meta.is_empty() { ptr::null() } else { meta.as_ptr() },
++                meta.len(),
++            );
++        })
++    }
++
++    /// 期3 G3 P1.1: read a pack's header only (cold-index scans).
++    pub fn prefix_pack_info(path: &Path) -> Result<PrefixPackInfo> {
++        let c = CString::new(path.to_string_lossy().as_bytes())
++            .map_err(|e| KvMemError(format!("pack path: {e}")))?;
++        let mut out = PrefixPackInfo::default();
++        clear_error();
++        let rc = unsafe { ffi::hk_prefix_pack_info_read(c.as_ptr(), &mut out) };
++        if rc != 0 {
++            return Err(last_error().map_or_else(
++                || KvMemError("pack info failed".to_string()),
++                KvMemError,
++            ));
++        }
++        Ok(out)
++    }
++
++    /// 期3 G3 P1.1: read only a pack's adapter metadata (cold-index scans;
++    /// never loads the payload).
++    pub fn prefix_pack_meta(path: &Path) -> Result<Vec<u8>> {
++        let c = CString::new(path.to_string_lossy().as_bytes())
++            .map_err(|e| KvMemError(format!("pack path: {e}")))?;
++        let info = Self::prefix_pack_info(path)?;
++        let mut meta = vec![0u8; info.meta_bytes as usize];
++        let mut meta_len = 0usize;
++        clear_error();
++        let rc = unsafe {
++            ffi::hk_prefix_pack_meta_read(
++                c.as_ptr(),
++                if meta.is_empty() { ptr::null_mut() } else { meta.as_mut_ptr() },
++                meta.len(),
++                &mut meta_len,
++            )
++        };
++        if rc != 0 {
++            return Err(last_error().map_or_else(
++                || KvMemError("pack meta read failed".to_string()),
++                KvMemError,
++            ));
++        }
++        meta.truncate(meta_len.min(meta.len()));
++        Ok(meta)
++    }
++
++    /// 期3 G3 P1.1: load a pack's payload into this (empty) store; geometry
++    /// must match. The adapter metadata is returned to the caller.
++    pub fn read_prefix_pack(&self, path: &Path) -> Result<Vec<u8>> {
++        let c = CString::new(path.to_string_lossy().as_bytes())
++            .map_err(|e| KvMemError(format!("pack path: {e}")))?;
++        let info = Self::prefix_pack_info(path)?;
++        let mut meta = vec![0u8; info.meta_bytes as usize];
++        let mut meta_len = 0usize;
++        let p = self.ptr.as_ptr();
++        clear_error();
++        let rc = unsafe {
++            ffi::hk_raw_store_read_prefix_pack(
++                p,
++                c.as_ptr(),
++                if meta.is_empty() { ptr::null_mut() } else { meta.as_mut_ptr() },
++                meta.len(),
++                &mut meta_len,
++            )
++        };
++        if rc != 0 {
++            return Err(last_error().map_or_else(
++                || KvMemError("pack read failed".to_string()),
++                KvMemError,
++            ));
++        }
++        meta.truncate(meta_len.min(meta.len()));
++        Ok(meta)
++    }
++
+     /// 期3 G4: capture one immutable core `KvSnapshot` over the sealed packed
+     /// records of blocks `[0, blocks)` (block-major, layer-major, K then V).
+     /// `previous` lets the capture inherit a block origin when the record's
+diff --git a/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs b/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs
+index 352c6b2211bb7d7eb1b5c5d943d77b013976c4ee..abfc24d4d78a9e32873366048a9c129fdbe8dc97 100644
+--- a/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs
++++ b/crates/hipfire-kvmem/tests/prefix_fork_smoke.rs
+@@ -250,3 +250,46 @@ fn copy_prefix_to_reproduces_packed_bytes_and_mean_and_separates_accounts() {
+         .expect("dst write");
+     assert_eq!(a.charged_bytes(), before, "writes stay in the destination account");
+ }
++
++#[test]
++fn prefix_pack_roundtrips_packed_bytes_mean_and_metadata() {
++    let dir = std::env::temp_dir().join(format!("kvmem-pack-{}", std::process::id()));
++    std::fs::create_dir_all(&dir).expect("dir");
++    let path = dir.join("p.hkpack");
++    let a = Storage::new_ram(1 << 30).expect("a");
++    let src = RawStore::new(raw_config(), Some(&a)).expect("src");
++    fill(&src, 3);
++    let canonical = src.fork_prefix(2 * BLOCK).expect("fork");
++    let meta = b"proof:frontier=256,layout=7,group=42".to_vec();
++    canonical.write_prefix_pack(2, &path, &meta).expect("write pack");
++    let info = RawStore::prefix_pack_info(&path).expect("info");
++    assert_eq!(info.blocks, 2);
++    assert_eq!(info.n_layer, LAYERS);
++    assert_eq!(info.block_tokens, BLOCK);
++    assert_eq!(info.meta_bytes, meta.len() as u64);
++    assert!(info.file_bytes > 0);
++
++    let b = Storage::new_ram(1 << 30).expect("b");
++    let dst = RawStore::new(raw_config(), Some(&b)).expect("dst");
++    let loaded = dst.read_prefix_pack(&path).expect("read pack");
++    assert_eq!(loaded, meta);
++    assert!(!dst.has_k_gpu(2, 0, BLOCK), "only two blocks persisted");
++    for blk in 0..2 {
++        for il in 0..LAYERS {
++            let mut x = vec![0u8; BLOCK as usize * ROW_BYTES];
++            let mut y = vec![0u8; BLOCK as usize * ROW_BYTES];
++            assert!(canonical.copy_k_gpu(blk, il, &mut x, BLOCK));
++            assert!(dst.copy_k_gpu(blk, il, &mut y, BLOCK));
++            assert_eq!(x, y, "K block {blk} layer {il}");
++            assert!(canonical.copy_v_gpu(blk, il, &mut x, BLOCK));
++            assert!(dst.copy_v_gpu(blk, il, &mut y, BLOCK));
++            assert_eq!(x, y, "V block {blk} layer {il}");
++            let mut m0 = vec![0f32; K_WIDTH];
++            let mut m1 = vec![0f32; K_WIDTH];
++            canonical.mean_k(blk, il, &mut m0);
++            dst.mean_k(blk, il, &mut m1);
++            assert_eq!(m0, m1, "Mean-K block {blk} layer {il}");
++        }
++    }
++    std::fs::remove_dir_all(&dir).ok();
++}

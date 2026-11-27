@@ -1,0 +1,604 @@
+diff --git a/crates/hipfire-arch-qwen35/src/forward_slots.rs b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+index 4eccf8ad3d32ea18b66a148922b160567b04c006..4f3d524102d6ac0bf8c55df48476fc025399622b 100644
+--- a/crates/hipfire-arch-qwen35/src/forward_slots.rs
++++ b/crates/hipfire-arch-qwen35/src/forward_slots.rs
+@@ -4057,6 +4057,7 @@ fn paged_decode_reference_layers(
+         pbs.kvmem_taps.as_ref(),
+         &desc_staging.row_slot_dev,
+         /* layerwise */ None,
++        /* use_mrope */ false,
+         layer_end,
+     )?;
+     // Back into the [n_slots × dim] batch buffer the head reads.
+@@ -4097,6 +4098,16 @@ fn paged_decode_layerwise(
+     gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, 0, row_bytes)?;
+     let pos = batch.positions[0] as usize;
+     gpu.hip.memcpy_htod(&s.pos_buf, &(pos as i32).to_ne_bytes())?;
++    // G7 Stage D: a VL decode row (image conversation, past the prompt) carries
++    // uniform M-RoPE phases `[p+delta; 3]` from the batch. Upload them to the
++    // single-row scratch so the attention prep can run the 3D RoPE kernel; the
++    // KV write below still uses the carrier's COMPACT positions, and the phases
++    // are the absolute ones the prefill stored keys under.
++    let use_mrope = batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty();
++    if use_mrope {
++        let bytes: Vec<u8> = batch.pos3[0].iter().flat_map(|v| v.to_ne_bytes()).collect();
++        gpu.hip.memcpy_htod(&s.pos_buf3, &bytes)?;
++    }
+ 
+     // Composite arena views: non-owning aliases (the carrier's arena owns the
+     // allocation). K base = arena base; V base = arena shifted by one K plane.
+@@ -4163,6 +4174,7 @@ fn paged_decode_layerwise(
+         pbs.kvmem_taps.as_ref(),
+         &desc_staging.row_slot_dev,
+         Some(lq),
++        use_mrope,
+         layer_end,
+     )?;
+     // Back into the [n_slots × dim] batch buffer the head reads.
+@@ -5691,12 +5703,17 @@ pub fn forward_batch_slots_opts(
+     // path also falls through).
+     #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+     let layerwise_handled = if let Some(lq) = layerwise.as_deref_mut() {
+-        // P4.1② G1: two admissible Layerwise shapes, both single-slot text-only
+-        // q8 paged. (a) AR single-row decode (D4b-3): n == 1, unspec, the paged
+-        // GQA decode tile engaged. (b) MTP multi-row verify span (②): n == width
+-        // > 1, spec-captured. The width-param staging (①-F1) supplies per-row
+-        // compacted causal bounds `[seq_len - width + i]`; the verify span rides
+-        // Path B `run_layers_slots` (width-aware) for BOTH dense and MoE — the
++        // P4.1② G1: two admissible Layerwise shapes, both single-slot q8 paged.
++        // (a) AR single-row decode (D4b-3): n == 1, unspec, the paged GQA decode
++        // tile engaged. G7 Stage D admits the uniform past-prompt M-RoPE form
++        // here: the FA seam rotates with the real phases (s.pos_buf3 on the
++        // dense reference path, pbs.pos3 on the slots ladder) while the compact
++        // carrier staging keeps driving the KV write / causal bound, and no
++        // decode row carries vision-tower ext_emb rows. (b) MTP multi-row verify
++        // span (②): n == width > 1, spec-captured, text-only. The width-param
++        // staging (①-F1) supplies per-row compacted causal bounds
++        // `[seq_len - width + i]`; the verify span rides Path B
++        // `run_layers_slots` (width-aware) for BOTH dense and MoE — the
+         // reference single-row sibling is not width-aware. Verify admission is
+         // deliberately INDEPENDENT of the legacy `paged_verify` WMMA envelope
+         // (which caps n at 4..=32 past a per-token ctx crossover): the Layerwise
+@@ -5705,15 +5722,16 @@ pub fn forward_batch_slots_opts(
+         // so short-context / small-width verify spans still ride Layerwise.
+         // Any other shape with a `Some` handle fails closed here, ahead of any
+         // attention — never a silent legacy fallback.
+-        let text_only = !use_mrope && !use_ext;
++        let no_ext = !use_ext;
+         let ar_admissible = paged_decode.is_some()
+             && n == 1
+             && active_slots == 1
+-            && text_only
++            && no_ext
+             && spec_capture.is_none();
+         let verify_admissible = n > 1
+             && active_slots == 1
+-            && text_only
++            && no_ext
++            && !use_mrope
+             && spec_capture.is_some()
+             && pool.is_paged()
+             && kv.is_q8();
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+index ab93332bfe4d000f95ffc96a5a71e9ed9b66a4c2..61d7f3869c3b6de4b2a54594001c8673fc53f231 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_ctl.rs
+@@ -1424,6 +1424,13 @@ impl KvMemCtl {
+         self.budget_blocks
+     }
+ 
++    /// Always-resident sink pages (`HIPFIRE_KVMEM_SINK_BLOCKS`). The layerwise
++    /// Query selection charges these inside the same budget as any mandatory
++    /// (media) pins, so an admission check must add them.
++    pub fn sink_blocks(&self) -> usize {
++        self.kv_cfg.sink_blocks as usize
++    }
++
+     /// P2.2a: generation reserve R (ninfer `reserve_tokens`).
+     pub fn gen_reserve(&self) -> u64 {
+         self.gen_reserve
+diff --git a/crates/hipfire-arch-qwen35/src/kvmem_media.rs b/crates/hipfire-arch-qwen35/src/kvmem_media.rs
+index 52746beb28fa59d72a3e888343f0212738eb2daf..3ff97ebf120162457ea97710ee9073bf25c5b2f2 100644
+--- a/crates/hipfire-arch-qwen35/src/kvmem_media.rs
++++ b/crates/hipfire-arch-qwen35/src/kvmem_media.rs
+@@ -66,6 +66,33 @@ pub fn spans_from_pad_runs(tokens: &[u32], pad: u32, n_visual: usize) -> Vec<Med
+     spans
+ }
+ 
++/// Canonical page ids (`block`-sized) any of `spans` touches, restricted to
++/// the sealed history `[0, frontier_pages)`. Sorted and deduped. A media span
++/// is indivisible (nInfer media group): every page it intersects must be
++/// pinned in the per-layer keep-set, and a page past the sealed frontier is
++/// the suffix stripe (always attended), not a canonical pin.
++pub fn pages_from_spans(spans: &[MediaSpan], block: u64, frontier_pages: u64) -> Vec<u64> {
++    let mut pages: Vec<u64> = Vec::new();
++    if block == 0 {
++        return pages;
++    }
++    for span in spans {
++        if span.begin >= span.end {
++            continue;
++        }
++        let first = span.begin / block;
++        let last = (span.end - 1) / block;
++        for id in first..=last {
++            if id < frontier_pages {
++                pages.push(id);
++            }
++        }
++    }
++    pages.sort_unstable();
++    pages.dedup();
++    pages
++}
++
+ /// nInfer `validate_layerwise_media` for one flat, ordered span list.
+ pub fn validate_spans(prompt_len: u64, spans: &[MediaSpan], block: u64) -> Result<(), String> {
+     if block == 0 {
+@@ -289,4 +316,36 @@ mod tests {
+         assert_eq!(a, b);
+         assert_eq!(a, 640);
+     }
++
++    #[test]
++    fn pages_cover_every_touched_page() {
++        // One span spanning a page boundary: both pages.
++        let spans = [MediaSpan { begin: 100, end: 200 }];
++        assert_eq!(pages_from_spans(&spans, BLOCK, 10), vec![0, 1]);
++        // Page-aligned span: exactly its pages, both ends inclusive.
++        let spans = [MediaSpan { begin: 128, end: 384 }];
++        assert_eq!(pages_from_spans(&spans, BLOCK, 10), vec![1, 2]);
++        // End on a boundary does not touch the next page.
++        let spans = [MediaSpan { begin: 100, end: 128 }];
++        assert_eq!(pages_from_spans(&spans, BLOCK, 10), vec![0]);
++        // Two spans on the same page dedup.
++        let spans = [
++            MediaSpan { begin: 10, end: 20 },
++            MediaSpan { begin: 30, end: 40 },
++        ];
++        assert_eq!(pages_from_spans(&spans, BLOCK, 10), vec![0]);
++    }
++
++    #[test]
++    fn pages_are_clamped_to_the_sealed_frontier() {
++        // A span reaching past the sealed history keeps only sealed pages; the
++        // rest is the suffix stripe (always attended, never a canonical pin).
++        let spans = [MediaSpan { begin: 200, end: 600 }];
++        assert_eq!(pages_from_spans(&spans, BLOCK, 3), vec![1, 2]);
++        assert_eq!(pages_from_spans(&spans, BLOCK, 0), Vec::<u64>::new());
++        // Degenerate spans are ignored; block 0 yields nothing.
++        let spans = [MediaSpan { begin: 5, end: 5 }];
++        assert!(pages_from_spans(&spans, BLOCK, 3).is_empty());
++        assert!(pages_from_spans(&[MediaSpan { begin: 0, end: 5 }], 0, 3).is_empty());
++    }
+ }
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index d57e306d98761e1074b68814838125ab30dd19e7..f66a6091441fd9e97640ae6eb02cd8e6b50eeca1 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -2058,7 +2058,7 @@ pub fn bootstrap_layerwise(
+ ) -> Result<LayerwiseBootstrap, String> {
+     bootstrap_layerwise_rows(
+         fed, session_id, incarnation, seq, fa_layers, n_heads, n_kv_heads, head_dim,
+-        budget_blocks, record_bytes, resident, 1, None,
++        budget_blocks, record_bytes, resident, 1, None, &[],
+     )
+ }
+ 
+@@ -2072,6 +2072,14 @@ pub fn bootstrap_layerwise(
+ /// `query` outside the evaluation span. The canonical history, specs, suffix page
+ /// and `native_history_tokens` are width-independent (the verify span rides the
+ /// single physical suffix stripe, `width ≤ block_tokens`).
++///
++/// `mandatory` are canonical page ids the per-layer selection must keep (G7
++/// Stage D media pins): every spec gets the SAME list, so the image's pages
++/// survive layer selection while the remaining pages compete for the budget.
++/// Ids beyond the sealed history are filtered defensively (the suffix stripe
++/// covers them); the core fails closed when the mandatory set cannot fit the
++/// selection budget.
++#[allow(clippy::too_many_arguments)]
+ pub fn bootstrap_layerwise_rows(
+     fed: u32,
+     session_id: u64,
+@@ -2086,6 +2094,7 @@ pub fn bootstrap_layerwise_rows(
+     resident: &[Vec<u64>],
+     width: u64,
+     query: Option<QueryRange>,
++    mandatory: &[u32],
+ ) -> Result<LayerwiseBootstrap, String> {
+     let bt = LAYERWISE_BLOCK_TOKENS;
+     if width == 0 {
+@@ -2147,6 +2156,15 @@ pub fn bootstrap_layerwise_rows(
+         .collect();
+     let mut canonical = Vec::with_capacity(fa_layers.len());
+     let mut specs = Vec::with_capacity(fa_layers.len());
++    // G7 Stage D: media pins are canonical ids inside the sealed history; a
++    // stale id past the frontier would be rejected by the core, so clamp to the
++    // same defensive filter the resident keep-set uses (dedup preserving order).
++    let mut mandatory_ids: Vec<u32> = Vec::with_capacity(mandatory.len());
++    for &id in mandatory {
++        if (id as u64) < full_pages as u64 && !mandatory_ids.contains(&id) {
++            mandatory_ids.push(id);
++        }
++    }
+     for (ordinal, &model_layer) in fa_layers.iter().enumerate() {
+         // Decision A (§3.10a): the persistent PER-LAYER keep-set drives each
+         // layer's canonical resident list. Keep only ids within the current
+@@ -2180,7 +2198,7 @@ pub fn bootstrap_layerwise_rows(
+                 device_tokens: (selected_pages as u64 + 1) * bt as u64,
+                 host_payload_bytes: full_pages as u64 * record_bytes,
+             },
+-            mandatory: Vec::new(),
++            mandatory: mandatory_ids.clone(),
+         });
+     }
+     // The core ties the evaluation span to the committed logical frontier:
+@@ -2296,6 +2314,12 @@ pub fn engine_carrier_rows<'a>(
+     output: &mut OutputPressure,
+     prefill: Option<&PrefillPressure>,
+     force_query: bool,
++    // G7 Stage D: canonical pages holding a media (image) span. They are
++    // MANDATORY in every per-layer selection (Query spec and Pressure seed), so
++    // the image's KV survives the keep-set refinement; empty for text
++    // (byte-neutral). The caller already filtered them to sealed pages and
++    // verified they fit the resident budget.
++    media_pages: &[u32],
+ ) -> Result<Option<LayerwiseQuery<'a>>, String> {
+     if !ctl.strategy().is_layerwise() || width == 0 {
+         return Ok(None);
+@@ -2353,6 +2377,7 @@ pub fn engine_carrier_rows<'a>(
+         ctl.layerwise_keep_set(slot).unwrap_or(&[]),
+         width,
+         query,
++        media_pages,
+     )?;
+     let selected_pages =
+         (bootstrap.native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
+@@ -2451,8 +2476,9 @@ pub fn engine_carrier_rows<'a>(
+             let catalog = MemoryCatalog::new(&descriptor, &bootstrap.canonical)
+                 .map_err(|e| format!("layerwise engine rows: catalog: {e}"))?;
+             let budget_tokens = budget_blocks as u64 * LAYERWISE_BLOCK_TOKENS as u64;
++            let media_pages_u64: Vec<u64> = media_pages.iter().map(|&p| p as u64).collect();
+             let choices = output
+-                .select(&catalog, pf, &[], budget_tokens, 0)
++                .select(&catalog, pf, &media_pages_u64, budget_tokens, 0)
+                 .map_err(|e| format!("layerwise engine rows: output select: {e}"))?;
+             let all = choices
+                 .read_all()
+@@ -2582,6 +2608,7 @@ pub fn engine_carrier_head<'a>(
+         ctl.layerwise_keep_set(slot).unwrap_or(&[]),
+         width,
+         None,
++        &[],
+     )?;
+     let selected_pages =
+         (bootstrap.native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
+@@ -4300,6 +4327,7 @@ mod tests {
+         let rows = |width: u64, query: Option<QueryRange>| {
+             bootstrap_layerwise_rows(
+                 fed, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, width, query,
++                &[],
+             )
+         };
+ 
+@@ -4315,6 +4343,18 @@ mod tests {
+         assert_eq!(one.suffix_page, ar.suffix_page);
+         assert_eq!(one.partial_tokens, ar.partial_tokens);
+         assert_eq!(one.native_history_tokens, ar.native_history_tokens);
++        // G7 Stage D: media pins ride EVERY layer's spec, clamped to the sealed
++        // history (4 pages here) and deduped; the id past the frontier is dropped
++        // (it is the suffix stripe, never a canonical pin). Empty by default.
++        assert!(one.specs.iter().all(|s| s.mandatory.is_empty()));
++        let pinned = bootstrap_layerwise_rows(
++            fed, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None,
++            &[1, 2, 2, 99],
++        )
++        .unwrap();
++        for spec in &pinned.specs {
++            assert_eq!(spec.mandatory, vec![1, 2], "media pins per layer");
++        }
+ 
+         // width=4 MTP verify span: evaluation rides [frontier, frontier+4).
+         let four = rows(4, None).unwrap();
+@@ -4349,11 +4389,11 @@ mod tests {
+         assert!(rows(4, Some(QueryRange { begin: frontier, end: frontier + 5 })).is_err()); // end > evaluation.end
+         assert!(rows(4, Some(QueryRange { begin: frontier + 2, end: frontier + 1 })).is_err()); // begin > end
+         assert!(bootstrap_layerwise_rows(
+-            fed, 0, 0, 5, &[], Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None
++            fed, 0, 0, 5, &[], Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None, &[]
+         )
+         .is_err()); // empty fa_layers
+         assert!(bootstrap_layerwise_rows(
+-            64, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None
++            64, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None, &[]
+         )
+         .is_err()); // fed < 128: no sealed history page
+     }
+@@ -7033,6 +7073,7 @@ mod tests {
+             Some(&taps),
+             &ref_row_slot,
+             Some(&mut carrier),
++            /* use_mrope */ false,
+             NL,
+         )
+         .expect("layerwise Path A forward");
+@@ -7110,6 +7151,7 @@ mod tests {
+             Some(&taps),
+             &ref_row_slot,
+             None,
++            /* use_mrope */ false,
+             NL,
+         )
+         .expect("legacy Path A forward");
+@@ -8284,7 +8326,7 @@ mod tests {
+         // width-4 verify span bootstrap (engine session 0/0 → core 1/1 == owner).
+         let bootstrap = bootstrap_layerwise_rows(
+             frontier as u32, 0, 0, 0, &[0, 1], NH as u32, KVH as u32, HD as u32,
+-            budget_blocks, record_bytes, &[], width, None,
++            budget_blocks, record_bytes, &[], width, None, &[],
+         )
+         .expect("bootstrap rows");
+         assert_eq!(
+@@ -8486,7 +8528,7 @@ mod tests {
+         let policy = ctl.layerwise_policy(frontier).expect("policy");
+         let mut carrier = engine_carrier_rows(
+             &mut gpu, &ctl, &policy, 0, 0, NL, NH, KVH, HD, CTX as u32, "qwen35",
+-            width, None, &mut output, None, false,
++            width, None, &mut output, None, false, &[],
+         )
+         .expect("engine_carrier_rows")
+         .expect("admitted carrier");
+diff --git a/crates/hipfire-arch-qwen35/src/qwen35/forward.rs b/crates/hipfire-arch-qwen35/src/qwen35/forward.rs
+index 0fc84813fae4af2657eeb45ecede72cec1c17ab1..99fe1bd4fc4ff85f2ad5e7bfea6ae7fe7734ceef 100644
+--- a/crates/hipfire-arch-qwen35/src/qwen35/forward.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35/forward.rs
+@@ -2776,6 +2776,17 @@ fn forward_scratch_layers(
+ /// Dense-FFN models only: the MoE layers keep the slots engine's own MoE
+ /// kernels, and the caller gates on `config.num_experts == 0`.
+ #[allow(clippy::too_many_arguments)]
++/// True when any layer carries an escha-trellis container. Those dense models
++/// lower the paged decode to the coarse-super-op program executor, whose decode
++/// arm has no M-RoPE path (VL stays on the Legacy slots ladder).
++pub(crate) fn has_escha_layers(weights: &Qwen35Weights) -> bool {
++    weights.layers.iter().any(|layer| match layer {
++        LayerWeights::DeltaNet(l) => l.escha.is_some(),
++        LayerWeights::FullAttn(l) => l.escha.is_some(),
++        _ => false,
++    })
++}
++
+ pub(crate) fn forward_scratch_layers_paged(
+     gpu: &mut Gpu,
+     weights: &Qwen35Weights,
+@@ -2788,6 +2799,7 @@ pub(crate) fn forward_scratch_layers_paged(
+     kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
+     row_slot: &GpuTensor,
+     mut layerwise: crate::LayerwiseFwd<'_, '_>,
++    use_mrope: bool,
+     layer_end: usize,
+ ) -> HipResult<()> {
+     // Escha-trellis dense layers cannot run their projections through the
+@@ -2797,13 +2809,16 @@ pub(crate) fn forward_scratch_layers_paged(
+     // escha_run_proj/escha_run_resid. The attention core is projection-agnostic
+     // and threads `paged`, so the paged KVMem Q8_0 write + GQA tile are
+     // identical either way. Non-escha dense models (MQ/Bonsai) keep the
+-    // certified dispatch path below untouched.
+-    let is_escha = weights.layers.iter().any(|layer| match layer {
+-        LayerWeights::DeltaNet(l) => l.escha.is_some(),
+-        LayerWeights::FullAttn(l) => l.escha.is_some(),
+-        _ => false,
+-    });
+-    if is_escha {
++    // certified dispatch path below untouched. A VL row cannot ride the
++    // lowered executor (no M-RoPE arm): fail closed rather than rotate 1D.
++    if has_escha_layers(weights) {
++        if use_mrope {
++            return Err(HipError::new(
++                0,
++                "paged dense decode: the escha lowered executor has no M-RoPE arm \
++                 (VL decode stays on the slots ladder)",
++            ));
++        }
+         return forward_scratch_layers_paged_lowered(
+             gpu, weights, config, pos, kv_cache, dn_state, s, paged, kvmem_taps, row_slot,
+             layerwise, layer_end,
+@@ -2820,7 +2835,7 @@ pub(crate) fn forward_scratch_layers_paged(
+     if let Some(lq) = layerwise.as_deref_mut() {
+         return forward_scratch_layers_paged_layerwise(
+             gpu, weights, config, pos, kv_cache, dn_state, s, paged, kvmem_taps, row_slot, lq,
+-            layer_end,
++            use_mrope, layer_end,
+         );
+     }
+     #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+@@ -3015,6 +3030,10 @@ fn forward_scratch_layers_paged_layerwise(
+     kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
+     row_slot: &GpuTensor,
+     lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
++    // G7 Stage D: `true` when the decode row's 3D M-RoPE phases were uploaded to
++    // `s.pos_buf3` by the caller; the FA seam must rotate with them instead of
++    // the 1D `pos_buf`. `false` reproduces the text path byte-for-byte.
++    use_mrope: bool,
+     layer_end: usize,
+ ) -> HipResult<()> {
+     let ctx = DispatchCtx::new(gpu);
+@@ -3051,6 +3070,7 @@ fn forward_scratch_layers_paged_layerwise(
+                 kvmem_taps,
+                 Some(row_slot),
+                 lq,
++                use_mrope.then_some(config.mrope_section),
+                 |gpu, ctx, binding, tap| {
+                     let mixer = binding.mixer(
+                         layer,
+@@ -5831,6 +5851,7 @@ impl<'a, 'b> Qwen35Bindings<'a, 'b> {
+         // fa_q_full; the returned prerotated flag feeds the later RESID_WO op).
+         let prerotated = layerwise_fa_attend(
+             gpu, ctx, s, config, kv_cache, dn_state, pos, fa, kvmem_taps, row_slot, &mut *lq,
++            None, // the lowered (escha) executor has no M-RoPE arm
+             |gpu, ctx, binding, tap| {
+                 let step = binding.mixer(
+                     layer,
+@@ -5881,6 +5902,9 @@ fn layerwise_fa_attend(
+     kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
+     row_slot: Option<&GpuTensor>,
+     lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
++    // G7 Stage D: `Some(section)` rotates with the 3D phases in `s.pos_buf3`
++    // (VL decode); `None` keeps the 1D `pos_buf` path byte-identical.
++    mrope_section: Option<[usize; 3]>,
+     attend: impl FnOnce(
+         &mut Gpu,
+         &DispatchCtx,
+@@ -5933,7 +5957,7 @@ fn layerwise_fa_attend(
+             kv_cache,
+             dn_state,
+             position: pos,
+-            mrope_section: None,
++            mrope_section,
+             paged: Some(hybrid::PagedAttentionKv {
+                 positions: &views.positions,
+                 descs: &views.descs,
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index c8320d8db380bd9bf4c72aaa3f9d950768845199..531663da749f662129c2229d04e7471cd8b5105b 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -649,13 +649,22 @@ impl ModelRig {
+ }
+ 
+ /// Decide whether this step is an admissible single-slot Layerwise decode and,
+-/// if so, return `(slot, session_id)` (design §3.9g). Layerwise recalls the
+-/// compacted selected working set per layer; it admits ONLY a single text-only
+-/// q8 paged autoregressive decode row with no speculative-verify / DFlash rows.
+-/// Every other step — prefill, multi-slot, VL (image sessions carry M-RoPE
+-/// phases the compacted view does not reproduce), spec, non-q8, non-paged, or
+-/// Legacy strategy — returns `None` and runs the byte-neutral Legacy path. The
+-/// host-store length gate (`fed >= 128`) lives in `engine_carrier_rows`.
++/// if so, return `(slot, session_id, media_pages)` (design §3.9g). Layerwise
++/// recalls the compacted selected working set per layer; it admits ONLY a
++/// single text-only OR uniform-M-RoPE q8 paged autoregressive decode row with
++/// no speculative-verify / DFlash rows. Every other step — prefill, multi-slot,
++/// spec-verify, non-q8, non-paged, or Legacy strategy — returns `None` and runs
++/// the byte-neutral Legacy path. The host-store length gate (`fed >= 128`) lives
++/// in `engine_carrier_rows`.
++///
++/// G7 Stage D (VL): an image-conversation decode row is admissible when its
++/// M-RoPE phases are the uniform past-prompt form `[p+delta; 3]` (in-prompt
++/// phases never reach a decode row) and the image's canonical pages fit the
++/// resident budget. `media_pages` are those pinned pages — MANDATORY in every
++/// per-layer selection, so the vision KV can never be dropped by the keep-set
++/// refinement. VL + native spec stays Legacy (the MTP head-plane draft selection
++/// is text-only), and a media working set that cannot fit the budget keeps the
++/// byte-neutral Legacy path instead of failing closed.
+ #[cfg(feature = "kvmem")]
+ fn layerwise_admissible(
+     rig: &Rig,
+@@ -664,7 +673,7 @@ fn layerwise_admissible(
+     work: &[PendingWork],
+     any_verify: bool,
+     any_dflash_rows: bool,
+-) -> Option<(usize, u64)> {
++) -> Option<(usize, u64, Vec<u32>)> {
+     let ctl = rig.model.kvmem.as_ref()?;
+     if !ctl.strategy().is_layerwise() {
+         return None;
+@@ -685,17 +694,71 @@ fn layerwise_admissible(
+     if !work[slot].decoding {
+         return None;
+     }
+-    // Text-only this step: no external (vision-tower) embedding rows and no
+-    // M-RoPE phases (the throat requires `!use_ext && !use_mrope`).
+-    if !batch.ext_emb.iter().all(|&e| e < 0) || !batch.pos3.is_empty() {
++    // No vision-tower embedding rows this step (decode rows never carry ext_emb;
++    // the image pads live in the prefill). M-RoPE phases are admitted only in
++    // the past-prompt uniform form: a decode row rotates all three axes at the
++    // same shifted position, which the attention seam reproduces bit-for-bit.
++    if !batch.ext_emb.iter().all(|&e| e < 0) {
++        return None;
++    }
++    if batch
++        .pos3
++        .iter()
++        .any(|p| p[0] != p[1] || p[1] != p[2])
++    {
+         return None;
+     }
+     let frame = slots[slot].as_ref()?;
+     let sess = rig.sessions.get(frame.session)?;
++    let mut media_pages: Vec<u32> = Vec::new();
+     if sess.has_image {
+-        return None;
++        // The MTP head plane restores an aux selection without media semantics;
++        // keep VL+MTP on the Legacy path (out of Stage D scope). Escha-trellis
++        // dense decode lowers to a program executor with no M-RoPE arm.
++        if work[slot].spec.active()
++            || crate::qwen35::forward::has_escha_layers(&rig.model.weights)
++        {
++            return None;
++        }
++        let fed = ctl.fed_tokens(slot).unwrap_or(0) as u64;
++        let block = crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u64;
++        let full_pages = fed / block;
++        let (_, ranges) = kvmem_session_media(rig, frame.session);
++        let spans: Vec<crate::kvmem_media::MediaSpan> = ranges
++            .iter()
++            .map(|&(begin, end)| crate::kvmem_media::MediaSpan {
++                begin: begin as u64,
++                end: end as u64,
++            })
++            .collect();
++        let pages = crate::kvmem_media::pages_from_spans(&spans, block, full_pages);
++        // The core Query selection charges the sink pages and every mandatory
++        // pin inside the same budget and fails closed when they do not fit. An
++        // image that cannot be represented keeps the Legacy path (the strategy
++        // is opt-in; a normal request must not poison).
++        let budget = ctl.budget_blocks() as u64;
++        if full_pages > budget && pages.len() as u64 + ctl.sink_blocks() as u64 > budget {
++            if rig.gpu.slot_trace() {
++                eprintln!(
++                    "[kvmem-layerwise] slot {slot} VL decode stays Legacy: media pages {} \
++                     + sink {} exceed the resident budget {budget}",
++                    pages.len(),
++                    ctl.sink_blocks()
++                );
++            }
++            return None;
++        }
++        media_pages = pages.into_iter().map(|p| p as u32).collect();
++        if rig.gpu.slot_trace() {
++            eprintln!(
++                "[kvmem-layerwise] slot {slot} VL decode admitted: media pages {} {:?} \
++                 (fed {fed}, budget {budget})",
++                media_pages.len(),
++                media_pages
++            );
++        }
+     }
+-    Some((slot, frame.session.0))
++    Some((slot, frame.session.0, media_pages))
+ }
+ 
+ /// Layerwise spec-verify admission (P4.1② design §A.6 / §B D1.4②; 期4 DFlash2).
+@@ -6174,7 +6237,7 @@ fn run_loop(
+             let fwd = {
+                 match layerwise_admissible(&rig, &batch, &slots, &work, any_verify, any_dflash_rows)
+                 {
+-                    Some((slot, session_id)) => {
++                    Some((slot, session_id, media_pages)) => {
+                         let mut kvmem = rig.model.kvmem.take();
+                         let n_fa = rig
+                             .model
+@@ -6264,6 +6327,7 @@ fn run_loop(
+                                 .expect("admissible layerwise AR step has an output owner"),
+                             None,
+                             force_query,
++                            &media_pages,
+                         );
+                         match built {
+                             Ok(Some(mut carrier)) => {
+@@ -6509,6 +6573,7 @@ fn run_loop(
+                                     .expect("admissible layerwise verify has an output owner"),
+                                 None,
+                                 force_query,
++                                &[],
+                             );
+                             match built {
+                                 Ok(Some(mut carrier)) => {

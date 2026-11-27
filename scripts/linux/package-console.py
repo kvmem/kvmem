@@ -22,7 +22,7 @@ def digest(path):
 
 
 def package(source, output, chat, wheel, expected, backend='ninfer'):
-    if backend not in ('ninfer','radiance','all'):raise ValueError('Unsupported console backend')
+    if backend not in ('ninfer','radiance','hipfire','all'):raise ValueError('Unsupported console backend')
     source, output, chat, wheel = (Path(p).resolve() for p in (source, output, chat, wheel))
     if output.exists() or Path(str(output) + '.tar.gz').exists():
         raise ValueError('Output already exists; choose a new versioned package path')
@@ -78,7 +78,7 @@ def package(source, output, chat, wheel, expected, backend='ninfer'):
             'Guide: docs/linux-launcher.md\n', encoding='utf-8', newline='\n')
         controller_files = {name: digest(staging / name) for name in files if name.startswith(('scripts/', 'ui/monitor/', 'backends/radiance/tools/'))}
         info = dict(schema_version=1, package_kind='console-only-preview', platform='linux-x86_64',
-                    launch_contract_version=3, supported_backends=['ninfer','llamacpp','radiance'] if backend=='all' else [backend], python_minimum='3.10',
+                    launch_contract_version=3, supported_backends=['ninfer','llamacpp','radiance','hipfire'] if backend=='all' else [backend], python_minimum='3.10',
                     psutil_version='7.2.2', psutil_wheel=wheel.name, psutil_sha256=expected,
                     native_worker_included=False, native_boot_validated=False, controller_files=controller_files,
                     chat_manifest_sha256=digest(chat / 'ui-build.json'))
@@ -105,6 +105,6 @@ if __name__ == '__main__':
     parser.add_argument('--chat-ui', type=Path, required=True)
     parser.add_argument('--psutil-wheel', type=Path, required=True)
     parser.add_argument('--psutil-sha256', required=True)
-    parser.add_argument('--backend', choices=('ninfer','radiance','all'), default='ninfer')
+    parser.add_argument('--backend', choices=('ninfer','radiance','hipfire','all'), default='ninfer')
     args = parser.parse_args()
     print(json.dumps(package(args.source, args.output, args.chat_ui, args.psutil_wheel, args.psutil_sha256,args.backend), indent=2))

@@ -1,0 +1,1687 @@
+diff --git a/crates/hipfire-arch-qwen35/src/spec_emit.rs b/crates/hipfire-arch-qwen35/src/spec_emit.rs
+index cb24a04b4..f44a93f75 100644
+--- a/crates/hipfire-arch-qwen35/src/spec_emit.rs
++++ b/crates/hipfire-arch-qwen35/src/spec_emit.rs
+@@ -89,17 +89,29 @@ impl<'a> Qwen35Emit<'a> {
+     /// `tool_schemas_dflash` builder. A spent think budget splices
+     /// `HIPFIRE_THINK_CONTINUATION` (default `</think>\n\n`).
+     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
+-        Self::with_think_close(ctx, think_continuation_text())
++        Self::with_think_close(ctx, think_continuation_text(), false)
++    }
++
++    /// [`Self::from_ctx`] for serving: malformed tool spans are released as
++    /// ordinary assistant text (PolyStrata-style fallback) instead of ending
++    /// the turn with `malformed_protocol`, so a degenerate call degrades the
++    /// answer instead of failing the request.
++    pub fn from_ctx_recover(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
++        Self::with_think_close(ctx, think_continuation_text(), true)
+     }
+ 
+     /// [`Self::from_ctx`] for Qwen4, whose AR producer splices the template's
+     /// own close ([`QWEN_TEMPLATE_THINK_CLOSE`]) when the think budget runs
+     /// out; MTP must splice the same tokens to produce the same text.
+     pub fn from_ctx_template_think_close(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
+-        Self::with_think_close(ctx, QWEN_TEMPLATE_THINK_CLOSE.to_string())
++        Self::with_think_close(ctx, QWEN_TEMPLATE_THINK_CLOSE.to_string(), false)
+     }
+ 
+-    fn with_think_close(ctx: SpecEmitCtx<'a>, think_close: String) -> Box<dyn SpecEmit + 'a> {
++    fn with_think_close(
++        ctx: SpecEmitCtx<'a>,
++        think_close: String,
++        tool_recover: bool,
++    ) -> Box<dyn SpecEmit + 'a> {
+         let tool_protocol_enabled = ctx.tools.is_some();
+         let tool_schemas: Vec<grammar::ToolSchema> = ctx
+             .tools
+@@ -139,7 +151,7 @@ impl<'a> Qwen35Emit<'a> {
+             stream_bytes: Vec::new(),
+             streamed_tokens: Vec::new(),
+             router: if tool_protocol_enabled {
+-                ToolOutputRouter::new()
++                ToolOutputRouter::new().with_recover(tool_recover)
+             } else {
+                 ToolOutputRouter::disabled()
+             },
+@@ -187,7 +199,14 @@ impl<'a> Qwen35Emit<'a> {
+                     }
+                 }
+             }
+-            Err(_) => {
++            Err(err) => {
++                if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_ok() {
++                    eprintln!(
++                        "[tool-router] malformed at gen={}: {err} | body tail={:?}",
++                        self.generated_hint,
++                        self.router.debug_buffer(),
++                    );
++                }
+                 self.router_malformed = true;
+             }
+         }
+@@ -474,6 +493,13 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
+         }
+ 
+         if self.router_malformed || self.router.is_malformed() {
++            if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_ok() {
++                eprintln!(
++                    "[tool-router] finish malformed: {:?} | body tail={:?}",
++                    self.router.malformed_detail(),
++                    self.router.debug_buffer(),
++                );
++            }
+             let _ = self.router.finish();
+             return FinishSummary {
+                 events,
+@@ -502,14 +528,22 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
+             // reason: the wrapper lets a pure length exit win (AR's rule in
+             // `qwen_ar_finish_route`) and fails closed only when the model
+             // ended the turn there. A mid-stream latch stays `malformed_protocol`.
+-            Err(_) => FinishSummary {
+-                events,
+-                finish_reason: "truncated_tool_call",
+-                tool_calls: 0,
+-                visible_text: std::mem::take(&mut self.visible_acc),
+-                decoded_eot,
+-                open_think: false,
+-            },
++            Err(err) => {
++                if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_ok() {
++                    eprintln!(
++                        "[tool-router] finish truncated: {err} | stop_matched={}",
++                        self.stop.matched(),
++                    );
++                }
++                FinishSummary {
++                    events,
++                    finish_reason: "truncated_tool_call",
++                    tool_calls: 0,
++                    visible_text: std::mem::take(&mut self.visible_acc),
++                    decoded_eot,
++                    open_think: false,
++                }
++            }
+             Ok(evs) => {
+                 let mut finished_calls = buffered_before;
+                 for ev in evs {
+@@ -686,13 +720,41 @@ mod tests {
+         })
+     }
+ 
++    fn make_emit_recover<'a>(tok: &'a Tokenizer) -> Box<dyn SpecEmit + 'a> {
++        Qwen35Emit::from_ctx_recover(SpecEmitCtx {
++            tokenizer: tok,
++            eos: 9,
++            im_end: Some(1),
++            tools: Some(&[]),
++            enable_grammar: true,
++            stop: Vec::new(),
++            min_tokens: 0,
++            max_think: 0,
++            max_tokens: 256,
++            assistant_prefix: AssistantPrefix::Plain,
++            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
++            decoded_vocab: None,
++        })
++    }
++
+     /// Drive the production emitter with whole-string encodes (one observe per
+     /// encoded token). Returns (stream events, finish, streamed_tokens).
+     fn drive_text(text: &str) -> (Vec<ClientEvent>, FinishSummary, Vec<u32>) {
++        drive_text_with(text, make_emit)
++    }
++
++    fn drive_text_recover(text: &str) -> (Vec<ClientEvent>, FinishSummary, Vec<u32>) {
++        drive_text_with(text, make_emit_recover)
++    }
++
++    fn drive_text_with(
++        text: &str,
++        build: for<'a> fn(&'a Tokenizer) -> Box<dyn SpecEmit + 'a>,
++    ) -> (Vec<ClientEvent>, FinishSummary, Vec<u32>) {
+         let tok = test_tokenizer();
+         let ids = tok.encode(text);
+         assert!(!ids.is_empty(), "encode produced no tokens for {text:?}");
+-        let mut emit = make_emit(&tok);
++        let mut emit = build(&tok);
+         let mut stream = Vec::new();
+         let mut first = true;
+         for id in &ids {
+@@ -869,6 +931,29 @@ mod tests {
+         assert_eq!(finish.tool_calls, 0);
+     }
+ 
++    #[test]
++    fn recover_mode_releases_malformed_spans_as_answer_text() {
++        // Strict mode fails these turns closed (`malformed_protocol` /
++        // `truncated_tool_call`); the serving constructor must instead end
++        // them normally with the degenerate span as assistant content.
++        let stacked = "<tool_call>{\"name\":\"a\",\"arguments\":{}}<tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
++        let (stream, finish, _) = drive_text_recover(stacked);
++        assert_eq!(finish.finish_reason, "stop");
++        assert_eq!(finish.tool_calls, 0);
++        assert!(held_calls(&finish).is_empty());
++        let mut visible = tokens_text(&stream);
++        visible.push_str(&tokens_text(&finish.events));
++        assert_eq!(visible, stacked);
++
++        let unclosed = "pre<tool_call>{\"name\":\"x\"";
++        let (stream2, finish2, _) = drive_text_recover(unclosed);
++        assert_eq!(finish2.finish_reason, "stop");
++        assert_eq!(finish2.tool_calls, 0);
++        let mut visible2 = tokens_text(&stream2);
++        visible2.push_str(&tokens_text(&finish2.events));
++        assert_eq!(visible2, unclosed);
++    }
++
+     #[test]
+     fn think_bytes_suppressed_from_token_channel() {
+         let (stream, finish, raw) = drive_text("<think>secret</think>answer");
+diff --git a/crates/hipfire-cli/src/serve/responses.rs b/crates/hipfire-cli/src/serve/responses.rs
+index f51b6a243..e1d79f402 100644
+--- a/crates/hipfire-cli/src/serve/responses.rs
++++ b/crates/hipfire-cli/src/serve/responses.rs
+@@ -5,8 +5,9 @@
+ //! OpenAI Responses API adapter (`POST /v1/responses`).
+ //!
+ //! Concern: lowering a Responses request (`instructions`, `input` items,
+-//! function tools, `reasoning`, `text.format`) onto the chat-completions body
+-//! the serve pipeline already runs, and rendering that pipeline's
++//! function/namespace/custom tools, `reasoning`, `text.format`) onto the
++//! chat-completions body the serve pipeline already runs (hosted tools are
++//! left out rather than refused), and rendering that pipeline's
+ //! [`Completion`] and stream events back as a `response` object or Responses
+ //! SSE events. There is no second generation path, and serve keeps no
+ //! response state: `previous_response_id` and item references are refused,
+@@ -18,6 +19,8 @@ use crate::serve::complete::{
+ use crate::serve::http::{id_suffix, sse_event};
+ use hipfire_runtime::prompt_frame::ToolCall;
+ use serde_json::{json, Map, Value};
++use std::collections::HashMap;
++use std::sync::{Mutex, OnceLock};
+ 
+ /// A Responses request lowered onto the chat-completions body.
+ #[derive(Debug)]
+@@ -27,10 +30,39 @@ pub(crate) struct Lowered {
+     pub(crate) echo: ResponseEcho,
+ }
+ 
+-/// Request parameters a `response` object echoes back.
++/// Request parameters a `response` object echoes back. `tool_names` is not
++/// echoed: it maps the flat names the model sees back to the namespace and
++/// tool kind the client sent.
+ #[derive(Debug, Clone)]
+ pub(crate) struct ResponseEcho {
+     fields: Map<String, Value>,
++    tool_names: ToolNames,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum ToolKind {
++    Function,
++    Custom,
++}
++
++#[derive(Debug, Clone)]
++struct ToolRef {
++    namespace: Option<String>,
++    name: String,
++    kind: ToolKind,
++}
++
++/// Flat model-facing tool name → the tool the client actually declared.
++#[derive(Debug, Clone, Default)]
++struct ToolNames {
++    by_name: HashMap<String, ToolRef>,
++}
++
++#[derive(Debug)]
++struct NormalizedTools {
++    tools: Vec<Value>,
++    names: ToolNames,
++    skipped: Vec<String>,
+ }
+ 
+ /// Lower a Responses request body. `Err` is a client error (HTTP 400).
+@@ -76,6 +108,7 @@ pub(crate) fn lower_request(body: &Value) -> Result<Lowered, String> {
+         Some(Value::Array(items)) => lower_items(items, &mut messages)?,
+         Some(_) => return Err("input must be a string or an array of items".into()),
+     }
++    normalize_system_messages(&mut messages);
+     chat.insert("messages".into(), Value::Array(messages));
+ 
+     // `top_k` and `stop` are hipfire extensions (the Responses API has
+@@ -85,12 +118,36 @@ pub(crate) fn lower_request(body: &Value) -> Result<Lowered, String> {
+             chat.insert(key.into(), value.clone());
+         }
+     }
+-    if let Some(tools) = present(obj, "tools") {
+-        let tools = lower_tools(tools)?;
+-        if !tools.is_empty() {
+-            chat.insert("tools".into(), Value::Array(tools));
++    // `additional_tools` input items (Codex) carry more tool definitions; they
++    // join the request's own `tools` before name lowering.
++    let mut given_tools = match present(obj, "tools") {
++        None => Vec::new(),
++        Some(tools) => tools
++            .as_array()
++            .cloned()
++            .ok_or_else(|| "tools must be an array".to_owned())?,
++    };
++    if let Some(items) = present(obj, "input").and_then(Value::as_array) {
++        for item in items {
++            if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
++                if let Some(extra) = item.get("tools").and_then(Value::as_array) {
++                    given_tools.extend(extra.iter().cloned());
++                }
++            }
+         }
+     }
++    let mut tool_names = ToolNames::default();
++    if !given_tools.is_empty() {
++        let normalized = lower_tools(&given_tools)?;
++        tool_names = normalized.names;
++        // `tool_choice: none` means the model may not call anything, so the
++        // tools need not reach the chat template at all (as in PolyStrata).
++        let choice_none = present(obj, "tool_choice").and_then(Value::as_str) == Some("none");
++        if !choice_none && !normalized.tools.is_empty() {
++            chat.insert("tools".into(), Value::Array(normalized.tools));
++        }
++        note_skipped_tools(&normalized.skipped);
++    }
+     if let Some(choice) = present(obj, "tool_choice") {
+         chat.insert("tool_choice".into(), lower_tool_choice(choice)?);
+     }
+@@ -146,7 +203,7 @@ pub(crate) fn lower_request(body: &Value) -> Result<Lowered, String> {
+     Ok(Lowered {
+         chat: Value::Object(chat),
+         stream,
+-        echo: ResponseEcho { fields },
++        echo: ResponseEcho { fields, tool_names },
+     })
+ }
+ 
+@@ -182,6 +239,18 @@ impl ItemFolder<'_> {
+         self.open_assistant = Some(index);
+         index
+     }
++
++    fn push_call(&mut self, call: Value) {
++        let index = match self.open_assistant {
++            Some(index) => index,
++            None => self.start_assistant(json!("")),
++        };
++        let entry = &mut self.out[index];
++        match entry.get_mut("tool_calls").and_then(Value::as_array_mut) {
++            Some(calls) => calls.push(call),
++            None => entry["tool_calls"] = json!([call]),
++        }
++    }
+ }
+ 
+ fn lower_items(items: &[Value], out: &mut Vec<Value>) -> Result<(), String> {
+@@ -205,33 +274,35 @@ fn lower_items(items: &[Value], out: &mut Vec<Value>) -> Result<(), String> {
+                     }
+                     "user" | "system" | "developer" => {
+                         folder.close_turn();
++                        // The chat template has no `developer` role; Codex's
++                        // developer items carry the same standing instructions.
++                        let role = if role == "developer" { "system" } else { role };
+                         folder.out.push(json!({ "role": role, "content": content }));
+                     }
+                     other => return Err(format!("{path}.role: unexpected role `{other}`")),
+                 }
+             }
+-            Some("function_call") => {
++            Some("function_call" | "custom_tool_call") => {
+                 let field = |key: &str| {
+                     item.get(key)
+                         .and_then(Value::as_str)
+                         .ok_or_else(|| format!("{path}.{key}: field required"))
+                 };
+-                let call = json!({
++                let name = qualified_name(item, field("name")?);
++                let arguments =
++                    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
++                        let input = item.get("input").and_then(Value::as_str).unwrap_or("");
++                        json!({ "input": input }).to_string()
++                    } else {
++                        field("arguments")?.to_owned()
++                    };
++                folder.push_call(json!({
+                     "id": field("call_id")?,
+                     "type": "function",
+-                    "function": { "name": field("name")?, "arguments": field("arguments")? },
+-                });
+-                let index = match folder.open_assistant {
+-                    Some(index) => index,
+-                    None => folder.start_assistant(json!("")),
+-                };
+-                let entry = &mut folder.out[index];
+-                match entry.get_mut("tool_calls").and_then(Value::as_array_mut) {
+-                    Some(calls) => calls.push(call),
+-                    None => entry["tool_calls"] = json!([call]),
+-                }
++                    "function": { "name": name, "arguments": arguments },
++                }));
+             }
+-            Some("function_call_output") => {
++            Some("function_call_output" | "custom_tool_call_output") => {
+                 folder.close_turn();
+                 let call_id = item
+                     .get("call_id")
+@@ -263,6 +334,10 @@ fn lower_items(items: &[Value], out: &mut Vec<Value>) -> Result<(), String> {
+                     .out
+                     .push(json!({ "role": "tool", "tool_call_id": call_id, "content": output }));
+             }
++            Some("additional_tools") => {
++                // Merged into the request's tools before lowering; it is not
++                // a conversation item.
++            }
+             Some("reasoning") => {
+                 // Raw reasoning text when the client kept it, else the summary.
+                 let texts = |key: &str| -> Vec<&str> {
+@@ -295,6 +370,78 @@ fn lower_items(items: &[Value], out: &mut Vec<Value>) -> Result<(), String> {
+     Ok(())
+ }
+ 
++/// A tool call's `namespace` joins its name the way the flattened tool list
++/// spells it. Codex sends namespaced calls this way; a call without a
++/// namespace is unchanged.
++fn qualified_name(item: &Value, name: &str) -> String {
++    match item
++        .get("namespace")
++        .and_then(Value::as_str)
++        .filter(|namespace| !namespace.is_empty())
++    {
++        Some(namespace) => format!("{namespace}.{name}"),
++        None => name.to_owned(),
++    }
++}
++
++/// The Qwen chat template accepts a system message only at the very start.
++/// Codex sends `instructions` plus developer/system input items, so consecutive
++/// leading system messages become one system message, and a later system
++/// message becomes a user message in place (as in PolyStrata).
++fn normalize_system_messages(messages: &mut Vec<Value>) {
++    let mut lead = 0;
++    while messages
++        .get(lead)
++        .and_then(|message| message.get("role"))
++        .and_then(Value::as_str)
++        == Some("system")
++    {
++        lead += 1;
++    }
++    if lead > 1 {
++        let mut text = String::new();
++        for message in &messages[..lead] {
++            let part = content_text(message.get("content"));
++            if part.is_empty() {
++                continue;
++            }
++            if !text.is_empty() {
++                text.push_str("\n\n");
++            }
++            text.push_str(&part);
++        }
++        messages.drain(..lead);
++        messages.insert(0, json!({ "role": "system", "content": text }));
++    }
++    for (i, message) in messages.iter_mut().enumerate() {
++        if i > 0 && message.get("role").and_then(Value::as_str) == Some("system") {
++            if let Some(object) = message.as_object_mut() {
++                object.insert("role".into(), json!("user"));
++            }
++        }
++    }
++}
++
++fn content_text(content: Option<&Value>) -> String {
++    match content {
++        Some(Value::String(text)) => text.clone(),
++        Some(Value::Array(parts)) => {
++            let mut text = String::new();
++            for part in parts {
++                if let Some(piece) = part
++                    .get("text")
++                    .and_then(Value::as_str)
++                    .or_else(|| part.get("refusal").and_then(Value::as_str))
++                {
++                    text.push_str(piece);
++                }
++            }
++            text
++        }
++        _ => String::new(),
++    }
++}
++
+ /// Message `content`: a string, or parts. Text parts concatenate exactly like
+ /// chat-completions content parts; an `input_image` becomes an `image_url`
+ /// part, which keeps the content an array as on chat.
+@@ -349,39 +496,185 @@ fn message_content(content: Option<&Value>, path: &str) -> Result<Value, String>
+     Ok(Value::Array(out))
+ }
+ 
+-/// Function tools (flat `name` / `description` / `parameters`) → chat
+-/// function tools. Hosted tools (web search, file search, …) are refused.
+-fn lower_tools(tools: &Value) -> Result<Vec<Value>, String> {
+-    let tools = tools
+-        .as_array()
+-        .ok_or_else(|| "tools must be an array".to_owned())?;
+-    tools
+-        .iter()
+-        .enumerate()
+-        .map(|(k, tool)| {
+-            match tool.get("type").and_then(Value::as_str) {
+-                Some("function") => {}
+-                Some(other) => {
+-                    return Err(format!(
+-                        "tools.{k}: tool type `{other}` is not supported; only function tools are"
+-                    ))
++/// Responses tools → chat function tools, with the map that turns the flat
++/// names back into the client's namespace/name/kind. A namespace's members
++/// become `namespace.name` (Qwen also writes `namespace__name` for MCP
++/// tools, so that spelling aliases the same entry). Hosted tools (web search,
++/// file search, …) cannot run here and are left out instead of failing the
++/// request.
++fn lower_tools(tools: &[Value]) -> Result<NormalizedTools, String> {
++    let mut out = NormalizedTools {
++        tools: Vec::new(),
++        names: ToolNames::default(),
++        skipped: Vec::new(),
++    };
++    for (k, tool) in tools.iter().enumerate() {
++        let path = format!("tools.{k}");
++        let tool = tool
++            .as_object()
++            .ok_or_else(|| format!("{path}: expected a tool object"))?;
++        let kind = match tool.get("type") {
++            Some(Value::String(kind)) => kind.as_str(),
++            Some(_) => return Err(format!("{path}.type: must be a string")),
++            None => return Err(format!("{path}.type: field required")),
++        };
++        match kind {
++            "function" | "custom" => add_tool(tool, &path, None, "", &mut out)?,
++            "namespace" => {
++                let namespace = tool
++                    .get("name")
++                    .and_then(Value::as_str)
++                    .filter(|name| !name.is_empty());
++                let description = tool
++                    .get("description")
++                    .and_then(Value::as_str)
++                    .unwrap_or("");
++                let members: &[Value] = match tool.get("tools") {
++                    None | Some(Value::Null) => &[],
++                    Some(Value::Array(members)) => members,
++                    Some(_) => return Err(format!("{path}.tools: must be an array")),
++                };
++                for (j, member) in members.iter().enumerate() {
++                    let member_path = format!("{path}.tools.{j}");
++                    let member = member.as_object().ok_or_else(|| {
++                        format!("{member_path}: a namespace holds function tools")
++                    })?;
++                    let member_kind = match member.get("type") {
++                        None => "function",
++                        Some(Value::String(kind)) => kind.as_str(),
++                        Some(_) => {
++                            return Err(format!("{member_path}: a namespace holds function tools"))
++                        }
++                    };
++                    if !matches!(member_kind, "function" | "custom") {
++                        return Err(format!("{member_path}: a namespace holds function tools"));
++                    }
++                    add_tool(member, &member_path, namespace, description, &mut out)?;
+                 }
+-                None => return Err(format!("tools.{k}.type: field required")),
+-            }
+-            let name = tool
+-                .get("name")
+-                .and_then(Value::as_str)
+-                .ok_or_else(|| format!("tools.{k}.name: field required"))?;
+-            let mut function = json!({ "name": name });
+-            if let Some(description) = tool.get("description").and_then(Value::as_str) {
+-                function["description"] = Value::String(description.to_owned());
+             }
+-            if let Some(parameters) = tool.get("parameters").filter(|p| !p.is_null()) {
+-                function["parameters"] = parameters.clone();
++            other => out.skipped.push(other.to_owned()),
++        }
++    }
++    Ok(out)
++}
++
++fn add_tool(
++    tool: &Map<String, Value>,
++    path: &str,
++    namespace: Option<&str>,
++    namespace_description: &str,
++    out: &mut NormalizedTools,
++) -> Result<(), String> {
++    let name = tool
++        .get("name")
++        .and_then(Value::as_str)
++        .filter(|name| !name.is_empty())
++        .ok_or_else(|| format!("{path}.name: field required"))?;
++    let kind = match tool.get("type").and_then(Value::as_str) {
++        Some("custom") => ToolKind::Custom,
++        _ => ToolKind::Function,
++    };
++    let flat = match namespace {
++        Some(namespace) => format!("{namespace}.{name}"),
++        None => name.to_owned(),
++    };
++    let mut description = tool
++        .get("description")
++        .and_then(Value::as_str)
++        .unwrap_or("")
++        .to_owned();
++    if let Some(namespace) = namespace {
++        if !namespace_description.is_empty() {
++            description = if description.is_empty() {
++                namespace_description.to_owned()
++            } else {
++                format!("{namespace_description}\n\n{description}")
++            };
++        }
++    }
++    let parameters = match kind {
++        ToolKind::Custom => {
++            // Free-form text, optionally constrained by a grammar the model
++            // reads. The model sees one `input` string; the adapter packs it
++            // into the chat tool-call arguments on the way back in.
++            if let Some(format) = tool.get("format") {
++                if format.get("type").and_then(Value::as_str) == Some("grammar") {
++                    if let Some(definition) = format
++                        .get("definition")
++                        .and_then(Value::as_str)
++                        .filter(|definition| !definition.is_empty())
++                    {
++                        let syntax = format.get("syntax").and_then(Value::as_str).unwrap_or("");
++                        description.push_str(&format!(
++                            "\n\nThe input must follow this {syntax} grammar:\n{definition}"
++                        ));
++                    }
++                }
+             }
+-            Ok(json!({ "type": "function", "function": function }))
+-        })
+-        .collect()
++            json!({
++                "type": "object",
++                "properties": {
++                    "input": { "type": "string", "description": "the raw input" }
++                },
++                "required": ["input"],
++            })
++        }
++        ToolKind::Function => match tool.get("parameters") {
++            None | Some(Value::Null) => default_parameters(),
++            Some(Value::Object(parameters)) if parameters.is_empty() => default_parameters(),
++            Some(parameters) => parameters.clone(),
++        },
++    };
++    out.tools.push(json!({
++        "type": "function",
++        "function": {
++            "name": flat,
++            "description": description,
++            "parameters": parameters,
++        },
++    }));
++    let reference = ToolRef {
++        namespace: namespace.map(str::to_owned),
++        name: name.to_owned(),
++        kind,
++    };
++    out.names.by_name.insert(flat, reference.clone());
++    if let Some(namespace) = namespace {
++        out.names
++            .by_name
++            .entry(format!("{namespace}__{name}"))
++            .or_insert(reference);
++    }
++    Ok(())
++}
++
++fn default_parameters() -> Value {
++    json!({ "type": "object", "properties": {} })
++}
++
++/// Say once per tool that a hosted tool was left out, like PolyStrata.
++fn note_skipped_tools(skipped: &[String]) {
++    if skipped.is_empty() {
++        return;
++    }
++    static NOTED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
++    let noted = NOTED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
++    let mut noted = noted.lock().unwrap_or_else(|poison| poison.into_inner());
++    let mut fresh: Vec<&str> = skipped
++        .iter()
++        .map(String::as_str)
++        .filter(|name| !noted.contains(*name))
++        .collect();
++    if fresh.is_empty() {
++        return;
++    }
++    fresh.sort_unstable();
++    fresh.dedup();
++    eprintln!(
++        "[hipfire] /v1/responses: left out hosted tools {} (this server cannot run them)",
++        fresh.join(", ")
++    );
++    noted.extend(skipped.iter().cloned());
+ }
+ 
+ fn lower_tool_choice(choice: &Value) -> Result<Value, String> {
+@@ -394,6 +687,7 @@ fn lower_tool_choice(choice: &Value) -> Result<Value, String> {
+                 .get("name")
+                 .and_then(Value::as_str)
+                 .ok_or_else(|| "tool_choice.name: field required".to_owned())?;
++            let name = qualified_name(choice, name);
+             Ok(json!({ "type": "function", "function": { "name": name } }))
+         }
+         _ => Err("tool_choice must be auto, none, required or {type: function, name}".into()),
+@@ -489,21 +783,68 @@ fn message_item(id: String, text: &str, status: &str) -> Value {
+     json!({ "type": "message", "id": id, "status": status, "role": "assistant", "content": content })
+ }
+ 
++/// Resolve the model's flat call name to the client's namespace, name and
++/// tool kind. A name the request did not declare stays a plain function.
++fn resolved_tool(echo: &ResponseEcho, name: &str) -> (Option<String>, String, ToolKind) {
++    match echo.tool_names.by_name.get(name) {
++        Some(tool) => (tool.namespace.clone(), tool.name.clone(), tool.kind),
++        None => (None, name.to_owned(), ToolKind::Function),
++    }
++}
++
+ fn function_call_item(
+     id: String,
+     call_id: String,
+-    call: &ToolCall,
++    name: &str,
++    namespace: Option<&str>,
+     arguments: &str,
+     status: &str,
+ ) -> Value {
+-    json!({
++    let mut item = json!({
+         "type": "function_call",
+         "id": id,
+         "call_id": call_id,
+-        "name": call.name,
++        "name": name,
+         "arguments": arguments,
+         "status": status,
+-    })
++    });
++    if let Some(namespace) = namespace {
++        item["namespace"] = Value::String(namespace.to_owned());
++    }
++    item
++}
++
++fn custom_tool_call_item(
++    id: String,
++    call_id: String,
++    name: &str,
++    namespace: Option<&str>,
++    input: &str,
++    status: &str,
++) -> Value {
++    let mut item = json!({
++        "type": "custom_tool_call",
++        "id": id,
++        "call_id": call_id,
++        "name": name,
++        "input": input,
++        "status": status,
++    });
++    if let Some(namespace) = namespace {
++        item["namespace"] = Value::String(namespace.to_owned());
++    }
++    item
++}
++
++/// A custom tool's whole raw input, which the chat tool call carries as
++/// `{"input": "..."}`.
++fn custom_input(arguments: &Value) -> String {
++    if let Value::Object(arguments) = arguments {
++        if let Some(Value::String(input)) = arguments.get("input") {
++            return input.clone();
++        }
++    }
++    arguments.to_string()
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -550,14 +891,30 @@ pub(crate) fn response_json(completion: &Completion, echo: &ResponseEcho) -> Val
+         ));
+     }
+     for (index, call) in released_calls(completion).iter().enumerate() {
+-        let arguments = call.arguments.to_string();
+-        output.push(function_call_item(
+-            item_id("fc", rid, output.len()),
+-            call_id(rid, index, call),
+-            call,
+-            &arguments,
+-            "completed",
+-        ));
++        let (namespace, name, kind) = resolved_tool(echo, &call.name);
++        let output_index = output.len();
++        let call_id = call_id(rid, index, call);
++        output.push(match kind {
++            ToolKind::Function => {
++                let arguments = call.arguments.to_string();
++                function_call_item(
++                    item_id("fc", rid, output_index),
++                    call_id,
++                    &name,
++                    namespace.as_deref(),
++                    &arguments,
++                    "completed",
++                )
++            }
++            ToolKind::Custom => custom_tool_call_item(
++                item_id("ctc", rid, output_index),
++                call_id,
++                &name,
++                namespace.as_deref(),
++                &custom_input(&call.arguments),
++                "completed",
++            ),
++        });
+     }
+     let (status, incomplete) = status(completion);
+     let mut response = response_object(
+@@ -776,29 +1133,88 @@ impl ResponseStream {
+         let mut bytes = Vec::new();
+         self.close_item(&mut bytes);
+         for (index, call) in released_calls(completion).iter().enumerate() {
++            let (namespace, name, kind) = resolved_tool(&self.echo, &call.name);
+             let output_index = self.output.len();
+-            let id = item_id("fc", &self.request_id, output_index);
++            let prefix = match kind {
++                ToolKind::Function => "fc",
++                ToolKind::Custom => "ctc",
++            };
++            let id = item_id(prefix, &self.request_id, output_index);
+             let call_id = call_id(&self.request_id, index, call);
+-            let arguments = call.arguments.to_string();
+-            self.emit(
+-                &mut bytes,
+-                "response.output_item.added",
+-                json!({
+-                    "output_index": output_index,
+-                    "item": function_call_item(id.clone(), call_id.clone(), call, "", "in_progress"),
+-                }),
+-            );
+-            self.emit(
+-                &mut bytes,
+-                "response.function_call_arguments.delta",
+-                json!({ "item_id": id, "output_index": output_index, "delta": arguments }),
+-            );
+-            self.emit(
+-                &mut bytes,
+-                "response.function_call_arguments.done",
+-                json!({ "item_id": id, "output_index": output_index, "name": call.name, "arguments": arguments }),
+-            );
+-            let item = function_call_item(id, call_id, call, &arguments, "completed");
++            let item = match kind {
++                ToolKind::Function => {
++                    let arguments = call.arguments.to_string();
++                    self.emit(
++                        &mut bytes,
++                        "response.output_item.added",
++                        json!({
++                            "output_index": output_index,
++                            "item": function_call_item(
++                                id.clone(),
++                                call_id.clone(),
++                                &name,
++                                namespace.as_deref(),
++                                "",
++                                "in_progress",
++                            ),
++                        }),
++                    );
++                    self.emit(
++                        &mut bytes,
++                        "response.function_call_arguments.delta",
++                        json!({ "item_id": id, "output_index": output_index, "delta": arguments }),
++                    );
++                    self.emit(
++                        &mut bytes,
++                        "response.function_call_arguments.done",
++                        json!({ "item_id": id, "output_index": output_index, "name": name, "arguments": arguments }),
++                    );
++                    function_call_item(
++                        id,
++                        call_id,
++                        &name,
++                        namespace.as_deref(),
++                        &arguments,
++                        "completed",
++                    )
++                }
++                ToolKind::Custom => {
++                    let input = custom_input(&call.arguments);
++                    self.emit(
++                        &mut bytes,
++                        "response.output_item.added",
++                        json!({
++                            "output_index": output_index,
++                            "item": custom_tool_call_item(
++                                id.clone(),
++                                call_id.clone(),
++                                &name,
++                                namespace.as_deref(),
++                                "",
++                                "in_progress",
++                            ),
++                        }),
++                    );
++                    self.emit(
++                        &mut bytes,
++                        "response.custom_tool_call_input.delta",
++                        json!({ "item_id": id, "output_index": output_index, "delta": input }),
++                    );
++                    self.emit(
++                        &mut bytes,
++                        "response.custom_tool_call_input.done",
++                        json!({ "item_id": id, "output_index": output_index, "input": input }),
++                    );
++                    custom_tool_call_item(
++                        id,
++                        call_id,
++                        &name,
++                        namespace.as_deref(),
++                        &input,
++                        "completed",
++                    )
++                }
++            };
+             self.emit(
+                 &mut bytes,
+                 "response.output_item.done",
+@@ -943,6 +1359,34 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn leading_developer_messages_fold_and_late_system_becomes_user() {
++        let lowered = lower_request(&json!({
++            "model": "m",
++            "instructions": "base",
++            "input": [
++                { "type": "message", "role": "developer",
++                  "content": [{ "type": "input_text", "text": "dev one" }] },
++                { "type": "message", "role": "system", "content": "dev two" },
++                { "type": "message", "role": "user", "content": "hi" },
++                { "type": "message", "role": "system", "content": "late" },
++                { "type": "message", "role": "developer", "content": "late dev" },
++                { "type": "message", "role": "user", "content": "again" },
++            ],
++        }))
++        .unwrap();
++        assert_eq!(
++            lowered.chat["messages"],
++            json!([
++                { "role": "system", "content": "base\n\ndev one\n\ndev two" },
++                { "role": "user", "content": "hi" },
++                { "role": "user", "content": "late" },
++                { "role": "user", "content": "late dev" },
++                { "role": "user", "content": "again" },
++            ])
++        );
++    }
++
+     #[test]
+     fn function_call_round_trip_folds_into_one_assistant_turn() {
+         let lowered = lower_request(&json!({
+@@ -1016,6 +1460,204 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn namespace_tools_flatten_and_round_trip() {
++        let lowered = lower_request(&json!({
++            "model": "m",
++            "input": [
++                { "role": "user", "content": "go" },
++                { "type": "function_call", "call_id": "c1", "namespace": "multi_agent_v1",
++                  "name": "spawn_agent", "arguments": "{\"task\":\"x\"}" },
++                { "type": "function_call_output", "call_id": "c1", "output": "ok" },
++            ],
++            "tools": [
++                { "type": "function", "name": "exec_command", "parameters": {} },
++                { "type": "namespace", "name": "multi_agent_v1",
++                  "description": "Tools for spawning and managing sub-agents.",
++                  "tools": [
++                      { "type": "function", "name": "spawn_agent", "description": "Spawn",
++                        "parameters": { "type": "object", "properties": {} } },
++                      { "type": "function", "name": "wait_agent" },
++                  ] },
++                { "type": "web_search", "external_web_access": true },
++            ],
++            "tool_choice": { "type": "function", "namespace": "multi_agent_v1", "name": "spawn_agent" },
++        }))
++        .unwrap();
++        assert_eq!(lowered.chat["tools"].as_array().unwrap().len(), 3);
++        assert_eq!(
++            lowered.chat["tools"][1]["function"]["name"],
++            json!("multi_agent_v1.spawn_agent")
++        );
++        assert_eq!(
++            lowered.chat["tools"][1]["function"]["description"],
++            json!("Tools for spawning and managing sub-agents.\n\nSpawn")
++        );
++        assert_eq!(
++            lowered.chat["tools"][2]["function"]["name"],
++            json!("multi_agent_v1.wait_agent")
++        );
++        assert_eq!(
++            lowered.chat["tools"][2]["function"]["parameters"],
++            json!({ "type": "object", "properties": {} })
++        );
++        assert_eq!(
++            lowered.chat["tool_choice"],
++            json!({ "type": "function", "function": { "name": "multi_agent_v1.spawn_agent" } })
++        );
++        assert_eq!(
++            lowered.chat["messages"][1]["tool_calls"][0]["function"]["name"],
++            json!("multi_agent_v1.spawn_agent")
++        );
++        assert_eq!(
++            lowered.chat["messages"][2],
++            json!({ "role": "tool", "tool_call_id": "c1", "content": "ok" })
++        );
++
++        // Both spellings resolve; output goes back namespaced.
++        let done = completion(
++            "",
++            "",
++            vec![
++                call("multi_agent_v1.spawn_agent", json!({ "task": "x" })),
++                call("multi_agent_v1__wait_agent", json!({})),
++            ],
++            "tool_calls",
++        );
++        let response = response_json(&done, &lowered.echo);
++        assert_eq!(response["output"][0]["type"], json!("function_call"));
++        assert_eq!(response["output"][0]["id"], json!("fc_9-2_0"));
++        assert_eq!(response["output"][0]["name"], json!("spawn_agent"));
++        assert_eq!(response["output"][0]["namespace"], json!("multi_agent_v1"));
++        assert_eq!(response["output"][1]["id"], json!("fc_9-2_1"));
++        assert_eq!(response["output"][1]["name"], json!("wait_agent"));
++        assert_eq!(response["output"][1]["namespace"], json!("multi_agent_v1"));
++        assert_eq!(response["output"][1]["arguments"], json!("{}"));
++    }
++
++    #[test]
++    fn custom_tools_lower_and_round_trip() {
++        let lowered = lower_request(&json!({
++            "model": "m",
++            "input": [
++                { "role": "user", "content": "patch" },
++                { "type": "custom_tool_call", "call_id": "ctc_1", "name": "apply_patch",
++                  "input": "*** Begin Patch\n*** End Patch" },
++                { "type": "custom_tool_call_output", "call_id": "ctc_1", "output": "done" },
++            ],
++            "tools": [
++                { "type": "custom", "name": "apply_patch", "description": "Apply a patch",
++                  "format": { "type": "grammar", "syntax": "lark", "definition": "start: begin_patch" } },
++            ],
++        }))
++        .unwrap();
++        assert_eq!(
++            lowered.chat["tools"][0]["function"]["name"],
++            json!("apply_patch")
++        );
++        let description = lowered.chat["tools"][0]["function"]["description"]
++            .as_str()
++            .unwrap();
++        assert!(
++            description.contains("The input must follow this lark grammar:\nstart: begin_patch"),
++            "{description}"
++        );
++        assert_eq!(
++            lowered.chat["tools"][0]["function"]["parameters"],
++            json!({
++                "type": "object",
++                "properties": { "input": { "type": "string", "description": "the raw input" } },
++                "required": ["input"],
++            })
++        );
++        assert_eq!(
++            lowered.chat["messages"][1]["tool_calls"][0]["function"]["arguments"],
++            json!("{\"input\":\"*** Begin Patch\\n*** End Patch\"}")
++        );
++        assert_eq!(
++            lowered.chat["messages"][2],
++            json!({ "role": "tool", "tool_call_id": "ctc_1", "content": "done" })
++        );
++
++        let done = completion(
++            "",
++            "",
++            vec![call(
++                "apply_patch",
++                json!({ "input": "*** Begin Patch\n*** End Patch" }),
++            )],
++            "tool_calls",
++        );
++        let response = response_json(&done, &lowered.echo);
++        assert_eq!(response["output"][0]["type"], json!("custom_tool_call"));
++        assert_eq!(response["output"][0]["id"], json!("ctc_9-2_0"));
++        assert_eq!(response["output"][0]["name"], json!("apply_patch"));
++        assert_eq!(
++            response["output"][0]["input"],
++            json!("*** Begin Patch\n*** End Patch")
++        );
++    }
++
++    #[test]
++    fn custom_call_streams_its_input_and_additional_tools_merge() {
++        let lowered = lower_request(&json!({
++            "model": "m",
++            "input": [
++                { "role": "user", "content": "x" },
++                { "type": "additional_tools", "tools": [
++                    { "type": "custom", "name": "apply_patch" },
++                    { "type": "namespace", "name": "ns", "tools": [
++                        { "type": "function", "name": "f" },
++                    ] },
++                ] },
++            ],
++            "tools": [{ "type": "function", "name": "early", "parameters": {} }],
++        }))
++        .unwrap();
++        assert_eq!(lowered.chat["tools"].as_array().unwrap().len(), 3);
++        assert_eq!(lowered.chat["tools"][0]["function"]["name"], json!("early"));
++        assert_eq!(
++            lowered.chat["tools"][1]["function"]["name"],
++            json!("apply_patch")
++        );
++        assert_eq!(lowered.chat["tools"][2]["function"]["name"], json!("ns.f"));
++        assert_eq!(lowered.chat["messages"].as_array().unwrap().len(), 1);
++
++        let none = lower_request(&json!({
++            "model": "m", "input": "x", "tool_choice": "none",
++            "tools": [{ "type": "function", "name": "f" }],
++        }))
++        .unwrap();
++        assert!(none.chat.get("tools").is_none());
++
++        let mut stream = ResponseStream::new(lowered.echo, "chatcmpl-9-2", 1_700_000_000, "m");
++        let mut bytes = stream.preamble();
++        bytes.extend(stream.terminal(&completion(
++            "",
++            "",
++            vec![call("apply_patch", json!({ "input": "patch" }))],
++            "tool_calls",
++        )));
++        let events = events(&bytes);
++        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
++        assert_eq!(
++            names,
++            [
++                "response.created",
++                "response.in_progress",
++                "response.output_item.added",
++                "response.custom_tool_call_input.delta",
++                "response.custom_tool_call_input.done",
++                "response.output_item.done",
++                "response.completed",
++            ]
++        );
++        assert_eq!(events[2].1["item"]["type"], json!("custom_tool_call"));
++        assert_eq!(events[3].1["delta"], json!("patch"));
++        assert_eq!(events[4].1["input"], json!("patch"));
++        assert_eq!(events[5].1["item"]["input"], json!("patch"));
++    }
++
+     #[test]
+     fn text_format_and_choice_modes_lower() {
+         let base = json!({ "model": "m", "input": "x" });
+@@ -1057,10 +1699,6 @@ mod tests {
+                 json!({ "model": "m", "input": [{ "type": "item_reference", "id": "x" }] }),
+                 "item_reference",
+             ),
+-            (
+-                json!({ "model": "m", "input": "x", "tools": [{ "type": "web_search" }] }),
+-                "web_search",
+-            ),
+             (
+                 json!({ "model": "m", "input": "x", "background": true }),
+                 "background",
+diff --git a/crates/hipfire-daemon/src/slots.rs b/crates/hipfire-daemon/src/slots.rs
+index fcc890bf0..9f9c48628 100644
+--- a/crates/hipfire-daemon/src/slots.rs
++++ b/crates/hipfire-daemon/src/slots.rs
+@@ -1638,7 +1638,10 @@ impl SlotBackend {
+         } else {
+             ThinkMode::NonThink
+         };
+-        let mut emitter = Qwen35Emit::from_ctx(SpecEmitCtx {
++        // Serving uses the PolyStrata-style fallback: a malformed tool span
++        // becomes ordinary assistant text instead of a terminal
++        // `malformed_protocol` error that kills the request.
++        let mut emitter = Qwen35Emit::from_ctx_recover(SpecEmitCtx {
+             tokenizer: &self.tokenizer,
+             eos: self.tokenizer.eos_id,
+             im_end: self.tokenizer.special_token_id("<|im_end|>"),
+diff --git a/crates/hipfire-generate/src/ar.rs b/crates/hipfire-generate/src/ar.rs
+index f23bbc1d0..2394f1e5c 100644
+--- a/crates/hipfire-generate/src/ar.rs
++++ b/crates/hipfire-generate/src/ar.rs
+@@ -524,6 +524,14 @@ impl QwenArSemanticProducer {
+         Self::new_with_tool_protocol(id, started_in_think, true)
+     }
+ 
++    /// Serving fallback: release malformed tool spans as ordinary assistant
++    /// text instead of ending the turn with a malformed-protocol error.
++    pub fn with_tool_recover(mut self) -> Self {
++        let router = std::mem::take(&mut self.router);
++        self.router = router.with_recover(true);
++        self
++    }
++
+     pub fn new_with_tool_protocol(
+         id: impl Into<String>,
+         started_in_think: bool,
+diff --git a/crates/hipfire-generate/src/qwen.rs b/crates/hipfire-generate/src/qwen.rs
+index 547f654f8..853c5275b 100644
+--- a/crates/hipfire-generate/src/qwen.rs
++++ b/crates/hipfire-generate/src/qwen.rs
+@@ -949,7 +949,8 @@ pub fn ep_serve_qwen35_dense_tp(
+ 
+     let t_decode = Instant::now();
+     let mut semantic =
+-        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled);
++        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled)
++            .with_tool_recover();
+     let mut streamed_tokens: Vec<u32> = Vec::new();
+     let mut bytes_fed_to_filter = 0usize;
+     let mut generated = 0usize;
+@@ -1298,7 +1299,8 @@ pub fn ep_serve_qwen35_moe(
+ 
+     let t_decode = Instant::now();
+     let mut semantic =
+-        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled);
++        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled)
++            .with_tool_recover();
+     let mut streamed_tokens: Vec<u32> = Vec::new();
+     let mut bytes_fed_to_filter = 0usize;
+     let mut generated = 0usize;
+diff --git a/crates/hipfire-runtime/src/emit_text.rs b/crates/hipfire-runtime/src/emit_text.rs
+index 619685a4e..c0c8e8309 100644
+--- a/crates/hipfire-runtime/src/emit_text.rs
++++ b/crates/hipfire-runtime/src/emit_text.rs
+@@ -380,6 +380,11 @@ enum RouteState {
+ /// at end-of-generation. Holds marker prefixes across chunk boundaries, emits
+ /// ordered prose and complete calls, and latches fail-closed on malformed or
+ /// truncated protocol.
++///
++/// [`Self::with_recover`] selects the PolyStrata-style fallback for serving:
++/// malformed spans are released as ordinary assistant text (markers included)
++/// instead of failing the turn, so a degenerate call can never kill a request.
++/// The strict default stays available for tests and internal verification.
+ pub struct ToolOutputRouter {
+     /// Whether this request declared at least one executable tool. Tool-like
+     /// text is ordinary assistant content when no tool contract exists.
+@@ -397,6 +402,12 @@ pub struct ToolOutputRouter {
+     completed: Vec<crate::prompt_frame::ToolCall>,
+     /// Latched fail-closed error; once set, further push/finish return it.
+     malformed: Option<ToolRouteError>,
++    /// Release malformed spans as ordinary text instead of failing closed.
++    recover: bool,
++    /// Raw bytes of the open span that were consumed by earlier decisions
++    /// (stacked `<tool_call>` openers). Only tracked in recover mode; non-empty
++    /// means the span is already unparseable and must be released as text.
++    span_raw: String,
+ }
+ 
+ impl Default for ToolOutputRouter {
+@@ -435,6 +446,8 @@ impl ToolOutputRouter {
+             seen: 0,
+             completed: Vec::new(),
+             malformed: None,
++            recover: false,
++            span_raw: String::new(),
+         }
+     }
+ 
+@@ -447,6 +460,16 @@ impl ToolOutputRouter {
+         }
+     }
+ 
++    /// Release malformed spans as ordinary assistant text (PolyStrata-style
++    /// fallback) instead of latching fail-closed.
++    ///
++    /// Structured calls that do parse strictly are still emitted as calls;
++    /// only unparseable, nested, stray-closer, or unclosed spans become text.
++    pub fn with_recover(mut self, recover: bool) -> Self {
++        self.recover = recover;
++        self
++    }
++
+     /// Structured calls completed so far (not yet terminal-gated by consumers).
+     pub fn tool_calls(&self) -> &[crate::prompt_frame::ToolCall] {
+         &self.completed
+@@ -457,6 +480,16 @@ impl ToolOutputRouter {
+         self.malformed.is_some()
+     }
+ 
++    /// Latched fail-closed detail, when a malformed verdict is present.
++    pub fn malformed_detail(&self) -> Option<String> {
++        self.malformed.as_ref().map(|err| err.detail().to_string())
++    }
++
++    /// Unconsumed body bytes (debug tracing only).
++    pub fn debug_buffer(&self) -> &str {
++        &self.buf
++    }
++
+     /// True while this request's tool protocol is inside an unclosed `<tool_call>`.
+     pub fn in_tool_call(&self) -> bool {
+         if !self.enabled {
+@@ -519,6 +552,18 @@ impl ToolOutputRouter {
+                 Ok(events)
+             }
+             RouteState::InToolCall => {
++                if self.recover {
++                    // Fallback: release the open span as ordinary text so the
++                    // turn still ends with usable assistant content.
++                    let mut text = String::new();
++                    text.push_str(TOOL_CALL_OPEN);
++                    text.push_str(&std::mem::take(&mut self.span_raw));
++                    text.push_str(&std::mem::take(&mut self.buf));
++                    self.note_recover("released unclosed span at finish as text", &text);
++                    events.push(visible_event(text));
++                    self.state = RouteState::Normal;
++                    return Ok(events);
++                }
+                 // Strict: unclosed tool span at finish is always fail-closed.
+                 // Do not fabricate calls from partial bodies (even brace-complete).
+                 let err = ToolRouteError::malformed("unclosed <tool_call> span at end of output");
+@@ -534,6 +579,24 @@ impl ToolOutputRouter {
+         err
+     }
+ 
++    /// Serving fallback visibility: with `HIPFIRE_SLOT_TRACE=1` each released
++    /// malformed span is logged so operators can confirm the recovery fired.
++    fn note_recover(&self, what: &str, span: &str) {
++        if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_err() {
++            return;
++        }
++        let mut cut = 0;
++        let mut taken = 0;
++        for (i, _) in span.char_indices().rev() {
++            if taken == 160 {
++                cut = i;
++                break;
++            }
++            taken += 1;
++        }
++        eprintln!("[tool-router] recover: {what} | tail={:?}", &span[cut..]);
++    }
++
+     /// Advance as far as the current buffer allows without waiting on more input.
+     fn drain(&mut self) -> Result<Vec<ToolRouteEvent>, ToolRouteError> {
+         let mut events = Vec::new();
+@@ -589,6 +652,19 @@ impl ToolOutputRouter {
+             }
+             Some((DelimHit::Close, start, end)) => {
+                 // Stray closer (no preceding opener in the unsettled buffer).
++                if self.recover {
++                    // Fallback: keep head and closer as ordinary text.
++                    let mut text = if start > 0 {
++                        self.buf[..start].to_string()
++                    } else {
++                        String::new()
++                    };
++                    text.push_str(&self.buf[start..end]);
++                    self.consume_through(end);
++                    self.note_recover("released stray </tool_call> as text", &text);
++                    events.push(visible_event(text));
++                    return Ok(true);
++                }
+                 if start > 0 {
+                     let head: String = self.buf[..start].to_string();
+                     if !head.is_empty() {
+@@ -606,6 +682,7 @@ impl ToolOutputRouter {
+                     }
+                 }
+                 self.consume_through(end);
++                self.span_raw.clear();
+                 self.state = RouteState::InToolCall;
+                 // Remainder (if any) is a fresh InToolCall segment; catch_up will
+                 // feed those bytes once under the new state.
+@@ -624,14 +701,35 @@ impl ToolOutputRouter {
+                 // buffered; cursor already holds partial match state for the tip.
+                 Ok(false)
+             }
+-            Some((DelimHit::Open, _start, _end)) => {
++            Some((DelimHit::Open, start, end)) => {
++                if self.recover {
++                    // Stacked/nested opener (MQ4 attractor shape): absorb it into
++                    // the span so the whole span is released as text at close.
++                    self.span_raw.push_str(&self.buf[..end]);
++                    self.consume_through(end);
++                    self.note_recover("absorbed nested <tool_call> opener", &self.span_raw);
++                    return Ok(true);
++                }
+                 // Nested/stacked reserved opener inside an open span — fail closed.
+                 Err(self.latch_malformed("nested <tool_call> opener inside an open tool-call span"))
+             }
+             Some((DelimHit::Close, start, end)) => {
+                 let body = self.buf[..start].to_string();
++                let span_raw = std::mem::take(&mut self.span_raw);
+                 self.consume_through(end);
+                 self.state = RouteState::Normal;
++                if self.recover && !span_raw.is_empty() {
++                    // The span already contained a stacked opener: release the
++                    // whole span as ordinary text, never execute it.
++                    let mut text = String::new();
++                    text.push_str(TOOL_CALL_OPEN);
++                    text.push_str(&span_raw);
++                    text.push_str(&body);
++                    text.push_str(TOOL_CALL_CLOSE);
++                    self.note_recover("released stacked span as text", &text);
++                    events.push(visible_event(text));
++                    return Ok(true);
++                }
+                 // Parse body once at close with the strict grammar only.
+                 match parse_strict_tool_call_body(&body) {
+                     Some(call) => {
+@@ -639,9 +737,21 @@ impl ToolOutputRouter {
+                         events.push(ToolRouteEvent::ToolCall(call));
+                         Ok(true)
+                     }
+-                    None => Err(self.latch_malformed(
+-                        "tool_call body is empty, truncated, or not fully valid JSON/Qwen XML",
+-                    )),
++                    None => {
++                        if self.recover {
++                            // Fallback: a single unparseable span becomes text.
++                            let mut text = String::new();
++                            text.push_str(TOOL_CALL_OPEN);
++                            text.push_str(&body);
++                            text.push_str(TOOL_CALL_CLOSE);
++                            self.note_recover("released unparseable span as text", &text);
++                            events.push(visible_event(text));
++                            return Ok(true);
++                        }
++                        Err(self.latch_malformed(
++                            "tool_call body is empty, truncated, or not fully valid JSON/Qwen XML",
++                        ))
++                    }
+                 }
+             }
+         }
+@@ -1658,6 +1768,38 @@ mod tests {
+         );
+     }
+ 
++    /// Drive a recovery-mode router with chunks; same collection as [`feed`].
++    fn feed_recover(chunks: &[&str]) -> (String, Vec<ToolCall>, Terminal) {
++        let mut router = ToolOutputRouter::new().with_recover(true);
++        let mut visible = String::new();
++        let mut calls = Vec::new();
++        let mut collect = |evs: Vec<ToolRouteEvent>| {
++            for ev in evs {
++                match ev {
++                    ToolRouteEvent::VisibleText(v) => visible.push_str(v.as_str()),
++                    ToolRouteEvent::ToolCall(c) => calls.push(c),
++                }
++            }
++        };
++        for chunk in chunks {
++            match router.push(chunk) {
++                Ok(evs) => collect(evs),
++                Err(ToolRouteError::MalformedToolProtocol { .. }) => {
++                    return (visible, calls, Terminal::Malformed);
++                }
++            }
++        }
++        match router.finish() {
++            Ok(evs) => {
++                collect(evs);
++                (visible, calls, Terminal::Ok)
++            }
++            Err(ToolRouteError::MalformedToolProtocol { .. }) => {
++                (visible, calls, Terminal::Malformed)
++            }
++        }
++    }
++
+     fn call_eq(a: &ToolCall, b: &ToolCall) {
+         assert_eq!(a.name, b.name);
+         assert_eq!(a.arguments, b.arguments);
+@@ -2329,6 +2471,62 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn router_recover_releases_nested_span_as_text() {
++        // The strict router fails closed here (MQ4 #111 stacked-opener shape);
++        // serving recovery must instead release the whole span as plain text
++        // and never execute either call.
++        let nested = "<tool_call>{\"name\":\"a\",\"arguments\":{}}<tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
++        let (vis, calls, term) = feed_recover(&[nested]);
++        assert_eq!(term, Terminal::Ok);
++        assert!(calls.is_empty(), "a stacked span must never execute");
++        assert_eq!(vis, nested);
++
++        // Chunk-boundary independence: per-byte feed matches the whole feed.
++        let byte_chunks: Vec<String> = nested.bytes().map(|b| (b as char).to_string()).collect();
++        let refs: Vec<&str> = byte_chunks.iter().map(|s| s.as_str()).collect();
++        let (v, c, t) = feed_recover(&refs);
++        assert_eq!(t, Terminal::Ok);
++        assert!(c.is_empty());
++        assert_eq!(v, vis);
++    }
++
++    #[test]
++    fn router_recover_unclosed_span_at_finish_becomes_text() {
++        let text = "<tool_call>{\"name\":\"a\",\"arguments\":{\"i\":1}}";
++        let (vis, calls, term) = feed_recover(&[text]);
++        assert_eq!(term, Terminal::Ok, "recovery must not fail the turn");
++        assert!(calls.is_empty());
++        assert_eq!(vis, text);
++
++        // Held partial closer at the tail is restored, not dropped.
++        let with_prefix = "<tool_call>{\"name\":\"a</tool";
++        let (vis2, calls2, term2) = feed_recover(&[with_prefix]);
++        assert_eq!(term2, Terminal::Ok);
++        assert!(calls2.is_empty());
++        assert_eq!(vis2, with_prefix);
++    }
++
++    #[test]
++    fn router_recover_stray_closer_becomes_text() {
++        let (vis, calls, term) = feed_recover(&["before</tool_call>after"]);
++        assert_eq!(term, Terminal::Ok);
++        assert!(calls.is_empty());
++        assert_eq!(vis, "before</tool_call>after");
++    }
++
++    #[test]
++    fn router_recover_keeps_valid_calls_and_releases_bad_spans() {
++        // A valid call still executes; only the later malformed span degrades.
++        let (vis, calls, term) = feed_recover(&[
++            "x<tool_call>{\"name\":\"a\",\"arguments\":{\"i\":1}}</tool_call>y<tool_call>oops",
++        ]);
++        assert_eq!(term, Terminal::Ok);
++        assert_eq!(calls.len(), 1);
++        assert_eq!(calls[0].name, "a");
++        assert_eq!(vis, "xy<tool_call>oops");
++    }
++
+     #[test]
+     fn delim_cursor_matches_open_and_close_bytewise() {
+         // Direct unit check: each newly fed byte advances state once; full
+diff --git a/crates/hipfire-runtime/src/hfq.rs b/crates/hipfire-runtime/src/hfq.rs
+index eac579665..01db84f70 100644
+--- a/crates/hipfire-runtime/src/hfq.rs
++++ b/crates/hipfire-runtime/src/hfq.rs
+@@ -1499,9 +1499,13 @@ impl HfqFile {
+     /// for base models). The runtime renders this when present so prompt
+     /// framing matches the model's training-time expectation; absent or
+     /// failing renders fall back to the hand-rolled `prompt_frame` path.
++    ///
++    /// GGUF-converted artifacts carry no `tokenizer_config`; their converter
++    /// copies the GGUF KV metadata verbatim, so the same template lives at
++    /// `gguf_meta["tokenizer.chat_template"]` and is used as the fallback.
+     pub fn chat_template(&self) -> Option<String> {
+         let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+-        let ct = meta.get("tokenizer_config")?.get("chat_template")?;
++        let ct = Self::chat_template_value(&meta)?;
+         // Plain-string form: return it directly.
+         if let Some(s) = ct.as_str() {
+             return Some(s.to_string());
+@@ -1511,13 +1515,21 @@ impl HfqFile {
+         self.chat_template_named("default")
+     }
+ 
++    /// Template JSON for this artifact: HF-native metadata first, then the
++    /// GGUF KV spelling for converter output without a `tokenizer_config`.
++    fn chat_template_value(meta: &serde_json::Value) -> Option<&serde_json::Value> {
++        meta.get("tokenizer_config")
++            .and_then(|tc| tc.get("chat_template"))
++            .or_else(|| meta.get("gguf_meta")?.get("tokenizer.chat_template"))
++    }
++
+     /// Select a named chat template. Cohere-style models ship `chat_template`
+     /// as a LIST of {name, template}; older models ship a plain string. Returns
+     /// the requested name, else the "default" entry, else the first; for a plain
+     /// string, returns it directly.
+     pub fn chat_template_named(&self, name: &str) -> Option<String> {
+         let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+-        let ct = meta.get("tokenizer_config")?.get("chat_template")?;
++        let ct = Self::chat_template_value(&meta)?;
+         if let Some(s) = ct.as_str() {
+             return Some(s.to_string());
+         }
+@@ -5596,3 +5608,52 @@ mod mq3v2_symmetric_tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod chat_template_fallback_tests {
++    use super::*;
++
++    #[test]
++    fn tokenizer_config_template_wins_over_gguf_meta() {
++        let meta = serde_json::json!({
++            "tokenizer_config": {"chat_template": "hf-native"},
++            "gguf_meta": {"tokenizer.chat_template": "gguf-copy"},
++        });
++        assert_eq!(
++            HfqFile::chat_template_value(&meta).and_then(|v| v.as_str()),
++            Some("hf-native")
++        );
++    }
++
++    #[test]
++    fn gguf_meta_template_used_without_tokenizer_config() {
++        let meta = serde_json::json!({
++            "gguf_meta": {"tokenizer.chat_template": "gguf-copy"},
++        });
++        assert_eq!(
++            HfqFile::chat_template_value(&meta).and_then(|v| v.as_str()),
++            Some("gguf-copy")
++        );
++    }
++
++    #[test]
++    fn gguf_meta_template_used_when_tokenizer_config_lacks_key() {
++        let meta = serde_json::json!({
++            "tokenizer_config": {"tokenizer_class": "Qwen2Tokenizer"},
++            "gguf_meta": {"tokenizer.chat_template": "gguf-copy"},
++        });
++        assert_eq!(
++            HfqFile::chat_template_value(&meta).and_then(|v| v.as_str()),
++            Some("gguf-copy")
++        );
++    }
++
++    #[test]
++    fn no_template_anywhere_is_none() {
++        let meta = serde_json::json!({
++            "tokenizer_config": {"tokenizer_class": "Qwen2Tokenizer"},
++            "gguf_meta": {"tokenizer.ggml.model": "gpt2"},
++        });
++        assert!(HfqFile::chat_template_value(&meta).is_none());
++    }
++}
+diff --git a/crates/hipfire-runtime/src/prompt_frame.rs b/crates/hipfire-runtime/src/prompt_frame.rs
+index ee1322912..23a97a0af 100644
+--- a/crates/hipfire-runtime/src/prompt_frame.rs
++++ b/crates/hipfire-runtime/src/prompt_frame.rs
+@@ -1498,6 +1498,16 @@ impl<'a> JinjaChatFrame<'a> {
+             messages => messages_val,
+             add_generation_prompt => true,
+             enable_thinking => self.enable_thinking,
++            // The generation prompt opens the assistant turn with an empty
++            // `<think>\n\n</think>\n\n` block when thinking is off. Templates
++            // that take `preserve_thinking is defined and is true` (Bonsai's
++            // upstream qwen35 template) otherwise drop that block from
++            // historical assistant turns, so the next turn's render is not a
++            // byte/token prefix of what the model actually saw — which makes
++            // native KV/history reuse impossible (KVMem requires the complete
++            // accepted prefix). Templates that treat `undefined` as true
++            // (Qwen's) render identically with this set.
++            preserve_thinking => true,
+             bos_token => bos_token,
+             eos_token => eos_token,
+             reasoning_strength => reasoning_strength_val,
+@@ -4929,6 +4939,43 @@ SYS:{{ build_system_message(system_message) }}:END
+         assert_eq!(t.decode(&rendered).matches("<tool_call>").count(), 1);
+     }
+ 
++    /// Bonsai/qwen35 upstream shape: the generation prompt opens the assistant
++    /// turn with an empty `</think>` block when thinking is off, and historical
++    /// assistant turns keep that block only under `preserve_thinking is true`.
++    /// The renderer must therefore supply `preserve_thinking => true`; without
++    /// it the next turn's render is not a token prefix of what the model saw
++    /// and KVMem cannot prove the accepted prefix for a native restore.
++    #[test]
++    fn history_render_preserves_non_thinking_turn_prefix() {
++        const TPL: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\\n{% if m.role == 'assistant' %}{% if preserve_thinking is defined and preserve_thinking is true %}<think>\\n\\n</think>\\n\\n{% endif %}{% endif %}{{ m.content }}<|im_end|>\\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\\n{% if enable_thinking is defined and enable_thinking is false %}<think>\\n\\n</think>\\n\\n{% else %}<think>\\n{% endif %}{% endif %}";
++        let t = make_tokenizer();
++        let frame = JinjaChatFrame {
++            tokenizer: &t,
++            template: TPL,
++            system: None,
++            user: "",
++            enable_thinking: false,
++            bos_token: Some(""),
++            reasoning_strength: None,
++            reasoning_effort: None,
++        };
++        let first = vec![qmsg(Role::User, "hello", None)];
++        let turn1 = frame.render_messages(&first, None, None).unwrap();
++        assert!(
++            turn1.ends_with("<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n"),
++            "thinking-off generation prompt closes an empty think block: {turn1:?}"
++        );
++        let mut consumed = t.encode(&turn1);
++        consumed.extend(t.encode("OK"));
++        let history = vec![
++            qmsg(Role::User, "hello", None),
++            qmsg(Role::Assistant, "OK", None),
++            qmsg(Role::User, "next", None),
++        ];
++        let turn2 = t.encode(&frame.render_messages(&history, None, None).unwrap());
++        assert_strict_extension(&turn2, &consumed, "preserve_thinking history");
++    }
++
+     #[test]
+     fn qwen_whole_body_lookup_miss_equals_plain_render() {
+         let t = make_tokenizer();

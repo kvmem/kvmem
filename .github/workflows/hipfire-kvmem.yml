@@ -1,0 +1,106 @@
+name: hipfire KVMem adapter
+
+on:
+  pull_request:
+  push:
+    branches: [master, feat/multi-backend-framework]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hipfire-shim-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check host source manifest and pin
+        run: |
+          python3 scripts/hipfire_host_sources.py --check
+          python3 scripts/hipfire_pin.py --check
+          python3 tests/test_hipfire_host_sources.py
+          python3 tests/test_hipfire_pin.py
+          python3 tests/test_prepare_backends.py
+          python3 tests/test_repack_hipfire_series.py
+          python3 tests/test_hipfire_contract_guard.py
+          python3 tests/test_hipfire_contract.py --no-rust
+      - name: Build shim and run smoke test
+        run: |
+          cmake -S . -B build-hipfire-shim \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKVMEM_BUILD_LLAMA=OFF \
+            -DKVMEM_BUILD_SERVER_TESTS=OFF \
+            -DKVMEM_BUILD_HIPFIRE_SHIM=ON
+          cmake --build build-hipfire-shim --target hipfire_shim_smoke -j"$(nproc)"
+          ctest --test-dir build-hipfire-shim -R '^hipfire_shim_smoke$' --output-on-failure
+
+  hipfire-crate-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Prepare the pinned hipfire checkout
+        run: python3 scripts/prepare-backends.py --backend hipfire --hipfire-dir ../hipfire
+      - name: Verify the grouped patch series
+        run: python3 scripts/repack_hipfire_series.py --check --hipfire-dir ../hipfire
+      - name: Check the Rust/C++ contract
+        env:
+          KVMEM_EXPECTED_COMMIT: ${{ github.sha }}
+        run: >-
+          python3 tests/test_hipfire_contract.py
+          --hipfire-dir ../hipfire --require-rust
+      - name: Check the stock hipfire workspace without KVMem
+        run: >-
+          env -u KVMEM_ROOT -u KVMEM_REQUIRE_PIN
+          cargo check --manifest-path ../hipfire/Cargo.toml --locked --workspace --all-targets
+      - name: Build and test the Rust crate against the shim
+        env:
+          KVMEM_REQUIRE_PIN: '1'
+          KVMEM_EXPECTED_COMMIT: ${{ github.sha }}
+          # hipfire-kvmem is a standalone workspace, so cargo would create
+          # crates/hipfire-kvmem/target — hipfire's `.gitignore` only covers the
+          # root `/target`, so that build output dirties the prepared tree for
+          # the final recheck. Keep it outside the checkout.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/hipfire-kvmem-target
+        run: >-
+          cargo test --manifest-path ../hipfire/crates/hipfire-kvmem/Cargo.toml
+          --locked -p hipfire-kvmem
+      - name: Check default and KVMem architecture builds
+        env:
+          KVMEM_ROOT: ${{ github.workspace }}
+          KVMEM_REQUIRE_PIN: '1'
+          KVMEM_EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          cargo check --manifest-path ../hipfire/Cargo.toml --locked -p hipfire-arch-qwen35
+          cargo check --manifest-path ../hipfire/Cargo.toml --locked -p hipfire-arch-qwen35 --features kvmem
+          cargo test --manifest-path ../hipfire/Cargo.toml --locked -p hipfire-arch-qwen35 --features kvmem --lib --no-run
+      - name: Check hipfire structure and recording inventory
+        run: |
+          python3 ../hipfire/scripts/check-crate-maps.py --check hipfire-arch-qwen35
+          cargo test --manifest-path ../hipfire/Cargo.toml --locked -p railgun-cert
+      - name: Install pinned rustfmt baseline
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+      - name: Check formatting
+        # hipfire v0.4.7 is formatted with rustfmt 1.9.0 (Rust 1.98.1).
+        # Newer stable rustfmt reformats upstream macro invocations; pin the
+        # formatter, not the build toolchain, so upstream formatting debt does
+        # not fail the integration job.
+        run: |
+          rustup run 1.98.1 cargo-fmt --manifest-path ../hipfire/Cargo.toml --all -- --check
+          rustup run 1.98.1 cargo-fmt --manifest-path ../hipfire/crates/hipfire-kvmem/Cargo.toml --all -- --check
+      - name: Recheck the prepared tree after Cargo
+        run: python3 scripts/prepare-backends.py --backend hipfire --hipfire-dir ../hipfire --check

@@ -1,0 +1,142 @@
+diff --git a/crates/hipfire-arch-qwen35/src/serve_engine.rs b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+index 3cd0adb96c9e1bdb1c0182f139130a73352c9ed0..6d205ea2a626839bef8257aa4a24886b1099e421 100644
+--- a/crates/hipfire-arch-qwen35/src/serve_engine.rs
++++ b/crates/hipfire-arch-qwen35/src/serve_engine.rs
+@@ -800,6 +800,10 @@ struct Rig {
+     kvmem_prefix_coverage: bool,
+     /// Coverage capture cadence in tokens (page-aligned; default 1024).
+     kvmem_prefix_coverage_interval: usize,
++    /// P3.2 checkpoint policy (`HIPFIRE_KVMEM_CHECKPOINT_POLICY=spread`):
++    /// `(interval, min_gap)` gating the prefill freeze cadence with the core
++    /// `CheckpointCapturePlan`. `None` = legacy (freeze every boundary).
++    kvmem_checkpoint_policy: Option<(u64, u64)>,
+     /// The configured `serve.prefix_cache_max_bytes` ceiling. Retained on
+     /// the Rig so the Reset path can re-apply it to the replacement index
+     /// (`PrefixIndex::new` starts with no ceiling; losing it on reset
+@@ -1301,6 +1305,50 @@ impl Rig {
+             * crate::kvmem_ctl::KV_BLOCK_TOKENS;
+         #[cfg(not(feature = "kvmem"))]
+         let kvmem_prefix_coverage_interval = 1024;
++        #[cfg(feature = "kvmem")]
++        let kvmem_checkpoint_policy = if kvmem_prefix_pin {
++            match hipfire_config::developer_var("HIPFIRE_KVMEM_CHECKPOINT_POLICY")
++                .ok()
++                .as_deref()
++            {
++                None | Some("legacy") | Some("0") => None,
++                Some("spread") => {
++                    let interval = hipfire_config::developer_var(
++                        "HIPFIRE_KVMEM_CHECKPOINT_INTERVAL",
++                    )
++                    .ok()
++                    .and_then(|v| v.parse::<u64>().ok())
++                    .unwrap_or(4096)
++                    .clamp(crate::kvmem_ctl::KV_BLOCK_TOKENS as u64, 1 << 20)
++                        / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64
++                        * crate::kvmem_ctl::KV_BLOCK_TOKENS as u64;
++                    let min_gap = hipfire_config::developer_var(
++                        "HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP",
++                    )
++                    .ok()
++                    .and_then(|v| v.parse::<u64>().ok())
++                    .unwrap_or(0)
++                    .min(interval);
++                    Some((interval, min_gap))
++                }
++                Some(other) => {
++                    return Err(format!(
++                        "HIPFIRE_KVMEM_CHECKPOINT_POLICY={other} invalid (legacy|spread)"
++                    ))
++                }
++            }
++        } else {
++            None
++        };
++        #[cfg(not(feature = "kvmem"))]
++        let kvmem_checkpoint_policy = None;
++        if kvmem_checkpoint_policy.is_some() {
++            eprintln!(
++                "  [hipfire] KVMem checkpoint policy: spread (interval {} tokens, min_gap {})",
++                kvmem_checkpoint_policy.unwrap().0,
++                kvmem_checkpoint_policy.unwrap().1
++            );
++        }
+         if kvmem_prefix_pin {
+             eprintln!(
+                 "  [hipfire] KVMem prefix PIN enabled: canonical-prefix freeze + \
+@@ -2422,6 +2470,7 @@ impl Rig {
+             kvmem_prefix_pin,
+             kvmem_prefix_coverage,
+             kvmem_prefix_coverage_interval,
++            kvmem_checkpoint_policy,
+             prefix_cache_max_bytes: if prefix_cache {
+                 Some(cfg.prefix_cache_max_bytes as usize)
+             } else {
+@@ -4488,6 +4537,9 @@ struct InFlight {
+     /// recurrent checkpoint (0 = none). The terminal endpoint freeze prefers
+     /// the exact aligned frontier and falls back to this anchor.
+     last_coverage_boundary: usize,
++    /// P3.2: prefill freeze cadence (.spread policy); `None` = legacy.
++    #[cfg(feature = "kvmem")]
++    checkpoint_plan: Option<hipfire_kvmem::CheckpointCapturePlan>,
+     /// Per-request grammar constraint for structured output (spec §7 G1/G2).
+     /// `None` for unconstrained requests. When present, a grammar mask is
+     /// applied to the slot's logits row BEFORE the GPU sampler's
+@@ -7456,6 +7508,18 @@ fn run_loop(
+                         }
+                         continue;
+                     }
++                    // P3.2 spread policy: capture only at coverage-due
++                    // frontiers (periodic stride from the request's reuse base).
++                    #[cfg(feature = "kvmem")]
++                    if rig.kvmem_checkpoint_policy.is_some() {
++                        let due = slots[s]
++                            .as_ref()
++                            .and_then(|f| f.checkpoint_plan.as_ref())
++                            .and_then(|p| p.due(boundary as u64).ok().flatten());
++                        if due.is_none() {
++                            continue;
++                        }
++                    }
+                     let freeze_result = (|| -> Result<(), String> {
+                         // 1. DeltaNet checkpoint FIRST (fail-closed pairing:
+                         // a cataloged prefix without a restorable recurrent
+@@ -7492,6 +7556,10 @@ fn run_loop(
+                         Ok(()) => {
+                             if let Some(f) = slots[s].as_mut() {
+                                 f.last_frozen_boundary = boundary;
++                                #[cfg(feature = "kvmem")]
++                                if let Some(plan) = f.checkpoint_plan.as_mut() {
++                                    plan.saved(boundary as u64);
++                                }
+                             }
+                             if rig.gpu.slot_trace() {
+                                 eprintln!(
+@@ -8674,6 +8742,16 @@ fn admit(
+                             // (the prefix below it was fed by earlier turns).
+                             last_frozen_boundary: plan.reused,
+                             last_coverage_boundary: 0,
++                            #[cfg(feature = "kvmem")]
++                            checkpoint_plan: rig.kvmem_checkpoint_policy.and_then(|(i, _)| {
++                                hipfire_kvmem::CheckpointCapturePlan::new(
++                                    plan.reused as u64,
++                                    i,
++                                    0,
++                                    0,
++                                )
++                                .ok()
++                            }),
+                             grammar: grammar_constraint,
+                             // Continuation reuse is session-local (convo hash),
+                             // not a radix lookup — no pin to hold.
+@@ -9645,6 +9723,10 @@ fn admit(
+         last_published_boundary: reused,
+         last_frozen_boundary: reused,
+         last_coverage_boundary: 0,
++        #[cfg(feature = "kvmem")]
++        checkpoint_plan: rig.kvmem_checkpoint_policy.and_then(|(i, _)| {
++            hipfire_kvmem::CheckpointCapturePlan::new(reused as u64, i, 0, 0).ok()
++        }),
+         grammar: grammar_constraint,
+         pin_ticket,
+     });

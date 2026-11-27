@@ -116,7 +116,7 @@ class LinuxControllerTests(unittest.TestCase):
         (package / 'scripts').mkdir(parents=True)
         (package / 'scripts/launcher-capabilities.json').write_bytes((ROOT / 'scripts/launcher-capabilities.json').read_bytes())
         controller = console.Controller(package, self.directory / 'other-state', 18198)
-        self.assertEqual(set(controller.backends), {'ninfer', 'llamacpp', 'radiance'})
+        self.assertEqual(set(controller.backends), {'ninfer', 'llamacpp', 'radiance', 'hipfire'})
         plan = controller.plan(self.data)
         self.assertEqual(plan['argv'][0], str(self.worker))
         controller.close()

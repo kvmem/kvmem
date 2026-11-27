@@ -1,0 +1,1191 @@
+diff --git a/crates/hipfire-cli/src/main.rs b/crates/hipfire-cli/src/main.rs
+index 4d9e7c8c909abaf2c30ecd1a1aa47fa327fe611c..0f7dbf62492ce0f8730ef6ade92991cc37e06bcb 100644
+--- a/crates/hipfire-cli/src/main.rs
++++ b/crates/hipfire-cli/src/main.rs
+@@ -6713,6 +6713,17 @@ pub(crate) fn config_value<'a>(
+         .ok_or_else(|| anyhow!("missing resolved configuration key {key}"))
+ }
+ 
++/// Render a resolved value for a JSON wire field.
++pub(crate) fn config_value_json(value: &hipfire_config::ConfigValue) -> serde_json::Value {
++    match value {
++        hipfire_config::ConfigValue::Bool(value) => serde_json::json!(value),
++        hipfire_config::ConfigValue::Integer(value) => serde_json::json!(value),
++        hipfire_config::ConfigValue::Float(value) => serde_json::json!(value),
++        hipfire_config::ConfigValue::String(value) => serde_json::json!(value),
++        hipfire_config::ConfigValue::Null => serde_json::Value::Null,
++    }
++}
++
+ pub(crate) fn config_string(
+     resolved: &hipfire_config::ResolvedConfig,
+     key: &str,
+diff --git a/crates/hipfire-cli/src/serve/complete.rs b/crates/hipfire-cli/src/serve/complete.rs
+index 5efc55e4c5817de5cf38a87846facd5f498e042c..12ca7813744fae178dbb3aa70c04f975a561ba00 100644
+--- a/crates/hipfire-cli/src/serve/complete.rs
++++ b/crates/hipfire-cli/src/serve/complete.rs
+@@ -14,8 +14,9 @@ use crate::serve::{
+     bail_invalid, invalid_request, Admission, AdmissionGuard, ModelOrigin, ServeMeta, ServeShared,
+ };
+ use crate::{
+-    apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
+-    insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp,
++    apply_http_reasoning_request, config_bool, config_string, config_u64, config_value_json,
++    insert_optional_f64, insert_optional_u64, request_config_value, request_f64, request_string,
++    request_u64, unix_timestamp,
+ };
+ use anyhow::{anyhow, bail, Context, Result};
+ use hipfire_client::ClientError;
+@@ -2386,6 +2387,20 @@ pub(crate) fn complete_request_attempt(
+             };
+             insert_optional_f64(&mut generate, key, value);
+         }
++        // Per-model think-recovery knobs: forwarded only when a user layer
++        // (config.toml / models.toml) set them, so the daemon's
++        // HIPFIRE_REASONING_* developer knobs and served defaults keep the
++        // surface — and stay byte-identical — for everyone else.
++        for (wire, config_key) in [
++            ("think_close_retry", "thinking.close_retry"),
++            ("think_loop_recovery", "thinking.loop_recovery"),
++            ("think_repeat_stop_tokens", "thinking.repeat_stop_tokens"),
++            ("think_answer_room", "thinking.answer_room"),
++        ] {
++            if let Some(value) = request_config_value(&resolved, config_key)? {
++                generate[wire] = config_value_json(value);
++            }
++        }
+         // Validate OpenAI logprobs contract before forwarding; reject rather
+         // than silently clamping so callers notice a mismatch.
+         validate_logprobs_request(body)?;
+@@ -4459,6 +4474,47 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn think_recovery_knobs_forward_only_when_a_user_layer_sets_them() {
++        use hipfire_config::{resolve, ConfigLayer, ConfigSource, ConfigValue, NamedLayer};
++        use std::path::PathBuf;
++        let builtins = resolve(Vec::<NamedLayer>::new()).unwrap();
++        for key in [
++            "thinking.close_retry",
++            "thinking.loop_recovery",
++            "thinking.repeat_stop_tokens",
++            "thinking.answer_room",
++        ] {
++            assert!(
++                request_config_value(&builtins, key).unwrap().is_none(),
++                "{key}: a built-in default must not ride the wire"
++            );
++        }
++        let mut model = ConfigLayer::default();
++        model.set_cli("thinking.close_retry", "false").unwrap();
++        model.set_cli("thinking.loop_recovery", "stop").unwrap();
++        model.set_cli("thinking.repeat_stop_tokens", "0").unwrap();
++        model.set_cli("thinking.answer_room", "false").unwrap();
++        let resolved = resolve([NamedLayer {
++            source: ConfigSource::ModelUser {
++                model: "qwen3.8:27b-mq4-xts".into(),
++                path: PathBuf::from("models.toml"),
++            },
++            layer: model,
++        }])
++        .unwrap();
++        let close = request_config_value(&resolved, "thinking.close_retry").unwrap();
++        assert_eq!(close, Some(&ConfigValue::Bool(false)));
++        assert_eq!(config_value_json(close.unwrap()), serde_json::json!(false));
++        let mode = request_config_value(&resolved, "thinking.loop_recovery").unwrap();
++        assert_eq!(mode, Some(&ConfigValue::String("stop".into())));
++        let repeat = request_config_value(&resolved, "thinking.repeat_stop_tokens").unwrap();
++        assert_eq!(repeat, Some(&ConfigValue::Integer(0)));
++        let room = request_config_value(&resolved, "thinking.answer_room").unwrap();
++        assert_eq!(room, Some(&ConfigValue::Bool(false)));
++        assert_eq!(config_value_json(room.unwrap()), serde_json::json!(false));
++    }
++
+     #[test]
+     fn request_sampling_omits_builtins_but_recovers_shadowed_registry_values() {
+         let builtins = resolve(Vec::<NamedLayer>::new()).unwrap();
+diff --git a/crates/hipfire-config/src/lib.rs b/crates/hipfire-config/src/lib.rs
+index 0929733ee34c916a0b634e6b5bcf0076a16ed2c3..97ad9bc7ee1cec0b46bdf7a2c966e91537e2e765 100644
+--- a/crates/hipfire-config/src/lib.rs
++++ b/crates/hipfire-config/src/lib.rs
+@@ -656,6 +656,11 @@ const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max",
+ // non-Qwen3.8 parents still validate. Values pass through as request strings;
+ // model-specific mapping lives downstream of config validation.
+ pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
++// What the multi-slot route does when it detects a reasoning loop: `off`
++// keeps generating, `stop` ends the request as length, `recover` restarts the
++// pass once with the low-effort system sentence. Mirrors
++// `HIPFIRE_REASONING_LOOP_RECOVERY` (`thinking.loop_recovery`).
++pub const LOOP_RECOVERY_MODES: &[&str] = &["off", "stop", "recover"];
+ // Which engine executes a spilled layer's weight-reading GEMVs. Exported for the
+ // same reason as `REASONING_EFFORTS`: the TUI's option list must be this list, or
+ // a value the schema accepts becomes unselectable (and an unselectable value
+@@ -1281,6 +1286,57 @@ pub static FIELDS: &[ConfigField] = &[
+         Some("HIPFIRE_MAX_TOTAL_THINK_TOKENS"),
+         "Cross-reopen reasoning budget; zero disables it."
+     ),
++    field!(
++        "thinking.close_retry",
++        "thinking_close_retry",
++        Reasoning,
++        Request,
++        DefaultValue::Bool(true),
++        ValueRule::Bool,
++        false,
++        true,
++        None,
++        "Think-close retry: when a thinking turn stops with the span still open, inject the close and keep generating (per-model override of HIPFIRE_REASONING_CLOSE_RETRY for the multi-slot route)."
++    ),
++    field!(
++        "thinking.loop_recovery",
++        "thinking_loop_recovery",
++        Reasoning,
++        Request,
++        DefaultValue::String("recover"),
++        ValueRule::Enum(LOOP_RECOVERY_MODES),
++        false,
++        true,
++        None,
++        "Reasoning-loop action: off, stop, or recover (per-model override of HIPFIRE_REASONING_LOOP_RECOVERY for the multi-slot route)."
++    ),
++    field!(
++        "thinking.repeat_stop_tokens",
++        "thinking_repeat_stop_tokens",
++        Reasoning,
++        Request,
++        DefaultValue::Integer(256),
++        ValueRule::Integer {
++            min: 0,
++            max: 65536
++        },
++        false,
++        true,
++        None,
++        "Same-token run guard: consecutive identical tokens that end the pass as length; zero disables (per-model override of HIPFIRE_REPEAT_STOP_TOKENS for the multi-slot route)."
++    ),
++    field!(
++        "thinking.answer_room",
++        "thinking_answer_room",
++        Reasoning,
++        Request,
++        DefaultValue::Bool(true),
++        ValueRule::Bool,
++        false,
++        true,
++        None,
++        "Answer room: with thinking on and no explicit budget, cap the thinking so the answer keeps a quarter of max_tokens (from 1024 up, or when the cap is all the context has left); an explicit budget that eats the room is clamped. Per-model override of HIPFIRE_THINKING_ANSWER_ROOM for the multi-slot route."
++    ),
+     field!(
+         "serve.host",
+         "host",
+diff --git a/crates/hipfire-daemon/src/slots.rs b/crates/hipfire-daemon/src/slots.rs
+index f79c51cf4cf19914bb0ca25769d094037f20d23f..4fd934d71af4cd33f5bffb3a060d03876c877483 100644
+--- a/crates/hipfire-daemon/src/slots.rs
++++ b/crates/hipfire-daemon/src/slots.rs
+@@ -53,12 +53,12 @@ use hipfire_runtime::serve::{
+     Continuation, DoneReason, Event, SlotEngineConfig, SubmitRequest, ThinkRecoveryStats,
+     VisualData,
+ };
+-use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
++use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx, StopReason};
+ use hipfire_runtime::tokenizer::Tokenizer;
+ 
+ use crate::think_recovery::{
+-    close_retry_skip_reason, focused_recovery_prompt, injection_text, CloseRetryInputs, GateAction,
+-    GateCtx, LoopMode, StreamGates, REPEAT_STOP_TOKENS,
++    answer_room_budget, close_retry_skip_reason, focused_recovery_prompt, injection_text, wrap_up_text,
++    AnswerRoomWhy, CloseRetryInputs, GateAction, GateCtx, LoopMode, StreamGates, REPEAT_STOP_TOKENS,
+ };
+ 
+ fn emit_qwen_ar_slot_error<W: std::io::Write>(
+@@ -1113,12 +1113,95 @@ impl SlotBackend {
+                     .and_then(|v| v.as_u64())
+             });
+ 
+-        // Finite caps (max_think_tokens >= 2) are ENFORCED on this route:
+-        // once the cursor consumes the budget inside a think span, the
+-        // grammar mask allows only the think close, forcing the span to end
+-        // through the normal commit path (vLLM thinking_token_budget
+-        // parity). Enforcement requires the tokenizer's special close id;
+-        // engines without one fall back to uncapped thinking (documented).
++        // Per-model think-recovery knobs (`thinking.close_retry`,
++        // `thinking.loop_recovery`, `thinking.repeat_stop_tokens` in
++        // config.toml / models.toml, forwarded by the gateway as these
++        // request fields). A present field overrides the matching
++        // HIPFIRE_REASONING_* developer knob for this request; an absent
++        // field falls back to the env/default exactly as before, so direct
++        // daemon clients and existing deployments keep the old surface.
++        let request_close_retry = match msg.get("think_close_retry") {
++            None | Some(serde_json::Value::Null) => None,
++            Some(v) => match v.as_bool() {
++                Some(value) => Some(value),
++                None => {
++                    hipfire_engine::emit::emit_active_attempt_error(
++                        stdout,
++                        Some(id),
++                        "think_close_retry must be a boolean",
++                        "validation",
++                        false,
++                        false,
++                    );
++                    let _ = stdout.flush();
++                    return Ok(());
++                }
++            },
++        };
++        let request_loop_recovery = match msg.get("think_loop_recovery") {
++            None | Some(serde_json::Value::Null) => None,
++            Some(v) => match v.as_str().map(LoopMode::from_config_value) {
++                Some(Some(mode)) => Some(mode),
++                _ => {
++                    hipfire_engine::emit::emit_active_attempt_error(
++                        stdout,
++                        Some(id),
++                        "think_loop_recovery must be one of off|stop|recover",
++                        "validation",
++                        false,
++                        false,
++                    );
++                    let _ = stdout.flush();
++                    return Ok(());
++                }
++            },
++        };
++        let request_repeat_stop = match msg.get("think_repeat_stop_tokens") {
++            None | Some(serde_json::Value::Null) => None,
++            Some(v) => match v.as_u64() {
++                Some(value) => Some(value as usize),
++                None => {
++                    hipfire_engine::emit::emit_active_attempt_error(
++                        stdout,
++                        Some(id),
++                        "think_repeat_stop_tokens must be a non-negative integer",
++                        "validation",
++                        false,
++                        false,
++                    );
++                    let _ = stdout.flush();
++                    return Ok(());
++                }
++            },
++        };
++        let request_answer_room = match msg.get("think_answer_room") {
++            None | Some(serde_json::Value::Null) => None,
++            Some(v) => match v.as_bool() {
++                Some(value) => Some(value),
++                None => {
++                    hipfire_engine::emit::emit_active_attempt_error(
++                        stdout,
++                        Some(id),
++                        "think_answer_room must be a boolean",
++                        "validation",
++                        false,
++                        false,
++                    );
++                    let _ = stdout.flush();
++                    return Ok(());
++                }
++            },
++        };
++
++        // Finite caps (max_think_tokens >= 2) are ENFORCED on this route by
++        // two separate mechanisms: structured-output requests hand the budget
++        // to the engine, whose grammar mask then allows only the think close
++        // once the budget is spent (vLLM thinking_token_budget parity); every
++        // other thinking turn arms the daemon's emitter (`max_think`), whose
++        // force-close queues the family close text and makes the pass loop
++        // splice it and continue cold. Both require the tokenizer's special
++        // close id; engines without one fall back to uncapped thinking
++        // (documented), and vision requests keep single-pass semantics.
+ 
+         // --- Projected reasoning authority ---
+         let has_think = self.tokenizer.special_token_id("<think>").is_some();
+@@ -1632,21 +1715,30 @@ impl SlotBackend {
+         // ONE request across several engine passes. A pass whose repair must
+         // be invisible to the client ends through `EngineCommand::Interrupt`;
+         // the session KV stays resident for the continuation pass.
+-        // Served default is ON (design Q1); HIPFIRE_REASONING_CLOSE_RETRY=0/off
+-        // disables. Unknown values keep the served default.
+-        let close_retry_enabled = hipfire_config::developer_var("HIPFIRE_REASONING_CLOSE_RETRY")
+-            .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
+-            .unwrap_or(true);
+-        // Served default is `recover` (design Q1); an explicit valid value
+-        // overrides, and an invalid value falls back to `off` rather than
+-        // guessing at the operator's intent.
+-        let loop_mode = hipfire_config::developer_var("HIPFIRE_REASONING_LOOP_RECOVERY")
+-            .map(|v| LoopMode::from_config_value(&v).unwrap_or(LoopMode::Off))
+-            .unwrap_or(LoopMode::Recover);
+-        let repeat_stop = hipfire_config::developer_var("HIPFIRE_REPEAT_STOP_TOKENS")
+-            .ok()
+-            .and_then(|v| v.trim().parse::<usize>().ok())
+-            .unwrap_or(REPEAT_STOP_TOKENS);
++        // Served default is ON (design Q1); a request/config-layer value
++        // (`thinking.close_retry`, gateway-forwarded) wins, then
++        // HIPFIRE_REASONING_CLOSE_RETRY=0/off disables. Unknown values keep
++        // the served default.
++        let close_retry_enabled = request_close_retry.unwrap_or_else(|| {
++            hipfire_config::developer_var("HIPFIRE_REASONING_CLOSE_RETRY")
++                .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
++                .unwrap_or(true)
++        });
++        // Served default is `recover` (design Q1); the request/config-layer
++        // value wins, then an explicit valid env value overrides, and an
++        // invalid env value falls back to `off` rather than guessing at the
++        // operator's intent.
++        let loop_mode = request_loop_recovery.unwrap_or_else(|| {
++            hipfire_config::developer_var("HIPFIRE_REASONING_LOOP_RECOVERY")
++                .map(|v| LoopMode::from_config_value(&v).unwrap_or(LoopMode::Off))
++                .unwrap_or(LoopMode::Recover)
++        });
++        let repeat_stop = request_repeat_stop.unwrap_or_else(|| {
++            hipfire_config::developer_var("HIPFIRE_REPEAT_STOP_TOKENS")
++                .ok()
++                .and_then(|v| v.trim().parse::<usize>().ok())
++                .unwrap_or(REPEAT_STOP_TOKENS)
++        });
+         // Only thinking turns are repaired. Vision and structured-output
+         // requests keep single-pass semantics: an injected token would
+         // desync the schema cursor, and the multi-slot vision path owns its
+@@ -1664,6 +1756,35 @@ impl SlotBackend {
+                 eprintln!("[think-recover] {line}");
+             }
+         };
++        // ── answer room (PolyStrata #123/#984/#16) ──
++        // max_tokens counts the thinking, so a long-thinking reply can be cut
++        // inside the span with no answer. With thinking on and no explicit
++        // budget, derive one that leaves the answer its room; an explicit
++        // budget that eats the room is clamped down. Vision and
++        // structured-output requests keep their single-pass semantics: their
++        // budget-close path cannot splice a wrap-up.
++        let answer_room_enabled = request_answer_room.unwrap_or_else(|| {
++            hipfire_config::developer_var("HIPFIRE_THINKING_ANSWER_ROOM")
++                .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
++                .unwrap_or(true)
++        });
++        let explicit_think_budget = max_think_tokens.filter(|&n| n >= 2).map(|n| n as usize);
++        let mut think_budget_effective = explicit_think_budget;
++        if enable_thinking && answer_room_enabled && recovery_allowed {
++            if let Some((budget, why)) =
++                answer_room_budget(max_tokens, self.cap_tokens, prompt_len, explicit_think_budget)
++            {
++                let why = match why {
++                    AnswerRoomWhy::Derived => "a quarter of the cap reserved for the answer",
++                    AnswerRoomWhy::ByContext => "the cap is all the context has left",
++                    AnswerRoomWhy::Clamped => "an explicit budget would have spent the answer's room",
++                };
++                trace_think(format!(
++                    "answer-room: thinking limited to {budget} of max_tokens {max_tokens} ({why})"
++                ));
++                think_budget_effective = Some(budget);
++            }
++        }
+         let original_prompt = prompt_tokens.clone();
+         // raw_ids: every sampled token of the request, rendered or not (a
+         // gate may drop a token from the client stream, but it is still part
+@@ -1713,7 +1834,15 @@ impl SlotBackend {
+             enable_grammar: self.tool_grammar,
+             stop: Vec::new(),
+             min_tokens: 0,
+-            max_think: 0,
++            // Non-schema thinking turns enforce `max_think_tokens` on this
++            // emitter (the multi-slot budget close); schema turns keep the
++            // engine's grammar-mask constraint (`SubmitRequest::think_budget`)
++            // and vision keeps single-pass semantics.
++            max_think: if recovery_allowed {
++                think_budget_effective.unwrap_or(0)
++            } else {
++                0
++            },
+             max_tokens,
+             assistant_prefix: prefix,
+             think_mode,
+@@ -1758,6 +1887,12 @@ impl SlotBackend {
+             let mut pass_ending = false;
+             let mut gate_trip_len: usize = 0;
+             let mut recover_requested = false;
++            // max_think_tokens: the emitter queued the family close at the
++            // trip token. The conclusion splices it and continues cold.
++            let mut budget_close_requested = false;
++            // A span re-opened after the splice spent the budget again: the
++            // emitter turned that into a hard stop instead of a second splice.
++            let mut think_capped = false;
+             let (tx, rx) = mpsc::channel::<Event>();
+             let req = SubmitRequest {
+                 query: if pass_index == 1 { request_query } else { None },
+@@ -1786,11 +1921,9 @@ impl SlotBackend {
+                 },
+                 started_in_think,
+                 // Enforced thinking budget: absent/0 = uncapped; the 1-sentinel
+-                // never enters a think span so the budget cannot engage.
+-                think_budget: max_think_tokens
+-                    .filter(|&n| n >= 2)
+-                    .map(|n| n as usize)
+-                    .unwrap_or(usize::MAX),
++                // never enters a think span so the budget cannot engage. The
++                // answer room may have derived or clamped this value above.
++                think_budget: think_budget_effective.unwrap_or(usize::MAX),
+                 // Canonical pending-input bytes (spec §5.3): the engine's wait
+                 // queue charges its byte cap against this, so daemon-side
+                 // waiters must carry the real prompt weight — a hardcoded 0
+@@ -1996,6 +2129,41 @@ impl SlotBackend {
+                             render_events(outcome.events, stdout, &mut terminal_tool_calls);
+                             produced += 1;
+                             tokens_total += 1;
++                            // ── max_think_tokens: the emitter reached the
++                            // budget inside the span and queued the family
++                            // close ──
++                            let forced = emitter.take_forced();
++                            if !forced.is_empty() && !pass_ending {
++                                trace_think(format!(
++                                    "budget-close: emitter queued {} close tokens at n={}",
++                                    forced.len(),
++                                    gates.n()
++                                ));
++                                budget_close_requested = true;
++                                pending_injection = Some(forced);
++                                pass_ending = true;
++                                gate_trip_len = gen_ids.len();
++                                if let Some(sess) = accepted_session {
++                                    self.engine.interrupt(sess);
++                                }
++                                continue;
++                            }
++                            // A span re-opened after the splice spent the
++                            // budget again: end the pass, never splice twice.
++                            if outcome.stop == Some(StopReason::ThinkCap) && !pass_ending {
++                                trace_think(format!(
++                                    "budget-close: a re-opened span exhausted the budget \
++                                     at n={}; ending as length",
++                                    gates.n()
++                                ));
++                                think_capped = true;
++                                pass_ending = true;
++                                gate_trip_len = gen_ids.len();
++                                if let Some(sess) = accepted_session {
++                                    self.engine.interrupt(sess);
++                                }
++                                continue;
++                            }
+                         }
+                         Event::Done { reason, generated } => {
+                             done_reason = Some((reason, generated));
+@@ -2126,6 +2294,56 @@ impl SlotBackend {
+                 break 'pass;
+             }
+ 
++            // ── max_think_tokens: wrap up the span and continue ──
++            if budget_close_requested {
++                // The emitter queued the bare family close when the budget
++                // tripped; the reference wraps up instead (#123): a short
++                // closing sentence, then the close. The queued tokens belong
++                // to the pass being abandoned, so they are dropped.
++                let _queued = pending_injection.take().unwrap_or_default();
++                let forced = emitter
++                    .think_close_text()
++                    .map(|close| self.tokenizer.encode(&wrap_up_text(close)))
++                    .unwrap_or_default();
++                let budget_left = max_tokens.saturating_sub(gates.n());
++                if think_capped || forced.is_empty() || budget_left <= forced.len() {
++                    // The re-opened span already ended the pass, or the
++                    // splice and its continuation would not fit: end as
++                    // `length` (the interrupt reported MaxTokens) without
++                    // touching the stream.
++                    trace_think(format!(
++                        "budget-close skipped: {}",
++                        if think_capped {
++                            "a re-opened span exhausted the budget again"
++                        } else {
++                            "no headroom for the splice"
++                        }
++                    ));
++                    break 'pass;
++                }
++                if let Some(sess) = accepted_session.take() {
++                    // The splice rewrites the stream the session witnessed:
++                    // hand it back and let the continuation cold-prefill the
++                    // exact prompt the client's history reproduces.
++                    self.close_session(sess);
++                }
++                gates.note_injected(forced.len());
++                let mut full = original_prompt.clone();
++                full.extend_from_slice(&gen_ids);
++                full.extend_from_slice(&forced);
++                pass_prompt = full;
++                pass_continuation = Continuation::Cold;
++                pass_max_tokens = max_tokens.saturating_sub(gates.n()).max(1);
++                pending_injection = Some(forced.clone());
++                self.note_think_recovery(|st| st.budget_closes += 1);
++                trace_think(format!(
++                    "budget-close: injected {} wrap-up tokens at n={}; continuing cold",
++                    forced.len(),
++                    gates.n()
++                ));
++                continue 'pass;
++            }
++
+             // ── #1053: a natural stop landed with thinking still open ──
+             if let Some(close) = emitter.think_close_text().map(str::to_string) {
+                 let extra = self.tokenizer.encode(&injection_text(&close));
+@@ -2218,6 +2436,10 @@ impl SlotBackend {
+ 
+         // Stage normal done payload and await commit via keyed registry.
+         let finish_reason = match reason {
++            // #606 / #728-stop semantics: a gate-ended pass reports `length`
++            // even when the engine's extra step before the interrupt landed
++            // on EOS (`decoded_eot`): the client never saw that tail.
++            _ if repeat_stopped || loop_stopped => "length",
+             DoneReason::MaxTokens if !summary.decoded_eot => "length",
+             _ if open_think => "stop",
+             _ => summary.finish_reason,
+diff --git a/crates/hipfire-daemon/src/think_recovery.rs b/crates/hipfire-daemon/src/think_recovery.rs
+index 77f46366117c6aa00177342db4b0a14db086e962..e161512978ff473c2fc574f39ba3726662d2de72 100644
+--- a/crates/hipfire-daemon/src/think_recovery.rs
++++ b/crates/hipfire-daemon/src/think_recovery.rs
+@@ -14,32 +14,27 @@
+ //! the #728 detect gate (:4999-5011) and the recovery action (:5072-5091). No engine, tokenizer or I/O here; S2
+ //! wires these decisions into `slots.rs` and the runtime's `SpecEmit` state.
+ 
+-use std::collections::{HashMap, HashSet};
+-
+-/// Output tokens between two looks at the reasoning (`LOOP_CHECK_EVERY`).
+-pub const LOOP_CHECK_EVERY: usize = 512;
+-/// Share of the recent window inside 12-word passages seen three times that reads as a loop (`LOOP_COVERAGE`).
+-pub const LOOP_COVERAGE: f64 = 0.25;
+-/// How far back the passages are counted (`LOOP_HISTORY_WORDS`).
+-pub const LOOP_HISTORY_WORDS: usize = 30_000;
+-/// Characters at the end of the reasoning also checked for a short period (`LOOP_TAIL_CHARS`, #1753).
+-pub const LOOP_TAIL_CHARS: usize = 2048;
+-/// A period at most this long in that tail reads as a fully repeated window (`LOOP_TAIL_PERIOD`).
+-pub const LOOP_TAIL_PERIOD: usize = 64;
+-/// Passage width in words for the coverage count.
+-pub const LOOP_WIDTH: usize = 12;
+-/// Recent window in words for the coverage count.
+-pub const LOOP_WINDOW_WORDS: usize = 2000;
++// Loop detection primitives live in `hipfire-runtime` so the sequential AR decode
++// loop (`hipfire-generate`) shares them without depending on this crate; re-exported
++// here under the names the multi-slot gates and tests already use.
++pub use hipfire_runtime::reasoning_loop::{
++    reasoning_repeat_coverage, LoopCheck, LoopMode, HIGH_EFFORT_INSTRUCTION, LOOP_CHECK_EVERY,
++    LOOP_COVERAGE, LOOP_HISTORY_WORDS, LOOP_TAIL_CHARS, LOOP_TAIL_PERIOD, LOOP_WIDTH,
++    LOOP_WINDOW_WORDS, LOW_EFFORT_INSTRUCTION,
++};
+ /// One token repeated this many times in a row ends the reply as "length" (`REPEAT_STOP_TOKENS`).
+ pub const REPEAT_STOP_TOKENS: usize = 256;
+-
+-/// The template's own xhigh sentence, which the recovery pass swaps for the low one (`EFFORT_TEXT["xhigh"]`).
+-pub const HIGH_EFFORT_INSTRUCTION: &str = "Reasoning effort is set to xhigh. Please think carefully through the \
+-task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and \
+-clarity in the final answer.";
+-/// The low sentence spliced in by the recovery pass (`EFFORT_TEXT["low"]`).
+-pub const LOW_EFFORT_INSTRUCTION: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, \
+-moving directly to the conclusion without unnecessary elaboration.";
++/// From this `max_tokens` on, a thinking reply without an explicit budget is closed early enough to leave the
++/// answer its room (`ANSWER_ROOM_MIN_CAP`, #1053's answer room).
++pub const ANSWER_ROOM_MIN_CAP: usize = 1024;
++/// The answer never gets less than this many tokens of the cap (`ANSWER_RESERVE_MIN`).
++pub const ANSWER_RESERVE_MIN: usize = 512;
++/// Margin the reference keeps between prompt + answer and the context (`CTX_SLACK`).
++pub const CTX_SLACK: usize = 8;
++
++/// The wrap-up sentence a budget-capped thinking span ends with (`REASONING_WRAP_UP` minus its close).
++pub const WRAP_UP_SENTENCE: &str =
++    "\n\nI have thought about this long enough; time to give my answer.";
+ 
+ /// The chat template's turn-end token, which closes the first (system) message in a rendered prompt.
+ pub const IM_END: &str = "<|im_end|>";
+@@ -58,106 +53,64 @@ pub fn injection_text(think_close: &str) -> String {
+     s
+ }
+ 
+-/// The reasoning-loop knob's three states. The reference has off/True("recover")/"stop"; served defaults to
+-/// recover, library and test callers default to off (design §4).
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub enum LoopMode {
+-    Off,
+-    Stop,
+-    Recover,
+-}
+-
+-impl LoopMode {
+-    /// Parses a configured value. Unknown strings return `None` so the caller applies its own default.
+-    pub fn from_config_value(v: &str) -> Option<LoopMode> {
+-        match v.trim().to_ascii_lowercase().as_str() {
+-            "off" | "0" | "false" | "no" => Some(LoopMode::Off),
+-            "stop" => Some(LoopMode::Stop),
+-            "recover" | "1" | "true" | "on" | "yes" => Some(LoopMode::Recover),
+-            _ => None,
+-        }
+-    }
++/// `closed_with(REASONING_WRAP_UP, think_end)`: the reference's wrap-up is `REASONING_WRAP_UP =
++/// "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"` with the model's own close
++/// tag substituted. `injection_text` already carries that substitution, so sentence + it is exact for Qwen and
++/// the Gemma form for `<channel|>`.
++pub fn wrap_up_text(think_close: &str) -> String {
++    format!("{WRAP_UP_SENTENCE}{}", injection_text(think_close))
+ }
+ 
+-/// Python's `\w` for a `str` pattern: letters, digits and underscore (plus whatever `is_alphanumeric` covers in
+-/// the numeric categories Nd/Nl/No). Combining marks are not word characters in either implementation.
+-fn is_word_char(ch: char) -> bool {
+-    ch.is_alphanumeric() || ch == '_'
++/// Why the answer room moved the thinking budget.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AnswerRoomWhy {
++    /// No budget was asked for and `max_tokens >= ANSWER_ROOM_MIN_CAP`.
++    Derived,
++    /// No budget was asked for but the cap is whatever the context has left.
++    ByContext,
++    /// An explicit budget would have spent the answer's room (#984).
++    Clamped,
+ }
+ 
+-/// `re.findall(r"\w+|[^\w\s]", lower)`: runs of word characters, and every other non-space character alone.
+-fn split_words(lower: &str) -> Vec<&str> {
+-    let mut out = Vec::new();
+-    let mut run_start: Option<usize> = None;
+-    for (idx, ch) in lower.char_indices() {
+-        if is_word_char(ch) {
+-            run_start.get_or_insert(idx);
+-            continue;
+-        }
+-        if let Some(s) = run_start.take() {
+-            out.push(&lower[s..idx]);
+-        }
+-        if !ch.is_whitespace() {
+-            out.push(&lower[idx..idx + ch.len_utf8()]);
+-        }
+-    }
+-    if let Some(s) = run_start {
+-        out.push(&lower[s..]);
++/// The answer room (`answer_room`): `max_new` tokens count the thinking, so a long-thinking reply could otherwise
++/// be cut off inside the span with no answer. Mirrors the reference exactly:
++///
++/// * reserve = `min(max(ANSWER_RESERVE_MIN, max_new / 4), max_new / 2)`;
++/// * with no explicit budget, derive one at `max_new - reserve` when `max_new >= ANSWER_ROOM_MIN_CAP` (or the cap
++///   is all the context has left, `max_new >= cap - CTX_SLACK - prompt_len`);
++/// * with an explicit budget above `max_new - reserve`, clamp it down to that (#984).
++///
++/// Returns `None` when the request is left as it was (explicit budget that already leaves room, or a cap below
++/// the minimum that is not context-bound).
++pub fn answer_room_budget(
++    max_new: usize,
++    cap: usize,
++    prompt_len: usize,
++    explicit: Option<usize>,
++) -> Option<(usize, AnswerRoomWhy)> {
++    if max_new == 0 {
++        return None;
+     }
+-    out
+-}
+-
+-/// `reasoning_repeat_coverage` (server.py:188-212), verbatim semantics:
+-/// 1. `tail = text[-2048:].lower()`; exactly 2048 chars and some period `p` in `1..=64` with `tail[p:] == tail[:-p]`
+-///    reads as 1.0 (a short cycle, e.g. one long number repeating a block).
+-/// 2. Otherwise words of the lowercased text, last 30,000 of them; fewer than 2,000 words reads as 0.0.
+-/// 3. Count every 12-word passage; a passage seen at least three times covers the word positions it occupies when
+-///    its start lies in the last 2,000 words. Coverage = covered positions / (len(words) - start).
+-pub fn reasoning_repeat_coverage(text: &str) -> f64 {
+-    let orig: Vec<char> = text.chars().collect();
+-    if orig.len() >= LOOP_TAIL_CHARS {
+-        let tail: String = orig[orig.len() - LOOP_TAIL_CHARS..].iter().collect();
+-        let tail: Vec<char> = tail.to_lowercase().chars().collect();
+-        if tail.len() == LOOP_TAIL_CHARS
+-            && (1..=LOOP_TAIL_PERIOD).any(|p| tail[p..] == tail[..LOOP_TAIL_CHARS - p])
+-        {
+-            return 1.0;
++    let reserve = ANSWER_RESERVE_MIN.max(max_new / 4).min(max_new / 2);
++    // The engine's `think_budget` uses 1 as its never-enter-the-span sentinel, so a derived budget below 2 would
++    // change meaning; such degenerate caps are left alone (they cannot fit a wrap-up either).
++    let usable = |budget: usize| (budget >= 2).then_some(budget);
++    match explicit {
++        None => {
++            let by_context = cap > 0 && max_new >= cap.saturating_sub(CTX_SLACK + prompt_len);
++            if max_new >= ANSWER_ROOM_MIN_CAP {
++                usable((max_new - reserve).max(1)).map(|b| (b, AnswerRoomWhy::Derived))
++            } else if by_context {
++                usable((max_new - reserve).max(1)).map(|b| (b, AnswerRoomWhy::ByContext))
++            } else {
++                None
++            }
+         }
+-    }
+-    let lower = text.to_lowercase();
+-    let words = split_words(&lower);
+-    let words = if words.len() > LOOP_HISTORY_WORDS {
+-        &words[words.len() - LOOP_HISTORY_WORDS..]
+-    } else {
+-        &words[..]
+-    };
+-    if words.len() < LOOP_WINDOW_WORDS {
+-        return 0.0;
+-    }
+-    // Intern the words to ids so a 12-gram key is a plain array (the reference keys tuples; this is the same
+-    // equality, without per-gram allocation).
+-    let mut ids: HashMap<&str, u32> = HashMap::new();
+-    let mut seq: Vec<u32> = Vec::with_capacity(words.len());
+-    for w in words {
+-        let next = ids.len() as u32;
+-        seq.push(*ids.entry(*w).or_insert(next));
+-    }
+-    let mut counts: HashMap<[u32; LOOP_WIDTH], u32> = HashMap::new();
+-    for i in 0..=seq.len() - LOOP_WIDTH {
+-        let mut gram = [0u32; LOOP_WIDTH];
+-        gram.copy_from_slice(&seq[i..i + LOOP_WIDTH]);
+-        *counts.entry(gram).or_insert(0) += 1;
+-    }
+-    let start = seq.len() - LOOP_WINDOW_WORDS;
+-    let mut covered: HashSet<usize> = HashSet::new();
+-    for i in start..=seq.len() - LOOP_WIDTH {
+-        let mut gram = [0u32; LOOP_WIDTH];
+-        gram.copy_from_slice(&seq[i..i + LOOP_WIDTH]);
+-        if counts[&gram] >= 3 {
+-            covered.extend(i..i + LOOP_WIDTH);
++        Some(budget) => {
++            let room = max_new.saturating_sub(reserve).max(1);
++            (budget > room).then(|| usable(room)).flatten().map(|b| (b, AnswerRoomWhy::Clamped))
+         }
+     }
+-    covered.len() as f64 / (seq.len() - start) as f64
+ }
+ 
+ /// #606: the current run of one repeated token. `observe` returns true when this token makes the run reach the
+@@ -192,37 +145,6 @@ impl RepeatRunGuard {
+     }
+ }
+ 
+-/// #728's check cadence: a look is due when the request has produced `n >= next_at` output tokens (counted across
+-/// passes, injections included). The reference re-arms to `n + 512` each time a look runs at a clean boundary.
+-#[derive(Clone, Debug)]
+-pub struct LoopCheck {
+-    next_at: usize,
+-}
+-
+-impl LoopCheck {
+-    pub fn new() -> Self {
+-        Self { next_at: LOOP_CHECK_EVERY }
+-    }
+-
+-    pub fn due(&self, n: usize) -> bool {
+-        n >= self.next_at
+-    }
+-
+-    pub fn advance(&mut self, n: usize) {
+-        self.next_at = n + LOOP_CHECK_EVERY;
+-    }
+-
+-    pub fn next_at(&self) -> usize {
+-        self.next_at
+-    }
+-}
+-
+-impl Default for LoopCheck {
+-    fn default() -> Self {
+-        Self::new()
+-    }
+-}
+-
+ /// #1053's trigger, as skip reasons in trace order. `None` means inject. The reference's other guards map as:
+ /// `not wrap` and `stops.hit is None` hold structurally here (no budget wrap; the multi-slot stop list is always
+ /// empty); `parser.buf != parser.think_end` (a held `</think>`) cannot happen because the emitter consumes a
+@@ -550,10 +472,6 @@ impl StreamGates {
+ mod tests {
+     use super::*;
+ 
+-    fn words_text(n: usize, prefix: &str) -> String {
+-        (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>().join(" ")
+-    }
+-
+     #[test]
+     fn injection_matches_reference_strings() {
+         assert_eq!(injection_text("</think>\n\n"), "\n</think>\n\n");
+@@ -561,52 +479,41 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn loop_mode_parsing() {
+-        assert_eq!(LoopMode::from_config_value("off"), Some(LoopMode::Off));
+-        assert_eq!(LoopMode::from_config_value("STOP"), Some(LoopMode::Stop));
+-        assert_eq!(LoopMode::from_config_value("recover"), Some(LoopMode::Recover));
+-        assert_eq!(LoopMode::from_config_value("true"), Some(LoopMode::Recover));
+-        assert_eq!(LoopMode::from_config_value(""), None);
+-        assert_eq!(LoopMode::from_config_value("sometimes"), None);
++    fn wrap_up_matches_reference_string() {
++        assert_eq!(
++            wrap_up_text("</think>\n\n"),
++            "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
++        );
++        assert_eq!(
++            wrap_up_text("<channel|>"),
++            "\n\nI have thought about this long enough; time to give my answer.\n<channel|>"
++        );
+     }
+ 
+     #[test]
+-    fn coverage_needs_two_thousand_words() {
+-        assert_eq!(reasoning_repeat_coverage(""), 0.0);
+-        assert_eq!(reasoning_repeat_coverage(&words_text(1999, "w")), 0.0);
++    fn answer_room_derives_reserve_from_the_cap() {
++        // 8192-cap agent harness: a quarter kept for the answer.
++        assert_eq!(answer_room_budget(8192, 32768, 100, None), Some((6144, AnswerRoomWhy::Derived)));
++        // Floor and half-cap bounds.
++        assert_eq!(answer_room_budget(1024, 32768, 100, None), Some((512, AnswerRoomWhy::Derived)));
++        assert_eq!(answer_room_budget(32768, 131072, 100, None), Some((24576, AnswerRoomWhy::Derived)));
++        // Below the minimum cap with context to spare: untouched.
++        assert_eq!(answer_room_budget(1000, 32768, 100, None), None);
++        // Below the minimum but the cap is all the context has left (#16).
++        assert_eq!(
++            answer_room_budget(900, 1000, 92, None),
++            Some((450, AnswerRoomWhy::ByContext))
++        );
++        assert_eq!(answer_room_budget(0, 1000, 92, None), None);
+     }
+ 
+     #[test]
+-    fn coverage_periodic_tail_reads_full() {
+-        let mut text = words_text(100, "w");
+-        text.push(' ');
+-        // 205 full copies of a 10-char cycle: the last 2048 chars are periodic with p=10.
+-        text.push_str(&"0123456789".repeat(205));
+-        assert_eq!(reasoning_repeat_coverage(&text), 1.0);
+-    }
+-
+-    #[test]
+-    fn coverage_repeated_passage_crosses_threshold() {
+-        // A 200-word passage four times, then 1200 unique words: 2000 words, ~800 covered.
+-        let passage = words_text(200, "p");
+-        let mut text = Vec::new();
+-        for _ in 0..4 {
+-            text.push(passage.clone());
+-        }
+-        text.push(words_text(1200, "u"));
+-        let cov = reasoning_repeat_coverage(&text.join(" "));
+-        assert!(cov >= LOOP_COVERAGE, "coverage {cov}");
+-        assert!(cov < 0.5, "coverage {cov}");
+-    }
+-
+-    #[test]
+-    fn coverage_unique_words_read_zero() {
+-        assert_eq!(reasoning_repeat_coverage(&words_text(2500, "u")), 0.0);
+-    }
+-
+-    #[test]
+-    fn words_split_like_python() {
+-        assert_eq!(split_words("ab, cd!_x9\n"), vec!["ab", ",", "cd", "!", "_x9"]);
++    fn answer_room_clamps_an_explicit_budget_that_eats_the_answer() {
++        assert_eq!(answer_room_budget(8192, 32768, 100, Some(8192)), Some((6144, AnswerRoomWhy::Clamped)));
++        assert_eq!(answer_room_budget(1024, 32768, 100, Some(512)), None);
++        assert_eq!(answer_room_budget(8192, 32768, 100, Some(6144)), None);
++        // A degenerate cap leaves the sentinel-adjacent budgets alone.
++        assert_eq!(answer_room_budget(2, 32768, 0, Some(2)), None);
+     }
+ 
+     #[test]
+@@ -630,16 +537,6 @@ mod tests {
+         }
+     }
+ 
+-    #[test]
+-    fn loop_check_cadence() {
+-        let mut c = LoopCheck::new();
+-        assert!(!c.due(LOOP_CHECK_EVERY - 1));
+-        assert!(c.due(LOOP_CHECK_EVERY));
+-        c.advance(LOOP_CHECK_EVERY);
+-        assert_eq!(c.next_at(), LOOP_CHECK_EVERY * 2);
+-        assert!(!c.due(LOOP_CHECK_EVERY + 1));
+-    }
+-
+     fn close_inputs() -> CloseRetryInputs {
+         CloseRetryInputs {
+             enabled: true,
+diff --git a/crates/hipfire-runtime/src/lib.rs b/crates/hipfire-runtime/src/lib.rs
+index c94a02b75ee43a78343500e167b274ba074c2a3c..98409a35000355d5312fe0c36bf11fa0078a7f8f 100644
+--- a/crates/hipfire-runtime/src/lib.rs
++++ b/crates/hipfire-runtime/src/lib.rs
+@@ -143,6 +143,7 @@ pub mod emit_text;
+ pub mod eos_filter;
+ pub mod prefill_progress;
+ pub mod prompt_frame;
++pub mod reasoning_loop;
+ pub mod semantic;
+ pub mod session_table;
+ pub mod stop_sequence;
+diff --git a/crates/hipfire-runtime/src/reasoning_loop.rs b/crates/hipfire-runtime/src/reasoning_loop.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b584d3ea46ebfdc02be4499c773700aba8713c45
+--- /dev/null
++++ b/crates/hipfire-runtime/src/reasoning_loop.rs
+@@ -0,0 +1,237 @@
++//! PolyStrata's reasoning-loop detector (#728) as pure logic.
++//!
++//! Shared by every served path that can recover from a thinking loop:
++//! - the multi-slot emitter (`hipfire-daemon`'s `think_recovery::StreamGates`),
++//! - the sequential AR decode loop (`hipfire-generate::ar::generate`).
++//!
++//! Reference: /mnt/ai/llm/PolyStrata/serve/server.py — `reasoning_repeat_coverage`
++//! (:188-212), the #728 detect gate (:4999-5011) and the recovery action (:5072-5091).
++//! No engine, tokenizer or I/O here: callers own the cadence trigger and the
++//! clean-boundary predicate (`n >= next_at`, no held marker prefix, no partial
++//! UTF-8).
++
++use std::collections::{HashMap, HashSet};
++
++/// Output tokens between two looks at the reasoning (`LOOP_CHECK_EVERY`).
++pub const LOOP_CHECK_EVERY: usize = 512;
++/// Share of the recent window inside 12-word passages seen three times that reads as a loop (`LOOP_COVERAGE`).
++pub const LOOP_COVERAGE: f64 = 0.25;
++/// How far back the passages are counted (`LOOP_HISTORY_WORDS`).
++pub const LOOP_HISTORY_WORDS: usize = 30_000;
++/// Characters at the end of the reasoning also checked for a short period (`LOOP_TAIL_CHARS`, #1753).
++pub const LOOP_TAIL_CHARS: usize = 2048;
++/// A period at most this long in that tail reads as a fully repeated window (`LOOP_TAIL_PERIOD`).
++pub const LOOP_TAIL_PERIOD: usize = 64;
++/// Passage width in words for the coverage count.
++pub const LOOP_WIDTH: usize = 12;
++/// Recent window in words for the coverage count.
++pub const LOOP_WINDOW_WORDS: usize = 2000;
++
++/// The template's own xhigh sentence, which the recovery pass swaps for the low one (`EFFORT_TEXT["xhigh"]`).
++pub const HIGH_EFFORT_INSTRUCTION: &str = "Reasoning effort is set to xhigh. Please think carefully through the \
++task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and \
++clarity in the final answer.";
++/// The low sentence spliced in by the recovery pass (`EFFORT_TEXT["low"]`).
++pub const LOW_EFFORT_INSTRUCTION: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, \
++moving directly to the conclusion without unnecessary elaboration.";
++
++/// The reasoning-loop knob's three states. The reference has off/True("recover")/"stop"; served defaults to
++/// recover, library and test callers default to off (design §4).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum LoopMode {
++    Off,
++    Stop,
++    Recover,
++}
++
++impl LoopMode {
++    /// Parses a configured value. Unknown strings return `None` so the caller applies its own default.
++    pub fn from_config_value(v: &str) -> Option<LoopMode> {
++        match v.trim().to_ascii_lowercase().as_str() {
++            "off" | "0" | "false" | "no" => Some(LoopMode::Off),
++            "stop" => Some(LoopMode::Stop),
++            "recover" | "1" | "true" | "on" | "yes" => Some(LoopMode::Recover),
++            _ => None,
++        }
++    }
++}
++
++/// Python's `\w` for a `str` pattern: letters, digits and underscore (plus whatever `is_alphanumeric` covers in
++/// the numeric categories Nd/Nl/No). Combining marks are not word characters in either implementation.
++fn is_word_char(ch: char) -> bool {
++    ch.is_alphanumeric() || ch == '_'
++}
++
++/// `re.findall(r"\w+|[^\w\s]", lower)`: runs of word characters, and every other non-space character alone.
++fn split_words(lower: &str) -> Vec<&str> {
++    let mut out = Vec::new();
++    let mut run_start: Option<usize> = None;
++    for (idx, ch) in lower.char_indices() {
++        if is_word_char(ch) {
++            run_start.get_or_insert(idx);
++            continue;
++        }
++        if let Some(s) = run_start.take() {
++            out.push(&lower[s..idx]);
++        }
++        if !ch.is_whitespace() {
++            out.push(&lower[idx..idx + ch.len_utf8()]);
++        }
++    }
++    if let Some(s) = run_start {
++        out.push(&lower[s..]);
++    }
++    out
++}
++
++/// `reasoning_repeat_coverage` (server.py:188-212), verbatim semantics:
++/// 1. `tail = text[-2048:].lower()`; exactly 2048 chars and some period `p` in `1..=64` with `tail[p:] == tail[:-p]`
++///    reads as 1.0 (a short cycle, e.g. one long number repeating a block).
++/// 2. Otherwise words of the lowercased text, last 30,000 of them; fewer than 2,000 words reads as 0.0.
++/// 3. Count every 12-word passage; a passage seen at least three times covers the word positions it occupies when
++///    its start lies in the last 2,000 words. Coverage = covered positions / (len(words) - start).
++pub fn reasoning_repeat_coverage(text: &str) -> f64 {
++    let orig: Vec<char> = text.chars().collect();
++    if orig.len() >= LOOP_TAIL_CHARS {
++        let tail: String = orig[orig.len() - LOOP_TAIL_CHARS..].iter().collect();
++        let tail: Vec<char> = tail.to_lowercase().chars().collect();
++        if tail.len() == LOOP_TAIL_CHARS
++            && (1..=LOOP_TAIL_PERIOD).any(|p| tail[p..] == tail[..LOOP_TAIL_CHARS - p])
++        {
++            return 1.0;
++        }
++    }
++    let lower = text.to_lowercase();
++    let words = split_words(&lower);
++    let words = if words.len() > LOOP_HISTORY_WORDS {
++        &words[words.len() - LOOP_HISTORY_WORDS..]
++    } else {
++        &words[..]
++    };
++    if words.len() < LOOP_WINDOW_WORDS {
++        return 0.0;
++    }
++    // Intern the words to ids so a 12-gram key is a plain array (the reference keys tuples; this is the same
++    // equality, without per-gram allocation).
++    let mut ids: HashMap<&str, u32> = HashMap::new();
++    let mut seq: Vec<u32> = Vec::with_capacity(words.len());
++    for w in words {
++        let next = ids.len() as u32;
++        seq.push(*ids.entry(*w).or_insert(next));
++    }
++    let mut counts: HashMap<[u32; LOOP_WIDTH], u32> = HashMap::new();
++    for i in 0..=seq.len() - LOOP_WIDTH {
++        let mut gram = [0u32; LOOP_WIDTH];
++        gram.copy_from_slice(&seq[i..i + LOOP_WIDTH]);
++        *counts.entry(gram).or_insert(0) += 1;
++    }
++    let start = seq.len() - LOOP_WINDOW_WORDS;
++    let mut covered: HashSet<usize> = HashSet::new();
++    for i in start..=seq.len() - LOOP_WIDTH {
++        let mut gram = [0u32; LOOP_WIDTH];
++        gram.copy_from_slice(&seq[i..i + LOOP_WIDTH]);
++        if counts[&gram] >= 3 {
++            covered.extend(i..i + LOOP_WIDTH);
++        }
++    }
++    covered.len() as f64 / (seq.len() - start) as f64
++}
++
++/// #728's check cadence: a look is due when the request has produced `n >= next_at` output tokens (counted across
++/// passes, injections included). The reference re-arms to `n + 512` each time a look runs at a clean boundary.
++#[derive(Clone, Debug)]
++pub struct LoopCheck {
++    next_at: usize,
++}
++
++impl LoopCheck {
++    pub fn new() -> Self {
++        Self { next_at: LOOP_CHECK_EVERY }
++    }
++
++    pub fn due(&self, n: usize) -> bool {
++        n >= self.next_at
++    }
++
++    pub fn advance(&mut self, n: usize) {
++        self.next_at = n + LOOP_CHECK_EVERY;
++    }
++
++    pub fn next_at(&self) -> usize {
++        self.next_at
++    }
++}
++
++impl Default for LoopCheck {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn words_text(n: usize, prefix: &str) -> String {
++        (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>().join(" ")
++    }
++
++    #[test]
++    fn loop_mode_parsing() {
++        assert_eq!(LoopMode::from_config_value("off"), Some(LoopMode::Off));
++        assert_eq!(LoopMode::from_config_value("STOP"), Some(LoopMode::Stop));
++        assert_eq!(LoopMode::from_config_value("recover"), Some(LoopMode::Recover));
++        assert_eq!(LoopMode::from_config_value("true"), Some(LoopMode::Recover));
++        assert_eq!(LoopMode::from_config_value(""), None);
++        assert_eq!(LoopMode::from_config_value("sometimes"), None);
++    }
++
++    #[test]
++    fn coverage_needs_two_thousand_words() {
++        assert_eq!(reasoning_repeat_coverage(""), 0.0);
++        assert_eq!(reasoning_repeat_coverage(&words_text(1999, "w")), 0.0);
++    }
++
++    #[test]
++    fn coverage_periodic_tail_reads_full() {
++        let mut text = words_text(100, "w");
++        text.push(' ');
++        // 205 full copies of a 10-char cycle: the last 2048 chars are periodic with p=10.
++        text.push_str(&"0123456789".repeat(205));
++        assert_eq!(reasoning_repeat_coverage(&text), 1.0);
++    }
++
++    #[test]
++    fn coverage_repeated_passage_crosses_threshold() {
++        // A 200-word passage four times, then 1200 unique words: 2000 words, ~800 covered.
++        let passage = words_text(200, "p");
++        let mut text = Vec::new();
++        for _ in 0..4 {
++            text.push(passage.clone());
++        }
++        text.push(words_text(1200, "u"));
++        let cov = reasoning_repeat_coverage(&text.join(" "));
++        assert!(cov >= LOOP_COVERAGE, "coverage {cov}");
++        assert!(cov < 0.5, "coverage {cov}");
++    }
++
++    #[test]
++    fn coverage_unique_words_read_zero() {
++        assert_eq!(reasoning_repeat_coverage(&words_text(2500, "u")), 0.0);
++    }
++
++    #[test]
++    fn words_split_like_python() {
++        assert_eq!(split_words("ab, cd!_x9\n"), vec!["ab", ",", "cd", "!", "_x9"]);
++    }
++
++    #[test]
++    fn loop_check_cadence() {
++        let mut c = LoopCheck::new();
++        assert!(!c.due(LOOP_CHECK_EVERY - 1));
++        assert!(c.due(LOOP_CHECK_EVERY));
++        c.advance(LOOP_CHECK_EVERY);
++        assert_eq!(c.next_at(), LOOP_CHECK_EVERY * 2);
++        assert!(!c.due(LOOP_CHECK_EVERY + 1));
++    }
++}
+diff --git a/docs/CONFIG.md b/docs/CONFIG.md
+index d28c4816bcec972d401b42fd908589ded971af52..a4f0810292c8a6d285f565bfc0541ca085698931 100644
+--- a/docs/CONFIG.md
++++ b/docs/CONFIG.md
+@@ -437,6 +437,10 @@ The EP owner-routed prefill and the expert-staging levers have no typed schema k
+ | `thinking_budget` | `"med"` | `off` \| `low` \| `med` \| `high` \| `xhigh` \| `max` \| `uncapped` | Legacy **named cap preset** only on models that still honor that config route. Not an effort dial. On effort-native models the string is dropped with a warning (no implicit cap). `off` is not a token cap: on a contract that honors the named route it disables thinking like `thinking = "off"`. |
+ | `max_think_tokens` | *(absent)* | int 0–393216 when set | Explicit **integer** think-span cap (`reasoning.max_tokens`) on Qwen Jinja contracts. `0` or absence = uncapped. Positive N force-closes through the validated Qwen continuation path. DeepSeek, Gemma, Glimmer, and unsupported contracts drop this field with a warning rather than inventing model-specific closure behavior. Independent of mode and effort. |
+ | `max_total_think_tokens` | `0` | int 0–1000000 | Cross-reopen total `<think>` budget; `0` = off. |
++| `thinking.close_retry` | `true` | bool | Multi-slot think repair: a thinking turn that stops with the span still open injects the close and continues in a fresh pass. Per-model override of `HIPFIRE_REASONING_CLOSE_RETRY` in a `models.toml` overrides layer (a global `config.toml` value stays local-run, like every generation key); vision and structured-output requests keep single-pass semantics. |
++| `thinking.loop_recovery` | `"recover"` | `off` \| `stop` \| `recover` | Multi-slot reasoning-loop action: `stop` ends the request as length; `recover` restarts the pass once with the low-effort system sentence. Per-model override of `HIPFIRE_REASONING_LOOP_RECOVERY` in a `models.toml` overrides layer. |
++| `thinking.repeat_stop_tokens` | `256` | int 0–65536 | Same-token run guard: consecutive identical tokens that end the pass as length; `0` disables. Per-model override of `HIPFIRE_REPEAT_STOP_TOKENS` in a `models.toml` overrides layer. |
++| `thinking.answer_room` | `true` | bool | Answer room: with thinking on and no explicit `max_think_tokens`, derive a cap that leaves the answer a quarter of `max_tokens` (floor 512, from 1024 up, or when the cap is all the context has left); an explicit budget that would eat the room is clamped. The budget trip injects the wrap-up sentence plus the close instead of the bare close. Vision and structured-output requests skip it. Per-model override of `HIPFIRE_THINKING_ANSWER_ROOM` in a `models.toml` overrides layer. |
+ 
+ ### Reasoning contract (three independent axes)
+ 
+@@ -2312,7 +2316,7 @@ misspelled key is unknown and fails the load with
+ 
+ <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
+ 
+-**Count:** 310 schema keys, plus the `developer.<name>` namespace.
++**Count:** 314 schema keys, plus the `developer.<name>` namespace.
+ 
+ | Key | Legacy key | Env | Lifecycle |
+ |---|---|---|---|
+@@ -2623,6 +2627,10 @@ misspelled key is unknown and fails the load with
+ | `speculation.prefill.sink` | `prefill_sink` |  | deprecated |
+ | `speculation.prefill.sparse_threshold` | `prefill_sparse_threshold` |  | deprecated |
+ | `speculation.prefill.threshold` | `prefill_threshold` |  | deprecated |
++| `thinking.answer_room` | `thinking_answer_room` |  | experimental |
++| `thinking.close_retry` | `thinking_close_retry` |  | experimental |
++| `thinking.loop_recovery` | `thinking_loop_recovery` |  | experimental |
++| `thinking.repeat_stop_tokens` | `thinking_repeat_stop_tokens` |  | experimental |
+ | `topology.ep` | `ep` | `HIPFIRE_TOPOLOGY_EP` | experimental |
+ | `topology.pp` | `pp` | `HIPFIRE_TOPOLOGY_PP` | experimental |
+ | `vision.mode` | `vision_mode` | `HIPFIRE_VISION_MODE` | stable |

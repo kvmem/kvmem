@@ -173,6 +173,72 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual('inkling_dspark_batch_worker' in {check['code'] for check in result['checks']},
                                  not expected)
 
+    def test_hipfire_hfq_uses_worker_inspect(self):
+        model = self.root / 'qwen3.8-27b.mq4-xts'
+        worker = self.root / 'hipfire'
+        model.write_bytes(b'HFQM' + bytes(28))
+        worker.write_text('fixture')
+        report = dict(schema_version=1, source='hfq', arch_id=5, architecture='qwen35',
+            tensor_count=100, can_serve=True, kv_types=['q8'],
+            vision={'present': True, 'sidecar_supported': True},
+            speculative={'mtp': {'supported': True}, 'dflash2': {'supported': True}})
+        with patch('model_health.subprocess.run', return_value=subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(report), stderr='')):
+            result = self.inspect(model, 'hipfire', Worker=str(worker), KvType='q8')
+        self.assertEqual(result['status'], 'ready')
+        self.assertTrue(result['can_start'])
+        self.assertEqual(result['model']['format'], 'HFQ')
+        self.assertEqual(result['model']['kv_types'], ['q8'])
+        self.assertEqual(result['features']['vision'], 'present')
+        self.assertEqual(result['features']['mtp'], 'supported')
+
+    def test_hipfire_rejects_safetensors_source(self):
+        model = self.root / 'qwen3.5-safetensors'
+        model.mkdir()
+        (model / 'config.json').write_text('{"model_type":"qwen3.5"}')
+        (model / 'model.safetensors').write_bytes(bytes(16))
+        worker = self.root / 'hipfire'
+        worker.write_text('fixture')
+        directory_report = dict(schema_version=1, source='safetensors-dir', arch_id=5,
+            architecture='qwen35', tensor_count=10, can_serve=True, kv_types=['q8'])
+        with patch('model_health.subprocess.run', return_value=subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(directory_report), stderr='')):
+            result = self.inspect(model, 'hipfire', Worker=str(worker), SpeculativeMode='none')
+        self.assertFalse(result['can_start'])
+        self.assertEqual(result['status'], 'blocked')
+
+    def test_hipfire_hfq_sidecars(self):
+        worker = self.root / 'hipfire'
+        worker.write_text('fixture')
+        trunk = self.root / 'trunk.mq4-xts'
+        sidecar = self.root / 'vision.hfq'
+        draft = self.root / 'draft.hfq'
+        for path in (trunk, sidecar, draft):
+            path.write_bytes(b'HFQM' + bytes(28))
+        trunk_report = dict(schema_version=1, source='hfq', arch_id=5, architecture='qwen35',
+            tensor_count=100, can_serve=True, kv_types=['q8'],
+            vision={'present': False, 'sidecar_supported': True},
+            speculative={'mtp': {'supported': True}, 'dflash2': {'supported': True}})
+        sidecar_report = dict(schema_version=1, source='hfq', arch_id=5, architecture='qwen35',
+            tensor_count=1, can_serve=False, kv_types=['q8'],
+            vision={'present': True, 'sidecar_supported': True},
+            speculative={'mtp': {'supported': False}, 'dflash2': {'supported': False}})
+        draft_report = dict(schema_version=1, source='hfq', arch_id=20, architecture='dflash-draft',
+            tensor_count=5, can_serve=False, kv_types=['q8'],
+            vision={'present': False, 'sidecar_supported': False},
+            speculative={'mtp': {'supported': False}, 'dflash2': {'supported': True}})
+        def run(args, **kwargs):
+            path = Path(args[3])
+            value = trunk_report if path == trunk else sidecar_report if path == sidecar else draft_report
+            return subprocess.CompletedProcess([], 0, stdout=json.dumps(value), stderr='')
+        with patch('model_health.subprocess.run', side_effect=run):
+            result = self.inspect(trunk, 'hipfire', Worker=str(worker), Vision=True,
+                                  VisionSidecar=str(sidecar), SpeculativeMode='dflash2',
+                                  DraftModel=str(draft))
+            self.assertTrue(result['can_start'], result)
+            self.assertEqual(result['features']['vision'], 'sidecar')
+            self.assertEqual(result['features']['dflash2'], 'external')
+
     def test_extension_cannot_disguise_wrong_container(self):
         path=self.root/'fake.gguf'; path.write_bytes(b'not a model'*10)
         self.assertFalse(self.inspect(path)['can_start'])

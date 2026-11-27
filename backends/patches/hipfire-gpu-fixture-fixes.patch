@@ -1,0 +1,73 @@
+diff --git a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+index c50ba6256..420a0b54b 100644
+--- a/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
++++ b/crates/hipfire-arch-qwen35/src/layerwise_driver.rs
+@@ -5716,7 +5716,9 @@ mod tests {
+                 extent as i32 - 1,
+                 "head suffix compacted causal bound"
+             );
+-            // Block table: [2*hphys, 2*scratch, -1] — history + scratch stripes.
++            // Block table: [2*hphys, 2*scratch, 2*overflow] — history,
++            // scratch and overflow stripes. The overflow page stays beyond the
++            // causal bound when unused and is therefore masked.
+             let mut bt_bytes = vec![0u8; 12];
+             gpu.hip
+                 .memcpy_dtoh_at(&mut bt_bytes, &head.staging.block_table(0).unwrap().buf, 0)
+@@ -5727,8 +5729,12 @@ mod tests {
+                 .collect();
+             assert_eq!(
+                 bt,
+-                vec![2 * hphys as i32, 2 * scratch as i32, -1],
+-                "history + scratch stripes"
++                vec![
++                    2 * hphys as i32,
++                    2 * scratch as i32,
++                    2 * head.suffix_slot_overflow as i32,
++                ],
++                "history + scratch + overflow stripes"
+             );
+             // Descriptor: seq_len = extent (visible + partial + rows).
+             let mut desc_buf = vec![0u8; std::mem::size_of::<KvSlotDesc>()];
+@@ -9833,21 +9839,16 @@ mod tests {
+     /// persistent output owner: `accepted_end` advances to `fed + 1`, one accepted
+     /// sample per FA layer, mass conserved. gfx1100-only (ported scorer + mass).
+     ///
+-    /// Run with `HIPFIRE_KVMEM_SINK_BLOCKS=0 HIPFIRE_KVMEM_RECENT_BLOCKS=0` in the
+-    /// PROCESS environment (the controller config is a start-time `OnceLock`
+-    /// snapshot, so a runtime `set_var` is invisible — same rationale as the
+-    /// strategy injection in `kvmem_ctl`). The one-page resident budget
+-    /// (`budget_blocks = 1`) requires sink + recent == 0 to pass the residency
+-    /// gate; the layerwise selection itself ignores sink/recent (`mandatory = []`,
++    /// The one-page resident budget (`budget_blocks = 1`) requires sink + recent
++    /// == 0; the fixture injects those values through explicit `KvMemOptions`
++    /// (the controller no longer reads process environment). The layerwise
++    /// selection itself ignores sink/recent (`mandatory = []`,
+     /// `selected_pages = full_pages.min(budget_blocks)`), so this only admits the
+-    /// constructor. Example:
+-    /// `HIPFIRE_KVMEM_SINK_BLOCKS=0 HIPFIRE_KVMEM_RECENT_BLOCKS=0 \`
+-    /// `cargo test -p hipfire-arch-qwen35 --features kvmem \`
+-    /// `engine_carrier_rows_multi_row_partial_accept -- --ignored --test-threads=1`
++    /// constructor. Run serially with `--ignored --test-threads=1`.
+     #[test]
+     #[ignore]
+     fn engine_carrier_rows_multi_row_partial_accept() {
+-        use crate::kvmem_ctl::{KvMemGeometry, KvMemPlan, RecallStrategy};
++        use crate::kvmem_ctl::{KvMemGeometry, KvMemOptions, KvMemPlan, RecallStrategy};
+         use hipfire_kvmem::{OutputOptions, OutputPressure, OutputScope, PrefillOptions};
+         use path_fixture::*;
+         use rdna_compute::kvmem_page_mass::PageMassScalar;
+@@ -9877,8 +9878,12 @@ mod tests {
+             grow_blocks: 2,
+             interval: 1,
+         };
+-        let mut ctl = KvMemCtl::new_with_strategy(1, &plan, &geom, RecallStrategy::Layerwise)
+-            .expect("layerwise ctl");
++        let mut options = KvMemOptions::default();
++        options.strategy = RecallStrategy::Layerwise;
++        options.sink_blocks = Some(0);
++        options.recent_blocks = Some(0);
++        let mut ctl =
++            KvMemCtl::new_with_options(1, &plan, &geom, options, None).expect("layerwise ctl");
+ 
+         // Populate the slot's statistics store directly (the &self core writes),
+         // mirroring the ① fixture: 3 sealed pages, mean-K sign trick selects one.

@@ -58,8 +58,8 @@ def scoring_settings(argv):
 
 def token_settings(backend, values, block=32, supplied=None):
     """Resolve token invariants; all consumers use the resulting effective values."""
-    block = 128 if backend == 'radiance' else 64 if backend == 'ninfer' else block
-    if block not in ((128,) if backend=='radiance' else (32,64)):
+    block = 128 if backend in ('radiance', 'hipfire') else 64 if backend == 'ninfer' else block
+    if block not in ((128,) if backend in ('radiance', 'hipfire') else (32,64)):
         raise ValueError('BlockTokens must be 32 or 64')
     if strategy(values) == 'layerwise':
         explicit = values if supplied is None else supplied
@@ -81,7 +81,8 @@ def token_settings(backend, values, block=32, supplied=None):
         return dict(requested=requested, effective=effective, block_tokens=block, adjustments=[])
     requested = {k: values[k] for k in ('Budget', 'Reserve', 'SinkTokens', 'RecentTokens', 'Prefill', 'Context')}
     effective = dict(requested)
-    minima = {'Budget': 2*block if backend=='radiance' else block if backend == 'llamacpp' else 128, 'Reserve': block,
+    minima = {'Budget': 2*block if backend in ('radiance', 'hipfire') else block if backend == 'llamacpp' else 128,
+              'Reserve': block,
               'SinkTokens': 0 if backend == 'polystrata' else block,
               'RecentTokens': 0 if backend == 'llamacpp' else block}
     for key, minimum in minima.items():
@@ -91,9 +92,9 @@ def token_settings(backend, values, block=32, supplied=None):
         if value < minimum:
             raise ValueError(f'{key} must retain at least {minimum} tokens after alignment')
         effective[key] = value
-    if backend in ('ninfer', 'polystrata', 'radiance'):
-        prefill = requested['Prefill'] or (1024 if backend == 'ninfer' else 0)
-        alignment = 128 if backend == 'ninfer' else 1
+    if backend in ('ninfer', 'polystrata', 'radiance', 'hipfire'):
+        prefill = requested['Prefill'] or (1024 if backend == 'ninfer' else 512 if backend == 'hipfire' else 0)
+        alignment = 128 if backend in ('ninfer', 'hipfire') else 1
         effective['Prefill'] = min(prefill, effective['Reserve']) // alignment * alignment
         if effective['Prefill'] < alignment:
             raise ValueError(f'Prefill and Reserve must allow at least {alignment} prefill tokens')
@@ -192,7 +193,8 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
     params = data.get('parameters') if isinstance(data, dict) else None
     if isinstance(params, dict):
         for key in ('Worker', 'Model', 'DraftModel', 'ChatTemplateFile', 'Mmproj', 'Lora', 'DiskPath',
-                    'Tokenizer', 'PolystrataSource', 'Python', 'VisionWorker', 'RadianceHome', 'RocmPath'):
+                    'Tokenizer', 'PolystrataSource', 'Python', 'VisionWorker', 'RadianceHome', 'RocmPath',
+                    'VisionSidecar', 'ApiKeyFile'):
             value = params.get(key)
             if isinstance(value, str) and value:
                 if platform == 'linux' and PureWindowsPath(value).drive:
@@ -204,6 +206,14 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
     supplied = normalize(data, tuple(caps), path_root=root)['parameters']
     p = dict(LAUNCH_DEFAULTS, **supplied)
     backend = p['Backend']
+    if backend == 'hipfire':
+        if p.get('RecallStrategy') == 'layerwise':
+            for key in ('SinkTokens', 'RecentTokens'):
+                if key not in supplied:
+                    p[key] = 128
+        from .hipfire import build_hipfire_plan
+        return build_hipfire_plan(p, supplied, root, platform, reveal_secrets,
+                                  caps[backend], token_settings(backend, p, supplied=supplied))
     if backend == 'radiance':
         from .radiance import build_radiance_plan
         return build_radiance_plan(supplied, root, platform, reveal_secrets, caps[backend])

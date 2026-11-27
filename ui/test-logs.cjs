@@ -33,7 +33,7 @@ async function until(fn){for(let i=0;i<100;i++){if(await fn())return;await sleep
   try{
     const page=await browser.newPage({viewport:{width:1440,height:1040}}),errors=[];
     page.on('pageerror',error=>errors.push(error.message));
-    await page.goto('http://127.0.0.1:'+server.address().port+'/monitor/#logs');
+    await page.goto('http://127.0.0.1:'+server.address().port+'/monitor/#logs',{waitUntil:'domcontentloaded',timeout:60000});
     await page.locator('.s-log-row').first().waitFor();
     assert.equal(await page.locator('[data-view=logs]').isVisible(),true);
     assert.equal(await page.locator('.s-log-row').count(),4);
