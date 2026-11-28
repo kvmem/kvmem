@@ -49,7 +49,7 @@ param(
     [ValidateRange(1, 16)][int]$RetainedSessions = 4,
     [ValidateRange(0, 2147483647)][int]$CacheMinTokens = 0,
     [switch]$Vision,
-    [ValidateSet('resident', 'cpu')][string]$VisionResidency = 'resident',
+    [ValidateSet('resident', 'cpu', 'overlay')][string]$VisionResidency = 'resident',
     [ValidateRange(0, 2147483647)][int]$CpuVisionIdleSeconds = 300,
     [ValidateRange(1, 16384)][int]$VisionTokens = 1024,
     [ValidateSet('off', 'auto')][string]$DeviceProfile = 'off',
@@ -104,14 +104,14 @@ if ($Backend -eq 'ninfer') {
     $capabilities.checkpoint_recompute_min_revision = 1
     $capabilities.supported_combinations = @{
         text = @{ kv = @('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'); max_concurrency = 8; mtp_drafts = @(0..15) }
-        images = @{ kv = @('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'); max_concurrency = 8; residency = @('resident', 'cpu') }
+        images = @{ kv = @('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'); max_concurrency = 8; residency = @('resident', 'cpu', 'overlay') }
         rk8v4 = @{ max_concurrency = 8; text_only = $false }
         cold_disk = @{ enabled = $false; reason = 'replaced_by_process_local_tiering' }
         active_disk = @{ enabled = $true; shared_active_idle_quota = $true; max_concurrency = 8 }
         ngram = @{ max_concurrency = 8; text_only = $false; image_kv = @('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'); requires_speculative = @('mtp', 'dflash2'); max_drafts = 63; concurrent_max_drafts = 15; wide_max_concurrency = 1; concurrent_width_policy = 'clamp_to_15' }
         lookup_ngram = @{ enabled = $false; reason = 'legacy_path_disabled'; replacement = '--ngram-draft-tokens --ngram-min-match' }
         adaptive_mtp = @{ max_concurrency = 8; text_only = $false; ngram = $true; ngram_max_concurrency = 8; ngram_concurrent_max_drafts = 15; cold_disk = $false }
-        fast_prefill = @{ kv = @('int8', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'); text_only = $false; max_concurrency = 8; residency = @('resident', 'cpu'); cold_disk = $false }
+        fast_prefill = @{ kv = @('int8', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'); text_only = $false; max_concurrency = 8; residency = @('resident', 'cpu', 'overlay'); cold_disk = $false }
         multi_gpu = @{ mode = 'layer'; modes = @('layer', 'tensor'); tensor_attention = @('heads'); tensor_split = $true;
             heads_tensor_parallel_min_revision = 1; max_devices = 8; vision_residency = @('resident', 'cpu'); mtp = $true; host_history = 'shared' }
         video = $false
@@ -216,6 +216,7 @@ foreach ($setting in @(
     @('ThinkingBudget', '^--(default-thinking-budget|reasoning-budget)(=|$)'),
     @('MaxTokens', '^(-n|--n-predict|--predict|--default-max-tokens)(=|$)'),
     @('Vision', '^--(mmproj|mmproj-offload|no-mmproj-offload|mmproj-device|image-max-tokens)(=|$)'),
+    @('VisionResidency', '^--vision-(residency|offload|cpu)(=|$)'),
     @('Mmproj', '^--mmproj(=|$)'),
     @('Lora', '^--lora(-scale)?(=|$)'),
     @('PreserveThinking', '^--((no-)?preserve-thinking|chat-template-kwargs)(=|$)'),
@@ -309,7 +310,8 @@ if ($Backend -eq 'ninfer') {
     if ($FastPrefill -and ($KvType -notin @('int8', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'))) {
         throw 'Fast prefill requires INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8'
     }
-    if ($VisionResidency -ne 'resident' -and !$Vision) { throw 'CPU Vision requires -Vision' }
+    if ($VisionResidency -eq 'cpu' -and !$Vision) { throw 'CPU Vision requires -Vision' }
+    if ($VisionResidency -eq 'overlay' -and (!$Vision -or $gpuIds.Count -ne 1)) { throw 'GPU Vision overlay requires -Vision and a single GPU' }
     if ($RecallStrategy -ne 'layerwise') {
         if ($RecentTokens -lt 64) { throw 'ninfer -RecentTokens must be at least 64 to keep the newest append page' }
         $sinkBlocks = if ($SinkTokens -lt 64) { 1 } else { [int][Math]::Floor($SinkTokens / 64) }
@@ -353,6 +355,7 @@ if ($Backend -eq 'ninfer') {
         $nativeArgs += $(if ($PreserveThinking) { '--preserve-thinking' } else { '--no-preserve-thinking' })
     }
 } else {
+    if ($VisionResidency -eq 'overlay') { throw 'GPU Vision overlay is only supported by NInfer' }
     # Legacy KvType still sets both sides. Explicit K/V values override that base;
     # emit separate native flags when either independent value was requested.
     $separateKv = $PSBoundParameters.ContainsKey('KvTypeK') -or $PSBoundParameters.ContainsKey('KvTypeV')
@@ -468,7 +471,8 @@ if ($DryRun) {
 Invoke-KVMemRecallWorkerCheck $Worker $effective $root
 $fullQueryReplay = $Backend -eq 'ninfer' -and $RecallStrategy -ne 'layerwise' -and
     ($scoringParameters.QueryMaxTokens -eq 0 -or $scoringParameters.QueryReplayMaxTokens -eq 0)
-if ($fullQueryReplay -or $Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0 -or $CacheMinTokens -gt 0) {
+$legacyOverlay = $VisionResidency -eq 'overlay' -and $RecallStrategy -eq 'legacy'
+if ($fullQueryReplay -or $legacyOverlay -or $Lora -or $TensorParallel -or $CheckpointExtraRecomputeTokens -gt 0 -or $CacheMinTokens -gt 0) {
     $probeInfo = New-KVMemProcessInfo $Worker @('--kvmem-capabilities')
     $probeInfo.RedirectStandardOutput = $true
     $probeInfo.RedirectStandardError = $true
@@ -488,6 +492,14 @@ if ($fullQueryReplay -or $Lora -or $TensorParallel -or $CheckpointExtraRecompute
         if ($fullQueryReplay -and (!$workerBackend -or $workerBackend.Value -ne 'ninfer' -or !$queryRevision -or
             ($queryRevision.Value -isnot [int] -and $queryRevision.Value -isnot [long]) -or $queryRevision.Value -lt 1)) {
             throw 'This worker does not support NInfer full Query/replay (zero token limits); update the complete NInfer package, or explicitly set both QueryMaxTokens and QueryReplayMaxTokens to positive limits'
+        }
+        if ($legacyOverlay) {
+            $residency = $contract
+            foreach ($key in @('recall_strategies', 'layerwise', 'vision_residency')) {
+                $property = if ($residency) { $residency.PSObject.Properties[$key] }
+                $residency = if ($property) { $property.Value }
+            }
+            if ('overlay' -notin $residency) { throw 'This worker does not support NInfer GPU Vision overlay; update the backend' }
         }
         $loraCapability = if ($contract) { $contract.PSObject.Properties['fixed_lora'] } else { $null }
         if ($Lora -and (!$loraCapability -or $loraCapability.Value -isnot [bool] -or !$loraCapability.Value)) {

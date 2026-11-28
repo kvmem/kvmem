@@ -206,6 +206,8 @@ def normalize(data, backends, *, path_root=None):
             raise ValueError(f'{key} must be >= {minimum}; zero means unlimited for NInfer')
     if p['Backend'] != 'radiance' and {'CpuThreads','VisionCacheMiB','WeightPlacement','WeightHostMiB'} & p.keys():
         raise ValueError('CPU threads, image cache and weight placement configure Radiance only')
+    if p.get('VisionResidency') == 'overlay' and p['Backend'] != 'ninfer':
+        raise ValueError('GPU Vision overlay is only supported by NInfer')
     if 'CheckpointExtraRecomputeTokens' in p and p['Backend'] != 'ninfer':
         raise ValueError('CheckpointExtraRecomputeTokens configures NInfer only')
     history = p.get('Lrfu', p.get('QueryScorer') == 'meanq-cosine')

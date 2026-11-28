@@ -62,7 +62,7 @@ from launcher.config import (SPECULATIVE_PROFILES, DEFAULTS, ENGINE_DEFAULTS,
     without_secrets, normalize)
 from launcher.plan import build_plan, capabilities as launcher_capabilities, scoring_settings
 from launcher.export import export_profile, read_revision
-from launcher.worker import require_launch_features, strategy_profile, supports_inkling_fp8
+from launcher.worker import require_launch_features, strategy_profile, supports_inkling_fp8, supports_vision_overlay
 
 
 def private_log(path, *, truncate=False):
@@ -262,6 +262,8 @@ class Controller:
         worker = parameters.get('Worker') or self.worker_defaults()[backend]['path']
         value = self.worker_capabilities(worker, backend)
         identity = dict(path=value['path'], executable_sha256=value['executable_sha256'])
+        if backend == 'ninfer':
+            identity['vision_overlay'] = supports_vision_overlay(value)
         if 'explicit_thinking_switches' in value:
             identity['explicit_thinking_switches'] = value['explicit_thinking_switches']
         return dict(schema_version=1, backend=backend, strategy=selected,

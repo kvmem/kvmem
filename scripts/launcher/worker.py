@@ -98,7 +98,20 @@ def supports_inkling_fp8(capabilities):
     return isinstance(formats, list) and 'fp8' in formats
 
 
+def supports_vision_overlay(capabilities):
+    # The KVMem Vision overlay patch advertises this mode in the layerwise
+    # profile and enables it on the legacy path as well.
+    strategies = capabilities.get('recall_strategies')
+    profile = strategies.get('layerwise') if isinstance(strategies, dict) else None
+    residency = profile.get('vision_residency') if isinstance(profile, dict) else None
+    return isinstance(residency, list) and 'overlay' in residency
+
+
 def require_launch_features(capabilities, parameters):
+    if (parameters.get('Backend') == 'ninfer' and parameters.get('Vision')
+            and parameters.get('VisionResidency') == 'overlay' and not supports_vision_overlay(capabilities)):
+        raise ValueError('所选 NInfer 不支持 GPU Vision Overlay，请更新后端。 / '
+                         'This worker does not support NInfer GPU Vision overlay; update the backend.')
     if (parameters.get('Backend') == 'ninfer' and capabilities.get('explicit_thinking_switches') is False
             and (parameters.get('ThinkingMode') == 'on' or parameters.get('PreserveThinking') is False)):
         raise ValueError('当前 NInfer 无法在启动时显式开启思考或关闭历史思考保留，请更新后端。 / '
