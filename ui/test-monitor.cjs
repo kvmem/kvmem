@@ -532,6 +532,11 @@ if (process.env.MONITOR_FIXTURE_ONLY) {
     assert.equal(await value('StageLayers'),'20 / 20');
     assert.equal(await page.locator('[data-runtime-config] img').count(),0);
     assert.match(await value('DiskPath'),/<img/);
+    const previousScenario=fixtureScenario;
+    fixtureScenario={backend:'ninfer',props:{kvmem:{vision:{enabled:true,gpu:true}}}};
+    await runtime({state:'ready',instance:'config-ninfer-overlay',active_config:{parameters:{Backend:'ninfer',Vision:true,VisionResidency:'overlay'}}});
+    await page.waitForFunction(()=>document.querySelector('[data-runtime-key="VisionResidency"] .s-runtime-value')?.textContent==='GPU Overlay');
+    fixtureScenario=previousScenario;
     fixtureScenario={...fixtureScenario,props:{...fixtureScenario.props,execution:{mode:'tensor',tensor_attention:'heads',
       tensor_split:[3,1],tensor_shares:[{rank:0,kv_heads:[0,6]},{rank:1,kv_heads:[6,8]}],stage_layers:[]}}};
     const tensorRuntime={state:'ready',instance:'config-ninfer-tensor',active_config:{parameters:{Backend:'ninfer',TensorParallel:true,

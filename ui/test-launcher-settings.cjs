@@ -157,6 +157,16 @@ module.exports = async function settingsChecks({browser,base,info}) {
   for(const [key,value] of Object.entries({DiskMiB:512,VisionTokens:512,VisionResidency:'cpu',ThinkingBudget:512,DraftPolicy:'adaptive',NgramDrafts:8,NgramMinMatch:6,FastPrefill:true}))assert.equal(active[key],value,'reactivated '+key);
   assert.equal(Object.hasOwn(active,'NoLrfu'),false,'C omits the obsolete ranking switch');
   assert.equal(Object.hasOwn(active,'ApiKey'),false);
+  const placement=field('VisionResidency');
+  await page.locator('[data-gpu-choice]').first().check();
+  await placement.selectOption('overlay');
+  assert.equal((await preview()).VisionResidency,'overlay','NInfer GPU Overlay reaches the launch plan');
+  await page.locator('[data-gpu-choice]').nth(1).check();
+  assert.equal(await field('Gpu').evaluate(el=>el.selectedOptions.length),2,'fixture has two selected GPUs');
+  assert.equal(await placement.locator('option[value=overlay]').evaluate(el=>el.disabled),true,'GPU Overlay is single-GPU');
+  assert.equal(await placement.evaluate(el=>el.validity.valid),false,'an existing overlay selection may not launch on multiple GPUs');
+  await page.locator('[data-gpu-choice]').nth(1).uncheck();
+  await placement.selectOption('cpu');
   await group(1);await field('SpeculativeMode').selectOption('dflash2');
   assert.equal(await field('DraftTokens').inputValue(),'5');await disabled(['DraftPolicy','DraftModel']);
   const dflash=await preview();assert.equal(dflash.SpeculativeMode,'dflash2');assert.equal(dflash.DraftTokens,5);
@@ -174,6 +184,7 @@ module.exports = async function settingsChecks({browser,base,info}) {
   assert.equal(stagedDraft.Gpu.split(',').length,2);
   await page.locator('[data-gpu-choice]').nth(1).uncheck();
   await field('Backend').selectOption('llamacpp');await group(1);
+  assert.equal(await field('VisionResidency').locator('option[value=overlay]').count(),0,'GPU Overlay is NInfer only');
   await field('SpeculativeMode').selectOption('dflash2');await field('DraftModel').fill('C:/models/draft with spaces.gguf');
   const llamaDraft=await preview();assert.equal(llamaDraft.SpeculativeMode,'dflash2');assert.equal(llamaDraft.DraftTokens,5);
   assert.equal(llamaDraft.DraftModel,'C:/models/draft with spaces.gguf');assert.equal(Object.hasOwn(llamaDraft,'NgramDrafts'),false);

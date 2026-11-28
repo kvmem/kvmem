@@ -832,8 +832,10 @@
     row('engine','Vision',['图像输入','Image input'],first(boolean(service.modalities?.vision),boolean(k.vision?.enabled),boolean(k.vision)),boolean(config.Vision),{optional:true});
     if (first(service.modalities?.vision,k.vision?.enabled,boolean(k.vision),config.Vision) === true) {
       row('engine','VisionTokens',['图像 token 上限','Image token limit'],undefined,config.VisionTokens,{optional:true,format:tokens});
-      row('engine','VisionResidency',['图像编码器位置','Vision encoder placement'],typeof k.vision?.gpu==='boolean'?k.vision.gpu?'resident':'cpu':undefined,
-        config.VisionResidency,{optional:true,format:value=>({resident:'GPU',cpu:'CPU'})[value]||String(value)});
+      const residency=first(k.vision?.residency,k.vision?.gpu===false?'cpu':k.vision?.gpu===true?
+        (config.VisionResidency==='overlay'?'overlay':'resident'):undefined);
+      row('engine','VisionResidency',['图像编码器位置','Vision encoder placement'],residency,
+        config.VisionResidency,{optional:true,format:value=>({resident:'GPU',overlay:'GPU Overlay',cpu:'CPU'})[value]||String(value)});
     }
     row('engine','ListenHost',['监听地址','Listen address'],undefined,config.ListenHost,{optional:true});
     row('engine','Port',['服务端口','Service port'],undefined,config.Port,{optional:true,format:String});
