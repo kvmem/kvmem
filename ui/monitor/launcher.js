@@ -1468,7 +1468,14 @@
     status.hidden=!budgetAdjustment;status.classList.toggle('l-error',budgetAdjustment?.kind==='error');
     if(!budgetAdjustment)return;
     if(budgetPending)status.textContent=tr(`正在加载模型并测算… ${Math.floor((Date.now()-budgetAdjustment.started)/1000)} 秒`,`Loading model and planning… ${Math.floor((Date.now()-budgetAdjustment.started)/1000)} s`);
-    else if(budgetAdjustment.kind==='success')status.textContent=tr(`已调整为 ${budgetAdjustment.budget.toLocaleString()} · 耗时 ${(budgetAdjustment.elapsed/1000).toFixed(1)} 秒；待启动验证。`,`Set to ${budgetAdjustment.budget.toLocaleString()} · ${(budgetAdjustment.elapsed/1000).toFixed(1)} s; startup validation pending.`);
+    else if(budgetAdjustment.kind==='success'){
+      const {budget,elapsed,adjustments}=budgetAdjustment;
+      const labels={Reserve:tr('生成预留','Gen reserve'),Prefill:tr('预填充','Prefill')};
+      const settings=adjustments.map(([name,requested,effective])=>
+        `${labels[name]} ${requested.toLocaleString()} → ${effective.toLocaleString()}`);
+      const summary=tr(`已调整为 ${budget.toLocaleString()} · 耗时 ${(elapsed/1000).toFixed(1)} 秒；待启动验证。`,`Set to ${budget.toLocaleString()} · ${(elapsed/1000).toFixed(1)} s; startup validation pending.`);
+      status.textContent=[summary,...settings].join(' · ');
+    }
     else status.textContent=budgetAdjustment.message;
   }
   async function adjustBudget(){
@@ -1476,18 +1483,19 @@
     let timer;
     try{
       const configuration=launchData(),key=JSON.stringify(configuration);
-      const {Prefill:prefill,Reserve:reserve}=configuration.parameters;
-      if(Number.isFinite(prefill)&&Number.isFinite(reserve)&&prefill>reserve)throw Error(tr(
-        `Prefill 不能超过 Gen Reserve。当前 Prefill 为 ${prefill.toLocaleString()}，Gen Reserve 为 ${reserve.toLocaleString()}。请先修改其中一项，自动调整只修改 Budget。`,
-        `Prefill (${prefill.toLocaleString()}) cannot exceed Gen Reserve (${reserve.toLocaleString()}). Adjust either setting first. Auto adjustment changes Budget only.`
-      ));
       busy=true;budgetPending=true;budgetAdjustment={started:Date.now()};applyConfigurationLock();renderMemoryRecovery();renderBudgetAdjustment();
       timer=setInterval(renderBudgetAdjustment,1000);
       const result=await api('adjust-budget',configuration,240000);
       if(JSON.stringify(launchData())!==key)throw Error(tr('设置已改变，测算结果未应用；请重新测算。','Settings changed; the result was not applied. Run adjustment again.'));
       const input=root.querySelector('[data-param=Budget]');
       input.value=String(result.changes.Budget);input.dispatchEvent(new Event('input',{bubbles:true}));
-      budgetAdjustment={kind:'success',budget:result.changes.Budget,elapsed:result.elapsed_ms};
+      const adjustments=[];
+      for(const [name,effective] of [['Reserve',result.reserve],['Prefill',result.prefill]]){
+        const requested=configuration.parameters[name];
+        if(Number.isFinite(requested)&&Number.isFinite(effective)&&requested!==effective)
+          adjustments.push([name,requested,effective]);
+      }
+      budgetAdjustment={kind:'success',budget:result.changes.Budget,elapsed:result.elapsed_ms,adjustments};
     }catch(error){budgetAdjustment={kind:'error',message:error.message||String(error)};}
     finally{clearInterval(timer);budgetPending=false;busy=false;applyConfigurationLock();updateStatus(runtime);renderBudgetAdjustment();}
   }

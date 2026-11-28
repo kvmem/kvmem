@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from test_console_memory import console, ROOT, MIB, KV_STORAGE
 from console_memory import validate_budget_plan
+from launcher.plan import token_settings
 
 
 def budget_evidence(parameters):
@@ -121,27 +122,24 @@ class AutoBudget(unittest.TestCase):
             job.return_value.close.assert_called_once();process.wait.assert_called_once()
             self.assertIsNone(self.c.budget_job)
 
-    def test_explicit_reserve_and_prefill_are_not_silently_changed(self):
-        for key,value in (('Reserve',4096), ('Prefill',128)):
-            with self.subTest(parameter=key):
-                plan=copy.deepcopy(self.plan)
-                plan['token_settings']['effective'][key]=value
-                with patch.object(self.c,'inspect_model',return_value={'can_start':True}),patch.object(self.c,'plan',return_value=plan),patch.object(self.c,'_run_budget_plan') as run,self.assertRaisesRegex(ValueError,'Align reserve'):
-                    self.c.adjust_budget(self.config)
-                run.assert_not_called()
-
-    def test_prefill_over_effective_reserve_explains_both_values(self):
-        self.p.update(Prefill=4097, Reserve=4097)
-        self.plan['token_settings']['effective'].update(Prefill=4096, Reserve=4096)
-        with patch.object(self.c, 'inspect_model', return_value={'can_start': True}), \
-                patch.object(self.c, 'plan', return_value=self.plan), \
-                patch.object(self.c, '_run_budget_plan') as run:
-            with self.assertRaisesRegex(
-                ValueError, r'Prefill 不能超过 Gen Reserve.*Prefill \(4,097\) cannot exceed the effective Gen Reserve \(4,096\)'
-            ):
-                self.c.adjust_budget(self.config)
-        run.assert_not_called()
-        self.assertFalse(self.c.budget_busy)
+    def test_budget_quote_uses_normalized_explicit_reserve_and_prefill(self):
+        for prefill, effective_prefill in ((4095, 3968), (4352, 4096), (0, 1024)):
+            with self.subTest(prefill=prefill):
+                self.p.update(Prefill=prefill, Reserve=4097)
+                original = copy.deepcopy(self.config)
+                tokens = token_settings('ninfer', self.p)
+                _, report = budget_evidence(tokens['effective'] | {'KvType': self.p['KvType']})
+                plan = dict(self.plan, token_settings=tokens)
+                output = 'KVMEM_BUDGET_PLAN ' + json.dumps(report)
+                with patch.object(self.c, 'inspect_model', return_value={'can_start': True}), \
+                        patch.object(self.c, 'plan', return_value=plan), \
+                        patch.object(self.c, '_run_budget_plan', return_value=output) as run:
+                    result = self.c.adjust_budget(self.config)
+                run.assert_called_once_with(plan)
+                self.assertEqual((result['prefill'], result['reserve']), (effective_prefill, 4096))
+                self.assertEqual(result['changes'], {'Budget': 49152})
+                self.assertEqual(self.config, original)
+                self.assertFalse(self.c.budget_busy)
 
 
 if __name__=='__main__':unittest.main()

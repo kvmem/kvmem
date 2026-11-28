@@ -31,7 +31,7 @@ param(
     [ValidateSet(32,64)][int]$BlockTokens = 32,
     [ValidateRange(32, 2147483647)][int]$Reserve = 1024,
     [ValidateRange(1, 1048576)][int]$HostMiB = 16384,
-    [ValidateRange(1, 2147483647)][int]$Prefill = 128,
+    [ValidateRange(0, 2147483647)][int]$Prefill = 128,
     [ValidateRange(0, 2147483647)][int]$MaxTokens = 1024,
     [string]$KvType,
     [string]$KvTypeK,
@@ -143,6 +143,7 @@ if ($Backend -ne 'polystrata' -and $PSBoundParameters.ContainsKey('BlockTokens')
     throw '-BlockTokens configures PolyStrata in this launcher'
 }
 if ($Backend -eq 'polystrata' -and !$PSBoundParameters.ContainsKey('Prefill')) { $Prefill=512 }
+if ($Prefill -eq 0 -and $Backend -ne 'ninfer') { throw "Prefill must be positive for $Backend" }
 $resolvedBlock = if ($Backend -eq 'llamacpp') { 32 } else { $BlockTokens }
 # A native logical-batch override must not change the independently emitted ubatch.
 $llamaPhysicalPrefill=$Prefill
@@ -441,6 +442,9 @@ if($RecallStrategy -eq 'layerwise' -and @($WorkerArgs | Where-Object {$_ -match 
 $nativeArgs += $WorkerArgs
 $effective=@{};foreach($entry in $PSBoundParameters.GetEnumerator()) {if($entry.Key -ne 'ApiKey'){$effective[$entry.Key]=$entry.Value}}
 foreach($name in @('Backend','Model','Worker','Gpu','Concurrency','KvType','Budget','Reserve','HostMiB','RetainedSessions','MaxTokens','Context','Prefill','Vision','VisionResidency','NgramDrafts','TensorParallel')) {$effective[$name]=Get-Variable -Name $name -ValueOnly}
+foreach ($name in @('SinkTokens','RecentTokens')) {
+    if ($effective.ContainsKey($name)) { $effective[$name] = $tokenPlan.effective[$name] }
+}
 $effective.BlockTokens=$resolvedBlock;$effective.SpeculativeMode=$SpeculativeMode;$effective.DraftTokens=$MtpDrafts
 $effective.CacheMinTokens=$CacheMinTokens
 $effective.DraftPolicy=if($AdaptiveMtp){'adaptive'}else{'fixed'}
