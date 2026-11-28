@@ -427,6 +427,27 @@ try {
             if ($item.effective -gt $item.requested) { throw 'ordinary rounding increased a requested budget' }
         }
     }
+    foreach ($requestedPrefill in @(0,4095,4352)) {
+        $layerwise = & $launcher @common -Backend ninfer -Model (Join-Path $testDir 'model with spaces.ninfer') `
+            -RecallStrategy layerwise -Context 24064 -Budget 20000 -Reserve 4097 -Prefill $requestedPrefill `
+            -SinkTokens 1025 -RecentTokens 0 -WarningVariable layerwiseWarnings | ConvertFrom-Json
+        $tokens = $layerwise.token_settings
+        $effectivePrefill = switch ($requestedPrefill) { 0 { 1024 } 4095 { 4032 } 4352 { 4096 } }
+        if ($tokens.requested.Prefill -ne $requestedPrefill -or $tokens.effective.Prefill -ne $effectivePrefill -or
+            $tokens.effective.Budget -ne 19968 -or $tokens.effective.Reserve -ne 4096 -or
+            $tokens.effective.SinkTokens -ne 1088 -or $tokens.effective.RecentTokens -ne 0 -or
+            $layerwise.effective_parameters.SinkTokens -ne 1088 -or $layerwiseWarnings.Count -ne 4) {
+            throw 'NInfer Layerwise must report the normalized token settings'
+        }
+        $flags = @{'--kvmem-budget'='Budget'; '--kvmem-gen-reserve'='Reserve'; '--prefill-chunk'='Prefill';
+                   '--kvmem-sink-tokens'='SinkTokens'; '--kvmem-recent-tokens'='RecentTokens'}
+        foreach ($flag in $flags.Keys) {
+            $at = [Array]::IndexOf($layerwise.argv,$flag)
+            if ($at -lt 0 -or $layerwise.argv[$at+1] -ne [string]$tokens.effective.($flags[$flag])) {
+                throw "NInfer Layerwise argv disagrees with the launch plan for $flag"
+            }
+        }
+    }
     # Values that look like token options must remain opaque to the launcher.
     foreach ($backend in 'ninfer','llamacpp') {
         $model=Join-Path $testDir $(if ($backend -eq 'ninfer') { 'model with spaces.ninfer' } else { 'model.gguf' })

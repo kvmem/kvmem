@@ -107,7 +107,9 @@ NInfer dense Qwen 27B 可设置 `NINFER_LAYERWISE_HYBRID_QUERY=1`：最终 Query
 
 Layerwise 起点使用历史预算 K=32768、追加预留 G=1024、canonical RAM 16384 MiB；
 显式参数优先。Radiance 新启动的 prefill 缺省为 256；显式 512 和历史比较协议不变。
-K/G 和显式 sink/recent 必须按该后端块大小对齐，不能靠启动器取整改变含义。
+NInfer 启动器将 K/G 向下对齐到 64-token 块，将显式 sink/recent 向上对齐以满足最低保留量。
+Prefill 向下对齐到 64-token 块并受 G 限制，填 `0` 时先按自动值 1024 计算。配置检查显示请求值和生效值。
+其他后端的 Layerwise K/G 和显式 sink/recent 仍须按其块大小填写。
 sink/recent 留空使用原生 auto；显式 `0` 原样传递。完整 Query evaluation 的准入仍由原生请求计划验证。
 普通 rolling 的 G 最低块数由该 worker 的能力契约声明，不假设所有后端都为一块或三块。
 

@@ -56,6 +56,19 @@ def scoring_settings(argv):
             'query_replay_max_tokens': int(value('--kvmem-query-replay-max-tokens', 2048))}
 
 
+def _token_adjustments(requested, effective, block):
+    return [dict(parameter=k, requested=v, effective=effective[k],
+                 reason='prefill alignment and Reserve limit' if k == 'Prefill' else f'alignment to {block} tokens')
+            for k, v in requested.items() if effective[k] != v]
+
+
+def _effective_prefill(prefill, reserve, alignment):
+    effective = min(prefill, reserve) // alignment * alignment
+    if effective < alignment:
+        raise ValueError(f'Prefill and Reserve must allow at least {alignment} prefill tokens')
+    return effective
+
+
 def token_settings(backend, values, block=32, supplied=None):
     """Resolve token invariants; all consumers use the resulting effective values."""
     block = 128 if backend == 'radiance' else 64 if backend == 'ninfer' else block
@@ -67,18 +80,35 @@ def token_settings(backend, values, block=32, supplied=None):
         for key in ('SinkTokens', 'RecentTokens'):
             requested[key] = explicit.get(key)
         effective = dict(requested)
-        if requested['Budget'] <= 0 or requested['Budget'] % block or requested['Reserve'] % block or requested['Reserve'] < block:
+        if backend == 'ninfer':
+            for key in ('Budget', 'Reserve'):
+                effective[key] = requested[key] // block * block
+            if min(effective['Budget'], effective['Reserve']) < block:
+                raise ValueError(f'Layerwise Budget and Reserve must each allow at least {block} tokens after alignment')
+        elif requested['Budget'] <= 0 or requested['Budget'] % block or requested['Reserve'] % block or requested['Reserve'] < block:
             raise ValueError('Layerwise Budget/Reserve require block alignment and Reserve >= one block')
         for key in ('SinkTokens', 'RecentTokens'):
-            if requested[key] is not None and (requested[key] < 0 or requested[key] % block):
-                raise ValueError(f'Layerwise {key} requires block alignment; explicit zero is preserved')
-        if all(requested[key] is not None for key in ('SinkTokens', 'RecentTokens')) and requested['SinkTokens'] + requested['RecentTokens'] > requested['Budget']:
+            value = requested[key]
+            if value is None:
+                continue
+            if value < 0 or (backend != 'ninfer' and value % block):
+                raise ValueError(f'Layerwise {key} must be nonnegative and aligned to {block} tokens')
+            if backend == 'ninfer':
+                effective[key] = (value + block - 1) // block * block
+        if backend == 'ninfer':
+            kept = (effective['SinkTokens'] or 0) + (effective['RecentTokens'] or 0)
+            if kept > effective['Budget']:
+                raise ValueError(f'Layerwise SinkTokens + RecentTokens need {kept} tokens after alignment; effective Budget is {effective["Budget"]}')
+        elif all(requested[key] is not None for key in ('SinkTokens', 'RecentTokens')) and requested['SinkTokens'] + requested['RecentTokens'] > requested['Budget']:
             raise ValueError('SinkTokens + RecentTokens must fit layerwise startup Budget')
-        if requested['Budget'] + requested['Reserve'] > requested['Context']:
+        if effective['Budget'] + effective['Reserve'] > effective['Context']:
             raise ValueError('Budget + Reserve must fit Context')
-        if requested['Prefill'] <= 0:
+        if backend == 'ninfer':
+            effective['Prefill'] = _effective_prefill(requested['Prefill'] or 1024, effective['Reserve'], block)
+        elif requested['Prefill'] <= 0:
             raise ValueError('Layerwise Prefill must be positive')
-        return dict(requested=requested, effective=effective, block_tokens=block, adjustments=[])
+        return dict(requested=requested, effective=effective, block_tokens=block,
+                    adjustments=_token_adjustments(requested, effective, block))
     requested = {k: values[k] for k in ('Budget', 'Reserve', 'SinkTokens', 'RecentTokens', 'Prefill', 'Context')}
     effective = dict(requested)
     minima = {'Budget': 2*block if backend=='radiance' else block if backend == 'llamacpp' else 128, 'Reserve': block,
@@ -94,19 +124,15 @@ def token_settings(backend, values, block=32, supplied=None):
     if backend in ('ninfer', 'polystrata', 'radiance'):
         prefill = requested['Prefill'] or (1024 if backend == 'ninfer' else 0)
         alignment = 128 if backend == 'ninfer' else 1
-        effective['Prefill'] = min(prefill, effective['Reserve']) // alignment * alignment
-        if effective['Prefill'] < alignment:
-            raise ValueError(f'Prefill and Reserve must allow at least {alignment} prefill tokens')
+        effective['Prefill'] = _effective_prefill(prefill, effective['Reserve'], alignment)
     if backend=='radiance' and effective['Reserve'] <= effective['Prefill']+block:
         raise ValueError('Radiance Reserve must exceed Prefill plus one 128-token block')
     if effective['SinkTokens'] + effective['RecentTokens'] > effective['Budget']:
         raise ValueError('SinkTokens + RecentTokens must fit Budget after alignment')
     if effective['Budget'] + effective['Reserve'] > effective['Context']:
         raise ValueError('Budget + Reserve must fit Context after alignment')
-    changes = [dict(parameter=k, requested=v, effective=effective[k],
-                    reason='prefill alignment and Reserve limit' if k == 'Prefill' else f'alignment to {block} tokens')
-               for k, v in requested.items() if effective[k] != v]
-    return dict(requested=requested, effective=effective, block_tokens=block, adjustments=changes)
+    return dict(requested=requested, effective=effective, block_tokens=block,
+                adjustments=_token_adjustments(requested, effective, block))
 
 
 def scoring_args(p):
@@ -212,6 +238,8 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
     for key, (low, high) in RANGES.items():
         if strategy(p) == 'layerwise' and key == 'Budget':
             low = 1  # The strategy-specific token check enforces native block alignment.
+        if backend == 'ninfer' and key == 'Prefill':
+            low = 0  # Native sentinel for automatic prefill.
         if key in p and not low <= p[key] <= high:
             raise ValueError(f'{key} must be in [{low}, {high}]')
     if p['VisionResidency'] not in ('resident', 'cpu') or p['DeviceProfile'] not in ('off', 'auto'):

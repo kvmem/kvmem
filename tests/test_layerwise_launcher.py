@@ -262,6 +262,30 @@ class LayerwiseLauncherTest(unittest.TestCase):
         cap = contract(); del cap['recall_strategies']['layerwise']['minimum_reserve_blocks']
         with self.assertRaisesRegex(ValueError, 'reserve floor'): require_launch_features(cap, p)
 
+    def test_ninfer_normalizes_layerwise_tokens_before_admission_and_argv(self):
+        for prefill, effective_prefill in ((4095, 4032), (4352, 4096), (0, 1024)):
+            with self.subTest(prefill=prefill):
+                requested = dict(Budget=20000, Reserve=4097, Prefill=prefill,
+                                 SinkTokens=1025, RecentTokens=0, Context=24064)
+                plan = build_plan(self.config(**requested))
+                tokens = plan['token_settings']
+                effective = dict(requested, Budget=19968, Reserve=4096, Prefill=effective_prefill, SinkTokens=1088)
+                self.assertEqual(tokens['requested'], requested)
+                self.assertEqual(tokens['effective'], effective)
+                self.assertEqual({item['parameter'] for item in tokens['adjustments']},
+                                 {'Budget', 'Reserve', 'SinkTokens', 'Prefill'})
+                for flag, key in (('--kvmem-budget', 'Budget'), ('--kvmem-gen-reserve', 'Reserve'),
+                                  ('--prefill-chunk', 'Prefill'), ('--kvmem-sink-tokens', 'SinkTokens'),
+                                  ('--kvmem-recent-tokens', 'RecentTokens')):
+                    self.assertEqual(plan['argv'][plan['argv'].index(flag) + 1], str(effective[key]))
+
+        with self.assertRaisesRegex(ValueError, 'at least 64 prefill tokens'):
+            build_plan(self.config(Prefill=63))
+        with self.assertRaisesRegex(ValueError, 'need 4160 tokens.*effective Budget is 4096'):
+            build_plan(self.config(Budget=4096, SinkTokens=1, RecentTokens=4095))
+        with self.assertRaisesRegex(ValueError, 'at least 64 tokens after alignment'):
+            build_plan(self.config(Reserve=63))
+
     def test_worker_contract_is_required_and_never_inherited_from_legacy(self):
         p = build_plan(self.config())['effective_parameters']
         for cap in ({}, {'query_scoring_revision': 999}, contract(available=False),

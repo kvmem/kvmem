@@ -459,7 +459,8 @@ class Controller:
                     result.setdefault('environment',{})['STRATA_API_KEY']=api_key if reveal_secrets else '<redacted>'
                 else:
                     argv.extend(['--api-key', api_key if reveal_secrets else '<redacted>'])
-            result['warnings'] = self.redact(run.stdout[:start].strip())
+            warnings = (run.stdout[:start].strip(), result.get('warnings', ''))
+            result['warnings'] = self.redact('\n'.join(filter(None, warnings)))
             native_argv = result.get('native_argv', argv)
             result['worker'] = self.worker_capabilities(native_argv[0], params['Backend'])
             require_launch_features(result['worker'], result.get('effective_parameters', params))
@@ -955,20 +956,6 @@ class Controller:
             plan = self.plan(clean)
             if plan['worker'].get('budget_planning_version') != 1:
                 raise ValueError('后端尚不支持自动调整 budget，请更新后端 / Update worker to support automatic budget planning')
-            effective = plan['token_settings']['effective']
-            # Omitted fields use the launcher's defaults. Only explicit values
-            # must remain unchanged; report validation uses the effective plan.
-            if any(key in p and effective[key] != p[key] for key in ('Reserve', 'Prefill')):
-                prefill = p.get('Prefill')
-                reserve = effective['Reserve']
-                if prefill is not None and prefill > reserve:
-                    raise ValueError(
-                        f'Prefill 不能超过 Gen Reserve。当前 Prefill 为 {prefill:,}，生效的 Gen Reserve 为 {reserve:,}。'
-                        '请先修改其中一项，自动调整只修改 Budget。 / '
-                        f'Prefill ({prefill:,}) cannot exceed the effective Gen Reserve ({reserve:,}). '
-                        'Adjust either setting first. Auto adjustment changes Budget only.'
-                    )
-                raise ValueError('请先通过检查配置对齐 gen reserve 和 prefill；自动调整只修改 budget / Align reserve and prefill first; auto adjustment changes budget only')
             result = validate_budget_plan(self._run_budget_plan(plan), p, plan['token_settings'])
             if self.budget_cancelled:
                 raise ValueError('Budget 测算已取消 / Budget planning cancelled')
