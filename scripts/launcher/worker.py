@@ -77,14 +77,17 @@ def probe_worker(worker, backend, environment=None):
     if backend == 'ninfer':
         if _identity(path) != identity:
             raise ValueError('Worker changed during capability probing; retry after the update completes')
-        # The native capability document predates these switches. With no
-        # artifact argument, successful parsing terminates before loading a model.
-        try:
-            switches = subprocess.run([str(path), '--thinking', '--no-preserve-thinking'], **probe)
-            value['explicit_thinking_switches'] = bool(
-                switches.returncode and 'artifact path is required' in switches.stderr)
-        except (OSError, subprocess.TimeoutExpired):
-            value['explicit_thinking_switches'] = False
+        # With no artifact argument, accepted options reach the missing-model
+        # check without loading a model or initializing a GPU.
+        for feature, args in (
+            ('explicit_thinking_switches', ('--thinking', '--no-preserve-thinking')),
+            ('host_embedding', ('--embedding-residency', 'host')),
+        ):
+            try:
+                switches = subprocess.run([str(path), *args], **probe)
+                value[feature] = bool(switches.returncode and 'artifact path is required' in switches.stderr)
+            except (OSError, subprocess.TimeoutExpired):
+                value[feature] = False
     digest = worker_digest(path)
     if _identity(path) != identity:
         raise ValueError('Worker changed during capability probing; retry after the update completes')
@@ -112,6 +115,10 @@ def require_launch_features(capabilities, parameters):
             and parameters.get('VisionResidency') == 'overlay' and not supports_vision_overlay(capabilities)):
         raise ValueError('所选 NInfer 不支持 GPU Vision Overlay，请更新后端。 / '
                          'This worker does not support NInfer GPU Vision overlay; update the backend.')
+    if (parameters.get('Backend') == 'ninfer' and parameters.get('EmbeddingPlacement') == 'ram'
+            and capabilities.get('host_embedding') is not True):
+        raise ValueError('所选 NInfer 不支持将文本嵌入表放在 RAM，请更新后端。 / '
+                         'This worker does not support NInfer host embeddings; update the backend.')
     if (parameters.get('Backend') == 'ninfer' and capabilities.get('explicit_thinking_switches') is False
             and (parameters.get('ThinkingMode') == 'on' or parameters.get('PreserveThinking') is False)):
         raise ValueError('当前 NInfer 无法在启动时显式开启思考或关闭历史思考保留，请更新后端。 / '

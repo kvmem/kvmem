@@ -183,12 +183,15 @@ class ConsoleTests(unittest.TestCase):
                         independent_graph_lrfu=True, signed_lrfu_hits=True)
         with patch.object(console.subprocess, 'run', side_effect=[
                 SimpleNamespace(returncode=0, stdout=json.dumps(contract)),
+                SimpleNamespace(returncode=1, stderr='ninfer-serve: artifact path is required'),
                 SimpleNamespace(returncode=1, stderr='ninfer-serve: artifact path is required')]) as run:
             first = console.Controller.worker_capabilities(self.controller, worker, 'ninfer')
             second = console.Controller.worker_capabilities(self.controller, worker, 'ninfer')
-            self.assertEqual(first, second); self.assertEqual(run.call_count, 2)
+            self.assertEqual(first, second); self.assertEqual(run.call_count, 3)
             self.assertTrue(first['explicit_thinking_switches'])
+            self.assertTrue(first['host_embedding'])
             self.assertEqual(len(first['executable_sha256']), 64)
+            self.assertEqual(run.call_args.args[0][1:], ['--embedding-residency', 'host'])
             self.assertEqual(run.call_args.kwargs['env']['CUDA_VISIBLE_DEVICES'], '-1')
         for value in ([], dict(contract, backend='llamacpp'), dict(contract, query_scoring_revision=1)):
             self.controller.worker_cache.clear()

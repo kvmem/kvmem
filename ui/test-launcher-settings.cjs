@@ -20,6 +20,14 @@ module.exports = async function settingsChecks({browser,base,info}) {
  }}};
  await page.route('**/api/launcher/info',route=>route.fulfill({json:fixture}));
  await page.route('**/api/launcher/status',route=>route.fulfill({json:{state:'stopped'}}));
+ let hostEmbedding=true;
+ await page.route('**/api/launcher/worker-capabilities',route=>{
+  const {Backend,Worker,RecallStrategy}=route.request().postDataJSON().parameters;
+  if(Backend!=='ninfer')return route.continue();
+  return route.fulfill({json:{schema_version:1,backend:Backend,strategy:RecallStrategy,
+   requested_worker:Worker,worker:{executable_sha256:'fixture',host_embedding:hostEmbedding,vision_overlay:true},
+   profile:{available:true}}});
+ });
  await page.route('**/api/launcher/browse-template',route=>route.fulfill({json:{path:'C:/templates/ui fixture.jinja'}}));
  await page.route('**/api/launcher/preview',async route=>{
   previews.push(route.request().postDataJSON().parameters);
@@ -63,6 +71,8 @@ module.exports = async function settingsChecks({browser,base,info}) {
   await page.getByRole('heading',{name:'启动配置',exact:true}).click();assert.equal(await tip.isVisible(),false,'outside click closes pinned help');
 
   await group(0);await field('DiskEnabled').uncheck();
+  assert.equal(await field('EmbeddingPlacement').inputValue(),'vram','NInfer defaults to GPU embeddings');
+  await field('EmbeddingPlacement').selectOption('ram');
   await disabled(['DiskPath','DiskMiB']);assert.equal(await field('DiskPath').inputValue(),'C:/cache/ui fixture');
   assert.equal(await field('DiskPath').getAttribute('required'),null,'disabled SSD does not require a path');
   assert.ok((await page.locator('[data-graph-recall]').textContent()).includes('历史检索'));
@@ -112,6 +122,7 @@ module.exports = async function settingsChecks({browser,base,info}) {
   assert.equal(draft.parameters.DraftPolicy,'adaptive');assert.equal(draft.parameters.NgramDrafts,8);assert.equal(draft.parameters.FastPrefill,true);
   assert.equal(draft.parameters.SpeculativeMode,'none');assert.equal(draft.parameters.DraftTokens,4);
   const inactive=await preview();
+  assert.equal(inactive.EmbeddingPlacement,'ram','host embedding reaches the launch payload');
   for(const key of ['DiskEnabled','DiskPath','DiskMiB','VisionTokens','VisionResidency','ThinkingBudget','ReasoningEffort','MtpEnabled','DraftTokens','DraftPolicy','NgramDrafts','NgramMinMatch','FastPrefill','StageLayers'])assert.equal(Object.hasOwn(inactive,key),false,'inactive override omitted: '+key);
   assert.equal(inactive.PreserveThinking,true,'preserving past reasoning is independent of the current thinking switch');
   assert.equal(Object.hasOwn(inactive,'NoLrfu'),false);assert.equal(inactive.ScoreAggregation,'max');assert.equal(inactive.Lrfu,true);assert.equal(inactive.ThinkingMode,'off');
@@ -124,17 +135,25 @@ module.exports = async function settingsChecks({browser,base,info}) {
   assert.equal(Object.hasOwn(template.draft.parameters,'ApiKey'),false,'secret excluded from personal template');
   assert.equal(template.draft.parameters.DiskEnabled,false);assert.equal(template.draft.parameters.NgramDrafts,8);
   assert.equal(template.draft.parameters.SpeculativeMode,'none');assert.equal(template.draft.parameters.DraftTokens,4);
+  hostEmbedding=false;
   await page.reload();await field('Backend').waitFor();
   assert.equal(await field('ApiKey').inputValue(),'','secret does not survive reload');
   await disabled(['DiskPath','DiskMiB','VisionTokens','VisionResidency','ThinkingBudget','DraftTokens','DraftPolicy','NgramDrafts','NgramMinMatch','FastPrefill','StageLayers']);
   assert.equal(await field('SpeculativeMode').inputValue(),'none','off remains off after reload despite a retained positive draft length');
   assert.equal(await field('VisionResidency').inputValue(),'cpu');assert.equal(await field('ThinkingBudget').inputValue(),'512');
   await group(0);await field('DiskEnabled').check();
+  await page.waitForFunction(()=>document.querySelector('[data-param=EmbeddingPlacement]')?.validationMessage.includes('不支持'));
+  assert.equal(await field('EmbeddingPlacement').inputValue(),'ram','old worker preserves the saved RAM choice');
+  assert.equal(await field('EmbeddingPlacement').locator('option[value=ram]').evaluate(el=>el.disabled),true);
+  await field('EmbeddingPlacement').selectOption('vram');
+  assert.equal(await field('EmbeddingPlacement').evaluate(el=>el.validity.valid),true);
+  hostEmbedding=true;
   await page.locator('[data-template-tab=mine]').click();await page.locator('[data-apply-template]').click();
   assert.equal(await field('DiskEnabled').isChecked(),false);
   await disabled(['DiskPath']);assert.equal(await field('DiskMiB').inputValue(),'512');
 
   await field('Backend').selectOption('llamacpp');
+  assert.equal(await field('EmbeddingPlacement').count(),0,'Embedding placement is unavailable for llama.cpp');
   await field('Model').fill('C:/models/ui fixture.gguf');await page.locator('[data-gpu-choice]').first().check();
   await disabled(['StageLayers','DraftPolicy']);
   await disabled(['Vision','VisionTokens','VisionResidency','ThinkingBudget','DraftTokens','ReasoningEffort','PreserveThinking'],false);
