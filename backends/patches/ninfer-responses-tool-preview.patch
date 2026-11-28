@@ -1,0 +1,699 @@
+diff --git a/docs/serving.md b/docs/serving.md
+index b16a81b0dc1f90ab310febbe35210edf716e0cd1..312f1a8a9653f8ea31b2ae7e660e45bcc90e0044 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -2345,11 +2345,20 @@ For `include:["reasoning.encrypted_content"]`, the in-progress
+ not available yet. `response.output_item.done` and the terminal Response output contain the same
+ complete raw mirror. A response with no reasoning Item emits no encrypted placeholder.
+ 
+-Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
+-and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
+-does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
+-streams immediately; only an ambiguous tool-call marker prefix or the structured tool region is
+-held. Tool markup that never opens a function is flushed back as ordinary text without losing bytes.
++Function arguments use `response.function_call_arguments.delta` and `.done`. For ordinary,
++non-strict Qwen tools without grammar constraints, streaming Responses preview recognizable
++parameters of the first tool call as decoding progresses. The preview escapes recognized values
++as JSON strings, so it can show temporary string types or repeated fields. The existing terminal
++parser remains authoritative: `response.function_call_arguments.done.arguments`,
++`response.output_item.done.item.arguments`, and the terminal Response contain the same normalized
++arguments. A client must use the finished item, not the preview, to execute a tool. IDs and output
++indices are stable across the events; an unmatched provisional item is not completed as a tool call.
++
++The preview is enabled by default for streaming Responses requests. Set `kvmem_tool_preview: false`
++in the request body for terminal-only tool arguments (whose concatenated deltas equal the final
++arguments). Later tool calls and other tool syntaxes retain terminal-only behavior. Responses SSE
++has no Chat Completions `[DONE]` sentinel. Ordinary answer text still streams immediately; tool
++markup that never opens a function is returned as ordinary text by the existing decoder.
+ 
+ ### Local response state and resources
+ 
+diff --git a/include/ninfer/request.h b/include/ninfer/request.h
+index afcb2065b44f0a27fbd42bd6da9a49ba09d32c26..646ae6bd56dacc770df9176c4b9010277f69e6ac 100644
+--- a/include/ninfer/request.h
++++ b/include/ninfer/request.h
+@@ -228,6 +228,7 @@ struct OutputOptions {
+     // Presentation constraint supplied by the protocol adapter. It bounds only Qwen's emitted
+     // function-name grammar; it does not require the name to match a currently declared tool.
+     std::uint32_t tool_name_max_length = 128;
++    bool preview_tool_arguments = false; // Responses permits authoritative terminal replacement.
+ };
+ 
+ struct NgramSessionHints {
+@@ -644,12 +645,22 @@ struct BranchResult {
+     TokenLogprob first;
+ };
+ 
++// Provisional tool output from committed decoder bytes. The terminal GenerationResult
++// remains authoritative. A missing terminal call (e.g. at a token limit) cannot be executed.
++struct ToolStreamEvent {
++    enum class Kind : std::uint8_t { Start, Arguments };
++    Kind kind;
++    std::uint32_t index;
++    std::string text; // function name on Start; JSON prefix fragment on Arguments
++};
++
+ struct OutputDelta {
+     OutputChannel channel = OutputChannel::Content;
+     std::string text;
+     // The log probability records of the content tokens whose text this delta publishes, in token
+     // order. Empty unless the request asked for logprobs.
+     std::vector<TokenLogprob> logprobs;
++    std::vector<ToolStreamEvent> tool_events;
+ };
+ 
+ // Exact prompt accounting selected at admission. Streaming consumers receive this once before any
+diff --git a/src/models/qwen3_5/frontend/output_session.cpp b/src/models/qwen3_5/frontend/output_session.cpp
+index 4e748be594abce1879f4fea1889263aeea970be2..767cd841db1c7ef0824407da7cae94d09d8cac26 100644
+--- a/src/models/qwen3_5/frontend/output_session.cpp
++++ b/src/models/qwen3_5/frontend/output_session.cpp
+@@ -577,6 +577,7 @@ public:
+         if (thinking.budget && *thinking.budget == 0) {
+             throw std::invalid_argument("thinking budget must be positive");
+         }
++        preview_tool_arguments    = output.preview_tool_arguments;
+         requested_budget          = thinking.budget;
+         early_close_available     = thinking.early_close_available;
+         answer_now                = thinking.answer_now;
+@@ -707,6 +708,7 @@ public:
+     std::vector<TokenLogprob> preview_logprobs;
+     std::vector<TokenLogprob> committed_logprobs;
+     fi::ToolCallOutputDecoder tool_call_output;
++    bool preview_tool_arguments = false;
+     std::vector<GeneratedToolCall> tool_calls;
+     ToolCallParseDiagnostics tool_call_parse;
+     // Free tool output keeps the open thinking, so a turn that ends inside it can still return the
+@@ -1943,6 +1945,10 @@ PublishedOutput OutputSession::commit_tokens() {
+                          : impl_->deepseek_tools ? impl_->deepseek_tools->feed(delta.text)
+                          : impl_->inkling_tools  ? impl_->inkling_tools->feed(delta.text)
+                                                  : impl_->tool_call_output.feed(delta.text);
++            if (impl_->preview_tool_arguments && !impl_->gemma_tools && !impl_->flint_tools &&
++                !impl_->deepseek_tools && !impl_->inkling_tools) {
++                delta.tool_events = impl_->tool_call_output.take_preview_events();
++            }
+         } else if (delta.channel == OutputChannel::Reasoning && impl_->collect_open_reasoning) {
+             impl_->open_reasoning.append(delta.text);
+         }
+diff --git a/src/models/qwen3_5/frontend/tool_call_parser.cpp b/src/models/qwen3_5/frontend/tool_call_parser.cpp
+index 3504707a2982ceeb1047cc2b69e421d16acb8803..91cb1b24aa887a03e0f5d5704d09d116c2fa031b 100644
+--- a/src/models/qwen3_5/frontend/tool_call_parser.cpp
++++ b/src/models/qwen3_5/frontend/tool_call_parser.cpp
+@@ -1354,6 +1354,151 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
+     return visible;
+ }
+ 
++// Responses has an authoritative terminal item. This scanner publishes provisional JSON
++// string values, without changing the held region, schema policy, or the terminal parser.
++std::vector<ToolStreamEvent> ToolCallOutputDecoder::take_preview_events() {
++    using Kind = ToolStreamEvent::Kind;
++    if (!contract_ || contract_->constrained || !saw_tool_marker_ || finished_) return {};
++    const std::string_view region = tool_region_;
++    std::vector<ToolStreamEvent> events;
++    const auto disable = [&] { preview_phase_ = PreviewPhase::Disabled; };
++    const auto emit = [&](std::string text) {
++        if (!events.empty() && events.back().kind == Kind::Arguments) events.back().text += text;
++        else events.push_back({Kind::Arguments, 0, std::move(text)});
++    };
++    const auto pending_opener = [](std::string_view rest, const auto& forms) {
++        return std::any_of(std::begin(forms), std::end(forms),
++                           [&](const auto& tag) { return tag.open.starts_with(rest); });
++    };
++    // Do not commit a delimiter when it might be literal content or split across token batches.
++    enum class Boundary { No, Wait, Yes };
++    const auto following_boundary = [&](std::size_t pos) {
++        skip_format_whitespace(region, pos);
++        auto rest = region.substr(pos);
++        if (tag_form_at(region, pos, kParameterForms)) return Boundary::Yes;
++        if (pending_opener(rest, kParameterForms)) return Boundary::Wait;
++        if (rest.starts_with(preview_function_close_)) {
++            pos += preview_function_close_.size();
++            skip_format_whitespace(region, pos);
++            rest = region.substr(pos);
++        } else if (preview_function_close_.starts_with(rest)) {
++            return Boundary::Wait;
++        }
++        for (const auto tag : {kToolClose, kFunctionCallsClose, kToolOpen, kThinkOpen, kThinkClose}) {
++            if (rest.starts_with(tag)) return Boundary::Yes;
++            if (tag.starts_with(rest)) return Boundary::Wait;
++        }
++        if (tag_form_at(region, pos, kFunctionForms)) return Boundary::Yes;
++        return pending_opener(rest, kFunctionForms) ? Boundary::Wait : Boundary::No;
++    };
++    while (preview_phase_ != PreviewPhase::Disabled) {
++        if (preview_phase_ == PreviewPhase::Header) {
++            std::size_t pos = 0;
++            skip_format_whitespace(region, pos);
++            auto rest = region.substr(pos);
++            if (rest.starts_with(kToolOpen)) pos += kToolOpen.size();
++            else if (rest.starts_with(kFunctionCallsOpen)) pos += kFunctionCallsOpen.size();
++            else if (kToolOpen.starts_with(rest) || kFunctionCallsOpen.starts_with(rest)) break;
++            skip_format_whitespace(region, pos);
++            rest = region.substr(pos);
++            const auto* form = tag_form_at(region, pos, kFunctionForms);
++            if (!form) {
++                if (!pending_opener(rest, kFunctionForms)) disable();
++                break;
++            }
++            std::size_t end;
++            const auto name = tag_name(tag_header(region, pos, *form, end));
++            if (end == std::string_view::npos) {
++                if (rest.size() > 1024) disable();
++                break;
++            }
++            const auto* tool = find_tool_contract(*contract_, name);
++            if (!valid_function_name(name, max_tool_name_length_) || !tool || tool->strict ||
++                !tool->unambiguous) { disable(); break; }
++            preview_name_ = name;
++            preview_function_close_ = form->close;
++            preview_cursor_ = end + 1;
++            preview_phase_ = PreviewPhase::Parameter;
++        } else if (preview_phase_ == PreviewPhase::Parameter) {
++            skip_format_whitespace(region, preview_cursor_);
++            const auto rest = region.substr(preview_cursor_);
++            if (rest.starts_with(preview_function_close_)) {
++                if (preview_started_) emit("}");
++                disable();
++                break;
++            }
++            const auto* form = tag_form_at(region, preview_cursor_, kParameterForms);
++            if (!form) {
++                if (!pending_opener(rest, kParameterForms) && !preview_function_close_.starts_with(rest)) disable();
++                break;
++            }
++            std::size_t end;
++            const auto key = tag_name(tag_header(region, preview_cursor_, *form, end));
++            if (end == std::string_view::npos) {
++                if (rest.size() > 1024) disable();
++                break;
++            }
++            if (key.empty()) { disable(); break; }
++            auto start = end + 1;
++            const auto suffix = region.substr(start);
++            if (suffix.empty() || suffix == "\r") break;
++            if (suffix.starts_with("\r\n")) start += 2;
++            else if (suffix.starts_with('\n')) ++start;
++            if (!preview_started_) events.push_back({Kind::Start, 0, preview_name_});
++            // Repeated names in the preview are intentional; only done is authoritative.
++            emit((preview_started_ ? "," : "{") + encode_json_string(key) + ":\"");
++            preview_started_ = true;
++            preview_parameter_open_ = form->open;
++            preview_parameter_close_ = form->close;
++            preview_depth_ = 1;
++            preview_cursor_ = start;
++            preview_phase_ = PreviewPhase::Value;
++        } else {
++            const auto begin = preview_cursor_;
++            std::size_t after_close = std::string_view::npos;
++            const TagForm form{preview_parameter_open_, preview_parameter_close_};
++            while (preview_cursor_ < region.size()) {
++                const auto rest = region.substr(preview_cursor_);
++                const std::size_t newline = rest.starts_with("\r\n") ? 2 : rest.starts_with('\n') ? 1 : 0;
++                const auto possible_close = rest.substr(newline);
++                if (possible_close.starts_with(form.close) && preview_depth_ == 1) {
++                    const auto end = preview_cursor_ + newline + form.close.size();
++                    const auto boundary = following_boundary(end);
++                    if (boundary == Boundary::Wait) break;
++                    if (boundary == Boundary::Yes) { after_close = end; break; }
++                }
++                if ((possible_close.size() < form.close.size() &&
++                     form.close.starts_with(possible_close)) || rest == "\r") break;
++                if (rest.starts_with(form.close) && preview_depth_ > 1) {
++                    --preview_depth_;
++                    preview_cursor_ += form.close.size();
++                    continue;
++                }
++                if (opens_tag(region, preview_cursor_, form)) {
++                    std::size_t end;
++                    const auto nested_key = tag_name(tag_header(region, preview_cursor_, form, end));
++                    if (end == std::string_view::npos && rest.size() <= 1024) break;
++                    if (!nested_key.empty() && end != std::string_view::npos) {
++                        ++preview_depth_;
++                        preview_cursor_ = end + 1;
++                        continue;
++                    }
++                } else if (form.open.starts_with(rest)) break;
++                ++preview_cursor_;
++            }
++            if (preview_cursor_ > begin) {
++                auto encoded = encode_json_string(region.substr(begin, preview_cursor_ - begin));
++                emit(encoded.substr(1, encoded.size() - 2));
++            }
++            if (after_close == std::string_view::npos) break;
++            emit("\"");
++            preview_cursor_ = after_close;
++            preview_phase_ = PreviewPhase::Parameter;
++        }
++    }
++    return events;
++}
++
+ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reason,
+                                                               std::string_view open_reasoning) {
+     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
+diff --git a/src/models/qwen3_5/frontend/tool_call_parser.h b/src/models/qwen3_5/frontend/tool_call_parser.h
+index 484b7db52c2ed10510e0f7ef8b9a86adc74024b6..5d61c307ac3e1957e73a43bda704779f0add252d 100644
+--- a/src/models/qwen3_5/frontend/tool_call_parser.h
++++ b/src/models/qwen3_5/frontend/tool_call_parser.h
+@@ -154,6 +154,8 @@ public:
+                           std::size_t max_tool_name_length);
+ 
+     [[nodiscard]] std::string feed(std::string_view text);
++    // Read provisional fragments from committed bytes without changing terminal parsing.
++    [[nodiscard]] std::vector<ToolStreamEvent> take_preview_events();
+     // `open_reasoning` is the thinking of a turn that ended without closing it. When the turn ended
+     // on the model's stop token and no content was fed, complete declared calls that end that
+     // thinking become the structured turn.
+@@ -177,6 +179,16 @@ private:
+     bool fed_content_                 = false;
+     bool forced_                      = false;
+     bool finished_                    = false;
++
++    enum class PreviewPhase { Header, Parameter, Value, Disabled };
++    PreviewPhase preview_phase_ = PreviewPhase::Header;
++    std::size_t preview_cursor_ = 0;
++    std::size_t preview_depth_ = 0;
++    std::string preview_name_;
++    std::string_view preview_function_close_;
++    std::string_view preview_parameter_close_;
++    std::string_view preview_parameter_open_;
++    bool preview_started_ = false;
+ };
+ 
+ } // namespace ninfer::models::qwen3_5::frontend
+diff --git a/src/serve/generation_service.cpp b/src/serve/generation_service.cpp
+index 087f4003206138a8d5b79b9b6632bc3060199902..ad17f84d633a52665eb12d8edaeb1bb6ee8e7259 100644
+--- a/src/serve/generation_service.cpp
++++ b/src/serve/generation_service.cpp
+@@ -434,8 +434,10 @@ public:
+             if (!delta.text.empty() && sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
+             return;
+         }
+-        if (delta.text.empty() && delta.logprobs.empty()) { return; }
+-        if (sink_->on_content) { sink_->on_content(delta.text, delta.logprobs); }
++        if (sink_->on_content && (!delta.text.empty() || !delta.logprobs.empty()))
++            sink_->on_content(delta.text, delta.logprobs);
++        if (sink_->on_tool)
++            for (const auto& event : delta.tool_events) sink_->on_tool(event);
+     }
+ 
+ private:
+@@ -914,6 +916,8 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
+         prepared.preparation   = prompt.preparation_stats();
+         prepared.prepare_seconds =
+             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
++        request_options.output.preview_tool_arguments = request.preview_tool_arguments &&
++            consumer_mode == GenerationConsumerMode::Streaming;
+         staged.submission = ninfer::GenerationSubmission{
+             .prompt           = std::move(prompt),
+             .options          = std::move(request_options),
+diff --git a/src/serve/generation_service.h b/src/serve/generation_service.h
+index 61bfce20e01ae54a26dc3803e855cfafd00d80cb..488f3d9132617fba24918505593371730755bd32 100644
+--- a/src/serve/generation_service.h
++++ b/src/serve/generation_service.h
+@@ -103,6 +103,7 @@ struct StreamSink {
+                        std::span<const ninfer::TokenLogprob> logprobs)>
+         on_content;
+     std::function<void(const std::string& delta_text)> on_reasoning;
++    std::function<void(const ninfer::ToolStreamEvent& event)> on_tool;
+     std::function<bool()> is_cancelled;
+ };
+ 
+diff --git a/src/serve/openai_responses.h b/src/serve/openai_responses.h
+index b5415366f415a06797bbfe19b2c3ec994c02ccb9..de0de7149f3cd7c37b431f1a84029853743a44ce 100644
+--- a/src/serve/openai_responses.h
++++ b/src/serve/openai_responses.h
+@@ -57,6 +57,7 @@ struct OpenAIResponsesCreateRequest {
+     bool parallel_tool_calls                 = true;
+     bool store                               = true;
+     bool stream                              = false;
++    bool tool_preview                        = true;
+     bool include_reasoning_encrypted_content = false;
+ };
+ 
+@@ -120,6 +121,7 @@ public:
+     // A content delta event carries the logprob records of the tokens whose text it publishes.
+     std::vector<std::string> content_delta(const std::string& text,
+                                            std::span<const ninfer::TokenLogprob> logprobs = {});
++    std::vector<std::string> tool_delta(const ninfer::ToolStreamEvent& event);
+     OpenAIResponsesStreamFinish finish(const GenerationOutcome& outcome);
+     std::string terminal(const BuiltOpenAIResponse& response);
+     std::string failed(const ApiError& error);
+diff --git a/src/serve/openai_responses_http.cpp b/src/serve/openai_responses_http.cpp
+index 06289101714410659f03e2dd27ee5e504fcf1574..07fdfb5bd7abbb8001a982b7576b137e4d284832 100644
+--- a/src/serve/openai_responses_http.cpp
++++ b/src/serve/openai_responses_http.cpp
+@@ -252,6 +252,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
+         request.prompt.model       = lease.model();
+         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
+                                                    request.store);
++        resolved.generation.preview_tool_arguments = request.stream && request.tool_preview;
+         resolved.generation.ngram_session = resolve_ngram_session(req, body, options_);
+     } catch (const ApiException& exception) {
+         write_openai_error(res, responses_error(exception.error()));
+@@ -432,6 +433,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
+                             return stream->encoder->content_delta(text, logprobs);
+                         });
+                     };
++                    output.on_tool = [&](const ninfer::ToolStreamEvent& event) {
++                        render_and_write(transport, [&] { return stream->encoder->tool_delta(event); });
++                    };
+                     output.is_cancelled = [&] { return transport.poll(); };
+ 
+                     outcome = service->run(stream->prepared, &output);
+diff --git a/src/serve/openai_responses_request.cpp b/src/serve/openai_responses_request.cpp
+index 5863abb4be7dc58730e2afa915231af6a5b550c5..620207ce265c08d00c91f4bb43f525f209a083f8 100644
+--- a/src/serve/openai_responses_request.cpp
++++ b/src/serve/openai_responses_request.cpp
+@@ -1252,6 +1252,7 @@ void validate_common_top_level(const Json& body, bool create) {
+                                                                   "instructions",
+                                                                   "lora",
+                                                                   "kvmem",
++                                                                  "kvmem_tool_preview",
+                                                                   "max_output_tokens",
+                                                                   "max_tool_calls",
+                                                                   "metadata",
+@@ -1334,6 +1335,7 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
+     out.parallel_tool_calls     = parsed.parallel_tool_calls;
+     out.store                   = optional_bool(body, "store", true);
+     out.stream                  = optional_bool(body, "stream", false);
++    out.tool_preview            = optional_bool(body, "kvmem_tool_preview", true);
+     out.prompt.generation.thinking_budget = parse_thinking_budget_field(body);
+     out.prompt.generation.bad_words       = parse_bad_words_field(body);
+     validate_metadata(body, out.metadata);
+diff --git a/src/serve/openai_responses_response.cpp b/src/serve/openai_responses_response.cpp
+index a496b89c3e2e259314c7b7e93b62acff221db8b1..7c5726cc02d260cf47c9466e7e136380009d9c66 100644
+--- a/src/serve/openai_responses_response.cpp
++++ b/src/serve/openai_responses_response.cpp
+@@ -403,6 +403,8 @@ public:
+     std::string content_text;
+     std::vector<ninfer::TokenLogprob> content_logprobs;
+     ItemIds ids;
++    std::string preview_name;
++    int preview_output_index = -1;
+ };
+ 
+ OpenAIResponsesEventStream::OpenAIResponsesEventStream(std::string response_id,
+@@ -470,6 +472,32 @@ OpenAIResponsesEventStream::content_delta(const std::string& text,
+     return events;
+ }
+ 
++std::vector<std::string> OpenAIResponsesEventStream::tool_delta(const ninfer::ToolStreamEvent& delta) {
++    using Kind = ninfer::ToolStreamEvent::Kind;
++    if (!impl_->started || impl_->finish_built || delta.index != 0) {
++        throw std::logic_error("invalid Responses tool preview event state");
++    }
++    if (delta.kind == Kind::Start) {
++        if (impl_->preview_output_index >= 0) throw std::logic_error("duplicate Responses tool preview");
++        auto events = impl_->close_reasoning(impl_->reasoning_text);
++        impl_->preview_name = delta.text;
++        impl_->preview_output_index = impl_->next_output_index++;
++        impl_->ids.function_calls.push_back(new_openai_response_item_id("fc"));
++        impl_->ids.call_ids.push_back(new_openai_response_item_id("call"));
++        Json item = {{"id", impl_->ids.function_calls.front()}, {"type", "function_call"},
++                     {"status", "in_progress"}, {"call_id", impl_->ids.call_ids.front()}, {"arguments", ""}};
++        add_wire_function_identity(item, impl_->request, impl_->preview_name);
++        events.push_back(sse(impl_->event("response.output_item.added",
++            Json{{"output_index", impl_->preview_output_index}, {"item", item}})));
++        return events;
++    }
++    if (delta.kind != Kind::Arguments || delta.text.empty()) return {};
++    if (impl_->preview_output_index < 0) throw std::logic_error("Responses preview has no item");
++    return {sse(impl_->event("response.function_call_arguments.delta",
++        Json{{"item_id", impl_->ids.function_calls.front()}, {"output_index", impl_->preview_output_index},
++             {"delta", delta.text}}))};
++}
++
+ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationOutcome& outcome) {
+     if (!impl_->started || impl_->finish_built) {
+         throw std::logic_error("invalid Responses stream finish state");
+@@ -478,6 +506,12 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
+     OpenAIResponsesStreamFinish finished;
+     const std::string status = response_status(outcome.finish_reason);
+     const char* item_status  = status == "completed" ? "completed" : "incomplete";
++    const bool preview = impl_->preview_output_index >= 0;
++    if (preview && (outcome.tool_calls.empty() || outcome.tool_calls.front().name != impl_->preview_name)) {
++        // A client's live slot binds its name and id at item.added. Never close it with another
++        // tool's parameters or report success for a provisional call the native parser rejected.
++        throw std::logic_error("Responses tool preview identity disagrees with the terminal parser");
++    }
+ 
+     auto append = [&](std::vector<std::string> events) {
+         finished.events_before_terminal.insert(finished.events_before_terminal.end(),
+@@ -519,27 +553,35 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
+ 
+     impl_->ids.function_calls.reserve(outcome.tool_calls.size());
+     impl_->ids.call_ids.reserve(outcome.tool_calls.size());
+-    for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
+-        const std::string item_id = new_openai_response_item_id("fc");
+-        const std::string call_id = new_openai_response_item_id("call");
+-        impl_->ids.function_calls.push_back(item_id);
+-        impl_->ids.call_ids.push_back(call_id);
+-        const int output_index = impl_->next_output_index++;
+-        Json added_item        = {{"id", item_id},
+-                                  {"type", "function_call"},
+-                                  {"status", "in_progress"},
+-                                  {"call_id", call_id},
+-                                  {"arguments", ""}};
+-        add_wire_function_identity(added_item, impl_->request, call.name);
+-        finished.events_before_terminal.push_back(
+-            sse(impl_->event("response.output_item.added",
+-                             Json{{"output_index", output_index}, {"item", added_item}})));
+-        if (!call.arguments_json.empty()) {
+-            finished.events_before_terminal.push_back(sse(impl_->event(
+-                "response.function_call_arguments.delta", Json{{"item_id", item_id},
+-                                                               {"output_index", output_index},
+-                                                               {"delta", call.arguments_json}})));
++    for (std::size_t i = 0; i < outcome.tool_calls.size(); ++i) {
++        const auto& call = outcome.tool_calls[i];
++        const bool reused = preview && i == 0;
++        const std::string item_id = reused ? impl_->ids.function_calls.front() : new_openai_response_item_id("fc");
++        const std::string call_id = reused ? impl_->ids.call_ids.front() : new_openai_response_item_id("call");
++        const int output_index = reused ? impl_->preview_output_index : impl_->next_output_index++;
++        if (!reused) {
++            impl_->ids.function_calls.push_back(item_id);
++            impl_->ids.call_ids.push_back(call_id);
+         }
++        if (!reused) {
++            Json added_item        = {{"id", item_id},
++                                      {"type", "function_call"},
++                                      {"status", "in_progress"},
++                                      {"call_id", call_id},
++                                      {"arguments", ""}};
++            add_wire_function_identity(added_item, impl_->request, call.name);
++            finished.events_before_terminal.push_back(
++                sse(impl_->event("response.output_item.added",
++                                 Json{{"output_index", output_index}, {"item", added_item}})));
++            if (!call.arguments_json.empty()) {
++                finished.events_before_terminal.push_back(sse(impl_->event(
++                    "response.function_call_arguments.delta", Json{{"item_id", item_id},
++                                                                   {"output_index", output_index},
++                                                                   {"delta", call.arguments_json}})));
++            }
++        }
++        // The native terminal parser remains authoritative, even when its normalized JSON is
++        // not an append-only extension of the preview (e.g. last duplicate parameter wins).
+         Json arguments_done = {{"item_id", item_id},
+                                {"output_index", output_index},
+                                {"arguments", call.arguments_json}};
+@@ -559,6 +601,12 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
+ 
+     finished.response = build_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime,
+                                        outcome, impl_->ids);
++    // A message that first appears at finish can be announced after a previewed tool. Keep the
++    // terminal body's output order consistent with each item’s previously assigned SSE index.
++    if (preview && impl_->message_index > impl_->preview_output_index) {
++        auto& items = finished.response.body.at("output");
++        std::swap(items.at(impl_->message_index), items.at(impl_->preview_output_index));
++    }
+     return finished;
+ }
+ 
+diff --git a/src/serve/request.h b/src/serve/request.h
+index 8ba307c8626a7a920a88baa46402581b760d3712..fa875a556578f6cc262785c6d60718f9c93eb9c6 100644
+--- a/src/serve/request.h
++++ b/src/serve/request.h
+@@ -250,6 +250,8 @@ struct GenerationRequest {
+     bool reset_generated_history = false;
+     std::vector<ToolDefinition> tools;
+     std::size_t tool_name_max_length = kMaximumToolNameLength;
++    // Set only by wire adapters that consume native tool argument fragments.
++    bool preview_tool_arguments = false; // Responses permits authoritative terminal replacement.
+     ToolChoice tool_choice;
+     std::vector<std::string> stop_strings;
+     bool stop_strings_apply_to_reasoning = false;
+diff --git a/tests/cmake/ProductTests.cmake b/tests/cmake/ProductTests.cmake
+index bcdcf2e0b54f9887cce2bcd00442416c87a8458a..7aaa35f14bf26873feb2e8fc0862192620616854 100644
+--- a/tests/cmake/ProductTests.cmake
++++ b/tests/cmake/ProductTests.cmake
+@@ -46,6 +46,11 @@ ninfer_add_test(ninfer_openai_responses_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_responses.cpp"
+   LIBRARIES ninfer_serve)
+ 
++ninfer_add_test(ninfer_responses_tool_preview_test STANDALONE
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_responses_tool_preview.cpp"
++  LIBRARIES ninfer_serve ninfer_model_runtime ninfer_text)
++ninfer_stage_runtime_dlls(ninfer_responses_tool_preview_test)
++
+ ninfer_add_test(ninfer_openai_responses_store_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_responses_store.cpp"
+   LIBRARIES ninfer_serve)
+diff --git a/tests/test_responses_tool_preview.cpp b/tests/test_responses_tool_preview.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7c27cd9021aabe3627f016af32e26b61f409b47
+--- /dev/null
++++ b/tests/test_responses_tool_preview.cpp
+@@ -0,0 +1,154 @@
++#include "models/qwen3_5/frontend/tool_call_parser.h"
++#include "serve/generation_service.h"
++#include "serve/openai_responses.h"
++
++#include <iostream>
++#include <stdexcept>
++#include <string_view>
++
++namespace {
++using namespace ninfer;
++using namespace ninfer::serve;
++namespace frontend = ninfer::models::qwen3_5::frontend;
++
++void check(bool ok, const char* message) {
++    if (!ok) throw std::runtime_error(message);
++}
++
++std::string join(const std::vector<std::string>& frames) {
++    std::string out;
++    for (const auto& frame : frames) out += frame;
++    return out;
++}
++
++void test_responses_preview_repair(bool dump) {
++    const std::vector<std::string> declarations = {
++        R"({"type":"function","function":{"name":"capture","parameters":{"type":"object","properties":{"payload":{"type":"string"},"count":{"type":"integer"}}}}})"};
++    const auto contract = frontend::select_tool_call_contract(
++        frontend::build_tool_call_output_contract(declarations, true), {});
++    check(!contract->constrained, "fixture must use ordinary auto");
++    frontend::ToolCallOutputDecoder decoder(contract, 64);
++    OpenAIResponsesCreateRequest request;
++    request.prompt.model = "test";
++    OpenAIResponsesEventStream stream("resp_preview", 1, std::move(request), {});
++    const auto start = join(stream.start());
++    const auto feed = [&](std::string_view bytes) {
++        check(decoder.feed(bytes).empty(), "tool markup escaped into content");
++        std::string frames;
++        for (const auto& event : decoder.take_preview_events()) frames += join(stream.tool_delta(event));
++        return frames;
++    };
++    const auto first = feed("<tool_call>\n<function=capture>\n<parameter=payload>\nfirst preview");
++    check(first.find("response.output_item.added") != std::string::npos &&
++              first.find("first preview") != std::string::npos,
++          "Responses did not publish the parameter before it closed");
++    const auto second = feed(" continues\n</par");
++    check(second.find(" continues") != std::string::npos,
++          "Responses did not publish the second committed fragment");
++    const auto third = feed("ameter>\n<parameter=count>\n\n</parameter>\n"
++               "<parameter=payload>\nfinal replacement\n</parameter>\n</function>\n</tool_call>");
++    auto terminal = decoder.finish();
++    check(terminal.tool_calls.size() == 1 && terminal.diagnostics.duplicate_parameters_repaired == 1 &&
++              terminal.diagnostics.empty_arguments_omitted == 1 &&
++              terminal.tool_calls[0].arguments_json == R"({"payload":"final replacement"})",
++          "legacy repair or normalization was lost");
++    GenerationOutcome outcome;
++    outcome.finish_reason = FinishReason::StopToken;
++    outcome.tool_calls = std::move(terminal.tool_calls);
++    const auto result = stream.finish(outcome);
++    const auto frames = join(result.events_before_terminal);
++    check(result.events_before_terminal.size() == 2 &&
++              frames.find("response.function_call_arguments.done") != std::string::npos &&
++              frames.find("response.output_item.done") != std::string::npos &&
++              frames.find("final replacement") != std::string::npos &&
++              frames.find("first preview") == std::string::npos &&
++              result.response.body.at("output").at(0).at("arguments") == outcome.tool_calls[0].arguments_json,
++          "Responses did not close the preview with authoritative repaired arguments");
++    if (dump) std::cout << start << first << second << third << frames << stream.terminal(result.response);
++}
++
++void test_responses_preview_multiple_parameters() {
++    const std::vector<std::string> declarations = {
++        R"({"function":{"name":"capture","parameters":{"type":"object","properties":{"description":{"type":"string"},"flag":{"type":"boolean"},"command":{"type":"string"},"options":{"type":"object"}}}}})"};
++    const auto contract = frontend::select_tool_call_contract(
++        frontend::build_tool_call_output_contract(declarations, true), {});
++    frontend::ToolCallOutputDecoder decoder(contract, 64);
++    std::string preview;
++    std::size_t starts = 0;
++    const auto feed = [&](std::string_view bytes) {
++        check(decoder.feed(bytes).empty(), "markup escaped the tool region");
++        std::string fragment;
++        for (const auto& event : decoder.take_preview_events()) {
++            if (event.kind == ToolStreamEvent::Kind::Start) {
++                check(event.index == 0 && event.text == "capture", "wrong Responses item identity");
++                ++starts;
++            } else if (event.kind == ToolStreamEvent::Kind::Arguments) fragment += event.text;
++        }
++        preview += fragment;
++        return fragment;
++    };
++    (void)feed("<tool_call>\n<function=capture>\n<parameter=description>short</parameter>\n<para");
++    check(feed("meter=flag>TRUE</parameter>\n<parameter=command>\r").find("\"flag\":\"TRUE") != std::string::npos,
++          "non-string value did not use provisional string form");
++    check(feed("\nfirst command fragment").find("first command fragment") != std::string::npos,
++          "third parameter did not stream while incomplete");
++    check(feed(" </parameter> literal </param").find("literal") != std::string::npos,
++          "literal closing tag broke the third parameter");
++    check(feed("eter>\n<param name='options'>\n{\"a\": ").find("options") != std::string::npos,
++          "later parameter did not start after a literal and a split closer");
++    check(feed("[1,2]").find("[1,2]") != std::string::npos, "object body waited until terminal");
++    (void)feed("}\n</param><parameter=unknown>19</parameter></function></tool_call>");
++    check(starts == 1, "did not preserve one provisional item");
++    const auto parsed_preview = nlohmann::json::parse(preview);
++    check(parsed_preview.at("flag") == "TRUE" && parsed_preview.at("options") == R"({"a": [1,2]})" &&
++              parsed_preview.at("command") == "first command fragment </parameter> literal " &&
++              parsed_preview.at("unknown") == "19",
++          "preview did not preserve escaped raw strings in all fields");
++    const auto terminal = decoder.finish();
++    check(terminal.tool_calls.size() == 1, "multi-parameter terminal call was lost");
++    const auto exact = nlohmann::json::parse(terminal.tool_calls[0].arguments_json);
++    check(exact.at("flag") == true && exact.at("options").at("a") == nlohmann::json::array({1, 2}) &&
++              exact.at("unknown") == 19 && exact.at("command") == parsed_preview.at("command"),
++          "original terminal typing/repair changed");
++}
++void test_preview_request_and_unmatched_item() {
++    const RequestJson base = {{"model", "test"}, {"input", "hello"}, {"stream", true}};
++    check(parse_openai_responses_create_request(base, {}).tool_preview, "preview did not default on");
++    auto request = base;
++    request["kvmem_tool_preview"] = false;
++    check(!parse_openai_responses_create_request(request, {}).tool_preview, "opt-out ignored");
++    request["kvmem_tool_preview"] = "false";
++    bool invalid = false;
++    try { (void)parse_openai_responses_create_request(request, {}); }
++    catch (const std::exception&) { invalid = true; }
++    check(invalid, "non-boolean option accepted");
++
++    for (const auto reason : {FinishReason::OutputLimit, FinishReason::StopToken}) {
++        OpenAIResponsesCreateRequest parsed;
++        parsed.prompt.model = "test";
++        OpenAIResponsesEventStream encoder("resp_unmatched", 1, std::move(parsed), {});
++        (void)encoder.start();
++        (void)encoder.tool_delta({ToolStreamEvent::Kind::Start, 0, "capture"});
++        (void)encoder.tool_delta({ToolStreamEvent::Kind::Arguments, 0, R"({"command":"partial)"});
++        GenerationOutcome outcome;
++        outcome.finish_reason = reason;
++        if (reason == FinishReason::StopToken) outcome.tool_calls.push_back({"different_tool", "{}"});
++        bool rejected = false;
++        try { (void)encoder.finish(outcome); }
++        catch (const std::logic_error&) { rejected = true; }
++        check(rejected, "unmatched preview could be published as executable");
++    }
++}
++} // namespace
++
++int main() {
++    try {
++        test_preview_request_and_unmatched_item();
++        test_responses_preview_multiple_parameters();
++        test_responses_preview_repair(false);
++        return 0;
++    } catch (const std::exception& error) {
++        std::cerr << error.what() << '\n';
++        return 1;
++    }
++}
