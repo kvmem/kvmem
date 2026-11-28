@@ -206,6 +206,11 @@ def normalize(data, backends, *, path_root=None):
             raise ValueError(f'{key} must be >= {minimum}; zero means unlimited for NInfer')
     if p['Backend'] != 'radiance' and {'CpuThreads','VisionCacheMiB','WeightPlacement','WeightHostMiB'} & p.keys():
         raise ValueError('CPU threads, image cache and weight placement configure Radiance only')
+    if 'EmbeddingPlacement' in p:
+        if p['Backend'] not in ('ninfer', 'radiance'):
+            raise ValueError('EmbeddingPlacement configures NInfer and Radiance only')
+        if p['EmbeddingPlacement'] not in ('vram', 'ram'):
+            raise ValueError('EmbeddingPlacement must be vram or ram')
     if p.get('VisionResidency') == 'overlay' and p['Backend'] != 'ninfer':
         raise ValueError('GPU Vision overlay is only supported by NInfer')
     if 'CheckpointExtraRecomputeTokens' in p and p['Backend'] != 'ninfer':

@@ -264,6 +264,7 @@ class Controller:
         identity = dict(path=value['path'], executable_sha256=value['executable_sha256'])
         if backend == 'ninfer':
             identity['vision_overlay'] = supports_vision_overlay(value)
+            identity['host_embedding'] = value.get('host_embedding') is True
         if 'explicit_thinking_switches' in value:
             identity['explicit_thinking_switches'] = value['explicit_thinking_switches']
         return dict(schema_version=1, backend=backend, strategy=selected,

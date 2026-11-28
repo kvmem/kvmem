@@ -50,6 +50,7 @@ param(
     [ValidateRange(0, 2147483647)][int]$CacheMinTokens = 0,
     [switch]$Vision,
     [ValidateSet('resident', 'cpu', 'overlay')][string]$VisionResidency = 'resident',
+    [ValidateSet('vram', 'ram')][string]$EmbeddingPlacement = 'vram',
     [ValidateRange(0, 2147483647)][int]$CpuVisionIdleSeconds = 300,
     [ValidateRange(1, 16384)][int]$VisionTokens = 1024,
     [ValidateSet('off', 'auto')][string]$DeviceProfile = 'off',
@@ -131,6 +132,9 @@ if ($Backend -eq 'polystrata') {
     }
 }
 if ($Describe) { $capabilities | ConvertTo-Json -Depth 4; return }
+if ($Backend -ne 'ninfer' -and $PSBoundParameters.ContainsKey('EmbeddingPlacement')) {
+    throw 'EmbeddingPlacement configures NInfer only in this launcher'
+}
 if ($Backend -ne 'llamacpp' -and ($Lora -or $PSBoundParameters.ContainsKey('LoraScale'))) { throw 'Lora configures llama.cpp only' }
 if ($Backend -ne 'ninfer' -and $PSBoundParameters.ContainsKey('CheckpointExtraRecomputeTokens')) {
     throw '-CheckpointExtraRecomputeTokens configures NInfer only'
@@ -217,6 +221,7 @@ foreach ($setting in @(
     @('MaxTokens', '^(-n|--n-predict|--predict|--default-max-tokens)(=|$)'),
     @('Vision', '^--(mmproj|mmproj-offload|no-mmproj-offload|mmproj-device|image-max-tokens)(=|$)'),
     @('VisionResidency', '^--vision-(residency|offload|cpu)(=|$)'),
+    @('EmbeddingPlacement', '^--embedding-residency(=|$)'),
     @('Mmproj', '^--mmproj(=|$)'),
     @('Lora', '^--lora(-scale)?(=|$)'),
     @('PreserveThinking', '^--((no-)?preserve-thinking|chat-template-kwargs)(=|$)'),
@@ -347,6 +352,7 @@ if ($Backend -eq 'ninfer') {
         '--ngram-draft-tokens', "$NgramDrafts", '--ngram-min-match', "$NgramMinMatch") }
     if ($AdaptiveMtp) { $nativeArgs += '--adaptive-mtp' }
     if ($FastPrefill) { $nativeArgs += '--fast-prefill-kernel' }
+    if ($EmbeddingPlacement -eq 'ram') { $nativeArgs += @('--embedding-residency', 'host') }
     if ($Vision) { $nativeArgs += @('--vision', '--vision-residency', $VisionResidency, '--vision-max-merged', "$VisionTokens") }
     if ($Vision -and $VisionResidency -eq 'cpu') { $nativeArgs += @('--cpu-vision-idle-seconds', "$CpuVisionIdleSeconds") }
     if ($ThinkingBudget -gt 0) { $nativeArgs += @('--default-thinking-budget', "$ThinkingBudget") }

@@ -316,6 +316,8 @@ def build_plan(data, root=ROOT, *, platform=None, reveal_secrets=False):
             argv.append('--adaptive-mtp')
         if p['FastPrefill']:
             argv.append('--fast-prefill-kernel')
+        if p.get('EmbeddingPlacement') == 'ram':
+            pair('--embedding-residency', 'host')
         if p['Vision']:
             argv.append('--vision')
             pair('--vision-residency', p['VisionResidency'])

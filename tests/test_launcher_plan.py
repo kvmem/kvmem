@@ -81,6 +81,27 @@ class PlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'only supported by NInfer'):
             self.plan('llamacpp', Vision=True, VisionResidency='overlay')
 
+    def test_ninfer_embedding_placement(self):
+        caps = {'legacy_query_replay_revision': 1}
+        for values in ({}, {'EmbeddingPlacement': 'vram'}):
+            plan = self.plan(**values)
+            self.assertNotIn('--embedding-residency', plan['argv'])
+            require_launch_features(caps, plan['effective_parameters'])
+
+        for recall in ('legacy', 'layerwise'):
+            plan = self.plan(EmbeddingPlacement='ram', RecallStrategy=recall)
+            argv = plan['argv']
+            self.assertEqual(argv.count('--embedding-residency'), 1)
+            self.assertEqual(argv[argv.index('--embedding-residency') + 1], 'host')
+            with self.assertRaisesRegex(ValueError, 'does not support NInfer host embeddings'):
+                require_launch_features(caps, plan['effective_parameters'])
+        require_launch_features(dict(caps, host_embedding=True),
+                                self.plan(EmbeddingPlacement='ram')['effective_parameters'])
+        with self.assertRaisesRegex(ValueError, 'must be vram or ram'):
+            self.plan(EmbeddingPlacement='host')
+        with self.assertRaisesRegex(ValueError, 'configures NInfer and Radiance only'):
+            self.plan('llamacpp', EmbeddingPlacement='ram')
+
     def test_full_query_limits_require_new_worker_without_changing_requested_values(self):
         cases = ({}, {'QueryMaxTokens': 512}, {'QueryReplayMaxTokens': 2048},
                  {'QueryMaxTokens': 0, 'QueryReplayMaxTokens': 2048},
@@ -433,6 +454,8 @@ class PlanTest(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'PowerShell regression comparison')
     def test_windows_canonical_cli_equivalence(self):
         cases = [('ninfer', {}), ('llamacpp', {}),
+                 ('ninfer', dict(EmbeddingPlacement='vram')),
+                 ('ninfer', dict(EmbeddingPlacement='ram', Vision=True, VisionResidency='cpu')),
                  ('llamacpp', dict(Lora=str(self.models['llamacpp']), LoraScale=-0.5)),
                  ('ninfer', dict(CheckpointExtraRecomputeTokens=16)),
                  ('ninfer', dict(CacheMinTokens=4096)),
